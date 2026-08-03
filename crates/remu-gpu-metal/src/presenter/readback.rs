@@ -44,6 +44,111 @@ fn begin_capture_attempt_if_due(
 }
 
 impl MetalPresenter {
+    pub(super) fn capture_scanout_writer_after_draw(
+        &mut self,
+        slot: u64,
+        draw: &IndexedDraw,
+        targets: &[DecodedRenderTarget],
+    ) -> Result<(), String> {
+        let Some(target) = targets
+            .iter()
+            .find(|target| self.is_diagnostic_scanout_target(target))
+            .copied()
+        else {
+            return Ok(());
+        };
+        let Some(capture_root) = self.capture_directory.clone() else {
+            eprintln!(
+                "[REMu][METAL][SCANOUT-AFTER] slot={slot} draw={} ps={:#x} skipped: REMU_CAPTURE_DIR is unset",
+                draw.sequence, draw.pixel_shader_address,
+            );
+            return Ok(());
+        };
+
+        // This is intentionally host-effectful and exists only behind the explicit writer
+        // selector. Settling here makes each artifact an ordered post-draw observation instead of
+        // a later flip snapshot that may already include several subsequent UI writers.
+        self.wait_for_guest_command_batches()?;
+        let descriptor = target.texture;
+        let texture = if target.direct_scanout {
+            self.direct_scanout_textures
+                .get(&descriptor.address)
+                .ok_or("diagnostic scanout writer has no direct scanout texture")?
+                .texture
+                .clone()
+        } else if let Some(resident) = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .filter(|resident| resident.serves_reads())
+        {
+            resident.texture.clone()
+        } else if let Some(snapshot) = self.scanout_snapshot_textures.get(&descriptor.address) {
+            snapshot.texture.clone()
+        } else {
+            self.resident_guest_textures
+                .values()
+                .find(|resident| {
+                    resident.serves_reads()
+                        && super::guest_texture_descriptors_share_storage(
+                            resident.descriptor,
+                            descriptor,
+                        )
+                })
+                .ok_or("diagnostic scanout writer has no readable Metal texture")?
+                .texture
+                .clone()
+        };
+        let device = self
+            .device
+            .as_ref()
+            .ok_or("Metal device is unavailable")?
+            .clone();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+        let native = read_texture_linear(&device, &queue, &texture, descriptor)?;
+        let fingerprint = guest_frame_fingerprint(&native);
+        let bgra = native_texture_capture_to_bgra(&native, descriptor).ok_or_else(|| {
+            format!(
+                "cannot convert diagnostic scanout format {:?} to BGRA",
+                descriptor.pixel_format
+            )
+        })?;
+        let pixels = bgra.chunks_exact(4);
+        let pixel_count = pixels.len();
+        let black = pixels
+            .clone()
+            .filter(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+            .count();
+        let green = pixels
+            .filter(|pixel| {
+                let blue = u16::from(pixel[0]);
+                let green = u16::from(pixel[1]);
+                let red = u16::from(pixel[2]);
+                green >= 128 && green >= red.saturating_add(48) && green >= blue.saturating_add(48)
+            })
+            .count();
+        let directory = capture_root.join("scanout-writers").join(format!(
+            "{slot:03}-draw-{}-ps-{:x}",
+            draw.sequence, draw.pixel_shader_address
+        ));
+        let path = capture_guest_frame(&directory, &bgra, descriptor, fingerprint)?;
+        eprintln!(
+            "[REMu][METAL][SCANOUT-AFTER] slot={slot} draw={} es={:#x} ps={:#x} target={:#x} {}x{} format={:?} fingerprint={fingerprint:016x} black={black}/{pixel_count} green={green}/{pixel_count} captured={}",
+            draw.sequence,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            descriptor.address,
+            descriptor.width,
+            descriptor.height,
+            descriptor.pixel_format,
+            path.display(),
+        );
+        Ok(())
+    }
+
     /// Settles a resident's publication debt for `trigger`, and reports whether guest memory
     /// was written.
     ///

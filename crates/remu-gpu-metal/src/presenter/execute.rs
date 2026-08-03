@@ -36,7 +36,8 @@ use super::{
     diagnostic_dump_video_target_consumer, diagnostic_force_msaa_vertex_pattern,
     diagnostic_global_binding_head, diagnostic_overlapping_global_writers,
     diagnostic_overlapping_memory_copies, diagnostic_overlapping_texture_writers,
-    diagnostic_related_texture_writers, diagnostic_shader_summary, diagnostic_target_draw_filter,
+    diagnostic_related_texture_writers, diagnostic_scanout_writer_slot, diagnostic_shader_summary,
+    diagnostic_target_draw_filter,
     diagnostic_texture_depth_plane_summaries, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
     diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
@@ -710,6 +711,54 @@ impl MetalPresenter {
             &mut self.next_sampled_texture_use,
             activity_stamp,
         )?;
+        let diagnostic_scanout_writer_slot = targets
+            .iter()
+            .any(|target| self.is_diagnostic_scanout_target(target))
+            .then(|| diagnostic_scanout_writer_slot(draw.sequence, draw.pixel_shader_address))
+            .flatten();
+        if let Some(slot) = diagnostic_scanout_writer_slot {
+            for (stage, evaluation, textures) in [
+                ("vertex", export_evaluation.as_ref(), export_textures.as_slice()),
+                ("pixel", pixel_evaluation, pixel_textures.as_slice()),
+            ] {
+                for (binding_index, (binding, uploaded)) in canonical_texture_bindings(evaluation)
+                    .into_iter()
+                    .zip(textures)
+                    .enumerate()
+                {
+                    let resident = uploaded
+                        .selected_resident
+                        .and_then(|descriptor| self.resident_guest_textures.get(&descriptor));
+                    let resident_summary = resident.map(|resident| {
+                        (
+                            resident.descriptor,
+                            resident.state,
+                            resident.serves_reads(),
+                            resident.gpu_written(),
+                            resident.content_version,
+                            resident.owned.byte_count(),
+                            resident.gpu_authored.byte_count(),
+                            resident.last_use,
+                        )
+                    });
+                    eprintln!(
+                        "[REMu][METAL][SCANOUT-SOURCE] slot={slot} draw={} es={:#x} ps={:#x} stage={stage} binding={binding_index} pc={:#x} op={} words={:08x?} requested={:?} selected={resident_summary:?} native={:?}/{}x{}/mips{}/layers{}",
+                        draw.sequence,
+                        draw.export_shader_address,
+                        draw.pixel_shader_address,
+                        binding.pc,
+                        binding.opcode,
+                        binding.resource_descriptor,
+                        uploaded.descriptor,
+                        uploaded.texture.pixel_format(),
+                        uploaded.texture.width(),
+                        uploaded.texture.height(),
+                        uploaded.texture.mipmap_level_count(),
+                        uploaded.texture.array_length(),
+                    );
+                }
+            }
+        }
         let (
             pipeline,
             vertex_function,
@@ -1802,6 +1851,9 @@ impl MetalPresenter {
                 );
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
+        }
+        if let Some(slot) = diagnostic_scanout_writer_slot {
+            self.capture_scanout_writer_after_draw(slot, draw, &targets)?;
         }
         let diagnostic_target = diagnostic_target_draw_filter()
             .and_then(|filter| {

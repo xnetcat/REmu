@@ -611,6 +611,52 @@ pub(super) fn trace_scanout_writes() -> bool {
     })
 }
 
+fn parse_diagnostic_shader_addresses(value: &str) -> Vec<u64> {
+    value
+        .split(',')
+        .filter_map(|part| parse_diagnostic_hex_address(part.trim()))
+        .collect()
+}
+
+/// Selects scanout writers for an ordered, per-draw source/capture trace.
+///
+/// This diagnostic is deliberately narrower than `REMU_TRACE_SCANOUT_WRITES`: a title can issue
+/// dozens of UI writers per frame, and settling all of them would perturb the workload beyond
+/// recognition. The comma-separated filter contains pixel-shader addresses in hexadecimal.
+pub(super) fn diagnostic_scanout_writer_selected(pixel_shader_address: u64) -> bool {
+    static FILTER: OnceLock<Vec<u64>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITERS")
+                .ok()
+                .map(|value| parse_diagnostic_shader_addresses(&value))
+                .unwrap_or_default()
+        })
+        .contains(&pixel_shader_address)
+}
+
+/// Allocates a bounded trace slot for a selected scanout writer.
+pub(super) fn diagnostic_scanout_writer_slot(
+    draw_sequence: u64,
+    pixel_shader_address: u64,
+) -> Option<u64> {
+    if draw_sequence < diagnostic_dump_target_minimum_draw()
+        || !diagnostic_scanout_writer_selected(pixel_shader_address)
+    {
+        return None;
+    }
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITER_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(96)
+    });
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let slot = NEXT.fetch_add(1, Ordering::Relaxed);
+    (slot < limit).then_some(slot)
+}
+
 pub(super) fn diagnostic_dump_target_before_pixel_shader() -> Option<u64> {
     static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
     *ADDRESS.get_or_init(|| {
@@ -797,6 +843,19 @@ pub(super) fn diagnostic_dump_target_address() -> Option<u64> {
         let value = value.strip_prefix("0x").unwrap_or(&value);
         u64::from_str_radix(value, 16).ok()
     })
+}
+
+pub(super) const fn diagnostic_target_address_matches(
+    expected: Option<u64>,
+    target_address: u64,
+    target_width: u32,
+    target_height: u32,
+) -> bool {
+    match expected {
+        Some(0) => target_width == 1_920 && target_height == 1_080,
+        Some(expected) => target_address == expected,
+        None => false,
+    }
 }
 
 pub(super) fn diagnostic_dump_target_pixel_shader() -> Option<u64> {
@@ -1704,6 +1763,14 @@ mod tests {
     }
 
     #[test]
+    fn scanout_writer_shader_filter_accepts_prefixed_and_plain_hex() {
+        assert_eq!(
+            parse_diagnostic_shader_addresses("0x8059850000, 8051dc0000,invalid,,0X80d3b70000"),
+            vec![0x8059_850000, 0x8051_dc0000, 0x80d3_b70000]
+        );
+    }
+
+    #[test]
     fn automatic_target_filter_selects_only_display_extent() {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: None,
@@ -1714,6 +1781,28 @@ mod tests {
 
         assert!(filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_920, 1_080));
         assert!(!filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_280, 720));
+    }
+
+    #[test]
+    fn target_address_selection_can_enable_pipeline_instrumentation() {
+        assert!(diagnostic_target_address_matches(
+            Some(0x00ef_c000_0000),
+            0x00ef_c000_0000,
+            1_280,
+            720
+        ));
+        assert!(diagnostic_target_address_matches(
+            Some(0),
+            0x00ef_c000_0000,
+            1_920,
+            1_080
+        ));
+        assert!(!diagnostic_target_address_matches(
+            Some(0),
+            0x00ef_c000_0000,
+            1_280,
+            720
+        ));
     }
 
     #[test]
