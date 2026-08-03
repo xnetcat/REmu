@@ -1238,10 +1238,22 @@ impl MetalPresenter {
                 None
             }
         });
+        let target_clear_sequences = initial_target_clear_colors
+            .iter()
+            .map(|clear| {
+                clear.map(|_| {
+                    let sequence = self.next_color_attachment_clear_sequence;
+                    self.next_color_attachment_clear_sequence =
+                        self.next_color_attachment_clear_sequence.wrapping_add(1);
+                    sequence
+                })
+            })
+            .collect::<Vec<_>>();
         let render_pass_key = GuestRenderPassKey {
             targets: targets
                 .iter()
-                .map(|target| {
+                .zip(target_clear_sequences)
+                .map(|(target, clear_sequence)| {
                     (
                         target.texture,
                         target.sample_count,
@@ -1251,6 +1263,7 @@ impl MetalPresenter {
                         target.base_layer,
                         target.mip_level,
                         target.mip_level_count,
+                        clear_sequence,
                     )
                 })
                 .collect(),
@@ -1382,7 +1395,12 @@ impl MetalPresenter {
                     .to_owned();
                 encoder.set_label("REMu translated guest render pass");
                 batch.render_pass = Some(OpenGuestRenderPass {
-                    key: render_pass_key,
+                    // A load clear is consumed when this encoder begins. Keep the attachment
+                    // identity as the compatible continuation state so the following draw does
+                    // not spill the freshly cleared tile, while a later one-shot clear sequence
+                    // still differs and opens a new pass before that operation. Each logical
+                    // queue stores this continuation in its own open batch.
+                    key: render_pass_key.continuation_after_color_loads(),
                     encoder,
                 });
                 statistics.encoded_render_passes =
