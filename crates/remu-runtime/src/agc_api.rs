@@ -240,18 +240,17 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
             read_guest_u64(header + AGC_SHADER_SPECIALS_OFFSET),
         );
     }
-    state.agc_shader_registry.headers.insert(code, header);
-    state.agc_shader_registry.code_sizes.insert(code, code_size);
+    let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+    agc.shader_registry.headers.insert(code, header);
+    agc.shader_registry.code_sizes.insert(code, code_size);
     match registration_code_fingerprint {
         Some(fingerprint) => {
-            state
-                .agc_shader_registry
+            agc.shader_registry
                 .registration_code_fingerprints
                 .insert(code, fingerprint);
         }
         None => {
-            state
-                .agc_shader_registry
+            agc.shader_registry
                 .registration_code_fingerprints
                 .remove(&code);
         }
@@ -261,8 +260,7 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
     // participated; otherwise a later shader could inherit an unrelated continuation merely
     // because its code landed at the same address.
     let mut invalidated_entries = vec![code];
-    state
-        .agc_shader_registry
+    agc.shader_registry
         .fused_continuations
         .retain(|front_code, continuations| {
             if *front_code == code {
@@ -277,8 +275,8 @@ pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchSt
             !continuations.is_empty()
         });
     for entry in invalidated_entries {
-        state.agc_shader_registry.snapshots.remove(&entry);
-        state.agc_shader_registry.decode_failures.remove(&entry);
+        agc.shader_registry.snapshots.remove(&entry);
+        agc.shader_registry.decode_failures.remove(&entry);
     }
     if destination != 0 {
         write_guest_u64(destination, header);
@@ -870,8 +868,8 @@ pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6], state: &mut ProbeDispa
     let front_program_address = read_guest_u64(front + SHADER_HEADER_CODE_OFFSET);
     let back_program_address = read_guest_u64(back + SHADER_HEADER_CODE_OFFSET);
     if front_program_address != 0 && back_program_address != 0 {
-        state
-            .agc_shader_registry
+        let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+        agc.shader_registry
             .fused_continuations
             .entry(front_program_address)
             .or_default()
@@ -881,12 +879,10 @@ pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6], state: &mut ProbeDispa
                 back_program_address,
                 back_code_size: read_guest_u32(back + AGC_SHADER_SIZE_OFFSET),
             });
-        state
-            .agc_shader_registry
+        agc.shader_registry
             .snapshots
             .remove(&front_program_address);
-        state
-            .agc_shader_registry
+        agc.shader_registry
             .decode_failures
             .remove(&front_program_address);
     }

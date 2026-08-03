@@ -1343,15 +1343,18 @@ fn ampr_publish_command_buffer_completion(
     // reads back through `sceKernelGetEventData` to identify which request completed. `udata`
     // belongs to the registration, not to the individual command.
     for completion in completions {
-        let user_data = state
-            .kernel_event_registrations
-            .get(&(
-                completion.equeue,
-                KERNEL_EVENT_FILTER_AMPR,
-                completion.ident,
-            ))
-            .copied()
-            .unwrap_or(0);
+        let user_data = {
+            let (_h, events) = crate::event_state::lock_event_state_for_read();
+            events
+                .kernel_event_registrations
+                .get(&(
+                    completion.equeue,
+                    KERNEL_EVENT_FILTER_AMPR,
+                    completion.ident,
+                ))
+                .copied()
+                .unwrap_or(0)
+        };
         queue_kernel_event(
             state,
             KernelQueuedEvent {

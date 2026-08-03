@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::sync::atomic::Ordering;
-
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -13,6 +13,7 @@ use crate::{
     stall_break_enabled, stall_report_interval, trace_guest_sync, trace_logarithmic_sequence,
 };
 
+use super::state::GuestConditionEntry;
 use super::{guest_mutex_entry, guest_sync};
 
 pub(crate) fn guest_condition_init(address: u64) -> u64 {
@@ -23,9 +24,7 @@ pub(crate) fn guest_condition_init(address: u64) -> u64 {
     sync.0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .conditions
-        .entry(address)
-        .or_default();
+        .condition_entry(address);
     0
 }
 
@@ -39,8 +38,15 @@ pub(crate) fn guest_condition_destroy(address: u64) -> u64 {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match state.conditions.get(&address) {
-        Some(condition) if !condition.is_idle() => sce_kernel_error(SCE_KERNEL_ERROR_BUSY),
-        Some(_) => {
+        Some(entry) => {
+            let idle = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_idle();
+            if !idle {
+                return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
+            }
             state.conditions.remove(&address);
             0
         }
@@ -83,19 +89,27 @@ where
     } else {
         return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
     };
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(waiter) = state.register_condition_waiter(condition, mutex_address) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    let (waiter, entry) = {
+        let mut state = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(waiter) = state.register_condition_waiter(condition, mutex_address) else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        };
+        let entry = state
+            .conditions
+            .get(&condition)
+            .cloned()
+            .expect("register_condition_waiter inserts the condition entry");
+        if trace_guest_sync() && trace_logarithmic_sequence(waiter, 8) {
+            eprintln!(
+                "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion} timeout_usec={timeout_usec:?}",
+                current_guest_thread_handle(),
+            );
+        }
+        (waiter, entry)
     };
-    if trace_guest_sync() && trace_logarithmic_sequence(waiter, 8) {
-        eprintln!(
-            "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion} timeout_usec={timeout_usec:?}",
-            current_guest_thread_handle(),
-        );
-    }
     mutex.owner = None;
     mutex.owner_guest_thread = 0;
     mutex.recursion = 0;
@@ -106,23 +120,25 @@ where
     // Set when a diagnostic spurious wake retires an otherwise unbounded wait.
     let mut released_spuriously = false;
     assert_wait_is_off_the_dispatch_lock("scePthreadCondWait");
+    let mut cond = entry
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (timed_out, interrupted) = if let Some(timeout) = timeout_usec {
         let duration = Duration::from_micros(timeout);
-        let (next_state, wait_result) = sync
-            .1
-            .wait_timeout_while(state, duration, |state| {
-                !state.condition_waiter_released(waiter)
-                    && !guest_exception_is_pending(guest_thread)
+        let (next_cond, wait_result) = entry
+            .wake
+            .wait_timeout_while(cond, duration, |cond| {
+                !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state = next_state;
+        cond = next_cond;
         let interrupted =
-            !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+            !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         let expired =
-            wait_result.timed_out() && !state.condition_waiter_released(waiter) && !interrupted;
+            wait_result.timed_out() && !cond.waiter_released(waiter) && !interrupted;
         if expired {
-            let guest_condition = state.conditions.entry(condition).or_default();
-            guest_condition.timeouts = guest_condition.timeouts.saturating_add(1);
+            cond.timeouts = cond.timeouts.saturating_add(1);
         }
         (expired, interrupted)
     } else if let Some(report_after) = stall_report_interval() {
@@ -131,14 +147,13 @@ where
         // wait once; the predicate is unchanged, so this cannot alter wait semantics.
         let mut reported = false;
         loop {
-            let (next_state, wait_result) = sync
-                .1
-                .wait_timeout_while(state, report_after, |state| {
-                    !state.condition_waiter_released(waiter)
-                        && !guest_exception_is_pending(guest_thread)
+            let (next_cond, wait_result) = entry
+                .wake
+                .wait_timeout_while(cond, report_after, |cond| {
+                    !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next_state;
+            cond = next_cond;
             if !wait_result.timed_out() {
                 break;
             }
@@ -155,78 +170,57 @@ where
             }
             if !reported {
                 reported = true;
-                let notifies = state
-                    .conditions
-                    .get(&condition)
-                    .map_or(0, |guest_condition| guest_condition.notifies);
+                let notifies = cond.notifies;
                 eprintln!(
                     "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies}",
                     report_after.as_secs(),
                     current_guest_thread_name()
                 );
                 if !STALL_SNAPSHOT_EMITTED.swap(true, Ordering::Relaxed) {
-                    // One process-wide view of every condition: which are being signaled, which
-                    // are only ever polled, and which have waiters nobody serves.
-                    let mut summary: Vec<_> = state
-                        .conditions
-                        .iter()
-                        .map(|(address, guest_condition)| {
-                            (
-                                *address,
-                                guest_condition.waiters.len(),
-                                guest_condition.notifies,
-                                guest_condition.timeouts,
-                            )
-                        })
-                        .collect();
-                    summary.sort_by_key(|(_, waiters, notifies, timeouts)| {
-                        (
-                            std::cmp::Reverse(*timeouts),
-                            std::cmp::Reverse(*waiters),
-                            *notifies,
-                        )
-                    });
-                    for (address, waiters, notifies, timeouts) in summary.iter().take(24) {
-                        eprintln!(
-                            "[REMu][STALL] condition={address:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}"
-                        );
-                    }
-                    report_kernel_event_registrations();
+                    drop(cond);
+                    emit_condition_stall_snapshot();
+                    cond = entry
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
             }
         }
         let interrupted =
-            !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+            !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         (false, interrupted)
     } else {
-        state = sync
-            .1
-            .wait_while(state, |state| {
-                !state.condition_waiter_released(waiter)
-                    && !guest_exception_is_pending(guest_thread)
+        cond = entry
+            .wake
+            .wait_while(cond, |cond| {
+                !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let interrupted =
-            !state.condition_waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+            !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         (false, interrupted)
     };
     if timed_out && trace_guest_sync() {
-        let timeouts = state
-            .conditions
-            .get(&condition)
-            .map_or(0, |guest_condition| guest_condition.timeouts);
+        let timeouts = cond.timeouts;
         if trace_logarithmic_sequence(timeouts, 8) {
             eprintln!(
                 "[REMu][COND] timeout sequence={timeouts} thread={guest_thread:#x} condition={condition:#x} mutex={mutex_address:#x} requested_usec={timeout_usec:?}"
             );
         }
     }
-    state.finish_condition_wait(
-        condition,
-        waiter,
-        timed_out || interrupted || released_spuriously,
-    );
-    drop(state);
+    drop(cond);
+
+    {
+        let mut state = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.finish_condition_wait(
+            condition,
+            waiter,
+            timed_out || interrupted || released_spuriously,
+        );
+    }
 
     if interrupted {
         // A cooperative guest exception is analogous to a signal interrupting pthread_cond_wait.
@@ -262,42 +256,119 @@ where
     }
 }
 
+fn emit_condition_stall_snapshot() {
+    let sync = guest_sync();
+    let state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut summary: Vec<_> = state
+        .conditions
+        .iter()
+        .map(|(address, entry)| {
+            let guest_condition = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                *address,
+                guest_condition.waiters.len(),
+                guest_condition.notifies,
+                guest_condition.timeouts,
+            )
+        })
+        .collect();
+    summary.sort_by_key(|(_, waiters, notifies, timeouts)| {
+        (
+            std::cmp::Reverse(*timeouts),
+            std::cmp::Reverse(*waiters),
+            *notifies,
+        )
+    });
+    for (address, waiters, notifies, timeouts) in summary.iter().take(24) {
+        eprintln!(
+            "[REMu][STALL] condition={address:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}"
+        );
+    }
+    drop(state);
+    report_kernel_event_registrations();
+}
+
 pub(crate) fn guest_condition_notify(condition: u64, broadcast: bool) -> u64 {
     if condition == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let sync = guest_sync();
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.condition_notify_count = state.condition_notify_count.saturating_add(1);
-    let notify_sequence = state.condition_notify_count;
-    let guest_condition = state.conditions.entry(condition).or_default();
-    guest_condition.notifies = guest_condition.notifies.saturating_add(1);
-    let pending_before = guest_condition.waiters.len();
-    let selected = if broadcast {
-        guest_condition.release_all()
-    } else {
-        guest_condition.release_one().into_iter().collect()
+    let (entry, selected, notify_sequence, pending_before) = {
+        let mut state = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.condition_notify_count = state.condition_notify_count.saturating_add(1);
+        let notify_sequence = state.condition_notify_count;
+        let entry = state.condition_entry(condition);
+        let mut guest_condition = entry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guest_condition.notifies = guest_condition.notifies.saturating_add(1);
+        let pending_before = guest_condition.waiters.len();
+        let selected = if broadcast {
+            guest_condition.release_all()
+        } else {
+            guest_condition.release_one().into_iter().collect()
+        };
+        for waiter in &selected {
+            if let Some(waiter_state) = state.condition_waiters.get_mut(waiter) {
+                waiter_state.released = true;
+            }
+        }
+        drop(guest_condition);
+        (entry, selected, notify_sequence, pending_before)
     };
-    for waiter in &selected {
-        state
-            .condition_waiters
-            .get_mut(waiter)
-            .expect("pending condition waiter exists")
-            .released = true;
-    }
     if trace_guest_sync() && trace_logarithmic_sequence(notify_sequence, 8) {
         eprintln!(
             "[REMu][COND] notify sequence={notify_sequence} condition={condition:#x} broadcast={broadcast} pending={pending_before} selected={selected:?}"
         );
     }
     if !selected.is_empty() {
-        // One host Condvar coordinates all guest synchronization objects. Wake all host waiters so
-        // the selected condition ticket cannot be consumed by an unrelated host waiter; only the
-        // released guest ticket is allowed to proceed.
-        sync.1.notify_all();
+        // Per-object wake (plan C3 / B16): only waiters on this condition are notified. FIFO
+        // ticket selection above is unchanged — only the host Condvar is per-object.
+        entry.wake.notify_all();
     }
     0
+}
+
+/// Wakes every live guest-sync waiter so cooperative exception delivery cannot lose a parked
+/// thread after per-object Condvars replace the process-wide `GUEST_SYNC` Condvar.
+pub(crate) fn wake_all_guest_sync_for_exception() {
+    let sync = guest_sync();
+    let state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let event_flags: Vec<Arc<_>> = state.event_flags.values().cloned().collect();
+    let semaphores: Vec<Arc<_>> = state.semaphores.values().cloned().collect();
+    let conditions: Vec<Arc<GuestConditionEntry>> = state.conditions.values().cloned().collect();
+    drop(state);
+    // pthread_once still parks on the registry Condvar.
+    sync.1.notify_all();
+    for entry in event_flags {
+        entry.wake.notify_all();
+    }
+    for entry in semaphores {
+        entry.wake.notify_all();
+    }
+    for entry in conditions {
+        entry.wake.notify_all();
+    }
+    for shard in super::state::guest_rwlock_shards() {
+        let locks = shard
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in locks.values() {
+            entry.wake.notify_all();
+        }
+    }
 }

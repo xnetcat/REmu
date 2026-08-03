@@ -388,7 +388,14 @@ fn wait_for_guest_condition_waiters(condition: u64, expected: usize) {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .conditions
             .get(&condition)
-            .map_or(0, |condition| condition.waiters.len());
+            .map_or(0, |entry| {
+                entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .waiters
+                    .len()
+            });
         if waiting == expected {
             return;
         }

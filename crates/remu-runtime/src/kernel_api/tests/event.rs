@@ -6,35 +6,38 @@ use super::*;
 #[test]
 fn a_user_event_registration_can_be_added_and_withdrawn_again() {
     let mut state = ProbeDispatchState::default();
-    state.kernel_equeues.insert(7);
+    crate::event_state::with_event_state_mut(|e| {
+        e.kernel_equeues.insert(7);
+    });
 
     assert_eq!(
         dispatch("4R6-OvI2cEA", args(&[7, 42]), &mut state),
         Some(SUCCESS)
     );
-    assert!(
-        state
-            .kernel_event_registrations
+    assert!(crate::event_state::with_event_state(|e| {
+        e.kernel_event_registrations
             .contains_key(&(7, KERNEL_EVENT_FILTER_USER, 42))
-    );
-    state.pending_events.push_back(KernelQueuedEvent {
-        equeue: 7,
-        ident: 42,
-        filter: KERNEL_EVENT_FILTER_USER,
-        flags: 0,
-        fflags: 1,
-        data: 0,
-        user_data: 0,
-        agc_graphics_completions: 0,
-        agc_user_interrupts: 0,
+    }));
+    crate::event_state::with_event_state_mut(|e| {
+        e.pending_events.push_back(KernelQueuedEvent {
+            equeue: 7,
+            ident: 42,
+            filter: KERNEL_EVENT_FILTER_USER,
+            flags: 0,
+            fflags: 1,
+            data: 0,
+            user_data: 0,
+            agc_graphics_completions: 0,
+            agc_user_interrupts: 0,
+        });
     });
 
     assert_eq!(
         dispatch("LJDwdSNTnDg", args(&[7, 42]), &mut state),
         Some(SUCCESS)
     );
-    assert!(state.kernel_event_registrations.is_empty());
-    assert!(state.pending_events.is_empty());
+    assert!(crate::event_state::with_event_state(|e| e.kernel_event_registrations.is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e.pending_events.is_empty()));
     assert_eq!(
         dispatch("LJDwdSNTnDg", args(&[7, 42]), &mut state),
         Some(KERNEL_NOT_FOUND)

@@ -10,7 +10,7 @@ mod agc_draw;
 mod agc_driver;
 mod agc_flip;
 mod dispatch_locks;
-mod event_state;
+pub(crate) mod event_state;
 mod import_routes;
 mod nid_u64;
 mod path_roots;
@@ -247,9 +247,9 @@ pub(crate) use guest_sync::{
     EVENT_FLAG_WAIT_OR, GuestConditionState, GuestEventFlagState, GuestSemaphoreState,
     dispatch_guest_sync_import, guest_condition_destroy, guest_condition_init,
     guest_condition_notify, guest_condition_wait, guest_condition_wait_with_interrupt,
-    guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry, guest_mutex_init,
-    guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init, guest_semaphore_entry,
-    guest_semaphore_wait,
+    guest_event_flag_entry, guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry,
+    guest_mutex_init, guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init,
+    guest_semaphore_entry, guest_semaphore_wait, wake_all_guest_sync_for_exception,
 };
 #[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use guest_sync::{
@@ -503,19 +503,6 @@ struct ProbeDispatchState {
     np_game_intent: np::GameIntentState,
     np_trophy: np::TrophyState,
     agc_submission_count: u64,
-    agc_graphics: AgcGraphicsState,
-    agc_compute_queues: BTreeMap<u32, AgcGraphicsState>,
-    agc_shader_registry: AgcShaderRegistry,
-    next_equeue: u64,
-    kernel_equeues: BTreeSet<u64>,
-    kernel_event_registrations: BTreeMap<(u64, i16, u64), u64>,
-    pending_events: VecDeque<KernelQueuedEvent>,
-    /// Accepted VideoOut flips awaiting retirement of their Metal presentation command.
-    pending_video_out_flips: VecDeque<PendingVideoOutFlip>,
-    /// Backend completion sequence paired with the AGC queue identifier registered through
-    /// `sceAgcDriverAddEqEvent` (graphics is 0, ACB queues use their owner ID).
-    pending_agc_completions: VecDeque<(u64, u64)>,
-    pending_agc_user_interrupts: VecDeque<u64>,
     agc_completion_telemetry: AgcCompletionTelemetry,
     save_root: PathBuf,
     /// Guest mount table for `/app0`, `/download0`, `/temp0`, and (later) save slots (G2).
@@ -1129,7 +1116,7 @@ pub(crate) struct PendingVideoOutFlip {
 // many as three cache tables. This small Fx-style mixer retains full equality checks in HashMap
 // while making those repeated fixed-width writes substantially cheaper.
 #[derive(Debug, Default)]
-struct AgcGraphicsState {
+pub(crate) struct AgcGraphicsState {
     context_registers: BTreeMap<u32, u32>,
     shader_registers: BTreeMap<u32, u32>,
     user_config_registers: BTreeMap<u32, u32>,
@@ -1171,7 +1158,7 @@ struct AgcGraphicsState {
 }
 
 #[derive(Debug, Default)]
-struct AgcShaderRegistry {
+pub(crate) struct AgcShaderRegistry {
     headers: BTreeMap<u64, u64>,
     code_sizes: BTreeMap<u64, u32>,
     registration_code_fingerprints: BTreeMap<u64, u64>,
@@ -1188,7 +1175,7 @@ struct AgcShaderRegistry {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct AgcFusedShaderContinuation {
+pub(crate) struct AgcFusedShaderContinuation {
     front_header_address: u64,
     back_header_address: u64,
     back_program_address: u64,
@@ -1196,7 +1183,7 @@ struct AgcFusedShaderContinuation {
 }
 
 impl AgcGraphicsState {
-    fn reset_pipeline(&mut self) {
+    pub(crate) fn reset_pipeline(&mut self) {
         self.context_registers.clear();
         self.shader_registers.clear();
         self.user_config_registers.clear();
@@ -1239,7 +1226,7 @@ pub(crate) struct KernelQueuedEvent {
     agc_user_interrupts: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct AgcCompletionTelemetry {
     refreshed_graphics: u64,
     refreshed_compute: u64,
@@ -2156,16 +2143,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.np_trophy = np::TrophyState::default();
     remu_gpu::reset_host_dialog_state();
     state.agc_submission_count = 0;
-    state.agc_graphics = AgcGraphicsState::default();
-    state.agc_compute_queues.clear();
-    state.agc_shader_registry = AgcShaderRegistry::default();
-    state.next_equeue = 1;
-    state.kernel_equeues.clear();
-    state.kernel_event_registrations.clear();
-    state.pending_events.clear();
-    state.pending_video_out_flips.clear();
-    state.pending_agc_completions.clear();
-    state.pending_agc_user_interrupts.clear();
+    agc_dispatch_state::reset_agc_state();
+    event_state::reset_event_state();
     state.agc_completion_telemetry = AgcCompletionTelemetry::default();
     *KERNEL_FILES
         .get_or_init(|| Mutex::new(KernelFileState::default()))
@@ -2208,7 +2187,6 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     set_current_guest_thread_handle(main_thread);
     set_current_guest_thread_unique_id(main_thread_unique_id);
     path_roots::republish_from_dispatch(&state);
-    event_state::sync_from_dispatch(&state);
     drop(state);
     publish_system_splash(system_splash);
 }
@@ -3846,19 +3824,13 @@ fn stall_break_enabled() -> bool {
 /// A queue with waiters but no registration, or a registration REmu never posts to, identifies
 /// the notification the guest expects and is not receiving.
 fn report_kernel_event_registrations() {
-    let Some(state) = PROBE_DISPATCH.get() else {
-        return;
-    };
-    let Ok(state) = state.try_read() else {
-        eprintln!("[REMu][STALL] event registrations unavailable while dispatch is busy");
-        return;
-    };
-    for (&(equeue, filter, ident), &user_data) in &state.kernel_event_registrations {
+    let (_h, events) = event_state::lock_event_state_for_read();
+    for (&(equeue, filter, ident), &user_data) in &events.kernel_event_registrations {
         eprintln!(
             "[REMu][STALL] registration equeue={equeue:#x} filter={filter} ident={ident:#x} user_data={user_data:#x}"
         );
     }
-    for equeue in &state.kernel_equeues {
+    for equeue in &events.kernel_equeues {
         eprintln!("[REMu][STALL] equeue={equeue:#x} exists");
     }
 }
@@ -4376,8 +4348,8 @@ fn kernel_raise_exception(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         GUEST_EXCEPTION_PENDING.store(true, Ordering::Release);
-        sync.1.notify_all();
         drop(_sync_guard);
+        crate::guest_sync::wake_all_guest_sync_for_exception();
         notify_kernel_equeue_waiters();
         eprintln!(
             "[REMu][KERNEL] queued cooperative exception source={source:#x} target={:#x} target_name={:?} type={exception} handler={handler:#x}",
@@ -5325,13 +5297,15 @@ fn dispatch_extended_import(
 
 /// Destroys an event queue and discards the registrations and undelivered events it owned.
 fn kernel_delete_equeue(handle: u64, state: &mut ProbeDispatchState) -> u64 {
-    if !state.kernel_equeues.remove(&handle) {
+    let (_h, mut events) = event_state::lock_event_state_for_write();
+    if !events.kernel_equeues.remove(&handle) {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
-    state
+    events
         .kernel_event_registrations
         .retain(|&(equeue, _, _), _| equeue != handle);
-    discard_kernel_events(state, |event| event.equeue == handle);
+    discard_kernel_events_into(&mut events, state, |event| event.equeue == handle);
+    drop(events);
     notify_kernel_equeue_waiters();
     0
 }
@@ -5356,28 +5330,30 @@ fn video_out_set_window_mode_margins(arguments: [u64; 6], state: &ProbeDispatchS
     0
 }
 
-fn kernel_create_equeue(output: u64, state: &mut ProbeDispatchState) -> u64 {
+fn kernel_create_equeue(output: u64, _state: &mut ProbeDispatchState) -> u64 {
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     }
-    let handle = state.next_equeue.max(1);
-    state.next_equeue = handle.saturating_add(1);
-    state.kernel_equeues.insert(handle);
+    let (_h, mut events) = event_state::lock_event_state_for_write();
+    let handle = events.next_equeue.max(1);
+    events.next_equeue = handle.saturating_add(1);
+    events.kernel_equeues.insert(handle);
     write_guest_u64(output, handle);
     0
 }
 
 fn kernel_register_event(
-    state: &mut ProbeDispatchState,
+    _state: &mut ProbeDispatchState,
     equeue: u64,
     ident: u64,
     filter: i16,
     user_data: u64,
 ) -> u64 {
-    if !state.kernel_equeues.contains(&equeue) {
+    let (_h, mut events) = event_state::lock_event_state_for_write();
+    if !events.kernel_equeues.contains(&equeue) {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
-    state
+    events
         .kernel_event_registrations
         .insert((equeue, filter, ident), user_data);
     0
@@ -5399,12 +5375,16 @@ fn kernel_add_user_event_edge(arguments: [u64; 6], state: &mut ProbeDispatchStat
 /// back to its context; the trigger's identifier selects which registration fires.
 fn kernel_trigger_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (equeue, ident) = (arguments[0], arguments[1]);
-    let Some(&user_data) =
-        state
+    let user_data = {
+        let (_h, events) = event_state::lock_event_state_for_read();
+        match events
             .kernel_event_registrations
             .get(&(equeue, KERNEL_EVENT_FILTER_USER, ident))
-    else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+            .copied()
+        {
+            Some(user_data) => user_data,
+            None => return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND),
+        }
     };
     queue_kernel_event(
         state,
@@ -5503,32 +5483,26 @@ fn notify_kernel_equeue_waiters() {
     wake.1.notify_all();
 }
 
-fn queue_kernel_event(state: &mut ProbeDispatchState, mut event: KernelQueuedEvent) {
-    if let Some(pending) = state.pending_events.iter_mut().find(|pending| {
-        pending.equeue == event.equeue
-            && pending.ident == event.ident
-            && pending.filter == event.filter
-    }) {
-        event.fflags = pending.fflags.saturating_add(1).max(event.fflags);
-        event.agc_graphics_completions = pending
-            .agc_graphics_completions
-            .saturating_add(event.agc_graphics_completions);
-        event.agc_user_interrupts = pending
-            .agc_user_interrupts
-            .saturating_add(event.agc_user_interrupts);
-        *pending = event;
-    } else {
-        state.pending_events.push_back(event);
-    }
+fn queue_kernel_event(_state: &mut ProbeDispatchState, event: KernelQueuedEvent) {
+    event_state::queue_kernel_event(event);
 }
 
 fn discard_kernel_events(
+    state: &mut ProbeDispatchState,
+    should_discard: impl FnMut(&KernelQueuedEvent) -> bool,
+) {
+    let (_h, mut events) = event_state::lock_event_state_for_write();
+    discard_kernel_events_into(&mut events, state, should_discard);
+}
+
+pub(crate) fn discard_kernel_events_into(
+    events: &mut event_state::EventState,
     state: &mut ProbeDispatchState,
     mut should_discard: impl FnMut(&KernelQueuedEvent) -> bool,
 ) {
     let mut cancelled_graphics = 0_u64;
     let mut cancelled_user = 0_u64;
-    state.pending_events.retain(|event| {
+    events.pending_events.retain(|event| {
         if should_discard(event) {
             cancelled_graphics =
                 cancelled_graphics.saturating_add(u64::from(event.agc_graphics_completions));
@@ -5561,7 +5535,8 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
     let newest_completed = completed.iter().next_back().copied().unwrap_or_default();
     let mut completed_queues = Vec::new();
     let mut claimed = BTreeSet::new();
-    state.pending_agc_completions.retain(|&(sequence, ident)| {
+    let (_event_hierarchy, mut events) = event_state::lock_event_state_for_write();
+    events.pending_agc_completions.retain(|&(sequence, ident)| {
         if completed.contains(&sequence) {
             completed_queues.push((sequence, ident));
             claimed.insert(sequence);
@@ -5571,7 +5546,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         }
     });
     let mut completed_compute = Vec::new();
-    state.pending_agc_user_interrupts.retain(|sequence| {
+    events.pending_agc_user_interrupts.retain(|sequence| {
         if completed.contains(sequence) {
             completed_compute.push(*sequence);
             claimed.insert(*sequence);
@@ -5593,7 +5568,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         // an ACB queue uses its owner ID (Silent Hill uses 0x20). Broadcasting one queue's
         // completion to every registration wakes unrelated interrupt work before its command
         // buffer has retired, allowing the guest to recycle live RHI task nodes.
-        let registrations = state
+        let registrations = events
             .kernel_event_registrations
             .iter()
             .filter_map(|(&(equeue, filter, ident), &user_data)| {
@@ -5613,8 +5588,8 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                 .saturating_add(1);
         }
         for (equeue, ident, filter, user_data) in registrations {
-            queue_kernel_event(
-                state,
+            event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident,
@@ -5636,7 +5611,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         if trace_logarithmic_sequence(sequence, 8) {
             eprintln!(
                 "[REMu][AGC] completed submission={sequence} newest_backend={newest_completed} equeues={}",
-                state
+                events
                     .kernel_event_registrations
                     .keys()
                     .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
@@ -5649,7 +5624,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         // end-of-pipe registrations. This is the signal the guest's AgcSubmissionThread waits on
         // before it can recycle the ACB and submit the next frame.
         let timestamp = kernel_process_time(true);
-        let registrations = state
+        let registrations = events
             .kernel_event_registrations
             .iter()
             .filter_map(|(&(equeue, filter, ident), &user_data)| {
@@ -5671,8 +5646,8 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                 .saturating_add(1);
         }
         for (equeue, ident, filter, user_data) in registrations {
-            queue_kernel_event(
-                state,
+            event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident,
@@ -5694,7 +5669,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         if trace_logarithmic_sequence(sequence, 8) {
             eprintln!(
                 "[REMu][AGC] completed compute submission={sequence} newest_backend={newest_completed} user_interrupts={}",
-                state
+                events
                     .kernel_event_registrations
                     .keys()
                     .filter(|(_, filter, ident)| {
@@ -5711,31 +5686,35 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
 
 fn kernel_poll_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> Result<u32, u64> {
     let handle = arguments[0];
-    let events = arguments[1];
+    let event_buffer = arguments[1];
     let event_capacity = low_u32(arguments[2]);
     let out_count = arguments[3];
-    if !state.kernel_equeues.contains(&handle) {
-        return Err(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+    {
+        let (_h, events) = event_state::lock_event_state_for_read();
+        if !events.kernel_equeues.contains(&handle) {
+            return Err(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
+        }
     }
-    if events == 0 || event_capacity == 0 {
+    if event_buffer == 0 || event_capacity == 0 {
         return Err(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
     }
     refresh_completed_video_out_flips(state);
     refresh_completed_agc_submissions(state);
+    let (_h, mut events) = event_state::lock_event_state_for_write();
     let mut delivered = 0_u32;
     while delivered < event_capacity {
-        let Some(index) = state
+        let Some(index) = events
             .pending_events
             .iter()
             .position(|event| event.equeue == handle)
         else {
             break;
         };
-        let event = state
+        let event = events
             .pending_events
             .remove(index)
             .expect("the queued event index was just found");
-        let Some(output) = events.checked_add(u64::from(delivered) * 0x20) else {
+        let Some(output) = event_buffer.checked_add(u64::from(delivered) * 0x20) else {
             return Err(sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT));
         };
         write_guest_u64(output, event.ident);
@@ -5777,23 +5756,13 @@ fn kernel_wait_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
 }
 
 fn report_kernel_equeue_wait_stall(equeue: u64, guest_thread: u64, report_after: Duration) {
-    let Some(state) = PROBE_DISPATCH.get() else {
-        return;
-    };
-    let Ok(state) = state.try_read() else {
-        eprintln!(
-            "[REMu][STALL] equeue wait exceeded {}s thread={:?} handle={guest_thread:#x} equeue={equeue:#x} dispatch=busy",
-            report_after.as_secs(),
-            current_guest_thread_name(),
-        );
-        return;
-    };
-    let registration_count = state
+    let (_h, events) = event_state::lock_event_state_for_read();
+    let registration_count = events
         .kernel_event_registrations
         .keys()
         .filter(|(registered_equeue, _, _)| *registered_equeue == equeue)
         .count();
-    let pending_count = state
+    let pending_count = events
         .pending_events
         .iter()
         .filter(|event| event.equeue == equeue)
@@ -5802,9 +5771,9 @@ fn report_kernel_equeue_wait_stall(equeue: u64, guest_thread: u64, report_after:
         "[REMu][STALL] equeue wait exceeded {}s thread={:?} handle={guest_thread:#x} equeue={equeue:#x} exists={} registrations={registration_count} pending={pending_count}",
         report_after.as_secs(),
         current_guest_thread_name(),
-        state.kernel_equeues.contains(&equeue),
+        events.kernel_equeues.contains(&equeue),
     );
-    for (&(_, filter, ident), &user_data) in state
+    for (&(_, filter, ident), &user_data) in events
         .kernel_event_registrations
         .iter()
         .filter(|((registered_equeue, _, _), _)| *registered_equeue == equeue)
@@ -5813,7 +5782,7 @@ fn report_kernel_equeue_wait_stall(equeue: u64, guest_thread: u64, report_after:
             "[REMu][STALL] equeue registration equeue={equeue:#x} filter={filter} ident={ident:#x} user_data={user_data:#x}"
         );
     }
-    for event in state
+    for event in events
         .pending_events
         .iter()
         .filter(|event| event.equeue == equeue)
@@ -9078,52 +9047,57 @@ fn report_diagnostic_stall_attribution() {
         .first()
         .copied()
         .zip(backend_unclaimed.last().copied());
-    if let Some(state) = PROBE_DISPATCH
+    let submission_count = PROBE_DISPATCH
         .get()
         .and_then(|dispatch| dispatch.try_read().ok())
-    {
-        let pending_graphics_range = state
-            .pending_agc_completions
-            .front()
-            .map(|&(sequence, _)| sequence)
-            .zip(
-                state
-                    .pending_agc_completions
-                    .back()
-                    .map(|&(sequence, _)| sequence),
-            );
-        let pending_compute_range = state
-            .pending_agc_user_interrupts
-            .front()
-            .copied()
-            .zip(state.pending_agc_user_interrupts.back().copied());
-        let pending_graphics_notifications = state
-            .pending_events
-            .iter()
-            .map(|event| u64::from(event.agc_graphics_completions))
-            .sum::<u64>();
-        let pending_user_interrupts = state
-            .pending_events
-            .iter()
-            .map(|event| u64::from(event.agc_user_interrupts))
-            .sum::<u64>();
-        let graphics_registrations = state
-            .kernel_event_registrations
-            .keys()
-            .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
-            .count();
-        let user_interrupt_registrations = state
-            .kernel_event_registrations
-            .keys()
-            .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
-            .count();
-        let telemetry = &state.agc_completion_telemetry;
+        .map(|state| state.agc_submission_count);
+    let telemetry = PROBE_DISPATCH
+        .get()
+        .and_then(|dispatch| dispatch.try_read().ok())
+        .map(|state| state.agc_completion_telemetry.clone());
+    let (_h, events) = event_state::lock_event_state_for_read();
+    let pending_graphics_range = events
+        .pending_agc_completions
+        .front()
+        .map(|&(sequence, _)| sequence)
+        .zip(
+            events
+                .pending_agc_completions
+                .back()
+                .map(|&(sequence, _)| sequence),
+        );
+    let pending_compute_range = events
+        .pending_agc_user_interrupts
+        .front()
+        .copied()
+        .zip(events.pending_agc_user_interrupts.back().copied());
+    let pending_graphics_notifications = events
+        .pending_events
+        .iter()
+        .map(|event| u64::from(event.agc_graphics_completions))
+        .sum::<u64>();
+    let pending_user_interrupts = events
+        .pending_events
+        .iter()
+        .map(|event| u64::from(event.agc_user_interrupts))
+        .sum::<u64>();
+    let graphics_registrations = events
+        .kernel_event_registrations
+        .keys()
+        .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
+        .count();
+    let user_interrupt_registrations = events
+        .kernel_event_registrations
+        .keys()
+        .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
+        .count();
+    if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
         eprintln!(
             "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
-            state.agc_submission_count,
+            submission_count,
             backend_unclaimed.len(),
-            state.pending_agc_completions.len(),
-            state.pending_agc_user_interrupts.len(),
+            events.pending_agc_completions.len(),
+            events.pending_agc_user_interrupts.len(),
             telemetry.refreshed_graphics,
             telemetry.last_refreshed_graphics,
             telemetry.refreshed_compute,
@@ -9147,6 +9121,7 @@ fn report_diagnostic_stall_attribution() {
             backend_unclaimed.len(),
         );
     }
+    drop(events);
     guest_sync::report_condition_stall_attribution();
 
     let dispatch_state = PROBE_DISPATCH

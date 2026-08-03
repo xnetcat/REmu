@@ -229,7 +229,8 @@ pub(crate) fn video_out_is_flip_pending(
     if low_i32(arguments[0]) != 1 || !state.video_out.is_open {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
     }
-    u64::from(!state.pending_video_out_flips.is_empty())
+    let (_h, events) = crate::event_state::lock_event_state_for_read();
+    u64::from(!events.pending_video_out_flips.is_empty())
 }
 
 pub(crate) fn video_out_submit_flip(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {

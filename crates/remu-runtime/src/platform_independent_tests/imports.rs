@@ -307,13 +307,7 @@ fn pending_guest_exception_interrupts_event_flag_and_semaphore_waits() {
         .event_flags
         .insert(
             EVENT_FLAG,
-            crate::GuestEventFlagState {
-                name: "exception-test".to_owned(),
-                attributes: 0,
-                bits: 0,
-                waiters: 0,
-                cancellation_generation: 0,
-            },
+            crate::guest_event_flag_entry("exception-test", 0, 0),
         );
     crate::guest_sync()
         .0
@@ -350,7 +344,14 @@ fn pending_guest_exception_interrupts_event_flag_and_semaphore_waits() {
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    assert_eq!(state.event_flags[&EVENT_FLAG].waiters, 0);
+    assert_eq!(
+        state.event_flags[&EVENT_FLAG]
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters,
+        0
+    );
     state.event_flags.remove(&EVENT_FLAG);
     state.semaphores.remove(&SEMAPHORE);
     drop(state);

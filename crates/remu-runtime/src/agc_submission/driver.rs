@@ -34,6 +34,12 @@ pub(crate) fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispat
     }
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
+    let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+    let crate::agc_dispatch_state::AgcState {
+        graphics,
+        shader_registry,
+        ..
+    } = &mut *agc;
     let (result, gpu_events) = {
         let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcDcbParse);
         capture_agc_gpu_events(|| {
@@ -41,8 +47,8 @@ pub(crate) fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispat
                 command_address,
                 dword_count,
                 &mut AgcSubmissionContext {
-                    graphics: &mut state.agc_graphics,
-                    shaders: &mut state.agc_shader_registry,
+                    graphics,
+                    shaders: shader_registry,
                     video_out: &state.video_out,
                     submission_count: &mut state.agc_submission_count,
                     flips: &mut flips,
@@ -89,6 +95,12 @@ pub(crate) fn agc_driver_submit_multi_dcbs(
         if command_address != 0 && dword_count != 0 && dword_count <= 1_000_000 {
             let mut flips = Vec::new();
             let mut event_writes = Vec::new();
+            let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+            let crate::agc_dispatch_state::AgcState {
+                graphics,
+                shader_registry,
+                ..
+            } = &mut *agc;
             let (result, gpu_events) = {
                 let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcDcbParse);
                 capture_agc_gpu_events(|| {
@@ -96,8 +108,8 @@ pub(crate) fn agc_driver_submit_multi_dcbs(
                         command_address,
                         dword_count,
                         &mut AgcSubmissionContext {
-                            graphics: &mut state.agc_graphics,
-                            shaders: &mut state.agc_shader_registry,
+                            graphics: graphics,
+                            shaders: shader_registry,
                             video_out: &state.video_out,
                             submission_count: &mut state.agc_submission_count,
                             flips: &mut flips,
@@ -164,13 +176,19 @@ pub(super) fn agc_submit_compute_commands(
     event_writes: &mut Vec<u32>,
 ) -> Result<(), AgcSubmissionError> {
     let (command_address, dword_count) = agc_resolve_acb_descriptor(command_address, dword_count)?;
-    let graphics = state.agc_compute_queues.entry(owner).or_default();
+    let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+    let crate::agc_dispatch_state::AgcState {
+        compute_queues,
+        shader_registry,
+        ..
+    } = &mut *agc;
+    let graphics = compute_queues.entry(owner).or_default();
     agc_parse_submission(
         command_address,
         dword_count,
         &mut AgcSubmissionContext {
             graphics,
-            shaders: &mut state.agc_shader_registry,
+            shaders: shader_registry,
             video_out: &state.video_out,
             submission_count: &mut state.agc_submission_count,
             flips,

@@ -682,10 +682,10 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
     };
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_thread_local_event_sink(sender);
-    let mut state = ProbeDispatchState {
-        agc_shader_registry: shaders,
-        ..ProbeDispatchState::default()
-    };
+    let mut state = ProbeDispatchState::default();
+    crate::agc_dispatch_state::with_agc_mut(|agc| {
+        agc.shader_registry = shaders;
+    });
 
     let result = agc_driver_submit_acb(
         [7, (&raw const packet).addr() as u64, 0, 0, 0, 0],
@@ -714,27 +714,24 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
         remu_gpu::ComputeGrid::Threadgroups([3, 2, 1])
     );
     assert_eq!(dispatch.shader_address, program_address);
-    assert!(state.agc_graphics.shader_registers.is_empty());
+    assert!(crate::agc_dispatch_state::with_agc(|agc| agc.graphics.shader_registers.is_empty()));
     assert_eq!(
-        state.agc_compute_queues.get(&7).and_then(|queue| queue
-            .shader_registers
-            .get(&remu_gpu::COMPUTE_PGM_LO_REGISTER)),
-        Some(&low_u32(program_address >> 8))
+        crate::agc_dispatch_state::with_agc(|agc| {
+            agc.compute_queues.get(&7).and_then(|queue| {
+                queue
+                    .shader_registers
+                    .get(&remu_gpu::COMPUTE_PGM_LO_REGISTER)
+                    .copied()
+            })
+        }),
+        Some(low_u32(program_address >> 8))
     );
     assert_eq!(
-        state
-            .pending_agc_completions
-            .iter()
-            .copied()
-            .collect::<Vec<_>>(),
+        crate::event_state::with_event_state(|e| e.pending_agc_completions.iter().copied().collect::<Vec<_>>()),
         vec![]
     );
     assert_eq!(
-        state
-            .pending_agc_user_interrupts
-            .iter()
-            .copied()
-            .collect::<Vec<_>>(),
+        crate::event_state::with_event_state(|e| e.pending_agc_user_interrupts.iter().copied().collect::<Vec<_>>()),
         vec![1]
     );
 }

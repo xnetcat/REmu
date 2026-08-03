@@ -200,17 +200,16 @@ pub(crate) fn queue_video_out_flip(
         return;
     };
     QUEUED_FLIPS.with(|queued| queued.set(queued.get().saturating_add(1)));
-    state
-        .pending_video_out_flips
-        .push_back(PendingVideoOutFlip {
-            completion: remu_gpu::GpuFlipCompletion {
-                address: display_address,
-                buffer_index,
-                flip_argument,
-            },
-            handle,
-            submit_process_time_counter: kernel_process_time(true),
-        });
+    let (_h, mut events) = crate::event_state::lock_event_state_for_write();
+    events.pending_video_out_flips.push_back(PendingVideoOutFlip {
+        completion: remu_gpu::GpuFlipCompletion {
+            address: display_address,
+            buffer_index,
+            flip_argument,
+        },
+        handle,
+        submit_process_time_counter: kernel_process_time(true),
+    });
 }
 
 pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) {
@@ -219,8 +218,9 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
         return;
     }
     let mut queued = false;
+    let (_h, mut events) = crate::event_state::lock_event_state_for_write();
     for completion in completed {
-        let Some(index) = state
+        let Some(index) = events
             .pending_video_out_flips
             .iter()
             .position(|pending| pending.completion == completion)
@@ -231,7 +231,7 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             );
             continue;
         };
-        let pending = state
+        let pending = events
             .pending_video_out_flips
             .remove(index)
             .expect("completed flip index was just found");
@@ -306,13 +306,15 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
 }
 
 pub(crate) fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: u32) {
-    let registrations = state
+    let (_h, events) = crate::event_state::lock_event_state_for_read();
+    let registrations = events
         .kernel_event_registrations
         .iter()
         .filter_map(|(&(equeue, filter, ident), &user_data)| {
             (filter == KERNEL_EVENT_FILTER_GRAPHICS).then_some((equeue, ident, filter, user_data))
         })
         .collect::<Vec<_>>();
+    drop(events);
     for (equeue, ident, filter, user_data) in registrations {
         queue_kernel_event(
             state,
@@ -341,7 +343,8 @@ pub(crate) fn request_agc_submission_completion(
     annotate_submission_flips(&mut events, sequence);
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
-        state
+        let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
+        event_state
             .pending_agc_completions
             .push_back((sequence, queue_id));
         true
@@ -363,7 +366,8 @@ pub(crate) fn request_agc_compute_submission_completion(
     // graphics-filter event makes the guest retire the same ACB/RHI storage twice.
     let queue_id = owner.saturating_add(1);
     if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
-        state.pending_agc_user_interrupts.push_back(sequence);
+        let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
+        event_state.pending_agc_user_interrupts.push_back(sequence);
         true
     } else {
         false

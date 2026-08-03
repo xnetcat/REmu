@@ -553,13 +553,13 @@ fn ampr_reset_and_destroy_wait_for_the_same_buffer_submission_order() {
 fn ampr_completions_are_announced_by_submission_not_registration() {
     let mut state = ProbeDispatchState::default();
     let equeue = 0x4000;
-    state.kernel_equeues.insert(equeue);
+    crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(equeue); });
     assert_eq!(
         kernel_add_ampr_event([equeue, 0x7502, 0xabc, 0, 0, 0], &mut state),
         0
     );
     assert!(
-        state.pending_events.is_empty(),
+        crate::event_state::with_event_state(|e| e.pending_events.is_empty()),
         "registration announced a completion"
     );
 
@@ -581,7 +581,7 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
         0
     );
     assert!(
-        state.pending_events.is_empty(),
+        crate::event_state::with_event_state(|e| e.pending_events.is_empty()),
         "recording announced a completion before submission"
     );
 
@@ -589,19 +589,19 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
         ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
         0
     );
-    assert_eq!(state.pending_events.len(), 1);
-    let event = state.pending_events.front().unwrap();
+    assert_eq!(crate::event_state::with_event_state(|e| e.pending_events.len()), 1);
+    let event = crate::event_state::with_event_state(|e| e.pending_events.front().cloned().unwrap());
     assert_eq!(event.equeue, equeue);
     assert_eq!(event.ident, 0x7502);
     assert_eq!(event.user_data, 0xabc);
-    state.pending_events.pop_front();
+    crate::event_state::with_event_state_mut(|e| { e.pending_events.pop_front(); });
 
     assert_eq!(
         ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
         0
     );
     assert_eq!(
-        state.pending_events.len(),
+        crate::event_state::with_event_state(|e| e.pending_events.len()),
         1,
         "reusing the command buffer lost its completion command"
     );
@@ -783,7 +783,7 @@ fn ampr_submit_contains_a_failed_read_and_still_publishes_its_completion() {
     let mut third = [0_u8; 4];
     let mut flag = 0_u64;
     let mut state = ProbeDispatchState::default();
-    state.kernel_equeues.insert(equeue);
+    crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(equeue); });
     state.ampr_files.insert(file_id, path.clone());
     ampr_record_read_program(
         command_buffer,
@@ -816,7 +816,7 @@ fn ampr_submit_contains_a_failed_read_and_still_publishes_its_completion() {
     // records and destinations still hold what the previous submission left there.
     std::fs::write(&path, b"ABCDEFGHIJKL").unwrap();
     flag = 0;
-    dispatch.write().unwrap().pending_events.clear();
+    crate::event_state::with_event_state_mut(|e| e.pending_events.clear());
     let mut submission_result = u64::MAX;
     let mut submission_id = 0_u32;
     let mut observed_offsets = Vec::new();
@@ -862,18 +862,20 @@ fn ampr_submit_contains_a_failed_read_and_still_publishes_its_completion() {
     assert_eq!(flag, u64::MAX, "the completion word did not report failure");
     assert_eq!(submission_result, read_error);
     assert_eq!(submission_id, 2);
-    let state = dispatch.read().unwrap();
-    let event = state
-        .pending_events
-        .front()
-        .expect("the failed submission announced no completion event");
+    let _state = dispatch.read().unwrap();
+    let event = crate::event_state::with_event_state(|e| {
+        e.pending_events
+            .front()
+            .cloned()
+            .expect("the failed submission announced no completion event")
+    });
     assert_eq!(event.equeue, equeue);
     assert_eq!(
         event.data, AMPR_TEST_EVENT_DATA,
         "the event lost its request identity"
     );
     assert_eq!(event.flags, 0x4000, "the event did not report the failure");
-    drop(state);
+    drop(_state);
     std::fs::remove_file(path).ok();
 }
 

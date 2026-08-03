@@ -20,8 +20,10 @@ mod state;
 pub(crate) use self::condition::guest_condition_wait;
 pub(crate) use self::condition::{
     guest_condition_destroy, guest_condition_init, guest_condition_notify,
-    guest_condition_wait_with_interrupt,
+    guest_condition_wait_with_interrupt, wake_all_guest_sync_for_exception,
 };
+#[cfg(test)]
+pub(crate) use self::event_flag::guest_event_flag_entry;
 #[cfg(test)]
 pub(crate) use self::event_flag::EVENT_FLAG_WAIT_OR;
 pub(crate) use self::event_flag::guest_event_flag_wait;
@@ -990,7 +992,11 @@ fn condition_trace_stats(condition: u64) -> (usize, u64, u64) {
     state
         .conditions
         .get(&condition)
-        .map_or((0, 0, 0), |condition| {
+        .map_or((0, 0, 0), |entry| {
+            let condition = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
                 condition.waiters.len(),
                 condition.notifies,

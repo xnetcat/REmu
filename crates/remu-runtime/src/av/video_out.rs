@@ -289,7 +289,10 @@ pub(super) fn video_out_get_flip_status(arguments: [u64; 6], state: &ProbeDispat
     if !guest_object_is_reachable(status, VIDEO_OUT_FLIP_STATUS_SIZE) {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
     }
-    let pending = u32::try_from(state.pending_video_out_flips.len()).unwrap_or(u32::MAX);
+    let pending = {
+        let (_h, events) = crate::event_state::lock_event_state_for_read();
+        u32::try_from(events.pending_video_out_flips.len()).unwrap_or(u32::MAX)
+    };
     guest_memset(status, 0, VIDEO_OUT_FLIP_STATUS_SIZE);
     write_guest_u64(status, state.video_out.completed_flip_count);
     write_guest_u32(status + VIDEO_OUT_FLIP_GC_QUEUE_NUM_OFFSET, 0);

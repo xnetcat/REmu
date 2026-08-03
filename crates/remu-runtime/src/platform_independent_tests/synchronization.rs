@@ -783,12 +783,13 @@ fn timed_condition_wait_reacquires_the_guest_mutex_before_returning() {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            state
-                .conditions
-                .get(&condition)
-                .is_some_and(crate::GuestConditionState::is_idle)
-        );
+        assert!(state.conditions.get(&condition).is_some_and(|entry| {
+            entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_idle()
+        }));
     }
 
     assert_eq!(crate::guest_mutex_unlock(mutex), 0);
@@ -849,7 +850,7 @@ fn condition_wait_delivers_interruption_before_reacquiring_guest_mutex() {
                 exception: 30,
             },
         );
-    crate::guest_sync().1.notify_all();
+    crate::wake_all_guest_sync_for_exception();
     handler_entered_rx
         .recv_timeout(std::time::Duration::from_secs(2))
         .expect("interruption handler ran before mutex reacquisition");
@@ -935,7 +936,14 @@ fn condition_signal_wakes_exactly_one_blocked_guest_thread() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .conditions
             .get(&condition)
-            .map_or(0, |condition| condition.waiters.len());
+            .map_or(0, |entry| {
+                entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .waiters
+                    .len()
+            });
         if waiting == 2 {
             break;
         }
@@ -1080,7 +1088,14 @@ fn selected_condition_waiter_survives_legal_condition_destruction() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .conditions
             .get(&condition)
-            .map_or(0, |condition| condition.waiters.len());
+            .map_or(0, |entry| {
+                entry
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .waiters
+                    .len()
+            });
         if waiting == 1 {
             break;
         }

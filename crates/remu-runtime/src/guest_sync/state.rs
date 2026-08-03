@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
@@ -10,7 +10,7 @@ use crate::PthreadMutexAttrState;
 
 #[derive(Debug, Default)]
 pub(crate) struct GuestSyncState {
-    pub(crate) conditions: HashMap<u64, GuestConditionState>,
+    pub(crate) conditions: HashMap<u64, Arc<GuestConditionEntry>>,
     pub(crate) condition_waiters: HashMap<u64, GuestConditionWaiterState>,
     pub(crate) next_condition_waiter: u64,
     pub(crate) condition_notify_count: u64,
@@ -18,7 +18,7 @@ pub(crate) struct GuestSyncState {
     pub(crate) next_semaphore_handle: u32,
     pub(crate) semaphore_wait_count: u64,
     pub(crate) semaphore_signal_count: u64,
-    pub(crate) event_flags: HashMap<u64, GuestEventFlagState>,
+    pub(crate) event_flags: HashMap<u64, Arc<GuestEventFlagEntry>>,
     pub(crate) next_event_flag_handle: u64,
 }
 
@@ -32,6 +32,8 @@ pub(crate) struct GuestConditionState {
     /// Timed waits that expired without being signaled. A large count with no signals is a poll
     /// whose predicate never becomes true.
     pub(crate) timeouts: u64,
+    /// Tickets selected by signal/broadcast; checked under this object's mutex (plan C3 wake).
+    pub(crate) released: HashSet<u64>,
 }
 
 impl GuestConditionState {
@@ -45,14 +47,25 @@ impl GuestConditionState {
     }
 
     pub(crate) fn release_one(&mut self) -> Option<u64> {
-        let waiter = self.waiters.pop_front();
+        let waiter = self.waiters.pop_front()?;
+        self.released.insert(waiter);
         self.clear_binding_if_idle();
-        waiter
+        Some(waiter)
     }
 
     pub(crate) fn release_all(&mut self) -> VecDeque<u64> {
         self.bound_mutex = None;
-        std::mem::take(&mut self.waiters)
+        let waiters = std::mem::take(&mut self.waiters);
+        self.released.extend(waiters.iter().copied());
+        waiters
+    }
+
+    pub(crate) fn waiter_released(&self, waiter: u64) -> bool {
+        self.released.contains(&waiter)
+    }
+
+    pub(crate) fn take_release(&mut self, waiter: u64) -> bool {
+        self.released.remove(&waiter)
     }
 
     pub(crate) fn cancel_wait(&mut self, waiter: u64) {
@@ -77,11 +90,21 @@ pub(crate) struct GuestConditionWaiterState {
 }
 
 impl GuestSyncState {
+    pub(crate) fn condition_entry(&mut self, condition: u64) -> Arc<GuestConditionEntry> {
+        self.conditions
+            .entry(condition)
+            .or_insert_with(GuestConditionEntry::new)
+            .clone()
+    }
+
     pub(crate) fn register_condition_waiter(&mut self, condition: u64, mutex: u64) -> Option<u64> {
-        if self
-            .conditions
-            .get(&condition)
-            .and_then(|condition| condition.bound_mutex)
+        let entry = self.condition_entry(condition);
+        let mut condition_state = entry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if condition_state
+            .bound_mutex
             .is_some_and(|bound| bound != mutex)
         {
             return None;
@@ -96,12 +119,10 @@ impl GuestSyncState {
             }
         };
         assert!(
-            self.conditions
-                .entry(condition)
-                .or_default()
-                .register_waiter(waiter, mutex),
+            condition_state.register_waiter(waiter, mutex),
             "condition mutex binding was validated under the synchronization lock"
         );
+        drop(condition_state);
         self.condition_waiters
             .insert(waiter, GuestConditionWaiterState { released: false });
         Some(waiter)
@@ -114,20 +135,28 @@ impl GuestSyncState {
     }
 
     pub(crate) fn finish_condition_wait(&mut self, condition: u64, waiter: u64, timed_out: bool) {
-        if timed_out {
-            self.conditions
-                .get_mut(&condition)
-                .expect("a pending condition waiter prevents destruction")
-                .cancel_wait(waiter);
-        }
+        let released = if let Some(entry) = self.conditions.get(&condition) {
+            let mut condition_state = entry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if timed_out {
+                condition_state.cancel_wait(waiter);
+            }
+            condition_state.take_release(waiter)
+        } else {
+            false
+        };
         let waiter_state = self
             .condition_waiters
             .remove(&waiter)
             .expect("registered condition waiter survives condition destruction");
         assert_eq!(
-            waiter_state.released, !timed_out,
+            released || waiter_state.released,
+            !timed_out,
             "timeout and notification have exactly one winner"
         );
+        let _ = waiter_state;
     }
 }
 
@@ -169,8 +198,7 @@ pub(crate) struct GuestRwlockState {
 
 #[derive(Debug, Default)]
 pub(crate) struct GuestRwlockShard {
-    pub(crate) locks: Mutex<HashMap<u64, GuestRwlockState>>,
-    pub(crate) wake: Condvar,
+    pub(crate) locks: Mutex<HashMap<u64, Arc<GuestRwlockEntry>>>,
 }
 
 impl Default for GuestMutexState {
@@ -208,13 +236,44 @@ pub(crate) struct GuestEventFlagState {
     pub(crate) cancellation_generation: u64,
 }
 
-/// Per-object event-flag entry (plan C3 follow-up — registry still holds [`GuestEventFlagState`]
-/// directly in Solo S1; this type is the target shape).
+/// Per-object event-flag entry (plan C3 / B16): own mutex + condvar; registry is lookup only.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct GuestEventFlagEntry {
     pub(crate) state: Mutex<GuestEventFlagState>,
     pub(crate) wake: Condvar,
+}
+
+/// Per-object condition entry (plan C3 / B16): FIFO-ticket logic stays in [`GuestConditionState`];
+/// only the host wake is per-object so unrelated waiters are not broadcast-woken.
+#[derive(Debug)]
+pub(crate) struct GuestConditionEntry {
+    pub(crate) state: Mutex<GuestConditionState>,
+    pub(crate) wake: Condvar,
+}
+
+impl GuestConditionEntry {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(GuestConditionState::default()),
+            wake: Condvar::new(),
+        })
+    }
+}
+
+/// Per-object rwlock entry (plan C3 / B16): shard map is a registry; wake is not shared.
+#[derive(Debug)]
+pub(crate) struct GuestRwlockEntry {
+    pub(crate) state: Mutex<GuestRwlockState>,
+    pub(crate) wake: Condvar,
+}
+
+impl Default for GuestRwlockEntry {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(GuestRwlockState::default()),
+            wake: Condvar::new(),
+        }
+    }
 }
 
 pub(crate) static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
@@ -258,7 +317,7 @@ pub(super) fn guest_mutex_shard(address: u64) -> usize {
     usize::try_from(hash >> (64 - 6)).unwrap_or_default()
 }
 
-pub(super) fn guest_rwlock_shards() -> &'static [GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT] {
+pub(crate) fn guest_rwlock_shards() -> &'static [GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT] {
     GUEST_RWLOCK_SHARDS.get_or_init(|| std::array::from_fn(|_| GuestRwlockShard::default()))
 }
 

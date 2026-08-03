@@ -108,36 +108,30 @@ fn create_shader_registers_the_authoritative_agc_code_extent() {
     );
     let mut state = ProbeDispatchState::default();
     let other_front = code_address.wrapping_add(0x1000);
-    state
-        .agc_shader_registry
-        .fused_continuations
-        .entry(code_address)
-        .or_default()
-        .insert(crate::AgcFusedShaderContinuation {
-            front_header_address: header_address,
-            back_header_address: 0x1111,
-            back_program_address: 0x2222,
-            back_code_size: 4,
-        });
-    state
-        .agc_shader_registry
-        .fused_continuations
-        .entry(other_front)
-        .or_default()
-        .insert(crate::AgcFusedShaderContinuation {
-            front_header_address: 0x3333,
-            back_header_address: header_address,
-            back_program_address: code_address,
-            back_code_size: 4,
-        });
-    state
-        .agc_shader_registry
-        .decode_failures
-        .insert(code_address);
-    state
-        .agc_shader_registry
-        .decode_failures
-        .insert(other_front);
+    crate::agc_dispatch_state::with_agc_mut(|agc| {
+        agc.shader_registry
+            .fused_continuations
+            .entry(code_address)
+            .or_default()
+            .insert(crate::AgcFusedShaderContinuation {
+                front_header_address: header_address,
+                back_header_address: 0x1111,
+                back_program_address: 0x2222,
+                back_code_size: 4,
+            });
+        agc.shader_registry
+            .fused_continuations
+            .entry(other_front)
+            .or_default()
+            .insert(crate::AgcFusedShaderContinuation {
+                front_header_address: 0x3333,
+                back_header_address: header_address,
+                back_program_address: code_address,
+                back_code_size: 4,
+            });
+        agc.shader_registry.decode_failures.insert(code_address);
+        agc.shader_registry.decode_failures.insert(other_front);
+    });
 
     assert_eq!(
         crate::agc_create_shader(
@@ -155,24 +149,20 @@ fn create_shader_registers_the_authoritative_agc_code_extent() {
     );
     assert_eq!(destination, header_address);
     assert_eq!(
-        state.agc_shader_registry.code_sizes.get(&code_address),
-        Some(&u32::try_from(std::mem::size_of_val(&code)).expect("test shader size fits u32"))
+        crate::agc_dispatch_state::with_agc(|agc| {
+            agc.shader_registry.code_sizes.get(&code_address).copied()
+        }),
+        Some(u32::try_from(std::mem::size_of_val(&code)).expect("test shader size fits u32"))
     );
     assert_eq!(shader_registers[1], low_u32(code_address >> 8));
     assert_eq!(shader_registers[3], low_u32(code_address >> 40));
-    assert!(state.agc_shader_registry.fused_continuations.is_empty());
-    assert!(
-        !state
-            .agc_shader_registry
-            .decode_failures
-            .contains(&code_address)
-    );
-    assert!(
-        !state
-            .agc_shader_registry
-            .decode_failures
-            .contains(&other_front)
-    );
+    assert!(crate::agc_dispatch_state::with_agc(|agc| agc.shader_registry.fused_continuations.is_empty()));
+    assert!(crate::agc_dispatch_state::with_agc(|agc| {
+        !agc.shader_registry.decode_failures.contains(&code_address)
+    }));
+    assert!(crate::agc_dispatch_state::with_agc(|agc| {
+        !agc.shader_registry.decode_failures.contains(&other_front)
+    }));
 }
 
 #[test]
@@ -290,8 +280,10 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
     assert_eq!(scratch[1], low_u32(code >> 8));
     assert_eq!(scratch[3], 0xa5a5_5a00 | (low_u32(code >> 40) & 0xff));
     assert_eq!(
-        state.agc_shader_registry.fused_continuations.get(&code),
-        Some(&std::collections::BTreeSet::from([
+        crate::agc_dispatch_state::with_agc(|agc| {
+            agc.shader_registry.fused_continuations.get(&code).cloned()
+        }),
+        Some(std::collections::BTreeSet::from([
             crate::AgcFusedShaderContinuation {
                 front_header_address: front_address,
                 back_header_address: back_address,
@@ -325,15 +317,16 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
         0
     );
     assert_eq!(
-        state
-            .agc_shader_registry
-            .fused_continuations
-            .get(&code)
-            .map(std::collections::BTreeSet::len),
+        crate::agc_dispatch_state::with_agc(|agc| {
+            agc.shader_registry
+                .fused_continuations
+                .get(&code)
+                .map(std::collections::BTreeSet::len)
+        }),
         Some(2)
     );
-    assert!(crate::agc_shader_snapshot(&mut state.agc_shader_registry, code).is_none());
-    assert!(state.agc_shader_registry.decode_failures.contains(&code));
+    assert!(crate::agc_dispatch_state::with_agc_mut(|agc| crate::agc_shader_snapshot(&mut agc.shader_registry, code).is_none()));
+    assert!(crate::agc_dispatch_state::with_agc(|agc| agc.shader_registry.decode_failures.contains(&code)));
 }
 
 #[test]

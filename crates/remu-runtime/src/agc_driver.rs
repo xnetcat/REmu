@@ -293,13 +293,19 @@ fn submit_graphics(
 ) -> u64 {
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
+    let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+    let crate::agc_dispatch_state::AgcState {
+        graphics,
+        shader_registry,
+        ..
+    } = &mut *agc;
     let (result, gpu_events) = capture_agc_gpu_events(|| {
         agc_parse_graphics_submission(
             command_address,
             dword_count,
             &mut AgcSubmissionContext {
-                graphics: &mut state.agc_graphics,
-                shaders: &mut state.agc_shader_registry,
+                graphics: graphics,
+                shaders: shader_registry,
                 video_out: &state.video_out,
                 submission_count: &mut state.agc_submission_count,
                 flips: &mut flips,
@@ -335,11 +341,12 @@ fn submit_graphics(
 /// that register is not part of the value: a registration is matched on the low word alone, or a
 /// deletion issued from a different call site than the registration would never find it.
 fn delete_eq_event(equeue: u64, requested: u64, state: &mut ProbeDispatchState) -> u64 {
-    if !state.kernel_equeues.contains(&equeue) {
+    let (_h, mut events) = crate::event_state::lock_event_state_for_write();
+    if !events.kernel_equeues.contains(&equeue) {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     let requested = low_u32(requested);
-    let matched = state
+    let matched = events
         .kernel_event_registrations
         .keys()
         .filter(|&&(registered_queue, filter, ident)| {
@@ -353,12 +360,12 @@ fn delete_eq_event(equeue: u64, requested: u64, state: &mut ProbeDispatchState) 
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     for ident in matched {
-        state
+        events
             .kernel_event_registrations
             .remove(&(equeue, KERNEL_EVENT_FILTER_GRAPHICS, ident));
         // An interrupt already queued for a listener the guest just cancelled must not surface on
         // the next wait, where it would resolve user data the guest considers released.
-        crate::discard_kernel_events(state, |event| {
+        crate::discard_kernel_events_into(&mut events, state, |event| {
             event.equeue == equeue
                 && event.filter == KERNEL_EVENT_FILTER_GRAPHICS
                 && event.ident == ident
@@ -742,7 +749,7 @@ mod tests {
             0
         );
         assert_eq!(state.agc_submission_count, 1);
-        assert_eq!(state.pending_agc_completions.len(), 1);
+        assert_eq!(crate::event_state::with_event_state(|e| e.pending_agc_completions.len()), 1);
         assert!(matches!(
             receiver.recv(),
             Ok(remu_gpu::GpuEvent::QueueSubmission {
@@ -825,7 +832,7 @@ mod tests {
             0
         );
         assert_eq!(state.agc_submission_count, 2);
-        assert_eq!(state.pending_agc_completions.len(), 2);
+        assert_eq!(crate::event_state::with_event_state(|e| e.pending_agc_completions.len()), 2);
         for sequence in 1..=2 {
             assert!(matches!(
                 receiver.recv(),
@@ -863,7 +870,7 @@ mod tests {
             AGC_ERROR_PARAMETER_NULL
         );
         assert_eq!(state.agc_submission_count, 0);
-        assert!(state.pending_agc_completions.is_empty());
+        assert!(crate::event_state::with_event_state(|e| e.pending_agc_completions.is_empty()));
     }
 
     #[test]
@@ -900,12 +907,13 @@ mod tests {
             0
         );
         queue_agc_event_write(&mut state, 7);
-        assert_eq!(state.pending_events.len(), 1);
-        state
-            .pending_events
-            .front_mut()
-            .expect("queued event")
-            .agc_graphics_completions = 2;
+        assert_eq!(crate::event_state::with_event_state(|e| e.pending_events.len()), 1);
+        crate::event_state::with_event_state_mut(|e| {
+            e.pending_events
+                .front_mut()
+                .expect("queued event")
+                .agc_graphics_completions = 2;
+        });
 
         // The event type is a four-byte value in a register whose upper half the caller never
         // sets, so a stale upper half must not hide the registration.
@@ -917,8 +925,8 @@ mod tests {
             ),
             0
         );
-        assert!(state.kernel_event_registrations.is_empty());
-        assert!(state.pending_events.is_empty());
+        assert!(crate::event_state::with_event_state(|e| e.kernel_event_registrations.is_empty()));
+        assert!(crate::event_state::with_event_state(|e| e.pending_events.is_empty()));
         assert_eq!(
             state
                 .agc_completion_telemetry
