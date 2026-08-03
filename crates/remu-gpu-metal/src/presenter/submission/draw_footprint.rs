@@ -603,7 +603,14 @@ impl MetalPresenter {
             }
         }
 
-        if std::env::var_os("REMU_TRACE_SHARED_EVENT_DRAWS").is_some_and(|value| value == "1") {
+        // The overlap-only spelling deliberately avoids the broad REMU_TRACE_ diagnostic gate:
+        // it classifies the ordinary preflight without making the draw footprint unavailable.
+        // Use it with admission disabled; the bounded log itself is not a performance run.
+        let trace_draws = std::env::var_os("REMU_TRACE_SHARED_EVENT_DRAWS")
+            .is_some_and(|value| value == "1")
+            || std::env::var_os("REMU_SHARED_EVENT_DRAW_OVERLAPS")
+                .is_some_and(|value| value == "1");
+        if trace_draws {
             static TRACES: AtomicUsize = AtomicUsize::new(0);
             let sequence = TRACES.fetch_add(1, Ordering::Relaxed) + 1;
             if sequence <= 16 || sequence.is_power_of_two() {
