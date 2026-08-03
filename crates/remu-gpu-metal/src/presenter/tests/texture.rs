@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
-    foreign_types::ForeignTypeRef,
     CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
     MTLTextureUsage, RenderPassDescriptor, Texture, TextureDescriptor,
@@ -74,6 +73,7 @@ fn upload_test_image_textures(
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
         ResidentTextureActivityStamp::default(),
+        &[],
     )
     .expect("test image bindings upload")
     .into_iter()

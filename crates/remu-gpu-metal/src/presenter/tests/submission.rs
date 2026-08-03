@@ -5726,6 +5726,7 @@ fn install_empty_shared_event_dependency(
         guest_write_range_count: 0,
         memory_write_count: 0,
         global_versions: Vec::new(),
+        resident_texture_versions: Vec::new(),
         unresolved_write_ranges: Vec::new(),
         pending_write_footprint: Vec::new(),
         footprint_complete: true,
