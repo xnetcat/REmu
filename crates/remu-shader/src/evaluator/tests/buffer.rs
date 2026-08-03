@@ -535,3 +535,198 @@ fn bounds_runtime_vertex_buffers_to_the_draws_referenced_records() {
     assert_eq!(evaluation.global_memory_bindings.len(), 1);
     assert_eq!(evaluation.global_memory_bindings[0].data.len(), 96);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Workstream Q1: SCRATCH spills, the full GLOBAL atomic set, and benign mode-control opcodes must
+// all evaluate through resource discovery instead of dropping the whole shader.
+// ---------------------------------------------------------------------------------------------
+
+fn scratch_control() -> InstructionControl {
+    // SCRATCH addresses private per-lane spill memory; there is no guest scalar base to resolve,
+    // so `decode_global_memory` records `scalar_address: None` for the segment.
+    InstructionControl::GlobalMemory(GlobalMemoryControl {
+        dword_count: 1,
+        vector_address: 0,
+        vector_data: 1,
+        vector_destination: 2,
+        scalar_address: None,
+        offset_bytes: 0,
+        dlc: false,
+        lds: false,
+        glc: false,
+        slc: false,
+    })
+}
+
+#[test]
+fn a_scratch_spill_reload_creates_no_binding_and_keeps_the_shader() {
+    // A register spill (ScratchStore) and reload (ScratchLoad) touch private scratch, not a guest
+    // resource. Previously the FLAT decoder rejected the segment outright and the whole shader was
+    // dropped; now the pair evaluates and contributes no global binding.
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Flat,
+                "ScratchStoreDword",
+                vec![Operand::vector(0), Operand::vector(1)],
+                Vec::new(),
+                Some(scratch_control()),
+            ),
+            instruction(
+                8,
+                ShaderEncoding::Flat,
+                "ScratchLoadDword",
+                vec![Operand::vector(0)],
+                vec![Operand::vector(2)],
+                Some(scratch_control()),
+            ),
+            end(16),
+        ],
+        vec![0; 8],
+    );
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("a scratch spill must not drop the shader");
+
+    assert!(
+        evaluation.global_memory_bindings.is_empty(),
+        "scratch is private memory and binds no guest resource"
+    );
+}
+
+#[test]
+fn the_full_global_atomic_set_resolves_a_writable_binding() {
+    let base = 0x2000_u64;
+    for opcode in [
+        "GlobalAtomicSwap",
+        "GlobalAtomicCmpswap",
+        "GlobalAtomicSub",
+        "GlobalAtomicSmin",
+        "GlobalAtomicUmin",
+        "GlobalAtomicSmax",
+        "GlobalAtomicUmax",
+        "GlobalAtomicAnd",
+        "GlobalAtomicOr",
+        "GlobalAtomicXor",
+        "GlobalAtomicInc",
+        "GlobalAtomicDec",
+    ] {
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Flat,
+                    opcode,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        vector_destination: 0,
+                        scalar_address: Some(12),
+                        offset_bytes: 0,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                    })),
+                ),
+                end(8),
+            ],
+            {
+                let mut user_data = vec![0; 14];
+                user_data[12] = u32::try_from(base & u64::from(u32::MAX)).unwrap();
+                user_data[13] = u32::try_from(base >> 32).unwrap();
+                user_data
+            },
+        );
+
+        let mut memory = TestMemory::default();
+        memory.write(base, &[0; 64]);
+        let evaluation = evaluate_shader(
+            &memory,
+            &shader,
+            EvaluationOptions {
+                maximum_binding_bytes: 64,
+                ..EvaluationOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{opcode} must resolve a writable binding: {error}"));
+
+        assert_eq!(evaluation.global_memory_bindings.len(), 1, "{opcode}");
+        let binding = &evaluation.global_memory_bindings[0];
+        assert_eq!(binding.base_address, base, "{opcode}");
+        assert!(binding.writable, "{opcode} binds writable guest memory");
+        assert!(binding.write_back_to_guest, "{opcode}");
+    }
+}
+
+#[test]
+fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
+    // S_DENORM_MODE / S_ROUND_MODE toggle FP mode; S_SETREG writes an opaque HW register and must
+    // not clobber the SGPR the decoder parked in its destination slot; S_GETREG reads an opaque HW
+    // register, resolved to a conservative zero.
+    let mut user_data = vec![0; 8];
+    user_data[5] = 0xdead_beef;
+    user_data[6] = 0x1234_5678;
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sopp,
+                "SDenormMode",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sopp,
+                "SRoundMode",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            instruction(
+                8,
+                ShaderEncoding::Sopk,
+                "SGetregB32",
+                Vec::new(),
+                vec![Operand::scalar(5)],
+                None,
+            ),
+            instruction(
+                12,
+                ShaderEncoding::Sopk,
+                "SSetregB32",
+                vec![Operand::scalar(6)],
+                vec![Operand::scalar(6)],
+                None,
+            ),
+            end(16),
+        ],
+        user_data,
+    );
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("benign mode-control and hwreg opcodes must not drop the shader");
+
+    assert_eq!(
+        evaluation.scalar_registers[5], 0,
+        "S_GETREG resolves to a conservative zero"
+    );
+    assert_eq!(
+        evaluation.scalar_registers[6], 0x1234_5678,
+        "S_SETREG must not clobber its data-source SGPR"
+    );
+}

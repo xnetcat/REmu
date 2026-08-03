@@ -1043,3 +1043,224 @@ fn decodes_clean_room_ps5_extension_regression_envelopes() {
     assert_eq!(vop3.instructions[0].sources.len(), 3);
     assert_eq!(vop3.instructions[1].pc, 8);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Workstream Q1: FLAT scratch + full GLOBAL/FLAT atomics; benign mode-control scalar opcodes.
+// Workstream Q2: the full GFX10 IMAGE_SAMPLE/GATHER4 lattice.
+// ---------------------------------------------------------------------------------------------
+
+/// The load/store OP numbers shared by the FLAT, SCRATCH and GLOBAL segments, with the name each
+/// segment gives them. `decode_flat` must resolve all three — a single spilled register (SCRATCH)
+/// or flat-addressed access previously abandoned the whole shader.
+const FLAT_SHARED_LOAD_STORE: &[(u32, &str, &str, &str)] = &[
+    (0x08, "FlatLoadUbyte", "ScratchLoadUbyte", "GlobalLoadUbyte"),
+    (0x0c, "FlatLoadDword", "ScratchLoadDword", "GlobalLoadDword"),
+    (0x0d, "FlatLoadDwordx2", "ScratchLoadDwordx2", "GlobalLoadDwordx2"),
+    (0x0e, "FlatLoadDwordx4", "ScratchLoadDwordx4", "GlobalLoadDwordx4"),
+    (0x0f, "FlatLoadDwordx3", "ScratchLoadDwordx3", "GlobalLoadDwordx3"),
+    (0x1c, "FlatStoreDword", "ScratchStoreDword", "GlobalStoreDword"),
+    (0x1d, "FlatStoreDwordx2", "ScratchStoreDwordx2", "GlobalStoreDwordx2"),
+    (0x24, "FlatLoadShortD16", "ScratchLoadShortD16", "GlobalLoadShortD16"),
+];
+
+fn flat_word(opcode: u32, segment: u32) -> u32 {
+    0xdc00_0000 | (opcode << 18) | (segment << 14)
+}
+
+#[test]
+fn decodes_flat_scratch_and_global_load_store_across_all_three_segments() {
+    // word1: VADDR=1, VDATA=16, SADDR=NULL(0x7f), VDST=32.
+    let extra = 1 | (16 << 8) | (0x7f << 16) | (32 << 24);
+    for &(opcode, flat, scratch, global) in FLAT_SHARED_LOAD_STORE {
+        for (segment, expected) in [(0, flat), (1, scratch), (2, global)] {
+            let word = flat_word(opcode, segment);
+            let frame = decode_frame(0, &[word, extra]).expect("FLAT-family frame");
+            assert_eq!(frame.encoding, ShaderEncoding::Flat);
+            assert!(
+                frame.opcode.is(expected),
+                "segment {segment} opcode 0x{opcode:02X} decoded as {:?}",
+                frame.opcode
+            );
+            assert_eq!(frame.dwords, 2);
+        }
+    }
+}
+
+/// The integer atomic block exists for FLAT and GLOBAL, mirroring the MUBUF numbering already in
+/// the decoder. Only `GlobalAtomicAdd`/`GlobalAtomicUMax` decoded before, so a `GlobalAtomicSwap`
+/// or `GlobalAtomicCmpswap` used to abandon the shader.
+const FLAT_ATOMICS: &[(u32, &str, &str)] = &[
+    (0x30, "FlatAtomicSwap", "GlobalAtomicSwap"),
+    (0x31, "FlatAtomicCmpswap", "GlobalAtomicCmpswap"),
+    (0x32, "FlatAtomicAdd", "GlobalAtomicAdd"),
+    (0x33, "FlatAtomicSub", "GlobalAtomicSub"),
+    (0x35, "FlatAtomicSmin", "GlobalAtomicSmin"),
+    (0x36, "FlatAtomicUmin", "GlobalAtomicUmin"),
+    (0x37, "FlatAtomicSmax", "GlobalAtomicSmax"),
+    (0x38, "FlatAtomicUmax", "GlobalAtomicUmax"),
+    (0x39, "FlatAtomicAnd", "GlobalAtomicAnd"),
+    (0x3a, "FlatAtomicOr", "GlobalAtomicOr"),
+    (0x3b, "FlatAtomicXor", "GlobalAtomicXor"),
+    (0x3c, "FlatAtomicInc", "GlobalAtomicInc"),
+    (0x3d, "FlatAtomicDec", "GlobalAtomicDec"),
+];
+
+#[test]
+fn decodes_the_full_flat_and_global_integer_atomic_block() {
+    let extra = 1 | (16 << 8) | (0x7f << 16) | (32 << 24);
+    for &(opcode, flat, global) in FLAT_ATOMICS {
+        for (segment, expected) in [(0, flat), (2, global)] {
+            let word = flat_word(opcode, segment);
+            let frame = decode_frame(0, &[word, extra]).expect("FLAT/GLOBAL atomic frame");
+            assert!(
+                frame.opcode.is(expected),
+                "segment {segment} atomic 0x{opcode:02X} decoded as {:?}",
+                frame.opcode
+            );
+        }
+    }
+}
+
+#[test]
+fn a_global_atomic_returns_to_its_vdst_only_when_glc_requests_it() {
+    let extra = 1 | (16 << 8) | (12 << 16) | (7 << 24);
+    // GLC (bit 16) set: GLOBAL_ATOMIC_ADD returns the pre-op value to VDST.
+    let word = flat_word(0x32, 2) | (1 << 16);
+    let instruction = create_instruction(
+        0,
+        ShaderEncoding::Flat,
+        Opcode::Known("GlobalAtomicAdd"),
+        vec![word, extra],
+    );
+    assert_eq!(instruction.destinations, [Operand::vector(7)]);
+    // GLC clear: no return value written back.
+    let word = flat_word(0x32, 2);
+    let instruction = create_instruction(
+        0,
+        ShaderEncoding::Flat,
+        Opcode::Known("GlobalAtomicAdd"),
+        vec![word, extra],
+    );
+    assert!(instruction.destinations.is_empty());
+}
+
+#[test]
+fn scratch_segment_has_no_atomic_encodings_and_stays_loud() {
+    // SCRATCH (segment 1) shares the load/store numbers but has no atomic block; an atomic OP in
+    // that segment is genuinely undefined and must remain a loud UnknownOpcode, not a fabrication.
+    let word = flat_word(0x32, 1);
+    assert!(matches!(
+        decode_frame(0, &[word, 0]),
+        Err(DecodeError::UnknownOpcode {
+            encoding: ShaderEncoding::Flat,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn reserved_flat_segment_three_is_still_rejected() {
+    let word = flat_word(0x0c, 3);
+    assert!(matches!(
+        decode_frame(0, &[word, 0]),
+        Err(DecodeError::FlatSegment { segment: 3, .. })
+    ));
+}
+
+#[test]
+fn decodes_benign_mode_control_and_wait_sopp_opcodes() {
+    // These carry no operands that resource discovery models. Decoding them keeps a shader that
+    // merely toggled rounding/denormal mode or slept alive instead of dropping the draw.
+    const BENIGN_SOPP: &[(u32, &str)] = &[
+        (0x03, "SWakeup"),
+        (0x0d, "SSethalt"),
+        (0x0e, "SSleep"),
+        (0x0f, "SSetprio"),
+        (0x11, "SSendmsghalt"),
+        (0x13, "SIcacheInv"),
+        (0x14, "SIncperflevel"),
+        (0x15, "SDecperflevel"),
+        (0x22, "SWaitIdle"),
+        (0x24, "SRoundMode"),
+        (0x25, "SDenormMode"),
+    ];
+    for &(opcode, name) in BENIGN_SOPP {
+        let word = 0xbf80_0000 | (opcode << 16);
+        let frame = decode_frame(0, &[word]).expect("benign SOPP frame");
+        assert_eq!(frame.encoding, ShaderEncoding::Sopp);
+        assert!(
+            frame.opcode.is(name),
+            "SOPP 0x{opcode:02X} decoded as {:?}",
+            frame.opcode
+        );
+        assert_eq!(frame.dwords, 1);
+    }
+}
+
+#[test]
+fn decodes_hardware_register_sopk_opcodes_including_the_immediate_form() {
+    // S_GETREG_B32 / S_SETREG_B32 are single dword; S_SETREG_IMM32_B32 carries a trailing literal
+    // and must frame as two dwords or every following instruction decodes at the wrong address.
+    for (opcode, name, dwords) in [
+        (0x11u32, "SGetregB32", 1usize),
+        (0x12, "SSetregB32", 1),
+        (0x13, "SSetregImm32B32", 2),
+    ] {
+        let word = 0xb000_0000 | (opcode << 23);
+        let frame = decode_frame(0, &[word, 0xdead_beef]).expect("SOPK hwreg frame");
+        assert_eq!(frame.encoding, ShaderEncoding::Sopk);
+        assert!(
+            frame.opcode.is(name),
+            "SOPK 0x{opcode:02X} decoded as {:?}",
+            frame.opcode
+        );
+        assert_eq!(frame.dwords, dwords, "{name} dword span");
+        let mut words = vec![word];
+        if dwords == 2 {
+            words.push(0xdead_beef); // the S_SETREG_IMM32_B32 literal
+        }
+        words.push(0xbf81_0000); // s_endpgm at pc dwords*4
+        let program = decode_program(0x1000, &words).expect("hwreg program terminates cleanly");
+        assert!(program.instructions[0].opcode.is(name));
+        assert_eq!(program.instructions[1].opcode, Opcode::END_PROGRAM);
+        assert_eq!(program.instructions[1].pc as usize, dwords * 4);
+    }
+}
+
+/// The GFX10 IMAGE_SAMPLE/GATHER4 modifier lattice. Real pixel shaders lean on the comparison
+/// (…C…, shadow), clamp, bias and gradient variants; only a sparse subset decoded before, so the
+/// rest framed as raw MIMG opcodes and dropped the draw at translation.
+#[test]
+fn decodes_the_full_gfx10_image_sample_gather_lattice() {
+    const SAMPLES: &[(u32, &str)] = &[
+        (0x20, "ImageSample"),
+        (0x21, "ImageSampleCl"),
+        (0x23, "ImageSampleDCl"),
+        (0x26, "ImageSampleBCl"),
+        (0x28, "ImageSampleC"),
+        (0x29, "ImageSampleCCl"),
+        (0x2a, "ImageSampleCD"),
+        (0x2c, "ImageSampleCL"),
+        (0x2d, "ImageSampleCB"),
+        (0x2f, "ImageSampleCLz"),
+        (0x38, "ImageSampleCO"),
+        (0x3f, "ImageSampleCLzO"),
+        (0x41, "ImageGather4Cl"),
+        (0x48, "ImageGather4C"),
+        (0x4f, "ImageGather4CLz"),
+        (0x60, "ImageGetLod"),
+        (0x68, "ImageSampleCd"),
+        (0x6b, "ImageSampleCCdCl"),
+    ];
+    for &(opcode, name) in SAMPLES {
+        assert_eq!(opcode >> 7, 0, "lattice opcode fits OP[6:0]");
+        let word = 0xf000_0000 | (opcode << 18);
+        let frame = decode_frame(0, &[word, 0]).expect("MIMG sample frame");
+        assert_eq!(frame.encoding, ShaderEncoding::Mimg);
+        assert!(
+            frame.opcode.is(name),
+            "MIMG 0x{opcode:02X} decoded as {:?}",
+            frame.opcode
+        );
+    }
+}

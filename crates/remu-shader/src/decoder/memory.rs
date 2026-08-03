@@ -157,43 +157,106 @@ pub(crate) fn decode_mubuf(word: u32, extra: u32) -> Frame {
 }
 
 pub(crate) fn decode_flat(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+    // The FLAT major encoding covers three address segments selected by SEG[15:14]: FLAT (0),
+    // SCRATCH (1) and GLOBAL (2). All three share the OP[24:18] load/store numbering; FLAT and
+    // GLOBAL additionally carry the atomic block. Decoding only GLOBAL made a single spilled
+    // register (SCRATCH) or a flat-addressed access abandon the whole shader. SDK cross-check:
+    // s_scratch_load_dword / scratch_load_dword and global_atomic_* mnemonics are present in the
+    // Prospero disassembler (sdk/host_tools/bin/libSceShaderIsaP.dll); OP numbers follow the
+    // public RDNA2 (GFX10) FLAT ISA, consistent with the MUBUF atomic block already decoded here.
     let segment = (word >> 14) & 0x3;
     let code = (word >> 18) & 0x7f;
-    if segment != 2 {
-        return Err(DecodeError::FlatSegment {
-            pc,
-            segment,
-            opcode: code,
-        });
-    }
-    let name = match code {
-        0x08 => Some("GlobalLoadUbyte"),
-        0x09 => Some("GlobalLoadSbyte"),
-        0x0a => Some("GlobalLoadUshort"),
-        0x0b => Some("GlobalLoadSshort"),
-        0x0c => Some("GlobalLoadDword"),
-        0x0d => Some("GlobalLoadDwordx2"),
-        0x0e => Some("GlobalLoadDwordx4"),
-        0x0f => Some("GlobalLoadDwordx3"),
-        0x18 => Some("GlobalStoreByte"),
-        0x19 => Some("GlobalStoreByteD16Hi"),
-        0x1a => Some("GlobalStoreShort"),
-        0x1b => Some("GlobalStoreShortD16Hi"),
-        0x1c => Some("GlobalStoreDword"),
-        0x1d => Some("GlobalStoreDwordx2"),
-        0x1e => Some("GlobalStoreDwordx4"),
-        0x1f => Some("GlobalStoreDwordx3"),
-        0x20 => Some("GlobalLoadUbyteD16"),
-        0x21 => Some("GlobalLoadUbyteD16Hi"),
-        0x22 => Some("GlobalLoadSbyteD16"),
-        0x23 => Some("GlobalLoadSbyteD16Hi"),
-        0x24 => Some("GlobalLoadShortD16"),
-        0x25 => Some("GlobalLoadShortD16Hi"),
-        0x32 => Some("GlobalAtomicAdd"),
-        0x38 => Some("GlobalAtomicUMax"),
-        _ => None,
+    let (prefix, allow_atomic) = match segment {
+        0 => ("Flat", true),
+        1 => ("Scratch", false),
+        2 => ("Global", true),
+        _ => {
+            return Err(DecodeError::FlatSegment {
+                pc,
+                segment,
+                opcode: code,
+            });
+        }
     };
+    let name = flat_memory_op_name(code, prefix, allow_atomic);
     known_frame(pc, word, ShaderEncoding::Flat, code, name, 2)
+}
+
+/// Names one FLAT/GLOBAL/SCRATCH load/store/atomic opcode.
+///
+/// The load and store numbering is shared across all three segments; atomics exist only for FLAT
+/// and GLOBAL. The name keeps a segment-specific prefix so downstream lowering can distinguish
+/// per-lane FLAT addressing, private SCRATCH and 64-bit GLOBAL addressing.
+fn flat_memory_op_name(code: u32, prefix: &str, allow_atomic: bool) -> Option<&'static str> {
+    // Each arm lists the three segment names in FLAT/SCRATCH/GLOBAL order; the SCRATCH column for
+    // an atomic code is unreachable (atomics are gated off for SCRATCH) but keeps the table square.
+    macro_rules! seg {
+        ($flat:literal, $scratch:literal, $global:literal) => {
+            Some(match prefix {
+                "Flat" => $flat,
+                "Scratch" => $scratch,
+                _ => $global,
+            })
+        };
+    }
+    match code {
+        0x08 => seg!("FlatLoadUbyte", "ScratchLoadUbyte", "GlobalLoadUbyte"),
+        0x09 => seg!("FlatLoadSbyte", "ScratchLoadSbyte", "GlobalLoadSbyte"),
+        0x0a => seg!("FlatLoadUshort", "ScratchLoadUshort", "GlobalLoadUshort"),
+        0x0b => seg!("FlatLoadSshort", "ScratchLoadSshort", "GlobalLoadSshort"),
+        0x0c => seg!("FlatLoadDword", "ScratchLoadDword", "GlobalLoadDword"),
+        0x0d => seg!("FlatLoadDwordx2", "ScratchLoadDwordx2", "GlobalLoadDwordx2"),
+        0x0e => seg!("FlatLoadDwordx4", "ScratchLoadDwordx4", "GlobalLoadDwordx4"),
+        0x0f => seg!("FlatLoadDwordx3", "ScratchLoadDwordx3", "GlobalLoadDwordx3"),
+        0x18 => seg!("FlatStoreByte", "ScratchStoreByte", "GlobalStoreByte"),
+        0x19 => seg!(
+            "FlatStoreByteD16Hi",
+            "ScratchStoreByteD16Hi",
+            "GlobalStoreByteD16Hi"
+        ),
+        0x1a => seg!("FlatStoreShort", "ScratchStoreShort", "GlobalStoreShort"),
+        0x1b => seg!(
+            "FlatStoreShortD16Hi",
+            "ScratchStoreShortD16Hi",
+            "GlobalStoreShortD16Hi"
+        ),
+        0x1c => seg!("FlatStoreDword", "ScratchStoreDword", "GlobalStoreDword"),
+        0x1d => seg!("FlatStoreDwordx2", "ScratchStoreDwordx2", "GlobalStoreDwordx2"),
+        0x1e => seg!("FlatStoreDwordx4", "ScratchStoreDwordx4", "GlobalStoreDwordx4"),
+        0x1f => seg!("FlatStoreDwordx3", "ScratchStoreDwordx3", "GlobalStoreDwordx3"),
+        0x20 => seg!("FlatLoadUbyteD16", "ScratchLoadUbyteD16", "GlobalLoadUbyteD16"),
+        0x21 => seg!(
+            "FlatLoadUbyteD16Hi",
+            "ScratchLoadUbyteD16Hi",
+            "GlobalLoadUbyteD16Hi"
+        ),
+        0x22 => seg!("FlatLoadSbyteD16", "ScratchLoadSbyteD16", "GlobalLoadSbyteD16"),
+        0x23 => seg!(
+            "FlatLoadSbyteD16Hi",
+            "ScratchLoadSbyteD16Hi",
+            "GlobalLoadSbyteD16Hi"
+        ),
+        0x24 => seg!("FlatLoadShortD16", "ScratchLoadShortD16", "GlobalLoadShortD16"),
+        0x25 => seg!(
+            "FlatLoadShortD16Hi",
+            "ScratchLoadShortD16Hi",
+            "GlobalLoadShortD16Hi"
+        ),
+        0x30 if allow_atomic => seg!("FlatAtomicSwap", "", "GlobalAtomicSwap"),
+        0x31 if allow_atomic => seg!("FlatAtomicCmpswap", "", "GlobalAtomicCmpswap"),
+        0x32 if allow_atomic => seg!("FlatAtomicAdd", "", "GlobalAtomicAdd"),
+        0x33 if allow_atomic => seg!("FlatAtomicSub", "", "GlobalAtomicSub"),
+        0x35 if allow_atomic => seg!("FlatAtomicSmin", "", "GlobalAtomicSmin"),
+        0x36 if allow_atomic => seg!("FlatAtomicUmin", "", "GlobalAtomicUmin"),
+        0x37 if allow_atomic => seg!("FlatAtomicSmax", "", "GlobalAtomicSmax"),
+        0x38 if allow_atomic => seg!("FlatAtomicUmax", "", "GlobalAtomicUmax"),
+        0x39 if allow_atomic => seg!("FlatAtomicAnd", "", "GlobalAtomicAnd"),
+        0x3a if allow_atomic => seg!("FlatAtomicOr", "", "GlobalAtomicOr"),
+        0x3b if allow_atomic => seg!("FlatAtomicXor", "", "GlobalAtomicXor"),
+        0x3c if allow_atomic => seg!("FlatAtomicInc", "", "GlobalAtomicInc"),
+        0x3d if allow_atomic => seg!("FlatAtomicDec", "", "GlobalAtomicDec"),
+        _ => None,
+    }
 }
 
 pub(crate) fn decode_mimg(word: u32) -> Frame {
@@ -221,21 +284,71 @@ pub(crate) fn decode_mimg(word: u32) -> Frame {
         0x1a => Some("ImageAtomicXor"),
         0x1b => Some("ImageAtomicInc"),
         0x1c => Some("ImageAtomicDec"),
+        // IMAGE_SAMPLE* block (OP 0x20-0x3f) — the CL/D/L/B/C/O modifier lattice. Real pixel
+        // shaders lean on the comparison (…C…, shadow lookups) and clamp/bias/gradient variants;
+        // decoding only a sparse subset abandoned the whole shader on the rest. SDK cross-check:
+        // the image_sample_* / image_gather4_* / image_get_lod mnemonics are present in the
+        // Prospero disassembler (libSceShaderIsaP.dll); OP numbers are the public RDNA2 (GFX10)
+        // MIMG lattice. `decode_image` is opcode-agnostic (address/data counts come from the
+        // encoding and DMASK), so every added name shares its resolution.
         0x20 => Some("ImageSample"),
+        0x21 => Some("ImageSampleCl"),
         0x22 => Some("ImageSampleD"),
+        0x23 => Some("ImageSampleDCl"),
         0x24 => Some("ImageSampleL"),
         0x25 => Some("ImageSampleB"),
+        0x26 => Some("ImageSampleBCl"),
         0x27 => Some("ImageSampleLz"),
+        0x28 => Some("ImageSampleC"),
+        0x29 => Some("ImageSampleCCl"),
+        0x2a => Some("ImageSampleCD"),
+        0x2b => Some("ImageSampleCDCl"),
+        0x2c => Some("ImageSampleCL"),
+        0x2d => Some("ImageSampleCB"),
+        0x2e => Some("ImageSampleCBCl"),
         0x2f => Some("ImageSampleCLz"),
         0x30 => Some("ImageSampleO"),
+        0x31 => Some("ImageSampleClO"),
+        0x32 => Some("ImageSampleDO"),
+        0x33 => Some("ImageSampleDClO"),
         0x34 => Some("ImageSampleLO"),
+        0x35 => Some("ImageSampleBO"),
+        0x36 => Some("ImageSampleBClO"),
         0x37 => Some("ImageSampleLzO"),
+        0x38 => Some("ImageSampleCO"),
+        0x39 => Some("ImageSampleCClO"),
+        0x3a => Some("ImageSampleCDO"),
+        0x3b => Some("ImageSampleCDClO"),
+        0x3c => Some("ImageSampleCLO"),
+        0x3d => Some("ImageSampleCBO"),
+        0x3e => Some("ImageSampleCBClO"),
+        0x3f => Some("ImageSampleCLzO"),
         0x40 => Some("ImageGather4"),
+        0x41 => Some("ImageGather4Cl"),
+        0x44 => Some("ImageGather4L"),
+        0x45 => Some("ImageGather4B"),
+        0x46 => Some("ImageGather4BCl"),
         0x47 => Some("ImageGather4Lz"),
         0x48 => Some("ImageGather4C"),
+        0x49 => Some("ImageGather4CCl"),
+        0x4c => Some("ImageGather4CL"),
+        0x4d => Some("ImageGather4CB"),
         0x4e => Some("ImageGather4CBCl"),
+        0x4f => Some("ImageGather4CLz"),
+        0x50 => Some("ImageGather4O"),
+        0x51 => Some("ImageGather4ClO"),
         0x57 => Some("ImageGather4LzO"),
+        0x58 => Some("ImageGather4CO"),
         0x5f => Some("ImageGather4CLzO"),
+        0x60 => Some("ImageGetLod"),
+        0x68 => Some("ImageSampleCd"),
+        0x69 => Some("ImageSampleCdCl"),
+        0x6a => Some("ImageSampleCCd"),
+        0x6b => Some("ImageSampleCCdCl"),
+        0x6c => Some("ImageSampleCdO"),
+        0x6d => Some("ImageSampleCdClO"),
+        0x6e => Some("ImageSampleCCdO"),
+        0x6f => Some("ImageSampleCCdClO"),
         _ => None,
     };
     Frame {
@@ -309,10 +422,16 @@ pub(crate) fn decode_global_memory(
     sources: &mut Vec<Operand>,
     destinations: &mut Vec<Operand>,
 ) -> InstructionControl {
+    let is_global = opcode.starts_with("Global");
     let vector_address = extra & 0xff;
     let vector_data = (extra >> 8) & 0xff;
     let scalar_address_field = (extra >> 16) & 0x7f;
-    let scalar_address = (scalar_address_field != 0x7f).then_some(scalar_address_field);
+    // Only GLOBAL's SADDR names a guest base that resource discovery resolves. FLAT addressing is
+    // supplied entirely per lane through a 64-bit VGPR pair (SADDR is always NULL), and SCRATCH's
+    // SADDR is a private-memory offset, not a guest pointer — modelling either as a scalar base
+    // would fabricate a binding for a spill or a flat access.
+    let scalar_address =
+        (is_global && scalar_address_field != 0x7f).then_some(scalar_address_field);
     let vector_destination = extra >> 24;
     let dword_count = memory_dword_count(opcode);
     sources.push(Operand::vector(vector_address));
@@ -321,14 +440,16 @@ pub(crate) fn decode_global_memory(
     } else {
         sources.push(Operand::vector(vector_address.saturating_add(1)));
     }
-    let lds = word >> 13 & 1 != 0;
-    if opcode.starts_with("GlobalLoad") {
+    // Direct-to-LDS is a GLOBAL-only modifier; the same bit position is SVE (scratch VGPR enable)
+    // for SCRATCH and reserved for FLAT, so gate it to GLOBAL to keep load destinations intact.
+    let lds = is_global && word >> 13 & 1 != 0;
+    if opcode.contains("Load") {
         if !lds {
             push_vector_range(destinations, vector_destination, dword_count);
         }
     } else {
         push_vector_range(sources, vector_data, dword_count);
-        if opcode.starts_with("GlobalAtomic") && word >> 16 & 1 != 0 {
+        if opcode.contains("Atomic") && word >> 16 & 1 != 0 {
             destinations.push(Operand::vector(vector_destination));
         }
     }
