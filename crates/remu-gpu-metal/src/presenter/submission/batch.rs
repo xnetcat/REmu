@@ -9,7 +9,10 @@ use super::super::shared_event::{
     SharedEventBatchTerminalState, SharedEventFence, SharedEventProducerId,
     terminal_shared_event_advance,
 };
-use super::super::{FlushPolicy, GuestQueueBatchState, PresenterStatistics};
+use super::super::{
+    FlushPolicy, GuestQueueBatchState, PresenterStatistics, TerminalPublicationPhase,
+    TerminalPublicationTimer,
+};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter, OrderedEventSource,
@@ -653,8 +656,15 @@ impl MetalPresenter {
                         .committed_batches
                         .pop_front()
                         .expect("terminal front exists");
-                    let execution_error = (batch.command_buffer.status()
-                        == MTLCommandBufferStatus::Error)
+                    let mut timer = TerminalPublicationTimer::start_if(
+                        self.terminal_publication_timing,
+                    );
+                    let terminal_status = batch.command_buffer.status();
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::MetalTerminal,
+                    );
+                    let execution_error = (terminal_status == MTLCommandBufferStatus::Error)
                         .then(|| {
                             command_buffer_failure_message(
                                 &format!(
@@ -665,10 +675,12 @@ impl MetalPresenter {
                                 &batch.command_buffer,
                             )
                         });
-                    let result = self.finish_terminal_guest_batch(&batch, execution_error);
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    self.publish_guest_batch_completion(&batch);
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::TerminalMetadata,
+                    );
+                    let result =
+                        self.complete_terminal_guest_batch(&batch, execution_error, timer);
                     if let Err(error) = result {
                         eprintln!(
                             "[REMu][METAL] queue {queue_id} guest batch finalization failed: {error}"
@@ -688,10 +700,22 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
-                    let result = self.finish_terminal_guest_batch(&batch, None);
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    self.publish_guest_batch_completion(&batch);
+                    let mut timer = TerminalPublicationTimer::start_if(
+                        self.terminal_publication_timing,
+                    );
+                    let terminal_status = (cfg!(debug_assertions)
+                        || self.terminal_publication_timing)
+                        .then(|| batch.command_buffer.status());
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::MetalTerminal,
+                    );
+                    debug_assert_eq!(terminal_status, Some(MTLCommandBufferStatus::Completed));
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::TerminalMetadata,
+                    );
+                    let result = self.complete_terminal_guest_batch(&batch, None, timer);
                     if let Err(error) = result {
                         eprintln!(
                             "[REMu][METAL] completed guest batch finalization failed: {error}"
@@ -703,6 +727,17 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
+                    let mut timer = TerminalPublicationTimer::start_if(
+                        self.terminal_publication_timing,
+                    );
+                    let terminal_status = (cfg!(debug_assertions)
+                        || self.terminal_publication_timing)
+                        .then(|| batch.command_buffer.status());
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::MetalTerminal,
+                    );
+                    debug_assert_eq!(terminal_status, Some(MTLCommandBufferStatus::Error));
                     let execution_error = command_buffer_failure_message(
                         &format!(
                             "Metal guest command batch [{}]",
@@ -710,13 +745,15 @@ impl MetalPresenter {
                         ),
                         &batch.command_buffer,
                     );
-                    let result = self.finish_terminal_guest_batch(&batch, Some(execution_error));
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::TerminalMetadata,
+                    );
+                    let result =
+                        self.complete_terminal_guest_batch(&batch, Some(execution_error), timer);
                     // A terminal native failure cannot be retried in-place. Publish both its
                     // ordered CPU labels and submission ID after reporting the error so the guest
                     // observes one failed queue item instead of a producerless 120-second wait.
-                    self.publish_guest_batch_completion(&batch);
                     if let Err(error) = result {
                         eprintln!("[REMu][METAL] {error}");
                     }
@@ -730,36 +767,45 @@ impl MetalPresenter {
         &mut self,
         batch: &GuestCommandBatch,
         execution_error: Option<String>,
+        timer: &mut TerminalPublicationTimer,
     ) -> Result<(), String> {
         let execution_succeeded = execution_error.is_none();
         let mut result = execution_error.map_or(Ok(()), Err);
-        if !execution_succeeded
-            && let (Some(queue_id), Some(maximum_fence)) =
-                (batch.queue_id, batch.max_encoded_signal)
-        {
-            let producer = SharedEventProducerId::new(queue_id);
-            let state = self
-                .guest_queue_batches
-                .get_mut(&queue_id)
-                .ok_or_else(|| format!("missing terminal guest queue {queue_id}"))?;
-            if let Some(value) = terminal_shared_event_advance(
-                SharedEventBatchTerminalState::Error,
-                producer,
-                state.shared_event_timeline.event().signaled_value(),
-                Some(maximum_fence),
-            )
-            .map_err(|error| error.to_string())?
+        let error_fence_advance = (|| {
+            if !execution_succeeded
+                && let (Some(queue_id), Some(maximum_fence)) =
+                    (batch.queue_id, batch.max_encoded_signal)
             {
-                state
-                    .shared_event_timeline
-                    .event()
-                    .set_signaled_value(value);
-                self.statistics.shared_event_error_advances = self
-                    .statistics
-                    .shared_event_error_advances
-                    .saturating_add(1);
+                let producer = SharedEventProducerId::new(queue_id);
+                let state = self
+                    .guest_queue_batches
+                    .get_mut(&queue_id)
+                    .ok_or_else(|| format!("missing terminal guest queue {queue_id}"))?;
+                if let Some(value) = terminal_shared_event_advance(
+                    SharedEventBatchTerminalState::Error,
+                    producer,
+                    state.shared_event_timeline.event().signaled_value(),
+                    Some(maximum_fence),
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    state
+                        .shared_event_timeline
+                        .event()
+                        .set_signaled_value(value);
+                    self.statistics.shared_event_error_advances = self
+                        .statistics
+                        .shared_event_error_advances
+                        .saturating_add(1);
+                }
             }
-        }
+            Ok::<(), String>(())
+        })();
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::ErrorFenceAdvance,
+        );
+        error_fence_advance?;
         if execution_succeeded {
             let writeback = write_back_pending_globals(&batch.global_writebacks);
             if let Ok(applied) = &writeback {
@@ -767,12 +813,20 @@ impl MetalPresenter {
             }
             result = merge_guest_batch_result(result, "global writeback", writeback.map(|_| ()));
         }
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::GlobalWriteback,
+        );
         // RELEASE_MEM, WRITE_DATA, and DMA fills are command-processor effects ordered after the
         // native work, not shader results. Once the Metal command buffer reaches either terminal
         // state, publish them even when the draw/dispatch or an unrelated global readback failed.
         // This matches the existing policy of retiring the submission after a native error while
         // retaining the error as the primary result.
         let result = self.publish_terminal_guest_memory_writes(&batch.memory_writes, result);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::GuestMemoryWrites,
+        );
         if let (Some(queue_id), Some(maximum_fence)) = (batch.queue_id, batch.max_encoded_signal) {
             let state = self
                 .guest_queue_batches
@@ -781,6 +835,31 @@ impl MetalPresenter {
             state.host_retired_fence_value =
                 state.host_retired_fence_value.max(maximum_fence.value());
         }
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::QueueRetirement,
+        );
+        result
+    }
+
+    fn complete_terminal_guest_batch(
+        &mut self,
+        batch: &GuestCommandBatch,
+        execution_error: Option<String>,
+        mut timer: TerminalPublicationTimer,
+    ) -> Result<(), String> {
+        let result = self.finish_terminal_guest_batch(batch, execution_error, &mut timer);
+        self.statistics.gpu_execution_time +=
+            completed_command_buffer_gpu_duration(&batch.command_buffer);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::GpuTimeQuery,
+        );
+        self.publish_guest_batch_completion(batch);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::CompletionWake,
+        );
         result
     }
 
@@ -1058,6 +1137,8 @@ impl MetalPresenter {
         let Some(batch) = self.committed_guest_batches.pop_front() else {
             return FrontBatchSettlement::Empty;
         };
+        let mut timer =
+            TerminalPublicationTimer::start_if(self.terminal_publication_timing);
         let execution_error = match settle_guest_batch_by(&batch, deadline) {
             GuestBatchSettlement::Completed => None,
             GuestBatchSettlement::Failed(error) => Some(error),
@@ -1066,10 +1147,15 @@ impl MetalPresenter {
                 return FrontBatchSettlement::Pending(error);
             }
         };
-        let result = self.finish_terminal_guest_batch(&batch, execution_error);
-        self.statistics.gpu_execution_time +=
-            completed_command_buffer_gpu_duration(&batch.command_buffer);
-        self.publish_guest_batch_completion(&batch);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::MetalTerminal,
+        );
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::TerminalMetadata,
+        );
+        let result = self.complete_terminal_guest_batch(&batch, execution_error, timer);
         FrontBatchSettlement::Retired(result)
     }
 
@@ -1085,6 +1171,8 @@ impl MetalPresenter {
         else {
             return FrontBatchSettlement::Empty;
         };
+        let mut timer =
+            TerminalPublicationTimer::start_if(self.terminal_publication_timing);
         let execution_error = match settle_guest_batch_by(&batch, deadline) {
             GuestBatchSettlement::Completed => None,
             GuestBatchSettlement::Failed(error) => Some(error),
@@ -1097,10 +1185,15 @@ impl MetalPresenter {
                 return FrontBatchSettlement::Pending(error);
             }
         };
-        let result = self.finish_terminal_guest_batch(&batch, execution_error);
-        self.statistics.gpu_execution_time +=
-            completed_command_buffer_gpu_duration(&batch.command_buffer);
-        self.publish_guest_batch_completion(&batch);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::MetalTerminal,
+        );
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::TerminalMetadata,
+        );
+        let result = self.complete_terminal_guest_batch(&batch, execution_error, timer);
         FrontBatchSettlement::Retired(result)
     }
 

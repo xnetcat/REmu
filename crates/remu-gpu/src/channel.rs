@@ -4,8 +4,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::counters::{
     AUDIO_OUTPUT_FRAMES, AUDIO_UNDERRUN_FRAMES, GPU_COMPLETED_FLIPS,
@@ -58,10 +61,30 @@ struct PublicationGuard {
     finished: bool,
 }
 
+/// Local wall-time attribution for one bounded-channel publication call.
+///
+/// Queue submissions can be split into several bounded chunks. Their FIFO waits and sends are
+/// summed here without publishing counters per chunk; the runtime records one aggregate sample
+/// for the complete guest publication call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GpuEventPublicationTiming {
+    pub setup: Duration,
+    pub queue_fifo_wait: Duration,
+    pub bounded_send: Duration,
+}
+
 static GPU_EVENT_SINK: OnceLock<(Mutex<EventSinkState>, Condvar)> = OnceLock::new();
 static GPU_PUBLICATION_COORDINATOR: OnceLock<(Mutex<PublicationCoordinator>, Condvar)> =
     OnceLock::new();
 static REPORTED_LINEAR_SUBMISSION_CHUNKING: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static GPU_PUBLICATION_TIMING_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+
+fn publication_timing_now() -> Instant {
+    #[cfg(test)]
+    GPU_PUBLICATION_TIMING_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    Instant::now()
+}
 
 struct ActiveEventSender {
     sender: SyncSender<GpuEvent>,
@@ -334,29 +357,61 @@ pub fn emit_event(event: GpuEvent) -> bool {
     emit_event_with_admission(event, || {})
 }
 
+/// Publishes one event and returns bounded-channel phase timing for its complete call.
+pub fn emit_event_with_timing(event: GpuEvent) -> (bool, GpuEventPublicationTiming) {
+    emit_event_with_optional_timing(event, || {}, true)
+}
+
 /// Publishes one event and reports when it has entered its queue-local FIFO.
 ///
 /// The callback runs after the event has been assigned an order within its hardware queue but
 /// before bounded-channel backpressure can block it. A caller which assigned a process-order
 /// ticket may therefore admit the next independent queue without allowing a later submission on
 /// this queue to overtake.
-pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -> bool {
+pub fn emit_event_with_admission(event: GpuEvent, admitted: impl FnOnce()) -> bool {
+    emit_event_with_optional_timing(event, admitted, false).0
+}
+
+/// Publishes one event, reports queue admission, and attributes its bounded-channel phases.
+pub fn emit_event_with_admission_and_timing(
+    event: GpuEvent,
+    admitted: impl FnOnce(),
+) -> (bool, GpuEventPublicationTiming) {
+    emit_event_with_optional_timing(event, admitted, true)
+}
+
+fn emit_event_with_optional_timing(
+    mut event: GpuEvent,
+    admitted: impl FnOnce(),
+    collect_timing: bool,
+) -> (bool, GpuEventPublicationTiming) {
+    let setup_started = collect_timing.then(publication_timing_now);
+    let mut timing = collect_timing.then(GpuEventPublicationTiming::default);
     let Some(sender) = active_event_sender() else {
         admitted();
-        return false;
+        if let (Some(timing), Some(started)) = (timing.as_mut(), setup_started) {
+            timing.setup = started.elapsed();
+        }
+        return (false, timing.unwrap_or_default());
     };
     let mut unpublished_waits = match register_queue_submission_waits(&mut event) {
         Ok(ids) => ids,
         Err(()) => {
             admitted();
+            if let (Some(timing), Some(started)) = (timing.as_mut(), setup_started) {
+                timing.setup = started.elapsed();
+            }
             eprintln!(
                 "[REMu][GPU] rejected queue submission: more than {GPU_WAIT_CAPACITY} memory waits are pending"
             );
-            return false;
+            return (false, timing.unwrap_or_default());
         }
     };
     let mut publication = PublicationGuard::new(&event);
     admitted();
+    if let (Some(timing), Some(started)) = (timing.as_mut(), setup_started) {
+        timing.setup = started.elapsed();
+    }
     let sent = match event {
         GpuEvent::QueueSubmission { queue_id, events }
             if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE =>
@@ -387,11 +442,22 @@ pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -
                     .count();
                 let chunk = GpuEvent::QueueSubmission { queue_id, events };
                 let chunk_waits = registered_wait_ids(&chunk);
+                let fifo_started = collect_timing.then(publication_timing_now);
                 publication.wait_turn();
+                if let (Some(timing), Some(started)) = (timing.as_mut(), fifo_started) {
+                    timing.queue_fifo_wait = timing
+                        .queue_fifo_wait
+                        .saturating_add(started.elapsed());
+                }
                 GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
                 GPU_WORK_ITEMS_PENDING.fetch_add(work_item_count, Ordering::Relaxed);
                 GPU_FLIPS_PENDING.fetch_add(flip_count, Ordering::Relaxed);
+                let send_started = collect_timing.then(publication_timing_now);
                 let chunk_sent = sender.sender.send(chunk).is_ok();
+                if let (Some(timing), Some(started)) = (timing.as_mut(), send_started) {
+                    timing.bounded_send =
+                        timing.bounded_send.saturating_add(started.elapsed());
+                }
                 if !chunk_sent {
                     record_gpu_event_consumed();
                     cancel_pending_gpu_work_items(work_item_count);
@@ -423,11 +489,21 @@ pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -
                 _ => 0,
             };
             let event_waits = registered_wait_ids(&event);
+            let fifo_started = collect_timing.then(publication_timing_now);
             publication.wait_turn();
+            if let (Some(timing), Some(started)) = (timing.as_mut(), fifo_started) {
+                timing.queue_fifo_wait = timing
+                    .queue_fifo_wait
+                    .saturating_add(started.elapsed());
+            }
             GPU_EVENTS_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
             GPU_WORK_ITEMS_PENDING.fetch_add(work_item_count, Ordering::Relaxed);
             GPU_FLIPS_PENDING.fetch_add(flip_count, Ordering::Relaxed);
+            let send_started = collect_timing.then(publication_timing_now);
             let sent = sender.sender.send(event).is_ok();
+            if let (Some(timing), Some(started)) = (timing.as_mut(), send_started) {
+                timing.bounded_send = timing.bounded_send.saturating_add(started.elapsed());
+            }
             if !sent {
                 record_gpu_event_consumed();
                 cancel_pending_gpu_work_items(work_item_count);
@@ -444,9 +520,9 @@ pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancel(&unpublished_waits);
-        false
+        (false, timing.unwrap_or_default())
     } else {
-        true
+        (true, timing.unwrap_or_default())
     }
 }
 
@@ -459,4 +535,34 @@ pub fn acquire_memory(acquire: GpuMemoryAcquire) {
 /// Emits an ordered guest pipeline-stage completion boundary.
 pub fn pipeline_barrier(barrier: GpuPipelineBarrier) {
     emit_event(GpuEvent::PipelineBarrier(barrier));
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::{
+        GPU_PUBLICATION_TIMING_SAMPLES, clear_event_sink, emit_event, emit_event_with_timing,
+        gpu_event_channel, install_event_sink,
+    };
+    use crate::GpuEvent;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn ordinary_emit_path_takes_no_publication_timestamps() {
+        let (sender, receiver) = gpu_event_channel();
+        install_event_sink(sender);
+        let before = GPU_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed);
+        assert!(emit_event(GpuEvent::HideHostDialog { sequence: 1 }));
+        assert_eq!(
+            GPU_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed),
+            before,
+            "the default event path must not sample the monotonic clock"
+        );
+        receiver.recv().expect("untimed event reaches receiver");
+
+        let before = GPU_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed);
+        assert!(emit_event_with_timing(GpuEvent::HideHostDialog { sequence: 2 }).0);
+        assert!(GPU_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed) > before);
+        receiver.recv().expect("timed event reaches receiver");
+        clear_event_sink();
+    }
 }

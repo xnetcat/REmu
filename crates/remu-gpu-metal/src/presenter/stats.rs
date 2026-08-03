@@ -9,6 +9,8 @@ use super::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -17,6 +19,140 @@ pub(super) struct ProcessMemoryStatistics {
     pub(super) resident_bytes: u64,
     pub(super) physical_footprint_bytes: u64,
     pub(super) peak_physical_footprint_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(super) enum TerminalPublicationPhase {
+    MetalTerminal = 0,
+    TerminalMetadata,
+    ErrorFenceAdvance,
+    GlobalWriteback,
+    GuestMemoryWrites,
+    QueueRetirement,
+    GpuTimeQuery,
+    CompletionWake,
+}
+
+const TERMINAL_PUBLICATION_PHASE_COUNT: usize =
+    TerminalPublicationPhase::CompletionWake as usize + 1;
+
+#[cfg(test)]
+static TERMINAL_PUBLICATION_TIMING_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+
+fn terminal_publication_now() -> Instant {
+    #[cfg(test)]
+    TERMINAL_PUBLICATION_TIMING_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    Instant::now()
+}
+
+/// Presenter-local latency aggregate for one truthful terminal-publication phase.
+///
+/// Terminal retirement runs only on the presenter thread. Keeping these counters local avoids an
+/// atomic read/modify/write for every completed Metal batch while retaining exact periodic sums.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct TerminalPublicationLatency {
+    pub(super) count: u64,
+    pub(super) total_ns: u64,
+    pub(super) maximum_ns: u64,
+}
+
+impl TerminalPublicationLatency {
+    fn record(&mut self, duration: Duration) {
+        let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(nanoseconds);
+        self.maximum_ns = self.maximum_ns.max(nanoseconds);
+    }
+
+    pub(super) fn mean_ns(self) -> u64 {
+        self.total_ns.checked_div(self.count).unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct TerminalPublicationStatistics {
+    phases: [TerminalPublicationLatency; TERMINAL_PUBLICATION_PHASE_COUNT],
+}
+
+impl TerminalPublicationStatistics {
+    fn record(&mut self, phase: TerminalPublicationPhase, duration: Duration) {
+        self.phases[phase as usize].record(duration);
+    }
+
+    pub(super) fn phase(self, phase: TerminalPublicationPhase) -> TerminalPublicationLatency {
+        self.phases[phase as usize]
+    }
+
+    /// Takes one periodic sample and resets every phase in the same presenter-thread operation.
+    pub(super) fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+pub(super) fn format_terminal_publication_report(
+    window_ms: u128,
+    sample: TerminalPublicationStatistics,
+) -> [String; 4] {
+    let compact = |phase| {
+        let latency = sample.phase(phase);
+        format!(
+            "{}/{}/{}/{}",
+            latency.count,
+            latency.total_ns,
+            latency.mean_ns(),
+            latency.maximum_ns,
+        )
+    };
+    let completed = sample.phase(TerminalPublicationPhase::CompletionWake).count;
+    [
+        format!(
+            "[REMu][PERF-GPU-PUBLICATION-PHASE] window_ms={window_ms} terminal_calls={completed} values=count/total_ns/mean_ns/max_ns"
+        ),
+        format!(
+            "[REMu][PERF-GPU-PUBLICATION-PHASE] part=terminal metal={} metadata={} error-fence={}",
+            compact(TerminalPublicationPhase::MetalTerminal),
+            compact(TerminalPublicationPhase::TerminalMetadata),
+            compact(TerminalPublicationPhase::ErrorFenceAdvance),
+        ),
+        format!(
+            "[REMu][PERF-GPU-PUBLICATION-PHASE] part=memory globals={} guest-memory={}",
+            compact(TerminalPublicationPhase::GlobalWriteback),
+            compact(TerminalPublicationPhase::GuestMemoryWrites),
+        ),
+        format!(
+            "[REMu][PERF-GPU-PUBLICATION-PHASE] part=retire queue={} gpu-time={} completion-wake={}",
+            compact(TerminalPublicationPhase::QueueRetirement),
+            compact(TerminalPublicationPhase::GpuTimeQuery),
+            compact(TerminalPublicationPhase::CompletionWake),
+        ),
+    ]
+}
+
+/// One monotonic boundary sample per serial phase after the initial call timestamp.
+pub(super) struct TerminalPublicationTimer {
+    last: Option<Instant>,
+}
+
+impl TerminalPublicationTimer {
+    pub(super) fn start_if(enabled: bool) -> Self {
+        Self {
+            last: enabled.then(terminal_publication_now),
+        }
+    }
+
+    pub(super) fn mark(
+        &mut self,
+        statistics: &mut TerminalPublicationStatistics,
+        phase: TerminalPublicationPhase,
+    ) {
+        let Some(last) = self.last else {
+            return;
+        };
+        let now = terminal_publication_now();
+        statistics.record(phase, now.saturating_duration_since(last));
+        self.last = Some(now);
+    }
 }
 
 unsafe extern "C" {
@@ -412,10 +548,95 @@ impl PresenterStatistics {
             shared_event_error_advances: 0,
             shared_event_fallbacks_no_exact_producer: 0,
             shared_event_fallbacks_timeline_overflow: 0,
+            terminal_publication: TerminalPublicationStatistics::default(),
             gpu_execution_time: Duration::ZERO,
             presentation_queue_latency: Duration::ZERO,
             last_audio_output_frames: remu_gpu::audio_output_frames(),
             last_audio_underrun_frames: remu_gpu::audio_underrun_frames(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TERMINAL_PUBLICATION_TIMING_SAMPLES, TerminalPublicationPhase,
+        TerminalPublicationStatistics, TerminalPublicationTimer,
+        format_terminal_publication_report,
+    };
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    #[test]
+    fn terminal_publication_statistics_count_sum_max_and_reset() {
+        let mut statistics = TerminalPublicationStatistics::default();
+        statistics.record(
+            TerminalPublicationPhase::GlobalWriteback,
+            Duration::from_nanos(10),
+        );
+        statistics.record(
+            TerminalPublicationPhase::GlobalWriteback,
+            Duration::from_nanos(30),
+        );
+        statistics.record(
+            TerminalPublicationPhase::CompletionWake,
+            Duration::from_nanos(7),
+        );
+
+        let sample = statistics.take();
+        let globals = sample.phase(TerminalPublicationPhase::GlobalWriteback);
+        assert_eq!(globals.count, 2);
+        assert_eq!(globals.total_ns, 40);
+        assert_eq!(globals.mean_ns(), 20);
+        assert_eq!(globals.maximum_ns, 30);
+        assert_eq!(
+            sample.phase(TerminalPublicationPhase::CompletionWake).count,
+            1
+        );
+        assert_eq!(statistics.take(), TerminalPublicationStatistics::default());
+    }
+
+    #[test]
+    fn terminal_publication_report_is_compact_and_self_describing() {
+        let mut statistics = TerminalPublicationStatistics::default();
+        statistics.record(
+            TerminalPublicationPhase::MetalTerminal,
+            Duration::from_nanos(12),
+        );
+        statistics.record(
+            TerminalPublicationPhase::CompletionWake,
+            Duration::from_nanos(8),
+        );
+
+        let report = format_terminal_publication_report(5_000, statistics.take());
+        assert_eq!(
+            report[0],
+            "[REMu][PERF-GPU-PUBLICATION-PHASE] window_ms=5000 terminal_calls=1 values=count/total_ns/mean_ns/max_ns"
+        );
+        assert!(report[1].contains("metal=1/12/12/12"));
+        assert!(report[2].contains("globals=0/0/0/0"));
+        assert!(report[3].contains("completion-wake=1/8/8/8"));
+        assert!(report.iter().all(|line| line.len() < 256));
+    }
+
+    #[test]
+    fn disabled_terminal_publication_timer_records_nothing() {
+        let before = TERMINAL_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed);
+        let mut timer = TerminalPublicationTimer::start_if(false);
+        let mut statistics = TerminalPublicationStatistics::default();
+        timer.mark(
+            &mut statistics,
+            TerminalPublicationPhase::MetalTerminal,
+        );
+        timer.mark(
+            &mut statistics,
+            TerminalPublicationPhase::CompletionWake,
+        );
+        assert_eq!(statistics, TerminalPublicationStatistics::default());
+        assert_eq!(
+            TERMINAL_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed),
+            before,
+            "disabled terminal attribution must not sample the monotonic clock"
+        );
     }
 }

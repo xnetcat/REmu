@@ -13,6 +13,7 @@ use super::super::{
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
     SHARED_HOST_KIND_WAIT, SharedEventDrawReject, WRITEBACK_TRIGGERS,
+    format_terminal_publication_report,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -269,6 +270,11 @@ impl MetalPresenter {
                 dispatch.gpu_publication_wait.buckets,
                 remu_gpu::DISPATCH_LATENCY_BUCKET_UPPER_NS,
             );
+            for line in
+                remu_gpu::format_gpu_publication_phase_report(dispatch_window_ms, &dispatch)
+            {
+                eprintln!("{line}");
+            }
             let direct = |import| dispatch.direct_import_calls_for(import);
             use remu_gpu::DirectDispatchImport as DirectImport;
             eprintln!(
@@ -289,6 +295,14 @@ impl MetalPresenter {
                 direct(DirectImport::PosixPthreadRwlockWriteLock),
                 direct(DirectImport::PosixPthreadRwlockUnlock),
             );
+            if self.terminal_publication_timing {
+                for line in format_terminal_publication_report(
+                    dispatch_window_ms,
+                    self.statistics.terminal_publication.take(),
+                ) {
+                    eprintln!("{line}");
+                }
+            }
             eprintln!(
                 "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s shared-host={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,

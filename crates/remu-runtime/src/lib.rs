@@ -7242,6 +7242,7 @@ fn flush_deferred_gpu_publication_with_admission(
         );
     }
     let order = GPU_PUBLICATION_ORDER.get_or_init(|| (Mutex::new(0), Condvar::new()));
+    let order_started = Instant::now();
     let mut next = order
         .0
         .lock()
@@ -7252,6 +7253,7 @@ fn flush_deferred_gpu_publication_with_admission(
             .wait(next)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
+    let ticket_order_wait = order_started.elapsed();
     if traced {
         // Paired with `begin` and `end`, this identifies the blocking stage without changing the
         // ordered publisher: begin-without-turn is an order wait, while turn-without-end is
@@ -7263,11 +7265,15 @@ fn flush_deferred_gpu_publication_with_admission(
         [remu_gpu::GpuEvent::QueueSubmission { .. }]
     );
     let mut all_sent = true;
+    let barrier_started = Instant::now();
+    let barrier_acquire;
+    let mut channel_timing = remu_gpu::GpuEventPublicationTiming::default();
     if queue_only {
         let _queue_publication = GPU_PUBLICATION_BARRIER
             .get_or_init(|| RwLock::new(()))
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        barrier_acquire = barrier_started.elapsed();
         let event = publication
             .events
             .into_iter()
@@ -7276,7 +7282,7 @@ fn flush_deferred_gpu_publication_with_admission(
         // Assign the event its queue-local sequence while this process-order turn is still held.
         // Once assigned, independent hardware queues may enter the bounded channel concurrently;
         // a later event on this same queue still waits for its FIFO predecessor inside `remu-gpu`.
-        all_sent &= remu_gpu::emit_event_with_admission(event, move || {
+        let (sent, timing) = remu_gpu::emit_event_with_admission_and_timing(event, move || {
             debug_assert_eq!(*next, ticket);
             *next = next.saturating_add(1);
             order.1.notify_all();
@@ -7285,6 +7291,8 @@ fn flush_deferred_gpu_publication_with_admission(
                 eprintln!("[REMu][GPU][PUBLICATION] admitted ticket={ticket} queue-only=true");
             }
         });
+        all_sent &= sent;
+        channel_timing = timing;
     } else {
         // Display lifecycle events and any mixed publication are process-wide barriers. They must
         // neither overtake an active hardware queue nor be overtaken by a later queue.
@@ -7292,9 +7300,18 @@ fn flush_deferred_gpu_publication_with_admission(
             .get_or_init(|| RwLock::new(()))
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        barrier_acquire = barrier_started.elapsed();
         admitted();
         for event in publication.events {
-            all_sent &= remu_gpu::emit_event(event);
+            let (sent, timing) = remu_gpu::emit_event_with_timing(event);
+            all_sent &= sent;
+            channel_timing.setup = channel_timing.setup.saturating_add(timing.setup);
+            channel_timing.queue_fifo_wait = channel_timing
+                .queue_fifo_wait
+                .saturating_add(timing.queue_fifo_wait);
+            channel_timing.bounded_send = channel_timing
+                .bounded_send
+                .saturating_add(timing.bounded_send);
         }
         debug_assert_eq!(*next, ticket);
         *next = next.saturating_add(1);
@@ -7309,7 +7326,44 @@ fn flush_deferred_gpu_publication_with_admission(
             summary.queue_work_items,
         );
     }
-    remu_gpu::record_gpu_publication_wait(publication_started.elapsed());
+    let total = publication_started.elapsed();
+    let attributed = ticket_order_wait
+        .saturating_add(barrier_acquire)
+        .saturating_add(channel_timing.setup)
+        .saturating_add(channel_timing.queue_fifo_wait)
+        .saturating_add(channel_timing.bounded_send);
+    let residual = total.saturating_sub(attributed);
+    let route = if queue_only {
+        remu_gpu::GpuPublicationRoute::QueueOnly
+    } else {
+        remu_gpu::GpuPublicationRoute::Mixed
+    };
+    for (phase, duration) in [
+        (
+            remu_gpu::GpuPublicationPhase::TicketOrderWait,
+            ticket_order_wait,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::BarrierAcquire,
+            barrier_acquire,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::ChannelSetup,
+            channel_timing.setup,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::QueueFifoWait,
+            channel_timing.queue_fifo_wait,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::BoundedSend,
+            channel_timing.bounded_send,
+        ),
+        (remu_gpu::GpuPublicationPhase::Residual, residual),
+    ] {
+        remu_gpu::record_gpu_publication_phase(route, phase, duration);
+    }
+    remu_gpu::record_gpu_publication_wait(total);
     all_sent
 }
 

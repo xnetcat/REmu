@@ -23,6 +23,30 @@ pub const DISPATCH_LATENCY_BUCKET_UPPER_NS: [u64; 7] = [
 ];
 pub const DISPATCH_LATENCY_BUCKET_COUNT: usize = DISPATCH_LATENCY_BUCKET_UPPER_NS.len() + 1;
 
+/// Shape of the deferred runtime publication whose exact span is being attributed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum GpuPublicationRoute {
+    QueueOnly = 0,
+    Mixed,
+}
+
+pub const GPU_PUBLICATION_ROUTE_COUNT: usize = GpuPublicationRoute::Mixed as usize + 1;
+
+/// Mutually exclusive serial portions of `flush_deferred_gpu_publication`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub enum GpuPublicationPhase {
+    TicketOrderWait = 0,
+    BarrierAcquire,
+    ChannelSetup,
+    QueueFifoWait,
+    BoundedSend,
+    Residual,
+}
+
+pub const GPU_PUBLICATION_PHASE_COUNT: usize = GpuPublicationPhase::Residual as usize + 1;
+
 /// Mutually exclusive runtime routes used to serve one guest import.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -177,6 +201,8 @@ pub struct DispatchTelemetrySample {
     pub dispatch_lock_acquire_wait: DispatchLatencyHistogram,
     pub dispatch_lock_hold: DispatchLatencyHistogram,
     pub gpu_publication_wait: DispatchLatencyHistogram,
+    gpu_publication_phases:
+        [[DispatchLatencyHistogram; GPU_PUBLICATION_PHASE_COUNT]; GPU_PUBLICATION_ROUTE_COUNT],
 }
 
 impl DispatchTelemetrySample {
@@ -197,6 +223,69 @@ impl DispatchTelemetrySample {
     pub fn direct_import_calls_for(&self, import: DirectDispatchImport) -> u64 {
         self.direct_import_calls[import as usize]
     }
+
+    #[must_use]
+    pub fn gpu_publication_phase(
+        &self,
+        route: GpuPublicationRoute,
+        phase: GpuPublicationPhase,
+    ) -> DispatchLatencyHistogram {
+        self.gpu_publication_phases[route as usize][phase as usize]
+    }
+}
+
+/// Formats exact outer-publication attribution without producing an unbounded diagnostic line.
+#[must_use]
+pub fn format_gpu_publication_phase_report(
+    window_ms: u128,
+    sample: &DispatchTelemetrySample,
+) -> [String; 5] {
+    let compact = |route, phase| {
+        let latency = sample.gpu_publication_phase(route, phase);
+        let mean = latency
+            .total_ns
+            .checked_div(latency.count)
+            .unwrap_or_default();
+        format!(
+            "{}/{}/{}/{}",
+            latency.count, latency.total_ns, mean, latency.maximum_ns,
+        )
+    };
+    let total_calls = [GpuPublicationRoute::QueueOnly, GpuPublicationRoute::Mixed]
+        .into_iter()
+        .map(|route| {
+            sample
+                .gpu_publication_phase(route, GpuPublicationPhase::TicketOrderWait)
+                .count
+        })
+        .fold(0_u64, u64::saturating_add);
+    let route_lines = |name, route| {
+        [
+            format!(
+                "[REMu][PERF-GPU-PUBLICATION] route={name} part=admit order={} barrier={} setup={}",
+                compact(route, GpuPublicationPhase::TicketOrderWait),
+                compact(route, GpuPublicationPhase::BarrierAcquire),
+                compact(route, GpuPublicationPhase::ChannelSetup),
+            ),
+            format!(
+                "[REMu][PERF-GPU-PUBLICATION] route={name} part=channel fifo={} send={} residual={}",
+                compact(route, GpuPublicationPhase::QueueFifoWait),
+                compact(route, GpuPublicationPhase::BoundedSend),
+                compact(route, GpuPublicationPhase::Residual),
+            ),
+        ]
+    };
+    let queue = route_lines("queue", GpuPublicationRoute::QueueOnly);
+    let mixed = route_lines("mixed", GpuPublicationRoute::Mixed);
+    [
+        format!(
+            "[REMu][PERF-GPU-PUBLICATION] window_ms={window_ms} calls={total_calls} values=count/total_ns/mean_ns/max_ns"
+        ),
+        queue[0].clone(),
+        queue[1].clone(),
+        mixed[0].clone(),
+        mixed[1].clone(),
+    ]
 }
 
 struct AtomicLatencyHistogram {
@@ -245,6 +334,8 @@ struct DispatchTelemetry {
     dispatch_lock_acquire_wait: AtomicLatencyHistogram,
     dispatch_lock_hold: AtomicLatencyHistogram,
     gpu_publication_wait: AtomicLatencyHistogram,
+    gpu_publication_phases:
+        [[AtomicLatencyHistogram; GPU_PUBLICATION_PHASE_COUNT]; GPU_PUBLICATION_ROUTE_COUNT],
 }
 
 impl DispatchTelemetry {
@@ -258,6 +349,9 @@ impl DispatchTelemetry {
             dispatch_lock_acquire_wait: AtomicLatencyHistogram::new(),
             dispatch_lock_hold: AtomicLatencyHistogram::new(),
             gpu_publication_wait: AtomicLatencyHistogram::new(),
+            gpu_publication_phases: [const {
+                [const { AtomicLatencyHistogram::new() }; GPU_PUBLICATION_PHASE_COUNT]
+            }; GPU_PUBLICATION_ROUTE_COUNT],
         }
     }
 
@@ -298,6 +392,9 @@ impl DispatchTelemetry {
             dispatch_lock_acquire_wait: self.dispatch_lock_acquire_wait.take(),
             dispatch_lock_hold: self.dispatch_lock_hold.take(),
             gpu_publication_wait: self.gpu_publication_wait.take(),
+            gpu_publication_phases: std::array::from_fn(|route| {
+                std::array::from_fn(|phase| self.gpu_publication_phases[route][phase].take())
+            }),
         }
     }
 }
@@ -331,6 +428,24 @@ pub fn record_gpu_publication_wait(duration: Duration) {
     DISPATCH_TELEMETRY.gpu_publication_wait.record(duration);
 }
 
+static REPORTED_EXACT_GPU_PUBLICATION_ATTRIBUTION: AtomicBool = AtomicBool::new(false);
+
+/// Records one exact outer-publication phase after the complete call has been attributed locally.
+pub fn record_gpu_publication_phase(
+    route: GpuPublicationRoute,
+    phase: GpuPublicationPhase,
+    duration: Duration,
+) {
+    if !REPORTED_EXACT_GPU_PUBLICATION_ATTRIBUTION.load(Ordering::Relaxed)
+        && REPORTED_EXACT_GPU_PUBLICATION_ATTRIBUTION
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        eprintln!("[REMu][PERF-GPU-PUBLICATION] exact runtime phase attribution enabled");
+    }
+    DISPATCH_TELEMETRY.gpu_publication_phases[route as usize][phase as usize].record(duration);
+}
+
 /// Takes and resets every B10 counter as one telemetry interval.
 ///
 /// Individual latency fields may receive a concurrent observation while the reset is in progress,
@@ -357,8 +472,9 @@ pub fn take_dispatch_telemetry_sample() -> DispatchTelemetrySample {
 mod tests {
     use super::{
         AtomicLatencyHistogram, DISPATCH_LATENCY_BUCKET_COUNT, DISPATCH_LATENCY_BUCKET_UPPER_NS,
-        DirectDispatchImport, DispatchImportFamily, DispatchTelemetry,
-        record_direct_dispatch_import, take_dispatch_telemetry_sample,
+        DirectDispatchImport, DispatchImportFamily, DispatchTelemetry, GpuPublicationPhase,
+        GpuPublicationRoute, format_gpu_publication_phase_report, record_direct_dispatch_import,
+        take_dispatch_telemetry_sample,
     };
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
@@ -470,6 +586,46 @@ mod tests {
         assert_eq!(
             take_dispatch_telemetry_sample()
                 .direct_import_calls_for(DirectDispatchImport::ScePthreadGetSpecific),
+            0
+        );
+    }
+
+    #[test]
+    fn gpu_publication_phase_accounting_resets_and_formats_compactly() {
+        let telemetry = DispatchTelemetry::new();
+        let queue_order = &telemetry.gpu_publication_phases
+            [GpuPublicationRoute::QueueOnly as usize]
+            [GpuPublicationPhase::TicketOrderWait as usize];
+        queue_order.record(Duration::from_nanos(10));
+        queue_order.record(Duration::from_nanos(30));
+        telemetry.gpu_publication_phases[GpuPublicationRoute::QueueOnly as usize]
+            [GpuPublicationPhase::BoundedSend as usize]
+            .record(Duration::from_nanos(5));
+        telemetry.gpu_publication_phases[GpuPublicationRoute::Mixed as usize]
+            [GpuPublicationPhase::Residual as usize]
+            .record(Duration::from_nanos(7));
+
+        let sample = telemetry.take();
+        let order = sample.gpu_publication_phase(
+            GpuPublicationRoute::QueueOnly,
+            GpuPublicationPhase::TicketOrderWait,
+        );
+        assert_eq!(order.count, 2);
+        assert_eq!(order.total_ns, 40);
+        assert_eq!(order.maximum_ns, 30);
+        let report = format_gpu_publication_phase_report(5_000, &sample);
+        assert!(report[1].contains("order=2/40/20/30"));
+        assert!(report[2].contains("send=1/5/5/5"));
+        assert!(report[4].contains("residual=1/7/7/7"));
+        assert!(report.iter().all(|line| line.len() < 256));
+        assert_eq!(
+            telemetry
+                .take()
+                .gpu_publication_phase(
+                    GpuPublicationRoute::QueueOnly,
+                    GpuPublicationPhase::TicketOrderWait,
+                )
+                .count,
             0
         );
     }
