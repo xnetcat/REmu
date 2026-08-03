@@ -718,6 +718,7 @@ impl PresenterStatistics {
             shared_event_draw_attempts: 0,
             shared_event_draw_disjoint_candidates: 0,
             shared_event_draw_versioned_global_candidates: 0,
+            shared_event_draw_resident_image_candidates: 0,
             shared_event_draw_internal_drains: 0,
             shared_event_draw_rejections: [0; super::SHARED_EVENT_DRAW_REJECT_COUNT],
             shared_event_incomplete_signal_footprints: 0,

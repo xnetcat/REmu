@@ -190,10 +190,11 @@ impl MetalPresenter {
             let mut shared_event_gpu_ordered_compute = false;
             let mut shared_event_gpu_ordered_registered_wait = false;
             let mut shared_event_gpu_ordered_draw = false;
+            let mut shared_event_direct_draw_plan = None;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
-                let direct_draw_candidate = if dependencies.is_empty() {
-                    false
+                shared_event_direct_draw_plan = if dependencies.is_empty() {
+                    None
                 } else if let GpuEvent::IndexedDraw(draw) = &event {
                     self.observe_shared_event_direct_draw_preflight(
                         queue_id,
@@ -201,9 +202,9 @@ impl MetalPresenter {
                         draw,
                     )
                 } else {
-                    false
+                    None
                 };
-                let direct_draw_gpu_orderable = direct_draw_candidate
+                let direct_draw_gpu_orderable = shared_event_direct_draw_plan.is_some()
                     && self.per_queue_guest_batches
                     && self.shared_event_direct_draw_admission;
                 let gpu_orderable = dependencies.is_empty()
@@ -638,8 +639,15 @@ impl MetalPresenter {
                         continue;
                     }
                     let cpu_synchronization_epoch = self.guest_batch_cpu_synchronization_epoch;
+                    let texture_overrides = if shared_event_gpu_ordered_draw {
+                        shared_event_direct_draw_plan
+                            .as_ref()
+                            .map_or(&[][..], |plan| plan.texture_overrides.as_slice())
+                    } else {
+                        &[]
+                    };
                     let result = match key.as_ref() {
-                        Ok(key) => self.execute_compiled_draw(&draw, key),
+                        Ok(key) => self.execute_compiled_draw(&draw, key, texture_overrides),
                         Err(error) => Err(error.clone()),
                     };
                     self.record_shared_event_direct_draw_outcome(

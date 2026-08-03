@@ -18,6 +18,7 @@ use super::{
     trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
 };
 use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
+use super::super::SharedEventDrawTextureOverride;
 use metal::foreign_types::ForeignType;
 use metal::{
     Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,
@@ -36,6 +37,7 @@ impl MetalPresenter {
     pub(crate) fn synchronize_sampled_aliases(
         &mut self,
         evaluations: &[&ShaderEvaluation],
+        shared_event_texture_overrides: &[SharedEventDrawTextureOverride],
     ) -> Result<(), String> {
         let mut aliases = Vec::new();
         for &evaluation in evaluations {
@@ -52,6 +54,12 @@ impl MetalPresenter {
                     // reject the entire draw before the fallback can be installed.
                     continue;
                 };
+                if shared_event_texture_overrides
+                    .iter()
+                    .any(|retained| retained.matches(sampled))
+                {
+                    continue;
+                }
                 let comparison = image_is_comparison(binding.opcode);
                 let sampled_bytes = guest_texture_byte_count(sampled.guest).ok_or_else(|| {
                     format!(

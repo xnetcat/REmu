@@ -6,6 +6,8 @@ use metal::{
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
     MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
+use metal::foreign_types::ForeignType;
+use super::super::SharedEventDrawTextureOverride;
 use remu_memory::CpuWriteWatchRetirement;
 use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 use super::super::refresh_resident_texture_write_watch;
@@ -74,6 +76,130 @@ fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
         error.contains("no complete live shared backing"),
         "unexpected validation error: {error}"
     );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+fn shared_event_texture_override_bypasses_replaced_guest_mapping_at_bind() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original backing");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement backing");
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original mapping");
+    let address = mapped.get();
+    let width = 32_u32;
+    let height = 32_u32;
+    let encoded = address >> 8;
+    let resource_descriptor = vec![
+        encoded as u32,
+        ((encoded >> 32) as u32 & 0xff) | 0x0380_0000 | (((width - 1) & 3) << 30),
+        ((width - 1) >> 2) | ((height - 1) << 14),
+        0x9000_0f2e,
+        width - 1,
+        0,
+        0,
+        0,
+    ];
+    let sampled = decode_image_descriptor(&resource_descriptor).expect("sample descriptor");
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            pc: 0x40,
+            opcode: Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(sampled.guest.pixel_format);
+    descriptor.set_width(u64::from(width));
+    descriptor.set_height(u64::from(height));
+    descriptor.set_storage_mode(MTLStorageMode::Private);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+    let retained = device.new_texture(&descriptor);
+    let retained_pointer = retained.as_ptr();
+    let overrides = [SharedEventDrawTextureOverride {
+        sampled,
+        texture: retained,
+    }];
+
+    memory
+        .unmap(mapped, GUEST_PAGE_SIZE)
+        .expect("remove original mapping");
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement mapping");
+    let uploaded = upload_image_textures(
+        "test",
+        &device,
+        &queue,
+        &evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
+        &overrides,
+    )
+    .expect("retained texture bind");
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0].texture.as_ptr(), retained_pointer);
+    assert!(presenter.sampled_texture_cache.is_empty());
+    assert!(presenter.sampled_texture_write_watches.is_empty());
 }
 
 #[test]
@@ -197,6 +323,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
         ResidentTextureActivityStamp::default(),
+        &[],
     )
     .expect("storage alias upload");
 
@@ -344,6 +471,7 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
         ResidentTextureActivityStamp::default(),
+        &[],
     )
     .expect("native depth sample upload");
     assert_eq!(uploaded.len(), 1);

@@ -204,7 +204,7 @@ impl MetalPresenter {
                 }
             }
         }
-        self.synchronize_sampled_aliases(&[evaluation])?;
+        self.synchronize_sampled_aliases(&[evaluation], &[])?;
 
         self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[evaluation])?;
@@ -243,6 +243,7 @@ impl MetalPresenter {
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
             activity_stamp,
+            &[],
         )?;
         let (sampler_buffer, samplers) = self.cached_sampler_argument_buffer(
             &device,

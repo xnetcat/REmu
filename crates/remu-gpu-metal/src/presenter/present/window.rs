@@ -343,13 +343,14 @@ impl MetalPresenter {
             );
             let draw_rejections = &self.statistics.shared_event_draw_rejections;
             eprintln!(
-                "[REMu][PERF-SHARED-EVENT-DRAW] attempts={:.0}/s disjoint-candidates={:.0}/s versioned-global-candidates={:.0}/s internal-drains={:.0}/s admission={} reject=overlap-resident:{:.0}/s,overlap-scanout:{:.0}/s,overlap-copied-global:{:.0}/s,overlap-zero-copy-global:{:.0}/s,overlap-terminal-write:{:.0}/s,overlap-internal-resident:{:.0}/s,incomplete-producer:{:.0}/s,unresolved:{:.0}/s,indirect:{:.0}/s,shader-coverage:{:.0}/s,special-op:{:.0}/s,diagnostic:{:.0}/s,other:{:.0}/s",
+                "[REMu][PERF-SHARED-EVENT-DRAW] attempts={:.0}/s disjoint-candidates={:.0}/s versioned-global-candidates={:.0}/s resident-image-candidates={:.0}/s internal-drains={:.0}/s admission={} reject=overlap-resident:{:.0}/s,overlap-scanout:{:.0}/s,overlap-copied-global:{:.0}/s,overlap-zero-copy-global:{:.0}/s,overlap-terminal-write:{:.0}/s,overlap-internal-resident:{:.0}/s,incomplete-producer:{:.0}/s,unresolved:{:.0}/s,indirect:{:.0}/s,shader-coverage:{:.0}/s,special-op:{:.0}/s,diagnostic:{:.0}/s,other:{:.0}/s",
                 f64::from(self.statistics.shared_event_draw_attempts) / seconds,
                 f64::from(self.statistics.shared_event_draw_disjoint_candidates) / seconds,
                 f64::from(
                     self.statistics
                         .shared_event_draw_versioned_global_candidates
                 ) / seconds,
+                f64::from(self.statistics.shared_event_draw_resident_image_candidates) / seconds,
                 f64::from(self.statistics.shared_event_draw_internal_drains) / seconds,
                 if self.shared_event_direct_draw_admission {
                     "enabled"
@@ -1056,6 +1057,7 @@ impl MetalPresenter {
         self.statistics.shared_event_draw_disjoint_candidates = 0;
         self.statistics
             .shared_event_draw_versioned_global_candidates = 0;
+        self.statistics.shared_event_draw_resident_image_candidates = 0;
         self.statistics.shared_event_draw_internal_drains = 0;
         self.statistics.shared_event_draw_rejections =
             [0; super::super::SHARED_EVENT_DRAW_REJECT_COUNT];

@@ -26,6 +26,7 @@ use super::{
     texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
     trace_resident_texture_removal, trace_target_sampling,
 };
+use super::super::SharedEventDrawTextureOverride;
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
@@ -201,6 +202,7 @@ pub(crate) fn upload_image_textures(
     fallback_texture_cache: &mut HashMap<SampledTextureKey, Texture>,
     next_sampled_texture_use: &mut u64,
     activity_stamp: ResidentTextureActivityStamp,
+    shared_event_texture_overrides: &[SharedEventDrawTextureOverride],
 ) -> Result<Vec<UploadedImageTexture>, String> {
     trace_alias_correlated_image_bindings(trace_stage, evaluation, activity_stamp);
     canonical_texture_bindings(evaluation)
@@ -230,6 +232,17 @@ pub(crate) fn upload_image_textures(
             let descriptor = decoded
                 .or_else(|_| fallback_image_descriptor(binding))
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            if let Some(retained) = shared_event_texture_overrides
+                .iter()
+                .find(|retained| retained.matches(descriptor))
+            {
+                return Ok(UploadedImageTexture {
+                    texture: retained.texture.clone(),
+                    descriptor,
+                    writable: false,
+                    selected_resident: None,
+                });
+            }
             // Slate/UMG font atlases are single-channel sampled images whose whole glyph
             // rendering depends on the T# destination select reaching the shader. Log the raw
             // descriptor words and the decoded swizzle once per atlas so a tofu report can be

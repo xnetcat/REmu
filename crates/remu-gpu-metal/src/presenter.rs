@@ -1593,6 +1593,7 @@ struct PresenterStatistics {
     shared_event_draw_attempts: u32,
     shared_event_draw_disjoint_candidates: u32,
     shared_event_draw_versioned_global_candidates: u32,
+    shared_event_draw_resident_image_candidates: u32,
     shared_event_draw_internal_drains: u32,
     shared_event_draw_rejections: [u32; SHARED_EVENT_DRAW_REJECT_COUNT],
     shared_event_incomplete_signal_footprints: u32,
@@ -1652,6 +1653,13 @@ struct GuestCommandBatch {
     /// destinations whose Metal commands can still be in flight when a later queue waits on the
     /// signal.
     resident_write_footprint: Vec<PhysicalFootprintRange>,
+    /// Exact Metal texture versions produced by resident writes in this batch.
+    ///
+    /// Shared-event checkpoints retain these objects so a same-queue consumer can sample the
+    /// producer version directly without observing mutable guest RAM or a later residency-map
+    /// tenant. Only ordinary render/storage destinations enter this journal; internal
+    /// rematerialization and scanout work remain host dependencies.
+    resident_texture_versions: Vec<SharedEventResidentTextureVersion>,
     /// False once native work was encoded for a destination without a stable physical identity.
     /// Unknown identity must remain a host dependency; virtual non-overlap is not a proof.
     resident_write_footprint_complete: bool,
@@ -1680,6 +1688,8 @@ struct SharedEventSignalCheckpoint {
     /// signal. Zero-copy guest buffers and CPU-published writes are deliberately excluded: their
     /// storage remains mutable and therefore cannot cross a queue on a GPU wait alone.
     global_versions: Vec<SharedEventGlobalBufferVersion>,
+    /// Exact resident texture objects visible at this queue signal.
+    resident_texture_versions: Vec<SharedEventResidentTextureVersion>,
     unresolved_write_ranges: Vec<SharedEventUnresolvedWriteRange>,
     /// Complete physical write footprint of every unretired producer batch ordered before this
     /// exact queue signal, including the signal-owning RELEASE_MEM label.
@@ -1712,6 +1722,41 @@ struct SharedEventGlobalBufferVersion {
     guest_address: u64,
     byte_count: u64,
     mapping_identity: Option<GuestSharedMappingIdentity>,
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventResidentTextureVersion {
+    texture: Texture,
+    descriptor: GuestTextureDescriptor,
+    texture_type: u32,
+    layer_count: u32,
+    mip_level_count: u32,
+    content_version: u64,
+    /// CPU-write generations at the exact GPU ownership boundary for this version.
+    gpu_write_watch_generations: Vec<u64>,
+    span: ResourceSpan,
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventDrawTextureOverride {
+    sampled: DecodedImageDescriptor,
+    texture: Texture,
+}
+
+impl SharedEventDrawTextureOverride {
+    fn matches(&self, sampled: DecodedImageDescriptor) -> bool {
+        self.sampled.guest == sampled.guest
+            && self.sampled.destination_select == sampled.destination_select
+            && self.sampled.base_mip_level == sampled.base_mip_level
+            && self.sampled.mip_level_count == sampled.mip_level_count
+            && self.sampled.texture_type == sampled.texture_type
+            && self.sampled.layer_count == sampled.layer_count
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventDirectDrawPlan {
+    texture_overrides: Vec<SharedEventDrawTextureOverride>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2059,7 +2104,7 @@ struct CachedNggMeshlets {
     primitive_count: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DecodedImageDescriptor {
     guest: GuestTextureDescriptor,
     span: Option<ResourceSpan>,
@@ -2462,7 +2507,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     }
     if presenter.shared_event_direct_draw_admission {
         eprintln!(
-            "[REMu][METAL] experimental disjoint/fence-versioned direct-draw SharedEvent admission enabled"
+            "[REMu][METAL] experimental disjoint/fence-versioned/resident-versioned direct-draw SharedEvent admission enabled"
         );
     }
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
