@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
@@ -11,7 +12,26 @@ use crate::{
     write_guest_u32,
 };
 
-use super::{GuestSemaphoreState, guest_sync};
+use super::state::{GuestSemaphoreEntry, GuestSemaphoreState};
+use super::guest_sync;
+
+/// Test/helper constructor for a per-object semaphore entry.
+#[cfg(test)]
+pub(crate) fn guest_semaphore_entry(count: i32, maximum: i32) -> Arc<GuestSemaphoreEntry> {
+    Arc::new(GuestSemaphoreEntry {
+        state: Mutex::new(GuestSemaphoreState { count, maximum }),
+        wake: Condvar::new(),
+    })
+}
+
+fn lookup_semaphore(handle: u32) -> Option<Arc<GuestSemaphoreEntry>> {
+    let sync = guest_sync();
+    let state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.semaphores.get(&handle).cloned()
+}
 
 pub(super) fn guest_semaphore_create(arguments: [u64; 6]) -> u64 {
     let output = arguments[0];
@@ -29,10 +49,13 @@ pub(super) fn guest_semaphore_create(arguments: [u64; 6]) -> u64 {
     let handle = state.next_semaphore_handle;
     state.semaphores.insert(
         handle,
-        GuestSemaphoreState {
-            count: initial,
-            maximum,
-        },
+        Arc::new(GuestSemaphoreEntry {
+            state: Mutex::new(GuestSemaphoreState {
+                count: initial,
+                maximum,
+            }),
+            wake: Condvar::new(),
+        }),
     );
     write_guest_u32(output, handle);
     if trace_guest_sync() {
@@ -51,14 +74,13 @@ pub(crate) fn guest_semaphore_poll(arguments: [u64; 6]) -> u64 {
     if needed <= 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let sync = guest_sync();
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(semaphore) = state.semaphores.get_mut(&handle) else {
+    let Some(entry) = lookup_semaphore(handle) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
+    let mut semaphore = entry
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if semaphore.count < needed {
         return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
     }
@@ -76,20 +98,26 @@ pub(crate) fn guest_semaphore_wait(arguments: [u64; 6]) -> u64 {
     let timeout = (timeout_pointer != 0)
         .then(|| Duration::from_micros(u64::from(read_guest_u32(timeout_pointer))));
     let deadline = timeout.and_then(|timeout| Instant::now().checked_add(timeout));
-    let sync = guest_sync();
     let guest_thread = current_guest_thread_handle();
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.semaphore_wait_count = state.semaphore_wait_count.saturating_add(1);
-    let wait_sequence = state.semaphore_wait_count;
+    let wait_sequence = {
+        let sync = guest_sync();
+        let mut registry = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.semaphore_wait_count = registry.semaphore_wait_count.saturating_add(1);
+        registry.semaphore_wait_count
+    };
+    let Some(entry) = lookup_semaphore(handle) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
     let trace_call = trace_guest_sync() && trace_logarithmic_sequence(wait_sequence, 8);
     let mut logged_block = false;
+    let mut semaphore = entry
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        let Some(semaphore) = state.semaphores.get_mut(&handle) else {
-            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-        };
         if needed > semaphore.maximum {
             return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
         }
@@ -121,16 +149,20 @@ pub(crate) fn guest_semaphore_wait(arguments: [u64; 6]) -> u64 {
                 write_guest_u32(timeout_pointer, 0);
                 return sce_kernel_error(SCE_KERNEL_ERROR_TIMED_OUT);
             };
-            let (next_state, _) = sync
-                .1
-                .wait_timeout(state, remaining)
+            let (next, _) = entry
+                .wake
+                .wait_timeout(semaphore, remaining)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next_state;
+            semaphore = next;
         } else {
-            state = sync
-                .1
-                .wait(state)
+            semaphore = entry
+                .wake
+                .wait(semaphore)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        // The registry may have deleted this handle while we were parked.
+        if lookup_semaphore(handle).is_none() {
+            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         }
     }
 }
@@ -153,10 +185,11 @@ pub(super) fn guest_semaphore_delete(handle: u64) -> u64 {
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if state.semaphores.remove(&low_u32(handle)).is_none() {
+    let Some(entry) = state.semaphores.remove(&low_u32(handle)) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    }
-    sync.1.notify_all();
+    };
+    drop(state);
+    entry.wake.notify_all();
     0
 }
 
@@ -166,16 +199,22 @@ pub(super) fn guest_semaphore_signal(arguments: [u64; 6]) -> u64 {
     if amount <= 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let sync = guest_sync();
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state.semaphore_signal_count = state.semaphore_signal_count.saturating_add(1);
-    let signal_sequence = state.semaphore_signal_count;
-    let Some(semaphore) = state.semaphores.get_mut(&handle) else {
+    let signal_sequence = {
+        let sync = guest_sync();
+        let mut registry = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.semaphore_signal_count = registry.semaphore_signal_count.saturating_add(1);
+        registry.semaphore_signal_count
+    };
+    let Some(entry) = lookup_semaphore(handle) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
+    let mut semaphore = entry
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(next) = semaphore.count.checked_add(amount) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
@@ -189,6 +228,6 @@ pub(super) fn guest_semaphore_signal(arguments: [u64; 6]) -> u64 {
             semaphore.count
         );
     }
-    sync.1.notify_all();
+    entry.wake.notify_all();
     0
 }

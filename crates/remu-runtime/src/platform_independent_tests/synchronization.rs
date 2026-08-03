@@ -18,10 +18,7 @@ fn semaphore_wait_honors_timeouts_and_rejects_impossible_counts() {
         .semaphores
         .insert(
             SEMAPHORE,
-            crate::GuestSemaphoreState {
-                count: 0,
-                maximum: 1,
-            },
+            crate::guest_semaphore_entry(0, 1),
         );
 
     let mut timeout_microseconds = 2_000_u32;
@@ -48,7 +45,7 @@ fn semaphore_wait_honors_timeouts_and_rejects_impossible_counts() {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.semaphores.get_mut(&SEMAPHORE).unwrap().count = 1;
+        state.semaphores.get_mut(&SEMAPHORE).unwrap().state.lock().unwrap().count = 1;
     }
     let mut available_timeout = 50_000_u32;
     assert_eq!(
@@ -83,10 +80,7 @@ fn semaphore_signal_reports_overflow_without_losing_the_count() {
         .semaphores
         .insert(
             SEMAPHORE,
-            crate::GuestSemaphoreState {
-                count: 1,
-                maximum: 1,
-            },
+            crate::guest_semaphore_entry(1, 1),
         );
 
     assert_eq!(
@@ -102,6 +96,9 @@ fn semaphore_signal_reports_overflow_without_losing_the_count() {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .semaphores[&SEMAPHORE]
+            .state
+            .lock()
+            .unwrap()
             .count,
         1
     );
@@ -445,10 +442,7 @@ fn polling_a_semaphore_takes_a_count_only_when_one_is_already_available() {
         let handle = state.next_semaphore_handle;
         state.semaphores.insert(
             handle,
-            crate::GuestSemaphoreState {
-                count: 2,
-                maximum: 4,
-            },
+            crate::guest_semaphore_entry(2, 4),
         );
         handle
     };

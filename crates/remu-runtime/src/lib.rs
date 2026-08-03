@@ -5,9 +5,15 @@ mod agc_acb;
 mod agc_api;
 mod agc_command_abi;
 mod agc_dcb;
+mod agc_dispatch_state;
 mod agc_draw;
 mod agc_driver;
 mod agc_flip;
+mod dispatch_locks;
+mod event_state;
+mod import_routes;
+mod nid_u64;
+mod path_roots;
 #[allow(dead_code)]
 mod agc_frontend;
 mod agc_register_defaults;
@@ -242,7 +248,8 @@ pub(crate) use guest_sync::{
     dispatch_guest_sync_import, guest_condition_destroy, guest_condition_init,
     guest_condition_notify, guest_condition_wait, guest_condition_wait_with_interrupt,
     guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry, guest_mutex_init,
-    guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init, guest_semaphore_wait,
+    guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init, guest_semaphore_entry,
+    guest_semaphore_wait,
 };
 #[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use guest_sync::{
@@ -326,7 +333,7 @@ pub(crate) use save_data::{
 pub(crate) use save_data::{
     current_unix_seconds, read_guest_bytes, save_data_commit,
     save_data_create_transaction_resource, save_data_delete, save_data_delete_transaction_resource,
-    save_data_dir_name_search, save_data_initialize, save_data_mount_is_writable, save_data_mount3,
+    save_data_dir_name_search, save_data_initialize, save_data_mount3,
     save_data_prepare, save_data_save_icon, save_data_set_param, save_data_terminate,
     save_data_umount2, write_guest_bytes,
 };
@@ -1110,7 +1117,7 @@ struct VideoOutBufferAttributes {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingVideoOutFlip {
+pub(crate) struct PendingVideoOutFlip {
     completion: remu_gpu::GpuFlipCompletion,
     handle: u32,
     /// Process time counter, in nanoseconds, when the flip was queued for the GPU.
@@ -1218,7 +1225,7 @@ struct AgcBlendRegisterProvenance {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct KernelQueuedEvent {
+pub(crate) struct KernelQueuedEvent {
     equeue: u64,
     ident: u64,
     filter: i16,
@@ -1274,6 +1281,7 @@ pub(crate) struct DispatchWriteGuard<'a> {
     guard: Option<std::sync::RwLockWriteGuard<'a, ProbeDispatchState>>,
     acquire_wait: Duration,
     acquired_at: Instant,
+    _hierarchy: dispatch_locks::LockHierarchyGuard,
 }
 
 impl std::ops::Deref for DispatchWriteGuard<'_> {
@@ -1307,6 +1315,8 @@ impl Drop for DispatchWriteGuard<'_> {
 pub(crate) fn lock_probe_dispatch_for_write(
     lock: &RwLock<ProbeDispatchState>,
 ) -> DispatchWriteGuard<'_> {
+    let _hierarchy =
+        dispatch_locks::LockHierarchyGuard::enter(dispatch_locks::LockLevel::ProbeDispatch);
     let started = Instant::now();
     let guard = lock
         .write()
@@ -1318,6 +1328,7 @@ pub(crate) fn lock_probe_dispatch_for_write(
         guard: Some(guard),
         acquire_wait,
         acquired_at: Instant::now(),
+        _hierarchy,
     }
 }
 
@@ -1396,6 +1407,8 @@ fn guest_exception_is_pending(thread: u64) -> bool {
 #[derive(Debug)]
 struct ImportTelemetry {
     nids: Box<[String]>,
+    nids_u64: Box<[u64]>,
+    routes: import_routes::ImportRouteTable,
     seen: Box<[AtomicBool]>,
     counts: Box<[AtomicUsize]>,
     hits: AtomicUsize,
@@ -1405,8 +1418,15 @@ struct ImportTelemetry {
 impl ImportTelemetry {
     fn new(nids: Vec<String>, maximum_hits: usize) -> Self {
         let count = nids.len();
+        let nids_u64 = nids
+            .iter()
+            .map(|nid| nid_u64::decode_nid(nid))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             nids: nids.into_boxed_slice(),
+            nids_u64,
+            routes: import_routes::ImportRouteTable::new(count),
             seen: (0..count)
                 .map(|_| AtomicBool::new(false))
                 .collect::<Vec<_>>()
@@ -2187,6 +2207,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .unwrap_or_else(std::sync::PoisonError::into_inner) = GuestSyncState::default();
     set_current_guest_thread_handle(main_thread);
     set_current_guest_thread_unique_id(main_thread_unique_id);
+    path_roots::republish_from_dispatch(&state);
+    event_state::sync_from_dispatch(&state);
     drop(state);
     publish_system_splash(system_splash);
 }
@@ -3336,10 +3358,23 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
     let stack_args = read_import_stack_arguments(frame);
     if let Some(result) = dispatch_stateless_import(nid, call_args, stack_args) {
         remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Stateless);
+        telemetry
+            .routes
+            .store(index, import_routes::ImportRoute::Stateless);
+        return ProbeImportReturn::integer(result);
+    }
+    if let Some(result) = dispatch_kernel_path_import(nid, call_args) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::KernelFd);
+        telemetry
+            .routes
+            .store(index, import_routes::ImportRoute::Path);
         return ProbeImportReturn::integer(result);
     }
     if let Some(result) = dispatch_kernel_fd_import(nid, call_args) {
         remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::KernelFd);
+        telemetry
+            .routes
+            .store(index, import_routes::ImportRoute::Fd);
         return ProbeImportReturn::integer(result);
     }
     if nid == "fzyMKs9kim0" {
@@ -3888,6 +3923,9 @@ fn dispatch_kernel_file_import(
     state: &mut ProbeDispatchState,
 ) -> Option<u64> {
     // These raw libKernel calls use Gen5 kernel errors, not POSIX -1/errno semantics.
+    // Path syscalls that only need the published PathRoots snapshot are also served from the
+    // pre-lock tier via [`dispatch_kernel_path_import`]; this arm remains for stateful callers
+    // and tests that go through `dispatch_probe_import` directly.
     Some(match nid {
         "1G3lF1Gg1k8" => guest_kernel_open(arguments, state),
         "1-LFLmRFxxM" => guest_kernel_mkdir(arguments, state),
@@ -3898,6 +3936,18 @@ fn dispatch_kernel_file_import(
         "oib76F-12fk" => guest_kernel_lseek(arguments),
         "kBwCPsYX-m4" => guest_kernel_fstat(arguments),
         "VW3TVZiM4-E" => guest_kernel_ftruncate(arguments),
+        _ => return None,
+    })
+}
+
+/// Path syscalls that resolve against the published PathRoots snapshot and never need the
+/// process-wide dispatch write lock (plan C2 step 1).
+fn dispatch_kernel_path_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
+    Some(match nid {
+        "1G3lF1Gg1k8" => guest_files::guest_kernel_open_prelock(arguments),
+        "1-LFLmRFxxM" => guest_files::guest_kernel_mkdir_prelock(arguments),
+        "naInUjYt3so" => guest_files::guest_kernel_rmdir_prelock(arguments),
+        "eV9wAD2riIA" => guest_files::guest_kernel_stat_prelock(arguments),
         _ => return None,
     })
 }
@@ -4318,8 +4368,16 @@ fn kernel_raise_exception(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
                 handler: *handler,
                 exception,
             });
+        // Publish the pending bit and wake waiters under the sync mutex so the predicate and the
+        // notify share one critical section (plan C3 — closes the lost-wakeup window).
+        let sync = guest_sync();
+        let _sync_guard = sync
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         GUEST_EXCEPTION_PENDING.store(true, Ordering::Release);
-        guest_sync().1.notify_all();
+        sync.1.notify_all();
+        drop(_sync_guard);
         notify_kernel_equeue_waiters();
         eprintln!(
             "[REMu][KERNEL] queued cooperative exception source={source:#x} target={:#x} target_name={:?} type={exception} handler={handler:#x}",
@@ -6710,6 +6768,7 @@ fn app_content_temporary_data_mount(arguments: [u64; 6], state: &mut ProbeDispat
     }
     // The console reports the guest-visible mount point, not a host path.
     write_guest_bytes(output, b"/temp0\0");
+    path_roots::republish_from_dispatch(state);
     eprintln!(
         "[REMu][VFS] temporary data mounted guest=/temp0 host={:?}",
         mount.display()
@@ -7049,8 +7108,7 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-struct DeferredGpuPublication {
-    ticket: Option<u64>,
+pub(crate) struct DeferredGpuPublication {
     events: Vec<remu_gpu::GpuEvent>,
 }
 
@@ -7081,8 +7139,6 @@ impl DeferredGpuPublication {
     }
 }
 
-static GPU_PUBLICATION_TICKET: AtomicU64 = AtomicU64::new(0);
-static GPU_PUBLICATION_ORDER: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 static GPU_PUBLICATION_BARRIER: OnceLock<RwLock<()>> = OnceLock::new();
 
 fn trace_gpu_publication() -> bool {
@@ -7099,7 +7155,6 @@ fn begin_deferred_gpu_publication() {
             "nested GPU publication capture would lose event ordering"
         );
         *publication = Some(DeferredGpuPublication {
-            ticket: None,
             events: Vec::new(),
         });
     });
@@ -7115,19 +7170,16 @@ fn take_deferred_gpu_publication() -> DeferredGpuPublication {
 
 /// Publishes an event immediately unless the current import still owns the dispatch-state lock.
 ///
-/// The first deferred event receives a process-order ticket while that lock is held. A queue-only
-/// publication releases the ticket after joining its hardware queue's FIFO, so another queue can
-/// publish a producer while this one is backpressured. Host lifecycle and mixed publications keep
-/// the ticket through their full barrier.
+/// Deferred events are collected without drawing a process-wide publication ticket. Queue-only
+/// publications rely on `remu-gpu`'s per-queue `PublicationCoordinator` FIFO (plan C2 / R5);
+/// mixed and lifecycle publications take the process barrier in
+/// [`flush_deferred_gpu_publication`].
 fn publish_gpu_event(event: remu_gpu::GpuEvent) -> bool {
     let mut event = Some(event);
     let deferred = DEFERRED_GPU_PUBLICATION.with_borrow_mut(|publication| {
         let Some(publication) = publication.as_mut() else {
             return false;
         };
-        publication
-            .ticket
-            .get_or_insert_with(|| GPU_PUBLICATION_TICKET.fetch_add(1, Ordering::Relaxed));
         publication
             .events
             .push(event.take().expect("deferred GPU event exists"));
@@ -7144,43 +7196,23 @@ fn flush_deferred_gpu_publication_with_admission(
     publication: DeferredGpuPublication,
     admitted: impl FnOnce(),
 ) -> bool {
-    let Some(ticket) = publication.ticket else {
-        debug_assert!(publication.events.is_empty());
+    if publication.events.is_empty() {
         admitted();
         return true;
-    };
+    }
     let publication_started = Instant::now();
     let traced = trace_gpu_publication();
     let summary = traced.then(|| publication.summary());
     let started = traced.then(Instant::now);
     if let Some(summary) = &summary {
         eprintln!(
-            "[REMu][GPU][PUBLICATION] begin ticket={ticket} outer={} work={} queues={:?} thread={:?} guest={:#x}",
+            "[REMu][GPU][PUBLICATION] begin outer={} work={} queues={:?} thread={:?} guest={:#x}",
             summary.outer_events,
             summary.work_items,
             summary.queue_work_items,
             std::thread::current().name().unwrap_or("unnamed"),
             current_guest_thread_handle(),
         );
-    }
-    let order = GPU_PUBLICATION_ORDER.get_or_init(|| (Mutex::new(0), Condvar::new()));
-    let order_started = Instant::now();
-    let mut next = order
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while *next != ticket {
-        next = order
-            .1
-            .wait(next)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-    }
-    let ticket_order_wait = order_started.elapsed();
-    if traced {
-        // Paired with `begin` and `end`, this identifies the blocking stage without changing the
-        // ordered publisher: begin-without-turn is an order wait, while turn-without-end is
-        // backend publication.
-        eprintln!("[REMu][GPU][PUBLICATION] turn ticket={ticket}");
     }
     let queue_only = matches!(
         publication.events.as_slice(),
@@ -7190,6 +7222,10 @@ fn flush_deferred_gpu_publication_with_admission(
     let barrier_started = Instant::now();
     let barrier_acquire;
     let mut channel_timing = remu_gpu::GpuEventPublicationTiming::default();
+    // Queue-only publications no longer take a process-wide ticket FIFO: remu-gpu's
+    // PublicationCoordinator already enforces per-queue order, and the dispatch-lock-drawn ticket
+    // was the reason AgcState could not leave that lock (plan C2 / R5).
+    let _agc_level = agc_dispatch_state::enter_agc_lock_level();
     if queue_only {
         let _queue_publication = GPU_PUBLICATION_BARRIER
             .get_or_init(|| RwLock::new(()))
@@ -7201,16 +7237,10 @@ fn flush_deferred_gpu_publication_with_admission(
             .into_iter()
             .next()
             .expect("queue-only publication owns one event");
-        // Assign the event its queue-local sequence while this process-order turn is still held.
-        // Once assigned, independent hardware queues may enter the bounded channel concurrently;
-        // a later event on this same queue still waits for its FIFO predecessor inside `remu-gpu`.
         let (sent, timing) = remu_gpu::emit_event_with_admission_and_timing(event, move || {
-            debug_assert_eq!(*next, ticket);
-            *next = next.saturating_add(1);
-            order.1.notify_all();
             admitted();
             if traced {
-                eprintln!("[REMu][GPU][PUBLICATION] admitted ticket={ticket} queue-only=true");
+                eprintln!("[REMu][GPU][PUBLICATION] admitted queue-only=true");
             }
         });
         all_sent &= sent;
@@ -7235,13 +7265,10 @@ fn flush_deferred_gpu_publication_with_admission(
                 .bounded_send
                 .saturating_add(timing.bounded_send);
         }
-        debug_assert_eq!(*next, ticket);
-        *next = next.saturating_add(1);
-        order.1.notify_all();
     }
     if let (Some(started), Some(summary)) = (started, summary) {
         eprintln!(
-            "[REMu][GPU][PUBLICATION] end ticket={ticket} elapsed_ms={:.3} outer={} work={} queues={:?} success={all_sent}",
+            "[REMu][GPU][PUBLICATION] end elapsed_ms={:.3} outer={} work={} queues={:?} success={all_sent}",
             started.elapsed().as_secs_f64() * 1_000.0,
             summary.outer_events,
             summary.work_items,
@@ -7249,6 +7276,7 @@ fn flush_deferred_gpu_publication_with_admission(
         );
     }
     let total = publication_started.elapsed();
+    let ticket_order_wait = Duration::ZERO;
     let attributed = ticket_order_wait
         .saturating_add(barrier_acquire)
         .saturating_add(channel_timing.setup)

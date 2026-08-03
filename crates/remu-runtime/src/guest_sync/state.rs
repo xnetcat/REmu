@@ -14,7 +14,7 @@ pub(crate) struct GuestSyncState {
     pub(crate) condition_waiters: HashMap<u64, GuestConditionWaiterState>,
     pub(crate) next_condition_waiter: u64,
     pub(crate) condition_notify_count: u64,
-    pub(crate) semaphores: HashMap<u32, GuestSemaphoreState>,
+    pub(crate) semaphores: HashMap<u32, Arc<GuestSemaphoreEntry>>,
     pub(crate) next_semaphore_handle: u32,
     pub(crate) semaphore_wait_count: u64,
     pub(crate) semaphore_signal_count: u64,
@@ -192,6 +192,13 @@ pub(crate) struct GuestSemaphoreState {
     pub(crate) maximum: i32,
 }
 
+/// Per-object semaphore entry (plan C3): own mutex + condvar, registry only for lookup.
+#[derive(Debug)]
+pub(crate) struct GuestSemaphoreEntry {
+    pub(crate) state: Mutex<GuestSemaphoreState>,
+    pub(crate) wake: Condvar,
+}
+
 #[derive(Debug)]
 pub(crate) struct GuestEventFlagState {
     pub(crate) name: String,
@@ -199,6 +206,15 @@ pub(crate) struct GuestEventFlagState {
     pub(crate) bits: u64,
     pub(crate) waiters: u32,
     pub(crate) cancellation_generation: u64,
+}
+
+/// Per-object event-flag entry (plan C3 follow-up — registry still holds [`GuestEventFlagState`]
+/// directly in Solo S1; this type is the target shape).
+#[derive(Debug)]
+#[allow(dead_code)]
+pub(crate) struct GuestEventFlagEntry {
+    pub(crate) state: Mutex<GuestEventFlagState>,
+    pub(crate) wake: Condvar,
 }
 
 pub(crate) static GUEST_SYNC: OnceLock<(Mutex<GuestSyncState>, Condvar)> = OnceLock::new();
@@ -220,6 +236,8 @@ pub(super) static GUEST_MUTEX_SHARDS: OnceLock<
 pub(super) static GUEST_RWLOCK_SHARDS: OnceLock<[GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT]> =
     OnceLock::new();
 
+pub(super) static GUEST_MUTEX_BY_OBJECT: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+
 pub(crate) fn guest_sync() -> &'static (Mutex<GuestSyncState>, Condvar) {
     GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()))
 }
@@ -229,8 +247,15 @@ pub(super) fn guest_mutex_shards()
     GUEST_MUTEX_SHARDS.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashMap::new())))
 }
 
+pub(super) fn guest_mutex_object_index() -> &'static Mutex<HashMap<u64, u64>> {
+    GUEST_MUTEX_BY_OBJECT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub(super) fn guest_mutex_shard(address: u64) -> usize {
-    usize::try_from(address >> 4).unwrap_or_default() & (GUEST_MUTEX_SHARD_COUNT - 1)
+    // Multiplicative hash (Knuth/Fibonacci): 0x100-byte mutex arrays previously collapsed
+    // `(address >> 4) & 63` onto a handful of shards (plan C3 / B16).
+    let hash = address.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    usize::try_from(hash >> (64 - 6)).unwrap_or_default()
 }
 
 pub(super) fn guest_rwlock_shards() -> &'static [GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT] {
@@ -238,5 +263,6 @@ pub(super) fn guest_rwlock_shards() -> &'static [GuestRwlockShard; GUEST_RWLOCK_
 }
 
 pub(super) fn guest_rwlock_shard(address: u64) -> usize {
-    usize::try_from(address >> 4).unwrap_or_default() & (GUEST_RWLOCK_SHARD_COUNT - 1)
+    let hash = address.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    usize::try_from(hash >> (64 - 6)).unwrap_or_default()
 }

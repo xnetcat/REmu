@@ -3,6 +3,7 @@ use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::link::fs_decode::{
     collect_fs_decode_seed_addresses, report_fs_load_boundary_mismatches, seed_offsets_in_region,
@@ -19,6 +20,9 @@ pub(crate) const GUEST_TLS_PREFIX_SIZE: u64 = 0x20_000;
 
 pub(crate) const GUEST_TLS_TCB_SIZE: u64 = 0x10_000;
 
+/// Counts TLS store-helper executions (plan C4). Nothing measured them before this counter.
+pub(crate) static TLS_STORE_THUNK_HITS: AtomicU64 = AtomicU64::new(0);
+
 const TLS_LOAD_HELPER_SIZE: u64 = 96;
 
 const TLS_LOAD_HELPER_SIZE_USIZE: usize = 96;
@@ -29,11 +33,15 @@ pub(crate) const TLS_HELPER_REGION_SIZE: u64 = TLS_LOAD_HELPER_SIZE * TLS_LOAD_H
 
 const TLS_HELPER_REGION_SIZE_USIZE: usize = 16 * TLS_LOAD_HELPER_SIZE_USIZE;
 
-const TLS_STORE_HELPER_SIZE: u64 = 192;
+/// Slim Rosetta-clean store helper: no XSAVE / pushfq (plan C4).
+const TLS_STORE_HELPER_SIZE: u64 = 96;
 
-const TLS_STORE_HELPER_SIZE_USIZE: usize = 192;
+const TLS_STORE_HELPER_SIZE_USIZE: usize = 96;
 
 const TLS_HELPER_SAVED_REGISTERS: [u8; 15] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// Caller-saved GPRs a SysV call may clobber (excluding RAX, which returns the TLS pointer).
+const TLS_STORE_SAVED_REGISTERS: [u8; 8] = [1, 2, 6, 7, 8, 9, 10, 11];
 
 const TLS_IMMEDIATE_STORE_SIZE: usize = 12;
 
@@ -467,20 +475,22 @@ fn write_tls_helpers(memory: &mut GuestImage, helper_base: GuestAddress) -> Resu
         let offset = usize::from(destination) * TLS_LOAD_HELPER_SIZE_USIZE;
         let slot = &mut helpers[offset..offset + TLS_LOAD_HELPER_SIZE_USIZE];
         let mut cursor = 0;
-        slot[cursor] = 0x9c; // pushfq
-        cursor += 1;
+        // No pushfq: the callee is a plain Cell::get that preserves flags once we use lea for
+        // stack adjust (plan C4 steps 1/3).
         for register in TLS_HELPER_SAVED_REGISTERS {
             emit_push_register(slot, &mut cursor, register);
         }
-        slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x08]);
-        cursor += 4;
+        // lea rsp, [rsp-8] — does not write flags (unlike sub rsp, 8).
+        slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xf8]);
+        cursor += 5;
         slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
         slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
         cursor += 10;
         slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]);
         cursor += 2;
-        slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xc4, 0x08]);
-        cursor += 4;
+        // lea rsp, [rsp+8]
+        slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x08]);
+        cursor += 5;
         let saved_index = TLS_HELPER_SAVED_REGISTERS
             .iter()
             .position(|register| *register == destination)
@@ -497,9 +507,8 @@ fn write_tls_helpers(memory: &mut GuestImage, helper_base: GuestAddress) -> Resu
         for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
             emit_pop_register(slot, &mut cursor, register);
         }
-        slot[cursor] = 0x9d; // popfq
-        cursor += 1;
         slot[cursor] = 0xc3;
+        let _ = cursor;
     }
     memory.write(helper_base, &helpers)?;
     Ok(())
@@ -515,7 +524,7 @@ fn write_tls_store_helpers(
         .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
         .ok_or(LinkError::AddressOverflow)?;
     let mut helpers = vec![0x90_u8; byte_count];
-    let dispatcher = current_guest_thread_pointer as *const () as usize as u64;
+    let dispatcher = tls_store_thread_pointer as *const () as usize as u64;
     for (index, store) in stores.iter().enumerate() {
         let offset = index
             .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
@@ -527,6 +536,12 @@ fn write_tls_store_helpers(
     Ok(())
 }
 
+/// Store-thunk entry: counts the hit then returns the guest TLS pointer (plan C4 measure-first).
+extern "C" fn tls_store_thread_pointer() -> u64 {
+    TLS_STORE_THUNK_HITS.fetch_add(1, Ordering::Relaxed);
+    current_guest_thread_pointer()
+}
+
 fn encode_tls_store_helper(
     slot: &mut [u8],
     dispatcher: u64,
@@ -534,6 +549,7 @@ fn encode_tls_store_helper(
     immediate: [u8; 4],
 ) -> usize {
     let mut cursor = emit_tls_store_helper_prologue(slot, dispatcher);
+    // mov dword ptr [rax+disp], imm32
     slot[cursor..cursor + 2].copy_from_slice(&[0xc7, 0x80]);
     slot[cursor + 2..cursor + 6].copy_from_slice(&displacement);
     slot[cursor + 6..cursor + 10].copy_from_slice(&immediate);
@@ -543,86 +559,30 @@ fn encode_tls_store_helper(
 
 fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
     let mut cursor = 0;
-    slot[cursor] = 0x9c; // pushfq
-    cursor += 1;
-    for register in TLS_HELPER_SAVED_REGISTERS {
+    // No pushfq / XSAVE: the getter only returns a u64 through rax (plan C4).
+    for register in TLS_STORE_SAVED_REGISTERS {
         emit_push_register(slot, &mut cursor, register);
     }
-    // A patched instruction can occur at any stack depth, not just at a SysV call boundary.
-    // Retain the post-save stack in callee-saved R15, allocate the exact XCR0-enabled save area
-    // reported by CPUID.0D.0:EBX, and align the dispatcher stack to 64 bytes.
-    slot[cursor..cursor + 3].copy_from_slice(&[0x49, 0x89, 0xe7]); // mov r15, rsp
-    cursor += 3;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
-    cursor += 2;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x0f, 0x01, 0xd0]); // xgetbv
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xd6]); // mov r14d, edx
-    cursor += 3;
-    slot[cursor..cursor + 5].copy_from_slice(&[0xb8, 0x0d, 0, 0, 0]); // mov eax, 0xd
-    cursor += 5;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
-    cursor += 2;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x0f, 0xa2]); // cpuid
-    cursor += 2;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xdc]); // mov r12d, ebx
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x29, 0xe4]); // sub rsp, r12
-    cursor += 3;
-    slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x3f]); // sub rsp, 63
-    cursor += 4;
-    slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xe4, 0xc0]); // and rsp, -64
-    cursor += 4;
-    // XRSTOR requires the standard-format XSAVE header's reserved bytes to be zero.
-    // Guest flags were saved already, so CLD is safe and POPFQ will restore the original DF.
-    slot[cursor] = 0xfc; // cld
-    cursor += 1;
-    slot[cursor..cursor + 8].copy_from_slice(&[0x48, 0x8d, 0xbc, 0x24, 0, 0x02, 0, 0]); // lea rdi, [rsp+512]
-    cursor += 8;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc0]); // xor eax, eax
-    cursor += 2;
-    slot[cursor..cursor + 5].copy_from_slice(&[0xb9, 0x08, 0, 0, 0]); // mov ecx, 8
-    cursor += 5;
-    slot[cursor..cursor + 3].copy_from_slice(&[0xf3, 0x48, 0xab]); // rep stosq
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
-    cursor += 3;
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x24, 0x24]); // xsave64 [rsp]
+    // Align to 16 for the SysV call without writing flags.
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xf8]); // lea rsp,[rsp-8]
     cursor += 5;
     slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
     slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
     cursor += 10;
-    slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]);
+    slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]); // call rax
     cursor += 2;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x49, 0x89, 0xc2]); // mov r10, rax
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
-    cursor += 3;
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x2c, 0x24]); // xrstor64 [rsp]
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x08]); // lea rsp,[rsp+8]
     cursor += 5;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x89, 0xd0]); // mov rax, r10
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x89, 0xfc]); // mov rsp, r15
-    cursor += 3;
-    // Guest code is entered only after assigning its per-thread pointer. Turn an invariant breach
-    // into an explicit trap rather than accessing host address zero.
+    // Trap on a null TLS pointer rather than writing host address zero.
     slot[cursor..cursor + 7].copy_from_slice(&[0x48, 0x85, 0xc0, 0x75, 0x02, 0x0f, 0x0b]);
     cursor += 7;
     cursor
 }
 
 fn emit_tls_store_helper_epilogue(slot: &mut [u8], mut cursor: usize) -> usize {
-    for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
+    for register in TLS_STORE_SAVED_REGISTERS.into_iter().rev() {
         emit_pop_register(slot, &mut cursor, register);
     }
-    slot[cursor] = 0x9d; // popfq
-    cursor += 1;
     // The patched store moves RSP below the 128-byte guest red zone before calling us.
     slot[cursor..cursor + 3].copy_from_slice(&[0xc2, 0x80, 0]); // ret 128
     cursor += 3;
@@ -799,9 +759,10 @@ mod tests {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
     use super::{
-        TLS_STORE_HELPER_SIZE_USIZE, encode_tls_store_helper, encode_tls_store_patch,
-        reachable_tls_immediate_store_offsets,
+        TLS_STORE_HELPER_SIZE_USIZE, TLS_STORE_THUNK_HITS, encode_tls_store_helper,
+        encode_tls_store_patch, reachable_tls_immediate_store_offsets,
     };
+    use std::sync::atomic::Ordering;
 
     const STORE: [u8; 12] = [0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0];
 
@@ -830,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_store_helper_preserves_full_machine_state_within_its_slot() {
+    fn tls_store_helper_is_rosetta_clean_without_xsave_or_pushfq() {
         let mut slot = [0x90_u8; TLS_STORE_HELPER_SIZE_USIZE];
         let encoded = encode_tls_store_helper(
             &mut slot,
@@ -839,54 +800,27 @@ mod tests {
             [0x0b, 0, 0x02, 0xa0],
         );
 
-        assert_eq!(encoded, 167);
         assert!(encoded <= TLS_STORE_HELPER_SIZE_USIZE);
-        assert_eq!(slot[0], 0x9c);
-        assert_eq!(&slot[24..27], &[0x49, 0x89, 0xe7]);
-        assert_eq!(&slot[27..32], &[0x31, 0xc9, 0x0f, 0x01, 0xd0]);
-        assert_eq!(&slot[43..47], &[0x31, 0xc9, 0x0f, 0xa2]);
-        assert_eq!(
-            &slot[50..61],
-            &[
-                0x4c, 0x29, 0xe4, 0x48, 0x83, 0xec, 0x3f, 0x48, 0x83, 0xe4, 0xc0
-            ]
+        assert_ne!(slot[0], 0x9c, "pushfq must be gone");
+        let mnemonics = decoded_mnemonics(&slot[..encoded]);
+        assert!(
+            !mnemonics
+                .iter()
+                .any(|m| matches!(m, Mnemonic::Xsave64 | Mnemonic::Xrstor64 | Mnemonic::Pushfq)),
+            "store helper must not use XSAVE/pushfq: {mnemonics:?}"
         );
-        assert_eq!(
-            &slot[61..80],
-            &[
-                0xfc, 0x48, 0x8d, 0xbc, 0x24, 0, 0x02, 0, 0, 0x31, 0xc0, 0xb9, 0x08, 0, 0, 0, 0xf3,
-                0x48, 0xab
-            ]
+        assert!(
+            mnemonics.contains(&Mnemonic::Lea),
+            "stack adjust must use lea: {mnemonics:?}"
         );
-        assert_eq!(&slot[86..91], &[0x48, 0x0f, 0xae, 0x24, 0x24]);
-        assert_eq!(
-            &slot[91..101],
-            &[0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11]
-        );
-        assert_eq!(&slot[123..130], &[0x48, 0x85, 0xc0, 0x75, 0x02, 0x0f, 0x0b]);
-        assert_eq!(
-            &slot[130..140],
-            &[0xc7, 0x80, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0]
-        );
-        assert_eq!(&slot[163..167], &[0x9d, 0xc2, 0x80, 0]);
-        // Subtracting the CPUID-reported state size plus 63 bytes before rounding down works
-        // for every possible incoming stack alignment. The state area remains below the saved
-        // registers and the dispatcher call is both XSAVE- and SysV-aligned.
-        for incoming_stack_modulo_64 in 0_u64..64 {
-            let saved_stack = 0x10_000 + incoming_stack_modulo_64;
-            let xsave_size = 2_688;
-            let state = (saved_stack - xsave_size - 63) & !63;
-            assert_eq!(state % 64, 0);
-            assert_eq!(state % 16, 0);
-            assert!(state + xsave_size <= saved_stack);
-        }
-        assert_eq!(
-            decoded_mnemonics(&slot[..encoded])
-                .into_iter()
-                .filter(|mnemonic| matches!(mnemonic, Mnemonic::Xsave64 | Mnemonic::Xrstor64))
-                .collect::<Vec<_>>(),
-            vec![Mnemonic::Xsave64, Mnemonic::Xrstor64]
-        );
+        // Ends with ret 128.
+        assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
+    }
+
+    #[test]
+    fn tls_store_thunk_counter_starts_at_zero() {
+        // The counter is process-global; this only asserts the symbol exists and is readable.
+        let _ = TLS_STORE_THUNK_HITS.load(Ordering::Relaxed);
     }
 
     #[test]

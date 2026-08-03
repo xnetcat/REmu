@@ -20,9 +20,8 @@ use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_ALREADY_EXISTS, SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NOT_DIRECTORY, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_PERMISSION_DENIED,
-    SCE_KERNEL_STAT_SIZE, low_i32, low_u32, read_guest_cstring, save_data_mount_is_writable,
-    sce_kernel_error, sce_kernel_io_error, signed_i32_return, trace_guest_vfs,
-    trace_guest_vfs_miss, write_guest_bytes, write_guest_u64,
+    SCE_KERNEL_STAT_SIZE, low_i32, low_u32, read_guest_cstring, sce_kernel_error, sce_kernel_io_error,
+    signed_i32_return, trace_guest_vfs, trace_guest_vfs_miss, write_guest_bytes, write_guest_u64,
 };
 
 pub(crate) static KERNEL_FILES: OnceLock<Mutex<KernelFileState>> = OnceLock::new();
@@ -131,10 +130,24 @@ impl KernelDirectory {
 }
 
 pub(crate) fn guest_kernel_rmdir(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    guest_kernel_rmdir_resolved(arguments, |path| resolve_probe_guest_path(state, path))
+}
+
+pub(crate) fn guest_kernel_rmdir_prelock(arguments: [u64; 6]) -> u64 {
+    let roots = crate::path_roots::load_path_roots();
+    guest_kernel_rmdir_resolved(arguments, |path| {
+        resolve_probe_guest_path_from_roots(&roots, path)
+    })
+}
+
+fn guest_kernel_rmdir_resolved(
+    arguments: [u64; 6],
+    resolve: impl FnOnce(&str) -> Option<(PathBuf, bool)>,
+) -> u64 {
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
-    let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
+    let Some((host_path, writable)) = resolve(&guest_path) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     if !writable {
@@ -170,10 +183,24 @@ fn report_read_only_directory_write(operation: &str, guest_path: &str) {
 }
 
 pub(crate) fn guest_kernel_mkdir(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    guest_kernel_mkdir_resolved(arguments, |path| resolve_probe_guest_path(state, path))
+}
+
+pub(crate) fn guest_kernel_mkdir_prelock(arguments: [u64; 6]) -> u64 {
+    let roots = crate::path_roots::load_path_roots();
+    guest_kernel_mkdir_resolved(arguments, |path| {
+        resolve_probe_guest_path_from_roots(&roots, path)
+    })
+}
+
+fn guest_kernel_mkdir_resolved(
+    arguments: [u64; 6],
+    resolve: impl FnOnce(&str) -> Option<(PathBuf, bool)>,
+) -> u64 {
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
-    let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
+    let Some((host_path, writable)) = resolve(&guest_path) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     if !writable {
@@ -542,6 +569,15 @@ pub(crate) fn resolve_probe_guest_path(
         .map(|resolved| (resolved.path, resolved.writable))
 }
 
+/// Path resolution against a published [`crate::path_roots::PathRoots`] snapshot (C2 pre-lock).
+pub(crate) fn resolve_probe_guest_path_from_roots(
+    roots: &crate::path_roots::PathRoots,
+    guest_path: &str,
+) -> Option<(PathBuf, bool)> {
+    resolve_probe_guest_path_with_presence_from_roots(roots, guest_path)
+        .map(|resolved| (resolved.path, resolved.writable))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ResolvedProbeGuestPath {
     pub(crate) path: PathBuf,
@@ -551,6 +587,35 @@ pub(crate) struct ResolvedProbeGuestPath {
 
 pub(crate) fn resolve_probe_guest_path_with_presence(
     state: &ProbeDispatchState,
+    guest_path: &str,
+) -> Option<ResolvedProbeGuestPath> {
+    resolve_probe_guest_path_with_presence_from_parts(
+        &state.game_root,
+        &state.save_mounts,
+        &state.vfs,
+        &state.prepared_save_resources,
+        guest_path,
+    )
+}
+
+pub(crate) fn resolve_probe_guest_path_with_presence_from_roots(
+    roots: &crate::path_roots::PathRoots,
+    guest_path: &str,
+) -> Option<ResolvedProbeGuestPath> {
+    resolve_probe_guest_path_with_presence_from_parts(
+        &roots.game_root,
+        &roots.save_mounts,
+        &roots.vfs,
+        &roots.prepared_save_resources,
+        guest_path,
+    )
+}
+
+fn resolve_probe_guest_path_with_presence_from_parts(
+    game_root: &Path,
+    save_mounts: &std::collections::BTreeMap<String, crate::SaveDataMount>,
+    vfs: &crate::vfs::VfsState,
+    prepared_save_resources: &std::collections::BTreeSet<u32>,
     guest_path: &str,
 ) -> Option<ResolvedProbeGuestPath> {
     let normalized = normalized_guest_path(guest_path);
@@ -564,13 +629,15 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
     // Static namespaces (`/app0`, `/download0`, `/temp0`) live in the VfsMount table (G2).
     // Save-data mounts stay on `save_mounts` because Prepare retargets their host root and
     // writability depends on the transaction resource — folding that into VfsMount is a later seam.
-    if let Some(mount) = state.vfs.find_mount(&normalized)
+    if let Some(mount) = vfs.find_mount(&normalized)
         && !matches!(mount.policy.kind, crate::vfs::VfsMountKind::SaveData)
     {
         return crate::vfs::resolve_via_vfs_mount(mount, &normalized);
     }
-    for (mount_point, mounted) in &state.save_mounts {
-        let writable = save_data_mount_is_writable(mounted, state);
+    for (mount_point, mounted) in save_mounts {
+        let writable = !mounted.read_only
+            && mounted.resource != u32::MAX
+            && prepared_save_resources.contains(&mounted.resource);
         if normalized == *mount_point {
             return Some(ResolvedProbeGuestPath {
                 path: mounted.path.clone(),
@@ -591,7 +658,7 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
             });
         }
     }
-    resolve_normalized_app_path_with_presence(&state.game_root, &normalized).map(|resolved| {
+    resolve_normalized_app_path_with_presence(game_root, &normalized).map(|resolved| {
         ResolvedProbeGuestPath {
             path: resolved.path,
             writable: false,
@@ -720,7 +787,22 @@ pub(crate) fn guest_fread(destination: u64, size: u64, count: u64, handle: u64) 
     }
 }
 
-pub(crate) fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+pub(crate) fn guest_kernel_open(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    guest_kernel_open_with_resolver(arguments, |path| resolve_probe_guest_path(state, path))
+}
+
+/// Pre-lock `sceKernelOpen` against the published path-roots snapshot (plan C2).
+pub(crate) fn guest_kernel_open_prelock(arguments: [u64; 6]) -> u64 {
+    let roots = crate::path_roots::load_path_roots();
+    guest_kernel_open_with_resolver(arguments, |path| {
+        resolve_probe_guest_path_from_roots(&roots, path)
+    })
+}
+
+fn guest_kernel_open_with_resolver(
+    arguments: [u64; 6],
+    resolve: impl FnOnce(&str) -> Option<(PathBuf, bool)>,
+) -> u64 {
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
@@ -729,7 +811,7 @@ pub(crate) fn guest_kernel_open(arguments: [u64; 6], state: &mut ProbeDispatchSt
     if access == 0x3 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some((host_path, writable)) = resolve_probe_guest_path(state, &guest_path) else {
+    let Some((host_path, writable)) = resolve(&guest_path) else {
         if let Some(miss) = trace_guest_vfs_miss() {
             eprintln!("[REMu][VFS] miss={miss} sceKernelOpen rejected guest={guest_path:?}");
         }
@@ -872,13 +954,29 @@ pub(crate) fn guest_kernel_getdents(arguments: [u64; 6], report_position: bool) 
 }
 
 pub(crate) fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    guest_kernel_stat_resolved(arguments, |path| {
+        resolve_probe_guest_path_with_presence(state, path)
+    })
+}
+
+pub(crate) fn guest_kernel_stat_prelock(arguments: [u64; 6]) -> u64 {
+    let roots = crate::path_roots::load_path_roots();
+    guest_kernel_stat_resolved(arguments, |path| {
+        resolve_probe_guest_path_with_presence_from_roots(&roots, path)
+    })
+}
+
+fn guest_kernel_stat_resolved(
+    arguments: [u64; 6],
+    resolve: impl FnOnce(&str) -> Option<ResolvedProbeGuestPath>,
+) -> u64 {
     if arguments[1] == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     }
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
-    let Some(resolved) = resolve_probe_guest_path_with_presence(state, &guest_path) else {
+    let Some(resolved) = resolve(&guest_path) else {
         if let Some(miss) = trace_guest_vfs_miss() {
             eprintln!("[REMu][VFS] miss={miss} sceKernelStat rejected guest={guest_path:?}");
         }

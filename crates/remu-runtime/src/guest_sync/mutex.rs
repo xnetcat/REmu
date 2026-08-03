@@ -22,6 +22,7 @@ use super::{
     GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
     guest_mutex_shards, guest_sync,
 };
+use super::state::guest_mutex_object_index;
 
 const GUEST_MUTEX_ENTRY_CACHE_SIZE: usize = 16;
 
@@ -80,14 +81,17 @@ pub(crate) fn guest_mutex_entry(address: u64, create: bool) -> Option<Arc<GuestM
         return Some(entry);
     }
     drop(shard);
-    for candidate in guest_mutex_shards() {
-        let candidate = candidate
+    // Secondary index: guest_object → storage address (plan C3). Replaces the 64-shard linear scan.
+    if let Some(storage) = guest_mutex_object_index()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&address)
+        .copied()
+    {
+        let shard = guest_mutex_shards()[guest_mutex_shard(storage)]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = candidate
-            .values()
-            .find(|entry| entry.guest_object != 0 && entry.guest_object == address)
-        {
+        if let Some(entry) = shard.get(&storage) {
             let entry = entry.clone();
             cache_guest_mutex_entry(address, &entry);
             return Some(entry);
@@ -212,6 +216,10 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
     cache_guest_mutex_entry(address, &entry);
     if guest_object != 0 {
         write_guest_u64(address, guest_object);
+        guest_mutex_object_index()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(guest_object, address);
     }
     0
 }
@@ -277,6 +285,10 @@ pub(crate) fn guest_mutex_destroy(address: u64) -> u64 {
     let guest_object = entry.guest_object;
     drop(shard);
     if guest_object != 0 {
+        guest_mutex_object_index()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&guest_object);
         write_guest_u64(storage_address, 0);
         guest_free(guest_object);
     }

@@ -38,10 +38,14 @@ pub(crate) use self::rwlock::{
 };
 pub(crate) use self::semaphore::guest_semaphore_wait;
 #[cfg(test)]
+pub(crate) use self::semaphore::guest_semaphore_entry;
+#[cfg(test)]
 pub(crate) use self::state::GuestConditionState;
+pub(crate) use self::state::{GuestEventFlagState, guest_sync};
+#[cfg(test)]
+pub(crate) use self::state::GuestSemaphoreState;
 #[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use self::state::{GUEST_SYNC, GuestSyncState};
-pub(crate) use self::state::{GuestEventFlagState, GuestSemaphoreState, guest_sync};
 
 use self::event_flag::{
     guest_event_flag_cancel, guest_event_flag_clear, guest_event_flag_create,

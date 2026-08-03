@@ -62,7 +62,6 @@ fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
 #[test]
 fn gpu_publication_summary_separates_queue_work_from_outer_events() {
     let publication = crate::DeferredGpuPublication {
-        ticket: Some(7),
         events: vec![
             remu_gpu::GpuEvent::QueueSubmission {
                 queue_id: 0,
@@ -144,7 +143,7 @@ fn gpu_publication_backpressure_releases_dispatch_state_and_preserves_ticket_ord
     assert_eq!(
         second_done_rx.recv_timeout(Duration::from_millis(20)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout),
-        "a later ticket must not overtake the blocked publisher"
+        "a later mixed publication must not overtake the blocked publisher"
     );
 
     assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
@@ -164,7 +163,7 @@ fn gpu_publication_backpressure_releases_dispatch_state_and_preserves_ticket_ord
     assert_eq!(
         receiver.recv(),
         Ok(remu_gpu::GpuEvent::SubmissionBoundary(0xa11)),
-        "the first publication must retain its ticket order"
+        "the first publication must retain barrier order"
     );
     remu_gpu::record_gpu_event_consumed();
     remu_gpu::record_gpu_work_item_processed();
@@ -176,7 +175,7 @@ fn gpu_publication_backpressure_releases_dispatch_state_and_preserves_ticket_ord
     assert_eq!(
         receiver.recv(),
         Ok(remu_gpu::GpuEvent::SubmissionBoundary(0xb22)),
-        "the later publication must follow the earlier ticket"
+        "the later publication must follow the earlier barrier holder"
     );
     remu_gpu::record_gpu_event_consumed();
     remu_gpu::record_gpu_work_item_processed();

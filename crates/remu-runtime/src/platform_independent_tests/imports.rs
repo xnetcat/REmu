@@ -322,10 +322,7 @@ fn pending_guest_exception_interrupts_event_flag_and_semaphore_waits() {
         .semaphores
         .insert(
             SEMAPHORE,
-            crate::GuestSemaphoreState {
-                count: 0,
-                maximum: 1,
-            },
+            crate::guest_semaphore_entry(0, 1),
         );
     crate::guest_exception_delivery()
         .lock()
