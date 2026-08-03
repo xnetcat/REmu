@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::cell::RefCell;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 
@@ -22,6 +24,9 @@ use super::{
 };
 
 const GUEST_MUTEX_ENTRY_CACHE_SIZE: usize = 16;
+
+#[cfg(test)]
+pub(crate) static GUEST_MUTEX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     /// Per-host-thread cache for the guest mutexes that thread is actively using.
@@ -53,7 +58,8 @@ fn cache_guest_mutex_entry(address: u64, entry: &Arc<GuestMutexEntry>) {
     static LOGGED: Once = Once::new();
     LOGGED.call_once(|| {
         eprintln!(
-            "[REMu][PTHREAD] mutex lookup cache enabled slots={GUEST_MUTEX_ENTRY_CACHE_SIZE}"
+            "[REMu][PTHREAD] mutex lookup cache enabled slots={GUEST_MUTEX_ENTRY_CACHE_SIZE} \
+             uncontended-wake-elision=true"
         );
     });
     GUEST_MUTEX_ENTRY_CACHE.with_borrow_mut(|cache| {
@@ -399,7 +405,16 @@ pub(crate) fn guest_mutex_unlock(address: u64) -> u64 {
             mutex.owner = None;
             mutex.owner_guest_thread = 0;
             mutex.recursion = 0;
-            entry.wake.notify_one();
+            // `waiters` is protected by the same state mutex used by the condition wait. A
+            // contender increments it before atomically releasing that mutex in `Condvar::wait`,
+            // so observing zero here proves that there is no sleeper (or waiter transitioning to
+            // sleep) to notify. Avoiding the unconditional host condition signal matters for
+            // engines that take tens of thousands of uncontended guest locks per second.
+            if mutex.waiters != 0 {
+                #[cfg(test)]
+                GUEST_MUTEX_WAKE_COUNT.fetch_add(1, Ordering::Relaxed);
+                entry.wake.notify_one();
+            }
         }
         return 0;
     }
