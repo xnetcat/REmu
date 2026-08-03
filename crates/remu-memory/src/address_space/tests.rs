@@ -860,6 +860,72 @@ fn gpu_backing_read_mapping_cache_stays_bounded() {
 }
 
 #[test]
+fn repeated_backing_writes_reuse_a_cached_writable_mapping() {
+    // Every writeback used to mmap and munmap a fresh window; a commit-heavy title publishing
+    // per-row texture writebacks paid two syscalls per row. Mirror the read cache so a hot
+    // physical window is mapped once and reused.
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    assert!(backing.write_all_at(0, b"first"));
+    assert_eq!(
+        backing.write_mapping_cache_stats(),
+        (1, 0, 1),
+        "the first write installs the writable window as a miss"
+    );
+    assert!(backing.write_all_at(8, b"second"));
+    assert_eq!(
+        backing.write_mapping_cache_stats(),
+        (1, 1, 1),
+        "a second write to the same page reuses the cached window without a new mmap"
+    );
+
+    // The cached MAP_SHARED window stays coherent with the read path over the same object.
+    let mut bytes = [0_u8; 6];
+    assert!(backing.read_exact_at(8, &mut bytes));
+    assert_eq!(&bytes, b"second");
+}
+
+#[test]
+fn backing_reads_and_writes_refuse_out_of_range_offsets() {
+    // M3 fault injection: the size check is the enforcer that keeps the unsafe mmap/copy in
+    // backing.rs from ever seeing an offset outside the object. Every out-of-range request must be
+    // rejected before any unsafe code runs, and in-range neighbours must still succeed.
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mut scratch = [0_u8; 8];
+
+    // Offset at the very end, and one that overflows u64, are rejected without a mapping.
+    assert!(!backing.write_all_at(GUEST_PAGE_SIZE, b"x"));
+    assert!(!backing.read_exact_at(GUEST_PAGE_SIZE, &mut scratch[..1]));
+    assert!(!backing.write_all_at(u64::MAX, b"x"));
+    assert!(!backing.read_exact_at(u64::MAX, &mut scratch[..1]));
+    // A write that starts in range but runs past the end is rejected whole.
+    assert!(!backing.write_all_at(GUEST_PAGE_SIZE - 4, &[0_u8; 8]));
+    assert_eq!(
+        backing.write_mapping_cache_stats(),
+        (0, 0, 0),
+        "a rejected write never installs a cached window"
+    );
+
+    // The last in-range bytes still round-trip.
+    assert!(backing.write_all_at(GUEST_PAGE_SIZE - 8, b"tailend!"));
+    assert!(backing.read_exact_at(GUEST_PAGE_SIZE - 8, &mut scratch));
+    assert_eq!(&scratch, b"tailend!");
+}
+
+#[test]
+fn backing_write_mapping_cache_stays_bounded() {
+    const PAGE_COUNT: u64 = 257;
+    let backing = GuestPhysicalBacking::new(PAGE_COUNT * GUEST_PAGE_SIZE).unwrap();
+    for page_index in 0..PAGE_COUNT {
+        assert!(backing.write_all_at(page_index * GUEST_PAGE_SIZE, b"x"));
+    }
+    assert_eq!(
+        backing.write_mapping_cache_stats(),
+        (256, 0, PAGE_COUNT),
+        "the least-recently-used writable window is retired at the fixed entry limit",
+    );
+}
+
+#[test]
 fn gpu_backing_alias_enumeration_tracks_aliases_and_remaps() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
@@ -1243,6 +1309,67 @@ fn separately_committed_adjacent_pages_resolve_as_one_backing_run() {
             byte_count: 4 * GUEST_PAGE_SIZE,
         }]),
         "separate adjacent commits coalesce into one write-watch alias"
+    );
+
+    // N1: the two separate commits must collapse to exactly one registry record, not one per
+    // mprotect. A commit-heavy title otherwise leaves the resolution scans walking one record per
+    // page. The backing id is this test's own, so the count is unaffected by concurrent tests.
+    let backing_id = guest_shared_mapping_identity(reserved.get(), GUEST_PAGE_SIZE)
+        .expect("committed pages have a backing identity")
+        .backing_id;
+    assert_eq!(
+        super::shared::shared_backing_record_count(backing_id),
+        1,
+        "adjacent contiguous commits collapse to a single coalesced record"
+    );
+}
+
+#[test]
+fn the_backing_index_stays_consistent_across_commit_split_and_release() {
+    // N2: the `by_backing` secondary index must track exactly the live records naming a backing as
+    // ranges are committed, split by a decommit hole, and released. A stale index entry would make
+    // a resolution scan visit a record the address map no longer holds.
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let reserved = memory
+        .reserve(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    memory
+        .protect(reserved, 4 * GUEST_PAGE_SIZE, GuestProtection::READ_WRITE)
+        .unwrap();
+    let backing_id = guest_shared_mapping_identity(reserved.get(), GUEST_PAGE_SIZE)
+        .expect("committed pages have a backing identity")
+        .backing_id;
+    assert_eq!(
+        super::shared::shared_backing_record_count(backing_id),
+        1,
+        "one contiguous commit is one indexed record"
+    );
+
+    // Punching a hole in the middle splits the record into two disjoint runs; the index must show
+    // both, and a resolution across the hole must fail while each side still resolves.
+    memory.unmap(page(reserved, 1), GUEST_PAGE_SIZE).unwrap();
+    assert_eq!(
+        super::shared::shared_backing_record_count(backing_id),
+        2,
+        "a decommit hole splits the run into two indexed records"
+    );
+    assert_eq!(
+        guest_shared_mapping_identity(reserved.get(), 4 * GUEST_PAGE_SIZE),
+        None,
+        "the hole severs resolution across the range"
+    );
+    assert!(guest_shared_mapping_identity(page(reserved, 2).get(), 2 * GUEST_PAGE_SIZE).is_some());
+
+    // Releasing the whole space retires every record, so the index forgets the backing entirely.
+    drop(memory);
+    assert_eq!(
+        super::shared::shared_backing_record_count(backing_id),
+        0,
+        "releasing the address space empties the backing index"
     );
 }
 

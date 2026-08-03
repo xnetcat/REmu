@@ -36,6 +36,7 @@ pub(super) enum FaultReason {
     AddressConversion,
     LengthConversion,
     ProtectFailed,
+    MaterializeFailed,
     IllegalInstruction,
 }
 
@@ -49,6 +50,7 @@ impl FaultReason {
             Self::AddressConversion => b"address-conversion-failed",
             Self::LengthConversion => b"length-conversion-failed",
             Self::ProtectFailed => b"mprotect-failed",
+            Self::MaterializeFailed => b"read-watch-materialize-failed",
         }
     }
 }

@@ -14,14 +14,26 @@ pub(super) fn protect_page(page_address: u64, read_only: bool) -> io::Result<()>
 }
 
 pub(super) fn protect_range(address: u64, byte_count: u64, read_only: bool) -> io::Result<()> {
+    let protection = libc::PROT_READ | if read_only { 0 } else { libc::PROT_WRITE };
+    protect_range_with(address, byte_count, protection)
+}
+
+/// Removes all access so a guest READ (not only a write) faults into the watch handler.
+///
+/// This is the arming protection for a D5 read-watch: a GPU-written range stays stale and
+/// unreadable until the first guest read faults and the handler materializes the bytes.
+pub(super) fn protect_range_no_access(address: u64, byte_count: u64) -> io::Result<()> {
+    protect_range_with(address, byte_count, libc::PROT_NONE)
+}
+
+fn protect_range_with(address: u64, byte_count: u64, protection: i32) -> io::Result<()> {
     let address = usize::try_from(address)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "page address does not fit"))?
         as *mut c_void;
     let byte_count = usize::try_from(byte_count)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "byte count does not fit"))?;
-    let protection = libc::PROT_READ | if read_only { 0 } else { libc::PROT_WRITE };
     // SAFETY: CpuWriteWatch's contract keeps every registered page live and permits exactly these
-    // read-only/read-write transitions.
+    // no-access/read-only/read-write transitions.
     if unsafe { libc::mprotect(address, byte_count, protection) } != 0 {
         return Err(io::Error::last_os_error());
     }

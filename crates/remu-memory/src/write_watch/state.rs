@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use super::page::{
     HOST_PAGE_SIZE, align_down, align_up, host_page_size_infallible, protect_page, protect_range,
+    protect_range_no_access,
 };
 use super::snapshot::publish_snapshot;
 
@@ -18,6 +19,12 @@ pub(super) struct WatchedPage {
     pub(super) address: u64,
     pub(super) dirty: AtomicBool,
     pub(super) armed: AtomicBool,
+    /// Read-watch only: whether the page's GPU-written bytes have been materialized into guest
+    /// memory. A freshly armed read-watch page is unmaterialized (stale); the first faulting guest
+    /// read materializes it, and a faulting guest write marks it materialized without a copy
+    /// because the guest is overwriting the stale bytes anyway. Always `true` for a write-watch
+    /// page, whose semantics do not involve materialization.
+    pub(super) materialized: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -26,11 +33,34 @@ pub(super) struct WatchedRange {
     pub(super) address: u64,
     pub(super) byte_count: u64,
     pub(super) precise_tracking: bool,
+    /// A read-watch arms its pages with no access so a guest READ faults and materializes the
+    /// GPU-written bytes on demand (audit D5). A plain write-watch arms read-only and only writes
+    /// fault. Read-watches are always precise and never demote.
+    pub(super) read_watch: bool,
     pub(super) generation: AtomicU64,
     pub(super) dirty: AtomicBool,
     pub(super) retirement: AtomicU8,
+    /// The `generation` value recorded the last time this range was armed. A rearm whose current
+    /// generation differs saw at least one store during the previous armed window, i.e. a
+    /// "dirty cycle"; this is how [`crate::CpuWriteWatch::rearm`] detects chronic dirtiness without
+    /// touching the hot fault handler.
+    pub(super) armed_generation: AtomicU64,
+    /// Consecutive dirty rearm cycles. Once it reaches [`DEMOTION_THRESHOLD`] the range demotes.
+    pub(super) dirty_rearm_streak: AtomicU64,
+    /// A chronically-dirty range stops arming its pages (no more protection faults) and instead
+    /// reports itself perpetually dirty, so its consumer revalidates the bytes at acquire time.
+    /// This inverts the cost model for a resource the guest rewrites every frame: the per-frame
+    /// fault storm on a shared host page (false sharing) is worse than an unconditional reread.
+    /// It is the acquire-time-revalidation stage the plan places between coalesced arms and the
+    /// D5 read-watch inversion.
+    pub(super) demoted: AtomicBool,
     pub(super) pages: Box<[WatchedPage]>,
 }
+
+/// Consecutive dirty rearm cycles a precise watch tolerates before demoting to acquire-time
+/// revalidation. Sized so a genuinely hot resident (rewritten every frame) demotes within about a
+/// second at 60 Hz, while a resource touched occasionally never does.
+pub(super) const DEMOTION_THRESHOLD: u64 = 64;
 
 pub(super) const WATCH_ACTIVE: u8 = 0;
 
@@ -183,25 +213,68 @@ pub(super) fn arm_range(range: &WatchedRange, state: &WatchState) -> io::Result<
     if !range.precise_tracking {
         return Ok(());
     }
+    // A chronically-dirty range does acquire-time revalidation instead of protection faulting:
+    // release write protection on any page it still owns and report itself dirty. It must not be
+    // left armed, or the fault handler would keep servicing faults it no longer wants.
+    if range.demoted.load(Ordering::Acquire) {
+        for page in &range.pages {
+            page.dirty.store(true, Ordering::Release);
+            if page.armed.swap(false, Ordering::AcqRel) {
+                restore_page_if_unowned(page.address, state);
+            }
+        }
+        range.dirty.store(true, Ordering::Release);
+        return Ok(());
+    }
+    let page_size = host_page_size_infallible();
     let mut changed = Vec::with_capacity(range.pages.len());
+    // First reserve the armed state and clear dirtiness for every page, recording which pages this
+    // call newly armed. Protection then follows in maximal contiguous runs: a large resident used
+    // to cost one mprotect per host page, which dominated presenter time after an alias writeback.
     for (index, page) in range.pages.iter().enumerate() {
         let was_dirty = page.dirty.swap(false, Ordering::AcqRel);
-        if page.armed.swap(true, Ordering::AcqRel) {
-            changed.push((index, false, was_dirty));
+        // Arming a read-watch re-stales its pages: the GPU may have rewritten the range, so the
+        // next guest read must materialize again rather than trust bytes from the previous window.
+        if range.read_watch {
+            page.materialized.store(false, Ordering::Release);
+        }
+        let newly_armed = !page.armed.swap(true, Ordering::AcqRel);
+        changed.push((index, newly_armed, was_dirty));
+    }
+    let mut index = 0;
+    while index < changed.len() {
+        if !changed[index].1 {
+            index += 1;
             continue;
         }
-        changed.push((index, true, was_dirty));
-        if let Err(error) = protect_page(page.address, true) {
+        let run_start = index;
+        index += 1;
+        while index < changed.len() && changed[index].1 {
+            index += 1;
+        }
+        let address = range.pages[run_start].address;
+        let byte_count = (index - run_start) as u64 * page_size;
+        let protect_result = if range.read_watch {
+            protect_range_no_access(address, byte_count)
+        } else {
+            protect_range(address, byte_count, true)
+        };
+        if let Err(error) = protect_result {
             rollback_arm(range, state, &changed);
             return Err(error);
         }
-        // A write can race the transition when another overlapping watch already protects this
-        // page. Its handler disarms us before making the page writable; do not leave that page
-        // read-only with no armed owner after our mprotect returns.
-        if !page.armed.load(Ordering::Acquire) {
-            restore_page_if_unowned(page.address, state);
+        // A write can race the transition when another overlapping watch already protects one of
+        // these pages: its handler disarms us before making the page writable. Do not leave any
+        // page in the run read-only with no armed owner after our mprotect returns.
+        for page in &range.pages[run_start..index] {
+            if !page.armed.load(Ordering::Acquire) {
+                restore_page_if_unowned(page.address, state);
+            }
         }
     }
+    range
+        .armed_generation
+        .store(range.generation.load(Ordering::Acquire), Ordering::Release);
     Ok(())
 }
 

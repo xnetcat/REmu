@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{CpuWriteWatch, CpuWriteWatchRetirement, notify_guest_memory_written};
 
@@ -200,6 +201,141 @@ fn explicit_host_write_notification_reaches_every_physical_alias() {
     );
     assert_eq!(watched_second.generation(), 1);
     drop(watched_second);
+}
+
+#[test]
+fn a_chronically_dirty_watch_demotes_to_acquire_time_revalidation() {
+    let mapping = TestMapping::new(1);
+    // SAFETY: the mapping remains live and writable until watch is dropped.
+    let watch = unsafe { CpuWriteWatch::new(mapping.address(), page_size() as u64).unwrap() };
+    assert!(!watch.is_demoted());
+
+    // Rewrite then rearm every cycle: the false-sharing signature of a per-frame resident.
+    for value in 0..super::DEMOTION_THRESHOLD {
+        // SAFETY: the store targets the live watched page and faults while armed.
+        unsafe { mapping.write(0, value as u8) };
+        assert!(watch.consume_dirty());
+        watch.rearm().unwrap();
+    }
+    assert!(
+        watch.is_demoted(),
+        "a resident rewritten every cycle demotes after the dirty-cycle threshold"
+    );
+
+    // Demoted: arming reports the range dirty unconditionally so the consumer revalidates at
+    // acquire time, and the page is no longer protected so stores complete without a fault.
+    assert!(watch.is_dirty());
+    let _ = watch.consume_dirty();
+    // SAFETY: the demoted page is writable; this store must not fault nor be lost.
+    unsafe { mapping.write(0, 0x5a) };
+    watch.rearm().unwrap();
+    assert!(
+        watch.is_dirty(),
+        "a demoted watch re-asserts dirtiness on every rearm"
+    );
+    drop(watch);
+}
+
+#[test]
+fn an_occasionally_dirty_watch_never_demotes() {
+    let mapping = TestMapping::new(1);
+    // SAFETY: the mapping remains live and writable until watch is dropped.
+    let watch = unsafe { CpuWriteWatch::new(mapping.address(), page_size() as u64).unwrap() };
+    // A clean rearm cycle resets the streak, so interleaving clean cycles prevents demotion even
+    // over many more iterations than the threshold.
+    for round in 0..(super::DEMOTION_THRESHOLD * 4) {
+        if round % 2 == 0 {
+            // SAFETY: the store targets the live watched page and faults while armed.
+            unsafe { mapping.write(0, round as u8) };
+            assert!(watch.consume_dirty());
+        }
+        watch.rearm().unwrap();
+    }
+    assert!(
+        !watch.is_demoted(),
+        "a watch with interleaved clean cycles keeps precise protection tracking"
+    );
+    drop(watch);
+}
+
+static READ_WATCH_MATERIALIZE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// A test read-watch materializer: fills the (handler-made-writable) page with a known pattern.
+///
+/// # Safety
+///
+/// Invoked from the fault handler with `[page_address, page_address + page_size)` writable.
+unsafe extern "C" fn fill_page_with_pattern(page_address: u64, page_size: u64) -> bool {
+    READ_WATCH_MATERIALIZE_CALLS.fetch_add(1, Ordering::SeqCst);
+    // SAFETY: the handler made the whole page writable before invoking the materializer.
+    unsafe {
+        std::ptr::write_bytes(page_address as *mut u8, 0xcd, page_size as usize);
+    }
+    true
+}
+
+// The process-global materializer makes these read-watch tests order-sensitive; the crate's
+// verification gate runs `--test-threads=1`, under which the shared counter is deterministic.
+#[test]
+fn a_read_watch_materializes_gpu_bytes_on_the_first_guest_read() {
+    super::set_read_watch_materializer(fill_page_with_pattern);
+    let mapping = TestMapping::new(1);
+    READ_WATCH_MATERIALIZE_CALLS.store(0, Ordering::SeqCst);
+    // SAFETY: the mapping stays live and its page tolerates a no-access window until watch drops.
+    let watch = unsafe {
+        CpuWriteWatch::new_read_materialized(mapping.address(), page_size() as u64).unwrap()
+    };
+    assert!(watch.is_read_watch());
+    assert!(!watch.all_pages_materialized());
+    assert!(!watch.is_dirty());
+
+    // A guest READ faults on the no-access page and materializes it.
+    // SAFETY: the byte is inside the live read-watched page.
+    let observed = unsafe { mapping.pointer.read_volatile() };
+    assert_eq!(
+        observed, 0xcd,
+        "the first read observes materialized producer bytes"
+    );
+    assert_eq!(READ_WATCH_MATERIALIZE_CALLS.load(Ordering::SeqCst), 1);
+    assert!(watch.all_pages_materialized());
+    assert!(
+        !watch.is_dirty(),
+        "a materializing read does not dirty the watch"
+    );
+
+    // A second read does not re-materialize: the page is now readable.
+    // SAFETY: same live page, now readable.
+    assert_eq!(unsafe { mapping.pointer.read_volatile() }, 0xcd);
+    assert_eq!(
+        READ_WATCH_MATERIALIZE_CALLS.load(Ordering::SeqCst),
+        1,
+        "materialization happens once per armed window"
+    );
+    drop(watch);
+}
+
+#[test]
+fn a_guest_write_to_a_read_watch_skips_materialization_and_dirties() {
+    super::set_read_watch_materializer(fill_page_with_pattern);
+    let mapping = TestMapping::new(1);
+    let calls_before = READ_WATCH_MATERIALIZE_CALLS.load(Ordering::SeqCst);
+    // SAFETY: live mapping; no-access window until watch drops.
+    let watch = unsafe {
+        CpuWriteWatch::new_read_materialized(mapping.address(), page_size() as u64).unwrap()
+    };
+    // A guest WRITE overwrites the stale bytes: it dirties the watch and skips materialization.
+    // SAFETY: the store targets the live read-watched page.
+    unsafe { mapping.write(0, 0x42) };
+    assert!(watch.is_dirty(), "a write dirties a read-watch");
+    assert_eq!(
+        READ_WATCH_MATERIALIZE_CALLS.load(Ordering::SeqCst),
+        calls_before,
+        "a guest write skips materialization (it overwrites the stale bytes)"
+    );
+    assert!(watch.all_pages_materialized());
+    // SAFETY: the byte the guest wrote must stand, not be overwritten by the materializer.
+    assert_eq!(unsafe { mapping.pointer.read_volatile() }, 0x42);
+    drop(watch);
 }
 
 #[test]

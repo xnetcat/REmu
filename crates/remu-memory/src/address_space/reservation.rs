@@ -139,6 +139,9 @@ impl HostReservation {
             });
         }
         // Mach allocation initially grants access; convert the whole reservation to a guard range.
+        // SAFETY: `requested`/`size_usize` name the exact Mach reservation this function just
+        // allocated (the `mach_vm_allocate` above returned KERN_SUCCESS with `actual == address`),
+        // so the range is live and owned here; the mprotect only narrows its own pages' access.
         if unsafe { libc::mprotect(requested, size_usize, libc::PROT_NONE) } != 0 {
             let source = io::Error::last_os_error();
             // SAFETY: This function still owns the Mach allocation.
@@ -198,6 +201,8 @@ impl Drop for HostReservation {
 const KERN_SUCCESS: i32 = 0;
 const VM_FLAGS_FIXED: i32 = 0;
 
+// SAFETY (declaration): the libSystem Mach VM entry points with their documented ABI; each call
+// site upholds the per-call preconditions (live task, owned range, representable sizes).
 #[link(name = "System")]
 unsafe extern "C" {
     fn mach_task_self() -> u32;

@@ -19,15 +19,29 @@ mod page;
 use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_infallible};
 
 mod signal;
+pub use signal::GuestReadMaterializer;
 use signal::install_fault_handlers;
+
+/// Registers the process-global read-watch materializer used by [`CpuWriteWatch::new_read_materialized`].
+///
+/// Returns the previously registered materializer, if any. This is the D5 integration seam: the
+/// gpu-metal consumer registers a function that copies a resident texture's bytes into a faulting
+/// guest page. The materializer runs in signal context and must be async-signal-safe (see
+/// [`GuestReadMaterializer`]).
+pub fn set_read_watch_materializer(
+    materializer: GuestReadMaterializer,
+) -> Option<GuestReadMaterializer> {
+    signal::set_read_watch_materializer(materializer)
+}
 
 mod snapshot;
 use snapshot::publish_snapshot;
 
 mod state;
 use state::{
-    WATCH_ACTIVE, WATCH_REPLACED, WATCH_REPROTECTED, WATCH_REPROTECTING, WatchedPage, WatchedRange,
-    arm_range, remember_writable_range, restore_unowned_pages, retire_overlapping, state,
+    DEMOTION_THRESHOLD, WATCH_ACTIVE, WATCH_REPLACED, WATCH_REPROTECTED, WATCH_REPROTECTING,
+    WatchedPage, WatchedRange, arm_range, remember_writable_range, restore_unowned_pages,
+    retire_overlapping, state,
 };
 
 /// Publishes bytes written directly by an HLE service into guest memory.
@@ -160,6 +174,43 @@ impl CpuWriteWatch {
     /// `address..address + byte_count` must belong to a live readable and writable mapping whose
     /// complete host pages can safely alternate between read-only and read/write protection.
     pub unsafe fn new(address: u64, byte_count: u64) -> io::Result<Self> {
+        // SAFETY: forwarded to the caller's contract on `new`.
+        unsafe { Self::new_inner(address, byte_count, false) }
+    }
+
+    /// Starts a read-watch that materializes GPU-written bytes on the first guest read (audit D5).
+    ///
+    /// Pages arm with no access, so a guest READ — not only a write — faults into the handler,
+    /// which invokes the process read-watch materializer to fill the page from the producer's
+    /// bytes, then leaves it readable. A guest WRITE to an unmaterialized page skips materialization
+    /// (the guest is overwriting the stale bytes) and dirties the watch like an ordinary write.
+    ///
+    /// Fails with [`io::ErrorKind::Unsupported`] if no materializer has been registered through
+    /// [`set_read_watch_materializer`]: without one the handler cannot supply the bytes, and arming
+    /// anyway would let the first read observe stale memory. This is a loud refusal, not a silent
+    /// fallback.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::new`], and additionally the pages must tolerate a no-access
+    /// protection window until their first fault.
+    pub unsafe fn new_read_materialized(address: u64, byte_count: u64) -> io::Result<Self> {
+        if signal::read_watch_materializer().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a read-watch requires a registered read-watch materializer",
+            ));
+        }
+        // SAFETY: forwarded to the caller's contract on `new_read_materialized`.
+        unsafe { Self::new_inner(address, byte_count, true) }
+    }
+
+    /// # Safety
+    ///
+    /// Same contract as [`Self::new`]: `address..address + byte_count` must belong to a live
+    /// readable/writable mapping whose complete host pages tolerate the protection transitions this
+    /// watch performs (read-only/read-write, and no-access for a read-watch).
+    unsafe fn new_inner(address: u64, byte_count: u64, read_watch: bool) -> io::Result<Self> {
         if address == 0 || byte_count == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -194,7 +245,9 @@ impl CpuWriteWatch {
                 "CPU write watch page count does not fit this host",
             )
         })?;
-        let precise_tracking = precise_tracking_requested();
+        // A read-watch must fault on reads, so it is always precise regardless of the disable flag
+        // (which only assumes CPU texture *writes* can be skipped, not reads).
+        let precise_tracking = read_watch || precise_tracking_requested();
         let mut pages = Vec::new();
         pages.try_reserve_exact(page_count).map_err(|error| {
             io::Error::new(
@@ -207,6 +260,7 @@ impl CpuWriteWatch {
                 address: page_start + index as u64 * page_size,
                 dirty: AtomicBool::new(false),
                 armed: AtomicBool::new(false),
+                materialized: AtomicBool::new(!read_watch),
             });
         }
 
@@ -225,9 +279,13 @@ impl CpuWriteWatch {
             address,
             byte_count,
             precise_tracking,
+            read_watch,
             generation: AtomicU64::new(0),
             dirty: AtomicBool::new(false),
             retirement: AtomicU8::new(WATCH_ACTIVE),
+            armed_generation: AtomicU64::new(0),
+            dirty_rearm_streak: AtomicU64::new(0),
+            demoted: AtomicBool::new(false),
             pages: pages.into_boxed_slice(),
         });
         state.ranges.insert(range.id, Arc::clone(&range));
@@ -265,6 +323,35 @@ impl CpuWriteWatch {
     #[must_use]
     pub fn precise_tracking(&self) -> bool {
         self.range.precise_tracking
+    }
+
+    /// Returns whether this watch has demoted itself to acquire-time revalidation.
+    ///
+    /// A demoted watch no longer arms its pages, so it takes no protection faults; it instead
+    /// reports [`Self::is_dirty`] on every armed cycle, and its consumer must revalidate the bytes
+    /// each time it acquires them. Demotion is one-way for the life of the watch: a resource hot
+    /// enough to trip it stays hot, and re-arming would only reopen the false-sharing fault storm.
+    #[must_use]
+    pub fn is_demoted(&self) -> bool {
+        self.range.demoted.load(Ordering::Acquire)
+    }
+
+    /// Returns whether this is a read-watch (materializes GPU bytes on the first guest read).
+    #[must_use]
+    pub fn is_read_watch(&self) -> bool {
+        self.range.read_watch
+    }
+
+    /// Returns whether every page of this watch has been materialized.
+    ///
+    /// A write-watch reports `true` unconditionally; a read-watch reports `true` only once each of
+    /// its pages has been materialized by a guest read or overwritten by a guest write.
+    #[must_use]
+    pub fn all_pages_materialized(&self) -> bool {
+        self.range
+            .pages
+            .iter()
+            .all(|page| page.materialized.load(Ordering::Acquire))
     }
 
     /// Returns the number of protected host pages faulted since this watch was created.
@@ -317,7 +404,31 @@ impl CpuWriteWatch {
                 "CPU write watch was retired by a guest mapping change",
             ));
         }
+        self.account_dirty_cycle_before_arming();
         arm_range(&self.range, &state)
+    }
+
+    /// Detects chronic dirtiness so [`arm_range`] can demote the range on this rearm.
+    ///
+    /// A store during the previous armed window advanced `generation` past the value recorded at
+    /// arm time, independently of whether the caller has consumed the dirty flag. A run of such
+    /// cycles is exactly the false-sharing signature the demotion targets; a clean cycle resets it.
+    fn account_dirty_cycle_before_arming(&self) {
+        if !self.range.precise_tracking
+            || self.range.read_watch
+            || self.range.demoted.load(Ordering::Acquire)
+        {
+            return;
+        }
+        let armed_generation = self.range.armed_generation.load(Ordering::Acquire);
+        if self.range.generation.load(Ordering::Acquire) == armed_generation {
+            self.range.dirty_rearm_streak.store(0, Ordering::Release);
+            return;
+        }
+        let streak = self.range.dirty_rearm_streak.fetch_add(1, Ordering::AcqRel) + 1;
+        if streak >= DEMOTION_THRESHOLD {
+            self.range.demoted.store(true, Ordering::Release);
+        }
     }
 
     /// Runs an operation while the watched guest mapping is pinned against replacement.
