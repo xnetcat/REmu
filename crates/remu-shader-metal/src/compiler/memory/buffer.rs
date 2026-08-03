@@ -422,7 +422,15 @@ impl Compiler<'_> {
                 control.dword_count
             ));
         }
-        let descriptor_word = self.temp("uint", &format!("s[{}]", control.scalar_resource + 3));
+        let fixed_instruction_format = control.instruction_format.is_some();
+        let descriptor_expression = format!("s[{}]", control.scalar_resource + 3);
+        let descriptor_word = if fixed_instruction_format && !instruction.opcode.contains("Store") {
+            // MTBUF carries DFMT/NFMT in the instruction and uses identity destination selects.
+            // Fixed-format loads therefore do not observe the descriptor's format/select word.
+            descriptor_expression
+        } else {
+            self.temp("uint", &descriptor_expression)
+        };
         let unified_format = control
             .instruction_format
             .map_or_else(|| format!("({descriptor_word} >> 12) & 0x7Fu"), format_u32);
@@ -451,8 +459,22 @@ impl Compiler<'_> {
                 &oob,
             );
         }
-        let mut canonical = Vec::with_capacity(4);
-        for component in 0..4 {
+        let component_count = format_component_count(
+            instruction
+                .opcode
+                .known_name()
+                .ok_or_else(|| "raw format opcode".to_owned())?,
+        );
+        // Descriptor-selected MUBUF loads can route any memory component into any destination,
+        // so all four canonical components remain observable. MTBUF has identity destination
+        // selects: FORMAT_X observes X, FORMAT_XY observes X/Y, and so on.
+        let canonical_component_count = if fixed_instruction_format {
+            component_count
+        } else {
+            4
+        };
+        let mut canonical = Vec::with_capacity(canonical_component_count as usize);
+        for component in 0..canonical_component_count {
             let byte_offset = self.temp("uint", "0u");
             let bit_offset = self.temp("uint", "0u");
             let bits = self.temp("uint", "0u");
@@ -480,29 +502,30 @@ impl Compiler<'_> {
                 ),
             ));
         }
-        let component_count = format_component_count(
-            instruction
-                .opcode
-                .known_name()
-                .ok_or_else(|| "raw format opcode".to_owned())?,
-        );
         let mut selected = Vec::with_capacity(component_count as usize);
         for destination in 0..component_count {
-            let selector = if control.instruction_format.is_some() {
-                format_u32(destination + 4)
+            if fixed_instruction_format {
+                selected.push(self.temp(
+                    "uint",
+                    &format!(
+                        "{oob} ? 0u : {}",
+                        canonical[usize::try_from(destination)
+                            .map_err(|_| "format destination overflow".to_owned())?]
+                    ),
+                ));
             } else {
-                self.temp(
+                let selector = self.temp(
                     "uint",
                     &format!("({descriptor_word} >> {}u) & 7u", destination * 3),
-                )
-            };
-            selected.push(self.temp(
-                "uint",
-                &format!(
-                    "{selector} == 1u ? remu_format_one({number_format}) : {oob} ? 0u : {selector} == 4u ? {} : {selector} == 5u ? {} : {selector} == 6u ? {} : {selector} == 7u ? {} : 0u",
-                    canonical[0], canonical[1], canonical[2], canonical[3]
-                ),
-            ));
+                );
+                selected.push(self.temp(
+                    "uint",
+                    &format!(
+                        "{selector} == 1u ? remu_format_one({number_format}) : {oob} ? 0u : {selector} == 4u ? {} : {selector} == 5u ? {} : {selector} == 6u ? {} : {selector} == 7u ? {} : 0u",
+                        canonical[0], canonical[1], canonical[2], canonical[3]
+                    ),
+                ));
+            }
         }
         let d16 = instruction.opcode.contains("FormatD16");
         let d16_hi = instruction.opcode.contains("FormatD16Hi");
