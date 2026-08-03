@@ -181,6 +181,8 @@ impl<'a> Compiler<'a> {
             }
         }
         let control_flow = analyze_control_flow(program)?;
+        let (readfirstlane_site_bases, disjoint_readfirstlane_slot_count) =
+            Self::plan_disjoint_readfirstlane_layout(program, options, &control_flow);
         let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh)
             .then(|| mesh_export_vertex_vgpr(program))
             .flatten();
@@ -200,6 +202,8 @@ impl<'a> Compiler<'a> {
             image_kinds,
             image_slots,
             control_flow,
+            readfirstlane_site_bases,
+            disjoint_readfirstlane_slot_count,
             mesh_export_vertex_vgpr,
             mesh_ngg_packed_export_sgpr,
             mesh_ngg_export_counts_pending: false,
