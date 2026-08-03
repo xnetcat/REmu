@@ -114,6 +114,57 @@ pub const fn identity_pixel_input_controls() -> [PixelInputControl; PIXEL_INPUT_
     controls
 }
 
+/// Raw guest NGG geometry-stage registers used to size a Metal mesh pipeline (workstream Q5).
+///
+/// These are the unmodified guest register dwords. The derived accessors apply the exact bit
+/// layouts the SDK's register structs encode (`sdk/target/include/agc/registerstructs.h`), so a
+/// caller — the `remu-gpu-metal` context/state decoder (co-designed with B2) — can hand REmu the
+/// values it already reads from the guest command stream instead of re-deriving the arithmetic.
+///
+/// The dynamic `M0` `GS_ALLOC_REQ` allocation (vertices `[10:0]`, primitives `[22:12]`) is a
+/// per-launch value the translated mesh program already reads at runtime (see the `S_SENDMSG`
+/// message-9 lowering in `compiler/driver.rs`); it is therefore not a compile-time field here.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NggRegisters {
+    /// `SPI_SHADER_PGM_RSRC1_*` for the merged NGG stage. Only the low `VGPRS` field is consumed.
+    pub pgm_rsrc1: u32,
+    /// `VGT_GS_MAX_VERT_OUT`: the geometry stage's maximum output vertex count.
+    pub gs_max_vert_out: u32,
+    /// `GE_NGG_SUBGRP_CNTL`: the per-subgroup output-vertex cap after amplification.
+    pub ge_ngg_subgrp_cntl: u32,
+}
+
+impl NggRegisters {
+    /// Allocated 32-wide vector registers, from `PGM_RSRC1.VGPRS`.
+    ///
+    /// SDK `ShShaderResource1Cs::getVgprs()` (registerstructs.h:1504-1507): `((VGPRS & 0x3f) + 1)
+    /// << 3`, documented as "the number of 32-wide vector general purpose registers. Divide by two
+    /// for 64-wide wavefronts." (registerstructs.h:1500). The default field value is `0x8`
+    /// (registerstructs.h:1427).
+    #[must_use]
+    pub const fn allocated_vgprs_wave32(self) -> u32 {
+        ((self.pgm_rsrc1 & 0x3f) + 1) << 3
+    }
+
+    /// Maximum geometry output vertices, from `VGT_GS_MAX_VERT_OUT`.
+    ///
+    /// SDK `CxGsMaxVertOut::getVertices()` (registerstructs.h:13165-13168): the 11-bit field
+    /// `value & 0x7ff`.
+    #[must_use]
+    pub const fn gs_max_output_vertices(self) -> u32 {
+        self.gs_max_vert_out & 0x7ff
+    }
+
+    /// Maximum per-subgroup output vertices after amplification, from `GE_NGG_SUBGRP_CNTL`.
+    ///
+    /// SDK `CxGeMaxOutputPerSubgroup::getMaxVertsPerSubgroup()` (registerstructs.h:6241-6246): the
+    /// 10-bit field `value & 0x3ff`.
+    #[must_use]
+    pub const fn max_verts_per_subgroup(self) -> u32 {
+        self.ge_ngg_subgrp_cntl & 0x3ff
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetalCompileOptions {
     pub stage: MetalShaderStage,
@@ -329,6 +380,48 @@ impl MetalCompileOptions {
             lds_size_bytes,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
+        }
+    }
+
+    /// Builds mesh options with the vertex/primitive capacities and VGPR allocation derived from
+    /// real guest NGG registers (workstream Q5), rather than caller-supplied estimates.
+    ///
+    /// The Metal-side maxima are `1..=256` (validated in `compiler/driver.rs`), while the guest
+    /// fields are wider (11-bit vertices, 6-bit VGPR granule up to 512), so each derived quantity
+    /// is clamped into the Metal window. Sizing the vertex records by the per-subgroup cap
+    /// (`GE_NGG_SUBGRP_CNTL`) matches the amplified output one Metal threadgroup exposes; a stage
+    /// that never programmed that register falls back to `VGT_GS_MAX_VERT_OUT`.
+    ///
+    /// Primitive capacity is bounded by the vertex capacity: the SDK register structs surfaced in
+    /// this payload expose a per-subgroup *vertex* cap but no per-subgroup *primitive* cap, and a
+    /// triangle-output subgroup can emit at most as many primitives as vertices. Over-provisioning
+    /// the Metal primitive records within `1..=256` is safe; it never drops geometry.
+    #[must_use]
+    pub fn mesh_from_ngg_registers(
+        required_vertex_output_count: u32,
+        lds_size_bytes: u32,
+        mesh_threadgroup_size: u32,
+        registers: NggRegisters,
+    ) -> Self {
+        let subgroup_verts = registers.max_verts_per_subgroup();
+        let vertex_capacity = if subgroup_verts != 0 {
+            subgroup_verts
+        } else {
+            registers.gs_max_output_vertices()
+        }
+        .clamp(1, 256);
+        let allocated_vector_register_count = registers
+            .allocated_vgprs_wave32()
+            .clamp(1, VECTOR_REGISTER_COUNT);
+        Self {
+            allocated_vector_register_count,
+            ..Self::mesh(
+                required_vertex_output_count,
+                lds_size_bytes,
+                vertex_capacity,
+                vertex_capacity,
+                mesh_threadgroup_size,
+            )
         }
     }
 }

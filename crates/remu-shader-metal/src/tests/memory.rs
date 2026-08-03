@@ -106,7 +106,7 @@ const GLOBAL_MEMORY_OPCODES: [&str; 24] = [
     "GlobalLoadShortD16",
     "GlobalLoadShortD16Hi",
     "GlobalAtomicAdd",
-    "GlobalAtomicUMax",
+    "GlobalAtomicUmax",
 ];
 
 fn memory_dword_count_for_test(name: &str) -> u32 {
