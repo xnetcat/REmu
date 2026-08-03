@@ -3,6 +3,7 @@
 
 //! Backend-neutral Gen5/RDNA2 shader decoding, evaluation, and intermediate representation.
 
+mod cfg;
 mod coverage;
 mod decoder;
 mod evaluator;
@@ -12,6 +13,10 @@ mod ir;
 mod metadata;
 mod state;
 
+pub use cfg::{
+    BasicBlock, BlockExit, BlockId, ControlFlowGraph, Dominators, NaturalLoop, PostDominators,
+    StructuredCfg, build_control_flow_graph,
+};
 pub use coverage::{OpcodeHistogram, OpcodeUsage, opcode_coverage_report};
 pub use decoder::{
     DecodeError, decode_program, decode_program_segments, read_program, read_program_bounded,
