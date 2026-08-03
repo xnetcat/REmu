@@ -19,7 +19,7 @@ mod page;
 use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_infallible};
 
 mod signal;
-use signal::install_fault_handlers;
+use signal::{install_fault_handlers, register_host_fault_diagnostic_callback};
 
 mod snapshot;
 use snapshot::publish_snapshot;
@@ -29,6 +29,22 @@ use state::{
     WATCH_ACTIVE, WATCH_REPLACED, WATCH_REPROTECTED, WATCH_REPROTECTING, WatchedPage, WatchedRange,
     arm_range, remember_writable_range, restore_unowned_pages, retire_overlapping, state,
 };
+
+/// Allocation-free callback invoked immediately before an unhandled host fault is forwarded.
+///
+/// The callback runs inside the process SIGBUS/SIGSEGV handler. It may only use async-signal-safe
+/// operations and lock-free state prepared before the fault. Registrations live for the process;
+/// a backend must not register a callback whose code can be unloaded.
+pub type HostFaultDiagnosticCallback = unsafe extern "C" fn();
+
+/// Installs one process-lifetime host-fault diagnostic callback.
+///
+/// Re-registering the same callback is idempotent. A different callback is refused so a backend
+/// cannot silently replace another subsystem's last-chance crash evidence.
+#[must_use]
+pub fn register_host_fault_diagnostic(callback: HostFaultDiagnosticCallback) -> bool {
+    register_host_fault_diagnostic_callback(callback)
+}
 
 /// Publishes bytes written directly by an HLE service into guest memory.
 ///

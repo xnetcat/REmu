@@ -26,7 +26,10 @@ pub use write_watch::notify_guest_memory_written;
 #[cfg(target_os = "macos")]
 pub use write_watch::notify_guest_memory_written_excluding;
 #[cfg(target_os = "macos")]
-pub use write_watch::{CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement};
+pub use write_watch::{
+    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement,
+    HostFaultDiagnosticCallback, register_host_fault_diagnostic,
+};
 
 /// Non-macOS builds have no unified-memory write-watch backend to notify.
 #[cfg(not(target_os = "macos"))]

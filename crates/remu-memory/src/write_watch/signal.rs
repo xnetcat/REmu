@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::io;
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::diagnostic::{
     DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace, format_fault_registers,
@@ -16,10 +16,28 @@ use super::diagnostic::{
 use super::guest_space::contains_guest_address;
 use super::page::{align_down, host_page_size_infallible};
 use super::snapshot::{ACTIVE_HANDLERS, WATCH_SNAPSHOT};
+use super::HostFaultDiagnosticCallback;
 
 static RECOVERED_DISARMED_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+static HOST_FAULT_DIAGNOSTIC: AtomicUsize = AtomicUsize::new(0);
+
 static HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
+
+pub(super) fn register_host_fault_diagnostic_callback(
+    callback: HostFaultDiagnosticCallback,
+) -> bool {
+    let callback = callback as usize;
+    match HOST_FAULT_DIAGNOSTIC.compare_exchange(
+        0,
+        callback,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => true,
+        Err(installed) => installed == callback,
+    }
+}
 
 struct PreviousAction(std::cell::UnsafeCell<MaybeUninit<libc::sigaction>>);
 
@@ -257,6 +275,7 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
     if let Some(registers) = registers.as_ref() {
         write_interrupted_stack_diagnostic(registers);
     }
+    write_registered_host_fault_diagnostic();
     // A declined fault is normally the crash itself. When the journal is armed, name every
     // emulator publication that covers the faulting bytes before the process dies. The register
     // values anchor the dump: a poisoned dereference faults on the derived garbage pointer, while
@@ -275,6 +294,18 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
         }
     }
     crate::dump_guest_write_journal(report.address, &anchors[..anchor_count]);
+}
+
+fn write_registered_host_fault_diagnostic() {
+    let callback = HOST_FAULT_DIAGNOSTIC.load(Ordering::Acquire);
+    if callback == 0 {
+        return;
+    }
+    // SAFETY: registration accepts only a process-lifetime function pointer with this exact ABI.
+    let callback: HostFaultDiagnosticCallback = unsafe { std::mem::transmute(callback) };
+    // SAFETY: the callback contract permits invocation from this signal handler and requires the
+    // implementation to use only async-signal-safe operations and lock-free prepared state.
+    unsafe { callback() };
 }
 
 /// Emits the mapped remainder of the interrupted stack page for offline symbolication.
