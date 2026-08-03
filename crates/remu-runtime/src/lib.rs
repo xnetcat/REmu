@@ -40,6 +40,7 @@ mod nid_names;
 mod nid_table;
 mod np;
 mod np_api;
+mod hid;
 mod pad;
 mod playgo;
 mod pthread;
@@ -281,19 +282,16 @@ pub(crate) use np_api::{
     np_universal_data_register_context, np_universal_data_terminate,
 };
 #[cfg(target_arch = "x86_64")]
+pub(crate) use hid::reset_hid_runtime;
+#[cfg(target_arch = "x86_64")]
 pub(crate) use pad::reset_pad_runtime;
 #[cfg(test)]
 pub(crate) use pad::{
     SCE_PAD_ERROR_ALREADY_OPENED, SCE_PAD_ERROR_DEVICE_NO_HANDLE, SCE_PAD_ERROR_INVALID_HANDLE,
     SCE_PAD_ERROR_NOT_INITIALIZED,
 };
-pub(crate) use pad::{
-    dispatch_pad_import, pad_boolean_operation, pad_close, pad_device_class_parse_data,
-    pad_get_controller_information, pad_get_extended_information, pad_get_handle,
-    pad_get_trigger_effect_state, pad_handle_operation, pad_initialize, pad_open,
-    pad_pointer_operation, pad_read, pad_read_state, pad_set_motion_sensor_state,
-    pad_set_vibration_mode,
-};
+pub(crate) use pad::dispatch_pad_import;
+pub(crate) use pad::{pad_get_handle, pad_open};
 pub(crate) use playgo::{
     play_go_accept_request, play_go_close, play_go_get_chunk_id, play_go_get_eta,
     play_go_get_install_speed, play_go_get_language_mask, play_go_get_locus, play_go_get_progress,
@@ -2078,6 +2076,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.av_player = AvPlayerRuntimeState::default();
     state.services = RuntimeServiceState::default();
     reset_pad_runtime();
+    #[cfg(any(test, target_arch = "x86_64"))]
+    reset_hid_runtime();
     reset_kernel_process_time();
     *AUDIO_OUT
         .get_or_init(|| Mutex::new(audio::AudioOutState::default()))
@@ -5013,19 +5013,12 @@ fn dispatch_probe_import(
             .unwrap_or_else(|| sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE)),
         // libScePad output structures must always be initialized; successful no-ops would expose
         // stale guest stack contents as controller capabilities and button state.
-        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments),
-        "gjP9-KQzoUk" => pad_get_controller_information(arguments),
-        "6ncge5+l5Qs" => pad_close(arguments),
-        "AcslpN1jHR8" => pad_get_extended_information(arguments),
-        "YndgXqQVV7c" => pad_read_state(arguments),
-        "q1cHNfGycLI" => pad_read(arguments),
-        "W2G-yoyMF5U" => pad_set_vibration_mode(arguments),
-        "rIZnR6eSpvk" | "DscD1i9HX1w" => pad_handle_operation(arguments),
-        "r44mAxdSG+U" | "vDLMoJLde8I" => pad_boolean_operation(arguments),
-        "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
-        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments),
-        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),
-        "hv1luiJrqQM" => pad_initialize(),
+        // Prefer dispatch_pad_import for new NIDs; these arms remain for the probe path.
+        "clVvL4ZDntw" | "gjP9-KQzoUk" | "6ncge5+l5Qs" | "AcslpN1jHR8" | "YndgXqQVV7c"
+        | "q1cHNfGycLI" | "W2G-yoyMF5U" | "rIZnR6eSpvk" | "DscD1i9HX1w" | "r44mAxdSG+U"
+        | "vDLMoJLde8I" | "KLmYx9ij2h0" | "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY"
+        | "znaWI0gpuo8" | "IHPqcbc0zCA" | "hv1luiJrqQM" => dispatch_pad_import(nid, arguments)
+            .expect("pad NID listed above must resolve in dispatch_pad_import"),
         // libSceSystemService status used by the foreground/background state machine.
         "rPo6tV8D9bM" => system_service_get_status(arguments),
         "fZo48un7LK4" => system_service_param_get_int(arguments),
