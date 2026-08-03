@@ -12,7 +12,8 @@ mod controls;
 mod liveness;
 
 pub use bindings::{
-    GlobalMemoryBinding, ImageBinding, ImageBindingSlotMap, ShaderEvaluation, VertexInputBinding,
+    GlobalMemoryBinding, ImageBinding, ImageBindingSlotMap, ImageSignatureClass,
+    ImageViewReinterpretation, ShaderEvaluation, TextureDescriptorType, VertexInputBinding,
     image_is_comparison,
 };
 pub use controls::{

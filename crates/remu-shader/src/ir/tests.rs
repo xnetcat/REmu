@@ -436,3 +436,135 @@ fn refuses_to_infer_a_continuation_without_an_explicit_setpc() {
         Err(ProgramLinkError::MissingSetpc)
     );
 }
+
+fn image_binding(dimension: u32, is_array: bool, opcode: &'static str, word3: u32) -> ImageBinding {
+    let mut resource_descriptor = smallvec::SmallVec::from_slice(&[0_u32; 8]);
+    resource_descriptor[0] = 0x1000; // non-null base so the descriptor is live
+    resource_descriptor[3] = word3;
+    ImageBinding {
+        pc: 0,
+        opcode: Opcode::from_static(opcode),
+        control: ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1, 2],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 8,
+            dimension,
+            is_array,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+            unorm: false,
+        },
+        resource_descriptor,
+        sampler_descriptor: smallvec::SmallVec::new(),
+        mip_level: None,
+    }
+}
+
+#[test]
+fn parses_the_descriptor_texture_type_from_dword3() {
+    // SDK agc/core/texture.h:249 places `Type m_type : 4` at the top of DWORD3; the values are
+    // texture.h:54-63 (k1d=8 .. k2dArrayMsaa=15).
+    let cases = [
+        (8_u32, TextureDescriptorType::OneD),
+        (9, TextureDescriptorType::TwoD),
+        (10, TextureDescriptorType::ThreeD),
+        (11, TextureDescriptorType::Cube),
+        (12, TextureDescriptorType::OneDArray),
+        (13, TextureDescriptorType::TwoDArray),
+        (14, TextureDescriptorType::TwoDMsaa),
+        (15, TextureDescriptorType::TwoDMsaaArray),
+    ];
+    for (nibble, expected) in cases {
+        let binding = image_binding(1, false, "ImageSample", nibble << 28);
+        assert_eq!(
+            binding.descriptor_type(),
+            Some(expected),
+            "type nibble {nibble}"
+        );
+    }
+    // Values below k1d are not valid texture descriptors.
+    assert_eq!(
+        image_binding(1, false, "ImageSample", 0).descriptor_type(),
+        None
+    );
+    assert_eq!(
+        image_binding(1, false, "ImageSample", 7 << 28).descriptor_type(),
+        None
+    );
+    // A null descriptor names no resource at all.
+    let mut null_binding = image_binding(1, false, "ImageSample", 13 << 28);
+    null_binding.resource_descriptor = smallvec::SmallVec::from_slice(&[0_u32; 8]);
+    assert_eq!(null_binding.descriptor_type(), None);
+}
+
+#[test]
+fn classifies_the_instruction_signature_from_the_dim_field() {
+    let cases = [
+        (0_u32, false, ImageSignatureClass::OneD),
+        (1, false, ImageSignatureClass::TwoD),
+        (2, false, ImageSignatureClass::ThreeD),
+        (3, false, ImageSignatureClass::Cube),
+        (4, true, ImageSignatureClass::OneDArray),
+        (5, true, ImageSignatureClass::TwoDArray),
+        (6, false, ImageSignatureClass::TwoDMsaa),
+        (7, true, ImageSignatureClass::TwoDMsaaArray),
+    ];
+    for (dimension, is_array, expected) in cases {
+        let binding = image_binding(dimension, is_array, "ImageSample", 9 << 28);
+        assert_eq!(binding.signature_class(), expected, "DIM {dimension}");
+    }
+}
+
+#[test]
+fn reconciles_descriptor_type_against_instruction_dim() {
+    // Agreement is direct, including 2D-array storage images (ImageStore with DIM 2DArray on a
+    // k2dArray descriptor).
+    let direct = image_binding(5, true, "ImageStore", 13 << 28);
+    assert_eq!(
+        direct.view_reinterpretation(),
+        ImageViewReinterpretation::Direct
+    );
+
+    // A cubemap addressed with array coordinates is its six-slice 2D-array layout
+    // (SDK agc/core/texture.h:321 permits the array view on kCubemap).
+    let cube_as_array = image_binding(5, true, "ImageLoad", 11 << 28);
+    assert_eq!(
+        cube_as_array.view_reinterpretation(),
+        ImageViewReinterpretation::CubeFacesAsArray
+    );
+
+    // A cube-sampled 2D-array descriptor must be re-viewed as a cube.
+    let array_as_cube = image_binding(3, false, "ImageSample", 13 << 28);
+    assert_eq!(
+        array_as_cube.view_reinterpretation(),
+        ImageViewReinterpretation::ArrayAsCube
+    );
+
+    // Non-array DIM over an array descriptor selects the base slice; array DIM over a
+    // single-layer descriptor is a one-element array.
+    assert_eq!(
+        image_binding(1, false, "ImageSample", 13 << 28).view_reinterpretation(),
+        ImageViewReinterpretation::ArrayBaseSlice
+    );
+    assert_eq!(
+        image_binding(5, true, "ImageSample", 9 << 28).view_reinterpretation(),
+        ImageViewReinterpretation::SingleLayerAsArray
+    );
+
+    // A null or invalid descriptor follows the instruction shape directly.
+    assert_eq!(
+        image_binding(5, true, "ImageSample", 0).view_reinterpretation(),
+        ImageViewReinterpretation::Direct
+    );
+
+    // Anything else is a real mismatch the backend must refuse loudly, never guess.
+    assert_eq!(
+        image_binding(2, false, "ImageSample", 9 << 28).view_reinterpretation(),
+        ImageViewReinterpretation::Incompatible
+    );
+}
