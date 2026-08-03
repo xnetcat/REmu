@@ -371,8 +371,8 @@ fn lpcm_converts_between_the_declared_input_and_requested_output_encodings() {
 fn a_job_for_a_codec_without_a_host_implementation_fails_the_whole_batch_loudly() {
     let engine = AjmEngine::new();
     let context = create_context(&engine);
-    // ATRAC9 registers and creates instances exactly as hardware would...
-    let instance = create_instance(&engine, context, AJM_CODEC_DEC_AT9, 2);
+    // MPEG4-AAC (P2, still unimplemented) registers and creates instances as hardware would...
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_M4AAC, 2);
 
     let input = [0_u8; 64];
     let mut output = [0_u8; 256];
@@ -393,7 +393,7 @@ fn a_job_for_a_codec_without_a_host_implementation_fails_the_whole_batch_loudly(
     assert_eq!(report.job_address, job_address);
     assert_eq!(report.command_offset, 0);
     assert_eq!(
-        engine.codec_job_count(AJM_CODEC_DEC_AT9),
+        engine.codec_job_count(AJM_CODEC_DEC_M4AAC),
         1,
         "demand telemetry counts the refused job"
     );
@@ -748,6 +748,226 @@ fn a_process_reset_drops_every_context_and_wakes_a_parked_waiter() {
     // The process-wide form is a no-op until a title ever starts the global engine, and safe
     // after: the next boot must not observe this test's contexts either way.
     reset_for_new_process();
+}
+
+//----------------------------------------------------------------------------
+// ATRAC9 (plan P1)
+//----------------------------------------------------------------------------
+
+/// The 4-byte ATRAC9 configuration data of a real Demon's Souls asset,
+/// `sound/streams/05_cutscene_sfx/scn000006_sfx.at9` (mono, 48 kHz), taken from the
+/// WAVEFORMATEXTENSIBLE ATRAC9 extension. Byte 0 is `SCE_AJM_DEC_AT9_INTERNAL_ID_NORMAL`
+/// (0xFE, at9_decoder.h:199).
+const AT9_DS_CONFIG: [u8; 4] = [0xFE, 0x70, 0x07, 0xF0];
+
+/// The first eight superframes (2048 bytes) of that asset's raw ATRAC9 bitstream.
+const AT9_DS_FRAMES: &[u8] = include_bytes!("testdata/atrac9_demons_souls_scn000006.frames.bin");
+
+/// The reference PCM for those superframes, decoded by **ffmpeg's independent `atrac9`
+/// decoder** (8192 mono S16 samples) and sign-negated into ATRAC9/LibAtrac9 output polarity.
+/// ffmpeg is a wholly separate implementation, so this is an independent oracle, not a
+/// self-referential capture.
+const AT9_DS_GOLDEN: &[u8] =
+    include_bytes!("testdata/atrac9_demons_souls_scn000006.s16le.pcm");
+
+/// A real `SceAjmDecAt9InitializeParameters` (config data + reserved word, at9_decoder.h:
+/// 268-274) for the Demon's Souls asset. The caller keeps this alive: the initialize job
+/// references it until the batch retires.
+const AT9_DS_INIT_PARAMETERS: [u8; 8] = [
+    AT9_DS_CONFIG[0],
+    AT9_DS_CONFIG[1],
+    AT9_DS_CONFIG[2],
+    AT9_DS_CONFIG[3],
+    0,
+    0,
+    0,
+    0,
+];
+
+/// Appends an ATRAC9 initialize job referencing the caller-owned `parameters` blob.
+fn append_at9_initialize(
+    fixture: &mut BatchFixture,
+    instance: u32,
+    parameters: &[u8],
+    result: &mut [u8; 8],
+) {
+    let info = fixture.info_address();
+    assert_eq!(
+        batch_job_initialize(args(&[
+            info,
+            u64::from(instance),
+            parameters.as_ptr() as u64,
+            parameters.len() as u64,
+            result.as_mut_ptr() as u64,
+        ])),
+        SUCCESS
+    );
+}
+
+#[test]
+fn atrac9_decodes_a_real_superframe_stream_and_matches_the_independent_ffmpeg_golden() {
+    let engine = AjmEngine::new();
+    let context = create_context(&engine);
+    // A default S16-output ATRAC9 instance, exactly as Demon's Souls creates one.
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_AT9, 0);
+
+    let mut output = vec![0_u8; AT9_DS_GOLDEN.len()];
+    let mut initialize_result = [0xff_u8; 8];
+    let mut decode_result = [0xff_u8; 32];
+    let mut fixture = BatchFixture::new();
+    append_at9_initialize(&mut fixture, instance, &AT9_DS_INIT_PARAMETERS, &mut initialize_result);
+    fixture.append_decode(instance, AT9_DS_FRAMES, &mut output, &mut decode_result);
+    let batch = fixture
+        .start(&engine, context)
+        .expect("a well-formed ATRAC9 batch starts");
+    assert!(engine.execute_next_queued_batch());
+    assert_eq!(
+        engine.batch_wait(args(&[
+            u64::from(context),
+            u64::from(batch),
+            u64::from(SCE_AJM_WAIT_INFINITE),
+            0
+        ])),
+        SUCCESS
+    );
+
+    assert_eq!(
+        i32::from_le_bytes(initialize_result[0..4].try_into().unwrap()),
+        0,
+        "the real config data initializes the decoder"
+    );
+    let (result, consumed, produced, total_samples, frames) = decode_result_fields(&decode_result);
+    assert_eq!(result, 0, "the decode job succeeded");
+    assert_eq!(consumed, 2048, "eight 256-byte superframes were consumed");
+    assert_eq!(produced, i32::try_from(AT9_DS_GOLDEN.len()).unwrap());
+    // 8 superframes * 4 frames * 256 samples of mono audio.
+    assert_eq!(total_samples, 8192);
+    assert_eq!(frames, 32, "four frames per superframe over eight superframes");
+
+    let decoded: Vec<i16> = output
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let reference: Vec<i16> = AT9_DS_GOLDEN
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    assert_eq!(decoded.len(), reference.len());
+    let max_abs_diff = decoded
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+        .max()
+        .unwrap();
+    // LibAtrac9 and ffmpeg are independent ATRAC9 implementations; they agree to within one
+    // LSB (sub-LSB rounding on the IMDCT), which no integration bug could survive.
+    assert!(
+        max_abs_diff <= 1,
+        "decoded PCM disagrees with the independent ffmpeg golden by {max_abs_diff} > 1 LSB"
+    );
+    let peak = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(peak > 1000, "real audio was produced, not silence (peak {peak})");
+}
+
+#[test]
+fn atrac9_reports_channel_config_sample_rate_and_codec_info_in_sideband() {
+    let engine = AjmEngine::new();
+    let context = create_context(&engine);
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_AT9, 0);
+
+    // One superframe in, its PCM out; a run job requesting the stream, format, and ATRAC9
+    // codec-info sidebands together (sideband.h:196-202, 187-193, at9_decoder.h:283-293).
+    let input = &AT9_DS_FRAMES[..256];
+    let mut output = vec![0_u8; 2048];
+    let mut initialize_result = [0_u8; 8];
+    let mut sideband = [0_u8; 128];
+    let mut fixture = BatchFixture::new();
+    append_at9_initialize(&mut fixture, instance, &AT9_DS_INIT_PARAMETERS, &mut initialize_result);
+    let flags = AJM_FLAG_SIDEBAND_STREAM | AJM_FLAG_SIDEBAND_FORMAT | AJM_FLAG_RUN_GET_CODEC_INFO;
+    let info = fixture.info_address();
+    assert_eq!(
+        batch_job_run(
+            args(&[
+                info,
+                u64::from(instance),
+                flags,
+                input.as_ptr() as u64,
+                input.len() as u64,
+                output.as_mut_ptr() as u64,
+            ]),
+            args(&[
+                output.len() as u64,
+                sideband.as_mut_ptr() as u64,
+                sideband.len() as u64,
+            ]),
+        ),
+        SUCCESS
+    );
+    let batch = fixture.start(&engine, context).expect("the batch starts");
+    assert!(engine.execute_next_queued_batch());
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0, 0])),
+        SUCCESS
+    );
+
+    let field = |offset: usize| u32::from_le_bytes(sideband[offset..offset + 4].try_into().unwrap());
+    // result(8) then stream(16) then format(24) then codec-info(16), in section order.
+    assert_eq!(field(0), 0, "the run succeeded");
+    // SceAjmSidebandFormat begins at 8 + 16 = 24 (sideband.h:535-543).
+    assert_eq!(field(24), 1, "mono channel count");
+    assert_eq!(field(24 + 4), 0x4, "mono channel mask (FRONT_CENTER)");
+    assert_eq!(field(24 + 8), 48_000, "48 kHz sample rate");
+    assert_eq!(field(24 + 12), 0, "default S16 output encoding");
+    // SceAjmSidebandDecAt9CodecInfo begins at 24 + 24 = 48 (at9_decoder.h:283-293).
+    assert_eq!(field(48), 256, "superframe size in bytes");
+    assert_eq!(field(48 + 4), 4, "frames per superframe");
+    assert_eq!(field(48 + 12), 256, "samples per frame");
+}
+
+#[test]
+fn atrac9_rejects_malformed_config_data_then_a_decode_reports_not_initialized() {
+    let engine = AjmEngine::new();
+    let context = create_context(&engine);
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_AT9, 0);
+
+    // All-zero config data is not a valid ATRAC9 configuration (LibAtrac9 ERR_BAD_CONFIG_DATA).
+    let parameters = [0_u8; 8];
+    let mut initialize_result = [0_u8; 8];
+    let mut output = vec![0_u8; 2048];
+    let mut decode_result = [0_u8; 32];
+    let mut fixture = BatchFixture::new();
+    let info = fixture.info_address();
+    assert_eq!(
+        batch_job_initialize(args(&[
+            info,
+            u64::from(instance),
+            parameters.as_ptr() as u64,
+            parameters.len() as u64,
+            initialize_result.as_mut_ptr() as u64,
+        ])),
+        SUCCESS
+    );
+    fixture.append_decode(instance, &AT9_DS_FRAMES[..256], &mut output, &mut decode_result);
+    let batch = fixture.start(&engine, context).expect("the batch starts");
+    assert!(engine.execute_next_queued_batch());
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0, 0])),
+        SUCCESS
+    );
+    let init_result = i32::from_le_bytes(initialize_result[0..4].try_into().unwrap());
+    assert!(
+        init_result < 0,
+        "a bad ATRAC9 config sets the fatal bit in the initialize result ({init_result:#x})"
+    );
+    let (decode_status, ..) = decode_result_fields(&decode_result);
+    assert!(
+        decode_status < 0,
+        "a decode with no initialized decoder is fatal, not a fabricated success"
+    );
+    assert!(
+        output.iter().all(|&byte| byte == 0),
+        "no PCM was invented for the uninitialized decoder"
+    );
 }
 
 /// The one serving path: the global engine behind [`dispatch`], with its worker pool

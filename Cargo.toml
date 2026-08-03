@@ -21,6 +21,7 @@ license = "GPL-2.0-or-later"
 
 [workspace.dependencies]
 block = "0.1"
+cc = "1.2"
 clap = { version = "4.5", features = ["derive"] }
 core-graphics-types = "0.2"
 cpal = "0.18"

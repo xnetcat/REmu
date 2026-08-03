@@ -87,6 +87,10 @@ const AJM_CODEC_DEC_HEVAG: u32 = 22; // hevag_decoder.h:21
 pub(crate) const AJM_CODEC_DEC_LPCM: u32 = 23; // lpcm_decoder.h:30
 const AJM_CODEC_DEC_OPUS: u32 = 24; // opus_decoder.h:20
 
+/// ATRAC9 configuration-data size in bytes (`SCE_AJM_DEC_AT9_CONFIG_DATA_SIZE`,
+/// at9_decoder.h:54).
+const SCE_AJM_DEC_AT9_CONFIG_DATA_SIZE: usize = 4;
+
 /// Job sizes the guest sized its arena with (ajm.h:184, ajm.h:192, ajm.h:208, ajm.h:304 with
 /// `SceAjmGetStatisticsParameters` = 16 bytes, sideband.h:856-859).
 const AJM_JOB_CONTROL_SIZE: u64 = 48;
@@ -252,6 +256,8 @@ struct InstanceState {
     flags: u64,
     /// LPCM initialize parameters once a `sceAjmBatchJobInitialize` job ran.
     lpcm: Option<LpcmParameters>,
+    /// ATRAC9 decoder once a `sceAjmBatchJobInitialize` job configured it (plan P1).
+    at9: Option<atrac9::Atrac9Decoder>,
     /// Sample frames decoded since the last reset (`uiTotalDecodedSamples`, sideband.h:436).
     total_decoded_samples: u64,
 }
@@ -261,6 +267,28 @@ impl InstanceState {
     /// sideband.h:75-77, offsets sideband.h:907-908).
     fn output_encoding(&self) -> u32 {
         (self.flags >> 7) as u32 & 0x7
+    }
+
+    /// Channel count of the PCM this instance produces, from whichever codec configured it.
+    fn channels(&self) -> u32 {
+        if let Some(parameters) = self.lpcm {
+            parameters.channels
+        } else if let Some(decoder) = &self.at9 {
+            decoder.channels
+        } else {
+            0
+        }
+    }
+
+    /// Sample rate of the PCM this instance produces, from whichever codec configured it.
+    fn sample_rate(&self) -> u32 {
+        if let Some(parameters) = self.lpcm {
+            parameters.sample_rate
+        } else if let Some(decoder) = &self.at9 {
+            decoder.sample_rate
+        } else {
+            0
+        }
     }
 }
 
@@ -520,6 +548,7 @@ impl AjmEngine {
                 codec,
                 flags,
                 lpcm: None,
+                at9: None,
                 total_decoded_samples: 0,
             },
         );
@@ -885,6 +914,7 @@ struct RunOutput {
 fn host_codec(codec: u32) -> Option<&'static dyn AjmCodec> {
     match codec {
         AJM_CODEC_DEC_LPCM => Some(&LpcmDecoder),
+        AJM_CODEC_DEC_AT9 => Some(&Atrac9Codec),
         _ => None,
     }
 }
@@ -991,6 +1021,139 @@ impl AjmCodec for LpcmDecoder {
             consumed,
             frames,
         }
+    }
+}
+
+/// ATRAC9 decoder backed by the vendored LibAtrac9 (plan P1, `ajm/at9_decoder.h`). The 4-byte
+/// configuration data delivered in the initialize job drives the decoder; a run consumes whole
+/// ATRAC9 superframes from the input bitstream and produces interleaved PCM, natively S16 and
+/// converted only when the instance requested another output encoding.
+struct Atrac9Codec;
+
+impl AjmCodec for Atrac9Codec {
+    fn initialize(&self, instance: &mut InstanceState, parameters: &[u8]) -> i32 {
+        // `SceAjmDecAt9InitializeParameters.uiConfigData[4]` (at9_decoder.h:268-274).
+        if parameters.len() < SCE_AJM_DEC_AT9_CONFIG_DATA_SIZE {
+            return SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER;
+        }
+        let config = [parameters[0], parameters[1], parameters[2], parameters[3]];
+        let Some(decoder) = atrac9::Atrac9Decoder::new(config) else {
+            // LibAtrac9 rejected the configuration; keep the decoder uninitialized so a later
+            // run reports NOT_INITIALIZED rather than fabricating output.
+            instance.at9 = None;
+            return SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER;
+        };
+        instance.at9 = Some(decoder);
+        instance.total_decoded_samples = 0;
+        0
+    }
+
+    fn run(&self, instance: &mut InstanceState, input: &[u8], output_capacity: usize) -> RunOutput {
+        let Some(decoder) = instance.at9.as_ref() else {
+            // A run before a successful `sceAjmBatchJobInitialize` has no decoder to run.
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_NOT_INITIALIZED,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let output_encoding = instance.output_encoding();
+        let Some(output_sample) = encoding_sample_bytes(output_encoding) else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let superframe_size = decoder.superframe_size as usize;
+        let channels = u64::from(decoder.channels);
+        let frame_samples = u64::from(decoder.frame_samples);
+        // Bytes of PCM one whole superframe yields in the requested output encoding.
+        let superframe_pcm = usize::try_from(
+            u64::from(decoder.frames_in_superframe) * frame_samples * channels * output_sample,
+        )
+        .unwrap_or(usize::MAX);
+        if superframe_size == 0 || superframe_pcm == 0 {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        }
+
+        let mut produced: Vec<u8> = Vec::new();
+        let mut consumed = 0_usize;
+        let mut frames = 0_u64;
+        let mut samples_decoded = 0_u64;
+        let mut fatal = false;
+        // Decode whole superframes while both the input and the output buffer hold one more.
+        // ATRAC9 is fed superframe-aligned: each is a fixed-size block whose trailing bytes
+        // pad the packed frames, so the next superframe begins one `superframe_size` on.
+        while input.len() - consumed >= superframe_size
+            && produced.len() + superframe_pcm <= output_capacity
+        {
+            let base = consumed;
+            let mut offset = 0_usize;
+            for _ in 0..decoder.frames_in_superframe {
+                if offset >= superframe_size {
+                    // A prior frame reported consuming the whole superframe; a malformed stream
+                    // that overshoots must not index past the block.
+                    fatal = true;
+                    break;
+                }
+                let frame_input = &input[base + offset..base + superframe_size];
+                let Some(frame) = decoder.decode_frame(frame_input) else {
+                    fatal = true;
+                    break;
+                };
+                for &sample in &frame.samples {
+                    push_output_sample(&mut produced, sample, output_encoding);
+                }
+                samples_decoded += frame_samples;
+                frames += 1;
+                offset += frame.bytes_used;
+            }
+            if fatal {
+                break;
+            }
+            consumed += superframe_size;
+        }
+
+        instance.total_decoded_samples += samples_decoded;
+        // Only a first-superframe failure with nothing produced is a fatal run; a stream error
+        // after real output leaves the produced frames and their honest consumed count.
+        let result = if fatal && frames == 0 {
+            SCE_AJM_RESULT_FATAL
+        } else {
+            0
+        };
+        RunOutput {
+            result,
+            produced,
+            consumed,
+            frames,
+        }
+    }
+}
+
+/// Appends one S16 sample to `out` in the instance's requested output encoding. ATRAC9 decodes
+/// natively to S16 (`SCE_AJM_FORMAT_ENCODING_S16`); S32 and float are the same normalization
+/// the LPCM path uses (sideband.h:518-523).
+fn push_output_sample(out: &mut Vec<u8>, sample: i16, encoding: u32) {
+    match encoding {
+        1 => {
+            let scaled = (f64::from(sample) / f64::from(i16::MAX)) * f64::from(i32::MAX);
+            let value = scaled.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        2 => {
+            let value = f64::from(sample) / f64::from(i16::MAX);
+            out.extend_from_slice(&(value as f32).to_le_bytes());
+        }
+        _ => out.extend_from_slice(&sample.to_le_bytes()),
     }
 }
 
@@ -1376,10 +1539,9 @@ fn format_sideband(state: &EngineState, context: u32, instance: u32) -> Vec<u8> 
         .get(&context)
         .and_then(|context_state| context_state.instances.get(&instance));
     let (channels, sample_rate, encoding) = instance_state.map_or((0, 0, 0), |instance_state| {
-        let parameters = instance_state.lpcm;
         (
-            parameters.map_or(0, |parameters| parameters.channels),
-            parameters.map_or(0, |parameters| parameters.sample_rate),
+            instance_state.channels(),
+            instance_state.sample_rate(),
             instance_state.output_encoding(),
         )
     });
@@ -1402,13 +1564,27 @@ fn format_sideband(state: &EngineState, context: u32, instance: u32) -> Vec<u8> 
     format
 }
 
-/// `SceAjmSidebandDecLpcmCodecInfo` (lpcm_decoder.h:81-85): the input encoding and two
-/// reserved words.
+/// The codec-specific `GET_CODEC_INFO` sideband for an instance. ATRAC9 returns
+/// `SceAjmSidebandDecAt9CodecInfo` (at9_decoder.h:283-293); every other codec returns the
+/// `SceAjmSidebandDecLpcmCodecInfo`-shaped input-encoding word plus two reserved words
+/// (lpcm_decoder.h:81-85).
 fn codec_info_sideband(state: &EngineState, context: u32, instance: u32) -> Vec<u8> {
-    let encoding = state
+    let instance_state = state
         .contexts
         .get(&context)
-        .and_then(|context_state| context_state.instances.get(&instance))
+        .and_then(|context_state| context_state.instances.get(&instance));
+    if let Some(decoder) = instance_state.and_then(|instance_state| instance_state.at9.as_ref()) {
+        // `SceAjmSidebandDecAt9CodecInfo`: super-frame size, frames per super-frame, the size
+        // the caller should provide for the next frame (one super-frame, since ATRAC9 is fed
+        // super-frame aligned), and samples per frame.
+        let mut info = Vec::with_capacity(16);
+        info.extend_from_slice(&decoder.superframe_size.to_le_bytes());
+        info.extend_from_slice(&decoder.frames_in_superframe.to_le_bytes());
+        info.extend_from_slice(&decoder.superframe_size.to_le_bytes());
+        info.extend_from_slice(&decoder.frame_samples.to_le_bytes());
+        return info;
+    }
+    let encoding = instance_state
         .and_then(|instance_state| instance_state.lpcm)
         .map_or(0, |parameters| parameters.encoding);
     let mut info = Vec::with_capacity(12);
@@ -1931,6 +2107,8 @@ pub(crate) fn reset_for_new_process() {
         engine.reset();
     }
 }
+
+mod atrac9;
 
 #[cfg(test)]
 mod tests;
