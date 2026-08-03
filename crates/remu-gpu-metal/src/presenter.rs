@@ -1407,7 +1407,6 @@ struct GuestQueueBatchState {
     host_retired_fence_value: u64,
     host_dependencies: HashMap<SharedEventProducerId, u64>,
     resource_dependencies: HashMap<SharedEventProducerId, SharedEventSignalCheckpoint>,
-    retired_fence_write_ranges: BTreeMap<u64, Vec<(u64, u64)>>,
     open_batch: Option<GuestCommandBatch>,
     committed_batches: VecDeque<GuestCommandBatch>,
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,

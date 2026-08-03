@@ -5073,12 +5073,6 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
             .is_empty(),
         "host-retired producers no longer need cross-queue resource forwarding"
     );
-    assert!(
-        presenter.guest_queue_batches[&41]
-            .retired_fence_write_ranges
-            .is_empty(),
-        "retired fence ranges are pruned after the last wait/resource reference"
-    );
     remu_gpu::clear_event_sink();
 }
 

@@ -13,7 +13,7 @@ use super::super::{FlushPolicy, GuestQueueBatchState, PresenterStatistics};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter, OrderedEventSource,
-    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange, UploadedGlobalBuffer,
+    PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
@@ -346,30 +346,7 @@ impl MetalPresenter {
             .iter()
             .map(|(&producer, &value)| super::super::SharedEventFence::new(producer, value))
             .collect();
-        self.prune_retired_fence_write_ranges();
         unsignaled
-    }
-
-    pub(crate) fn prune_retired_fence_write_ranges(&mut self) {
-        let mut referenced = self
-            .gpu_wait_fences
-            .fences()
-            .map(|fence| (fence.producer(), fence.value()))
-            .collect::<std::collections::HashSet<_>>();
-        for state in self.guest_queue_batches.values() {
-            referenced.extend(
-                state
-                    .resource_dependencies
-                    .iter()
-                    .map(|(&producer, checkpoint)| (producer, checkpoint.fence.value())),
-            );
-        }
-        for (&queue_id, state) in &mut self.guest_queue_batches {
-            let producer = SharedEventProducerId::new(queue_id);
-            state
-                .retired_fence_write_ranges
-                .retain(|&value, _| referenced.contains(&(producer, value)));
-        }
     }
 
     pub(crate) fn set_active_guest_queue(&mut self, queue_id: Option<u64>) {
@@ -403,7 +380,6 @@ impl MetalPresenter {
                 host_retired_fence_value: 0,
                 host_dependencies: std::collections::HashMap::new(),
                 resource_dependencies: std::collections::HashMap::new(),
-                retired_fence_write_ranges: std::collections::BTreeMap::new(),
                 open_batch: None,
                 committed_batches: std::collections::VecDeque::new(),
                 transient_global_buffer_cache: std::collections::HashMap::new(),
@@ -797,31 +773,6 @@ impl MetalPresenter {
         // This matches the existing policy of retiring the submission after a native error while
         // retaining the error as the primary result.
         let result = self.publish_terminal_guest_memory_writes(&batch.memory_writes, result);
-        let retired_fence_ranges = batch
-            .signal_checkpoints
-            .iter()
-            .map(|checkpoint| {
-                let mut ranges = batch.memory_writes[..checkpoint.memory_write_count]
-                    .iter()
-                    .map(PendingGuestMemoryWrite::range)
-                    .collect::<Vec<_>>();
-                ranges.extend(
-                    batch.global_writebacks[..checkpoint.global_writeback_count]
-                        .iter()
-                        .filter_map(|writeback| {
-                            u64::try_from(writeback.byte_count)
-                                .ok()
-                                .map(|length| (writeback.guest_address, length))
-                        }),
-                );
-                ranges.extend(
-                    batch.guest_write_ranges[..checkpoint.guest_write_range_count]
-                        .iter()
-                        .map(|range| (range.address, range.byte_count)),
-                );
-                (checkpoint.fence.value(), ranges)
-            })
-            .collect::<Vec<_>>();
         if let (Some(queue_id), Some(maximum_fence)) = (batch.queue_id, batch.max_encoded_signal) {
             let state = self
                 .guest_queue_batches
@@ -829,11 +780,7 @@ impl MetalPresenter {
                 .expect("terminal queue state remains live");
             state.host_retired_fence_value =
                 state.host_retired_fence_value.max(maximum_fence.value());
-            for (fence_value, ranges) in retired_fence_ranges {
-                state.retired_fence_write_ranges.insert(fence_value, ranges);
-            }
         }
-        self.prune_retired_fence_write_ranges();
         result
     }
 
