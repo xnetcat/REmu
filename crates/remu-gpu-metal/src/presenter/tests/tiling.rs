@@ -14,6 +14,44 @@ use super::{
 };
 
 #[test]
+fn sdk_npot_mip_rounding_uses_floor_for_visible_and_shift_ceil_for_padding() {
+    // B2 precondition settled from SDK agc_gpu_address.cpp:
+    // - computeWidthInElementsForMip (:529-532) floors with `>>`
+    // - mipWidthCeil / first-tail entry (:565-566, :735-737) use shiftCeil (:62-64)
+    // - mode-27 already matched; mode-5 must match the same split
+    let mode5 = GuestTextureDescriptor {
+        address: 0x70_2754_1000,
+        width: 513,
+        height: 257,
+        pitch: 513,
+        tile_mode: 5,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mode5_layout = mode5_mip_chain_layout(mode5, 4).expect("mode-5 NPOT layout");
+    assert_eq!(mode5_layout.levels[0].width, 513);
+    assert_eq!(mode5_layout.levels[0].height, 257);
+    assert_eq!(mode5_layout.levels[1].width, 256); // floor(513>>1), not ceil 257
+    assert_eq!(mode5_layout.levels[1].height, 128); // floor(257>>1), not ceil 129
+    assert_eq!(mode5_layout.levels[1].padded_width % mode5_layout.block_width, 0);
+    // Padding is derived from shiftCeil, so it is at least the ceil extent.
+    assert!(mode5_layout.levels[1].padded_width >= 257);
+
+    let mode27 = GuestTextureDescriptor {
+        tile_mode: 27,
+        pitch: 513,
+        ..mode5
+    };
+    let mode27_layout = mode27_mip_chain_layout(mode27, 4).expect("mode-27 NPOT layout");
+    assert_eq!(mode27_layout.levels[1].width, 256);
+    assert_eq!(mode27_layout.levels[1].height, 128);
+    assert_eq!(
+        mode5_layout.levels[1].width, mode27_layout.levels[1].width,
+        "mode-5 and mode-27 must agree on visible NPOT dims"
+    );
+}
+
+#[test]
 fn superliminal_mode5_mip_chains_place_the_base_image_after_smaller_levels() {
     let rgba8 = GuestTextureDescriptor {
         address: 0x70_2754_1000,

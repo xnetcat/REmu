@@ -96,19 +96,22 @@ pub(crate) fn mode5_mip_chain_layout(
     } else {
         0
     };
+    // SDK agc_gpu_address.cpp:529-575 / 735-737: visible dims use floor (`>>`);
+    // padding and first-tail entry use shiftCeil. Mode-27 already matched; mode-5
+    // previously used shift_ceil for visible dims too (the named B2 disagreement).
     for level in (0..first_tail).rev() {
         let shift = u32::try_from(level).expect("level count is bounded");
-        let mip_width = shift_ceil(width, shift)
+        let mip_width_ceil = shift_ceil(width, shift)
             .ok_or("mip width overflows")?
             .max(1);
-        let mip_height = shift_ceil(height, shift)
+        let mip_height_ceil = shift_ceil(height, shift)
             .ok_or("mip height overflows")?
             .max(1);
-        let padded_width = mip_width
+        let padded_width = mip_width_ceil
             .div_ceil(block_width)
             .checked_mul(block_width)
             .ok_or("mip padded width overflows")?;
-        let padded_height = mip_height
+        let padded_height = mip_height_ceil
             .div_ceil(block_height)
             .checked_mul(block_height)
             .ok_or("mip padded height overflows")?;
@@ -117,8 +120,8 @@ pub(crate) fn mode5_mip_chain_layout(
             .and_then(|elements| elements.checked_mul(bytes_per_element))
             .ok_or("mip storage size overflows")?;
         levels[level] = GuestMipLevelLayout {
-            width: mip_width,
-            height: mip_height,
+            width: (width >> shift).max(1),
+            height: (height >> shift).max(1),
             padded_width,
             offset,
             ..empty
@@ -128,12 +131,8 @@ pub(crate) fn mode5_mip_chain_layout(
     for (level, output) in levels.iter_mut().enumerate().skip(first_tail) {
         let shift = u32::try_from(level).expect("level count is bounded");
         let (tail_x, tail_y) = mode5_mip_tail_location(level - first_tail, bytes_log2)?;
-        let mip_width = shift_ceil(width, shift)
-            .ok_or("mip width overflows")?
-            .max(1);
-        let mip_height = shift_ceil(height, shift)
-            .ok_or("mip height overflows")?
-            .max(1);
+        let mip_width = (width >> shift).max(1);
+        let mip_height = (height >> shift).max(1);
         if tail_x + mip_width > block_width || tail_y + mip_height > block_height {
             return Err(format!(
                 "mode-5 mip {level} tail placement ({tail_x},{tail_y}) {mip_width}x{mip_height} exceeds {block_width}x{block_height}"

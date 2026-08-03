@@ -41,6 +41,7 @@ mod stats;
 mod submission;
 mod telemetry;
 mod texture;
+mod tiler;
 mod tiling;
 use self::cache::{GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT};
 use self::decode::{
@@ -1099,6 +1100,10 @@ enum QueueBlockReason {
     FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
     ComputePipeline(ComputePipelineKey),
+    /// B3: deferred in-batch guest texture readback. The queue stays blocked until the
+    /// continuation is completed; encoding must not commit for the value (see `tiler::deferred`).
+    #[allow(dead_code)] // Constructed when open-batch resolve wires QueueBlockReason.
+    GuestReadback(tiler::DeferredGuestReadId),
 }
 
 enum PipelineCompileCandidate {
@@ -2283,6 +2288,12 @@ struct MetalPresenter {
     rectangle_indirect_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_scatter_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_gather_pipeline: Option<ComputePipelineState>,
+    /// B3: deferred in-batch readbacks. Encoding records here; never invents bytes.
+    #[allow(dead_code)] // Wired for QueueBlockReason::GuestReadback; open-batch resolve is next.
+    deferred_guest_reads: tiler::DeferredGuestReadTracker,
+    /// Q4: absolute-address pool bind (gpu-metal half). None until a live shared backing proves.
+    #[allow(dead_code)] // Bind surface until shader-metal agrees on slot + lowering.
+    absolute_address_pool: Option<tiler::AbsoluteAddressPool>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
     /// Compute dispatches whose execution failed, keyed by shader address; same contract as
@@ -2527,6 +2538,8 @@ impl MetalPresenter {
             rectangle_indirect_pipeline: None,
             mode27_rematerialisation_scatter_pipeline: None,
             mode27_rematerialisation_gather_pipeline: None,
+            deferred_guest_reads: tiler::DeferredGuestReadTracker::new(),
+            absolute_address_pool: None,
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             dropped_compute_executions: HashMap::new(),

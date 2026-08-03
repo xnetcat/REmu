@@ -115,7 +115,8 @@ impl MetalPresenter {
                         || self.failed_compute_pipelines.contains(key)
                 }
                 QueueBlockReason::GuestMemoryWait(_)
-                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
+                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
+                | QueueBlockReason::GuestReadback(_) => false,
                 QueueBlockReason::GuestSharedEventHostEffect {
                     consumer_queue_id,
                     consumer_ack,

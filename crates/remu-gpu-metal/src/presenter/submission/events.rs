@@ -332,7 +332,8 @@ impl OrderedGpuEventReceiver {
         self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
             QueueBlockReason::GuestMemoryWait(_)
-            | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => true,
+            | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
+            | QueueBlockReason::GuestReadback(_) => true,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
             | QueueBlockReason::GuestSharedEventHostEffect { .. }
             | QueueBlockReason::GraphicsPipeline(_)
@@ -340,7 +341,8 @@ impl OrderedGpuEventReceiver {
         });
         if self.host_block.as_mut().is_some_and(|reason| match reason {
             QueueBlockReason::GuestMemoryWait(_)
-            | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
+            | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
+            | QueueBlockReason::GuestReadback(_) => false,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
             | QueueBlockReason::GuestSharedEventHostEffect { .. }
             | QueueBlockReason::GraphicsPipeline(_)
@@ -728,7 +730,8 @@ impl OrderedGpuEventReceiver {
                 }
                 QueueBlockReason::GuestMemoryWait(_)
                 | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
-                | QueueBlockReason::GuestSharedEventHostEffect { .. } => memory += 1,
+                | QueueBlockReason::GuestSharedEventHostEffect { .. }
+                | QueueBlockReason::GuestReadback(_) => memory += 1,
                 QueueBlockReason::FlipSafetyWait(_) => flip += 1,
             }
         }
@@ -814,6 +817,9 @@ impl OrderedGpuEventReceiver {
                             ),
                             QueueBlockReason::ComputePipeline(key) => {
                                 format!("compute-pipeline:{:#x}", key.program_identity.0.address)
+                            }
+                            QueueBlockReason::GuestReadback(id) => {
+                                format!("guest-readback:{}", id.get())
                             }
                         });
                 Some(format!(
