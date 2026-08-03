@@ -24,7 +24,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-pub(crate) const SAME_QUEUE_DMA_FILL_REJECT_COUNT: usize = 10;
+pub(crate) const SAME_QUEUE_DMA_FILL_REJECT_COUNT: usize = 12;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
@@ -33,6 +33,8 @@ pub(crate) enum SameQueueDmaFillReject {
     NonImmediateSource,
     DestinationSelector,
     SourceSnapshot,
+    UnsupportedWidth,
+    NonZeroImmediate,
     InvalidRange,
     MissingIdentity,
     MetadataOverlap,
@@ -52,6 +54,8 @@ impl SameQueueDmaFillReject {
             Self::NonImmediateSource => "non-immediate-source",
             Self::DestinationSelector => "destination-selector",
             Self::SourceSnapshot => "source-snapshot",
+            Self::UnsupportedWidth => "unsupported-width",
+            Self::NonZeroImmediate => "nonzero-immediate",
             Self::InvalidRange => "invalid-range",
             Self::MissingIdentity => "missing-identity",
             Self::MetadataOverlap => "metadata-overlap",
@@ -205,11 +209,14 @@ impl MetalPresenter {
         if copy.source_snapshot.is_some() {
             return Err(SameQueueDmaFillReject::SourceSnapshot);
         }
+        if copy.byte_count != 4 {
+            return Err(SameQueueDmaFillReject::UnsupportedWidth);
+        }
+        if copy.source_address as u32 != 0 {
+            return Err(SameQueueDmaFillReject::NonZeroImmediate);
+        }
         if copy.destination_address == 0
-            || copy.byte_count == 0
-            || copy.byte_count > 512 * 1024 * 1024
             || !copy.destination_address.is_multiple_of(4)
-            || !copy.byte_count.is_multiple_of(4)
             || copy
                 .destination_address
                 .checked_add(copy.byte_count)

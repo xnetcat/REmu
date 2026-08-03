@@ -344,7 +344,7 @@ impl MetalPresenter {
             );
             let dma_fill_rejections = &self.statistics.shared_event_dma_fill_rejections;
             eprintln!(
-                "[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts={:.0}/s accepted={:.0}/s reject=cross-queue:{:.0}/s,non-immediate-source:{:.0}/s,destination-selector:{:.0}/s,source-snapshot:{:.0}/s,invalid-range:{:.0}/s,missing-identity:{:.0}/s,metadata-overlap:{:.0}/s,cache-overlap:{:.0}/s,incomplete-dependency:{:.0}/s,missing-open-batch:{:.0}/s",
+                "[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts={:.0}/s accepted={:.0}/s reject=cross-queue:{:.0}/s,non-immediate-source:{:.0}/s,destination-selector:{:.0}/s,source-snapshot:{:.0}/s,unsupported-width:{:.0}/s,nonzero-immediate:{:.0}/s,invalid-range:{:.0}/s,missing-identity:{:.0}/s,metadata-overlap:{:.0}/s,cache-overlap:{:.0}/s,incomplete-dependency:{:.0}/s,missing-open-batch:{:.0}/s",
                 f64::from(self.statistics.shared_event_dma_fill_attempts) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_dma_fills) / seconds,
                 f64::from(dma_fill_rejections[SameQueueDmaFillReject::CrossQueue.index()])
@@ -356,6 +356,10 @@ impl MetalPresenter {
                     dma_fill_rejections[SameQueueDmaFillReject::DestinationSelector.index()],
                 ) / seconds,
                 f64::from(dma_fill_rejections[SameQueueDmaFillReject::SourceSnapshot.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::UnsupportedWidth.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::NonZeroImmediate.index()])
                     / seconds,
                 f64::from(dma_fill_rejections[SameQueueDmaFillReject::InvalidRange.index()])
                     / seconds,

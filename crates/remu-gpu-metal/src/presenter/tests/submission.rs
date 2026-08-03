@@ -5938,6 +5938,34 @@ fn same_queue_immediate_fill_attaches_and_publishes_only_at_terminal_retirement(
     let (_destination_space, destination) = mapped_test_label();
     // SAFETY: the retained test address space owns this aligned writable dword.
     unsafe { std::ptr::write_volatile(destination as *mut u32, 0x1234_5678) };
+    let wait = GpuMemoryWait {
+        address: destination,
+        reference: 0,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 41,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("overlapping waiter submission");
+    let (wait_source, wait_event) = match presenter.receiver.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: event @ GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            (source, event)
+        }
+        other => panic!("expected overlapping waiter, got {other:?}"),
+    };
+    presenter.receiver.block_event(
+        wait_source,
+        wait_event,
+        QueueBlockReason::GuestMemoryWait(wait),
+    );
     let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
     let fill = immediate_dma_fill(destination, 0);
     sender
@@ -5955,6 +5983,13 @@ fn same_queue_immediate_fill_attaches_and_publishes_only_at_terminal_retirement(
         0,
     );
     assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    assert!(
+        matches!(
+            presenter.receiver.blocked_queues.get(&41),
+            Some(QueueBlockReason::GuestMemoryWait(actual)) if *actual == wait
+        ),
+        "dequeue cannot retry a wait before the deferred fill is published"
+    );
     assert_eq!(
         read_test_label(destination),
         0x1234_5678,
@@ -6002,6 +6037,10 @@ fn same_queue_immediate_fill_attaches_and_publishes_only_at_terminal_retirement(
     presenter
         .wait_for_guest_command_batches()
         .expect("same-q fill batch retires");
+    assert!(
+        !presenter.receiver.blocked_queues.contains_key(&41),
+        "terminal publication wakes the overlapping wait"
+    );
     assert_eq!(read_test_label(destination), 0);
     assert_eq!(
         presenter.color_metadata_clears[&destination],
@@ -6078,6 +6117,31 @@ fn same_queue_immediate_fill_rejects_every_unproven_shape() {
     );
     let mut copy = immediate_dma_fill(destination, 0);
     copy.byte_count = 2;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::UnsupportedWidth,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.byte_count = 8;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::UnsupportedWidth,
+    );
+    let copy = immediate_dma_fill(destination, 1);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::NonZeroImmediate,
+    );
+    let copy = immediate_dma_fill(destination + 2, 0);
     assert_reject(
         &mut presenter,
         0,
@@ -6197,7 +6261,7 @@ fn same_queue_immediate_fill_refuses_replaced_destination_without_cache_transiti
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
-    let fill = immediate_dma_fill(destination.get(), 0xdead_beef);
+    let fill = immediate_dma_fill(destination.get(), 0);
     let prepared = presenter
         .prepare_same_queue_immediate_fill(0, &[dependency], &fill)
         .expect("original exact mapping admits the fill");

@@ -477,6 +477,7 @@ impl MetalPresenter {
                 GpuEvent::MemoryCopy(copy) => {
                     let destination_address = copy.destination_address;
                     let byte_count = copy.byte_count;
+                    let retry_waits_on_dequeue = prepared_same_queue_dma_fill.is_none();
                     let result = if let Some(prepared) = prepared_same_queue_dma_fill {
                         let OrderedEventSource::GuestQueue(queue_id) = source else {
                             unreachable!("same-queue DMA admission requires a guest queue")
@@ -486,9 +487,13 @@ impl MetalPresenter {
                         self.execute_guest_memory_copy(copy)
                     };
                     match result {
-                        Ok(()) => self
-                            .receiver
-                            .retry_guest_memory_waits_overlapping(destination_address, byte_count),
+                        Ok(()) if retry_waits_on_dequeue => {
+                            self.receiver.retry_guest_memory_waits_overlapping(
+                                destination_address,
+                                byte_count,
+                            );
+                        }
+                        Ok(()) => {}
                         Err(error) => {
                             eprintln!("[REMu][METAL] DMA_DATA synchronization failed: {error}");
                         }
