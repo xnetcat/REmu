@@ -441,7 +441,7 @@ fn upload_system_ui_overlay(texture: &metal::Texture, rgba: &[u8]) {
 pub(super) fn create_presentation_resources(
     device: &Device,
 ) -> Result<PresentationResources, String> {
-    let library = if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+    let library = if super::shader::offline_metal_compiler().is_some() {
         compile_metal_library_with_tools(device, "presentation", PRESENTATION_SHADER_SOURCE)?
     } else {
         let options = CompileOptions::new();

@@ -84,24 +84,11 @@ fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
-bundled_metal_compiler="$repo_dir/.remu/toolchains/Metal.xctoolchain/usr/bin/metal"
-# Xcode's downloadable Metal component is normally unpacked under a versioned directory (for
-# example Metal-27A5209h/Metal.xctoolchain). Accept both that layout and the stable developer
-# override above so an installed offline compiler is not silently ignored.
-if [ ! -x "$bundled_metal_compiler" ]; then
-    for candidate in "$repo_dir"/.remu/toolchains/Metal-*/Metal.xctoolchain/usr/bin/metal; do
-        if [ -x "$candidate" ] && [ -x "$(dirname -- "$candidate")/metallib" ]; then
-            bundled_metal_compiler=$candidate
-            break
-        fi
-    done
-fi
-# Offline libraries can be retained across launches, avoiding tens of seconds of repeated cold
-# runtime compilation for Unity's large shader set. Set REMU_USE_BUNDLED_METAL_COMPILER=0 to
-# diagnose Apple's in-process source compiler explicitly.
-if [ "${REMU_USE_BUNDLED_METAL_COMPILER:-1}" != 0 ] && \
-    [ -z "${REMU_METAL_COMPILER:-}" ] && [ -x "$bundled_metal_compiler" ]; then
-    REMU_METAL_COMPILER=$bundled_metal_compiler
+# Offline libraries are retained across launches by default (plan F1): the runner discovers the
+# bundled toolchain itself, so no export is needed here. REMU_USE_BUNDLED_METAL_COMPILER=0 still
+# selects Apple's in-process source compiler for diagnosis, now through the runner's kill-switch.
+if [ "${REMU_USE_BUNDLED_METAL_COMPILER:-1}" = 0 ] && [ -z "${REMU_METAL_COMPILER:-}" ]; then
+    REMU_METAL_COMPILER=0
     export REMU_METAL_COMPILER
 fi
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
@@ -366,7 +353,9 @@ if [ "$timeout_seconds" -gt 0 ] 2>/dev/null; then
     echo "[REMu] automatic shutdown after ${timeout_seconds}s (pass 0 to disable)"
     echo "[REMu] external launch watchdog after ${watchdog_timeout_seconds}s"
 fi
-if [ -n "${REMU_METAL_COMPILER:-}" ]; then
+if [ "${REMU_METAL_COMPILER:-}" = 0 ]; then
+    echo "[REMu] offline Metal compiler disabled; using the in-process source compiler"
+elif [ -n "${REMU_METAL_COMPILER:-}" ]; then
     echo "[REMu] using offline Metal compiler: $REMU_METAL_COMPILER"
 fi
 if [ "${MTL_HUD_ENABLED:-0}" = 1 ]; then

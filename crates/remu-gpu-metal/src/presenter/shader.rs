@@ -29,6 +29,7 @@ pub(crate) use self::compile::{
     compile_metal_compute_library, compile_metal_library_with_tools, compile_metal_shader_library,
     dump_compute_shader_msl, dump_shader_pair_ir, dump_shader_pair_msl,
     invalidate_metal_library_cache, metal_cache_root, metal_compile_failure_is_transient,
+    offline_metal_compiler,
 };
 mod program;
 pub(crate) use self::program::{

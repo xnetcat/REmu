@@ -5,6 +5,7 @@ use metal::{CompileOptions, Device, Library};
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 pub(crate) const METAL_LIBRARY_CACHE_FORMAT: &[u8] = b"remu-metal-library-v1\0";
@@ -64,12 +65,78 @@ fn dump_failed_metal_source(stage: &str, source: &str) {
     }
 }
 
+/// Resolves the offline Metal compiler once for the process (plan F1).
+///
+/// The persistent metallib and pipeline caches are default-on: the compiler is discovered from
+/// the executable's ancestry (`.remu/toolchains/…/usr/bin/metal`, the layout `run-game.sh`
+/// bundles) without configuration. `REMU_METAL_COMPILER` still overrides the path explicitly,
+/// and `REMU_METAL_COMPILER=0` survives one cycle as the kill-switch selecting in-process
+/// compilation with no persistent library cache.
+pub(crate) fn offline_metal_compiler() -> Option<&'static Path> {
+    static COMPILER: OnceLock<Option<PathBuf>> = OnceLock::new();
+    COMPILER
+        .get_or_init(|| {
+            if let Some(value) = std::env::var_os("REMU_METAL_COMPILER") {
+                if value == "0" {
+                    eprintln!(
+                        "[REMu][METAL] offline compiler disabled by kill-switch; persistent metallib cache off"
+                    );
+                    return None;
+                }
+                return Some(PathBuf::from(value));
+            }
+            let discovered = discover_bundled_metal_compiler();
+            match &discovered {
+                Some(path) => eprintln!(
+                    "[REMu][METAL] discovered bundled offline Metal compiler {}",
+                    path.display()
+                ),
+                None => eprintln!(
+                    "[REMu][METAL] no offline Metal compiler found; compiling in-process without a persistent metallib cache"
+                ),
+            }
+            discovered
+        })
+        .as_deref()
+}
+
+/// Walks the executable's ancestry for the bundled toolchain layout `run-game.sh` unpacks.
+fn discover_bundled_metal_compiler() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let mut directory = executable.parent()?.to_path_buf();
+    loop {
+        let toolchains = directory.join(".remu/toolchains");
+        if toolchains.is_dir() {
+            let mut candidates = vec![toolchains.join("Metal.xctoolchain/usr/bin/metal")];
+            if let Ok(entries) = std::fs::read_dir(&toolchains) {
+                let mut versioned = entries
+                    .flatten()
+                    .filter(|entry| {
+                        entry.file_name().to_string_lossy().starts_with("Metal-")
+                    })
+                    .map(|entry| entry.path().join("Metal.xctoolchain/usr/bin/metal"))
+                    .collect::<Vec<_>>();
+                versioned.sort();
+                candidates.extend(versioned);
+            }
+            for candidate in candidates {
+                if candidate.is_file() && candidate.with_file_name("metallib").is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        if !directory.pop() {
+            return None;
+        }
+    }
+}
+
 pub(crate) fn compile_metal_shader_library(
     device: &Device,
     stage: &str,
     source: &str,
 ) -> Result<Library, String> {
-    let result = if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+    let result = if offline_metal_compiler().is_some() {
         match compile_metal_library_with_tools(device, stage, source) {
             Ok(library) => Ok(library),
             Err(error) if metal_compile_failure_is_transient(&error) => Err(error),
@@ -93,7 +160,7 @@ pub(crate) fn compile_metal_compute_library(
     device: &Device,
     source: &str,
 ) -> Result<Library, String> {
-    if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+    if offline_metal_compiler().is_some() {
         match compile_metal_library_with_tools(device, "compute", source) {
             Ok(library) => Ok(library),
             Err(error) if metal_compile_failure_is_transient(&error) => Err(error),
@@ -118,9 +185,9 @@ pub(crate) fn compile_metal_library_with_tools(
     static CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
     static REPORTED_MULTICALL_LINKER: AtomicBool = AtomicBool::new(false);
     let compiler = canonical_tool_path(
-        std::env::var_os("REMU_METAL_COMPILER")
-            .map(PathBuf::from)
-            .ok_or("REMU_METAL_COMPILER is not configured")?,
+        offline_metal_compiler()
+            .map(Path::to_path_buf)
+            .ok_or("no offline Metal compiler is configured or bundled")?,
     );
     if !compiler.is_file() {
         return Err(format!("{} is not a file", compiler.display()));
@@ -274,11 +341,36 @@ fn metallib_tool_path(compiler: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{MetalCompileDirectory, canonical_tool_path, metallib_tool_path};
+    use super::{
+        MetalCompileDirectory, canonical_tool_path, discover_bundled_metal_compiler,
+        metallib_tool_path,
+    };
     use std::ffi::OsStr;
     use std::fs::File;
     use std::os::unix::fs::symlink;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bundled_metal_compiler_is_discovered_without_configuration() {
+        // Plan F1: the persistent metallib/function caches are default-on, so the offline
+        // compiler must be found from the executable's ancestry, not from the environment.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root");
+        if !repo.join(".remu/toolchains").is_dir() {
+            eprintln!("skipped: this checkout carries no bundled Metal toolchain");
+            return;
+        }
+        let compiler = discover_bundled_metal_compiler()
+            .expect("a checkout with .remu/toolchains discovers its compiler");
+        assert_eq!(compiler.file_name(), Some(OsStr::new("metal")));
+        assert!(
+            compiler.with_file_name("metallib").is_file(),
+            "the discovered compiler must sit beside its metallib linker"
+        );
+    }
 
     #[test]
     fn metallib_tool_path_preserves_the_multicall_symlink_name() {

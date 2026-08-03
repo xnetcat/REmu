@@ -510,7 +510,7 @@ impl ShaderFunctionCache {
         let compiled = match compiled {
             Ok(function) => Ok(function),
             Err(error)
-                if std::env::var_os("REMU_METAL_COMPILER").is_some()
+                if super::compile::offline_metal_compiler().is_some()
                     && error.contains("does not exist") =>
             {
                 invalidate_metal_library_cache(&shader.source);

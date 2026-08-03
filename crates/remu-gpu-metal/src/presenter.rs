@@ -2325,7 +2325,7 @@ impl MetalPresenter {
             mpsc::channel::<ShaderCompileResult>();
         let shader_compile_requests = Arc::new(Mutex::new(shader_compile_requests));
         let function_cache = ShaderFunctionCache::default();
-        let render_pipeline_archive = if std::env::var_os("REMU_METAL_COMPILER").is_some() {
+        let render_pipeline_archive = if shader::offline_metal_compiler().is_some() {
             match PersistentRenderPipelineArchive::open(&device) {
                 Ok(archive) => Some(archive),
                 Err(error) => {
