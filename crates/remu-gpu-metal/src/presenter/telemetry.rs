@@ -153,7 +153,10 @@ fn write_run_json(directory: &Path, device_name: &str) -> std::io::Result<()> {
     let record = telemetry_record_json(&[
         ("schema", TelemetryValue::from(RUN_SCHEMA)),
         ("pid", TelemetryValue::from(u64::from(std::process::id()))),
-        ("start_unix_ms", TelemetryValue::from(unix_time_milliseconds())),
+        (
+            "start_unix_ms",
+            TelemetryValue::from(unix_time_milliseconds()),
+        ),
         ("revision", TelemetryValue::from(revision.as_str())),
         ("executable", TelemetryValue::from(executable.as_str())),
         ("device", TelemetryValue::from(device_name)),

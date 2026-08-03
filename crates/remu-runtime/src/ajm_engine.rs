@@ -303,8 +303,8 @@ struct LpcmParameters {
 /// Bytes one sample of an encoding occupies (`SceAjmFormatEncoding`, sideband.h:518-523).
 fn encoding_sample_bytes(encoding: u32) -> Option<u64> {
     match encoding {
-        0 => Some(2),        // SCE_AJM_FORMAT_ENCODING_S16
-        1 | 2 => Some(4),    // S32 / FLOAT
+        0 => Some(2),     // SCE_AJM_FORMAT_ENCODING_S16
+        1 | 2 => Some(4), // S32 / FLOAT
         _ => None,
     }
 }
@@ -439,10 +439,7 @@ impl AjmEngine {
         let output = arguments[1];
         let expansion = low_u32(flag) & 0x7f;
         let undefined_low_bits = low_u32(flag) & !0x7f;
-        if output == 0
-            || undefined_low_bits != 0
-            || expansion > 32
-            || !expansion.is_multiple_of(2)
+        if output == 0 || undefined_low_bits != 0 || expansion > 32 || !expansion.is_multiple_of(2)
         {
             return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
         }
@@ -833,7 +830,11 @@ impl AjmEngine {
     /// Jobs seen per codec type, for tests and diagnostics.
     #[cfg(test)]
     fn codec_job_count(&self, codec: u32) -> u64 {
-        self.lock().codec_job_counts.get(&codec).copied().unwrap_or(0)
+        self.lock()
+            .codec_job_counts
+            .get(&codec)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -986,12 +987,16 @@ impl AjmCodec for LpcmDecoder {
             let offset = sample * usize::try_from(input_sample).expect("sample sizes are small");
             // Normalize through f64 so every encoding pair converts without a special case.
             let value = match parameters.encoding {
-                0 => f64::from(i16::from_le_bytes(
-                    input[offset..offset + 2].try_into().expect("sized above"),
-                )) / f64::from(i16::MAX),
-                1 => f64::from(i32::from_le_bytes(
-                    input[offset..offset + 4].try_into().expect("sized above"),
-                )) / f64::from(i32::MAX),
+                0 => {
+                    f64::from(i16::from_le_bytes(
+                        input[offset..offset + 2].try_into().expect("sized above"),
+                    )) / f64::from(i16::MAX)
+                }
+                1 => {
+                    f64::from(i32::from_le_bytes(
+                        input[offset..offset + 4].try_into().expect("sized above"),
+                    )) / f64::from(i32::MAX)
+                }
                 _ => f64::from(f32::from_le_bytes(
                     input[offset..offset + 4].try_into().expect("sized above"),
                 )),
@@ -1146,7 +1151,9 @@ fn push_output_sample(out: &mut Vec<u8>, sample: i16, encoding: u32) {
     match encoding {
         1 => {
             let scaled = (f64::from(sample) / f64::from(i16::MAX)) * f64::from(i32::MAX);
-            let value = scaled.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+            let value = scaled
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
             out.extend_from_slice(&value.to_le_bytes());
         }
         2 => {
@@ -1444,7 +1451,8 @@ fn execute_job(
                 .get_mut(&context)
                 .and_then(|context_state| context_state.instances.get_mut(&job.instance))
                 .ok_or(SCE_AJM_ERROR_INVALID_INSTANCE)?;
-            let codec = host_codec(instance_state.codec).ok_or(SCE_AJM_ERROR_CODEC_NOT_SUPPORTED)?;
+            let codec =
+                host_codec(instance_state.codec).ok_or(SCE_AJM_ERROR_CODEC_NOT_SUPPORTED)?;
             let mut result = 0_i32;
             if flags & AJM_FLAG_CONTROL_INITIALIZE != 0 {
                 let parameters = read_guest_buffer(sideband_input)?;
@@ -1466,7 +1474,8 @@ fn execute_job(
                 .get_mut(&context)
                 .and_then(|context_state| context_state.instances.get_mut(&job.instance))
                 .ok_or(SCE_AJM_ERROR_INVALID_INSTANCE)?;
-            let codec = host_codec(instance_state.codec).ok_or(SCE_AJM_ERROR_CODEC_NOT_SUPPORTED)?;
+            let codec =
+                host_codec(instance_state.codec).ok_or(SCE_AJM_ERROR_CODEC_NOT_SUPPORTED)?;
             let mut input = Vec::new();
             for buffer in inputs {
                 input.extend_from_slice(&read_guest_buffer(buffer)?);
@@ -1484,7 +1493,9 @@ fn execute_job(
                 // `SceAjmSidebandStream` (sideband.h:432-437).
                 let mut stream = Vec::with_capacity(16);
                 stream.extend_from_slice(
-                    &i32::try_from(output.consumed).unwrap_or(i32::MAX).to_le_bytes(),
+                    &i32::try_from(output.consumed)
+                        .unwrap_or(i32::MAX)
+                        .to_le_bytes(),
                 );
                 stream.extend_from_slice(
                     &i32::try_from(output.produced.len())
@@ -1512,13 +1523,14 @@ fn execute_job(
                 // `SceAjmSidebandMFrame` (sideband.h:614-618).
                 let mut mframe = Vec::with_capacity(8);
                 mframe.extend_from_slice(
-                    &u32::try_from(output.frames).unwrap_or(u32::MAX).to_le_bytes(),
+                    &u32::try_from(output.frames)
+                        .unwrap_or(u32::MAX)
+                        .to_le_bytes(),
                 );
                 mframe.extend_from_slice(&0_u32.to_le_bytes());
                 sections.push(mframe);
             }
-            let section_slices: Vec<&[u8]> =
-                sections.iter().map(std::vec::Vec::as_slice).collect();
+            let section_slices: Vec<&[u8]> = sections.iter().map(std::vec::Vec::as_slice).collect();
             write_sideband(sideband, output.result, &section_slices)
         }
         AjmJobKind::Statistics { interval, result } => {
@@ -1615,7 +1627,11 @@ fn statistics_report(state: &EngineState, batch_id: u32, interval: f32) -> Vec<u
                 .iter()
                 .map(|(_, spent)| spent.as_secs_f32())
                 .sum();
-            return if span > f32::EPSILON { busy / span } else { busy.min(1.0) };
+            return if span > f32::EPSILON {
+                busy / span
+            } else {
+                busy.min(1.0)
+            };
         }
         let bound = Duration::from_secs_f32(window.min(3600.0));
         state
@@ -1629,9 +1645,7 @@ fn statistics_report(state: &EngineState, batch_id: u32, interval: f32) -> Vec<u
     let instances: u32 = state
         .contexts
         .values()
-        .map(|context_state| {
-            u32::try_from(context_state.instances.len()).unwrap_or(u32::MAX)
-        })
+        .map(|context_state| u32::try_from(context_state.instances.len()).unwrap_or(u32::MAX))
         .sum();
     let in_flight: u32 = state
         .batches
@@ -1659,7 +1673,11 @@ fn statistics_report(state: &EngineState, batch_id: u32, interval: f32) -> Vec<u
             .saturating_sub(instance_used)
             .to_le_bytes(),
     );
-    report.extend_from_slice(&AJM_BUFFER_MEMORY_BUDGET.saturating_sub(in_flight).to_le_bytes());
+    report.extend_from_slice(
+        &AJM_BUFFER_MEMORY_BUDGET
+            .saturating_sub(in_flight)
+            .to_le_bytes(),
+    );
     let (arena, input, output) = batch.map_or((0, 0, 0), |batch| {
         (batch.arena_bytes, batch.input_bytes, batch.output_bytes)
     });
@@ -1875,7 +1893,13 @@ fn batch_job_initialize(arguments: [u64; 6]) -> u64 {
         address: arguments[4],
         size: AJM_SIDEBAND_RESULT_SIZE,
     };
-    append_control_job(info, instance, AJM_FLAG_CONTROL_INITIALIZE, parameters, result)
+    append_control_job(
+        info,
+        instance,
+        AJM_FLAG_CONTROL_INITIALIZE,
+        parameters,
+        result,
+    )
 }
 
 /// `sceAjmBatchJobClearContext(pInfo, uiInstance, pResult)` (ajm.h:910-929).
@@ -1889,7 +1913,10 @@ fn batch_job_clear_context(arguments: [u64; 6]) -> u64 {
         info,
         instance,
         AJM_FLAG_CONTROL_RESET,
-        AjmBuffer { address: 0, size: 0 },
+        AjmBuffer {
+            address: 0,
+            size: 0,
+        },
         result,
     )
 }
@@ -1987,9 +2014,15 @@ fn append_run_split_job(
     write_arena_u32(job + 4, instance);
     write_arena_u64(job + 8, flags);
     write_arena_u64(job + 16, sideband.address);
-    write_arena_u32(job + 24, u32::try_from(sideband.size).expect("bounded above"));
+    write_arena_u32(
+        job + 24,
+        u32::try_from(sideband.size).expect("bounded above"),
+    );
     write_arena_u16(job + 28, u16::try_from(input_count).expect("bounded above"));
-    write_arena_u16(job + 30, u16::try_from(output_count).expect("bounded above"));
+    write_arena_u16(
+        job + 30,
+        u16::try_from(output_count).expect("bounded above"),
+    );
     for index in 0..input_count {
         let source = inputs + index * 16;
         write_arena_u64(job + 32 + index * 16, read_arena_u64(source));

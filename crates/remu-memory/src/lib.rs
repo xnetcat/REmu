@@ -38,17 +38,16 @@ pub const fn notify_guest_memory_written(_address: u64, _byte_count: u64) -> boo
 mod address_space;
 #[cfg(target_os = "macos")]
 pub use address_space::{
-    AddressSpaceError, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapCoalescing, GuestMapPlacement,
-    GuestPhysicalBacking, GuestProtection, GuestSharedBackingRange, GuestSharedBackingSegment,
-    GuestSharedBackingView, GuestSharedMapOptions, GuestSharedMappingIdentity, GuestVmaInfo,
-    GuestVmaState, GuardedBackingWrite, GuestRangeLease, LeasePublishOutcome, RequestedAddress,
-    guest_shared_backing_alias_segments,
+    AddressSpaceError, GUEST_PAGE_SIZE, GuardedBackingWrite, GuestAddressSpace, GuestMapCoalescing,
+    GuestMapPlacement, GuestPhysicalBacking, GuestProtection, GuestRangeLease,
+    GuestSharedBackingRange, GuestSharedBackingSegment, GuestSharedBackingView,
+    GuestSharedMapOptions, GuestSharedMappingIdentity, GuestVmaInfo, GuestVmaState,
+    LeasePublishOutcome, RequestedAddress, guest_shared_backing_alias_segments,
     guest_shared_backing_identity, guest_shared_backing_range, guest_shared_backing_ranges_overlap,
     guest_shared_backing_segments, guest_shared_mapping_epoch, guest_shared_mapping_identity,
     read_guest_shared_backing, write_guest_shared_backing, write_guest_shared_backing_at_identity,
-    write_guest_shared_backing_at_identity_with_baseline,
-    write_guest_shared_backing_if_identity, write_guest_shared_backing_if_identity_and_baseline,
-    write_guest_shared_backing_scattered,
+    write_guest_shared_backing_at_identity_with_baseline, write_guest_shared_backing_if_identity,
+    write_guest_shared_backing_if_identity_and_baseline, write_guest_shared_backing_scattered,
 };
 
 /// Guest page size is 16 KiB on every host. The sparse address-space backend that uses it is

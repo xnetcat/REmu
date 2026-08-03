@@ -26,6 +26,7 @@ mod cache;
 mod completion;
 mod decode;
 mod diagnostics;
+mod display_link;
 mod execute;
 mod format;
 mod host_ui;
@@ -34,7 +35,6 @@ mod readback;
 mod sampler;
 mod shader;
 mod shared_event;
-mod display_link;
 mod stats;
 mod submission;
 mod telemetry;
@@ -1553,7 +1553,9 @@ struct PendingGlobalWriteback {
 
 impl PendingGlobalWriteback {
     fn mapping_identity(&self) -> Option<GuestSharedMappingIdentity> {
-        self.lease.as_ref().map(remu_memory::GuestRangeLease::identity)
+        self.lease
+            .as_ref()
+            .map(remu_memory::GuestRangeLease::identity)
     }
 }
 

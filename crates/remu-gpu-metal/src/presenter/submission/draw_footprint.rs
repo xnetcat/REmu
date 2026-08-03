@@ -1724,8 +1724,10 @@ mod tests {
             pending_write_footprint: vec![producer],
             footprint_complete: true,
         };
-        let internal =
-            HashMap::from([(producer_id, checkpoint_with(SharedEventWriteKind::InternalResidentDestination))]);
+        let internal = HashMap::from([(
+            producer_id,
+            checkpoint_with(SharedEventWriteKind::InternalResidentDestination),
+        )]);
         let (admission, overrides) = direct_draw_dependencies_are_gpu_orderable(
             9,
             &[fence],
@@ -1738,8 +1740,10 @@ mod tests {
         assert_eq!(admission, DirectDrawAdmission::ResidentImage);
         assert_eq!(overrides.len(), 1);
 
-        let mismatched =
-            HashMap::from([(producer_id, checkpoint_with(SharedEventWriteKind::ResidentDestination))]);
+        let mismatched = HashMap::from([(
+            producer_id,
+            checkpoint_with(SharedEventWriteKind::ResidentDestination),
+        )]);
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
                 9,

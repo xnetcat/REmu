@@ -1071,8 +1071,7 @@ impl MetalPresenter {
                 u64::try_from(self.committed_guest_batch_count()).unwrap_or(0);
             let telemetry_textures = u64::try_from(self.sampled_texture_cache.len()).unwrap_or(0);
             let telemetry_compiled = u64::try_from(self.compiled_shader_pairs.len()).unwrap_or(0);
-            let telemetry_compiling =
-                u64::try_from(self.compiling_shader_pairs.len()).unwrap_or(0);
+            let telemetry_compiling = u64::try_from(self.compiling_shader_pairs.len()).unwrap_or(0);
             if let Some(log) = self.telemetry_log.as_mut() {
                 use super::super::telemetry::TelemetryValue;
                 let mean_ns = |histogram: &remu_gpu::DispatchLatencyHistogram| {
@@ -1120,13 +1119,22 @@ impl MetalPresenter {
                         "pending_flips",
                         TelemetryValue::from(u64::try_from(pending_flips).unwrap_or(0)),
                     ),
-                    ("resident_textures", TelemetryValue::from(telemetry_textures)),
+                    (
+                        "resident_textures",
+                        TelemetryValue::from(telemetry_textures),
+                    ),
                     (
                         "texture_cache_mib",
                         TelemetryValue::from(sampled_texture_cache_mib),
                     ),
-                    ("pipelines_compiled", TelemetryValue::from(telemetry_compiled)),
-                    ("pipelines_compiling", TelemetryValue::from(telemetry_compiling)),
+                    (
+                        "pipelines_compiled",
+                        TelemetryValue::from(telemetry_compiled),
+                    ),
+                    (
+                        "pipelines_compiling",
+                        TelemetryValue::from(telemetry_compiling),
+                    ),
                     ("audio_out_per_s", TelemetryValue::from(audio_output_rate)),
                     (
                         "audio_underrun_percent",

@@ -925,8 +925,7 @@ impl GuestRangeLease {
         let Some(run_address) = self.address.checked_add(run_offset) else {
             return LeasePublishOutcome::Revoked;
         };
-        let Some(run_backing_offset) = self.identity.backing_offset.checked_add(run_offset)
-        else {
+        let Some(run_backing_offset) = self.identity.backing_offset.checked_add(run_offset) else {
             return LeasePublishOutcome::Revoked;
         };
         let Some(run_backing_end) = run_backing_offset.checked_add(run_bytes) else {
@@ -970,7 +969,12 @@ impl GuestRangeLease {
             return LeasePublishOutcome::Revoked;
         }
         if run_backing_end > backing.size() {
-            trace_refused_identity_write(&mappings, self.identity, run_bytes, "range exceeds backing");
+            trace_refused_identity_write(
+                &mappings,
+                self.identity,
+                run_bytes,
+                "range exceeds backing",
+            );
             return LeasePublishOutcome::Revoked;
         }
         if !identity_range_is_live(

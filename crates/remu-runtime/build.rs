@@ -27,7 +27,10 @@ fn main() {
     ];
 
     let mut build = cc::Build::new();
-    build.include(src).warnings(false).flag_if_supported("-std=c11");
+    build
+        .include(src)
+        .warnings(false)
+        .flag_if_supported("-std=c11");
     for source in sources {
         build.file(src.join(source));
     }

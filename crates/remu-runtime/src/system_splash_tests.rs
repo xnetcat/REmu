@@ -1,7 +1,4 @@
-use super::{
-    ProbeDispatchState, SplashState, load_system_splash,
-    system_service_hide_splash,
-};
+use super::{ProbeDispatchState, SplashState, load_system_splash, system_service_hide_splash};
 
 #[test]
 fn installed_splash_loads_case_insensitively_as_rgba8() {

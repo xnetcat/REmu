@@ -3,12 +3,11 @@
 
 use super::super::WritebackTrigger;
 use super::{
-    ActiveTranslatedScanout, GuestTextureDescriptor,
-    HostSplashTexture, MetalPresenter, OrderedEventSource, WriteWatchRefresh, capture_interval,
-    completed_command_buffer_gpu_duration, decode_guest_texture_linear_from_raw,
-    diagnostic_scanout_writer, diagnostic_texture_writer, raw_video_out_texture_descriptor,
-    read_texture_linear, refresh_resident_texture_write_watch, snapshot_guest_texture_raw,
-    trace_resident_texture_removal, trace_scanout_writes,
+    ActiveTranslatedScanout, GuestTextureDescriptor, HostSplashTexture, MetalPresenter,
+    OrderedEventSource, WriteWatchRefresh, capture_interval, completed_command_buffer_gpu_duration,
+    decode_guest_texture_linear_from_raw, diagnostic_scanout_writer, diagnostic_texture_writer,
+    raw_video_out_texture_descriptor, read_texture_linear, refresh_resident_texture_write_watch,
+    snapshot_guest_texture_raw, trace_resident_texture_removal, trace_scanout_writes,
 };
 use crate::presenter::completion::command_buffer_failure_message;
 use metal::{

@@ -989,9 +989,15 @@ fn queued_copied_writer_forwards_across_a_shifted_physical_alias() {
             offset: 32,
             guest_address: producer_address,
             byte_count: usize::try_from(producer_bytes).unwrap(),
-            lease: (guest_shared_backing_identity(producer_address, producer_bytes)).map(|identity| {
-                GuestRangeLease::adopt(producer_address, u64::try_from(usize::try_from(producer_bytes).unwrap()).unwrap(), identity)
-            }),
+            lease: (guest_shared_backing_identity(producer_address, producer_bytes)).map(
+                |identity| {
+                    GuestRangeLease::adopt(
+                        producer_address,
+                        u64::try_from(usize::try_from(producer_bytes).unwrap()).unwrap(),
+                        identity,
+                    )
+                },
+            ),
             write_watch: None,
             original_bytes: vec![0; usize::try_from(producer_bytes).unwrap()],
             original_version: None,
@@ -1426,10 +1432,7 @@ fn writable_global_capture_acquires_its_lease_at_collect_time() {
     let lease = pending[0].lease.as_ref().expect("capture-time lease");
     assert_eq!(
         Some(lease.identity()),
-        guest_shared_backing_identity(
-            binding_address,
-            u64::try_from(binding_byte_count).unwrap()
-        ),
+        guest_shared_backing_identity(binding_address, u64::try_from(binding_byte_count).unwrap()),
         "the lease records the identity resolved at capture"
     );
 
@@ -2919,7 +2922,11 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                     guest_address: stale_address.get(),
                     byte_count: 4,
                     lease: (Some(stale_identity)).map(|identity| {
-                        GuestRangeLease::adopt(stale_address.get(), u64::try_from(4).unwrap(), identity)
+                        GuestRangeLease::adopt(
+                            stale_address.get(),
+                            u64::try_from(4).unwrap(),
+                            identity,
+                        )
                     }),
                     write_watch: None,
                     original_bytes: vec![0; 4],
@@ -2931,7 +2938,11 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                     guest_address: valid_address.get(),
                     byte_count: 4,
                     lease: (Some(valid_identity)).map(|identity| {
-                        GuestRangeLease::adopt(valid_address.get(), u64::try_from(4).unwrap(), identity)
+                        GuestRangeLease::adopt(
+                            valid_address.get(),
+                            u64::try_from(4).unwrap(),
+                            identity,
+                        )
                     }),
                     write_watch: None,
                     original_bytes: vec![0; 4],
@@ -5156,9 +5167,11 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            lease: (guest_shared_backing_identity(                guest_address,
+            lease: (guest_shared_backing_identity(
+                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            )).map(|identity| {
+            ))
+            .map(|identity| {
                 GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
             }),
             write_watch: None,
@@ -5180,9 +5193,11 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            lease: (guest_shared_backing_identity(                guest_address,
+            lease: (guest_shared_backing_identity(
+                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            )).map(|identity| {
+            ))
+            .map(|identity| {
                 GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
             }),
             write_watch: None,
@@ -5242,9 +5257,11 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            lease: (guest_shared_backing_identity(                guest_address,
+            lease: (guest_shared_backing_identity(
+                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            )).map(|identity| {
+            ))
+            .map(|identity| {
                 GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
             }),
             write_watch: None,
@@ -5391,9 +5408,11 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
             offset: 0,
             guest_address,
             byte_count,
-            lease: (guest_shared_backing_identity(                guest_address,
+            lease: (guest_shared_backing_identity(
+                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            )).map(|identity| {
+            ))
+            .map(|identity| {
                 GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
             }),
             write_watch: None,
@@ -6212,9 +6231,8 @@ fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
         offset: 0,
         guest_address: address,
         byte_count: 32,
-        lease: (Some(copied_identity)).map(|identity| {
-            GuestRangeLease::adopt(address, u64::try_from(32).unwrap(), identity)
-        }),
+        lease: (Some(copied_identity))
+            .map(|identity| GuestRangeLease::adopt(address, u64::try_from(32).unwrap(), identity)),
         write_watch: None,
         original_bytes: vec![0; 32],
         original_version: None,
@@ -7302,8 +7320,8 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
 
 #[test]
 fn per_queue_batch_flags_default_on_and_honour_the_zero_kill_switch() {
-    use std::ffi::OsStr;
     use super::super::graduated_flag_enabled;
+    use std::ffi::OsStr;
     assert!(graduated_flag_enabled(None));
     assert!(!graduated_flag_enabled(Some(OsStr::new("0"))));
     assert!(graduated_flag_enabled(Some(OsStr::new("1"))));

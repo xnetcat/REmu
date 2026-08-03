@@ -33,8 +33,8 @@ fn a_display_call_on_a_handle_no_port_owns_is_rejected() {
 
 /// Sets the process display port's open flag, returning the previous value for restoration.
 fn set_process_display_open(open: bool) -> bool {
-    let dispatch_lock = crate::PROBE_DISPATCH
-        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let dispatch_lock =
+        crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
     let mut state = crate::lock_probe_dispatch_for_write(dispatch_lock);
     std::mem::replace(&mut state.video_out.is_open, open)
 }
@@ -60,8 +60,8 @@ fn wait_vblank_validates_its_port_briefly_and_sleeps_off_the_dispatch_lock() {
 
 #[test]
 fn wait_vblank_refuses_to_run_under_the_dispatch_write_lock() {
-    let dispatch_lock = crate::PROBE_DISPATCH
-        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let dispatch_lock =
+        crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
     let guard = crate::lock_probe_dispatch_for_write(dispatch_lock);
     // Catch the refusal inside the guard's lifetime: letting the panic unwind out of the test
     // would drop the guard on a panicking thread and poison the process-wide lock for every

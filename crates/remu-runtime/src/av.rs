@@ -25,12 +25,12 @@ mod ngs2_voice;
 mod ngs2_waveform;
 mod video_out;
 use self::ajm::ajm_str_error;
+use self::audio_out::audio_out_set_mix_level_pad_spk;
 #[cfg(test)]
 use self::audio_out::{
     AUDIO_OUT_ERROR_INVALID_ARG, AUDIO_OUT_ERROR_INVALID_MIXLEVEL, AUDIO_OUT_MIXLEVEL_MAXIMUM,
     AUDIO_OUT_OUTPUTS_MAX,
 };
-use self::audio_out::audio_out_set_mix_level_pad_spk;
 // Dispatched before the process-wide dispatch lock (plan C5).
 pub(crate) use self::audio_out::audio_out_outputs;
 use self::mp3::ajm_dec_mp3_parse_frame;

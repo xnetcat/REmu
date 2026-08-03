@@ -581,7 +581,10 @@ fn a_lease_follows_a_recycled_va_through_the_identity_licence() {
     );
     let mut observed = [0_u8; 8];
     memory.read(observer, &mut observed).unwrap();
-    assert_eq!(observed, [0x5a; 8], "the original physical pages hold the GPU result");
+    assert_eq!(
+        observed, [0x5a; 8],
+        "the original physical pages hold the GPU result"
+    );
 }
 
 #[test]

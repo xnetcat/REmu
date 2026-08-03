@@ -99,7 +99,13 @@ impl BatchFixture {
         );
     }
 
-    fn append_decode(&mut self, instance: u32, input: &[u8], output: &mut [u8], result: &mut [u8; 32]) {
+    fn append_decode(
+        &mut self,
+        instance: u32,
+        input: &[u8],
+        output: &mut [u8],
+        result: &mut [u8; 32],
+    ) {
         let info = self.info_address();
         assert_eq!(
             batch_job_decode(
@@ -291,7 +297,9 @@ fn an_lpcm_decode_batch_runs_end_to_end_and_reports_real_stream_totals() {
     let mut fixture = BatchFixture::new();
     fixture.append_initialize(instance, &mut initialize_result);
     fixture.append_decode(instance, &input, &mut output, &mut decode_result);
-    let batch = fixture.start(&engine, context).expect("a well-formed batch starts");
+    let batch = fixture
+        .start(&engine, context)
+        .expect("a well-formed batch starts");
 
     assert!(engine.execute_next_queued_batch());
     assert!(!engine.execute_next_queued_batch(), "one batch was queued");
@@ -310,8 +318,7 @@ fn an_lpcm_decode_batch_runs_end_to_end_and_reports_real_stream_totals() {
         0,
         "initialization succeeded"
     );
-    let (result, consumed, produced, total_samples, frames) =
-        decode_result_fields(&decode_result);
+    let (result, consumed, produced, total_samples, frames) = decode_result_fields(&decode_result);
     assert_eq!(result, 0);
     assert_eq!(consumed, i32::try_from(input.len()).unwrap());
     assert_eq!(produced, i32::try_from(input.len()).unwrap());
@@ -348,7 +355,9 @@ fn lpcm_converts_between_the_declared_input_and_requested_output_encodings() {
     fixture.lpcm_parameters = [0, 1, 48_000]; // S16 mono in
     fixture.append_initialize(instance, &mut initialize_result);
     fixture.append_decode(instance, &input, &mut output, &mut decode_result);
-    let batch = fixture.start(&engine, context).expect("a well-formed batch starts");
+    let batch = fixture
+        .start(&engine, context)
+        .expect("a well-formed batch starts");
     assert!(engine.execute_next_queued_batch());
     assert_eq!(
         engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0, 0])),
@@ -397,7 +406,10 @@ fn a_job_for_a_codec_without_a_host_implementation_fails_the_whole_batch_loudly(
         1,
         "demand telemetry counts the refused job"
     );
-    assert!(output.iter().all(|&byte| byte == 0), "no output was invented");
+    assert!(
+        output.iter().all(|&byte| byte == 0),
+        "no output was invented"
+    );
 }
 
 #[test]
@@ -411,7 +423,10 @@ fn a_scribbled_arena_fails_batch_start_with_invalid_opcode() {
         .start(&engine, context)
         .expect_err("a corrupt arena must be refused");
     assert_eq!(status, error(SCE_AJM_ERROR_MALFORMED_BATCH));
-    assert_eq!(report.error_code, SCE_AJM_ERROR_INVALID_OPCODE.cast_signed());
+    assert_eq!(
+        report.error_code,
+        SCE_AJM_ERROR_INVALID_OPCODE.cast_signed()
+    );
 }
 
 #[test]
@@ -556,7 +571,11 @@ fn statistics_jobs_report_engine_accounting_not_invented_decode() {
         AJM_INSTANCE_MEMORY_BUDGET - AJM_INSTANCE_NOMINAL_SIZE,
         "one live instance is charged against the engine's real budget"
     );
-    assert_eq!(u64::from(field(32)), arena_bytes, "the batch arena size is real");
+    assert_eq!(
+        u64::from(field(32)),
+        arena_bytes,
+        "the batch arena size is real"
+    );
     assert_eq!(field(36), u32::try_from(input.len()).unwrap());
     assert_eq!(field(40), u32::try_from(output.len()).unwrap());
 }
@@ -606,7 +625,10 @@ fn a_split_decode_gathers_input_segments_and_scatters_output() {
     );
     let mut gathered = output_front.clone();
     gathered.extend_from_slice(&output_back);
-    assert_eq!(gathered, bytes, "input segments concatenate across output segments");
+    assert_eq!(
+        gathered, bytes,
+        "input segments concatenate across output segments"
+    );
     let (result, consumed, produced, ..) = decode_result_fields(&decode_result);
     assert_eq!(result, 0);
     assert_eq!(consumed, i32::try_from(bytes.len()).unwrap());
@@ -767,8 +789,7 @@ const AT9_DS_FRAMES: &[u8] = include_bytes!("testdata/atrac9_demons_souls_scn000
 /// decoder** (8192 mono S16 samples) and sign-negated into ATRAC9/LibAtrac9 output polarity.
 /// ffmpeg is a wholly separate implementation, so this is an independent oracle, not a
 /// self-referential capture.
-const AT9_DS_GOLDEN: &[u8] =
-    include_bytes!("testdata/atrac9_demons_souls_scn000006.s16le.pcm");
+const AT9_DS_GOLDEN: &[u8] = include_bytes!("testdata/atrac9_demons_souls_scn000006.s16le.pcm");
 
 /// A real `SceAjmDecAt9InitializeParameters` (config data + reserved word, at9_decoder.h:
 /// 268-274) for the Demon's Souls asset. The caller keeps this alive: the initialize job
@@ -815,7 +836,12 @@ fn atrac9_decodes_a_real_superframe_stream_and_matches_the_independent_ffmpeg_go
     let mut initialize_result = [0xff_u8; 8];
     let mut decode_result = [0xff_u8; 32];
     let mut fixture = BatchFixture::new();
-    append_at9_initialize(&mut fixture, instance, &AT9_DS_INIT_PARAMETERS, &mut initialize_result);
+    append_at9_initialize(
+        &mut fixture,
+        instance,
+        &AT9_DS_INIT_PARAMETERS,
+        &mut initialize_result,
+    );
     fixture.append_decode(instance, AT9_DS_FRAMES, &mut output, &mut decode_result);
     let batch = fixture
         .start(&engine, context)
@@ -842,7 +868,10 @@ fn atrac9_decodes_a_real_superframe_stream_and_matches_the_independent_ffmpeg_go
     assert_eq!(produced, i32::try_from(AT9_DS_GOLDEN.len()).unwrap());
     // 8 superframes * 4 frames * 256 samples of mono audio.
     assert_eq!(total_samples, 8192);
-    assert_eq!(frames, 32, "four frames per superframe over eight superframes");
+    assert_eq!(
+        frames, 32,
+        "four frames per superframe over eight superframes"
+    );
 
     let decoded: Vec<i16> = output
         .chunks_exact(2)
@@ -866,7 +895,10 @@ fn atrac9_decodes_a_real_superframe_stream_and_matches_the_independent_ffmpeg_go
         "decoded PCM disagrees with the independent ffmpeg golden by {max_abs_diff} > 1 LSB"
     );
     let peak = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap();
-    assert!(peak > 1000, "real audio was produced, not silence (peak {peak})");
+    assert!(
+        peak > 1000,
+        "real audio was produced, not silence (peak {peak})"
+    );
 }
 
 #[test]
@@ -882,7 +914,12 @@ fn atrac9_reports_channel_config_sample_rate_and_codec_info_in_sideband() {
     let mut initialize_result = [0_u8; 8];
     let mut sideband = [0_u8; 128];
     let mut fixture = BatchFixture::new();
-    append_at9_initialize(&mut fixture, instance, &AT9_DS_INIT_PARAMETERS, &mut initialize_result);
+    append_at9_initialize(
+        &mut fixture,
+        instance,
+        &AT9_DS_INIT_PARAMETERS,
+        &mut initialize_result,
+    );
     let flags = AJM_FLAG_SIDEBAND_STREAM | AJM_FLAG_SIDEBAND_FORMAT | AJM_FLAG_RUN_GET_CODEC_INFO;
     let info = fixture.info_address();
     assert_eq!(
@@ -910,7 +947,8 @@ fn atrac9_reports_channel_config_sample_rate_and_codec_info_in_sideband() {
         SUCCESS
     );
 
-    let field = |offset: usize| u32::from_le_bytes(sideband[offset..offset + 4].try_into().unwrap());
+    let field =
+        |offset: usize| u32::from_le_bytes(sideband[offset..offset + 4].try_into().unwrap());
     // result(8) then stream(16) then format(24) then codec-info(16), in section order.
     assert_eq!(field(0), 0, "the run succeeded");
     // SceAjmSidebandFormat begins at 8 + 16 = 24 (sideband.h:535-543).
@@ -947,7 +985,12 @@ fn atrac9_rejects_malformed_config_data_then_a_decode_reports_not_initialized() 
         ])),
         SUCCESS
     );
-    fixture.append_decode(instance, &AT9_DS_FRAMES[..256], &mut output, &mut decode_result);
+    fixture.append_decode(
+        instance,
+        &AT9_DS_FRAMES[..256],
+        &mut output,
+        &mut decode_result,
+    );
     let batch = fixture.start(&engine, context).expect("the batch starts");
     assert!(engine.execute_next_queued_batch());
     assert_eq!(
@@ -1080,7 +1123,10 @@ fn dispatch_serves_the_whole_lifecycle_through_the_worker_pool() {
     assert_eq!(result, 0);
     assert_eq!(frames, 48);
     assert_eq!(
-        call("RbLbuKv8zho", args(&[u64::from(context), u64::from(instance)])),
+        call(
+            "RbLbuKv8zho",
+            args(&[u64::from(context), u64::from(instance)])
+        ),
         SUCCESS
     );
     assert_eq!(call("MHur6qCsUus", args(&[u64::from(context)])), SUCCESS);

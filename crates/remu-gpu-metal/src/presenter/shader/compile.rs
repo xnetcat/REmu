@@ -111,9 +111,7 @@ fn discover_bundled_metal_compiler() -> Option<PathBuf> {
             if let Ok(entries) = std::fs::read_dir(&toolchains) {
                 let mut versioned = entries
                     .flatten()
-                    .filter(|entry| {
-                        entry.file_name().to_string_lossy().starts_with("Metal-")
-                    })
+                    .filter(|entry| entry.file_name().to_string_lossy().starts_with("Metal-"))
                     .map(|entry| entry.path().join("Metal.xctoolchain/usr/bin/metal"))
                     .collect::<Vec<_>>();
                 versioned.sort();

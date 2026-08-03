@@ -4,10 +4,9 @@
 use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
-    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry,
-    VideoOutBufferAttributes, VideoOutState, agc_apply_submission_registers, agc_pm4,
-    compute_graphics_state, decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait,
-    low_u32,
+    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, VideoOutBufferAttributes,
+    VideoOutState, agc_apply_submission_registers, agc_pm4, compute_graphics_state,
+    decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait, low_u32,
 };
 
 fn append_native_memory_dma(
