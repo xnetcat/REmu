@@ -583,6 +583,63 @@ fn immutable_app_directory_index_resolves_case_once_for_sibling_paths() {
 }
 
 #[test]
+fn immutable_app_directory_index_proves_absent_subtrees_without_descending() {
+    let temporary = TemporaryTestDirectory::new("app-directory-absence");
+    std::fs::create_dir(temporary.path.join("Content")).unwrap();
+    let cache = std::sync::RwLock::new(crate::ImmutableAppPathCache::default());
+
+    let first = crate::resolve_immutable_app_path_with_presence(
+        &temporary.path,
+        "Missing/Config/first.ini",
+        &cache,
+    )
+    .unwrap();
+    let second = crate::resolve_immutable_app_path_with_presence(
+        &temporary.path,
+        "Missing/Config/second.ini",
+        &cache,
+    )
+    .unwrap();
+
+    assert!(first.known_absent);
+    assert!(second.known_absent);
+    assert_eq!(first.path, temporary.path.join("Missing/Config/first.ini"));
+    assert_eq!(
+        second.path,
+        temporary.path.join("Missing/Config/second.ini")
+    );
+    let cache = cache
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(cache.directories.len(), 1);
+    assert!(cache.directories.contains_key(&temporary.path));
+}
+
+#[test]
+fn immutable_app_directory_read_failures_do_not_claim_absence() {
+    let temporary = TemporaryTestDirectory::new("app-directory-unreadable");
+    let missing_root = temporary.path.join("not-mounted");
+    let cache = std::sync::RwLock::new(crate::ImmutableAppPathCache::default());
+
+    let resolved = crate::resolve_immutable_app_path_with_presence(
+        &missing_root,
+        "Content/config.ini",
+        &cache,
+    )
+    .unwrap();
+
+    assert!(!resolved.known_absent);
+    assert_eq!(resolved.path, missing_root.join("Content/config.ini"));
+    assert!(
+        cache
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .directories
+            .is_empty()
+    );
+}
+
+#[test]
 fn implements_seek_read_stat_and_truncate_on_one_guest_descriptor() {
     let temporary = TemporaryTestDirectory::new("file-abi");
     let path = temporary.path.join("payload.bin");

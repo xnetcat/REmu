@@ -246,12 +246,11 @@ pub(crate) struct ImmutableDirectoryIndex {
 }
 
 impl ImmutableDirectoryIndex {
-    pub(crate) fn read(parent: &Path) -> Self {
+    pub(crate) fn read(parent: &Path) -> Option<Self> {
         let mut index = Self::default();
-        let Ok(entries) = std::fs::read_dir(parent) else {
-            return index;
-        };
-        for entry in entries.flatten() {
+        let entries = std::fs::read_dir(parent).ok()?;
+        for entry in entries {
+            let entry = entry.ok()?;
             let Some(name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
                 continue;
             };
@@ -262,7 +261,7 @@ impl ImmutableDirectoryIndex {
                 .or_insert_with(|| path.clone());
             index.exact.insert(name, path);
         }
-        index
+        Some(index)
     }
 
     pub(crate) fn get(&self, component: &str) -> Option<PathBuf> {
@@ -277,19 +276,52 @@ impl ImmutableDirectoryIndex {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ImmutableAppPathResolution {
+    pub(crate) path: PathBuf,
+    pub(crate) known_absent: bool,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ImmutableAppPathCache {
-    pub(crate) roots: HashMap<PathBuf, HashMap<String, PathBuf>>,
+    pub(crate) roots: HashMap<PathBuf, HashMap<String, ImmutableAppPathResolution>>,
     pub(crate) directories: HashMap<PathBuf, ImmutableDirectoryIndex>,
     pub(crate) entries: usize,
 }
 
 impl ImmutableAppPathCache {
+    #[cfg(test)]
     pub(crate) fn get(&self, game_root: &Path, relative: &str) -> Option<PathBuf> {
+        self.get_resolution(game_root, relative)
+            .map(|resolved| resolved.path)
+    }
+
+    pub(crate) fn get_resolution(
+        &self,
+        game_root: &Path,
+        relative: &str,
+    ) -> Option<ImmutableAppPathResolution> {
         self.roots.get(game_root)?.get(relative).cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, game_root: &Path, relative: &str, resolved: PathBuf) {
+        self.insert_resolution(
+            game_root,
+            relative,
+            ImmutableAppPathResolution {
+                path: resolved,
+                known_absent: false,
+            },
+        );
+    }
+
+    pub(crate) fn insert_resolution(
+        &mut self,
+        game_root: &Path,
+        relative: &str,
+        resolved: ImmutableAppPathResolution,
+    ) {
         if self.entries >= APP_PATH_CACHE_CAPACITY {
             self.roots.clear();
             self.entries = 0;
@@ -328,11 +360,20 @@ impl ImmutableAppPathCache {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_immutable_app_path(
     root: &Path,
     relative: &str,
     cache: &RwLock<ImmutableAppPathCache>,
 ) -> Option<PathBuf> {
+    resolve_immutable_app_path_with_presence(root, relative, cache).map(|resolved| resolved.path)
+}
+
+pub(crate) fn resolve_immutable_app_path_with_presence(
+    root: &Path,
+    relative: &str,
+    cache: &RwLock<ImmutableAppPathCache>,
+) -> Option<ImmutableAppPathResolution> {
     let mut components: Vec<&str> = Vec::new();
     for component in relative.split('/') {
         match component {
@@ -345,7 +386,12 @@ pub(crate) fn resolve_immutable_app_path(
     }
 
     let mut host = root.to_owned();
+    let mut known_absent = false;
     for component in components {
+        if known_absent {
+            host.push(component);
+            continue;
+        }
         let cached = cache
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -354,22 +400,43 @@ pub(crate) fn resolve_immutable_app_path(
             Some(Some(matched)) => {
                 host = matched;
             }
-            Some(None) => host.push(component),
+            Some(None) => {
+                host.push(component);
+                known_absent = true;
+            }
             None => {
-                let directory = ImmutableDirectoryIndex::read(&host);
+                let Some(directory) = ImmutableDirectoryIndex::read(&host) else {
+                    // A transient I/O or permission failure is not proof that this component is
+                    // absent. Preserve the requested spelling and let the caller's final host
+                    // operation report the authoritative error.
+                    host.push(component);
+                    continue;
+                };
                 let matched = directory.get(component);
                 cache
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert_directory(host.clone(), directory);
-                host = matched.unwrap_or_else(|| host.join(component));
+                match matched {
+                    Some(matched) => host = matched,
+                    None => {
+                        host.push(component);
+                        known_absent = true;
+                    }
+                }
             }
         }
     }
-    Some(host)
+    Some(ImmutableAppPathResolution {
+        path: host,
+        known_absent,
+    })
 }
 
-pub(crate) fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
+fn resolve_guest_path_with_presence(
+    game_root: &Path,
+    guest_path: &str,
+) -> Option<ImmutableAppPathResolution> {
     let normalized = guest_path.replace('\\', "/");
     let relative = if let Some(path) = normalized.strip_prefix("/app0/") {
         path
@@ -386,22 +453,28 @@ pub(crate) fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<P
     // optional configuration and localization paths, and resolving each miss used to repeat an
     // `exists` syscall for every component plus a `read_dir` scan for every case-insensitive
     // fallback. Cache the resolved host spelling (including paths that ultimately do not exist)
-    // so subsequent stat/open calls perform only their authoritative final syscall.
+    // so subsequent operations do not repeat path-component I/O. A successful immutable parent
+    // scan also proves a missing child cannot exist, allowing metadata-only callers to avoid a
+    // redundant final syscall without changing open/read behavior.
     static APP_PATH_CACHE: OnceLock<RwLock<ImmutableAppPathCache>> = OnceLock::new();
     let cache = APP_PATH_CACHE.get_or_init(|| RwLock::new(ImmutableAppPathCache::default()));
-    if let Some(path) = cache
+    if let Some(resolved) = cache
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(game_root, relative)
+        .get_resolution(game_root, relative)
     {
-        return Some(path);
+        return Some(resolved);
     }
-    let resolved = resolve_immutable_app_path(game_root, relative, cache)?;
+    let resolved = resolve_immutable_app_path_with_presence(game_root, relative, cache)?;
     let mut cache = cache
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.insert(game_root, relative, resolved.clone());
+    cache.insert_resolution(game_root, relative, resolved.clone());
     Some(resolved)
+}
+
+pub(crate) fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
+    resolve_guest_path_with_presence(game_root, guest_path).map(|resolved| resolved.path)
 }
 
 /// Returns a host file that stands in for a guest path, if an overlay directory supplies one.
@@ -425,28 +498,70 @@ pub(crate) fn resolve_probe_guest_path(
     state: &ProbeDispatchState,
     guest_path: &str,
 ) -> Option<(PathBuf, bool)> {
+    resolve_probe_guest_path_with_presence(state, guest_path)
+        .map(|resolved| (resolved.path, resolved.writable))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ResolvedProbeGuestPath {
+    pub(crate) path: PathBuf,
+    pub(crate) writable: bool,
+    pub(crate) known_absent: bool,
+}
+
+pub(crate) fn resolve_probe_guest_path_with_presence(
+    state: &ProbeDispatchState,
+    guest_path: &str,
+) -> Option<ResolvedProbeGuestPath> {
     let normalized = guest_path.replace('\\', "/");
     if let Some(overlaid) = overlay_guest_path(&normalized) {
-        return Some((overlaid, false));
+        return Some(ResolvedProbeGuestPath {
+            path: overlaid,
+            writable: false,
+            known_absent: false,
+        });
     }
     let download_root = state.save_root.join("download0");
     if normalized == "/download0" {
-        return Some((download_root, true));
+        return Some(ResolvedProbeGuestPath {
+            path: download_root,
+            writable: true,
+            known_absent: false,
+        });
     }
     if let Some(relative) = normalized.strip_prefix("/download0/") {
-        return resolve_path_beneath(&download_root, relative).map(|path| (path, true));
+        return resolve_path_beneath(&download_root, relative).map(|path| ResolvedProbeGuestPath {
+            path,
+            writable: true,
+            known_absent: false,
+        });
     }
     for (mount_point, mounted) in &state.save_mounts {
         let writable = save_data_mount_is_writable(mounted, state);
         if normalized == *mount_point {
-            return Some((mounted.path.clone(), writable));
+            return Some(ResolvedProbeGuestPath {
+                path: mounted.path.clone(),
+                writable,
+                known_absent: false,
+            });
         }
         if let Some(relative) = normalized.strip_prefix(&format!("{mount_point}/")) {
-            return resolve_path_beneath(&mounted.path, relative)
-                .map(|path| (path, writable));
+            return resolve_path_beneath(&mounted.path, relative).map(|path| {
+                ResolvedProbeGuestPath {
+                    path,
+                    writable,
+                    known_absent: false,
+                }
+            });
         }
     }
-    resolve_guest_path(&state.game_root, &normalized).map(|path| (path, false))
+    resolve_guest_path_with_presence(&state.game_root, &normalized).map(|resolved| {
+        ResolvedProbeGuestPath {
+            path: resolved.path,
+            writable: false,
+            known_absent: resolved.known_absent,
+        }
+    })
 }
 
 /// Finds a sibling of `path` whose name differs only by case.
@@ -733,12 +848,22 @@ pub(crate) fn guest_kernel_stat(arguments: [u64; 6], state: &ProbeDispatchState)
     let Some(guest_path) = read_guest_cstring(arguments[0]) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_MEMORY_FAULT);
     };
-    let Some((host_path, _)) = resolve_probe_guest_path(state, &guest_path) else {
+    let Some(resolved) = resolve_probe_guest_path_with_presence(state, &guest_path) else {
         if let Some(miss) = trace_guest_vfs_miss() {
             eprintln!("[REMu][VFS] miss={miss} sceKernelStat rejected guest={guest_path:?}");
         }
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
+    let host_path = resolved.path;
+    if resolved.known_absent {
+        if let Some(miss) = trace_guest_vfs_miss() {
+            eprintln!(
+                "[REMu][VFS] miss={miss} sceKernelStat known absent guest={guest_path:?} host={:?}",
+                host_path.display()
+            );
+        }
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
     let metadata = match std::fs::metadata(&host_path) {
         Ok(metadata) => metadata,
         Err(error) => {

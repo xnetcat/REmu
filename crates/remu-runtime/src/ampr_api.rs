@@ -16,7 +16,7 @@ use crate::{
     SCE_KERNEL_ERROR_OUT_OF_MEMORY, current_guest_thread_name, guest_memset,
     kernel_stat_payload_from_metadata, lock_probe_dispatch_for_write, low_u32,
     notify_kernel_equeue_waiters, process_guest_range_has_read_access, queue_kernel_event,
-    read_guest_u64, resolve_probe_guest_path, sce_kernel_error, trace_ampr_reads,
+    read_guest_u64, resolve_probe_guest_path_with_presence, sce_kernel_error, trace_ampr_reads,
     try_read_process_guest_u64, write_guest_u32, write_guest_u64,
 };
 
@@ -747,10 +747,18 @@ fn ampr_resolve_one_path(
     sizes: u64,
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    let Some((host_path, _)) = resolve_probe_guest_path(state, guest_path) else {
+    let Some(resolved) = resolve_probe_guest_path_with_presence(state, guest_path) else {
         eprintln!("[REMu][AMPR] resolve rejected guest={guest_path:?} index={index} of {count}");
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
+    let host_path = resolved.path;
+    if resolved.known_absent {
+        eprintln!(
+            "[REMu][AMPR] resolve absent guest={guest_path:?} host={:?} index={index} of {count}",
+            host_path.display()
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    }
     let Ok(metadata) = host_path.metadata() else {
         eprintln!(
             "[REMu][AMPR] resolve missing guest={guest_path:?} host={:?} index={index} of {count}",
