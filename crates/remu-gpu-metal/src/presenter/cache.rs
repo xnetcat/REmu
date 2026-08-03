@@ -1844,7 +1844,7 @@ fn contained_global_writeback_offset(
         address,
         byte_count,
     );
-    if let Some(producer_identity) = writeback.mapping_identity {
+    if let Some(producer_identity) = writeback.mapping_identity() {
         if let Some(read_identity) = guest_shared_backing_identity(address, byte_count) {
             if read_identity.backing_id == producer_identity.backing_id {
                 let producer_start = producer_identity.backing_offset;
@@ -1916,7 +1916,7 @@ fn contained_global_writeback_virtual_offset(
     };
     QueuedWriteReadMatch::Buffer {
         offset,
-        physical_identity: writeback.mapping_identity,
+        physical_identity: writeback.mapping_identity(),
     }
 }
 

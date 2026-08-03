@@ -150,7 +150,7 @@ impl SharedEventSignalCheckpoint {
                 offset: writeback.offset,
                 guest_address: writeback.guest_address,
                 byte_count,
-                mapping_identity: writeback.mapping_identity,
+                mapping_identity: writeback.mapping_identity(),
             };
             self.capture_global_version(version);
         }
@@ -1972,7 +1972,7 @@ fn pending_global_writeback_overlaps(
     ) {
         return true;
     }
-    let Some(producer_identity) = writeback.mapping_identity else {
+    let Some(producer_identity) = writeback.mapping_identity() else {
         return guest_physical_ranges_overlap(
             writeback.guest_address,
             writeback_byte_count,
@@ -2095,10 +2095,14 @@ pub(crate) fn collect_pending_global_writebacks(
         }
         let byte_count = u64::try_from(binding.byte_count)
             .map_err(|_| "writable global buffer byte count does not fit u64")?;
-        let mapping_identity = buffer
+        // The capture itself claims the destination (plan D2): an upload-time identity is
+        // adopted, otherwise the range is resolved and pinned now. Publication then reuses
+        // this claim instead of re-deriving identity and epoch after the queue drains.
+        let lease = buffer
             .physical_identity
-            .or_else(|| guest_shared_backing_identity(binding.base_address, byte_count));
-        let write_watch = if mapping_identity.is_some() {
+            .map(|identity| GuestRangeLease::adopt(binding.base_address, byte_count, identity))
+            .or_else(|| GuestRangeLease::acquire(binding.base_address, byte_count));
+        let write_watch = if lease.is_some() {
             None
         } else {
             // SAFETY: shader evaluation accepted this exact range as a live readable/writable
@@ -2148,7 +2152,7 @@ pub(crate) fn collect_pending_global_writebacks(
             offset: buffer.offset,
             guest_address: binding.base_address,
             byte_count: binding.byte_count,
-            mapping_identity,
+            lease,
             write_watch,
             original_bytes,
             original_version,
@@ -2296,10 +2300,9 @@ pub(crate) fn write_back_pending_globals(
                 writeback.byte_count,
             )
         };
-        let outcome = if let Some(expected) = writeback.mapping_identity {
+        let outcome = if let Some(lease) = writeback.lease.as_ref() {
             let byte_count = u64::try_from(writeback.byte_count)
                 .map_err(|_| "writable global buffer byte count does not fit u64")?;
-            let lease = GuestRangeLease::adopt(writeback.guest_address, byte_count, expected);
             if !lease.live_va_matches() {
                 // Prospero recycles direct-memory VAs while GPU work is still draining. Publishing
                 // through the captured producer identity keeps GPU results on those physical pages
@@ -2309,11 +2312,11 @@ pub(crate) fn write_back_pending_globals(
                 trace_remapped_global_writeback_published_by_identity(
                     writeback.guest_address,
                     writeback.byte_count,
-                    expected,
+                    lease.identity(),
                     guest_shared_backing_identity(writeback.guest_address, byte_count),
                 );
             }
-            write_changed_global_ranges_leased(writeback, current_bytes, original_bytes, &lease)?
+            write_changed_global_ranges_leased(writeback, current_bytes, original_bytes, lease)?
         } else if let Some(write_watch) = writeback.write_watch.as_ref() {
             match write_watch.with_live_mapping(|| {
                 write_changed_global_ranges_direct(writeback, current_bytes, original_bytes)

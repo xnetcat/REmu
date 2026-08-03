@@ -1540,10 +1540,19 @@ struct PendingGlobalWriteback {
     offset: u64,
     guest_address: u64,
     byte_count: usize,
-    mapping_identity: Option<GuestSharedMappingIdentity>,
+    /// Capture-time claim on the destination (plan D2): identity resolved, shared-mapping
+    /// epoch recorded, and the backing object pinned when the range was captured — not
+    /// re-derived at publish time, seconds later on a deep queue.
+    lease: Option<remu_memory::GuestRangeLease>,
     write_watch: Option<CpuWriteWatch>,
     original_bytes: Vec<u8>,
     original_version: Option<GlobalBufferOriginalVersion>,
+}
+
+impl PendingGlobalWriteback {
+    fn mapping_identity(&self) -> Option<GuestSharedMappingIdentity> {
+        self.lease.as_ref().map(remu_memory::GuestRangeLease::identity)
+    }
 }
 
 struct PendingPresentation {

@@ -15,7 +15,7 @@ use remu_gpu::{
 
 use remu_memory::{
     CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-    GuestProtection, guest_shared_backing_identity, guest_shared_backing_range,
+    GuestProtection, GuestRangeLease, guest_shared_backing_identity, guest_shared_backing_range,
 };
 use remu_shader::{
     GlobalMemoryBinding, GlobalMemoryControl, Instruction, InstructionControl, Opcode, Program,
@@ -899,7 +899,7 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
             offset: 32,
             guest_address: 0x12_0000,
             byte_count: 64,
-            mapping_identity: None,
+            lease: None,
             write_watch: None,
             original_bytes: vec![0; 64],
             original_version: None,
@@ -989,7 +989,9 @@ fn queued_copied_writer_forwards_across_a_shifted_physical_alias() {
             offset: 32,
             guest_address: producer_address,
             byte_count: usize::try_from(producer_bytes).unwrap(),
-            mapping_identity: guest_shared_backing_identity(producer_address, producer_bytes),
+            lease: (guest_shared_backing_identity(producer_address, producer_bytes)).map(|identity| {
+                GuestRangeLease::adopt(producer_address, u64::try_from(usize::try_from(producer_bytes).unwrap()).unwrap(), identity)
+            }),
             write_watch: None,
             original_bytes: vec![0; usize::try_from(producer_bytes).unwrap()],
             original_version: None,
@@ -1235,7 +1237,7 @@ fn writable_physical_alias_uses_exact_staging_and_preserves_adjacent_bytes() {
     collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
         .expect("exact staged writeback is captured");
     assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].mapping_identity, uploaded.physical_identity);
+    assert_eq!(pending[0].mapping_identity(), uploaded.physical_identity);
     assert!(pending[0].write_watch.is_none());
     // SAFETY: the exact shared buffer is binding_byte_count bytes long and retained by `uploaded`.
     unsafe {
@@ -1375,6 +1377,78 @@ fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
             );
         }
     }
+}
+
+#[test]
+fn writable_global_capture_acquires_its_lease_at_collect_time() {
+    // Plan D2: the capture itself claims the range — identity resolved, epoch recorded, and
+    // the backing object pinned — instead of re-deriving all three at publish time. Once the
+    // guest unmaps the range, the leased publish refuses loudly rather than writing.
+    let mut address_space = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let alias = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let binding_address = alias.get() + 64;
+    let binding_byte_count = 16_usize;
+    // SAFETY: the alias is mapped read/write for the staged upload.
+    unsafe {
+        std::ptr::write_bytes(binding_address as *mut u8, 0x11, binding_byte_count);
+    }
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: binding_address,
+        instruction_pcs: Default::default(),
+        byte_count: binding_byte_count,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("writable alias uses staged storage");
+    let evaluation = evaluation_with_global(binding);
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("staged writeback is captured");
+    assert_eq!(pending.len(), 1);
+    let lease = pending[0].lease.as_ref().expect("capture-time lease");
+    assert_eq!(
+        Some(lease.identity()),
+        guest_shared_backing_identity(
+            binding_address,
+            u64::try_from(binding_byte_count).unwrap()
+        ),
+        "the lease records the identity resolved at capture"
+    );
+
+    // GPU output arrives in the staged buffer, then the guest unmaps the whole range.
+    // SAFETY: the staged buffer is host-shared storage this test owns.
+    unsafe {
+        std::ptr::write_bytes(
+            uploaded.buffer.contents().cast::<u8>(),
+            0x5a,
+            binding_byte_count,
+        );
+    }
+    drop(alias);
+    drop(address_space);
+    let applied = write_back_pending_globals(&pending).expect("leased publish refuses cleanly");
+    assert!(
+        applied.is_empty(),
+        "an unmapped leased range must never be written"
+    );
 }
 
 #[test]
@@ -1767,7 +1841,9 @@ fn queued_writable_global_cow_copies_on_gpu_and_diffs_against_the_retained_basel
             offset: 0,
             guest_address,
             byte_count: BYTE_COUNT,
-            mapping_identity: Some(identity),
+            lease: (Some(identity)).map(|identity| {
+                GuestRangeLease::adopt(guest_address, u64::try_from(BYTE_COUNT).unwrap(), identity)
+            }),
             write_watch: None,
             original_bytes: vec![0; BYTE_COUNT],
             original_version: None,
@@ -2690,7 +2766,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         offset: second_offset,
         guest_address,
         byte_count: destination.len(),
-        mapping_identity: None,
+        lease: None,
         write_watch: None,
         original_bytes: vec![0; destination.len()],
         original_version: None,
@@ -2719,7 +2795,7 @@ fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
         offset: 0,
         guest_address,
         byte_count: destination.len(),
-        mapping_identity: None,
+        lease: None,
         write_watch: None,
         original_bytes: vec![1, 2, 3, 4],
         original_version: None,
@@ -2749,7 +2825,7 @@ fn global_writeback_yields_changed_runs_to_newer_cpu_stores() {
         offset: 0,
         guest_address,
         byte_count: destination.len(),
-        mapping_identity: None,
+        lease: None,
         write_watch: None,
         original_bytes: vec![1, 2, 3, 4],
         original_version: None,
@@ -2843,7 +2919,9 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                     offset: 0,
                     guest_address: stale_address.get(),
                     byte_count: 4,
-                    mapping_identity: Some(stale_identity),
+                    lease: (Some(stale_identity)).map(|identity| {
+                        GuestRangeLease::adopt(stale_address.get(), u64::try_from(4).unwrap(), identity)
+                    }),
                     write_watch: None,
                     original_bytes: vec![0; 4],
                     original_version: None,
@@ -2853,7 +2931,9 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                     offset: 0,
                     guest_address: valid_address.get(),
                     byte_count: 4,
-                    mapping_identity: Some(valid_identity),
+                    lease: (Some(valid_identity)).map(|identity| {
+                        GuestRangeLease::adopt(valid_address.get(), u64::try_from(4).unwrap(), identity)
+                    }),
                     write_watch: None,
                     original_bytes: vec![0; 4],
                     original_version: None,
@@ -2947,7 +3027,7 @@ fn malformed_global_writeback_remains_fatal() {
         offset: 0,
         guest_address,
         byte_count: destination.len(),
-        mapping_identity: None,
+        lease: None,
         write_watch: None,
         original_bytes: vec![0; destination.len() - 1],
         original_version: None,
@@ -2986,7 +3066,7 @@ fn anonymous_global_writeback_discards_replaced_guest_mapping() {
         offset: 0,
         guest_address,
         byte_count: 4,
-        mapping_identity: None,
+        lease: None,
         write_watch: Some(watch),
         original_bytes: vec![0; 4],
         original_version: None,
@@ -3045,7 +3125,7 @@ fn anonymous_global_writeback_updates_the_pinned_guest_mapping() {
         offset: 0,
         guest_address,
         byte_count: 4,
-        mapping_identity: None,
+        lease: None,
         write_watch: Some(watch),
         original_bytes: vec![1, 2, 3, 4],
         original_version: None,
@@ -5077,10 +5157,11 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: guest_shared_backing_identity(
-                guest_address,
+            lease: (guest_shared_backing_identity(                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            ),
+            )).map(|identity| {
+                GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
+            }),
             write_watch: None,
             original_bytes: vec![0; byte_count],
             original_version: None,
@@ -5100,10 +5181,11 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: guest_shared_backing_identity(
-                guest_address,
+            lease: (guest_shared_backing_identity(                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            ),
+            )).map(|identity| {
+                GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
+            }),
             write_watch: None,
             original_bytes: vec![0; byte_count],
             original_version: None,
@@ -5161,10 +5243,11 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: guest_shared_backing_identity(
-                guest_address,
+            lease: (guest_shared_backing_identity(                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            ),
+            )).map(|identity| {
+                GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
+            }),
             write_watch: None,
             original_bytes: vec![0; byte_count],
             original_version: None,
@@ -5309,10 +5392,11 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: guest_shared_backing_identity(
-                guest_address,
+            lease: (guest_shared_backing_identity(                guest_address,
                 u64::try_from(byte_count).unwrap(),
-            ),
+            )).map(|identity| {
+                GuestRangeLease::adopt(guest_address, u64::try_from(byte_count).unwrap(), identity)
+            }),
             write_watch: None,
             original_bytes: vec![0; byte_count],
             original_version: None,
@@ -6129,7 +6213,9 @@ fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
         offset: 0,
         guest_address: address,
         byte_count: 32,
-        mapping_identity: Some(copied_identity),
+        lease: (Some(copied_identity)).map(|identity| {
+            GuestRangeLease::adopt(address, u64::try_from(32).unwrap(), identity)
+        }),
         write_watch: None,
         original_bytes: vec![0; 32],
         original_version: None,

@@ -3,7 +3,7 @@
 
 use super::super::WritebackTrigger;
 use super::{
-    ActiveTranslatedScanout, FlushPolicy, GuestBatchFlushReason, GuestTextureDescriptor,
+    ActiveTranslatedScanout, GuestTextureDescriptor,
     HostSplashTexture, MetalPresenter, OrderedEventSource, WriteWatchRefresh, capture_interval,
     completed_command_buffer_gpu_duration, decode_guest_texture_linear_from_raw,
     diagnostic_scanout_writer, diagnostic_texture_writer, raw_video_out_texture_descriptor,
