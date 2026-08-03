@@ -1775,6 +1775,12 @@ struct SharedEventResidentTextureVersion {
     /// CPU-write generations at the exact GPU ownership boundary for this version.
     gpu_write_watch_generations: Vec<u64>,
     span: ResourceSpan,
+    /// Which write recorded this version: a guest render-target write
+    /// (`ResidentDestination`) or an internal relayout (`InternalResidentDestination`,
+    /// plan A2). A version only licenses producer ranges of its own kind, and internal
+    /// versions do not require the resident to be GPU-authored — an internal relayout of
+    /// clean CPU content leaves guest RAM authoritative.
+    kind: SharedEventWriteKind,
 }
 
 #[derive(Clone, Debug)]

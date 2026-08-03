@@ -2982,6 +2982,13 @@ fn a_contained_tenant_is_rematerialised_by_an_ordered_blit() {
         MTLCommandBufferStatus::NotEnqueued,
         "rematerialisation must not flush, commit, or wait"
     );
+    assert!(
+        batch.resident_texture_versions.iter().any(|version| {
+            version.kind == super::super::SharedEventWriteKind::InternalResidentDestination
+                && version.descriptor == tenant
+        }),
+        "the internal rematerialisation must version the tenant on the queue timeline (plan A2)"
+    );
     batch.command_buffer.commit();
     batch.command_buffer.wait_until_completed();
 

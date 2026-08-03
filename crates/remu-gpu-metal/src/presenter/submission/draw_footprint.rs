@@ -477,13 +477,17 @@ fn retained_resident_version_is_current(
     let Some(resident) = residents.get(&version.descriptor) else {
         return false;
     };
+    // A guest render-target version requires the resident to still be GPU-authored; an internal
+    // relayout version (plan A2) does not — the relayout carried clean guest content, and the
+    // watch-token check below is what proves the CPU has not touched it since.
+    let requires_gpu_authored = version.kind == SharedEventWriteKind::ResidentDestination;
     if resident.texture.as_ptr() != version.texture.as_ptr()
         || resident.content_version != version.content_version
         || resident.texture_type != version.texture_type
         || resident.layer_count != version.layer_count
         || resident.mip_level_count != version.mip_level_count
         || resident.span != Some(version.span)
-        || !resident.gpu_written()
+        || (requires_gpu_authored && !resident.gpu_written())
         || !resident.serves_reads()
         || resident.gpu_write_watch_generations != version.gpu_write_watch_generations
     {
@@ -547,15 +551,19 @@ fn direct_draw_dependencies_are_gpu_orderable(
                     admission = DirectDrawAdmission::VersionedGlobal;
                     continue;
                 }
-                if producer.kind == SharedEventWriteKind::ResidentDestination
-                    && consumer.kind == DrawFootprintKind::ImageRead
+                if matches!(
+                    producer.kind,
+                    SharedEventWriteKind::ResidentDestination
+                        | SharedEventWriteKind::InternalResidentDestination
+                ) && consumer.kind == DrawFootprintKind::ImageRead
                     && fence.producer().queue_id() == consumer_queue_id
                     && let Some(sampled) = consumer.image
                     && let Some(version) = checkpoint
                         .resident_texture_versions
                         .iter()
                         .filter(|version| {
-                            version.span.backing() == Some(producer.mapping)
+                            version.kind == producer.kind
+                                && version.span.backing() == Some(producer.mapping)
                                 && version.span.len() == producer.byte_count
                                 && version.descriptor == sampled.guest
                                 && version.texture_type == sampled.texture_type
@@ -1646,6 +1654,108 @@ mod tests {
     }
 
     #[test]
+    fn same_queue_internal_resident_write_is_versioned_and_admits_the_sampling_draw() {
+        // Plan A2: internal writes (mip promotion, stale-read rematerialisation) version their
+        // resident on the queue timeline exactly like guest render-target writes, instead of
+        // draining the host. A version recorded for a guest write must not satisfy an internal
+        // producer range, and vice versa.
+        let mut space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("backing");
+        let mapped = space
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("mapping");
+        let address = mapped.get();
+        let sampled =
+            decode_image_descriptor_without_diagnostics(&image_descriptor(address, 32, 32))
+                .expect("sample descriptor");
+        let (_, byte_count) = sampled_texture_raw_range(sampled).expect("sample range");
+        let byte_count = u64::try_from(byte_count).expect("sample bytes fit u64");
+        let span = ResourceSpan::new(address, byte_count);
+        let producer = PhysicalFootprintRange::new(
+            SharedEventWriteKind::InternalResidentDestination,
+            address,
+            byte_count,
+            span.backing(),
+        )
+        .expect("internal producer footprint");
+        let mut consumer =
+            DrawFootprintRange::new(DrawFootprintKind::ImageRead, address, byte_count)
+                .expect("sample consumer footprint");
+        consumer.image = Some(sampled);
+        let footprint = DirectDrawFootprint::from_ranges(vec![consumer]);
+
+        let device = Device::system_default().expect("Metal device");
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(sampled.guest.pixel_format);
+        metal_descriptor.set_width(u64::from(sampled.guest.width));
+        metal_descriptor.set_height(u64::from(sampled.guest.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&metal_descriptor);
+        let version = |kind| super::super::super::SharedEventResidentTextureVersion {
+            texture: texture.clone(),
+            descriptor: sampled.guest,
+            texture_type: sampled.texture_type,
+            layer_count: sampled.layer_count,
+            mip_level_count: sampled.mip_level_count,
+            content_version: 17,
+            gpu_write_watch_generations: Vec::new(),
+            span,
+            kind,
+        };
+        let producer_id = SharedEventProducerId::new(9);
+        let fence = SharedEventFence::new(producer_id, 3);
+        let checkpoint_with = |kind| SharedEventSignalCheckpoint {
+            fence,
+            global_writeback_count: 0,
+            guest_write_range_count: 0,
+            memory_write_count: 0,
+            global_versions: Vec::new(),
+            resident_texture_versions: vec![version(kind)],
+            unresolved_write_ranges: Vec::new(),
+            pending_write_footprint: vec![producer],
+            footprint_complete: true,
+        };
+        let internal =
+            HashMap::from([(producer_id, checkpoint_with(SharedEventWriteKind::InternalResidentDestination))]);
+        let (admission, overrides) = direct_draw_dependencies_are_gpu_orderable(
+            9,
+            &[fence],
+            &internal,
+            &footprint,
+            |_, _| false,
+            |_| true,
+        )
+        .expect("same queue internal resident version is GPU-orderable");
+        assert_eq!(admission, DirectDrawAdmission::ResidentImage);
+        assert_eq!(overrides.len(), 1);
+
+        let mismatched =
+            HashMap::from([(producer_id, checkpoint_with(SharedEventWriteKind::ResidentDestination))]);
+        assert_eq!(
+            direct_draw_dependencies_are_gpu_orderable(
+                9,
+                &[fence],
+                &mismatched,
+                &footprint,
+                |_, _| false,
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
+            Err(SharedEventDrawReject::OverlapInternalResident),
+            "a guest-write version must not license an internal producer range"
+        );
+    }
+
+    #[test]
     fn same_queue_resident_image_retains_exact_texture_across_mapping_replacement() {
         let mut space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
         let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original");
@@ -1708,6 +1818,7 @@ mod tests {
                     content_version: 17,
                     gpu_write_watch_generations: Vec::new(),
                     span,
+                    kind: SharedEventWriteKind::ResidentDestination,
                 },
             ],
             unresolved_write_ranges: Vec::new(),
@@ -1774,6 +1885,7 @@ mod tests {
             content_version: resident.content_version,
             gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
             span: resident.span.expect("resident has physical span"),
+            kind: SharedEventWriteKind::ResidentDestination,
         }
     }
 

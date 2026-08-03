@@ -277,7 +277,8 @@ impl GuestCommandBatch {
         version: SharedEventResidentTextureVersion,
     ) {
         if let Some(existing) = self.resident_texture_versions.iter_mut().find(|existing| {
-            existing.span.backing() == version.span.backing()
+            existing.kind == version.kind
+                && existing.span.backing() == version.span.backing()
                 && existing.span.len() == version.span.len()
         }) {
             *existing = version;

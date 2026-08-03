@@ -908,6 +908,36 @@ pub(crate) fn resident_texture_ownership_stats(
 }
 
 impl MetalPresenter {
+    /// Records the current resident as an internal-relayout version on the open batch
+    /// (plan A2), so a later same-queue draw can sample it through the shared-event
+    /// checkpoint instead of draining the host.
+    fn record_internal_resident_version(&mut self, descriptor: GuestTextureDescriptor) {
+        let Some(version) = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .and_then(|resident| {
+                Some(SharedEventResidentTextureVersion {
+                    texture: resident.texture.clone(),
+                    descriptor: resident.descriptor,
+                    texture_type: resident.texture_type,
+                    layer_count: resident.layer_count,
+                    mip_level_count: resident.mip_level_count,
+                    content_version: resident.content_version,
+                    gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
+                    span: resident.span?,
+                    kind: SharedEventWriteKind::InternalResidentDestination,
+                })
+            })
+        else {
+            return;
+        };
+        if let Some(batch) = self.active_open_guest_batch_mut() {
+            batch.record_resident_texture_version(version);
+        }
+    }
+}
+
+impl MetalPresenter {
     /// Restores a demoted read target from the allocation that currently owns its bytes.
     ///
     /// View reuse is immediate. A copy is appended to the existing guest command buffer after
@@ -1306,6 +1336,7 @@ impl MetalPresenter {
         }
         self.resident_guest_textures
             .insert(target_descriptor, target);
+        self.record_internal_resident_version(target_descriptor);
         Ok(true)
     }
 
@@ -1454,6 +1485,7 @@ impl MetalPresenter {
                         SharedEventWriteKind::InternalResidentDestination,
                         descriptor.span,
                     );
+                self.record_internal_resident_version(descriptor.guest);
                 return resident_texture_for_sample(
                     self.resident_guest_textures
                         .get_mut(&descriptor.guest)
@@ -1501,6 +1533,7 @@ impl MetalPresenter {
                     SharedEventWriteKind::InternalResidentDestination,
                     descriptor.span,
                 );
+            self.record_internal_resident_version(descriptor.guest);
         }
         Ok(texture)
     }
@@ -1823,6 +1856,7 @@ impl MetalPresenter {
                     SharedEventWriteKind::InternalResidentDestination,
                     target.span,
                 );
+            self.record_internal_resident_version(target.texture);
             return Ok(SelectedResidentTexture {
                 texture,
                 descriptor: target.texture,
@@ -2538,6 +2572,7 @@ impl MetalPresenter {
                         content_version: resident.content_version,
                         gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
                         span: writer_span,
+                        kind: SharedEventWriteKind::ResidentDestination,
                     });
                 }
             }
