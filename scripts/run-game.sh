@@ -324,6 +324,11 @@ revision=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown
 if [ "$revision" != unknown ] && ! git -C "$repo_dir" diff-index --quiet HEAD -- 2>/dev/null; then
     revision="$revision-dirty"
 fi
+# The runner appends structured per-window records (telemetry.jsonl) and a run description
+# (run.json) into the run directory when these are exported (plan E4).
+REMU_RUN_DIR=$run_dir
+REMU_RUN_REVISION=$revision
+export REMU_RUN_DIR REMU_RUN_REVISION
 started_at=$(date +%s)
 child_pid=
 

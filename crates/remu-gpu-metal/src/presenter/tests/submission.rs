@@ -1442,7 +1442,6 @@ fn writable_global_capture_acquires_its_lease_at_collect_time() {
             binding_byte_count,
         );
     }
-    drop(alias);
     drop(address_space);
     let applied = write_back_pending_globals(&pending).expect("leased publish refuses cleanly");
     assert!(

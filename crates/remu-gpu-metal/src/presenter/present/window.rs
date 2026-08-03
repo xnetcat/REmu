@@ -1055,6 +1055,124 @@ impl MetalPresenter {
                     .join("; ");
                 eprintln!("[REMu][PERF-TEXTURE-TOP] {top}");
             }
+            // Structured record for this declared window (plan E4), assembled from the same
+            // sampled values the title and PERF lines above printed.
+            if !self.telemetry_log_attempted {
+                self.telemetry_log_attempted = true;
+                let device_name = self
+                    .device
+                    .as_ref()
+                    .map(|device| device.name().to_owned())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                self.telemetry_log =
+                    super::super::telemetry::TelemetryLog::open_in_run_directory(&device_name);
+            }
+            let telemetry_committed_batches =
+                u64::try_from(self.committed_guest_batch_count()).unwrap_or(0);
+            let telemetry_textures = u64::try_from(self.sampled_texture_cache.len()).unwrap_or(0);
+            let telemetry_compiled = u64::try_from(self.compiled_shader_pairs.len()).unwrap_or(0);
+            let telemetry_compiling =
+                u64::try_from(self.compiling_shader_pairs.len()).unwrap_or(0);
+            if let Some(log) = self.telemetry_log.as_mut() {
+                use super::super::telemetry::TelemetryValue;
+                let mean_ns = |histogram: &remu_gpu::DispatchLatencyHistogram| {
+                    if histogram.count == 0 {
+                        0
+                    } else {
+                        histogram.total_ns / histogram.count
+                    }
+                };
+                let (rss_mib, footprint_mib) = process_memory.map_or((0, 0), |memory| {
+                    (
+                        memory.resident_bytes.div_ceil(1024 * 1024),
+                        memory.physical_footprint_bytes.div_ceil(1024 * 1024),
+                    )
+                });
+                log.record(vec![
+                    (
+                        "window_ms",
+                        TelemetryValue::from(u64::try_from(dispatch_window_ms).unwrap_or(u64::MAX)),
+                    ),
+                    ("fps", TelemetryValue::from(flip_rate)),
+                    ("present_per_s", TelemetryValue::from(present_rate)),
+                    ("gpu_percent", TelemetryValue::from(gpu_utilization)),
+                    (
+                        "present_latency_ms",
+                        TelemetryValue::from(presentation_latency_milliseconds),
+                    ),
+                    ("draw_per_s", TelemetryValue::from(draw_rate)),
+                    ("render_pass_per_s", TelemetryValue::from(render_pass_rate)),
+                    ("compute_per_s", TelemetryValue::from(compute_rate)),
+                    ("guest_batch_per_s", TelemetryValue::from(guest_batch_rate)),
+                    (
+                        "pipeline_barrier_per_s",
+                        TelemetryValue::from(pipeline_barrier_rate),
+                    ),
+                    (
+                        "committed_batches",
+                        TelemetryValue::from(telemetry_committed_batches),
+                    ),
+                    (
+                        "pending_gpu_events",
+                        TelemetryValue::from(u64::try_from(pending_gpu_events).unwrap_or(0)),
+                    ),
+                    (
+                        "pending_flips",
+                        TelemetryValue::from(u64::try_from(pending_flips).unwrap_or(0)),
+                    ),
+                    ("resident_textures", TelemetryValue::from(telemetry_textures)),
+                    (
+                        "texture_cache_mib",
+                        TelemetryValue::from(sampled_texture_cache_mib),
+                    ),
+                    ("pipelines_compiled", TelemetryValue::from(telemetry_compiled)),
+                    ("pipelines_compiling", TelemetryValue::from(telemetry_compiling)),
+                    ("audio_out_per_s", TelemetryValue::from(audio_output_rate)),
+                    (
+                        "audio_underrun_percent",
+                        TelemetryValue::from(audio_underrun_percent),
+                    ),
+                    ("rss_mib", TelemetryValue::from(rss_mib)),
+                    ("footprint_mib", TelemetryValue::from(footprint_mib)),
+                    ("metal_mib", TelemetryValue::from(metal_allocated_mib)),
+                    (
+                        "import_calls",
+                        TelemetryValue::from(dispatch.total_import_calls()),
+                    ),
+                    (
+                        "import_video",
+                        TelemetryValue::from(calls(ImportFamily::Video)),
+                    ),
+                    (
+                        "import_stateful",
+                        TelemetryValue::from(calls(ImportFamily::Stateful)),
+                    ),
+                    (
+                        "lock_wait_count",
+                        TelemetryValue::from(dispatch.dispatch_lock_acquire_wait.count),
+                    ),
+                    (
+                        "lock_wait_mean_ns",
+                        TelemetryValue::from(mean_ns(&dispatch.dispatch_lock_acquire_wait)),
+                    ),
+                    (
+                        "lock_wait_max_ns",
+                        TelemetryValue::from(dispatch.dispatch_lock_acquire_wait.maximum_ns),
+                    ),
+                    (
+                        "lock_wait_total_ns",
+                        TelemetryValue::from(dispatch.dispatch_lock_acquire_wait.total_ns),
+                    ),
+                    (
+                        "lock_hold_total_ns",
+                        TelemetryValue::from(dispatch.dispatch_lock_hold.total_ns),
+                    ),
+                    (
+                        "gpu_publication_total_ns",
+                        TelemetryValue::from(dispatch.gpu_publication_wait.total_ns),
+                    ),
+                ]);
+            }
             self.statistics.last_logged = Instant::now();
         }
         self.statistics.interval_started = Instant::now();

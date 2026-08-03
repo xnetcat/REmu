@@ -36,6 +36,7 @@ mod shader;
 mod shared_event;
 mod stats;
 mod submission;
+mod telemetry;
 mod texture;
 mod tiling;
 use self::cache::{GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT};
@@ -2196,6 +2197,10 @@ struct MetalPresenter {
     /// Bounded command-buffer phase attribution for consumer acknowledgement batches.
     shared_event_ack_phase_timing: bool,
     shared_event_ack_phase_samples_remaining: u32,
+    /// Per-window structured records (plan E4); opened on the first 5-second window when the
+    /// launcher exported a run directory.
+    telemetry_log: Option<telemetry::TelemetryLog>,
+    telemetry_log_attempted: bool,
     shared_event_ack_batch_cpu: HashMap<u64, SharedEventAckBatchCpuPhases>,
     pending_shared_event_ack_traces: HashMap<u64, PendingSharedEventAckTrace>,
     shared_event_ack_traces: HashMap<usize, SharedEventAckTrace>,
@@ -2436,6 +2441,8 @@ impl MetalPresenter {
             terminal_publication_timing,
             shared_event_ack_phase_timing,
             shared_event_ack_phase_samples_remaining: 64,
+            telemetry_log: None,
+            telemetry_log_attempted: false,
             shared_event_ack_batch_cpu: HashMap::new(),
             pending_shared_event_ack_traces: HashMap::new(),
             shared_event_ack_traces: HashMap::new(),
