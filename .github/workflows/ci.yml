@@ -1,0 +1,62 @@
+# The gate CONTRIBUTING.md documents, as CI (plan H1). REmu is a macOS/Metal emulator whose
+# x86_64 target runs guest code under Rosetta 2, so both the native arm64 and the cross-built
+# x86_64 configurations are checked on Apple-Silicon runners. Tests run serially
+# (`--test-threads=1`): the runtime suite's residual global-counter cross-talk (docs/status.md)
+# is not yet fully removed, so serial remains the honest gate. Clippy runs informationally until
+# the pre-existing warning debt is cleared (plan H3); it does not gate merges yet.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    runs-on: macos-14
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.93.0
+          rustup target add x86_64-apple-darwin
+          rustc --version
+
+      - name: Ensure Rosetta 2 is available for the x86_64 target
+        run: softwareupdate --install-rosetta --agree-to-license || true
+
+      - name: Install the offline Metal toolchain
+        # Three remu-shader-metal tests compile generated MSL with Apple's `metal` tool.
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Tests (native arm64, serial)
+        run: cargo test --workspace -- --test-threads=1
+
+      - name: Tests (x86_64 under Rosetta, serial)
+        run: cargo test --workspace --target x86_64-apple-darwin -- --test-threads=1
+
+      - name: Clippy (informational until the warning debt is cleared, plan H3)
+        continue-on-error: true
+        run: |
+          cargo clippy --workspace --all-targets
+          cargo clippy --workspace --all-targets --target x86_64-apple-darwin
+
+  python:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Script unit tests
+        run: python3 -m unittest discover -s scripts/tests
