@@ -44,6 +44,35 @@ const CONTENT_FINGERPRINT_CHUNK_BYTES: u64 = 4 * 1024;
 /// re-examines it on the next use.
 const MAX_STABLE_SNAPSHOT_ATTEMPTS: u32 = 4;
 
+/// Read-only write-watch state used to prove that an ACQUIRE_MEM cache action is empty.
+///
+/// Every field is observed twice before an acquire can be dropped. The token deliberately contains
+/// both coarse and page-range dirty state: a protection fault or mapping transition which straddles
+/// one read must change the second complete token and conservatively reject the proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcquireNoOpWatchToken {
+    precise_tracking: bool,
+    retirement: Option<CpuWriteWatchRetirement>,
+    dirty: bool,
+    dirty_page_ranges: Vec<(u64, u64)>,
+    content_validation_pending: bool,
+    generations: Vec<u64>,
+}
+
+impl AcquireNoOpWatchToken {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.precise_tracking
+            && self.retirement.is_none()
+            && !self.dirty
+            && self.dirty_page_ranges.is_empty()
+            && !self.content_validation_pending
+    }
+
+    pub(crate) fn generations(&self) -> &[u64] {
+        &self.generations
+    }
+}
+
 impl MetalPresenter {
     pub(crate) fn synchronize_cpu_written_guest_resources(
         &mut self,
@@ -298,6 +327,17 @@ impl MetalPresenter {
 }
 
 impl GuestTextureWriteWatch {
+    pub(crate) fn acquire_noop_token(&self) -> AcquireNoOpWatchToken {
+        AcquireNoOpWatchToken {
+            precise_tracking: self.precise_tracking(),
+            retirement: self.retirement(),
+            dirty: self.is_dirty(),
+            dirty_page_ranges: self.dirty_page_ranges(),
+            content_validation_pending: self.content_validation_pending(),
+            generations: self.generations(),
+        }
+    }
+
     pub(crate) fn new(address: u64, byte_count: u64) -> Result<Self, String> {
         loop {
             let epoch = guest_shared_mapping_epoch();
