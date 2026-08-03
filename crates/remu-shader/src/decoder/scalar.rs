@@ -162,6 +162,7 @@ pub(crate) fn decode_sopp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x00 => Some("SNop"),
         0x01 => Some("SEndpgm"),
         0x02 => Some("SBranch"),
+        0x03 => Some("SWakeup"),
         0x04 => Some("SCbranchScc0"),
         0x05 => Some("SCbranchScc1"),
         0x06 => Some("SCbranchVccz"),
@@ -170,8 +171,22 @@ pub(crate) fn decode_sopp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x09 => Some("SCbranchExecnz"),
         0x0a => Some("SBarrier"),
         0x0c => Some("SWaitcnt"),
+        0x0d => Some("SSethalt"),
+        0x0e => Some("SSleep"),
+        0x0f => Some("SSetprio"),
         0x10 => Some("SSendmsg"),
+        0x11 => Some("SSendmsghalt"),
+        0x13 => Some("SIcacheInv"),
+        0x14 => Some("SIncperflevel"),
+        0x15 => Some("SDecperflevel"),
         0x16 => Some("STtraceData"),
+        // Mode-control ops. They set rounding/denormal/priority state that resource discovery
+        // does not model, so decoding them keeps a shader that merely toggled a mode alive. SDK
+        // cross-check: s_round_mode / s_denorm_mode / s_sleep mnemonics in libSceShaderIsaP.dll;
+        // OP numbers continue the RDNA2 (GFX10) SOPP block already decoded above (0x20-0x23).
+        0x22 => Some("SWaitIdle"),
+        0x24 => Some("SRoundMode"),
+        0x25 => Some("SDenormMode"),
         // RDNA2 uses S_CODE_END to pad bytes beyond the executable shader. Treating it as the
         // bounded stream terminator keeps the decoder from interpreting padding as instructions.
         0x1f => {
@@ -207,9 +222,19 @@ pub(crate) fn decode_sopk(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x0e => Some("SCmpkLeU32"),
         0x0f => Some("SAddkI32"),
         0x10 => Some("SMulkI32"),
+        // Hardware-register access. S_GETREG reads a mode/status register into an SGPR;
+        // S_SETREG(_IMM32) writes one. Resource discovery treats the mode registers as opaque, so
+        // decoding these keeps a prologue that configures rounding or reads HW_ID alive. SDK
+        // cross-check: s_getreg_b32 / s_setreg_b32 / s_setreg_imm32_b32 in libSceShaderIsaP.dll;
+        // OP numbers follow the RDNA2 (GFX10) SOPK block. S_SETREG_IMM32_B32 carries a trailing
+        // 32-bit literal, so it frames as two dwords.
+        0x11 => Some("SGetregB32"),
+        0x12 => Some("SSetregB32"),
+        0x13 => Some("SSetregImm32B32"),
         _ => None,
     };
-    known_frame(pc, word, ShaderEncoding::Sopk, code, name, 1)
+    let dwords = 1 + usize::from(code == 0x13);
+    known_frame(pc, word, ShaderEncoding::Sopk, code, name, dwords)
 }
 
 pub(crate) fn decode_smrd(pc: u32, word: u32) -> Result<Frame, DecodeError> {

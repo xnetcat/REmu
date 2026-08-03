@@ -148,7 +148,9 @@ pub(crate) fn required_vertex_bytes(
 }
 
 pub(crate) fn uses_sampler(opcode: Opcode) -> bool {
-    opcode.starts_with("ImageSample") || opcode.starts_with("ImageGather")
+    opcode.starts_with("ImageSample")
+        || opcode.starts_with("ImageGather")
+        || opcode.is("ImageGetLod")
 }
 
 pub(crate) fn resolve_image_mip_level(
@@ -544,8 +546,8 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         };
         let binding_base = minimum_address & !3;
         let prefix_bytes = base_address.wrapping_sub(binding_base);
-        let writable = instruction.opcode.starts_with("GlobalStore")
-            || instruction.opcode.starts_with("GlobalAtomic");
+        let writable =
+            instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
         self.record_global_binding_or_readonly_zero(
             instruction,
             BindingRequest {
