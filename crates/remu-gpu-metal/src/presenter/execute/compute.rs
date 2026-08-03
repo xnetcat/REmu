@@ -6,11 +6,12 @@ use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
     ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
     append_unique_global_writebacks,
-    append_unique_guest_write_ranges, collect_pending_global_writebacks,
-    collect_pending_guest_write_ranges, compute_pipeline_key, compute_program_can_split_wave64,
-    create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
-    dump_msl_compute_filter_matches, image_resource_descriptor_is_null, is_storage_image_opcode,
-    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
+    append_unique_guest_write_ranges, canonical_texture_bindings,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges, compute_pipeline_key,
+    compute_program_can_split_wave64, create_global_argument_buffer, decode_image_descriptor,
+    diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear,
     record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
@@ -18,10 +19,19 @@ use super::{
     storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, wave64_split_blockers,
 };
-use metal::{MTLResourceUsage, MTLSize};
+use metal::foreign_types::ForeignTypeRef;
+use metal::{MTLResourceUsage, MTLSize, MTLTextureType};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::OnceLock;
+
+fn metal_validation_texture_diagnostic_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("MTL_DEBUG_LAYER").is_some_and(|value| value == "1")
+    })
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn storage_image_requires_exact_preacquire(
@@ -312,7 +322,41 @@ impl MetalPresenter {
                 scalar_byte_count,
                 scalar_metadata.as_ptr().cast::<c_void>(),
             );
-            for (index, texture) in texture_indices.iter().zip(&textures) {
+            let canonical_texture_bindings = canonical_texture_bindings(evaluation);
+            for ((index, texture), binding) in texture_indices
+                .iter()
+                .zip(&textures)
+                .zip(canonical_texture_bindings)
+            {
+                if metal_validation_texture_diagnostic_enabled()
+                    && let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor)
+                {
+                    let expected = match descriptor.texture_type {
+                        9 => Some(MTLTextureType::D2),
+                        10 => Some(MTLTextureType::D3),
+                        11 | 13 => Some(MTLTextureType::D2Array),
+                        _ => None,
+                    };
+                    eprintln!(
+                        "[REMu][METAL][VALIDATION-TEXTURE] shader={:#x} setter=set_texture index={index} pc={:#x} opcode={} control_dimension={} control_array={} words={:08x?} decoded_type={} decoded_layers={} descriptor_expected={expected:?} selected_type={:?} selected={:#x} parent={:#x} label={:?} resident={:#x?}",
+                        dispatch.shader_address,
+                        binding.pc,
+                        binding.opcode,
+                        binding.control.dimension,
+                        binding.control.is_array,
+                        binding.resource_descriptor,
+                        descriptor.texture_type,
+                        descriptor.layer_count,
+                        texture.texture.texture_type(),
+                        texture.texture.as_ptr() as usize,
+                        texture
+                            .texture
+                            .parent_texture()
+                            .map_or(0, |parent| parent.as_ptr() as usize),
+                        texture.texture.label(),
+                        texture.selected_resident.map(|resident| resident.address),
+                    );
+                }
                 encoder.set_texture(*index, Some(&texture.texture));
             }
             if let (Some(index), Some(buffer)) = (
