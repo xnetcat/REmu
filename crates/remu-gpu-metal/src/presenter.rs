@@ -178,9 +178,11 @@ use self::stats::{
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, process_memory_statistics, record_mode27_work_detail,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, TerminalPublicationPhase, TerminalPublicationStatistics,
+    TerminalPublicationTimer, format_terminal_publication_report, process_memory_statistics,
+    record_mode27_work_detail, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
+    take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use self::submission::{
     SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject, append_unique_global_writebacks,
@@ -1504,6 +1506,7 @@ struct PresenterStatistics {
     shared_event_error_advances: u32,
     shared_event_fallbacks_no_exact_producer: u32,
     shared_event_fallbacks_timeline_overflow: u32,
+    terminal_publication: TerminalPublicationStatistics,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,
     last_audio_output_frames: u64,
@@ -1991,6 +1994,8 @@ struct MetalPresenter {
     /// Experimental B17 admission for direct draws proven disjoint from exact producer writes.
     /// This remains independently opt-in so the classifier can collect an unbiased OFF baseline.
     shared_event_direct_draw_admission: bool,
+    /// Optional high-resolution attribution of presenter terminal-retirement work.
+    terminal_publication_timing: bool,
     /// Monotonic marker for any explicit CPU settlement of guest Metal batches.
     /// Interval statistics reset, so they cannot reliably identify a drain inside one draw.
     guest_batch_cpu_synchronization_epoch: u64,
@@ -2196,6 +2201,13 @@ impl MetalPresenter {
         let shared_event_direct_draw_admission = per_queue_guest_batches
             && std::env::var_os("REMU_SHARED_EVENT_DIRECT_DRAWS")
                 .is_some_and(|value| value == "1");
+        let terminal_publication_timing = std::env::var_os("REMU_GPU_TERMINAL_PHASES")
+            .is_some_and(|value| value == "1");
+        if terminal_publication_timing {
+            eprintln!(
+                "[REMu][PERF-GPU-TERMINAL] optional presenter terminal phase attribution enabled"
+            );
+        }
         Ok(Self {
             receiver: OrderedGpuEventReceiver::new(receiver),
             window: None,
@@ -2205,6 +2217,7 @@ impl MetalPresenter {
             event_loop_waker: None,
             per_queue_guest_batches,
             shared_event_direct_draw_admission,
+            terminal_publication_timing,
             guest_batch_cpu_synchronization_epoch: 0,
             active_guest_queue: None,
             guest_queue_batches: HashMap::new(),
