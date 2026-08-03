@@ -1194,6 +1194,9 @@ impl MetalPresenter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), String> {
+        self.guest_batch_cpu_synchronization_epoch = self
+            .guest_batch_cpu_synchronization_epoch
+            .saturating_add(1);
         if self.per_queue_guest_batches {
             return self.wait_for_guest_queue_command_batches_within(timeout);
         }

@@ -9,7 +9,8 @@ use metal::{
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
     GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, ShaderSnapshot, gpu_event_channel,
+    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw, ShaderSnapshot,
+    gpu_event_channel,
 };
 
 use remu_memory::{
@@ -29,9 +30,9 @@ use super::super::submission::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PhysicalFootprintRange,
-    PendingGuestWriteRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_WAIT,
-    SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
+    PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
+    SharedEventDrawReject, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -144,21 +145,56 @@ fn flip_wait_blocks_only_its_queue_front_and_preserves_the_following_boundary() 
     assert_eq!(presenter.receiver.pending_event_count(), 0);
 }
 
-fn mapped_test_label() -> (GuestAddressSpace, u64) {
-    let mut address_space =
-        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest label address space");
-    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest label backing");
+fn mapped_test_pages(page_count: u64) -> (GuestAddressSpace, u64) {
+    let byte_count = page_count
+        .checked_mul(GUEST_PAGE_SIZE)
+        .expect("test mapping byte count");
+    let mut address_space = GuestAddressSpace::new(
+        byte_count
+            .checked_add(GUEST_PAGE_SIZE)
+            .expect("test address-space byte count"),
+    )
+    .expect("guest test address space");
+    let backing = GuestPhysicalBacking::new(byte_count).expect("guest test backing");
     let address = address_space
         .map_shared(
             GuestMapPlacement::Anywhere,
-            GUEST_PAGE_SIZE,
+            byte_count,
             GUEST_PAGE_SIZE,
             GuestProtection::READ_WRITE,
             &backing,
             0,
         )
-        .expect("guest label mapping");
+        .expect("guest test mapping");
     (address_space, address.get())
+}
+
+fn mapped_test_label() -> (GuestAddressSpace, u64) {
+    mapped_test_pages(1)
+}
+
+fn shared_event_depth_draw(address: u64) -> IndexedDraw {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader_address = 0x0080_07a8_0000;
+    draw.export_shader = Some(ShaderSnapshot {
+        header_address: draw.export_shader_address,
+        program: Arc::new(Program::new(draw.export_shader_address, Vec::new())),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    draw.export_shader_evaluation = Some(Arc::new(ShaderEvaluation {
+        initial_scalar_registers: Default::default(),
+        scalar_registers: Default::default(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    }));
+    super::append_depth_target_registers(&mut draw, address, 64, 64, 0xa000_0003, 0x66);
+    draw
 }
 
 fn read_test_label(address: u64) -> u32 {
@@ -4492,6 +4528,347 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
     assert!(
         !presenter.shared_event_dependencies_supply_compute_globals(&unresolved),
         "zero-copy or CPU-published overlap must remain behind the host gate"
+    );
+}
+
+#[test]
+fn disjoint_direct_draw_admission_is_default_disabled() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = false;
+    let (_label_space, label) = mapped_test_label();
+    let (_depth_space, depth) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth))),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_disjoint_candidates, 1,
+        "the OFF arm still measures the exact candidate population"
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        1,
+        "default-OFF must preserve the existing draw host gate"
+    );
+    assert_eq!(
+        presenter
+            .statistics
+            .batch_flushes_for_shared_event_host_effect,
+        1
+    );
+    let Some(QueueBlockReason::GuestSharedEventHostEffect {
+        consumer_ack: Some(consumer_ack),
+        terminal_dependencies,
+        ..
+    }) = presenter.receiver.blocked_queues.get(&0)
+    else {
+        panic!("default-OFF draw must retain a consumer host acknowledgement");
+    };
+    assert_eq!(consumer_ack.producer().queue_id(), 0);
+    assert_eq!(terminal_dependencies.len(), 1);
+    assert_eq!(terminal_dependencies[0].producer().queue_id(), 41);
+    assert_eq!(read_test_label(label), 0, "producer has not host-retired");
+    assert!(presenter.guest_queue_batches[&0]
+        .committed_batches
+        .iter()
+        .all(|batch| batch.completion_sequences.is_empty()));
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("default-OFF acknowledgement and producer settle");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = true;
+    let (_label_space, label) = mapped_test_label();
+    let (_depth_space, depth) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth))),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_disjoint_candidates, 1
+    );
+    assert_eq!(presenter.statistics.shared_event_host_blocks, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        0
+    );
+    assert!(
+        !matches!(
+            presenter.receiver.blocked_queues.get(&0),
+            Some(QueueBlockReason::GuestSharedEventHostEffect { .. })
+        ),
+        "the cold pipeline may finish or fail during this drain, but it cannot reintroduce a host acknowledgement"
+    );
+    let consumer = &presenter.guest_queue_batches[&0];
+    let (&producer, checkpoint) = consumer
+        .resource_dependencies
+        .iter()
+        .next()
+        .expect("consumer retains one exact producer checkpoint");
+    assert_eq!(producer.queue_id(), 41);
+    assert_eq!(consumer.host_dependencies.get(&producer), Some(&checkpoint.fence.value()));
+    assert!(checkpoint.footprint_complete);
+    assert_eq!(
+        consumer
+            .open_batch
+            .as_ref()
+            .expect("the wait remains in the open consumer batch")
+            .max_encoded_signal,
+        None,
+        "admission must not manufacture a consumer host acknowledgement"
+    );
+    assert_eq!(read_test_label(label), 0, "GPU signal is not host retirement");
+
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("consumer wait batch commits before its producer");
+    let consumer_commands = presenter.guest_queue_batches[&0]
+        .committed_batches
+        .back()
+        .expect("consumer wait batch is retained")
+        .command_buffer
+        .clone();
+    assert_ne!(
+        consumer_commands.status(),
+        metal::MTLCommandBufferStatus::Completed,
+        "the exact producer wait must hold a consumer committed first"
+    );
+    assert!(presenter.guest_queue_batches[&0]
+        .committed_batches
+        .iter()
+        .all(|batch| batch.completion_sequences.is_empty()));
+    assert_eq!(read_test_label(label), 0);
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("producer signal releases the exact consumer wait");
+    assert_eq!(
+        consumer_commands.status(),
+        metal::MTLCommandBufferStatus::Completed
+    );
+    assert_eq!(read_test_label(label), 1);
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = true;
+    let (_shared_space, shared_address) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: shared_address,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: shared_address,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(shared_address))),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_disjoint_candidates, 0
+    );
+    assert_eq!(
+        presenter.statistics.shared_event_draw_rejections
+            [SharedEventDrawReject::Overlap.index()],
+        1
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        1
+    );
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestSharedEventHostEffect {
+            consumer_ack: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(read_test_label(shared_address), 0);
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("overlapping draw host gate and producer settle");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = true;
+    let (_label_space, label) = mapped_test_label();
+    let (_depth_space, depth) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![GpuEvent::MemoryWait(wait)],
+    }));
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_waits, 1);
+    let checkpoint = presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .resource_dependencies
+        .values_mut()
+        .next()
+        .expect("consumer retained the exact producer checkpoint");
+    checkpoint.footprint_complete = false;
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth)))],
+    }));
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_rejections
+            [SharedEventDrawReject::IncompleteProducer.index()],
+        1
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        1
+    );
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestSharedEventHostEffect {
+            consumer_ack: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(read_test_label(label), 0);
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("incomplete-producer host gate and producer settle");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn shared_event_direct_draw_outcome_counts_encoding_and_internal_drains_separately() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+
+    presenter.record_shared_event_direct_draw_outcome(
+        false,
+        presenter.guest_batch_cpu_synchronization_epoch,
+        true,
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(presenter.statistics.shared_event_draw_internal_drains, 0);
+
+    let before = presenter.guest_batch_cpu_synchronization_epoch;
+    presenter.record_shared_event_direct_draw_outcome(true, before, true);
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 1);
+    assert_eq!(presenter.statistics.shared_event_draw_internal_drains, 0);
+
+    let before = presenter.guest_batch_cpu_synchronization_epoch;
+    presenter.guest_batch_cpu_synchronization_epoch += 1;
+    presenter.record_shared_event_direct_draw_outcome(true, before, false);
+    assert_eq!(
+        presenter.statistics.shared_event_gpu_ordered_draws, 1,
+        "a failed draw is not reported as encoded"
+    );
+    assert_eq!(
+        presenter.statistics.shared_event_draw_internal_drains, 1,
+        "an admitted draw which explicitly settles Metal work is never interpreted as a saved gate"
     );
 }
 
