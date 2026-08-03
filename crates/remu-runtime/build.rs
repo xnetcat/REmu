@@ -1,14 +1,25 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Compiles the vendored LibAtrac9 decoder (see `vendored/libatrac9/PROVENANCE.md`) into the
-//! runtime so the AJM engine can decode ATRAC9 (plan P1). The C is third-party, so its own
-//! warnings are silenced and cannot perturb the workspace warning budget; the `cc` crate picks
-//! up the active target, so the same sources build for arm64 and x86_64 alike.
+//! Compiles the vendored AJM/AMPR codecs into the runtime:
+//! - LibAtrac9 (plan P1) — ATRAC9
+//! - minimp3 (plan P6) — MP3
+//! - ooz + SIMDe (plan P3) — Kraken/Oodle decompress
+//!
+//! Third-party C/C++ is compiled with `.warnings(false)` so it cannot perturb the workspace
+//! warning budget. The `cc` crate picks up the active target, so the same sources build for
+//! arm64 and x86_64 (ooz SSE goes through SIMDe on Apple Silicon).
 
 use std::path::Path;
 
 fn main() {
+    build_atrac9();
+    build_minimp3();
+    build_ooz();
+    println!("cargo:rerun-if-changed=build.rs");
+}
+
+fn build_atrac9() {
     let src = Path::new("vendored/libatrac9/src");
     let sources = [
         "band_extension.c",
@@ -25,7 +36,6 @@ fn main() {
         "unpack.c",
         "utility.c",
     ];
-
     let mut build = cc::Build::new();
     build
         .include(src)
@@ -35,7 +45,39 @@ fn main() {
         build.file(src.join(source));
     }
     build.compile("atrac9");
-
-    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=vendored/libatrac9/src");
+}
+
+fn build_minimp3() {
+    let dir = Path::new("vendored/minimp3");
+    cc::Build::new()
+        .file(dir.join("minimp3_impl.c"))
+        .include(dir)
+        .warnings(false)
+        .flag_if_supported("-std=c11")
+        .compile("minimp3");
+    println!("cargo:rerun-if-changed=vendored/minimp3");
+}
+
+fn build_ooz() {
+    let dir = Path::new("vendored/ooz");
+    let simde = Path::new("vendored/simde");
+    let mut build = cc::Build::new();
+    build
+        .cpp(true)
+        .std("c++17")
+        .include(dir)
+        .include(simde)
+        .warnings(false)
+        .file(dir.join("bitknit.cpp"))
+        .file(dir.join("lzna.cpp"))
+        .file(dir.join("kraken.cpp"))
+        .file(dir.join("ooz_bridge.cpp"));
+    // Apple clang needs libc++ explicitly when mixing into a Rust cdylib/staticlib.
+    if std::env::var("CARGO_CFG_TARGET_OS").ok().as_deref() == Some("macos") {
+        build.cpp_set_stdlib("c++");
+    }
+    build.compile("ooz");
+    println!("cargo:rerun-if-changed=vendored/ooz");
+    println!("cargo:rerun-if-changed=vendored/simde");
 }

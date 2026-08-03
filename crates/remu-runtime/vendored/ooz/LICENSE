@@ -1,0 +1,11 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+The vendored ooz sources (kraken.cpp / bitknit.cpp / lzna.cpp) are
+Copyright (C) 2016 Powzix, and are free software under the GNU GPL v3
+(or later), as stated in the source file headers. See
+https://www.gnu.org/licenses/gpl-3.0.html for the full license text.
+
+REmu itself is GPL-2.0-or-later; combining with GPL-3 ooz requires the
+combined work to be distributed under GPL-3 terms for those parts. This
+tree is private and unpublished — recorded for provenance.

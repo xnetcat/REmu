@@ -380,8 +380,9 @@ fn lpcm_converts_between_the_declared_input_and_requested_output_encodings() {
 fn a_job_for_a_codec_without_a_host_implementation_fails_the_whole_batch_loudly() {
     let engine = AjmEngine::new();
     let context = create_context(&engine);
-    // MPEG4-AAC (P2, still unimplemented) registers and creates instances as hardware would...
-    let instance = create_instance(&engine, context, AJM_CODEC_DEC_M4AAC, 2);
+    // Opus (P6 deferred — libopus vendor conflicts with the AJM-only build budget) registers
+    // and creates instances as hardware would...
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_OPUS, 2);
 
     let input = [0_u8; 64];
     let mut output = [0_u8; 256];
@@ -402,7 +403,7 @@ fn a_job_for_a_codec_without_a_host_implementation_fails_the_whole_batch_loudly(
     assert_eq!(report.job_address, job_address);
     assert_eq!(report.command_offset, 0);
     assert_eq!(
-        engine.codec_job_count(AJM_CODEC_DEC_M4AAC),
+        engine.codec_job_count(AJM_CODEC_DEC_OPUS),
         1,
         "demand telemetry counts the refused job"
     );
@@ -1130,4 +1131,225 @@ fn dispatch_serves_the_whole_lifecycle_through_the_worker_pool() {
         SUCCESS
     );
     assert_eq!(call("MHur6qCsUus", args(&[u64::from(context)])), SUCCESS);
+}
+
+// --- P2 MPEG4-AAC -----------------------------------------------------------------
+
+const M4AAC_ADTS: &[u8] = include_bytes!("testdata/m4aac_sine440.adts");
+const M4AAC_GOLDEN: &[u8] = include_bytes!("testdata/m4aac_sine440.s16le.pcm");
+/// ADTS initialize parameters: config=ADTS (1), sampling index ignored (m4aac_decoder.h:214-220).
+const M4AAC_INIT_PARAMETERS: [u8; 8] = [1, 0, 0, 0, 3, 0, 0, 0];
+
+fn append_m4aac_initialize(
+    fixture: &mut BatchFixture,
+    instance: u32,
+    parameters: &[u8],
+    result: &mut [u8; 8],
+) {
+    let info = fixture.info_address();
+    assert_eq!(
+        batch_job_initialize(args(&[
+            info,
+            u64::from(instance),
+            parameters.as_ptr() as u64,
+            parameters.len() as u64,
+            result.as_mut_ptr() as u64,
+        ])),
+        SUCCESS
+    );
+}
+
+#[test]
+fn m4aac_decodes_an_adts_stream_and_matches_the_independent_ffmpeg_golden() {
+    let engine = AjmEngine::new();
+    let context = create_context(&engine);
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_M4AAC, 2);
+
+    let mut output = vec![0_u8; M4AAC_GOLDEN.len()];
+    let mut initialize_result = [0xff_u8; 8];
+    let mut decode_result = [0xff_u8; 32];
+    let mut fixture = BatchFixture::new();
+    append_m4aac_initialize(
+        &mut fixture,
+        instance,
+        &M4AAC_INIT_PARAMETERS,
+        &mut initialize_result,
+    );
+    fixture.append_decode(instance, M4AAC_ADTS, &mut output, &mut decode_result);
+    let batch = fixture
+        .start(&engine, context)
+        .expect("a well-formed MPEG4-AAC batch starts");
+    assert!(engine.execute_next_queued_batch());
+    assert_eq!(
+        engine.batch_wait(args(&[
+            u64::from(context),
+            u64::from(batch),
+            u64::from(SCE_AJM_WAIT_INFINITE),
+            0
+        ])),
+        SUCCESS
+    );
+
+    assert_eq!(
+        i32::from_le_bytes(initialize_result[0..4].try_into().unwrap()),
+        0
+    );
+    let (result, consumed, produced, total_samples, frames) = decode_result_fields(&decode_result);
+    assert_eq!(result, 0, "the decode job succeeded");
+    assert_eq!(consumed, i32::try_from(M4AAC_ADTS.len()).unwrap());
+    assert_eq!(produced, i32::try_from(M4AAC_GOLDEN.len()).unwrap());
+    assert_eq!(total_samples as usize, M4AAC_GOLDEN.len() / 4); // stereo S16
+    assert!(frames > 0);
+
+    let decoded: Vec<i16> = output
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let reference: Vec<i16> = M4AAC_GOLDEN
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    assert_eq!(decoded.len(), reference.len());
+    // Symphonia and ffmpeg are independent AAC LC implementations; allow a small absolute
+    // error per sample (encoder/decoder rounding), but require a real sine peak.
+    let max_abs_diff = decoded
+        .iter()
+        .zip(&reference)
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+        .max()
+        .unwrap();
+    assert!(
+        max_abs_diff <= 64,
+        "decoded PCM disagrees with the independent ffmpeg golden by {max_abs_diff} > 64"
+    );
+    let peak = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(peak > 1000, "decoded audio must not be silence (peak={peak})");
+}
+
+// --- P6 MP3 -----------------------------------------------------------------------
+
+const MP3_STREAM: &[u8] = include_bytes!("testdata/mp3_sine440.mp3");
+const MP3_GOLDEN: &[u8] = include_bytes!("testdata/mp3_sine440.s16le.pcm");
+
+#[test]
+fn mp3_decodes_a_stream_and_matches_the_independent_ffmpeg_golden() {
+    let engine = AjmEngine::new();
+    let context = create_context(&engine);
+    let instance = create_instance(&engine, context, AJM_CODEC_DEC_MP3, 2);
+
+    let mut output = vec![0_u8; MP3_GOLDEN.len().saturating_mul(2).max(MP3_GOLDEN.len() + 8192)];
+    let mut initialize_result = [0xff_u8; 8];
+    let mut decode_result = [0xff_u8; 32];
+    let mut fixture = BatchFixture::new();
+    // MP3 initialize takes no parameter blob (mp3_decoder.h has no InitializeParameters).
+    let info = fixture.info_address();
+    assert_eq!(
+        batch_job_initialize(args(&[
+            info,
+            u64::from(instance),
+            0,
+            0,
+            initialize_result.as_mut_ptr() as u64,
+        ])),
+        SUCCESS
+    );
+    fixture.append_decode(instance, MP3_STREAM, &mut output, &mut decode_result);
+    let batch = fixture
+        .start(&engine, context)
+        .expect("a well-formed MP3 batch starts");
+    assert!(engine.execute_next_queued_batch());
+    assert_eq!(
+        engine.batch_wait(args(&[
+            u64::from(context),
+            u64::from(batch),
+            u64::from(SCE_AJM_WAIT_INFINITE),
+            0
+        ])),
+        SUCCESS
+    );
+
+    assert_eq!(
+        i32::from_le_bytes(initialize_result[0..4].try_into().unwrap()),
+        0
+    );
+    let (result, consumed, produced, total_samples, frames) = decode_result_fields(&decode_result);
+    assert_eq!(result, 0);
+    assert!(consumed > 0);
+    assert!(produced > 0);
+    assert!(total_samples > 0);
+    assert!(frames > 0);
+
+    let produced_usize = produced as usize;
+    let decoded: Vec<i16> = output[..produced_usize]
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    let reference: Vec<i16> = MP3_GOLDEN
+        .chunks_exact(2)
+        .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
+        .collect();
+    // Compare the overlapping prefix (encoder delay / padding may differ by a frame).
+    let n = decoded.len().min(reference.len()).saturating_sub(1152 * 2);
+    assert!(n > 1000, "enough overlapping samples to compare");
+    let max_abs_diff = decoded[..n]
+        .iter()
+        .zip(&reference[..n])
+        .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_abs_diff <= 96,
+        "decoded PCM disagrees with the independent ffmpeg golden by {max_abs_diff} > 96"
+    );
+    let peak = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap();
+    assert!(peak > 1000, "decoded audio must not be silence (peak={peak})");
+}
+
+// --- P3 Kraken/Oodle --------------------------------------------------------------
+
+const KRAKEN_SRC: &[u8] = include_bytes!("testdata/kraken_uncompressed.bin");
+const KRAKEN_PLAIN: &[u8] = include_bytes!("testdata/kraken_uncompressed.plain");
+
+#[test]
+fn ooz_kraken_decompresses_an_uncompressed_quantum() {
+    let mut dst = vec![0_u8; KRAKEN_PLAIN.len()];
+    let written = super::oodle::kraken_decompress(KRAKEN_SRC, &mut dst)
+        .expect("ooz must accept the crafted uncompressed quantum");
+    assert_eq!(written, KRAKEN_PLAIN.len());
+    assert_eq!(&dst[..], KRAKEN_PLAIN);
+}
+
+#[test]
+fn ampr_kraken_decode_stage_matches_the_two_phase_closure_signature() {
+    use std::io::Write;
+    // File framing = 8-byte LE uncompressed size + Kraken bitstream (ooz CLI convention).
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "remu-kraken-stage-{}.bin",
+        std::process::id()
+    ));
+    {
+        let mut file = std::fs::File::create(&path).unwrap();
+        let size = KRAKEN_PLAIN.len() as u64;
+        file.write_all(&size.to_le_bytes()).unwrap();
+        file.write_all(KRAKEN_SRC).unwrap();
+    }
+    let file = std::fs::File::open(&path).unwrap();
+    let mut guest = vec![0_u8; KRAKEN_PLAIN.len()];
+    let destination = guest.as_mut_ptr() as u64;
+    // The closure signature is the seam contract (ampr_api two-phase submit).
+    let decode: fn(&std::fs::File, u32, u64, u64, u64, usize) -> Result<usize, u64> =
+        super::oodle::ampr_kraken_decode_stage;
+    let written = decode(
+        &file,
+        0x11,
+        destination,
+        KRAKEN_PLAIN.len() as u64,
+        0,
+        guest.len(),
+    )
+    .expect("decode stage succeeds");
+    assert_eq!(written, KRAKEN_PLAIN.len());
+    assert_eq!(&guest[..], KRAKEN_PLAIN);
+    let _ = std::fs::remove_file(&path);
 }

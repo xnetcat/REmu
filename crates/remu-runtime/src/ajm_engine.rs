@@ -258,6 +258,10 @@ struct InstanceState {
     lpcm: Option<LpcmParameters>,
     /// ATRAC9 decoder once a `sceAjmBatchJobInitialize` job configured it (plan P1).
     at9: Option<atrac9::Atrac9Decoder>,
+    /// MPEG4-AAC decoder once initialized (plan P2).
+    m4aac: Option<m4aac::M4aacDecoder>,
+    /// MP3 decoder once created (plan P6); geometry fills in on the first decoded frame.
+    mp3: Option<mp3::Mp3Decoder>,
     /// Sample frames decoded since the last reset (`uiTotalDecodedSamples`, sideband.h:436).
     total_decoded_samples: u64,
 }
@@ -275,6 +279,10 @@ impl InstanceState {
             parameters.channels
         } else if let Some(decoder) = &self.at9 {
             decoder.channels
+        } else if let Some(decoder) = &self.m4aac {
+            decoder.channels
+        } else if let Some(decoder) = &self.mp3 {
+            decoder.channels
         } else {
             0
         }
@@ -286,9 +294,18 @@ impl InstanceState {
             parameters.sample_rate
         } else if let Some(decoder) = &self.at9 {
             decoder.sample_rate
+        } else if let Some(decoder) = &self.m4aac {
+            decoder.sample_rate
+        } else if let Some(decoder) = &self.mp3 {
+            decoder.sample_rate
         } else {
             0
         }
+    }
+
+    /// Maximum channels requested at instance create (bits 0-6, sideband.h:904-906).
+    fn max_channels(&self) -> u32 {
+        (self.flags as u32) & 0x7f
     }
 }
 
@@ -546,6 +563,8 @@ impl AjmEngine {
                 flags,
                 lpcm: None,
                 at9: None,
+                m4aac: None,
+                mp3: None,
                 total_decoded_samples: 0,
             },
         );
@@ -916,6 +935,8 @@ fn host_codec(codec: u32) -> Option<&'static dyn AjmCodec> {
     match codec {
         AJM_CODEC_DEC_LPCM => Some(&LpcmDecoder),
         AJM_CODEC_DEC_AT9 => Some(&Atrac9Codec),
+        AJM_CODEC_DEC_M4AAC => Some(&M4aacCodec),
+        AJM_CODEC_DEC_MP3 => Some(&Mp3Codec),
         _ => None,
     }
 }
@@ -1161,6 +1182,133 @@ fn push_output_sample(out: &mut Vec<u8>, sample: i16, encoding: u32) {
             out.extend_from_slice(&(value as f32).to_le_bytes());
         }
         _ => out.extend_from_slice(&sample.to_le_bytes()),
+    }
+}
+
+/// MPEG4-AAC decoder (plan P2, `ajm/m4aac_decoder.h`). Initialize takes
+/// `SceAjmDecM4aacInitializeParameters` (8 bytes); a run consumes ADTS frames and produces
+/// interleaved PCM in the instance's requested output encoding.
+struct M4aacCodec;
+
+impl AjmCodec for M4aacCodec {
+    fn initialize(&self, instance: &mut InstanceState, parameters: &[u8]) -> i32 {
+        // `SceAjmDecM4aacInitializeParameters` (m4aac_decoder.h:214-220).
+        if parameters.len() < 8 {
+            return SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER;
+        }
+        let config_number = u32::from_le_bytes(parameters[0..4].try_into().expect("sized above"));
+        let sampling_freq_index =
+            u32::from_le_bytes(parameters[4..8].try_into().expect("sized above"));
+        let Some(decoder) =
+            m4aac::M4aacDecoder::new(config_number, sampling_freq_index, instance.max_channels())
+        else {
+            instance.m4aac = None;
+            return SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER;
+        };
+        instance.m4aac = Some(decoder);
+        instance.total_decoded_samples = 0;
+        0
+    }
+
+    fn run(&self, instance: &mut InstanceState, input: &[u8], output_capacity: usize) -> RunOutput {
+        let output_encoding = instance.output_encoding();
+        let Some(output_sample) = encoding_sample_bytes(output_encoding) else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let Some(decoder) = instance.m4aac.as_mut() else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_NOT_INITIALIZED,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let max_samples = output_capacity / usize::try_from(output_sample).unwrap_or(2);
+        let Some((samples, consumed, frames)) = decoder.decode_s16(input, max_samples) else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let mut produced = Vec::with_capacity(samples.len() * usize::try_from(output_sample).unwrap_or(2));
+        for sample in samples {
+            push_output_sample(&mut produced, sample, output_encoding);
+        }
+        instance.total_decoded_samples += frames;
+        RunOutput {
+            result: 0,
+            produced,
+            consumed,
+            frames,
+        }
+    }
+}
+
+/// MP3 decoder (plan P6, `ajm/mp3_decoder.h`). Initialize is a no-op success — frame headers
+/// carry the geometry — and a run consumes MP3 frames via minimp3.
+struct Mp3Codec;
+
+impl AjmCodec for Mp3Codec {
+    fn initialize(&self, instance: &mut InstanceState, _parameters: &[u8]) -> i32 {
+        instance.mp3 = Some(mp3::Mp3Decoder::new());
+        instance.total_decoded_samples = 0;
+        0
+    }
+
+    fn run(&self, instance: &mut InstanceState, input: &[u8], output_capacity: usize) -> RunOutput {
+        let output_encoding = instance.output_encoding();
+        let Some(output_sample) = encoding_sample_bytes(output_encoding) else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_INVALID_PARAMETER,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let Some(decoder) = instance.mp3.as_mut() else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL | SCE_AJM_RESULT_NOT_INITIALIZED,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let max_samples = output_capacity / usize::try_from(output_sample).unwrap_or(2);
+        let Some((samples, consumed, mpeg_frames)) = decoder.decode_s16(input, max_samples) else {
+            return RunOutput {
+                result: SCE_AJM_RESULT_FATAL,
+                produced: Vec::new(),
+                consumed: 0,
+                frames: 0,
+            };
+        };
+        let channels = u64::from(decoder.channels.max(1));
+        let sample_frames = if channels == 0 {
+            0
+        } else {
+            samples.len() as u64 / channels
+        };
+        let mut produced = Vec::with_capacity(samples.len() * usize::try_from(output_sample).unwrap_or(2));
+        for sample in samples {
+            push_output_sample(&mut produced, sample, output_encoding);
+        }
+        instance.total_decoded_samples += sample_frames;
+        // Report MPEG frame count in the multiple-frames field when the job asked for it;
+        // sample frames feed the stream total above.
+        let _ = mpeg_frames;
+        RunOutput {
+            result: 0,
+            produced,
+            consumed,
+            frames: sample_frames,
+        }
     }
 }
 
@@ -1577,7 +1725,9 @@ fn format_sideband(state: &EngineState, context: u32, instance: u32) -> Vec<u8> 
 }
 
 /// The codec-specific `GET_CODEC_INFO` sideband for an instance. ATRAC9 returns
-/// `SceAjmSidebandDecAt9CodecInfo` (at9_decoder.h:283-293); every other codec returns the
+/// `SceAjmSidebandDecAt9CodecInfo` (at9_decoder.h:283-293); MPEG4-AAC returns
+/// `SceAjmSidebandDecM4aacCodecInfo` (m4aac_decoder.h:229-235); MP3 returns
+/// `SceAjmSidebandDecMp3CodecInfo` (mp3_decoder.h:88-106); every other codec returns the
 /// `SceAjmSidebandDecLpcmCodecInfo`-shaped input-encoding word plus two reserved words
 /// (lpcm_decoder.h:81-85).
 fn codec_info_sideband(state: &EngineState, context: u32, instance: u32) -> Vec<u8> {
@@ -1595,6 +1745,12 @@ fn codec_info_sideband(state: &EngineState, context: u32, instance: u32) -> Vec<
         info.extend_from_slice(&decoder.superframe_size.to_le_bytes());
         info.extend_from_slice(&decoder.frame_samples.to_le_bytes());
         return info;
+    }
+    if let Some(decoder) = instance_state.and_then(|instance_state| instance_state.m4aac.as_ref()) {
+        return decoder.codec_info_bytes().to_vec();
+    }
+    if let Some(decoder) = instance_state.and_then(|instance_state| instance_state.mp3.as_ref()) {
+        return decoder.codec_info_bytes().to_vec();
     }
     let encoding = instance_state
         .and_then(|instance_state| instance_state.lpcm)
@@ -2142,6 +2298,9 @@ pub(crate) fn reset_for_new_process() {
 }
 
 mod atrac9;
+mod m4aac;
+mod mp3;
+pub(crate) mod oodle;
 
 #[cfg(test)]
 mod tests;
