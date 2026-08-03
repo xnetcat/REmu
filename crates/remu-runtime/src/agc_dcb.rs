@@ -40,6 +40,11 @@ const ADDRESSED_EVENT_TYPE_GROUP: u32 = 0x38;
 
 const BRANCH_PACKET_BYTES: u64 = 56;
 const RELEASE_MEM_PACKET_BYTES: u64 = 32;
+/// An `atomicMem()` operation is issued through one `ATOMIC_MEM` PM4 packet: a header, the atomic
+/// control dword, a 64-bit address, 64-bit source and compare data, and the loop-interval dword —
+/// nine dwords. The compute queue emits the identical packet, so `sceAgcAcbAtomicMemGetSize`
+/// (`da1Sm8-QDoU`) already reports 36 here; the draw queue's query has to agree byte for byte.
+const ATOMIC_MEM_PACKET_BYTES: u64 = 36;
 const COPY_DATA_PACKET_BYTES: u64 = 24;
 const DRAW_INDEX_INDIRECT_MULTI_PACKET_BYTES: u64 = 40;
 const SET_BASE_PACKET_BYTES: u64 = 16;
@@ -85,6 +90,7 @@ fn dispatch_packet_size(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         // the shader-stage event index from the action code alone.
         "zg6u-N6Otxs" => RELEASE_MEM_PACKET_BYTES,
         "b5u0Jzm8TF8" => COPY_DATA_PACKET_BYTES,
+        "oz6zQq1JwCE" => ATOMIC_MEM_PACKET_BYTES,
         "r98I08t+LOg" => DRAW_INDEX_INDIRECT_MULTI_PACKET_BYTES,
         "9S4noWrUI0s" | "MMlmJAL7N5w" => SET_BASE_PACKET_BYTES,
         "yheJGN-ay+A" | "vLrBL8DQiz8" | "XN+Iuu7XsM8" => SET_PREDICATION_PACKET_BYTES,
@@ -404,6 +410,8 @@ mod tests {
         assert_eq!(call("uZW-mqsxkrM", [0; 6]), 56);
         assert_eq!(call("zg6u-N6Otxs", [0; 6]), 32);
         assert_eq!(call("b5u0Jzm8TF8", [0; 6]), 24);
+        // sceAgcDcbAtomicMemGetSize agrees with the compute queue's sceAgcAcbAtomicMemGetSize.
+        assert_eq!(call("oz6zQq1JwCE", [0; 6]), 36);
         assert_eq!(call("r98I08t+LOg", [0; 6]), 40);
         assert_eq!(call("9S4noWrUI0s", [0; 6]), 16);
         assert_eq!(call("MMlmJAL7N5w", [0; 6]), 16);
@@ -671,7 +679,6 @@ mod tests {
             "0o3VDdtA6nM",
             "ms1xVoZ-Vwc",
             "P1CugZ99Uzc",
-            "oz6zQq1JwCE",
         ] {
             assert_eq!(dispatch(nid, [0; 6], &mut state), None);
         }

@@ -119,21 +119,115 @@ pub(super) fn scheduler_priority_bound(policy: i32, bound: i32) -> u64 {
     }
 }
 
+/// The number of logical CPUs the PS5 exposes to a game process (cores 0-7).
+const PS5_LOGICAL_CPU_COUNT: u32 = 8;
+
+/// Distributes freshly placed threads across the cores their affinity permits.
+///
+/// A round-robin seed, not a per-call value: once a thread is placed it keeps its core, so this
+/// only advances when a thread is placed for the first time or migrated after an affinity change.
+static NEXT_CORE_PLACEMENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Reports which logical CPU the calling thread is running on.
 ///
-/// Guest threads are not pinned, so the answer is derived from the affinity the thread itself
-/// asked for: the first core it allows. A thread that has never constrained its affinity reports
-/// the first core of the default set.
-pub(super) fn kernel_current_cpu(state: &ProbeDispatchState) -> u64 {
+/// REmu runs guest threads on host threads and does not pin them to emulated cores, and macOS does
+/// not expose the host core a thread is executing on. Deriving the answer from the affinity mask —
+/// as this used to — is a fabrication: the affinity mask is what a thread *permits*, not where it
+/// runs, and recomputing it every call pretends a placement that never happened.
+///
+/// Instead REmu makes a real placement decision it owns and reports consistently: the first time a
+/// thread asks, it is assigned a core round-robin among those its affinity permits, and it keeps
+/// that core on every later call. The placement is only revisited when an affinity change stops
+/// permitting the current core, which the console models as a migration. A thread whose affinity
+/// permits no core in the console's range reports core 0, the value the console returns when no
+/// affinity applies.
+pub(super) fn kernel_current_cpu(state: &mut ProbeDispatchState) -> u64 {
+    let handle = current_guest_thread_handle();
     let mask = state
         .thread_attributes
-        .get(&current_guest_thread_handle())
+        .get(&handle)
         .map_or(DEFAULT_THREAD_AFFINITY_MASK, |attributes| {
             attributes.affinity_mask
         });
-    if mask == 0 {
-        0
-    } else {
-        u64::from(mask.trailing_zeros())
+    u64::from(placed_core(state, handle, mask))
+}
+
+/// Returns the emulated core REmu is running `handle` on, placing it if it has none yet.
+fn placed_core(state: &mut ProbeDispatchState, handle: u64, affinity_mask: u64) -> u32 {
+    if let Some(&core) = state.thread_running_cpu.get(&handle) {
+        if core_is_permitted(affinity_mask, core) {
+            return core;
+        }
+    }
+    let permitted: Vec<u32> = (0..PS5_LOGICAL_CPU_COUNT)
+        .filter(|&core| core_is_permitted(affinity_mask, core))
+        .collect();
+    if permitted.is_empty() {
+        // No console core is permitted, so there is no honest placement to report or store.
+        return 0;
+    }
+    let placement = NEXT_CORE_PLACEMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let core = permitted[placement as usize % permitted.len()];
+    state.thread_running_cpu.insert(handle, core);
+    core
+}
+
+fn core_is_permitted(affinity_mask: u64, core: u32) -> bool {
+    affinity_mask & (1_u64 << core) != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THREAD: u64 = 0x4000_1000;
+
+    #[test]
+    fn a_thread_is_placed_on_a_core_its_affinity_permits() {
+        let mut state = ProbeDispatchState::default();
+        // Affinity permitting only core 3 leaves exactly one honest placement.
+        assert_eq!(placed_core(&mut state, THREAD, 1 << 3), 3);
+        assert_eq!(state.thread_running_cpu.get(&THREAD), Some(&3));
+    }
+
+    #[test]
+    fn a_placement_is_stable_across_calls_rather_than_recomputed() {
+        let mut state = ProbeDispatchState::default();
+        let first = placed_core(&mut state, THREAD, 1 << 5);
+        // Later calls report the placement REmu committed to, not a fresh derivation. The mask
+        // still permits core 5, so the same core comes back even though other threads have since
+        // advanced the round-robin seed.
+        let _ = placed_core(&mut state, THREAD + 0x100, 0x7f);
+        assert_eq!(placed_core(&mut state, THREAD, 1 << 5), first);
+        assert_eq!(first, 5);
+    }
+
+    #[test]
+    fn losing_affinity_for_the_current_core_migrates_the_thread() {
+        let mut state = ProbeDispatchState::default();
+        assert_eq!(placed_core(&mut state, THREAD, 1 << 2), 2);
+        // The thread re-pins to core 0 only, so its placement must migrate off core 2.
+        assert_eq!(placed_core(&mut state, THREAD, 1 << 0), 0);
+        assert_eq!(state.thread_running_cpu.get(&THREAD), Some(&0));
+    }
+
+    #[test]
+    fn an_affinity_permitting_no_console_core_reports_core_zero_without_a_placement() {
+        let mut state = ProbeDispatchState::default();
+        // Bits set only outside the console's eight logical CPUs: no honest placement exists.
+        assert_eq!(placed_core(&mut state, THREAD, 0xff00), 0);
+        assert_eq!(placed_core(&mut state, THREAD, 0), 0);
+        assert_eq!(state.thread_running_cpu.get(&THREAD), None);
+    }
+
+    #[test]
+    fn every_placement_falls_inside_the_default_affinity_set() {
+        let mut state = ProbeDispatchState::default();
+        // The default mask (0x7f) permits cores 0-6; round-robin placement must stay within it.
+        for index in 0..32 {
+            let core = placed_core(&mut state, THREAD + index, DEFAULT_THREAD_AFFINITY_MASK);
+            assert!(core_is_permitted(DEFAULT_THREAD_AFFINITY_MASK, core));
+            assert!(core < 7);
+        }
     }
 }

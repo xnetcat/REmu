@@ -126,8 +126,15 @@ fn dispatch_command_size(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "pbnNnahE8vk" => MARKER_HEADER_BYTES,
         // The gather and scatter reads have no builder yet, and the completion-word command does,
         // but every record is the same fixed stride, so their footprints are already settled.
+        //
+        // The wait-on-address, wait-on-counter and write-counter-on-completion size queries
+        // (`sceAmprMeasureCommandSizeWaitOnAddress`/`WaitOnCounter`/`WriteCounterOnCompletion`)
+        // report that same single-record footprint: like the reads, their builders are not yet
+        // wired (the two-phase executor models file transfers and completion writes, not counter
+        // synchronisation), but a guest sizes its buffer from the query before recording, so the
+        // footprint is a fixed fact independent of the builder. See `AMPR_COMMAND_RECORD_SIZE`.
         "rddQYXM0CjM" | "qesF88X4DRg" | "7nXGDGMXSqo" | "DXmgc5op8Yw" | "C+IEj+BsAFM"
-        | "4fgtGfXDrFc" => AMPR_COMMAND_RECORD_SIZE,
+        | "4fgtGfXDrFc" | "jIlc4p5dSD0" | "6jLL5BIZ88U" | "4muPEJ-x5N8" => AMPR_COMMAND_RECORD_SIZE,
         "Zi3dBUjgyXI" => ampr_measure_command_size(),
         _ => return None,
     })
@@ -928,6 +935,17 @@ mod tests {
         assert_eq!(fixture.call("7nXGDGMXSqo", [0; 6]), 0x30);
         assert_eq!(fixture.call("DXmgc5op8Yw", [0; 6]), 0x30);
         assert_eq!(fixture.call("Zi3dBUjgyXI", [0; 6]), 0x30);
+    }
+
+    #[test]
+    fn the_wait_and_counter_size_queries_report_one_command_record() {
+        // sceAmprMeasureCommandSizeWaitOnAddress / WaitOnCounter / WriteCounterOnCompletion.
+        // Each records as a single fixed-stride command, so its measured footprint is one record.
+        let mut fixture = Fixture::new(0x100);
+
+        assert_eq!(fixture.call("jIlc4p5dSD0", [0; 6]), 0x30);
+        assert_eq!(fixture.call("6jLL5BIZ88U", [0; 6]), 0x30);
+        assert_eq!(fixture.call("4muPEJ-x5N8", [0; 6]), 0x30);
     }
 
     #[test]
