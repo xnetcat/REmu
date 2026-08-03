@@ -34,6 +34,7 @@ mod readback;
 mod sampler;
 mod shader;
 mod shared_event;
+mod display_link;
 mod stats;
 mod submission;
 mod telemetry;
@@ -2207,6 +2208,8 @@ struct MetalPresenter {
     /// launcher exported a run directory.
     telemetry_log: Option<telemetry::TelemetryLog>,
     telemetry_log_attempted: bool,
+    /// Timebase count of the vblank that carried the most recent drawable present (plan E1).
+    last_presented_vblank: u64,
     shared_event_ack_batch_cpu: HashMap<u64, SharedEventAckBatchCpuPhases>,
     pending_shared_event_ack_traces: HashMap<u64, PendingSharedEventAckTrace>,
     shared_event_ack_traces: HashMap<usize, SharedEventAckTrace>,
@@ -2449,6 +2452,7 @@ impl MetalPresenter {
             shared_event_ack_phase_samples_remaining: 64,
             telemetry_log: None,
             telemetry_log_attempted: false,
+            last_presented_vblank: 0,
             shared_event_ack_batch_cpu: HashMap::new(),
             pending_shared_event_ack_traces: HashMap::new(),
             shared_event_ack_traces: HashMap::new(),
@@ -2575,6 +2579,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
         .build()
         .map_err(|error| format!("event loop failed: {error}"))?;
     presenter.event_loop_waker = Some(event_loop.create_proxy());
+    display_link::start_display_link(event_loop.create_proxy());
     if presenter.per_queue_guest_batches {
         eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
     }

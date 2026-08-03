@@ -12,6 +12,11 @@ pub use channel::clear_thread_local_event_sink;
 mod startup;
 pub use startup::{StartupMilestone, begin_startup_timeline, record_startup_milestone};
 
+mod display_timebase;
+pub use display_timebase::{
+    DisplayVblankSample, display_vblank_sample, monotonic_nanos, record_display_vblank,
+};
+
 mod compute;
 pub use compute::{
     COMPUTE_NUM_THREAD_X_REGISTER, COMPUTE_NUM_THREAD_Y_REGISTER, COMPUTE_NUM_THREAD_Z_REGISTER,

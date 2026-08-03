@@ -169,6 +169,19 @@ impl MetalPresenter {
         let (Some(layer), Some(queue)) = (self.layer.as_mut(), self.command_queue.as_ref()) else {
             return;
         };
+        // Present at most once per hardware vblank (plan E1). The display link's stamp wakes
+        // this loop right after every vblank, so deferring a mid-period present to the next
+        // stamp submits with a full refresh period of margin to its vsync deadline.
+        // Free-running submission is what let a hair-late present slip a whole frame and stick
+        // the entire flip pipeline at half rate. `redraw_pending` stays set, so the next stamp
+        // re-enters here; without a live link (headless, occluded) nothing is deferred.
+        let vblank_sample = remu_gpu::display_vblank_sample()
+            .filter(|sample| sample.is_live_at(remu_gpu::monotonic_nanos()));
+        if let Some(sample) = &vblank_sample
+            && sample.count == self.last_presented_vblank
+        {
+            return;
+        }
         if layer.pixel_format() != drawable_format {
             layer.set_pixel_format(drawable_format);
         }
@@ -265,6 +278,9 @@ impl MetalPresenter {
         drawable.add_presented_handler(&presented_handler);
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        if let Some(sample) = &vblank_sample {
+            self.last_presented_vblank = sample.count;
+        }
         if trace_scanout_writes() {
             eprintln!(
                 "[REMu][METAL][SCANOUT-PRESENT] outcome=committed source={presentation_source} source_size={source_dimensions:?} source_format={:?} drawable={}x{} pending={} finalized={} uploaded={} submitted_before={}",
