@@ -516,7 +516,10 @@ impl MetalPresenter {
                 eprintln!("[REMu][PERF-QUEUE-WAITS] {wait_dependencies}");
             }
             let committed_batches = self.committed_guest_batches_for_diagnostics();
-            if !committed_batches.is_empty() {
+            let batch_diag_count = u64::try_from(committed_batches.len()).unwrap_or(0);
+            let batches = if committed_batches.is_empty() {
+                String::new()
+            } else {
                 let batches = committed_batches
                     .iter()
                     .map(|(queue_id, index, batch)| {
@@ -538,7 +541,7 @@ impl MetalPresenter {
                     .join("; ");
                 eprintln!("[REMu][PERF-BATCHES] {batches}");
                 if trace_metal_command_stalls() {
-                    for (queue_id, index, batch) in committed_batches {
+                    for (queue_id, index, batch) in &committed_batches {
                         let Some(age) = batch.committed_at.map(|committed| committed.elapsed())
                         else {
                             continue;
@@ -557,15 +560,17 @@ impl MetalPresenter {
                         );
                     }
                 }
-            }
-            if !self.dropped_draw_executions.is_empty()
-                || !self.dropped_compute_executions.is_empty()
-            {
-                // Executions that failed after pipeline compilation are dropped; keep the running
-                // totals visible in every run's perf trail so a scene pass failing each frame
-                // cannot disappear behind its single once-per-key log line.
-                let dropped_draws: u64 = self.dropped_draw_executions.values().sum();
-                let dropped_dispatches: u64 = self.dropped_compute_executions.values().sum();
+                batches
+            };
+            // Executions that failed after pipeline compilation are dropped; keep the running
+            // totals visible in every run's perf trail so a scene pass failing each frame
+            // cannot disappear behind its single once-per-key log line.
+            let dropped_draws: u64 = self.dropped_draw_executions.values().sum();
+            let dropped_dispatches: u64 = self.dropped_compute_executions.values().sum();
+            let dropped_draw_keys = u64::try_from(self.dropped_draw_executions.len()).unwrap_or(0);
+            let dropped_compute_keys =
+                u64::try_from(self.dropped_compute_executions.len()).unwrap_or(0);
+            if dropped_draws != 0 || dropped_dispatches != 0 {
                 let worst_draw = self
                     .dropped_draw_executions
                     .iter()
@@ -581,9 +586,7 @@ impl MetalPresenter {
                         format!(" worst_cs={cs:#x}/{count}")
                     });
                 eprintln!(
-                    "[REMu][PERF-DROPPED] draws={dropped_draws}/{} keys compute={dropped_dispatches}/{} keys{worst_draw}{worst_dispatch}",
-                    self.dropped_draw_executions.len(),
-                    self.dropped_compute_executions.len(),
+                    "[REMu][PERF-DROPPED] draws={dropped_draws}/{dropped_draw_keys} keys compute={dropped_dispatches}/{dropped_compute_keys} keys{worst_draw}{worst_dispatch}",
                 );
             }
             {
@@ -874,6 +877,12 @@ impl MetalPresenter {
                 target_ownership.unresolved_backing_bytes as f64 / (1024.0 * 1024.0),
                 largest_targets,
             );
+            let mut metal_tgt_activity = String::new();
+            let mut metal_tgt_overlap_pairs = 0_u64;
+            let mut metal_tgt_overlap_pair_mib = 0.0_f64;
+            let mut metal_tgt_overlap_residents = 0_u64;
+            let mut metal_tgt_overlap_resident_mib = 0.0_f64;
+            let mut metal_tgt_idle = String::new();
             if resident_texture_lifetime_diagnostics_enabled() {
                 let current_work = resident_texture_activity_latest_work();
                 let current_flip = self.next_flip_sequence;
@@ -902,21 +911,26 @@ impl MetalPresenter {
                             .join(",")
                     };
                 }
-                eprintln!(
-                    "[REMu][PERF-METAL-TARGET-ACTIVITY] now=work:{current_work}/flip:{current_flip} read_work=[{}] write_work=[{}] read_flip=[{}] write_flip=[{}]",
+                metal_tgt_activity = format!(
+                    "now=work:{current_work}/flip:{current_flip} read_work=[{}] write_work=[{}] read_flip=[{}] write_flip=[{}]",
                     format_age_buckets!(RESIDENT_WORK_AGE_LABELS, activity.read_work),
                     format_age_buckets!(RESIDENT_WORK_AGE_LABELS, activity.write_work),
                     format_age_buckets!(RESIDENT_FLIP_AGE_LABELS, activity.read_flip),
                     format_age_buckets!(RESIDENT_FLIP_AGE_LABELS, activity.write_flip),
                 );
+                eprintln!("[REMu][PERF-METAL-TARGET-ACTIVITY] {metal_tgt_activity}");
 
                 let overlap = resident_texture_backing_overlap_stats(&self.resident_guest_textures);
+                metal_tgt_overlap_pairs = u64::try_from(overlap.pair_count).unwrap_or(0);
+                metal_tgt_overlap_pair_mib = overlap.pair_overlap_bytes as f64 / (1024.0 * 1024.0);
+                metal_tgt_overlap_residents = u64::try_from(overlap.resident_count).unwrap_or(0);
+                metal_tgt_overlap_resident_mib = overlap.resident_bytes as f64 / (1024.0 * 1024.0);
                 eprintln!(
                     "[REMu][PERF-METAL-TARGET-OVERLAP] pairs={}/{:.1}MiB residents={}/{:.1}MiB gpu={}/{:.1}MiB cpu={}/{:.1}MiB",
-                    overlap.pair_count,
-                    overlap.pair_overlap_bytes as f64 / (1024.0 * 1024.0),
-                    overlap.resident_count,
-                    overlap.resident_bytes as f64 / (1024.0 * 1024.0),
+                    metal_tgt_overlap_pairs,
+                    metal_tgt_overlap_pair_mib,
+                    metal_tgt_overlap_residents,
+                    metal_tgt_overlap_resident_mib,
                     overlap.gpu_owned_count,
                     overlap.gpu_owned_bytes as f64 / (1024.0 * 1024.0),
                     overlap.cpu_owned_count,
@@ -947,7 +961,7 @@ impl MetalPresenter {
                         |(work, flip)| format!("{work}@f{flip}"),
                     )
                 };
-                let oldest = oldest
+                metal_tgt_idle = oldest
                     .into_iter()
                     .take(16)
                     .map(|(last_work, last_flip, resident, activity)| {
@@ -975,7 +989,7 @@ impl MetalPresenter {
                     })
                     .collect::<Vec<_>>()
                     .join("; ");
-                eprintln!("[REMu][PERF-METAL-TARGET-IDLE] oldest=[{oldest}]");
+                eprintln!("[REMu][PERF-METAL-TARGET-IDLE] oldest=[{metal_tgt_idle}]");
             }
             eprintln!(
                 "[REMu][PERF-GLOBAL-CACHE] captured={}/{:.1}MiB identity={}/{:.1}MiB",
@@ -985,7 +999,9 @@ impl MetalPresenter {
                 self.guest_global_buffer_cache_bytes as f64 / (1024.0 * 1024.0),
             );
             let snapshot_details = take_texture_snapshot_work_details();
-            if !snapshot_details.is_empty() {
+            let snapshot_top = if snapshot_details.is_empty() {
+                String::new()
+            } else {
                 let top = snapshot_details
                     .into_iter()
                     .take(8)
@@ -1003,9 +1019,12 @@ impl MetalPresenter {
                     .collect::<Vec<_>>()
                     .join("; ");
                 eprintln!("[REMu][PERF-SNAPSHOT-TOP] {top}");
-            }
+                top
+            };
             let dirty_details = take_texture_dirty_work_details();
-            if !dirty_details.is_empty() {
+            let texture_dirty_top = if dirty_details.is_empty() {
+                String::new()
+            } else {
                 let top = dirty_details
                     .into_iter()
                     .take(8)
@@ -1031,9 +1050,12 @@ impl MetalPresenter {
                     .collect::<Vec<_>>()
                     .join("; ");
                 eprintln!("[REMu][PERF-TEXTURE-DIRTY-TOP] {top}");
-            }
+                top
+            };
             let mode27_details = take_mode27_work_details();
-            if !mode27_details.is_empty() {
+            let texture_top = if mode27_details.is_empty() {
+                String::new()
+            } else {
                 let top = mode27_details
                     .into_iter()
                     .take(8)
@@ -1055,8 +1077,9 @@ impl MetalPresenter {
                     .collect::<Vec<_>>()
                     .join("; ");
                 eprintln!("[REMu][PERF-TEXTURE-TOP] {top}");
-            }
-            // Structured record for this declared window (plan E4), assembled from the same
+                top
+            };
+            // Structured record for this declared window (plan E4 + K3), assembled from the same
             // sampled values the title and PERF lines above printed.
             if !self.telemetry_log_attempted {
                 self.telemetry_log_attempted = true;
@@ -1074,7 +1097,7 @@ impl MetalPresenter {
             let telemetry_compiled = u64::try_from(self.compiled_shader_pairs.len()).unwrap_or(0);
             let telemetry_compiling = u64::try_from(self.compiling_shader_pairs.len()).unwrap_or(0);
             if let Some(log) = self.telemetry_log.as_mut() {
-                use super::super::telemetry::TelemetryValue;
+                use super::super::telemetry::{PerfChannelSample, TelemetryValue};
                 let mean_ns = |histogram: &remu_gpu::DispatchLatencyHistogram| {
                     if histogram.count == 0 {
                         0
@@ -1088,7 +1111,7 @@ impl MetalPresenter {
                         memory.physical_footprint_bytes.div_ceil(1024 * 1024),
                     )
                 });
-                log.record(vec![
+                let mut fields = vec![
                     (
                         "window_ms",
                         TelemetryValue::from(u64::try_from(dispatch_window_ms).unwrap_or(u64::MAX)),
@@ -1180,7 +1203,199 @@ impl MetalPresenter {
                         "gpu_publication_total_ns",
                         TelemetryValue::from(dispatch.gpu_publication_wait.total_ns),
                     ),
-                ]);
+                ];
+                // Plan K3: the nineteen audit PERF channels join the same declared window.
+                fields.extend(
+                    PerfChannelSample {
+                        rp_end_compute_per_s: f64::from(
+                            self.statistics.render_pass_ends_for_compute,
+                        ) / seconds,
+                        rp_end_key_per_s: f64::from(
+                            self.statistics.render_pass_ends_for_target_change,
+                        ) / seconds,
+                        rp_end_color_op_per_s: f64::from(
+                            self.statistics.render_pass_ends_for_color_operation,
+                        ) / seconds,
+                        rp_end_flush_per_s: f64::from(
+                            self.statistics.render_pass_ends_for_batch_flush,
+                        ) / seconds,
+                        cb_flush_tick_per_s: f64::from(
+                            self.statistics.batch_flushes_from_event_loop,
+                        ) / seconds,
+                        cb_flush_memory_per_s: f64::from(
+                            self.statistics.batch_flushes_for_guest_memory_write,
+                        ) / seconds,
+                        cb_flush_wait_per_s: f64::from(
+                            self.statistics.batch_flushes_for_blocked_wait,
+                        ) / seconds,
+                        cb_flush_shared_host_per_s: f64::from(
+                            self.statistics.batch_flushes_for_shared_event_host_effect,
+                        ) / seconds,
+                        cb_flush_flip_per_s: f64::from(
+                            self.statistics.batch_flushes_for_flip_snapshot,
+                        ) / seconds,
+                        cb_flush_capacity_per_s: f64::from(
+                            self.statistics.batch_flushes_for_work_capacity,
+                        ) / seconds,
+                        cb_flush_pfp_per_s: f64::from(
+                            self.statistics.batch_flushes_for_command_processor_barrier,
+                        ) / seconds,
+                        cb_flush_sync_per_s: f64::from(
+                            self.statistics.batch_flushes_for_cpu_synchronization,
+                        ) / seconds,
+                        rp_key_target_count_per_s: f64::from(transitions.target_count) / seconds,
+                        rp_key_target_addr_per_s: f64::from(transitions.target_address) / seconds,
+                        rp_key_depth_presence_per_s: f64::from(transitions.depth_presence)
+                            / seconds,
+                        rp_key_depth_addr_per_s: f64::from(transitions.depth_address) / seconds,
+                        pipeline_ready_graphics: u64::try_from(self.compiled_shader_pairs.len())
+                            .unwrap_or(0),
+                        pipeline_ready_compute: u64::try_from(
+                            self.compiled_compute_pipelines.len(),
+                        )
+                        .unwrap_or(0),
+                        pipeline_active_graphics: u64::try_from(
+                            self.compiling_shader_pairs.len(),
+                        )
+                        .unwrap_or(0),
+                        pipeline_active_compute: u64::try_from(
+                            self.compiling_compute_pipelines.len(),
+                        )
+                        .unwrap_or(0),
+                        pipeline_failed_graphics: u64::try_from(self.failed_shader_pairs.len())
+                            .unwrap_or(0),
+                        pipeline_failed_compute: u64::try_from(
+                            self.failed_compute_pipelines.len(),
+                        )
+                        .unwrap_or(0),
+                        pipeline_enqueued: compile_enqueued,
+                        pipeline_queue_full: compile_queue_full,
+                        pipeline_completed: compile_completed,
+                        pipeline_failed_interval: compile_failed,
+                        pipeline_draw_gates: draw_gates,
+                        pipeline_compute_gates: compute_gates,
+                        pipeline_blocks: u64::try_from(pipeline_blocks).unwrap_or(0),
+                        pipeline_memory_blocks: u64::try_from(memory_blocks).unwrap_or(0),
+                        pipeline_flip_blocks: u64::try_from(flip_blocks).unwrap_or(0),
+                        queues: queue_diagnostics,
+                        queue_waits: wait_dependencies,
+                        batches,
+                        batch_diag_count,
+                        dropped_draws,
+                        dropped_draw_keys,
+                        dropped_compute: dropped_dispatches,
+                        dropped_compute_keys,
+                        texture_snapshot_count: snapshot_count,
+                        texture_snapshot_mib: snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        texture_snapshot_ms: snapshot_nanoseconds as f64 / 1_000_000.0,
+                        texture_snapshot_unstable: snapshot_unstable,
+                        texture_dirty_count: dirty_validation_count,
+                        texture_dirty_mib: dirty_validation_bytes as f64 / (1024.0 * 1024.0),
+                        texture_dirty_ms: dirty_validation_nanoseconds as f64 / 1_000_000.0,
+                        texture_dirty_clean: dirty_validation_unchanged,
+                        texture_mode27_count: decode_count,
+                        texture_mode27_mib: decode_bytes as f64 / (1024.0 * 1024.0),
+                        texture_mode27_ms: decode_nanoseconds as f64 / 1_000_000.0,
+                        texture_upload_count: upload_count,
+                        texture_upload_mib: upload_bytes as f64 / (1024.0 * 1024.0),
+                        texture_upload_ms: upload_nanoseconds as f64 / 1_000_000.0,
+                        texcache_resident_count: telemetry_textures,
+                        texcache_resident_mib: sampled_texture_cache_mib,
+                        texcache_guest_mib: sampled_texture_cache_guest_mib,
+                        texcache_metal_allocated_mib: metal_allocated_mib,
+                        texcache_metal_recommended_mib: metal_recommended_mib,
+                        texcache_watches: u64::try_from(self.sampled_texture_write_watches.len())
+                            .unwrap_or(0),
+                        texcache_hits: cache_hits,
+                        texcache_misses: cache_misses,
+                        texcache_dirty_reloads: cache_dirty_reloads,
+                        texcache_acquire_invalidate: cache_acquire_invalidations,
+                        texcache_resident_acquire_invalidate: resident_acquire_invalidations,
+                        texcache_capacity_evict: cache_capacity_evictions,
+                        texcache_depth_native: depth_resident_hits,
+                        texcache_alias_writeback_count: alias_writeback_count,
+                        texcache_alias_writeback_mib: alias_writeback_bytes as f64
+                            / (1024.0 * 1024.0),
+                        texcache_alias_writeback_ms: alias_writeback_nanoseconds as f64
+                            / 1_000_000.0,
+                        texcache_write_attribution_miss: write_attribution_misses,
+                        metal_res_sampled_count: telemetry_textures,
+                        metal_res_sampled_mib: sampled_texture_cache_resident_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_res_targets_count: u64::try_from(
+                            self.resident_guest_textures.len(),
+                        )
+                        .unwrap_or(0),
+                        metal_res_targets_mib: resident_target_bytes as f64 / (1024.0 * 1024.0),
+                        metal_res_depth_arrays_count: u64::try_from(
+                            self.depth_array_textures.len(),
+                        )
+                        .unwrap_or(0),
+                        metal_res_depth_arrays_mib: depth_array_bytes as f64 / (1024.0 * 1024.0),
+                        metal_res_direct_scanout_count: u64::try_from(
+                            self.direct_scanout_textures.len(),
+                        )
+                        .unwrap_or(0),
+                        metal_res_direct_scanout_mib: direct_scanout_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_res_scanout_snapshots_count: u64::try_from(
+                            self.scanout_snapshot_textures.len(),
+                        )
+                        .unwrap_or(0),
+                        metal_res_scanout_snapshots_mib: scanout_snapshot_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_res_msaa_count: u64::try_from(self.multisample_textures.len())
+                            .unwrap_or(0),
+                        metal_res_msaa_mib: multisample_bytes as f64 / (1024.0 * 1024.0),
+                        metal_res_fallback_count: u64::try_from(self.fallback_texture_cache.len())
+                            .unwrap_or(0),
+                        metal_res_fallback_mib: fallback_bytes as f64 / (1024.0 * 1024.0),
+                        metal_res_accounted_mib: accounted_texture_bytes as f64 / (1024.0 * 1024.0),
+                        metal_res_other_mib: unaccounted_metal_bytes as f64 / (1024.0 * 1024.0),
+                        metal_tgt_gpu_owned_count: u64::try_from(target_ownership.gpu_owned_count)
+                            .unwrap_or(0),
+                        metal_tgt_gpu_owned_mib: target_ownership.gpu_owned_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_tgt_cpu_owned_count: u64::try_from(target_ownership.cpu_owned_count)
+                            .unwrap_or(0),
+                        metal_tgt_cpu_owned_mib: target_ownership.cpu_owned_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_tgt_active_mapping_count: u64::try_from(
+                            target_ownership.active_mapping_count,
+                        )
+                        .unwrap_or(0),
+                        metal_tgt_active_mapping_mib: target_ownership.active_mapping_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_tgt_unresolved_count: u64::try_from(
+                            target_ownership.unresolved_backing_count,
+                        )
+                        .unwrap_or(0),
+                        metal_tgt_unresolved_mib: target_ownership.unresolved_backing_bytes as f64
+                            / (1024.0 * 1024.0),
+                        metal_tgt_top: largest_targets,
+                        metal_tgt_activity,
+                        metal_tgt_overlap_pairs,
+                        metal_tgt_overlap_pair_mib,
+                        metal_tgt_overlap_residents,
+                        metal_tgt_overlap_resident_mib,
+                        metal_tgt_idle,
+                        global_cache_captured_count: u64::try_from(self.global_buffer_cache.len())
+                            .unwrap_or(0),
+                        global_cache_captured_mib: self.global_buffer_cache_bytes as f64
+                            / (1024.0 * 1024.0),
+                        global_cache_identity_count: u64::try_from(
+                            self.guest_global_buffer_cache.len(),
+                        )
+                        .unwrap_or(0),
+                        global_cache_identity_mib: self.guest_global_buffer_cache_bytes as f64
+                            / (1024.0 * 1024.0),
+                        snapshot_top,
+                        texture_dirty_top,
+                        texture_top,
+                    }
+                    .into_fields(),
+                );
+                log.record(fields);
             }
             self.statistics.last_logged = Instant::now();
         }
