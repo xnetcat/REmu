@@ -3272,6 +3272,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             | "b+uAV89IlxE"
             | "QOQtbeDqsT4"
             | "GrQ9s4IrNaQ"
+            | "Ptlts326pds"
             | "g2tViFIohHE"
             | "R7d0F1g2qsU"
             | "gatEUKG+Ea4"
@@ -3626,6 +3627,9 @@ fn dispatch_audio_out_import(nid: &str, arguments: [u64; 6]) -> u64 {
             .map_or_else(audio_out_error, |()| 0),
         "GrQ9s4IrNaQ" => state
             .get_port_state(arguments)
+            .map_or_else(audio_out_error, |()| 0),
+        "Ptlts326pds" => state
+            .get_last_output_time(arguments)
             .map_or_else(audio_out_error, |()| 0),
         "QOQtbeDqsT4" => {
             let output = state.output(arguments);

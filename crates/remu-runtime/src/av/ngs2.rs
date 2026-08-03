@@ -292,6 +292,15 @@ pub(super) fn ngs2_system_render(arguments: [u64; 6]) -> u64 {
         if buffer == 0 || bytes == 0 {
             return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
         }
+        let Ok(byte_len) = usize::try_from(bytes) else {
+            return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
+        };
+        if !process_guest_range_is_readable(buffer, byte_len) {
+            eprintln!(
+                "[REMu][NGS2] sceNgs2SystemRender rejected unreadable buffer at {buffer:#x} bytes={bytes}"
+            );
+            return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
+        }
         guest_memset(buffer, 0, bytes);
     }
     0

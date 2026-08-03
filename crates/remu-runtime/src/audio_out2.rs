@@ -344,6 +344,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                     grain_frames,
                     queued: 0,
                     last_queue_update: Instant::now(),
+                    last_device_frames: crate::audio::device_clock_frames().unwrap_or(0),
                     memory_address: arguments[1],
                     memory_size: arguments[2],
                 },

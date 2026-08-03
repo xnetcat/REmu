@@ -483,6 +483,7 @@ fn audio_out2_queue_preserves_short_lateness_as_catch_up_credit() {
         grain_frames: AUDIO_OUT2_DEFAULT_GRAIN_FRAMES,
         queued: 1,
         last_queue_update: now - grain_duration - grain_duration / 2,
+        last_device_frames: 0,
         memory_address: 0,
         memory_size: 0,
     };
@@ -508,6 +509,7 @@ fn audio_out2_queue_reanchors_after_a_real_idle_period() {
             - grain_duration
                 .checked_mul(AUDIO_OUT2_DEFAULT_QUEUE_DEPTH + 1)
                 .unwrap_or(Duration::MAX),
+        last_device_frames: 0,
         memory_address: 0,
         memory_size: 0,
     };

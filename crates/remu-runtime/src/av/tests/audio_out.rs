@@ -52,6 +52,20 @@ fn a_pad_speaker_mix_level_outside_its_range_is_rejected_before_the_port_is_look
 }
 
 #[test]
+fn a_synchronized_output_rejects_an_unreadable_pcm_buffer_without_faulting() {
+    // Port lookup fails first when no ports are open; the INVALID_POINTER path for a mapped
+    // param block whose PCM pointer is unreadable is covered by audio::output tests. Here the
+    // param-array bounds stay the gate before any buffer deref.
+    let mut entries = [0_u8; 16];
+    entries[..4].copy_from_slice(&1_u32.to_le_bytes());
+    entries[8..16].copy_from_slice(&0x10_u64.to_le_bytes());
+    assert_eq!(
+        audio_out_outputs(args(&[address(&entries), 1])),
+        audio_out_error(audio::AudioOutError::InvalidPort)
+    );
+}
+
+#[test]
 fn a_nid_no_module_here_owns_is_left_for_the_next_dispatcher() {
     let mut state = open_display();
     assert_eq!(dispatch("AAAAAAAAAAA", args(&[0]), &mut state), None);

@@ -42,6 +42,8 @@ pub(crate) struct AudioOut2ContextState {
     pub(crate) grain_frames: u32,
     pub(crate) queued: u32,
     pub(crate) last_queue_update: Instant,
+    /// Device-consumed frames observed at the last queue drain (plan I3).
+    pub(crate) last_device_frames: u64,
     pub(crate) memory_address: u64,
     pub(crate) memory_size: u64,
 }
@@ -223,6 +225,45 @@ pub(crate) fn audio_out2_grain_duration(grain_frames: u32) -> Duration {
 }
 
 pub(crate) fn audio_out2_update_context_queue(context: &mut AudioOut2ContextState, now: Instant) {
+    if let Some(device_frames) = crate::audio::device_clock_frames() {
+        audio_out2_update_context_queue_from_device(context, device_frames);
+        return;
+    }
+    audio_out2_update_context_queue_from_instant(context, now);
+}
+
+fn audio_out2_update_context_queue_from_device(
+    context: &mut AudioOut2ContextState,
+    device_frames: u64,
+) {
+    let grain = u64::from(context.grain_frames.max(1));
+    if context.queued == 0 {
+        // Preserve short producer lateness as catch-up credit against the device clock. A
+        // genuinely stopped stream re-anchors after one complete queue depth of idle device time.
+        let idle_limit = grain.saturating_mul(u64::from(context.queue_depth.max(1)));
+        if device_frames.saturating_sub(context.last_device_frames) > idle_limit {
+            context.last_device_frames = device_frames;
+        }
+        return;
+    }
+    let elapsed = device_frames.saturating_sub(context.last_device_frames);
+    let drained = (elapsed / grain).min(u64::from(context.queued));
+    let drained = u32::try_from(drained)
+        .unwrap_or(context.queued)
+        .min(context.queued);
+    if drained == 0 {
+        return;
+    }
+    context.queued -= drained;
+    context.last_device_frames = context
+        .last_device_frames
+        .saturating_add(u64::from(drained).saturating_mul(grain));
+}
+
+fn audio_out2_update_context_queue_from_instant(
+    context: &mut AudioOut2ContextState,
+    now: Instant,
+) {
     let grain_duration = audio_out2_grain_duration(context.grain_frames);
     if context.queued == 0 {
         // Preserve a short amount of producer lateness as catch-up credit. Re-anchoring every

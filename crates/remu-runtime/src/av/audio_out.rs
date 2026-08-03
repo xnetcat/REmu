@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::{
-    AUDIO_OUT, audio, audio_out_error, low_i32, process_guest_range_is_readable, read_guest_u32,
-    read_guest_u64, sce_kernel_error,
+    AUDIO_OUT, audio, audio_out_error, low_i32, process_guest_range_has_read_access,
+    process_guest_range_is_readable, read_guest_u32, read_guest_u64, sce_kernel_error,
 };
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -14,8 +14,6 @@ pub(super) const AUDIO_OUT_OUTPUTS_MAX: u64 = 8;
 /// Bytes one `SceAudioOutOutputParam` occupies, and the offset of its buffer pointer.
 pub(super) const AUDIO_OUT_OUTPUT_PARAM_SIZE: u64 = 16;
 pub(super) const AUDIO_OUT_OUTPUT_PARAM_BUFFER_OFFSET: u64 = 8;
-/// Bytes one `SceAudioOutPortState` occupies.
-pub(super) const AUDIO_OUT_PORT_STATE_SIZE: usize = 16;
 /// Error reported for a port count outside the range a synchronized output accepts.
 pub(super) const AUDIO_OUT_ERROR_INVALID_ARG: u32 = 0x8026_0015;
 /// Error reported for a mix level outside the range the pad speaker accepts.
@@ -35,14 +33,8 @@ pub(super) fn audio_out_state() -> std::sync::MutexGuard<'static, audio::AudioOu
 }
 
 /// Reports whether a port handle names an open port.
-///
-/// The mixer owns its port table privately, so the port-state query is what answers this.
 pub(super) fn audio_out_port_is_open(state: &audio::AudioOutState, handle: i32) -> bool {
-    let mut probe = [0_u8; AUDIO_OUT_PORT_STATE_SIZE];
-    let address = probe.as_mut_ptr() as u64;
-    state
-        .get_port_state([u64::from(handle.cast_unsigned()), address, 0, 0, 0, 0])
-        .is_ok()
+    state.contains_port(handle)
 }
 
 /// Outputs one configured buffer on each of several ports at once.
@@ -76,6 +68,22 @@ pub(crate) fn audio_out_outputs(arguments: [u64; 6]) -> u64 {
         .all(|&(handle, _)| audio_out_port_is_open(&state, handle))
     {
         return audio_out_error(audio::AudioOutError::InvalidPort);
+    }
+    // Validate every per-entry PCM pointer before touching a port (plan I2). A decommitted buffer
+    // must yield INVALID_POINTER rather than SIGSEGV inside the single-port path.
+    for &(handle, buffer) in &entries {
+        if buffer == 0 {
+            continue;
+        }
+        let Some(port_frames_format) = state.port_buffer_bytes(handle) else {
+            return audio_out_error(audio::AudioOutError::InvalidPort);
+        };
+        if !process_guest_range_has_read_access(buffer, port_frames_format) {
+            eprintln!(
+                "[REMu][AUDIO] sceAudioOutOutputs rejected unreadable PCM at {buffer:#x} for port {handle}"
+            );
+            return audio_out_error(audio::AudioOutError::InvalidPointer);
+        }
     }
     let mut delay = Duration::ZERO;
     for (handle, buffer) in entries {
