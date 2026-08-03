@@ -28,6 +28,8 @@ pub(crate) fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x0e => Some("DsWrite2B32"),
         0x0f => Some("DsWrite2St64B32"),
         0x10 => Some("DsCmpstB32"),
+        0x1e => Some("DsWriteB8"),
+        0x1f => Some("DsWriteB16"),
         0x20 => Some("DsAddRtnU32"),
         0x21 => Some("DsSubRtnU32"),
         0x23 => Some("DsIncRtnU32"),
@@ -45,6 +47,10 @@ pub(crate) fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x36 => Some("DsReadB32"),
         0x37 => Some("DsRead2B32"),
         0x38 => Some("DsRead2St64B32"),
+        0x39 => Some("DsReadI8"),
+        0x3a => Some("DsReadU8"),
+        0x3b => Some("DsReadI16"),
+        0x3c => Some("DsReadU16"),
         0x4d => Some("DsWriteB64"),
         // The 64-bit DS block mirrors the 32-bit block at +0x40 (0x0d/0x4d writes, 0x36/0x76
         // reads). Poppy Playtime's glyph-prep compute reads LDS pairs through 0x76.
@@ -208,6 +214,15 @@ fn flat_memory_op_name(code: u32, prefix: &str, allow_atomic: bool) -> Option<&'
         0x0d => seg!("FlatLoadDwordx2", "ScratchLoadDwordx2", "GlobalLoadDwordx2"),
         0x0e => seg!("FlatLoadDwordx4", "ScratchLoadDwordx4", "GlobalLoadDwordx4"),
         0x0f => seg!("FlatLoadDwordx3", "ScratchLoadDwordx3", "GlobalLoadDwordx3"),
+        // ADDTID addressing is GLOBAL-only: the address is SADDR + offset + tid*4, no VADDR.
+        0x16 => match prefix {
+            "Global" => Some("GlobalLoadDwordAddtid"),
+            _ => None,
+        },
+        0x17 => match prefix {
+            "Global" => Some("GlobalStoreDwordAddtid"),
+            _ => None,
+        },
         0x18 => seg!("FlatStoreByte", "ScratchStoreByte", "GlobalStoreByte"),
         0x19 => seg!(
             "FlatStoreByteD16Hi",
@@ -279,6 +294,32 @@ fn flat_memory_op_name(code: u32, prefix: &str, allow_atomic: bool) -> Option<&'
         0x3b if allow_atomic => seg!("FlatAtomicXor", "", "GlobalAtomicXor"),
         0x3c if allow_atomic => seg!("FlatAtomicInc", "", "GlobalAtomicInc"),
         0x3d if allow_atomic => seg!("FlatAtomicDec", "", "GlobalAtomicDec"),
+        // GLOBAL_ATOMIC_CSUB is the one GLOBAL-only atomic (clamped subtract).
+        0x34 if allow_atomic => match prefix {
+            "Global" => Some("GlobalAtomicCsub"),
+            _ => None,
+        },
+        0x3e if allow_atomic => seg!("FlatAtomicFcmpswap", "", "GlobalAtomicFcmpswap"),
+        0x3f if allow_atomic => seg!("FlatAtomicFmin", "", "GlobalAtomicFmin"),
+        0x40 if allow_atomic => seg!("FlatAtomicFmax", "", "GlobalAtomicFmax"),
+        // The 64-bit atomics mirror the 32-bit block at +0x20 (RDNA2 FLAT ISA); their data and
+        // returned values are VGPR pairs, and the compare-swaps carry two pairs.
+        0x50 if allow_atomic => seg!("FlatAtomicSwapX2", "", "GlobalAtomicSwapX2"),
+        0x51 if allow_atomic => seg!("FlatAtomicCmpswapX2", "", "GlobalAtomicCmpswapX2"),
+        0x52 if allow_atomic => seg!("FlatAtomicAddX2", "", "GlobalAtomicAddX2"),
+        0x53 if allow_atomic => seg!("FlatAtomicSubX2", "", "GlobalAtomicSubX2"),
+        0x55 if allow_atomic => seg!("FlatAtomicSminX2", "", "GlobalAtomicSminX2"),
+        0x56 if allow_atomic => seg!("FlatAtomicUminX2", "", "GlobalAtomicUminX2"),
+        0x57 if allow_atomic => seg!("FlatAtomicSmaxX2", "", "GlobalAtomicSmaxX2"),
+        0x58 if allow_atomic => seg!("FlatAtomicUmaxX2", "", "GlobalAtomicUmaxX2"),
+        0x59 if allow_atomic => seg!("FlatAtomicAndX2", "", "GlobalAtomicAndX2"),
+        0x5a if allow_atomic => seg!("FlatAtomicOrX2", "", "GlobalAtomicOrX2"),
+        0x5b if allow_atomic => seg!("FlatAtomicXorX2", "", "GlobalAtomicXorX2"),
+        0x5c if allow_atomic => seg!("FlatAtomicIncX2", "", "GlobalAtomicIncX2"),
+        0x5d if allow_atomic => seg!("FlatAtomicDecX2", "", "GlobalAtomicDecX2"),
+        0x5e if allow_atomic => seg!("FlatAtomicFcmpswapX2", "", "GlobalAtomicFcmpswapX2"),
+        0x5f if allow_atomic => seg!("FlatAtomicFminX2", "", "GlobalAtomicFminX2"),
+        0x60 if allow_atomic => seg!("FlatAtomicFmaxX2", "", "GlobalAtomicFmaxX2"),
         _ => None,
     }
 }
@@ -407,7 +448,7 @@ pub(crate) fn decode_data_share(
         sources.push(Operand::vector(vector_data0));
     } else if opcode.is("DsReadAddtidB32") {
         sources.clear();
-    } else if opcode.is("DsWriteB32") {
+    } else if opcode.is("DsWriteB32") || opcode.is("DsWriteB8") || opcode.is("DsWriteB16") {
         sources.push(Operand::vector(vector_data0));
     } else if opcode.is("DsWriteB64") {
         push_vector_range(sources, vector_data0, 2);
@@ -426,7 +467,14 @@ pub(crate) fn decode_data_share(
         sources.push(Operand::vector(vector_data0));
     }
 
-    if opcode.is("DsReadB32") || opcode.is("DsReadAddtidB32") || opcode.is("DsSwizzleB32") {
+    if opcode.is("DsReadB32")
+        || opcode.is("DsReadAddtidB32")
+        || opcode.is("DsSwizzleB32")
+        || opcode.is("DsReadI8")
+        || opcode.is("DsReadU8")
+        || opcode.is("DsReadI16")
+        || opcode.is("DsReadU16")
+    {
         destinations.push(Operand::vector(vector_destination));
     } else if opcode.is("DsRead2B32") || opcode.is("DsRead2St64B32") || opcode.is("DsReadB64") {
         push_vector_range(destinations, vector_destination, 2);
@@ -458,10 +506,20 @@ pub(crate) fn decode_global_memory(
         (is_global && scalar_address_field != 0x7f).then_some(scalar_address_field);
     let vector_destination = extra >> 24;
     let dword_count = memory_dword_count(opcode);
-    sources.push(Operand::vector(vector_address));
+    let scratch = opcode.starts_with("Scratch");
+    let addtid = opcode.contains("Addtid");
+    // ADDTID addressing carries no VADDR at all, and SCRATCH addresses are a single 32-bit
+    // offset (VADDR or the scalar offset register, never a pair). Only GLOBAL/FLAT with a null
+    // SADDR consume a 64-bit VADDR pair.
+    if !addtid && (!scratch || scalar_address.is_none()) {
+        sources.push(Operand::vector(vector_address));
+    }
     if let Some(scalar_address) = scalar_address {
         sources.push(Operand::scalar(scalar_address));
-    } else {
+    } else if scratch && scalar_address_field != 0x7f {
+        // The SCRATCH offset register is read but is not a guest pointer.
+        sources.push(Operand::scalar(scalar_address_field));
+    } else if !scratch && !addtid {
         sources.push(Operand::vector(vector_address.saturating_add(1)));
     }
     // Direct-to-LDS is a GLOBAL-only modifier; the same bit position is SVE (scratch VGPR enable)
@@ -474,7 +532,14 @@ pub(crate) fn decode_global_memory(
     } else {
         push_vector_range(sources, vector_data, dword_count);
         if opcode.contains("Atomic") && word >> 16 & 1 != 0 {
-            destinations.push(Operand::vector(vector_destination));
+            // The returned pre-op value is one register narrower for compare-swaps, whose data
+            // operand carries both the source and the comparand.
+            let returned = if opcode.contains("Cmpswap") || opcode.contains("Fcmpswap") {
+                dword_count / 2
+            } else {
+                dword_count
+            };
+            push_vector_range(destinations, vector_destination, returned);
         }
     }
     InstructionControl::GlobalMemory(GlobalMemoryControl {
@@ -613,11 +678,18 @@ pub(crate) fn memory_dword_count(opcode: Opcode) -> u32 {
         } else {
             1
         }
+    } else if name.ends_with("CmpswapX2") || name.ends_with("FcmpswapX2") {
+        4
     } else if name.ends_with("Xyzw") || name.ends_with("Dwordx4") {
         4
     } else if name.ends_with("Xyz") || name.ends_with("Dwordx3") {
         3
-    } else if name.ends_with("Xy") || name.ends_with("Dwordx2") || name.ends_with("Cmpswap") {
+    } else if name.ends_with("Xy")
+        || name.ends_with("Dwordx2")
+        || name.ends_with("Cmpswap")
+        || name.ends_with("Fcmpswap")
+        || name.ends_with("X2")
+    {
         2
     } else {
         1

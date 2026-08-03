@@ -730,3 +730,66 @@ fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
         "S_SETREG must not clobber its data-source SGPR"
     );
 }
+
+#[test]
+fn the_extended_global_atomics_bind_writable_guest_memory() {
+    let base = 0x9000_u64;
+    for opcode in [
+        "GlobalAtomicUminX2",
+        "GlobalAtomicFmax",
+        "GlobalAtomicCmpswapX2",
+        "GlobalAtomicCsub",
+    ] {
+        let mut memory = TestMemory::default();
+        memory.write(base, &[0xab; 64]);
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Flat,
+                    opcode,
+                    Vec::new(),
+                    Vec::new(),
+                    Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: if opcode.ends_with("CmpswapX2") {
+                            4
+                        } else if opcode.ends_with("X2") {
+                            2
+                        } else {
+                            1
+                        },
+                        vector_address: 0,
+                        vector_data: 0,
+                        vector_destination: 0,
+                        scalar_address: Some(4),
+                        offset_bytes: 0,
+                        dlc: false,
+                        lds: false,
+                        glc: true,
+                        slc: false,
+                    })),
+                ),
+                end(8),
+            ],
+            {
+                let mut user_data = vec![0; 6];
+                user_data[4] = u32::try_from(base).unwrap();
+                user_data
+            },
+        );
+
+        let evaluation = evaluate_shader(
+            &memory,
+            &shader,
+            EvaluationOptions {
+                maximum_binding_bytes: 64,
+                ..EvaluationOptions::default()
+            },
+        )
+        .unwrap_or_else(|error| panic!("{opcode} evaluation: {error}"));
+        assert_eq!(evaluation.global_memory_bindings.len(), 1, "{opcode}");
+        let binding = &evaluation.global_memory_bindings[0];
+        assert_eq!(binding.base_address, base, "{opcode}");
+        assert!(binding.writable, "{opcode} must bind writable memory");
+    }
+}

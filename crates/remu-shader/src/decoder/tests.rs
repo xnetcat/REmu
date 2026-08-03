@@ -1483,3 +1483,145 @@ fn decodes_s_call_and_scans_past_endpgm_to_its_forward_subroutine() {
     assert_eq!(program.instructions[0].destinations, [Operand::scalar(10)]);
     assert!(program.instructions[2].opcode.is("SMovkI32"));
 }
+
+#[test]
+fn decodes_the_complete_global_atomic_set_with_return_shapes() {
+    let atomics: &[(u32, &str, u32, u32)] = &[
+        // (code, name, data dwords, returned dwords with GLC)
+        (0x30, "GlobalAtomicSwap", 1, 1),
+        (0x31, "GlobalAtomicCmpswap", 2, 1),
+        (0x34, "GlobalAtomicCsub", 1, 1),
+        (0x3e, "GlobalAtomicFcmpswap", 2, 1),
+        (0x3f, "GlobalAtomicFmin", 1, 1),
+        (0x40, "GlobalAtomicFmax", 1, 1),
+        (0x50, "GlobalAtomicSwapX2", 2, 2),
+        (0x51, "GlobalAtomicCmpswapX2", 4, 2),
+        (0x52, "GlobalAtomicAddX2", 2, 2),
+        (0x53, "GlobalAtomicSubX2", 2, 2),
+        (0x55, "GlobalAtomicSminX2", 2, 2),
+        (0x56, "GlobalAtomicUminX2", 2, 2),
+        (0x57, "GlobalAtomicSmaxX2", 2, 2),
+        (0x58, "GlobalAtomicUmaxX2", 2, 2),
+        (0x59, "GlobalAtomicAndX2", 2, 2),
+        (0x5a, "GlobalAtomicOrX2", 2, 2),
+        (0x5b, "GlobalAtomicXorX2", 2, 2),
+        (0x5c, "GlobalAtomicIncX2", 2, 2),
+        (0x5d, "GlobalAtomicDecX2", 2, 2),
+        (0x5e, "GlobalAtomicFcmpswapX2", 4, 2),
+        (0x5f, "GlobalAtomicFminX2", 2, 2),
+        (0x60, "GlobalAtomicFmaxX2", 2, 2),
+    ];
+    for &(code, name, data_dwords, returned_dwords) in atomics {
+        let word = flat_word(code, 2) | (1 << 16); // GLC returns the pre-op value
+        let extra = 2 | (4 << 8) | (0x7f << 16) | (8 << 24); // vaddr=2 vdata=4 saddr=null vdst=8
+        let frame = decode_frame(0, &[word, extra]).expect("GLOBAL atomic frame");
+        let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+        // vaddr pair (null SADDR) then the data registers.
+        let data_sources = &instruction.sources[2..];
+        assert_eq!(
+            data_sources.len() as u32,
+            data_dwords,
+            "{name} data register count"
+        );
+        assert_eq!(
+            instruction.destinations.len() as u32,
+            returned_dwords,
+            "{name} GLC return register count"
+        );
+        assert_eq!(instruction.destinations[0], Operand::vector(8));
+    }
+    // CSUB is GLOBAL-only; a SCRATCH or FLAT encoding of it stays a loud unknown.
+    for segment in [0_u32, 1] {
+        assert!(matches!(
+            decode_frame(0, &[flat_word(0x34, segment), 0]),
+            Err(DecodeError::UnknownOpcode { .. })
+        ));
+    }
+}
+
+#[test]
+fn decodes_scratch_memory_without_treating_offsets_as_guest_pointers() {
+    // SCRATCH with SADDR: the scalar register is a private-space offset and VADDR is disabled.
+    let word = flat_word(0x0c, 1); // scratch_load_dword
+    let extra = (5 << 16) | (7 << 24); // saddr=5, vdst=7
+    let frame = decode_frame(0, &[word, extra]).expect("SCRATCH load frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert!(instruction.opcode.is("ScratchLoadDword"));
+    assert_eq!(instruction.sources, [Operand::scalar(5)]);
+    assert_eq!(instruction.destinations, [Operand::vector(7)]);
+    assert!(matches!(
+        instruction.control,
+        Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+            scalar_address: None,
+            ..
+        }))
+    ));
+
+    // Without SADDR the 32-bit VADDR is the only address register: no phantom vaddr+1 pair.
+    let word = flat_word(0x1a, 1); // scratch_store_short
+    let extra = 3 | (9 << 8) | (0x7f << 16);
+    let frame = decode_frame(0, &[word, extra]).expect("SCRATCH store frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert!(instruction.opcode.is("ScratchStoreShort"));
+    assert_eq!(
+        instruction.sources,
+        [Operand::vector(3), Operand::vector(9)]
+    );
+    assert!(instruction.destinations.is_empty());
+}
+
+#[test]
+fn decodes_global_addtid_operations_without_a_vaddr() {
+    // ADDTID addressing has no VADDR at all; the address is SADDR + offset + tid*4.
+    let word = flat_word(0x16, 2); // global_load_dword_addtid
+    let extra = (6 << 16) | (11 << 24);
+    let frame = decode_frame(0, &[word, extra]).expect("ADDTID frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert!(instruction.opcode.is("GlobalLoadDwordAddtid"));
+    assert_eq!(instruction.sources, [Operand::scalar(6)]);
+    assert_eq!(instruction.destinations, [Operand::vector(11)]);
+
+    // ADDTID is GLOBAL-only.
+    for segment in [0_u32, 1] {
+        assert!(matches!(
+            decode_frame(0, &[flat_word(0x16, segment), 0]),
+            Err(DecodeError::UnknownOpcode { .. })
+        ));
+    }
+}
+
+#[test]
+fn decodes_lds_byte_and_short_transfers() {
+    // DS word: 0xd800_0000 | code<<18; extra: addr | data0<<8 | vdst<<24.
+    let cases: &[(u32, &str, usize, usize)] = &[
+        // (code, name, source count, destination count)
+        (0x1e, "DsWriteB8", 2, 0),
+        (0x1f, "DsWriteB16", 2, 0),
+        (0x39, "DsReadI8", 1, 1),
+        (0x3a, "DsReadU8", 1, 1),
+        (0x3b, "DsReadI16", 1, 1),
+        (0x3c, "DsReadU16", 1, 1),
+    ];
+    for &(code, name, source_count, destination_count) in cases {
+        let word = 0xd800_0000 | (code << 18);
+        let extra = 1 | (2 << 8) | (5 << 24);
+        let frame = decode_frame(0, &[word, extra]).expect("DS byte/short frame");
+        let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+        assert_eq!(instruction.sources.len(), source_count, "{name} sources");
+        assert_eq!(
+            instruction.destinations.len(),
+            destination_count,
+            "{name} destinations"
+        );
+    }
+}
