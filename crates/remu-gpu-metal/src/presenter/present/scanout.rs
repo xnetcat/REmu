@@ -15,9 +15,8 @@ use metal::{
     MTLTextureType, MTLTextureUsage, Texture, TextureDescriptor,
 };
 use remu_gpu::GpuHostImage;
-use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 impl MetalPresenter {
     fn matches_registered_video_out_scanout(&self, descriptor: GuestTextureDescriptor) -> bool {
@@ -878,14 +877,10 @@ impl MetalPresenter {
                 self.submitted_flip_sequence,
             );
         }
-        static LOGGED_TRANSLATED_SCANOUTS: OnceLock<Mutex<HashSet<(u64, &'static str)>>> =
-            OnceLock::new();
-        let first_for_source = LOGGED_TRANSLATED_SCANOUTS
-            .get_or_init(|| Mutex::new(HashSet::new()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert((address, source));
-        if first_for_source {
+        // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup on the
+        // per-present scanout snapshot path).
+        static LOGGED_TRANSLATED_SCANOUTS: AtomicUsize = AtomicUsize::new(0);
+        if LOGGED_TRANSLATED_SCANOUTS.fetch_add(1, Ordering::Relaxed) < 64 {
             eprintln!(
                 "[REMu][METAL] snapshotted translated {source} scanout sequence={} at {address:#x} {}x{} format={:?} tile={}",
                 sequence,

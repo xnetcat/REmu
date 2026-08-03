@@ -5780,6 +5780,71 @@ fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
 }
 
 #[test]
+fn same_queue_wait_reg_mem_elides_the_redundant_self_event() {
+    // A3: a RELEASE_MEM producer and its WAIT_REG_MEM consumer on the SAME guest queue.
+    // sync.cpp's gpuSyncPreConsumer (sync.cpp:759) issues a PFP WAIT_REG_MEM against a label
+    // that the queue's own gpuSyncPostProducer RELEASE_MEM (queueEndOfPipeAction, sync.cpp:749)
+    // wrote earlier in the same command stream; on one MTLCommandQueue Metal FIFO order already
+    // reproduces that ordering, so no GPU event wait is needed.
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_label_space, label) = mapped_test_label();
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![GpuEvent::MemoryWait(wait)],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    // The wait is satisfied by same-queue FIFO order, not a cross-queue event wait.
+    assert_eq!(presenter.statistics.same_queue_wait_elisions, 1);
+    assert_eq!(presenter.statistics.shared_event_waits, 0);
+    assert_eq!(
+        presenter
+            .statistics
+            .shared_event_fallbacks_no_exact_producer,
+        0
+    );
+    assert!(
+        presenter.receiver.blocked_queues.get(&0).is_none(),
+        "the elided wait leaves its queue runnable"
+    );
+    // The producer footprint stays recorded so same-queue DMA fills / direct draws consult it.
+    let consumer = presenter
+        .guest_queue_batches
+        .get(&0)
+        .expect("queue 0 exists");
+    assert!(
+        consumer
+            .resource_dependencies
+            .values()
+            .any(|checkpoint| checkpoint.fence.producer().queue_id() == 0),
+        "the same-queue producer checkpoint is retained for later same-queue consumers"
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("the elided same-queue producer settles");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
 fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
     remu_gpu::clear_event_sink();
     let (sender, receiver) = gpu_event_channel();

@@ -250,25 +250,13 @@ impl MetalPresenter {
         let diagnostic_disable_depth_for_draw = diagnostic_disable_depth()
             && (!diagnostic_disable_combined_raster || diagnostic_complex_msaa_raster);
         if trace_target_sampling() {
-            static LOGGED_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, MTLPixelFormat, u32)>>> =
-                OnceLock::new();
-            let mut logged = LOGGED_TARGETS
-                .get_or_init(|| Mutex::new(HashSet::new()))
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+            static LOGGED_TARGETS: AtomicUsize = AtomicUsize::new(0);
             for target in &targets {
                 let descriptor = target.texture;
-                let key = (
-                    descriptor.address,
-                    descriptor.width,
-                    descriptor.height,
-                    descriptor.pixel_format,
-                    descriptor.tile_mode,
-                );
                 if descriptor.width == 1_920
                     && descriptor.height == 1_080
-                    && logged.len() < 256
-                    && logged.insert(key)
+                    && LOGGED_TARGETS.fetch_add(1, Ordering::Relaxed) < 256
                 {
                     let primary = target.guest_slot * CB_COLOR_REGISTER_STRIDE;
                     let fmask = register_value(&draw.context_registers, CB_COLOR0_FMASK + primary);
@@ -809,13 +797,9 @@ impl MetalPresenter {
                             .is_some_and(|shader| shader.program.instructions.len() == count)
                     }))
             {
-                static DUMPED_SCANOUT_PAIRS: OnceLock<Mutex<HashSet<(u64, u64)>>> = OnceLock::new();
-                let pair = (draw.export_shader_address, draw.pixel_shader_address);
-                let mut dumped = DUMPED_SCANOUT_PAIRS
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if dumped.len() < 128 && dumped.insert(pair) {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static DUMPED_SCANOUT_PAIRS: AtomicUsize = AtomicUsize::new(0);
+                if DUMPED_SCANOUT_PAIRS.fetch_add(1, Ordering::Relaxed) < 128 {
                     let sampled = sampled_image_bindings(pixel_evaluation)
                         .map(|binding| {
                             let descriptor =
@@ -1166,12 +1150,9 @@ impl MetalPresenter {
                     .ok()
                     .and_then(|scalar| scalar.checked_add(3))
                     .and_then(|scalar| pixel_scalar_metadata.get(scalar).copied());
-                static LOGGED: OnceLock<Mutex<HashSet<(u32, u32)>>> = OnceLock::new();
-                let mut logged = LOGGED
-                    .get_or_init(|| Mutex::new(HashSet::new()))
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if logged.len() < 64 && logged.insert((binding.pc, descriptor_word)) {
+                // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
                     eprintln!(
                         "[REMu][METAL][GLYPH-SELECT] pc={:#x} scalar_resource={} descriptor_word3={descriptor_word:#010x} descriptor_select={select:#x} seeded_word3={seeded:#010x?} seeded_select={:#x?}",
                         binding.pc,
@@ -1268,15 +1249,12 @@ impl MetalPresenter {
                     .ok_or("diagnostic pixel-output byte count overflow")?;
                 let buffer = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
                 buffer.set_label("REMu diagnostic pixel outputs");
-                // SAFETY: the newly allocated shared buffer exposes exactly `byte_count` bytes.
-                unsafe {
-                    std::ptr::write_bytes(
-                        buffer.contents().cast::<u8>(),
-                        0,
-                        usize::try_from(byte_count)
-                            .expect("diagnostic pixel-output byte count fits usize"),
-                    );
-                }
+                let byte_count = usize::try_from(byte_count)
+                    .expect("diagnostic pixel-output byte count fits usize");
+                assert!(
+                    super::MetalBytes::new(&buffer).fill(0, 0, byte_count),
+                    "the newly allocated shared buffer exposes exactly byte_count bytes"
+                );
                 self.diagnostic_pixel_output_buffer = Some(buffer);
             }
             self.diagnostic_pixel_output_buffer.clone()
@@ -2557,11 +2535,9 @@ impl MetalPresenter {
                         let indices = indexed_draw.as_ref()?.0.as_ref();
                         let word_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
                             .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)?;
-                        // SAFETY: the diagnostic buffer is allocated above with exactly this many
-                        // shared u32 words and the completed command batch is waited before readback.
-                        let words = unsafe {
-                            std::slice::from_raw_parts(buffer.contents().cast::<u32>(), word_count)
-                        };
+                        // The diagnostic buffer is allocated above with exactly this many shared
+                        // u32 words and the completed command batch is waited before readback.
+                        let words = super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
                         let mut seen = HashSet::new();
                         Some(
                             indices
@@ -2602,11 +2578,9 @@ impl MetalPresenter {
                         let word_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
                             .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)?
                             .checked_mul(5)?;
-                        // SAFETY: the shared diagnostic buffer is allocated with exactly this
-                        // many words and the command batch has completed before this readback.
-                        let words = unsafe {
-                            std::slice::from_raw_parts(buffer.contents().cast::<u32>(), word_count)
-                        };
+                        // The shared diagnostic buffer is allocated with exactly this many words
+                        // and the command batch has completed before this readback.
+                        let words = super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
                         let covered = words.chunks_exact(5).filter(|pixel| pixel[0] != 0).count();
                         let nonzero = words
                             .chunks_exact(5)
@@ -2965,16 +2939,14 @@ impl MetalPresenter {
                 .enumerate()
                 .filter(|(_, (binding, _))| binding.byte_count <= 4 * 1024 * 1024)
             {
-                let contents = uploaded.buffer.contents().cast::<u8>();
                 let offset = usize::try_from(uploaded.offset)
                     .map_err(|_| "video global-buffer offset does not fit usize")?;
-                if contents.is_null() {
+                // Every uploaded global buffer is shared CPU-visible storage; skip any that is not
+                // mapped or whose validated extent no longer fits (null contents -> zero length).
+                let uploaded_bytes = super::MetalBytes::new(&uploaded.buffer);
+                let Some(data) = uploaded_bytes.slice(offset, binding.byte_count) else {
                     continue;
-                }
-                // SAFETY: every uploaded global buffer is shared CPU-visible storage and the
-                // binding extent was validated when the buffer and its byte offset were created.
-                let data =
-                    unsafe { std::slice::from_raw_parts(contents.add(offset), binding.byte_count) };
+                };
                 let binding_path = directory.join(format!(
                     "draw-{}-export-binding-{index}-{:x}-{}.bin",
                     draw.sequence, binding.base_address, binding.byte_count,

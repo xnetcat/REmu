@@ -74,7 +74,6 @@ impl MetalPresenter {
                         fence.producer().queue_id()
                     )
                 })?;
-            let producer_event = producer.shared_event_timeline.event_owned();
             let resource_checkpoint = producer
                 .committed_batches
                 .iter()
@@ -89,6 +88,48 @@ impl MetalPresenter {
                         fence.value()
                     )
                 })?;
+            if fence.producer().queue_id() == consumer_queue_id {
+                // A3: same-queue WAIT_REG_MEM elision — the default disposition.
+                //
+                // The O(1) producer index (`gpu_wait_fences`) located the producer's RELEASE_MEM
+                // signal checkpoint on THIS very queue, which proves it is encoded ahead of this
+                // wait. In the SDK, `gpuSyncPreConsumer` emits a PFP `WAIT_REG_MEM`
+                // (`waitOnAddress`, sync.cpp:759) against a label whose producer
+                // `gpuSyncPostProducer` `RELEASE_MEM` (`queueEndOfPipeAction`, sync.cpp:749) is
+                // queued earlier in the same command stream. A single `MTLCommandQueue` already
+                // reproduces that command-processor FIFO order, so a GPU wait for the producer's
+                // own event — and the render-pass split `close_active_pass_encoders` would force —
+                // is pure overhead. Keep the resource dependency so same-queue DMA fills
+                // (`prepare_same_queue_immediate_fill_inner`) and direct draws still consult the
+                // producer footprint; skip the event wait and the host dependency (host
+                // retirement of one queue is already FIFO-ordered).
+                let consumer = self
+                    .guest_queue_batches
+                    .get_mut(&consumer_queue_id)
+                    .ok_or_else(|| format!("missing consumer guest queue {consumer_queue_id}"))?;
+                consumer
+                    .resource_dependencies
+                    .entry(fence.producer())
+                    .and_modify(|checkpoint| {
+                        if checkpoint.fence.value() < resource_checkpoint.fence.value() {
+                            *checkpoint = resource_checkpoint.clone();
+                        }
+                    })
+                    .or_insert(resource_checkpoint);
+                let taken = self.gpu_wait_fences.take(ticket_id);
+                debug_assert_eq!(taken, Some(fence));
+                remu_gpu::retire_gpu_wait(ticket_id);
+                self.guest_memory_waits.complete(key);
+                self.statistics.same_queue_wait_elisions =
+                    self.statistics.same_queue_wait_elisions.saturating_add(1);
+                return Ok(GuestMemoryWaitStatus::Satisfied);
+            }
+            let producer_event = self
+                .guest_queue_batches
+                .get(&fence.producer().queue_id())
+                .expect("producer queue verified above")
+                .shared_event_timeline
+                .event_owned();
             self.ensure_active_open_guest_batch()?;
             let consumer = self
                 .guest_queue_batches

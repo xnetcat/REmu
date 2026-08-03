@@ -485,10 +485,8 @@ mod tests {
         let fence = timeline.allocate_fence().expect("producer fence");
         let source_buffer = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
         let observed = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
-        unsafe {
-            std::ptr::write_bytes(source_buffer.contents().cast::<u8>(), 0, BYTE_COUNT);
-            std::ptr::write_bytes(observed.contents().cast::<u8>(), 0, BYTE_COUNT);
-        }
+        assert!(super::super::MetalBytes::new(&source_buffer).fill(0, 0, BYTE_COUNT));
+        assert!(super::super::MetalBytes::new(&observed).fill(0, 0, BYTE_COUNT));
 
         let consumer = consumer_queue.new_command_buffer().to_owned();
         consumer.encode_wait_for_event(timeline.event(), fence.value());
@@ -527,8 +525,10 @@ mod tests {
             producer_commands.status(),
             MTLCommandBufferStatus::Completed
         );
-        let observed =
-            unsafe { std::slice::from_raw_parts(observed.contents().cast::<u8>(), BYTE_COUNT) };
+        let observed_bytes = super::super::MetalBytes::new(&observed);
+        let observed = observed_bytes
+            .slice(0, BYTE_COUNT)
+            .expect("observed buffer exposes the copied bytes");
         assert!(
             observed.iter().all(|&byte| byte == PRODUCED_BYTE),
             "consumer did not observe producer bytes through the SharedEvent edge"

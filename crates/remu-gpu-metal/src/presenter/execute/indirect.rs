@@ -141,10 +141,12 @@ kernel void write_arguments(device uint4* output [[buffer(0)]]) {
         command.commit();
         command.wait_until_completed();
 
-        // SAFETY: the shared destination is 48 bytes and the completed kernels wrote three
-        // contiguous uint4 records.
-        let converted =
-            unsafe { std::slice::from_raw_parts(destination.contents().cast::<u32>(), 12) };
+        // The shared destination is 48 bytes and the completed kernels wrote three contiguous
+        // uint4 records.
+        let converted_bytes = super::super::super::MetalBytes::new(&destination);
+        let converted = converted_bytes
+            .typed_slice::<u32>(0, 12)
+            .expect("destination exposes 12 u32 records");
         assert_eq!(converted, &[4, 7, 11, 13, 0, 17, 19, 23, 6, 29, 31, 37]);
         assert!(RECTANGLE_INDIRECT_ARGUMENT_SOURCE.contains("vertex_count == 3u"));
     }
