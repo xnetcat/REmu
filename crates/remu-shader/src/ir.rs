@@ -218,9 +218,22 @@ impl fmt::Display for Operand {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RawOpcodeFamily {
+    Sop1,
+    Sop2,
+    Sopc,
+    Sopk,
+    Sopp,
+    Smrd,
+    Smem,
+    Vop1,
+    Vop2,
+    Vopc,
     Vop3,
     Vop3b,
     Vop3p,
+    Vintrp,
+    Ds,
+    Flat,
     Mubuf,
     Mimg,
 }

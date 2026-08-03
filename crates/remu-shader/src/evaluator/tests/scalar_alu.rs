@@ -806,3 +806,74 @@ fn scalar_hint_opcodes_are_benign_and_getreg_is_loudly_unsupported() {
         EvaluationError::UnsupportedScalarOpcode { .. }
     ));
 }
+
+#[test]
+fn raw_scalar_opcodes_fail_loudly_and_raw_vector_opcodes_stay_benign() {
+    // A raw scalar op on an executed path must never produce fabricated register state.
+    let raw_scalar = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Sop1,
+        opcode: Opcode::Raw {
+            family: crate::RawOpcodeFamily::Sop1,
+            code: 0x69,
+        },
+        words: vec![0],
+        sources: vec![Operand::scalar(2)],
+        destinations: vec![Operand::scalar(4)],
+        control: None,
+    };
+    let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+    let mut exec_mask = u64::MAX;
+    let mut scalar_condition = false;
+    let error = execute_scalar_alu(
+        &raw_scalar,
+        0x1000,
+        &mut registers,
+        &mut exec_mask,
+        &mut scalar_condition,
+    )
+    .expect_err("raw scalar opcode must be loudly unsupported");
+    assert!(matches!(
+        error,
+        EvaluationError::UnsupportedScalarOpcode { .. }
+    ));
+
+    // A raw vector op is invisible to scalar discovery: the program still evaluates.
+    let mut raw_vector = instruction(
+        0,
+        ShaderEncoding::Vop1,
+        "placeholder",
+        vec![Operand::vector(1)],
+        vec![Operand::vector(2)],
+        None,
+    );
+    raw_vector.opcode = Opcode::Raw {
+        family: crate::RawOpcodeFamily::Vop1,
+        code: 0x6a,
+    };
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sopk,
+                "SMovkI32",
+                vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 21,
+                }],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            raw_vector,
+            end(8),
+        ],
+        Vec::new(),
+    );
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("raw vector opcodes must not fail scalar evaluation");
+    assert_eq!(evaluation.scalar_registers[0], 21);
+}

@@ -8,18 +8,20 @@ use crate::ir::{
     ShaderEncoding,
 };
 
-use super::{DecodeError, Frame, known_frame};
+use super::{DecodeError, Frame, frame_or_raw};
 
 pub(crate) fn vector_extension_dwords(source: u32) -> usize {
     usize::from(matches!(source, 0xe9 | 0xea | 0xf9 | 0xfa | 0xff))
 }
 
-pub(crate) fn decode_vop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_vop1(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 9) & 0xff;
     let name = match code {
         0x00 => Some("VNop"),
         0x01 => Some("VMovB32"),
         0x02 => Some("VReadfirstlaneB32"),
+        0x03 => Some("VCvtI32F64"),
+        0x04 => Some("VCvtF64I32"),
         0x05 => Some("VCvtF32I32"),
         0x06 => Some("VCvtF32U32"),
         0x07 => Some("VCvtU32F32"),
@@ -29,10 +31,19 @@ pub(crate) fn decode_vop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x0c => Some("VCvtRpiI32F32"),
         0x0d => Some("VCvtFlrI32F32"),
         0x0e => Some("VCvtOffF32I4"),
+        0x0f => Some("VCvtF32F64"),
+        0x10 => Some("VCvtF64F32"),
         0x11 => Some("VCvtF32Ubyte0"),
         0x12 => Some("VCvtF32Ubyte1"),
         0x13 => Some("VCvtF32Ubyte2"),
         0x14 => Some("VCvtF32Ubyte3"),
+        0x15 => Some("VCvtU32F64"),
+        0x16 => Some("VCvtF64U32"),
+        0x17 => Some("VTruncF64"),
+        0x18 => Some("VCeilF64"),
+        0x19 => Some("VRndneF64"),
+        0x1a => Some("VFloorF64"),
+        0x1b => Some("VPipeflush"),
         0x20 => Some("VFractF32"),
         0x21 => Some("VTruncF32"),
         0x22 => Some("VCeilF32"),
@@ -43,34 +54,82 @@ pub(crate) fn decode_vop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x2a => Some("VRcpF32"),
         0x2b => Some("VRcpIflagF32"),
         0x2e => Some("VRsqF32"),
+        0x2f => Some("VRcpF64"),
+        0x31 => Some("VRsqF64"),
         0x33 => Some("VSqrtF32"),
+        0x34 => Some("VSqrtF64"),
         0x35 => Some("VSinF32"),
         0x36 => Some("VCosF32"),
         0x37 => Some("VNotB32"),
         0x38 => Some("VBfrevB32"),
+        0x39 => Some("VFfbhU32"),
         0x3a => Some("VFfblB32"),
+        0x3b => Some("VFfbhI32"),
+        0x3c => Some("VFrexpExpI32F64"),
+        0x3d => Some("VFrexpMantF64"),
+        0x3e => Some("VFractF64"),
+        0x3f => Some("VFrexpExpI32F32"),
+        0x40 => Some("VFrexpMantF32"),
         0x42 => Some("VMovreldB32"),
         0x43 => Some("VMovrelsB32"),
         0x44 => Some("VMovrelsdB32"),
+        0x48 => Some("VMovrelsd2B32"),
+        0x50 => Some("VCvtF16U16"),
+        0x51 => Some("VCvtF16I16"),
         0x52 => Some("VCvtU16F16"),
+        0x53 => Some("VCvtI16F16"),
         0x54 => Some("VRcpF16"),
         0x55 => Some("VSqrtF16"),
         0x56 => Some("VRsqF16"),
         0x57 => Some("VLogF16"),
         0x58 => Some("VExpF16"),
+        0x59 => Some("VFrexpMantF16"),
+        0x5a => Some("VFrexpExpI16F16"),
+        0x5b => Some("VFloorF16"),
+        0x5c => Some("VCeilF16"),
+        0x5d => Some("VTruncF16"),
+        0x5e => Some("VRndneF16"),
+        0x5f => Some("VFractF16"),
+        0x60 => Some("VSinF16"),
+        0x61 => Some("VCosF16"),
+        0x62 => Some("VSatPkU8I16"),
+        0x63 => Some("VCvtNormI16F16"),
+        0x64 => Some("VCvtNormU16F16"),
+        0x65 => Some("VSwapB32"),
+        0x68 => Some("VSwaprelB32"),
         _ => None,
     };
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Vop1,
+        RawOpcodeFamily::Vop1,
         code,
         name,
         1 + vector_extension_dwords(word & 0x1ff),
+    ))
+}
+
+/// VOP1 operations whose result is a 64-bit value written to a VGPR pair.
+pub(crate) fn vop1_writes_vector_pair(opcode: Opcode) -> bool {
+    matches!(
+        opcode.known_name(),
+        Some(
+            "VCvtF64I32"
+                | "VCvtF64F32"
+                | "VCvtF64U32"
+                | "VTruncF64"
+                | "VCeilF64"
+                | "VRndneF64"
+                | "VFloorF64"
+                | "VRcpF64"
+                | "VRsqF64"
+                | "VSqrtF64"
+                | "VFrexpMantF64"
+                | "VFractF64"
+        )
     )
 }
 
-pub(crate) fn decode_vop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_vop2(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 25) & 0x3f;
     let name = match code {
         0x01 => Some("VCndmaskB32"),
@@ -78,7 +137,11 @@ pub(crate) fn decode_vop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x03 => Some("VAddF32"),
         0x04 => Some("VSubF32"),
         0x05 => Some("VSubrevF32"),
+        0x06 => Some("VFmacLegacyF32"),
+        0x07 => Some("VMulLegacyF32"),
         0x08 => Some("VMulF32"),
+        0x09 => Some("VMulI32I24"),
+        0x0a => Some("VMulHiI32I24"),
         0x0b => Some("VMulU32U24"),
         0x0c => Some("VMulHiU32U24"),
         0x0f => Some("VMinF32"),
@@ -125,21 +188,21 @@ pub(crate) fn decode_vop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x39 => Some("VMaxF16"),
         0x3a => Some("VMinF16"),
         0x3b => Some("VLdexpF16"),
+        0x3c => Some("VPkFmacF16"),
         _ => None,
     };
     let forced_literal = matches!(code, 0x20 | 0x21 | 0x2c | 0x2d);
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Vop2,
+        RawOpcodeFamily::Vop2,
         code,
         name,
         1 + usize::from(forced_literal).max(vector_extension_dwords(word & 0x1ff)),
-    )
+    ))
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_vopc(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 17) & 0xff;
     let name = match code {
         0x00 => Some("VCmpFF32"),
@@ -174,6 +237,38 @@ pub(crate) fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x1d => Some("VCmpxNeqF32"),
         0x1e => Some("VCmpxNltF32"),
         0x1f => Some("VCmpxTruF32"),
+        0x20 => Some("VCmpFF64"),
+        0x21 => Some("VCmpLtF64"),
+        0x22 => Some("VCmpEqF64"),
+        0x23 => Some("VCmpLeF64"),
+        0x24 => Some("VCmpGtF64"),
+        0x25 => Some("VCmpLgF64"),
+        0x26 => Some("VCmpGeF64"),
+        0x27 => Some("VCmpOF64"),
+        0x28 => Some("VCmpUF64"),
+        0x29 => Some("VCmpNgeF64"),
+        0x2a => Some("VCmpNlgF64"),
+        0x2b => Some("VCmpNgtF64"),
+        0x2c => Some("VCmpNleF64"),
+        0x2d => Some("VCmpNeqF64"),
+        0x2e => Some("VCmpNltF64"),
+        0x2f => Some("VCmpTruF64"),
+        0x30 => Some("VCmpxFF64"),
+        0x31 => Some("VCmpxLtF64"),
+        0x32 => Some("VCmpxEqF64"),
+        0x33 => Some("VCmpxLeF64"),
+        0x34 => Some("VCmpxGtF64"),
+        0x35 => Some("VCmpxLgF64"),
+        0x36 => Some("VCmpxGeF64"),
+        0x37 => Some("VCmpxOF64"),
+        0x38 => Some("VCmpxUF64"),
+        0x39 => Some("VCmpxNgeF64"),
+        0x3a => Some("VCmpxNlgF64"),
+        0x3b => Some("VCmpxNgtF64"),
+        0x3c => Some("VCmpxNleF64"),
+        0x3d => Some("VCmpxNeqF64"),
+        0x3e => Some("VCmpxNltF64"),
+        0x3f => Some("VCmpxTruF64"),
         0x80 => Some("VCmpFI32"),
         0x81 => Some("VCmpLtI32"),
         0x82 => Some("VCmpEqI32"),
@@ -183,6 +278,13 @@ pub(crate) fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x86 => Some("VCmpGeI32"),
         0x87 => Some("VCmpTI32"),
         0x88 => Some("VCmpClassF32"),
+        0x89 => Some("VCmpLtI16"),
+        0x8a => Some("VCmpEqI16"),
+        0x8b => Some("VCmpLeI16"),
+        0x8c => Some("VCmpGtI16"),
+        0x8d => Some("VCmpNeI16"),
+        0x8e => Some("VCmpGeI16"),
+        0x8f => Some("VCmpClassF16"),
         0x90 => Some("VCmpxFI32"),
         0x91 => Some("VCmpxLtI32"),
         0x92 => Some("VCmpxEqI32"),
@@ -191,6 +293,28 @@ pub(crate) fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x95 => Some("VCmpxNeI32"),
         0x96 => Some("VCmpxGeI32"),
         0x97 => Some("VCmpxTI32"),
+        0x98 => Some("VCmpxClassF32"),
+        0x99 => Some("VCmpxLtI16"),
+        0x9a => Some("VCmpxEqI16"),
+        0x9b => Some("VCmpxLeI16"),
+        0x9c => Some("VCmpxGtI16"),
+        0x9d => Some("VCmpxNeI16"),
+        0x9e => Some("VCmpxGeI16"),
+        0x9f => Some("VCmpxClassF16"),
+        0xa8 => Some("VCmpClassF64"),
+        0xa9 => Some("VCmpLtU16"),
+        0xaa => Some("VCmpEqU16"),
+        0xab => Some("VCmpLeU16"),
+        0xac => Some("VCmpGtU16"),
+        0xad => Some("VCmpNeU16"),
+        0xae => Some("VCmpGeU16"),
+        0xb8 => Some("VCmpxClassF64"),
+        0xb9 => Some("VCmpxLtU16"),
+        0xba => Some("VCmpxEqU16"),
+        0xbb => Some("VCmpxLeU16"),
+        0xbc => Some("VCmpxGtU16"),
+        0xbd => Some("VCmpxNeU16"),
+        0xbe => Some("VCmpxGeU16"),
         0xc0 => Some("VCmpFU32"),
         0xc1 => Some("VCmpLtU32"),
         0xc2 => Some("VCmpEqU32"),
@@ -241,14 +365,13 @@ pub(crate) fn decode_vopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0xff => Some("VCmpxTruF16"),
         _ => None,
     };
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Vopc,
+        RawOpcodeFamily::Vopc,
         code,
         name,
         1 + vector_extension_dwords(word & 0x1ff),
-    )
+    ))
 }
 
 pub(crate) fn decode_vop3(word: u32, extra: u32) -> Frame {
@@ -386,7 +509,7 @@ pub(crate) fn decode_vop3p(word: u32, extra: u32) -> Frame {
     }
 }
 
-pub(crate) fn decode_vintrp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_vintrp(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 16) & 3;
     let name = match code {
         0 => Some("VInterpP1F32"),
@@ -394,7 +517,13 @@ pub(crate) fn decode_vintrp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         2 => Some("VInterpMovF32"),
         _ => None,
     };
-    known_frame(pc, word, ShaderEncoding::Vintrp, code, name, 1)
+    Ok(frame_or_raw(
+        ShaderEncoding::Vintrp,
+        RawOpcodeFamily::Vintrp,
+        code,
+        name,
+        1,
+    ))
 }
 
 #[allow(clippy::fn_params_excessive_bools, clippy::too_many_arguments)]

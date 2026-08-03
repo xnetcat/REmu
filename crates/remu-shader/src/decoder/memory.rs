@@ -8,9 +8,9 @@ use crate::ir::{
     RawOpcodeFamily, ShaderEncoding,
 };
 
-use super::{DecodeError, Frame, known_frame, push_vector_range, sign_extend};
+use super::{DecodeError, Frame, frame_or_raw, push_vector_range, sign_extend};
 
-pub(crate) fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_ds(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 18) & 0xff;
     let name = match code {
         0x00 => Some("DsAddU32"),
@@ -63,7 +63,13 @@ pub(crate) fn decode_ds(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0xff => Some("DsReadB128"),
         _ => None,
     };
-    known_frame(pc, word, ShaderEncoding::Ds, code, name, 2)
+    Ok(frame_or_raw(
+        ShaderEncoding::Ds,
+        RawOpcodeFamily::Ds,
+        code,
+        name,
+        2,
+    ))
 }
 
 pub(crate) fn decode_mtbuf(word: u32, extra: u32) -> Frame {
@@ -185,7 +191,13 @@ pub(crate) fn decode_flat(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         }
     };
     let name = flat_memory_op_name(code, prefix, allow_atomic);
-    known_frame(pc, word, ShaderEncoding::Flat, code, name, 2)
+    Ok(frame_or_raw(
+        ShaderEncoding::Flat,
+        RawOpcodeFamily::Flat,
+        code,
+        name,
+        2,
+    ))
 }
 
 /// Names one FLAT/GLOBAL/SCRATCH load/store/atomic opcode.

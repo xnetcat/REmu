@@ -3,11 +3,11 @@
 
 //! Scalar encoding families: SOP1/SOP2/SOPC/SOPK/SOPP and the scalar memory encodings.
 
-use crate::ir::{Opcode, ShaderEncoding};
+use crate::ir::{Opcode, RawOpcodeFamily, ShaderEncoding};
 
-use super::{DecodeError, Frame, known_frame};
+use super::{DecodeError, Frame, frame_or_raw};
 
-pub(crate) fn decode_sop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_sop1(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 8) & 0xff;
     let name = match code {
         0x03 => Some("SMovB32"),
@@ -71,17 +71,16 @@ pub(crate) fn decode_sop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x45 => Some("SOrn1SaveexecB32"),
         _ => None,
     };
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Sop1,
+        RawOpcodeFamily::Sop1,
         code,
         name,
         1 + usize::from(word & 0xff == 0xff),
-    )
+    ))
 }
 
-pub(crate) fn decode_sop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_sop2(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 23) & 0x7f;
     let name = match code {
         0x00 => Some("SAddU32"),
@@ -138,17 +137,16 @@ pub(crate) fn decode_sop2(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         _ => None,
     };
     let literal = word & 0xff == 0xff || (word >> 8) & 0xff == 0xff;
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Sop2,
+        RawOpcodeFamily::Sop2,
         code,
         name,
         1 + usize::from(literal),
-    )
+    ))
 }
 
-pub(crate) fn decode_sopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_sopc(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 16) & 0x7f;
     let name = match code {
         0x00 => Some("SCmpEqI32"),
@@ -172,17 +170,16 @@ pub(crate) fn decode_sopc(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         _ => None,
     };
     let literal = word & 0xff == 0xff || (word >> 8) & 0xff == 0xff;
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Sopc,
+        RawOpcodeFamily::Sopc,
         code,
         name,
         1 + usize::from(literal),
-    )
+    ))
 }
 
-pub(crate) fn decode_sopp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_sopp(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 16) & 0x7f;
     let name = match code {
         0x00 => Some("SNop"),
@@ -232,10 +229,19 @@ pub(crate) fn decode_sopp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x23 => Some("SWaitcntDepctr"),
         _ => None,
     };
-    known_frame(pc, word, ShaderEncoding::Sopp, code, name, 1)
+    // Every SOPP control transfer is in the named table (including the debug-conditional
+    // branches, which production compilers never emit); a reserved code is a hint-space
+    // operation whose raw fallthrough matches hardware behavior without a debugger attached.
+    Ok(frame_or_raw(
+        ShaderEncoding::Sopp,
+        RawOpcodeFamily::Sopp,
+        code,
+        name,
+        1,
+    ))
 }
 
-pub(crate) fn decode_sopk(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_sopk(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = ((word >> 23) & 0x7f) - 0x60;
     let name = match code {
         0x00 => Some("SMovkI32"),
@@ -274,34 +280,38 @@ pub(crate) fn decode_sopk(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x18 => Some("SWaitcntLgkmcnt"),
         _ => None,
     };
-    let dwords = 1 + usize::from(code == 0x13);
-    known_frame(pc, word, ShaderEncoding::Sopk, code, name, dwords)
+    // S_SETREG_IMM32_B32 is the one SOPK instruction that carries a 32-bit literal.
+    Ok(frame_or_raw(
+        ShaderEncoding::Sopk,
+        RawOpcodeFamily::Sopk,
+        code,
+        name,
+        1 + usize::from(code == 0x13),
+    ))
 }
 
-pub(crate) fn decode_smrd(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_smrd(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 22) & 0x1f;
     let name = scalar_load_name(code);
     let literal = word >> 8 & 1 == 0 && word & 0xff == 0xff;
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Smrd,
+        RawOpcodeFamily::Smrd,
         code,
         name,
         1 + usize::from(literal),
-    )
+    ))
 }
 
-pub(crate) fn decode_smem(pc: u32, word: u32) -> Result<Frame, DecodeError> {
+pub(crate) fn decode_smem(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = (word >> 18) & 0xff;
-    known_frame(
-        pc,
-        word,
+    Ok(frame_or_raw(
         ShaderEncoding::Smem,
+        RawOpcodeFamily::Smem,
         code,
         scalar_load_name(code),
         2,
-    )
+    ))
 }
 
 pub(crate) const fn scalar_load_name(code: u32) -> Option<&'static str> {
