@@ -88,7 +88,7 @@ use crate::backend::backend_error;
 #[cfg(test)]
 use crate::backend::create_default_device;
 use crate::context::{read_readback, wait_for_fence, write_upload, write_upload_at};
-use crate::diagnostics::name_object;
+use crate::diagnostics::{device_removed_report, name_object};
 use crate::guest_shader::{compile_guest_shader, translate_guest_shader};
 use crate::process_memory::read_process_memory;
 #[cfg(test)]
@@ -106,6 +106,7 @@ const MAXIMUM_COMPUTE_PIPELINE_CACHE_ENTRIES: usize = 256;
 const MAXIMUM_PERSISTENT_RENDER_TARGETS: usize = 8;
 const MAXIMUM_PENDING_DRAWS: usize = 128;
 const MAXIMUM_RESIDENT_SAMPLED_TEXTURES: usize = 128;
+const D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION: u32 = 65_535;
 const TEXTURE_WRITEBACK_CHUNK_BYTES: usize = 1024 * 1024;
 const SHARED_DESCRIPTOR_CAPACITY: usize = 65_536;
 const SHARED_SAMPLER_CAPACITY: usize = 2_048;
@@ -621,6 +622,16 @@ impl Dx12GuestExecutor {
         })
     }
 
+    /// Returns a DRED report only after Windows has removed the shared device.
+    ///
+    /// Guest translation errors are recoverable and common while support is still incomplete, so
+    /// the presenter must distinguish those from a terminal native-device failure before emitting
+    /// the comparatively expensive DRED traversal.
+    pub(super) fn device_removed_report(&self) -> Option<String> {
+        let report = device_removed_report(&self.device);
+        (report != "device_state=available").then_some(report)
+    }
+
     pub(super) fn native_present_target(
         &mut self,
         address: u64,
@@ -675,6 +686,37 @@ impl Dx12GuestExecutor {
             .shader_evaluation
             .as_ref()
             .ok_or("compute dispatch has no evaluated shader resources")?;
+        if std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1") {
+            let globals = evaluation
+                .global_memory_bindings
+                .iter()
+                .map(|binding| {
+                    format!(
+                        "{:#x}/{}:{}{}",
+                        binding.base_address,
+                        binding.byte_count,
+                        if binding.writable { "w" } else { "r" },
+                        if binding.write_back_to_guest { "b" } else { "" },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let images = evaluation
+                .image_bindings
+                .iter()
+                .map(|binding| {
+                    decode_texture(binding)
+                        .map(|texture| format!("{texture:?}"))
+                        .unwrap_or_else(|error| format!("decode-error({error})"))
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[REMu][D3D12-BINDINGS] compute={} shader={:#x} grid={:?} local={:?} globals={globals:?} images={images:?}",
+                dispatch.sequence,
+                dispatch.shader_address,
+                dispatch.launch.grid,
+                dispatch.launch.threads_per_group,
+            );
+        }
         let total_threads = dispatch.launch.threads_per_group_total();
         if total_threads == 0 || total_threads > 1_024 {
             return Err(format!(
@@ -682,6 +724,10 @@ impl Dx12GuestExecutor {
                 dispatch.launch.threads_per_group
             ));
         }
+        // Dispatch returns void. Passing a count beyond the native limit removes the entire
+        // D3D12 device, so reject stale or partially produced indirect arguments before compiling
+        // shaders or creating resource views.
+        let group_count = dispatch_group_count(dispatch)?;
         let mut options = MetalCompileOptions::compute_wave(
             dispatch.launch.lds_size_bytes,
             dispatch.launch.wave_lane_count,
@@ -740,7 +786,6 @@ impl Dx12GuestExecutor {
         record_stage_uploads(&commands, &resources);
         let mut root_constants = dispatch_root_constants(dispatch);
         root_constants[0] = root_descriptors[0];
-        let group_count = dispatch_group_count(dispatch)?;
         // SAFETY: descriptor zero is the binding table, all resources remain alive, and the root
         // signature/PSO were built from this exact translated shader interface.
         unsafe {
@@ -2917,8 +2962,8 @@ fn shader_semantics(source: &str) -> String {
 }
 
 fn dispatch_group_count(dispatch: &ComputeDispatch) -> Result<[u32; 3], String> {
-    match dispatch.launch.grid {
-        ComputeGrid::Threadgroups(groups) => Ok(groups),
+    let groups = match dispatch.launch.grid {
+        ComputeGrid::Threadgroups(groups) => groups,
         ComputeGrid::Threads(threads) => {
             let mut groups = [0_u32; 3];
             for axis in 0..3 {
@@ -2926,9 +2971,17 @@ fn dispatch_group_count(dispatch: &ComputeDispatch) -> Result<[u32; 3], String> 
                 groups[axis] = u32::try_from(threads[axis].div_ceil(size))
                     .map_err(|_| "compute thread grid exceeds the D3D12 dispatch range")?;
             }
-            Ok(groups)
+            groups
+        }
+    };
+    for (&count, axis) in groups.iter().zip(['x', 'y', 'z']) {
+        if count > D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION {
+            return Err(format!(
+                "compute dispatch {axis}-dimension {count} exceeds D3D12's {D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION}-group limit"
+            ));
         }
     }
+    Ok(groups)
 }
 
 fn resolve_indirect_compute(dispatch: &ComputeDispatch) -> Result<Option<ComputeDispatch>, String> {
@@ -6907,11 +6960,48 @@ mod tests {
     };
 
     use super::{
-        Dx12GuestExecutor, WritebackJournalSites, expand_primitive_indices,
+        Dx12GuestExecutor, WritebackJournalSites, dispatch_group_count, expand_primitive_indices,
         indirect_draw_count_allows, presentable_bgra, primitive_restart_index,
         regroup_restart_list_indices, resolve_indirect_compute, resolve_indirect_draw,
         write_changed_ranges_direct,
     };
+
+    fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
+        ComputeDispatch {
+            sequence: 1,
+            source: ComputeDispatchSource::Direct,
+            launch: ComputeLaunch {
+                grid,
+                group_count: [1; 3],
+                base_group: [0; 3],
+                threads_per_group: [1; 3],
+                wave_lane_count: 32,
+                lds_size_bytes: 0,
+                initiator: 1,
+            },
+            shader_address: 0,
+            shader_prefix: [0; 4],
+            shader: None,
+            shader_evaluation: None,
+            shader_registers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn rejects_dispatch_dimensions_that_would_remove_a_d3d12_device() {
+        assert_eq!(
+            dispatch_group_count(&dispatch_with_grid(ComputeGrid::Threadgroups([
+                65_535, 2, 1
+            ])))
+            .expect("maximum native dispatch is valid"),
+            [65_535, 2, 1]
+        );
+        let error = dispatch_group_count(&dispatch_with_grid(ComputeGrid::Threadgroups([
+            65_536, 2, 1,
+        ])))
+        .expect_err("oversized native dispatch must be rejected");
+        assert!(error.contains("x-dimension 65536"), "{error}");
+    }
 
     #[test]
     fn converts_rgba_scanout_bytes_to_presenter_bgra() {

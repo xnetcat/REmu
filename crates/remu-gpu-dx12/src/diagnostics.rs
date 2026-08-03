@@ -8,10 +8,11 @@ use std::sync::OnceLock;
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_AUTO_BREADCRUMB_NODE1, D3D12_AUTO_BREADCRUMB_OP, D3D12_DRED_ALLOCATION_NODE1,
     D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1, D3D12_DRED_ENABLEMENT_FORCED_ON,
-    D3D12_DRED_PAGE_FAULT_OUTPUT1, D3D12_DRED_PAGE_FAULT_OUTPUT2, D3D12GetDebugInterface,
-    ID3D12Debug, ID3D12Debug1, ID3D12Device, ID3D12DeviceRemovedExtendedData1,
-    ID3D12DeviceRemovedExtendedData2, ID3D12DeviceRemovedExtendedDataSettings,
-    ID3D12DeviceRemovedExtendedDataSettings1, ID3D12Object,
+    D3D12_DRED_PAGE_FAULT_OUTPUT1, D3D12_DRED_PAGE_FAULT_OUTPUT2, D3D12_MESSAGE,
+    D3D12GetDebugInterface, ID3D12Debug, ID3D12Debug1, ID3D12Device,
+    ID3D12DeviceRemovedExtendedData1, ID3D12DeviceRemovedExtendedData2,
+    ID3D12DeviceRemovedExtendedDataSettings, ID3D12DeviceRemovedExtendedDataSettings1,
+    ID3D12InfoQueue, ID3D12Object,
 };
 use windows::core::{Interface, PCWSTR};
 
@@ -20,6 +21,8 @@ const MAX_DRED_ALLOCATIONS: usize = 64;
 const MAX_DRED_CONTEXTS: usize = 32;
 const MAX_DRED_STRING_CODE_UNITS: usize = 4_096;
 const DRED_HISTORY_CAPACITY: usize = 65_536;
+const MAX_DEBUG_MESSAGES: u64 = 16;
+const MAX_DEBUG_MESSAGE_BYTES: usize = 4_096;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(super) struct DiagnosticOptions {
@@ -174,9 +177,50 @@ pub(super) fn device_removed_report(device: &ID3D12Device) -> String {
             ("legacy".to_owned(), page_fault)
         }
     };
+    let debug = summarize_debug_messages(device);
     format!(
-        "{reason}; dred_state={device_state}; breadcrumbs={breadcrumbs}; page_fault={page_fault}"
+        "{reason}; dred_state={device_state}; breadcrumbs={breadcrumbs}; page_fault={page_fault}; debug={debug}"
     )
+}
+
+fn summarize_debug_messages(device: &ID3D12Device) -> String {
+    let Ok(info) = device.cast::<ID3D12InfoQueue>() else {
+        return "unavailable".to_owned();
+    };
+    // SAFETY: these methods synchronously inspect messages owned by the device's debug queue.
+    let count = unsafe { info.GetNumStoredMessages() };
+    if count == 0 {
+        return "none".to_owned();
+    }
+    let mut messages = Vec::new();
+    for index in count.saturating_sub(MAX_DEBUG_MESSAGES)..count {
+        let mut byte_count = 0_usize;
+        // SAFETY: a null message pointer requests the exact storage size.
+        if unsafe { info.GetMessage(index, None, &raw mut byte_count) }.is_err()
+            || byte_count < std::mem::size_of::<D3D12_MESSAGE>()
+            || byte_count > MAX_DEBUG_MESSAGE_BYTES
+        {
+            continue;
+        }
+        let mut storage = vec![0_usize; byte_count.div_ceil(std::mem::size_of::<usize>())];
+        let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+        // SAFETY: storage is usize-aligned and covers the requested message byte count.
+        if unsafe { info.GetMessage(index, Some(message), &raw mut byte_count) }.is_err() {
+            continue;
+        }
+        // SAFETY: a successful query points the description into the live message allocation.
+        let description = unsafe {
+            let message = &*message;
+            std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength)
+        };
+        let description = description.strip_suffix(&[0]).unwrap_or(description);
+        messages.push(String::from_utf8_lossy(description).replace(['\r', '\n'], " "));
+    }
+    if messages.is_empty() {
+        format!("{count} message(s), all unavailable or oversized")
+    } else {
+        messages.join(" | ")
+    }
 }
 
 fn summarize_breadcrumbs(output: &D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1) -> String {

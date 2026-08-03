@@ -145,10 +145,20 @@ thick 4 KiB blocks (8 KiB total); treating depth slices as sixteen independently
 incorrectly produced a 64 KiB footprint and overwrote adjacent MallocBinned3 free-list nodes. The
 corrected GFX10 S3 address equations survived a 75-second DRED-enabled run, advanced from the old
 deterministic access violation at submission 16 to submission 595, kept the GPU worker active, and
-left WASAPI active. A follow-up 60-second run with cumulative VideoOut telemetry completed nine
-alternating-buffer flips and left the tenth queued while the GPU was still making progress. This is
-a crash and presentation-progress regression result, not yet a Poppy playability claim: current
-per-draw/dispatch fencing and guest-memory publication still make this workload much too slow.
+left WASAPI active. Cumulative VideoOut telemetry initially appeared to show nine alternating-buffer
+flips in a follow-up 60-second run, but one-shot device-removal reporting proved only the first three
+were native completions; the backend had continued retiring failed presentations after the device
+was lost. This remains a crash and presentation-progress result, not yet a Poppy playability claim:
+current per-draw/dispatch fencing and guest-memory publication still make the workload much too slow.
+
+The removal came from a live indirect-argument buffer containing an X dimension of `0x18003fff`
+(402,669,567 groups), far above Direct3D 12's 65,535-groups-per-dimension limit. `Dispatch` has no
+HRESULT return, so forwarding the value removed the device and only the next allocator call revealed
+the failure. The executor now validates all direct and live-resolved indirect dimensions before
+shader/resource work. A subsequent 60-second DRED run rejected each oversized dispatch, completed
+six real flips, and reached submission 137 without device removal. One-shot removal reports now
+include DRED, page-fault, and available SDK debug-queue state; `REMU_TRACE_D3D12_BINDINGS=1` adds
+per-dispatch resource evidence for diagnosis.
 
 ## Crate and data-flow boundaries
 

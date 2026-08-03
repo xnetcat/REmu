@@ -504,6 +504,7 @@ struct Dx12Presenter {
     guest_queues: BTreeMap<u64, VecDeque<GpuEvent>>,
     queue_turns: VecDeque<u64>,
     presentation_state: PresentationState,
+    device_removal_reported: bool,
     shutdown: bool,
 }
 
@@ -532,8 +533,24 @@ impl Dx12Presenter {
             guest_queues: BTreeMap::new(),
             queue_turns: VecDeque::new(),
             presentation_state: PresentationState::default(),
+            device_removal_reported: false,
             shutdown: false,
         }
+    }
+
+    fn report_device_removal(&mut self) {
+        if self.device_removal_reported {
+            return;
+        }
+        let Some(report) = self
+            .guest_executor
+            .as_ref()
+            .and_then(Dx12GuestExecutor::device_removed_report)
+        else {
+            return;
+        };
+        self.device_removal_reported = true;
+        eprintln!("[REMu][D3D12][DEVICE-REMOVED] {report}");
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -852,9 +869,10 @@ impl Dx12Presenter {
                     });
                 if let Err(error) = result {
                     eprintln!(
-                        "[REMu][D3D12] compute shader {:#x} execution failed: {error}",
-                        dispatch.shader_address,
+                        "[REMu][D3D12] compute {} shader {:#x} execution failed: {error}",
+                        dispatch.sequence, dispatch.shader_address,
                     );
+                    self.report_device_removal();
                 }
             }
             GpuEvent::IndexedDraw(draw) => {
@@ -871,6 +889,7 @@ impl Dx12Presenter {
                         "[REMu][D3D12] draw {} ES={:#x} PS={:#x} execution failed: {error}",
                         draw.sequence, draw.export_shader_address, draw.pixel_shader_address,
                     );
+                    self.report_device_removal();
                 }
             }
             GpuEvent::SubmissionBoundary(sequence) => {
@@ -879,18 +898,18 @@ impl Dx12Presenter {
                 // fenced, so completion is ordered while native targets remain authoritative.
                 // Release/wait packets, overlapping consumers, CPU writes and cache eviction
                 // publish only the allocations that actually cross back to guest memory.
-                let completed = self
+                let result = self
                     .guest_executor
                     .as_mut()
-                    .is_none_or(|executor| match executor.complete_pending_gpu_work() {
-                        Ok(()) => true,
-                        Err(error) => {
-                            eprintln!(
-                                "[REMu][D3D12] submission {sequence} completion failed: {error}"
-                            );
-                            false
-                        }
-                    });
+                    .map_or(Ok(()), Dx12GuestExecutor::complete_pending_gpu_work);
+                let completed = match result {
+                    Ok(()) => true,
+                    Err(error) => {
+                        eprintln!("[REMu][D3D12] submission {sequence} completion failed: {error}");
+                        self.report_device_removal();
+                        false
+                    }
+                };
                 if completed {
                     remu_gpu::record_gpu_submission_completed(sequence);
                 }
