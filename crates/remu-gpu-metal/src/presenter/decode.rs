@@ -9,6 +9,7 @@ use super::{
     RenderTargetFormat, RenderTargetPipelineState, ResourceSpan, decode_sampled_texture_format,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
+    diagnostic_dump_target_address, diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
     diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
     diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
@@ -19,8 +20,9 @@ use super::{
     fragmentless_pixel_program, graphics_allocated_vector_register_count, guest_texture_byte_count,
     half_float_to_f32, is_storage_image_opcode, ngg_memoryless_cover_export_stage,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base, tiled_block_dimensions, trace_image_descriptors,
-    trace_target_sampling, unsigned_float_to_f32, video_target_binding_summary,
+    diagnostic_target_address_matches, program_embeds_global_base, tiled_block_dimensions,
+    trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
+    video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
 use remu_gpu::{GpuRegister, IndexedDraw};

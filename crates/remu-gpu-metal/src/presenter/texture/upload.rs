@@ -680,6 +680,10 @@ pub(crate) fn upload_image_textures(
             } else if let Some(texture) = depth_array_resolve {
                 texture
             } else if let Some(texture) = render_resolve {
+                // Preserve the actual GPU-side source for opt-in scanout provenance. Read-only
+                // bindings do not use this field for write attribution, so recording it cannot
+                // change residency semantics.
+                selected_resident = render_resolve_descriptor;
                 texture
             } else {
                 let key = sampled_texture_key(descriptor, comparison);
