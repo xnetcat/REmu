@@ -200,10 +200,14 @@ pub(crate) fn fallback_image_descriptor(
         .get(3)
         .map_or(0, |word| (word >> 28) & 0xf);
     // Match the texture type emitted by remu-shader-metal. Sample instructions select their
-    // Metal dimension from the instruction itself, while storage instructions use the descriptor
-    // only to distinguish 3D from 2D.
+    // Metal dimension from the instruction itself, while storage instructions preserve known
+    // descriptor 3D and array types even when the remaining descriptor fields are invalid.
     let texture_type = if storage {
-        if encoded_texture_type == 10 { 10 } else { 9 }
+        match encoded_texture_type {
+            10 => 10,
+            11 | 12 | 13 | 15 => 13,
+            _ => 9,
+        }
     } else {
         match binding.control.dimension {
             2 => 10,

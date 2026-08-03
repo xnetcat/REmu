@@ -20,7 +20,7 @@ use super::{
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
-    sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
+    sampled_texture_key, sampled_texture_supports_access, sampled_texture_uses_exact_mode5_mips,
     sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
     snapshot_watched_sampled_texture_raw, storage_image_requires_mip_hierarchy,
     texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
@@ -203,7 +203,26 @@ pub(crate) fn upload_image_textures(
     activity_stamp: ResidentTextureActivityStamp,
 ) -> Result<Vec<UploadedImageTexture>, String> {
     trace_alias_correlated_image_bindings(trace_stage, evaluation, activity_stamp);
-    canonical_texture_bindings(evaluation)
+    let canonical_bindings = canonical_texture_bindings(evaluation);
+    // Access mode is part of the MSL binding identity, so a shader can expose one guest image as
+    // separate read-only and read-write texture arguments. Metal must still receive the same
+    // native allocation for both arguments. Determine the capability superset before creating the
+    // first cache entry; otherwise a load preceding a store would retain a read-only allocation
+    // while the store silently promoted only its later binding.
+    let shader_write_keys = canonical_bindings
+        .iter()
+        .copied()
+        .filter(|binding| is_writable_image_opcode(binding.opcode))
+        .filter_map(|binding| {
+            decode_image_descriptor(&binding.resource_descriptor)
+                .or_else(|_| fallback_image_descriptor(binding))
+                .ok()
+                .map(|descriptor| {
+                    sampled_texture_key(descriptor, image_is_comparison(binding.opcode))
+                })
+        })
+        .collect::<HashSet<_>>();
+    canonical_bindings
         .into_iter()
         .map(|binding| {
             let writable = is_writable_image_opcode(binding.opcode);
@@ -230,6 +249,8 @@ pub(crate) fn upload_image_textures(
             let descriptor = decoded
                 .or_else(|_| fallback_image_descriptor(binding))
                 .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            let key = sampled_texture_key(descriptor, comparison);
+            let requires_shader_write = shader_write_keys.contains(&key);
             // Slate/UMG font atlases are single-channel sampled images whose whole glyph
             // rendering depends on the T# destination select reaching the shader. Log the raw
             // descriptor words and the decoded swizzle once per atlas so a tofu report can be
@@ -581,6 +602,7 @@ pub(crate) fn upload_image_textures(
                     descriptor.texture_type,
                     descriptor.layer_count,
                     false,
+                    requires_shader_write,
                 )?;
                 texture.set_label("REMu diagnostic zero R16Unorm row");
                 texture
@@ -606,14 +628,20 @@ pub(crate) fn upload_image_textures(
                     descriptor.texture_type,
                     descriptor.layer_count,
                     false,
+                    requires_shader_write,
                 )?;
                 texture.set_label("REMu diagnostic R32Float sample");
                 texture
             } else if fallback {
-                let key = sampled_texture_key(descriptor, comparison);
-                if let Some(texture) = fallback_texture_cache.get(&key) {
+                if let Some(texture) = fallback_texture_cache
+                    .get(&key)
+                    .filter(|texture| {
+                        sampled_texture_supports_access(texture, requires_shader_write)
+                    })
+                {
                     texture.clone()
                 } else {
+                    fallback_texture_cache.remove(&key);
                     let (_, _, _, bytes_per_element) =
                         texture_element_layout(descriptor.guest)?;
                     let byte_count = bytes_per_element
@@ -644,6 +672,7 @@ pub(crate) fn upload_image_textures(
                         descriptor.texture_type,
                         descriptor.layer_count,
                         comparison,
+                        requires_shader_write,
                     )?;
                     texture.set_label("REMu fallback guest image");
                     fallback_texture_cache.insert(key, texture.clone());
@@ -686,7 +715,18 @@ pub(crate) fn upload_image_textures(
                 selected_resident = render_resolve_descriptor;
                 texture
             } else {
-                let key = sampled_texture_key(descriptor, comparison);
+                if sampled_texture_cache.get(&key).is_some_and(|cached| {
+                    !sampled_texture_supports_access(
+                        &cached.texture,
+                        requires_shader_write,
+                    )
+                }) && let Some(retired) = sampled_texture_cache.remove(&key)
+                {
+                    // Capabilities cannot be added to an existing Metal allocation. The key
+                    // intentionally remains access-agnostic so the replacement becomes the one
+                    // coherent identity reused by later samples, loads, and stores.
+                    retire_sampled_texture(retired);
+                }
                 let reload = if let Some(cached) = sampled_texture_cache.get_mut(&key) {
                     let refresh = refresh_sampled_texture_write_watch(
                         key,
@@ -736,6 +776,7 @@ pub(crate) fn upload_image_textures(
                             descriptor,
                             &raw,
                             comparison,
+                            requires_shader_write,
                         )
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?
                     } else if sampled_texture_uses_exact_mode27_mips(descriptor) {
@@ -768,6 +809,7 @@ pub(crate) fn upload_image_textures(
                                 descriptor.texture_type,
                                 descriptor.layer_count,
                                 comparison,
+                                requires_shader_write,
                             )?
                         };
                     texture.set_label(&format!(

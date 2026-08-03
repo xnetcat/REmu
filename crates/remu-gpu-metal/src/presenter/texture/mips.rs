@@ -10,7 +10,7 @@ use super::{
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
     record_mode27_work_detail, record_texture_work, refresh_resident_texture_write_watch,
     resident_texture_for_sample, snapshot_watched_guest_range, trace_resident_texture_removal,
-    watch_resident_texture,
+    sampled_texture_usage, watch_resident_texture,
 };
 use metal::{
     CommandBufferRef, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
@@ -437,6 +437,7 @@ pub(crate) fn create_exact_mode5_sampled_mip_view(
     descriptor: DecodedImageDescriptor,
     raw: &[u8],
     comparison: bool,
+    writable: bool,
 ) -> Result<Texture, String> {
     if comparison {
         return Err(format!(
@@ -482,11 +483,10 @@ pub(crate) fn create_exact_mode5_sampled_mip_view(
                 .map(|(_, levels)| levels)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let usage = if compressed_texture_block_extent(descriptor.guest.pixel_format).is_some() {
-        MTLTextureUsage::ShaderRead
-    } else {
-        MTLTextureUsage::ShaderRead | MTLTextureUsage::PixelFormatView
-    };
+    let mut usage = sampled_texture_usage(comparison, writable)?;
+    if compressed_texture_block_extent(descriptor.guest.pixel_format).is_none() {
+        usage |= MTLTextureUsage::PixelFormatView;
+    }
     let metal_descriptor = TextureDescriptor::new();
     let texture_type = if descriptor.texture_type == 9 {
         MTLTextureType::D2
