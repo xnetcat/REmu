@@ -1,6 +1,4 @@
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, OnceLock};
@@ -8,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use remu_memory::notify_guest_memory_written;
 
+use crate::av_player_libav::{self, LibavDemuxSession};
 use crate::{
     AvPlayerDecoder, AvPlayerDecoderProgress, AvPlayerEventCallback, AvPlayerEventDelivery,
     AvPlayerInstance, AvPlayerTextureDeallocation, PROBE_DISPATCH, ProbeDispatchState,
@@ -19,6 +18,33 @@ use crate::{
 
 pub(crate) const AV_PLAYER_ERROR_INVALID_PARAMS: u32 = 0x806a_0001;
 pub(crate) const AV_PLAYER_ERROR_OPERATION_FAILED: u32 = 0x806a_0002;
+
+/// Owned NV12 geometry published to the guest (plan I4 / B25).
+///
+/// `chroma_offset` is the single source of truth for the UV plane base. Every consumer of the
+/// layout — buffer sizing, packing, and VideoFrameInfo crop fields — must derive from this
+/// descriptor rather than recomputing storage height independently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Nv12Layout {
+    pub visible_width: usize,
+    pub visible_height: usize,
+    pub pitch: usize,
+    pub storage_height: usize,
+    pub chroma_offset: usize,
+    pub frame_bytes: usize,
+    pub crop_right: u32,
+    pub crop_bottom: u32,
+}
+
+/// SDK `sceavplayer.h:413` / `sceavplayer_ex.h:242`: values 2..16 are valid; otherwise default 2.
+pub(crate) fn av_player_normalize_output_buffer_count(raw: i32) -> usize {
+    if (2..=16).contains(&raw) {
+        raw as usize
+    } else {
+        2
+    }
+}
+
 
 #[derive(Debug, PartialEq, Eq)]
 enum AvPlayerDecoderPoll {
@@ -177,12 +203,8 @@ impl AvPlayerDecoder {
         if let Some(progress) = &self.progress {
             progress.queue_blocked.store(false, Ordering::Release);
         }
-        if let Some(child) = self.child.as_mut() {
-            // Closing the process side of the pipe makes a decoder worker blocked in read_exact
-            // return immediately. Child collection and the host-thread join happen on the
-            // reaper, never under the process-wide guest dispatch lock.
-            let _ = child.kill();
-        }
+        // Join the in-process libav worker on the reaper thread, never under the process-wide
+        // guest dispatch lock.
         if let Err(error) = av_player_decoder_reaper().send(self) {
             let mut decoder = error.0;
             decoder.reap();
@@ -194,10 +216,6 @@ impl AvPlayerDecoder {
         if let Some(progress) = &self.progress {
             progress.queue_blocked.store(false, Ordering::Release);
         }
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -206,9 +224,9 @@ impl AvPlayerDecoder {
 
 impl Drop for AvPlayerDecoder {
     fn drop(&mut self) {
-        // Normal playback teardown reaches `retire` and leaves both handles empty before drop.
+        // Normal playback teardown reaches `retire` and leaves the worker empty before drop.
         // This fallback is for a failed reaper startup/channel and process-state destruction.
-        if self.child.is_some() || self.worker.is_some() {
+        if self.worker.is_some() {
             self.reap();
         }
     }
@@ -292,7 +310,7 @@ pub(crate) fn av_player_next_backpressure_report(previous: Option<Duration>) -> 
 }
 
 fn av_player_decoder_worker(
-    mut output: std::process::ChildStdout,
+    mut session: LibavDemuxSession,
     frame_bytes: usize,
     sender: SyncSender<Vec<u8>>,
     cancelled: Arc<AtomicBool>,
@@ -302,8 +320,13 @@ fn av_player_decoder_worker(
     let mut decoded_frame = 0_u64;
     while !cancelled.load(Ordering::Acquire) {
         let mut frame = vec![0_u8; frame_bytes];
-        if output.read_exact(&mut frame).is_err() {
-            break;
+        match session.read_frame(&mut frame) {
+            0 => {}
+            1 => break, // EOF
+            _ => {
+                eprintln!("[REMu][AVPLAYER] in-process {kind} decoder failed mid-stream");
+                break;
+            }
         }
         decoded_frame = decoded_frame.saturating_add(1);
         if !av_player_send_decoded_frame(
@@ -322,6 +345,9 @@ fn av_player_decoder_worker(
     }
 }
 
+/// Locates a host ffmpeg/ffprobe binary for test fixture generation only.
+/// Production decode is in-process libavcodec (P5); this is not a behaviour flag.
+#[cfg(test)]
 pub(crate) fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
     if let Some(configured) = std::env::var_os(environment).map(PathBuf::from)
         && configured.is_file()
@@ -342,80 +368,11 @@ pub(crate) fn av_player_tool(name: &str, environment: &str) -> Option<PathBuf> {
 }
 
 fn av_player_probe_video(path: &Path) -> Option<(u32, u32, f64, Duration)> {
-    let ffprobe = av_player_tool("ffprobe", "REMU_FFPROBE")?;
-    let output = Command::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height,avg_frame_rate,duration",
-            "-of",
-            "default=noprint_wrappers=1",
-        ])
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let fields = String::from_utf8(output.stdout).ok()?;
-    let mut width = 0;
-    let mut height = 0;
-    let mut frames_per_second = 30.0;
-    let mut duration = Duration::ZERO;
-    for line in fields.lines() {
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        match name {
-            "width" => width = value.parse().ok()?,
-            "height" => height = value.parse().ok()?,
-            "avg_frame_rate" => {
-                let (numerator, denominator) = value.split_once('/').unwrap_or((value, "1"));
-                let (Ok(numerator), Ok(denominator)) =
-                    (numerator.parse::<f64>(), denominator.parse::<f64>())
-                else {
-                    continue;
-                };
-                if numerator.is_finite() && denominator.is_finite() && denominator > 0.0 {
-                    frames_per_second = numerator / denominator;
-                }
-            }
-            "duration" => {
-                if let Ok(seconds) = value.parse::<f64>()
-                    && seconds.is_finite()
-                    && seconds >= 0.0
-                {
-                    duration = Duration::from_secs_f64(seconds);
-                }
-            }
-            _ => {}
-        }
-    }
-    (width != 0 && height != 0 && frames_per_second.is_finite() && frames_per_second > 0.0)
-        .then_some((width, height, frames_per_second, duration))
+    av_player_libav::probe_video(path)
 }
 
 fn av_player_probe_has_audio(path: &Path) -> bool {
-    let Some(ffprobe) = av_player_tool("ffprobe", "REMU_FFPROBE") else {
-        return false;
-    };
-    Command::new(ffprobe)
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "a:0",
-            "-show_entries",
-            "stream=index",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-        .is_ok_and(|output| output.status.success() && !output.stdout.is_empty())
+    av_player_libav::probe_has_audio(path)
 }
 
 /// Clamps a media source path at the application filesystem root.
@@ -504,6 +461,8 @@ pub(crate) fn av_player_init(arguments: [u64; 6], state: &mut ProbeDispatchState
     state.av_player.next_handle = handle.saturating_add(1);
     // EventReplacement follows MemAllocator (0x28) and FileReplacement (0x28): object@0x50, cb@0x58.
     // auto_start sits after debug_level/base_priority/num_framebuffers (0x60+0xc = 0x6c).
+    // numOutputVideoFrameBuffers is i32 at +0x68 (sceavplayer.h:413).
+    let num_output = av_player_normalize_output_buffer_count(read_guest_u32(parameter + 0x68) as i32);
     state.av_player.players.insert(
         handle,
         AvPlayerInstance {
@@ -538,7 +497,8 @@ pub(crate) fn av_player_init(arguments: [u64; 6], state: &mut ProbeDispatchState
             raw_video_frame: Vec::new(),
             padded_video_frame: Vec::new(),
             video_buffer_base: 0,
-            video_buffers: [0; 3],
+            video_buffers: vec![0; num_output],
+            num_output_video_frame_buffers: num_output,
             video_buffer_stride: 0,
             next_video_buffer: 0,
             next_video_frame: 0,
@@ -610,6 +570,12 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
         unsafe { std::slice::from_raw_parts(parameter as *const u8, size).to_vec() };
     let handle = state.av_player.next_handle.max(1);
     state.av_player.next_handle = handle.saturating_add(1);
+    // sceavplayer_ex.h:242 — numOutputVideoFrameBuffers follows the nine ThreadInfo records at +0x228.
+    let num_output = if size >= 0x22c {
+        av_player_normalize_output_buffer_count(read_guest_u32(parameter + 0x228) as i32)
+    } else {
+        2
+    };
     state.av_player.players.insert(
         handle,
         AvPlayerInstance {
@@ -651,7 +617,8 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             raw_video_frame: Vec::new(),
             padded_video_frame: Vec::new(),
             video_buffer_base: 0,
-            video_buffers: [0; 3],
+            video_buffers: vec![0; num_output],
+            num_output_video_frame_buffers: num_output,
             video_buffer_stride: 0,
             next_video_buffer: 0,
             next_video_frame: 0,
@@ -687,6 +654,7 @@ pub(crate) fn av_player_post_init(arguments: [u64; 6], state: &ProbeDispatchStat
 }
 
 fn av_player_queue_event(
+    handle: u64,
     function: u64,
     object: u64,
     event: u64,
@@ -701,6 +669,7 @@ fn av_player_queue_event(
         .av_player
         .pending_callbacks
         .push(AvPlayerEventCallback {
+            handle,
             function,
             object,
             event,
@@ -815,21 +784,22 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
         let Some(player) = state.av_player.players.get(&handle) else {
             return;
         };
-        if player.video_buffers[0] != 0
+        if player.video_buffers.first().copied().unwrap_or(0) != 0
             || player.allocate_texture_callback == 0
             || player.width == 0
             || player.height == 0
         {
             return;
         }
-        let Some((_, stride)) = av_player_nv12_layout(player.width, player.height, extended) else {
+        let Some(layout) = av_player_nv12_layout(player.width, player.height, extended) else {
             return;
         };
         (
             player.allocate_texture_callback,
             player.deallocate_texture_callback,
             player.allocator_object,
-            stride,
+            layout.frame_bytes,
+            player.num_output_video_frame_buffers.max(2),
         )
     };
     if !process_guest_range_has_read_access(request.0, 1)
@@ -846,19 +816,18 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
     // object. This runs before the process dispatch lock is acquired, so the allocator may call
     // kernel memory exports while it obtains GPU-visible storage.
     let allocate: AllocateTexture = unsafe { std::mem::transmute(request.0) };
-    let mut buffers = [0_u64; 3];
-    for (index, buffer) in buffers.iter_mut().enumerate() {
-        let Ok(size) = u32::try_from(request.3) else {
-            return;
-        };
+    let Ok(size) = u32::try_from(request.3) else {
+        return;
+    };
+    let mut buffers = Vec::with_capacity(request.4);
+    for index in 0..request.4 {
         // SAFETY: The callback ABI is `(object, alignment, size)`.
-        *buffer = unsafe { allocate(request.2, 0x100, size) };
-        if *buffer == 0 {
+        let buffer = unsafe { allocate(request.2, 0x100, size) };
+        if buffer == 0 {
             eprintln!("[REMu][AVPLAYER] texture allocator returned null for buffer {index}");
             invoke_av_player_texture_deallocations(
-                buffers[..index]
-                    .iter()
-                    .copied()
+                buffers
+                    .into_iter()
                     .map(|address| AvPlayerTextureDeallocation {
                         function: request.1,
                         object: request.2,
@@ -868,17 +837,19 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
             );
             return;
         }
+        buffers.push(buffer);
     }
     let mut state = dispatch
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let installed = if let Some(player) = state.av_player.players.get_mut(&handle)
-        && player.video_buffers[0] == 0
+        && player.video_buffers.first().copied().unwrap_or(0) == 0
     {
-        player.video_buffers = buffers;
+        player.video_buffers = buffers.clone();
         player.video_buffer_stride = request.3;
         eprintln!(
-            "[REMu][AVPLAYER] allocated guest video buffers size={} addresses={buffers:#x?}",
+            "[REMu][AVPLAYER] allocated guest video buffers count={} size={} addresses={buffers:#x?}",
+            request.4,
             request.3
         );
         true
@@ -952,6 +923,7 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
         player.auto_start,
     );
     av_player_queue_event(
+        arguments[0],
         callback.0,
         callback.1,
         2,
@@ -961,6 +933,7 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
     if callback.2 {
         // Auto-start is performed as part of the controller's Ready transition.
         av_player_queue_event(
+            arguments[0],
             callback.0,
             callback.1,
             3,
@@ -1008,29 +981,10 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
     } {
         return true;
     }
-    let (Some(ffmpeg), Some(source)) = (
-        av_player_tool("ffmpeg", "REMU_FFMPEG"),
-        player.source.as_deref(),
-    ) else {
+    let Some(source) = player.source.as_deref() else {
+        eprintln!("[REMu][AVPLAYER] decoder start rejected: no source");
         return false;
     };
-    let mut command = Command::new(ffmpeg);
-    command.args(["-nostdin", "-hide_banner", "-loglevel", "error"]);
-    if !player.decoder_seek.is_zero() {
-        // JumpToTime restarts the decoders; the input-side seek makes them begin at the target
-        // instead of replaying the stream from byte zero.
-        command.args(["-ss", &format!("{:.3}", player.decoder_seek.as_secs_f64())]);
-    }
-    command.arg("-i").arg(source);
-    if audio {
-        command.args([
-            "-map", "0:a:0", "-vn", "-ac", "2", "-ar", "48000", "-f", "s16le", "pipe:1",
-        ]);
-    } else {
-        command.args([
-            "-map", "0:v:0", "-an", "-pix_fmt", "nv12", "-f", "rawvideo", "pipe:1",
-        ]);
-    }
     let frame_bytes = if audio {
         Some(1024 * 2 * 2)
     } else {
@@ -1041,15 +995,22 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
             .and_then(|bytes| usize::try_from(bytes).ok())
     };
     let Some(frame_bytes) = frame_bytes else {
+        eprintln!("[REMu][AVPLAYER] decoder start rejected: invalid frame size");
         return false;
     };
-    let Ok(mut child) = command.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
-        return false;
-    };
-    let Some(output) = child.stdout.take() else {
-        let _ = child.kill();
-        let _ = child.wait();
-        return false;
+    let session = match LibavDemuxSession::open(
+        Path::new(source),
+        audio,
+        player.decoder_seek,
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!(
+                "[REMu][AVPLAYER] in-process {} decoder open failed source={source:?}: {error}",
+                if audio { "audio" } else { "video" }
+            );
+            return false;
+        }
     };
     let (sender, frames) = mpsc::sync_channel(if audio { 8 } else { 4 });
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -1062,7 +1023,7 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
         .name(format!("REMu AVPlayer {kind}"))
         .spawn(move || {
             av_player_decoder_worker(
-                output,
+                session,
                 frame_bytes,
                 sender,
                 worker_cancelled,
@@ -1071,12 +1032,10 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
             );
         })
     else {
-        let _ = child.kill();
-        let _ = child.wait();
+        eprintln!("[REMu][AVPLAYER] failed to spawn in-process {kind} decoder worker");
         return false;
     };
     let decoder = AvPlayerDecoder {
-        child: Some(child),
         frames: std::sync::Mutex::new(frames),
         cancelled,
         worker: Some(worker),
@@ -1091,7 +1050,7 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
     }
     player.playing_since.get_or_insert_with(Instant::now);
     eprintln!(
-        "[REMu][AVPLAYER] started {} decoder source={source:?}",
+        "[REMu][AVPLAYER] started in-process {} decoder source={source:?}",
         if audio { "audio" } else { "video" }
     );
     true
@@ -1129,7 +1088,7 @@ fn av_player_read_audio_frame(player: &mut AvPlayerInstance) -> AvPlayerFrameSta
 ///
 /// The demuxer reaches EOF before its per-stream decoder queues do. shadPS4 consequently keeps a
 /// source active until both audio and video queues are empty, then emits one controller-thread
-/// Stop event. REmu uses independent ffmpeg workers, so the equivalent boundary is the point where
+/// Stop event. REmu uses independent in-process libav workers, so the equivalent boundary is the point where
 /// every worker has disconnected after its public frame queue was consumed. Finishing on video EOF
 /// alone truncates the tail of an audio track and can advance a cutscene state machine while its
 /// narration is still queued.
@@ -1188,9 +1147,14 @@ fn av_player_mark_decoder_drained(player: &mut AvPlayerInstance, audio: bool) {
     }
 }
 
-fn av_player_queue_natural_stop(callback: Option<(u64, u64)>, state: &mut ProbeDispatchState) {
+fn av_player_queue_natural_stop(
+    handle: u64,
+    callback: Option<(u64, u64)>,
+    state: &mut ProbeDispatchState,
+) {
     if let Some((function, object)) = callback {
         av_player_queue_event(
+            handle,
             function,
             object,
             1,
@@ -1204,35 +1168,102 @@ pub(crate) fn av_player_nv12_layout(
     width: u32,
     height: u32,
     extended: bool,
-) -> Option<(usize, usize)> {
-    let width = usize::try_from(width).ok()?;
-    let height = usize::try_from(height).ok()?;
+) -> Option<Nv12Layout> {
+    let visible_width = usize::try_from(width).ok()?;
+    let visible_height = usize::try_from(height).ok()?;
     // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the raw visible height.
     // Disassembly of Poppy Playtime's FAVPlayerMovieStreamer and UE MediaPlayer consumers
     // (ghidra-avplayer-abi.md) proves both derive the chroma plane as pData + pitch*height
     // with height used unaligned — a tightly packed NV12 with no inter-plane padding. Legacy
     // frame info has no explicit pitch and exposes both dimensions 16-aligned.
-    let (row_pitch, storage_height) = if extended {
-        (width.checked_add(255)? & !255, height)
+    // SDK/I4: settle align256 vs align64 from that measurement — extended keeps align256.
+    let (pitch, storage_height) = if extended {
+        (visible_width.checked_add(255)? & !255, visible_height)
     } else {
-        (width.checked_add(15)? & !15, height.checked_add(15)? & !15)
+        (
+            visible_width.checked_add(15)? & !15,
+            visible_height.checked_add(15)? & !15,
+        )
     };
-    let frame_bytes = row_pitch
-        .checked_mul(storage_height)?
-        .checked_mul(3)?
-        .checked_div(2)?;
-    Some((row_pitch, frame_bytes))
+    let chroma_offset = pitch.checked_mul(storage_height)?;
+    // Chroma occupies `pitch` bytes per chroma row (interleaved UV), including pitch padding.
+    let frame_bytes = chroma_offset.checked_add(pitch.checked_mul(storage_height.div_ceil(2))?)?;
+    let crop_right = u32::try_from(pitch.saturating_sub(visible_width)).unwrap_or_default();
+    let crop_bottom = u32::try_from(storage_height.saturating_sub(visible_height)).unwrap_or_default();
+    Some(Nv12Layout {
+        visible_width,
+        visible_height,
+        pitch,
+        storage_height,
+        chroma_offset,
+        frame_bytes,
+        crop_right,
+        crop_bottom,
+    })
+}
+
+/// Pack a tightly packed NV12 frame into the published layout with edge-extension padding (I4).
+///
+/// Luma pitch/height padding copies the last visible sample; chroma column padding uses 0x80
+/// (neutral chroma) so BT.709 limited-range does not turn the pad into green.
+pub(crate) fn av_player_pack_nv12_edge_extend(
+    packed: &[u8],
+    width: usize,
+    height: usize,
+    layout: &Nv12Layout,
+    out: &mut [u8],
+) {
+    assert!(out.len() >= layout.frame_bytes);
+    let src_chroma = width * height;
+    // Luma rows + height padding
+    for row in 0..layout.storage_height {
+        let src_row = row.min(height.saturating_sub(1));
+        let src = src_row * width;
+        let dst = row * layout.pitch;
+        if width > 0 && height > 0 {
+            out[dst..dst + width].copy_from_slice(&packed[src..src + width]);
+            let edge = packed[src + width - 1];
+            out[dst + width..dst + layout.pitch].fill(edge);
+        } else {
+            out[dst..dst + layout.pitch].fill(0);
+        }
+    }
+    // Chroma rows + height padding
+    let chroma_rows = height.div_ceil(2);
+    let storage_chroma_rows = layout.storage_height.div_ceil(2);
+    for row in 0..storage_chroma_rows {
+        let src_row = row.min(chroma_rows.saturating_sub(1));
+        let src = src_chroma + src_row * width;
+        let dst = layout.chroma_offset + row * layout.pitch;
+        if width > 0 && chroma_rows > 0 {
+            out[dst..dst + width].copy_from_slice(&packed[src..src + width]);
+            // Neutral chroma for the pitch pad (U=0x80,V=0x80 repeating).
+            let mut pad = dst + width;
+            while pad + 1 < dst + layout.pitch {
+                out[pad] = 0x80;
+                out[pad + 1] = 0x80;
+                pad += 2;
+            }
+            if pad < dst + layout.pitch {
+                out[pad] = 0x80;
+            }
+        } else {
+            out[dst..dst + layout.pitch].fill(0x80);
+        }
+    }
 }
 
 fn av_player_ensure_video_buffers(player: &mut AvPlayerInstance, extended: bool) -> bool {
-    if player.video_buffers[0] != 0 {
+    if player.video_buffers.first().copied().unwrap_or(0) != 0 {
         return true;
     }
-    let Some((_, stride)) = av_player_nv12_layout(player.width, player.height, extended) else {
+    let Some(layout) = av_player_nv12_layout(player.width, player.height, extended) else {
         return false;
     };
-    let Some(total) = stride
-        .checked_mul(3)
+    let count = player.num_output_video_frame_buffers.max(2);
+    let Some(total) = layout
+        .frame_bytes
+        .checked_mul(count)
         .and_then(|bytes| u64::try_from(bytes).ok())
     else {
         return false;
@@ -1250,15 +1281,18 @@ fn av_player_ensure_video_buffers(player: &mut AvPlayerInstance, extended: bool)
         )
     };
     player.video_buffer_base = allocation;
-    for (index, buffer) in player.video_buffers.iter_mut().enumerate() {
-        *buffer = allocation
-            + u64::try_from(index)
-                .unwrap_or(0)
-                .saturating_mul(u64::try_from(stride).unwrap_or(0));
-    }
-    player.video_buffer_stride = stride;
+    player.video_buffers = (0..count)
+        .map(|index| {
+            allocation
+                + u64::try_from(index)
+                    .unwrap_or(0)
+                    .saturating_mul(u64::try_from(layout.frame_bytes).unwrap_or(0))
+        })
+        .collect();
+    player.video_buffer_stride = layout.frame_bytes;
     eprintln!(
-        "[REMu][AVPLAYER] allocated fallback video buffers size={stride} base={allocation:#x}"
+        "[REMu][AVPLAYER] allocated fallback video buffers count={count} size={} base={allocation:#x}",
+        layout.frame_bytes
     );
     true
 }
@@ -1272,50 +1306,34 @@ fn av_player_write_video_frame(
     if !av_player_ensure_video_buffers(player, extended) {
         return false;
     }
-    let Some((row_pitch, frame_bytes)) =
-        av_player_nv12_layout(player.width, player.height, extended)
-    else {
+    let Some(layout) = av_player_nv12_layout(player.width, player.height, extended) else {
         return false;
     };
-    if player.video_buffer_stride < frame_bytes {
+    if player.video_buffer_stride < layout.frame_bytes {
         return false;
     }
     let width = usize::try_from(player.width).unwrap_or(0);
     let height = usize::try_from(player.height).unwrap_or(0);
-    // The chroma destination must sit exactly where the layout published it: at
-    // row_pitch*height on the extended path, and at the 16-aligned storage height on the
-    // legacy path.
-    let storage_height = if extended {
-        height
-    } else {
-        height.saturating_add(15) & !15
-    };
     // The decoder hands over a tightly packed frame whose UV plane starts at width*height.
-    // The published layout promises UV at row_pitch*storage_height, so the packed frame can
-    // only be forwarded untouched when both dimensions already match their aligned forms.
-    let frame = if row_pitch == width && storage_height == height {
+    // Forward untouched only when the published layout is already tightly packed.
+    let frame = if layout.pitch == width && layout.storage_height == height {
         &player.raw_video_frame
     } else {
-        player.padded_video_frame.resize(frame_bytes, 0);
-        player.padded_video_frame.fill(0);
-        for row in 0..height {
-            let source = row * width;
-            let destination = row * row_pitch;
-            player.padded_video_frame[destination..destination + width]
-                .copy_from_slice(&player.raw_video_frame[source..source + width]);
-        }
-        let source_chroma = width * height;
-        let destination_chroma = row_pitch * storage_height;
-        for row in 0..height.div_ceil(2) {
-            let source = source_chroma + row * width;
-            let destination = destination_chroma + row * row_pitch;
-            player.padded_video_frame[destination..destination + width]
-                .copy_from_slice(&player.raw_video_frame[source..source + width]);
-        }
+        player.padded_video_frame.resize(layout.frame_bytes, 0);
+        av_player_pack_nv12_edge_extend(
+            &player.raw_video_frame,
+            width,
+            height,
+            &layout,
+            &mut player.padded_video_frame,
+        );
         &player.padded_video_frame
     };
+    if player.video_buffers.is_empty() {
+        return false;
+    }
     let address = player.video_buffers[player.next_video_buffer];
-    player.next_video_buffer = (player.next_video_buffer + 1) % 3;
+    player.next_video_buffer = (player.next_video_buffer + 1) % player.video_buffers.len();
     // SAFETY: the destination is one complete slice of the dedicated three-frame allocation.
     unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), address as *mut u8, frame.len()) };
     remu_memory::record_guest_write(
@@ -1332,7 +1350,7 @@ fn av_player_write_video_frame(
         timestamp_milliseconds,
         player.width,
         player.height,
-        row_pitch,
+        layout.pitch,
         player.frames_per_second,
         extended,
     );
@@ -1509,7 +1527,7 @@ pub(crate) fn av_player_video_catch_up_target(
         target = target.min(total_frames.saturating_sub(1));
     }
 
-    // Sequentially draining ffmpeg preserves decoder state and exact frame ordering. Bound the
+    // Sequentially draining the in-process decoder preserves decoder state and exact frame ordering. Bound the
     // work by bytes as well as frames so a tiny UI movie can catch up promptly without one poll
     // reading hundreds of MiB from a 4K stream.
     const MAXIMUM_CATCH_UP_BYTES: usize = 64 * 1_024 * 1_024;
@@ -1683,11 +1701,17 @@ pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u6
     let Some(mut player) = state.av_player.players.remove(&handle) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
+    // I4 / B25: a Stop→Close sequence must not deliver the STOP callback into a freed object.
+    state
+        .av_player
+        .pending_callbacks
+        .retain(|callback| callback.handle != handle);
     if player.video_buffer_base == 0 && player.deallocate_texture_callback != 0 {
         state.av_player.pending_texture_deallocations.extend(
             player
                 .video_buffers
-                .into_iter()
+                .iter()
+                .copied()
                 .filter(|address| *address != 0)
                 .map(|address| AvPlayerTextureDeallocation {
                     function: player.deallocate_texture_callback,
@@ -1697,7 +1721,7 @@ pub(crate) fn av_player_close(handle: u64, state: &mut ProbeDispatchState) -> u6
         );
         // The callbacks now own these addresses. Clear the instance copy before its teardown so
         // future Drop changes cannot accidentally treat callback-owned memory as fallback memory.
-        player.video_buffers = [0; 3];
+        player.video_buffers.clear();
     }
     0
 }
@@ -1747,6 +1771,7 @@ pub(crate) fn av_player_pause(handle: u64, state: &mut ProbeDispatchState) -> u6
     player.video_catch_up_origin = None;
     let callback = (player.event_callback, player.event_object);
     av_player_queue_event(
+        handle,
         callback.0,
         callback.1,
         4,
@@ -1776,6 +1801,7 @@ pub(crate) fn av_player_start(handle: u64, state: &mut ProbeDispatchState) -> u6
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] started handle={handle:#x}");
     av_player_queue_event(
+        handle,
         callback.0,
         callback.1,
         3,
@@ -1801,6 +1827,7 @@ pub(crate) fn av_player_resume(handle: u64, state: &mut ProbeDispatchState) -> u
     let callback = (player.event_callback, player.event_object);
     eprintln!("[REMu][AVPLAYER] resumed handle={handle:#x}");
     av_player_queue_event(
+        handle,
         callback.0,
         callback.1,
         3,
@@ -1857,6 +1884,7 @@ pub(crate) fn av_player_stop(handle: u64, state: &mut ProbeDispatchState) -> u64
     player.paused = false;
     let callback = (player.event_callback, player.event_object);
     av_player_queue_event(
+        handle,
         callback.0,
         callback.1,
         1,
@@ -1982,7 +2010,7 @@ pub(crate) fn av_player_get_video_data(
     }
     if player.video_decoder_drained {
         let callback = av_player_finish_stream_if_drained(arguments[0], player);
-        av_player_queue_natural_stop(callback, state);
+        av_player_queue_natural_stop(arguments[0], callback, state);
         av_player_trace_zero_return(arguments[0], "video", "decoder-drained");
         return 0;
     }
@@ -2037,7 +2065,7 @@ pub(crate) fn av_player_get_video_data(
             AvPlayerFrameStatus::Finished => {
                 av_player_mark_decoder_drained(player, false);
                 let callback = av_player_finish_stream_if_drained(arguments[0], player);
-                av_player_queue_natural_stop(callback, state);
+                av_player_queue_natural_stop(arguments[0], callback, state);
                 return 0;
             }
         }
@@ -2059,7 +2087,7 @@ pub(crate) fn av_player_get_video_data(
         AvPlayerFrameStatus::Finished => {
             av_player_mark_decoder_drained(player, false);
             let callback = av_player_finish_stream_if_drained(arguments[0], player);
-            av_player_queue_natural_stop(callback, state);
+            av_player_queue_natural_stop(arguments[0], callback, state);
             return 0;
         }
     }
@@ -2121,7 +2149,7 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
     }
     if player.audio_decoder_drained {
         let callback = av_player_finish_stream_if_drained(arguments[0], player);
-        av_player_queue_natural_stop(callback, state);
+        av_player_queue_natural_stop(arguments[0], callback, state);
         av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
         return 0;
     }
@@ -2138,7 +2166,7 @@ pub(crate) fn av_player_get_audio_data(arguments: [u64; 6], state: &mut ProbeDis
         AvPlayerFrameStatus::Finished => {
             av_player_mark_decoder_drained(player, true);
             let callback = av_player_finish_stream_if_drained(arguments[0], player);
-            av_player_queue_natural_stop(callback, state);
+            av_player_queue_natural_stop(arguments[0], callback, state);
             av_player_trace_zero_return(arguments[0], "audio", "decoder-drained");
             return 0;
         }

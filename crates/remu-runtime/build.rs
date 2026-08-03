@@ -5,17 +5,20 @@
 //! - LibAtrac9 (plan P1) — ATRAC9
 //! - minimp3 (plan P6) — MP3
 //! - ooz + SIMDe (plan P3) — Kraken/Oodle decompress
+//! - libav bridge (plan P5) — in-process AvPlayer/Videodec2 decode against system ffmpeg
 //!
 //! Third-party C/C++ is compiled with `.warnings(false)` so it cannot perturb the workspace
 //! warning budget. The `cc` crate picks up the active target, so the same sources build for
 //! arm64 and x86_64 (ooz SSE goes through SIMDe on Apple Silicon).
 
 use std::path::Path;
+use std::process::Command;
 
 fn main() {
     build_atrac9();
     build_minimp3();
     build_ooz();
+    build_libav_bridge();
     println!("cargo:rerun-if-changed=build.rs");
 }
 
@@ -80,4 +83,60 @@ fn build_ooz() {
     build.compile("ooz");
     println!("cargo:rerun-if-changed=vendored/ooz");
     println!("cargo:rerun-if-changed=vendored/simde");
+}
+
+fn build_libav_bridge() {
+    let dir = Path::new("vendored/libav_bridge");
+    let mut build = cc::Build::new();
+    build
+        .file(dir.join("remu_libav_bridge.c"))
+        .include(dir)
+        .warnings(false)
+        .flag_if_supported("-std=c11");
+
+    let host = std::env::var("HOST").unwrap_or_default();
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let cross = host != target;
+    let linked = !cross && try_link_system_libav(&mut build);
+    if !linked {
+        build.define("REMU_LIBAV_STUB", None);
+        println!(
+            "cargo:warning=libav bridge stubbed (cross-target or system ffmpeg unavailable)"
+        );
+    }
+    build.compile("remu_libav_bridge");
+    println!("cargo:rerun-if-changed=vendored/libav_bridge");
+}
+
+fn try_link_system_libav(build: &mut cc::Build) -> bool {
+    let Ok(output) = Command::new("pkg-config")
+        .args([
+            "--cflags",
+            "--libs",
+            "libavformat",
+            "libavcodec",
+            "libavutil",
+            "libswscale",
+            "libswresample",
+        ])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let Ok(flags) = String::from_utf8(output.stdout) else {
+        return false;
+    };
+    for token in flags.split_whitespace() {
+        if let Some(include) = token.strip_prefix("-I") {
+            build.include(include);
+        } else if let Some(lib_dir) = token.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={lib_dir}");
+        } else if let Some(lib) = token.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    }
+    true
 }

@@ -22,6 +22,7 @@ mod audio_out2;
 mod audio_out2_abi;
 mod av;
 mod av_player;
+mod av_player_libav;
 mod ces;
 mod dialog;
 mod guest_files;
@@ -64,7 +65,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
@@ -179,7 +179,7 @@ pub(crate) use audio_out2_abi::{
     trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_audio_out2_pcm,
     write_audio_out2_context_param, write_audio_out2_port_state,
 };
-#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
+#[cfg(test)]
 pub(crate) use av_player::av_player_nv12_layout;
 #[cfg(test)]
 pub(crate) use av_player::{
@@ -521,6 +521,8 @@ struct ProbeDispatchState {
     save_transactions: BTreeMap<u32, SaveDataTransaction>,
     /// Opaque Videodec2 compute queues returned by `sceVideodec2AllocateComputeQueue`.
     videodec2_compute_queues: BTreeSet<u64>,
+    /// Live Videodec2 decoder instances keyed by the opaque handle returned to the guest.
+    videodec2_decoders: BTreeMap<u64, videodec2::Videodec2Decoder>,
 }
 
 #[derive(Debug)]
@@ -550,6 +552,9 @@ struct AvPlayerRuntimeState {
 
 #[derive(Clone, Copy, Debug)]
 struct AvPlayerEventCallback {
+    /// Player handle that queued the event. Close purges by this key so a Stop→Close sequence
+    /// cannot deliver into a freed game object (plan I4 / B25).
+    handle: u64,
     function: u64,
     object: u64,
     event: u64,
@@ -571,7 +576,6 @@ struct AvPlayerTextureDeallocation {
 
 #[derive(Debug)]
 struct AvPlayerDecoder {
-    child: Option<Child>,
     frames: Mutex<Receiver<Vec<u8>>>,
     cancelled: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
@@ -622,8 +626,8 @@ struct AvPlayerInstance {
     /// native audio-master behavior. Video-only sources use the bounded start anchor immediately.
     presentation_master_delivered: bool,
     looping: bool,
-    /// Media position freshly started decoders begin at. JumpToTime sets it so the ffmpeg
-    /// processes are launched with an input-side seek instead of replaying from byte zero.
+    /// Media position freshly started decoders begin at. JumpToTime sets it so the in-process
+    /// libavcodec session seeks instead of replaying from byte zero.
     decoder_seek: Duration,
     /// Playback-rate percentage from sceAvPlayerSetTrickSpeed; 100 is normal speed. It scales
     /// the player media clock, not media timestamps.
@@ -639,7 +643,10 @@ struct AvPlayerInstance {
     raw_video_frame: Vec<u8>,
     padded_video_frame: Vec<u8>,
     video_buffer_base: u64,
-    video_buffers: [u64; 3],
+    /// Output video frame slots. Length is `num_output_video_frame_buffers` (SDK 2..16).
+    video_buffers: Vec<u64>,
+    /// From `SceAvPlayerInitData(Ex)::numOutputVideoFrameBuffers` — sdk `sceavplayer.h:413`.
+    num_output_video_frame_buffers: usize,
     video_buffer_stride: usize,
     next_video_buffer: usize,
     next_video_frame: u64,

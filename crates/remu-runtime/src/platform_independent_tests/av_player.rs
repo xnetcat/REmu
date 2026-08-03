@@ -352,14 +352,19 @@ fn av_player_gen5_extended_stream_info_preserves_size_and_reports_frame_rate() {
 
 #[test]
 fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
+    let layout_small = crate::av_player::av_player_nv12_layout(378, 150, true)
+        .expect("extended 378x150 layout");
+    assert_eq!(layout_small.pitch, 512, "the extended ABI uses its explicit pitch");
+    assert_eq!(layout_small.storage_height, 150, "raw visible height");
+    assert_eq!(layout_small.frame_bytes, 115_200);
+    assert_eq!(layout_small.chroma_offset, layout_small.pitch * layout_small.storage_height);
+    let layout_hd = crate::av_player::av_player_nv12_layout(1_920, 1_080, true)
+        .expect("extended 1920x1080 layout");
+    assert_eq!(layout_hd.pitch, 2_048);
+    assert_eq!(layout_hd.frame_bytes, 3_317_760);
     assert_eq!(
-        crate::av_player::av_player_nv12_layout(378, 150, true),
-        Some((512, 115_200)),
-        "the extended ABI uses its explicit pitch and the raw visible height"
-    );
-    assert_eq!(
-        crate::av_player::av_player_nv12_layout(1_920, 1_080, true),
-        Some((2_048, 3_317_760)),
+        layout_hd.chroma_offset,
+        layout_hd.pitch * layout_hd.storage_height,
         "the guest derives the chroma plane at pitch*height with no inter-plane padding"
     );
     let mut frame_info = [0xab_u8; 112];
@@ -477,7 +482,6 @@ fn av_player_stall_snapshot_distinguishes_decoder_and_guest_progress() {
         player.next_video_frame = 4;
         player.last_video_delivery = Some(Instant::now());
         player.video_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -871,7 +875,6 @@ fn av_player_actual_eof_exposes_duration_and_queues_one_controller_stop() {
         player.event_callback = 0x1234;
         player.event_object = 0x5678;
         player.video_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -938,7 +941,6 @@ fn av_player_multiplexed_source_waits_for_video_and_audio_to_drain() {
         player.event_callback = 0x1234;
         player.event_object = 0x5678;
         player.video_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(video_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -947,7 +949,6 @@ fn av_player_multiplexed_source_waits_for_video_and_audio_to_drain() {
             )),
         });
         player.audio_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(audio_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -1014,7 +1015,6 @@ fn av_player_loop_restarts_only_after_every_enabled_stream_drains() {
         player.playing_since = Some(Instant::now());
         player.looping = true;
         player.video_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(video_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -1023,7 +1023,6 @@ fn av_player_loop_restarts_only_after_every_enabled_stream_drains() {
             )),
         });
         player.audio_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(audio_frames),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -1150,7 +1149,6 @@ fn av_player_sync_none_hands_video_timing_to_the_caller() {
         player.playing_since = Some(Instant::now());
         player.next_video_frame = 240;
         player.video_decoder = Some(crate::AvPlayerDecoder {
-            child: None,
             frames: std::sync::Mutex::new(receiver),
             cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             worker: None,
@@ -1354,8 +1352,7 @@ fn av_player_blocked_controller_callback_never_stalls_a_guest_import() {
             player.playing_since = Some(Instant::now());
             player.event_callback = av_player_blocking_event_callback as *const () as usize as u64;
             player.video_decoder = Some(crate::AvPlayerDecoder {
-                child: None,
-                frames: std::sync::Mutex::new(frames),
+                    frames: std::sync::Mutex::new(frames),
                 cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 worker: None,
                 progress: Some(std::sync::Arc::new(
@@ -1402,4 +1399,162 @@ fn av_player_blocked_controller_callback_never_stalls_a_guest_import() {
     let mut state = crate::lock_probe_dispatch_for_write(dispatch);
     assert_eq!(crate::av_player_close(handle, &mut state), 0);
     state.av_player.pending_callbacks.clear();
+}
+
+#[test]
+fn av_player_close_purges_pending_callbacks_for_that_handle() {
+    // I4 / B25: Stop→Close must not deliver STOP into a freed game object on a later import.
+    let mut state = ProbeDispatchState::default();
+    let handle = av_player_test_player(&mut state);
+    {
+        let player = state.av_player.players.get_mut(&handle).unwrap();
+        player.event_callback = 0x1234;
+        player.event_object = 0x5678;
+        player.source = Some("test-source".to_owned());
+    }
+    assert_eq!(crate::av_player_stop(handle, &mut state), 0);
+    assert_eq!(
+        state.av_player.pending_callbacks.len(),
+        1,
+        "Stop queues a calling-thread STOP before Close"
+    );
+    assert_eq!(crate::av_player_close(handle, &mut state), 0);
+    assert!(
+        state.av_player.pending_callbacks.is_empty(),
+        "Close must purge this handle's pending event callbacks"
+    );
+}
+
+#[test]
+fn av_player_nv12_layout_is_a_single_owned_descriptor() {
+    let layout = crate::av_player::av_player_nv12_layout(378, 150, true)
+        .expect("valid extended layout");
+    assert_eq!(layout.visible_width, 378);
+    assert_eq!(layout.visible_height, 150);
+    assert_eq!(layout.pitch, 512);
+    assert_eq!(layout.storage_height, 150);
+    assert_eq!(
+        layout.chroma_offset,
+        layout.pitch * layout.storage_height,
+        "chroma_offset is the single source of truth for the UV plane"
+    );
+    assert_eq!(layout.frame_bytes, layout.chroma_offset + layout.pitch * 150usize.div_ceil(2));
+    assert_eq!(layout.crop_right, 134);
+    assert_eq!(layout.crop_bottom, 0);
+
+    let legacy = crate::av_player::av_player_nv12_layout(378, 150, false)
+        .expect("valid legacy layout");
+    assert_eq!(legacy.pitch, 384);
+    assert_eq!(legacy.storage_height, 160);
+    assert_eq!(legacy.chroma_offset, legacy.pitch * legacy.storage_height);
+}
+
+#[test]
+fn av_player_nv12_edge_extension_fills_pitch_and_height_padding() {
+    // 2x2 luma + 2x1 chroma packed source into pitch=4 storage_height=4.
+    let width = 2_usize;
+    let height = 2_usize;
+    let packed = vec![
+        10, 20, // row 0
+        30, 40, // row 1
+        0x70, 0x80, // chroma row 0 (UV)
+    ];
+    let layout = crate::av_player::Nv12Layout {
+        visible_width: width,
+        visible_height: height,
+        pitch: 4,
+        storage_height: 4,
+        chroma_offset: 16,
+        frame_bytes: 16 + 4 * 2,
+        crop_right: 2,
+        crop_bottom: 2,
+    };
+    let mut out = vec![0xcd_u8; layout.frame_bytes];
+    crate::av_player::av_player_pack_nv12_edge_extend(&packed, width, height, &layout, &mut out);
+
+    // Luma row 0
+    assert_eq!(&out[0..4], &[10, 20, 20, 20]);
+    // Luma row 1
+    assert_eq!(&out[4..8], &[30, 40, 40, 40]);
+    // Height padding copies last luma row
+    assert_eq!(&out[8..12], &[30, 40, 40, 40]);
+    assert_eq!(&out[12..16], &[30, 40, 40, 40]);
+    // Chroma: visible UV plus 0x80 edge pad (not zero — zero chroma is green under BT.709)
+    assert_eq!(&out[16..20], &[0x70, 0x80, 0x80, 0x80]);
+    assert_eq!(&out[20..24], &[0x70, 0x80, 0x80, 0x80]);
+}
+
+#[test]
+fn av_player_init_honours_num_output_video_frame_buffers() {
+    // SDK sceavplayer.h:413 — values 2..16 valid; outside that range default to 2.
+    let mut state = ProbeDispatchState::default();
+    let mut initialization = [0_u8; 0x230];
+    let initialization_size = initialization.len() as u64;
+    initialization[..8].copy_from_slice(&initialization_size.to_ne_bytes());
+    for offset in [16_usize, 24, 32, 40] {
+        initialization[offset..offset + 8].copy_from_slice(&(0x1000 + offset as u64).to_ne_bytes());
+    }
+    // InitDataEx numOutputVideoFrameBuffers at +0x228 (sdk sceavplayer_ex.h:242).
+    initialization[0x228..0x22c].copy_from_slice(&6_i32.to_ne_bytes());
+    let mut handle = 0_u64;
+    assert_eq!(
+        crate::av_player_init_ex(
+            [
+                initialization.as_ptr().addr() as u64,
+                (&raw mut handle).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    let player = &state.av_player.players[&handle];
+    assert_eq!(player.num_output_video_frame_buffers, 6);
+    assert_eq!(player.video_buffers.len(), 6);
+    assert!(player.video_buffers.iter().all(|address| *address == 0));
+
+    // Out-of-range defaults to 2.
+    let mut initialization = [0_u8; 0x230];
+    initialization[..8].copy_from_slice(&initialization_size.to_ne_bytes());
+    for offset in [16_usize, 24, 32, 40] {
+        initialization[offset..offset + 8].copy_from_slice(&(0x1000 + offset as u64).to_ne_bytes());
+    }
+    initialization[0x228..0x22c].copy_from_slice(&1_i32.to_ne_bytes());
+    let mut handle2 = 0_u64;
+    assert_eq!(
+        crate::av_player_init_ex(
+            [
+                initialization.as_ptr().addr() as u64,
+                (&raw mut handle2).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        state.av_player.players[&handle2].num_output_video_frame_buffers,
+        2
+    );
+}
+
+#[test]
+fn av_player_decode_path_does_not_spawn_an_ffmpeg_subprocess() {
+    // P5: production decode must be in-process libavcodec, not `Command::new("ffmpeg")`.
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/av_player.rs");
+    let text = std::fs::read_to_string(&source).expect("av_player.rs readable");
+    assert!(
+        !text.contains("Command::new(ffmpeg)") && !text.contains("Command::new(ffprobe)"),
+        "av_player.rs must not spawn ffmpeg/ffprobe subprocesses after P5"
+    );
+    assert!(
+        !text.contains("Stdio::piped()"),
+        "av_player.rs must not pipe a media subprocess after P5"
+    );
 }
