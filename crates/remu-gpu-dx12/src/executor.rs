@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use remu_gpu::{ComputeDispatch, ComputeDispatchSource, ComputeGrid, IndexedDraw};
+use remu_memory::{CpuWriteWatch, GuestRangeLease, GuestWriteSite, LeasePublishOutcome};
 use remu_shader::{Program, ShaderEvaluation};
 use remu_shader_metal::{HlslEvaluationKey, HlslShader, MetalCompileOptions};
 use windows::Win32::Foundation::RECT;
@@ -351,6 +352,16 @@ struct GlobalResource {
     readback: Option<ID3D12Resource>,
     byte_count: usize,
     writable: bool,
+    original_bytes: Vec<u8>,
+    writeback_guard: Option<GlobalWritebackGuard>,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+enum GlobalWritebackGuard {
+    Lease(GuestRangeLease),
+    Anonymous(CpuWriteWatch),
+    #[cfg(test)]
+    Direct,
 }
 
 struct ComputeResources {
@@ -3051,16 +3062,53 @@ fn create_stage_resources(
             None => (create_upload_buffer(device, &arena_bytes)?, 0),
         };
     let mut globals = Vec::with_capacity(evaluation.global_memory_bindings.len());
-    for (binding, &offset) in evaluation
+    for ((binding, &offset), original_bytes) in evaluation
         .global_memory_bindings
         .iter()
         .zip(&global_offsets)
+        .zip(global_snapshots.into_iter())
     {
         let byte_count = binding.byte_count.max(4);
         let writable = binding.writable;
         let absolute_offset = arena_base
             .checked_add(offset)
             .ok_or("stage upload offset overflows")?;
+        let writeback_guard = if binding.write_back_to_guest && binding.byte_count != 0 {
+            if binding.base_address < 0x10_000 {
+                return Err(format!(
+                    "global writeback has invalid guest address {:#x}",
+                    binding.base_address
+                ));
+            }
+            let guest_byte_count = u64::try_from(binding.byte_count)
+                .map_err(|_| "writable global buffer byte count does not fit u64")?;
+            if let Some(lease) = GuestRangeLease::acquire(binding.base_address, guest_byte_count) {
+                Some(GlobalWritebackGuard::Lease(lease))
+            } else {
+                #[cfg(test)]
+                {
+                    Some(GlobalWritebackGuard::Direct)
+                }
+                #[cfg(not(test))]
+                {
+                    // SAFETY: shader evaluation accepted this exact range as live readable and
+                    // writable guest memory. Mapping replacement retires the watch before the
+                    // address can be reused, and publication holds its registry lock.
+                    let watch = unsafe {
+                        CpuWriteWatch::new(binding.base_address, guest_byte_count)
+                    }
+                    .map_err(|error| {
+                        format!(
+                            "could not pin D3D12 writable global buffer address={:#x} bytes={}: {error}",
+                            binding.base_address, binding.byte_count
+                        )
+                    })?;
+                    Some(GlobalWritebackGuard::Anonymous(watch))
+                }
+            }
+        } else {
+            None
+        };
         globals.push(GlobalResource {
             gpu: if writable {
                 create_gpu_buffer(device, byte_count)?
@@ -3081,6 +3129,12 @@ fn create_stage_resources(
                 .transpose()?,
             byte_count: binding.byte_count,
             writable,
+            original_bytes: if writeback_guard.is_some() {
+                original_bytes
+            } else {
+                Vec::new()
+            },
+            writeback_guard,
         });
     }
     let samplers = sampler_bindings
@@ -6151,6 +6205,9 @@ fn write_back_globals(
     evaluation: &ShaderEvaluation,
     resources: &[GlobalResource],
 ) -> Result<(), String> {
+    if evaluation.global_memory_bindings.len() != resources.len() {
+        return Err("D3D12/global buffer binding count mismatch".to_owned());
+    }
     for (binding, resource) in evaluation.global_memory_bindings.iter().zip(resources) {
         if !binding.write_back_to_guest || binding.byte_count == 0 {
             continue;
@@ -6167,16 +6224,206 @@ fn write_back_globals(
                 binding.base_address
             ));
         }
-        // SAFETY: the evaluated writable range is still mapped and owns byte_count bytes.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                binding.base_address as *mut u8,
+        if resource.original_bytes.len() != binding.byte_count {
+            return Err(format!(
+                "D3D12 writable global baseline length mismatch address={:#x} bytes={} baseline={}",
+                binding.base_address,
                 binding.byte_count,
-            );
+                resource.original_bytes.len()
+            ));
+        }
+        let current_bytes = bytes
+            .get(..binding.byte_count)
+            .ok_or("D3D12 writable global readback is shorter than its guest range")?;
+        let guard = resource
+            .writeback_guard
+            .as_ref()
+            .ok_or("D3D12 writable global binding has no publication guard")?;
+        match guard {
+            GlobalWritebackGuard::Lease(lease) => {
+                write_changed_global_ranges_leased(
+                    binding.base_address,
+                    current_bytes,
+                    &resource.original_bytes,
+                    lease,
+                )?;
+            }
+            GlobalWritebackGuard::Anonymous(watch) => {
+                match watch.with_live_mapping(|| {
+                    write_changed_global_ranges_direct(
+                        binding.base_address,
+                        current_bytes,
+                        &resource.original_bytes,
+                    )
+                }) {
+                    Ok(result) => result?,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        trace_discarded_global_writeback(
+                            binding.base_address,
+                            binding.byte_count,
+                            "anonymous mapping retired",
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "D3D12 writable global mapping could not be pinned for completion address={:#x} bytes={}: {error}",
+                            binding.base_address, binding.byte_count
+                        ));
+                    }
+                }
+            }
+            #[cfg(test)]
+            GlobalWritebackGuard::Direct => write_changed_global_ranges_direct(
+                binding.base_address,
+                current_bytes,
+                &resource.original_bytes,
+            )?,
         }
     }
     Ok(())
+}
+
+fn write_changed_global_ranges_leased(
+    guest_address: u64,
+    current_bytes: &[u8],
+    original_bytes: &[u8],
+    lease: &GuestRangeLease,
+) -> Result<(), String> {
+    visit_changed_byte_runs(current_bytes, original_bytes, |start, end| {
+        let run_offset = u64::try_from(start)
+            .map_err(|_| "D3D12 writable global changed offset does not fit u64")?;
+        let address = guest_address
+            .checked_add(run_offset)
+            .ok_or("D3D12 writable global changed address overflows")?;
+        let source = &current_bytes[start..end];
+        let baseline = &original_bytes[start..end];
+        match lease.publish_run_if_baseline(run_offset, baseline, source) {
+            LeasePublishOutcome::AppliedAtLiveVa => {
+                journal_global_write(GuestWriteSite::GlobalWriteback, address, source)
+            }
+            LeasePublishOutcome::AppliedByIdentity => {
+                journal_global_write(GuestWriteSite::GlobalWritebackIdentity, address, source)
+            }
+            LeasePublishOutcome::GuestModified => {
+                trace_kept_guest_bytes(address, source.len(), "leased")
+            }
+            LeasePublishOutcome::Revoked => {
+                trace_discarded_global_writeback(address, source.len(), "lease revoked");
+                return Ok(false);
+            }
+            LeasePublishOutcome::WriteFailed => {
+                return Err(format!(
+                    "D3D12 writable global backing write failed address={address:#x} bytes={} identity={:?}",
+                    source.len(),
+                    lease.identity()
+                ));
+            }
+        }
+        Ok(true)
+    })
+}
+
+fn write_changed_global_ranges_direct(
+    guest_address: u64,
+    current_bytes: &[u8],
+    original_bytes: &[u8],
+) -> Result<(), String> {
+    let destination = usize::try_from(guest_address)
+        .map_err(|_| "D3D12 writable global address does not fit usize")?;
+    visit_changed_byte_runs(current_bytes, original_bytes, |start, end| {
+        // SAFETY: Production holds the CpuWriteWatch registry lock across this comparison and
+        // any following copy. Unit tests retain their destination allocation for the whole call.
+        let guest_now = unsafe {
+            std::slice::from_raw_parts((destination as *const u8).add(start), end - start)
+        };
+        if guest_now != &original_bytes[start..end] {
+            trace_kept_guest_bytes(
+                guest_address
+                    .checked_add(start as u64)
+                    .ok_or("D3D12 writable global changed address overflows")?,
+                end - start,
+                "anonymous",
+            );
+            return Ok(true);
+        }
+        // SAFETY: the same mapping lock keeps the destination live and prevents replacement.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                current_bytes[start..end].as_ptr(),
+                (destination as *mut u8).add(start),
+                end - start,
+            );
+        }
+        let address = guest_address
+            .checked_add(start as u64)
+            .ok_or("D3D12 writable global changed address overflows")?;
+        journal_global_write(
+            GuestWriteSite::GlobalWritebackDirect,
+            address,
+            &current_bytes[start..end],
+        );
+        Ok(true)
+    })
+}
+
+fn visit_changed_byte_runs(
+    current_bytes: &[u8],
+    original_bytes: &[u8],
+    mut visit: impl FnMut(usize, usize) -> Result<bool, String>,
+) -> Result<(), String> {
+    if current_bytes.len() != original_bytes.len() {
+        return Err(format!(
+            "D3D12 writable global comparison length mismatch current={} baseline={}",
+            current_bytes.len(),
+            original_bytes.len()
+        ));
+    }
+    let mut cursor = 0;
+    while cursor < current_bytes.len() {
+        while cursor < current_bytes.len() && current_bytes[cursor] == original_bytes[cursor] {
+            cursor += 1;
+        }
+        let start = cursor;
+        while cursor < current_bytes.len() && current_bytes[cursor] != original_bytes[cursor] {
+            cursor += 1;
+        }
+        if start != cursor {
+            if !visit(start, cursor)? {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn journal_global_write(site: GuestWriteSite, address: u64, bytes: &[u8]) {
+    remu_memory::record_guest_write(
+        site,
+        address,
+        bytes.len() as u64,
+        bytes,
+        remu_gpu::gpu_completed_submission_sequence(),
+    );
+}
+
+fn trace_kept_guest_bytes(address: u64, byte_count: usize, guard: &str) {
+    static KEPT: AtomicUsize = AtomicUsize::new(0);
+    let sequence = KEPT.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][D3D12] kept newer guest bytes over GPU writeback sequence={sequence} address={address:#x} bytes={byte_count} guard={guard}"
+        );
+    }
+}
+
+fn trace_discarded_global_writeback(address: u64, byte_count: usize, reason: &str) {
+    static DISCARDED: AtomicUsize = AtomicUsize::new(0);
+    let sequence = DISCARDED.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][D3D12] discarded stale GPU writeback sequence={sequence} address={address:#x} bytes={byte_count} reason={reason}"
+        );
+    }
 }
 
 fn create_upload_buffer(device: &ID3D12Device, bytes: &[u8]) -> Result<ID3D12Resource, String> {
@@ -6492,7 +6739,7 @@ mod tests {
     use super::{
         Dx12GuestExecutor, expand_primitive_indices, indirect_draw_count_allows, presentable_bgra,
         primitive_restart_index, regroup_restart_list_indices, resolve_indirect_compute,
-        resolve_indirect_draw,
+        resolve_indirect_draw, write_changed_global_ranges_direct,
     };
 
     #[test]
@@ -6504,6 +6751,62 @@ mod tests {
             ),
             Some(vec![3, 2, 1, 4, 30, 20, 10, 40])
         );
+    }
+
+    #[test]
+    fn writable_global_publication_preserves_newer_guest_bytes() {
+        let original = [0_u8; 12];
+        let current = [1_u8; 12];
+        let mut guest = original;
+        guest[4..8].fill(9);
+
+        write_changed_global_ranges_direct(guest.as_mut_ptr() as u64, &current, &original)
+            .expect("publish baseline-guarded D3D12 global bytes");
+
+        // A single contiguous GPU change is conservatively withheld when any byte in the run
+        // changed on the CPU. This prevents a stale full-buffer snapshot from corrupting the
+        // guest-owned update.
+        assert_eq!(guest, [0, 0, 0, 0, 9, 9, 9, 9, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn linear_texture_writeback_preserves_guest_pitch_padding() {
+        const WIDTH: u32 = 2;
+        const HEIGHT: u32 = 2;
+        const PITCH: u32 = 4;
+        const BYTES_PER_PIXEL: usize = 4;
+        let mut raw = vec![0xa5_u8; (PITCH * HEIGHT) as usize * BYTES_PER_PIXEL];
+        let descriptor = super::DecodedTexture {
+            address: raw.as_mut_ptr() as u64,
+            width: WIDTH,
+            height: HEIGHT,
+            pitch: PITCH,
+            tile_mode: 0,
+            format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            bytes_per_element: BYTES_PER_PIXEL as u32,
+            block_extent: [1, 1],
+            texture_type: 9,
+            layer_count: 1,
+            mip_level_count: 1,
+            writable: true,
+        };
+        let linear = vec![0x11_u8; (WIDTH * HEIGHT) as usize * BYTES_PER_PIXEL];
+
+        super::write_texture_linear(descriptor, &linear)
+            .expect("publish a pitched linear guest texture");
+
+        let row_bytes = WIDTH as usize * BYTES_PER_PIXEL;
+        let pitch_bytes = PITCH as usize * BYTES_PER_PIXEL;
+        for row in 0..HEIGHT as usize {
+            assert_eq!(
+                &raw[row * pitch_bytes..row * pitch_bytes + row_bytes],
+                vec![0x11; row_bytes]
+            );
+            assert_eq!(
+                &raw[row * pitch_bytes + row_bytes..(row + 1) * pitch_bytes],
+                vec![0xa5; pitch_bytes - row_bytes]
+            );
+        }
     }
 
     fn literal(value: u32) -> Operand {

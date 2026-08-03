@@ -415,6 +415,13 @@ pub(super) fn write_texture_mip_chain(
     unsafe {
         std::ptr::copy_nonoverlapping(raw.as_ptr(), descriptor.address as *mut u8, raw.len());
     }
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::TextureWritebackRange,
+        descriptor.address,
+        raw.len() as u64,
+        &raw,
+        remu_gpu::gpu_completed_submission_sequence(),
+    );
     Ok(())
 }
 
@@ -721,6 +728,14 @@ pub(super) fn write_texture_linear(
     }
     let layer_raw_bytes = descriptor.raw_layer_byte_count()?;
     let mut raw = vec![0_u8; descriptor.raw_byte_count()?];
+    // A guest image owns only the texels named by width/height. Pitch padding and unused tiled
+    // block slots can belong to another tenant in a pooled allocation (including allocator
+    // metadata). Preserve those bytes instead of zero-filling and publishing the full footprint.
+    // SAFETY: the evaluated descriptor retains the complete validated raw mapping through this
+    // synchronous publication.
+    unsafe {
+        std::ptr::copy_nonoverlapping(descriptor.address as *const u8, raw.as_mut_ptr(), raw.len());
+    }
     let layer_linear_bytes = linear.len() / descriptor.layer_count as usize;
     for layer in 0..descriptor.layer_count as usize {
         retile_layer(
