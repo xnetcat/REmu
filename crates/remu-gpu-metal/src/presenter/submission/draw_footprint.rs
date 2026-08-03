@@ -1,12 +1,12 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Pure consumer-footprint classification for direct draws behind exact `SharedEvent` waits.
+//! Consumer-footprint classification for direct draws behind exact `SharedEvent` waits.
 //!
-//! This module deliberately does not make draws GPU-orderable. It proves which blocked draws
-//! would be physically disjoint from every exact producer checkpoint and reports the rejection
-//! histogram. Admission remains default-deny until live measurements and scheduler integration
-//! tests establish that the candidates also avoid internal Metal drains.
+//! Physical disjointness remains the default proof. The one overlapping class admitted here is a
+//! read-only global range backed by the immutable copied-buffer version retained in the exact
+//! producer checkpoint. The consumer command buffer has already encoded that checkpoint's Metal
+//! wait, so the version crosses queues without guest-RAM observation or host retirement.
 
 use super::super::{CB_COLOR_CONTROL, ColorOperationMode, ResourceSpan};
 use super::super::{
@@ -25,12 +25,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub(crate) const SHARED_EVENT_DRAW_REJECT_COUNT: usize = 8;
+pub(crate) const SHARED_EVENT_DRAW_REJECT_COUNT: usize = 13;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum SharedEventDrawReject {
-    Overlap,
+    OverlapResident,
+    OverlapScanout,
+    OverlapCopiedGlobal,
+    OverlapZeroCopyGlobal,
+    OverlapTerminalWrite,
+    OverlapInternalResident,
     IncompleteProducer,
     Unresolved,
     Indirect,
@@ -47,7 +52,12 @@ impl SharedEventDrawReject {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Overlap => "overlap",
+            Self::OverlapResident => "overlap-resident",
+            Self::OverlapScanout => "overlap-scanout",
+            Self::OverlapCopiedGlobal => "overlap-copied-global",
+            Self::OverlapZeroCopyGlobal => "overlap-zero-copy-global",
+            Self::OverlapTerminalWrite => "overlap-terminal-write",
+            Self::OverlapInternalResident => "overlap-internal-resident",
             Self::IncompleteProducer => "incomplete-producer",
             Self::Unresolved => "unresolved",
             Self::Indirect => "indirect",
@@ -64,13 +74,14 @@ impl SharedEventDrawReject {
 enum DrawFootprintKind {
     ColorAttachment,
     DepthAttachment,
-    Global,
+    GlobalRead,
+    GlobalWrite,
     ScalarEvaluationRead,
     Image,
 }
 
 impl DrawFootprintKind {
-    const COUNT: usize = 5;
+    const COUNT: usize = 6;
 
     const fn index(self) -> usize {
         self as usize
@@ -80,7 +91,8 @@ impl DrawFootprintKind {
         match self {
             Self::ColorAttachment => "color",
             Self::DepthAttachment => "depth",
-            Self::Global => "global",
+            Self::GlobalRead => "global-read",
+            Self::GlobalWrite => "global-write",
             Self::ScalarEvaluationRead => "scalar-eval",
             Self::Image => "image",
         }
@@ -141,6 +153,21 @@ struct DirectDrawFootprint {
     ranges: Arc<[DrawFootprintRange]>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectDrawAdmission {
+    Disjoint,
+    VersionedGlobal,
+}
+
+impl DirectDrawAdmission {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Disjoint => "disjoint",
+            Self::VersionedGlobal => "versioned-global",
+        }
+    }
+}
+
 impl DirectDrawFootprint {
     fn from_ranges(mut ranges: Vec<DrawFootprintRange>) -> Self {
         ranges.sort_unstable_by_key(|range| {
@@ -155,6 +182,7 @@ impl DirectDrawFootprint {
         for range in ranges {
             if let Some(previous) = coalesced.last_mut()
                 && previous.kind == range.kind
+                && previous.kind != DrawFootprintKind::GlobalRead
                 && previous.mapping.backing_id == range.mapping.backing_id
             {
                 let previous_end = previous
@@ -267,9 +295,24 @@ fn append_evaluation_ranges(
         }
         let byte_count =
             u64::try_from(binding.byte_count).map_err(|_| SharedEventDrawReject::Unresolved)?;
+        let proven_read_only = !binding.writable
+            && !binding.instruction_pcs.is_empty()
+            && binding.instruction_pcs.iter().all(|pc| {
+                snapshot
+                    .program
+                    .instructions
+                    .iter()
+                    .find(|instruction| instruction.pc == *pc)
+                    .and_then(|instruction| instruction.opcode.known_name())
+                    .is_some_and(|opcode| !opcode.contains("Store") && !opcode.contains("Atomic"))
+            });
         append_range(
             ranges,
-            DrawFootprintKind::Global,
+            if proven_read_only {
+                DrawFootprintKind::GlobalRead
+            } else {
+                DrawFootprintKind::GlobalWrite
+            },
             binding.base_address,
             byte_count,
         )?;
@@ -386,11 +429,26 @@ fn direct_draw_footprint(
     Ok(DirectDrawFootprint::from_ranges(ranges))
 }
 
-fn direct_draw_dependencies_are_disjoint(
+fn overlap_rejection(kind: SharedEventWriteKind) -> SharedEventDrawReject {
+    match kind {
+        SharedEventWriteKind::ResidentDestination => SharedEventDrawReject::OverlapResident,
+        SharedEventWriteKind::DirectScanoutTarget => SharedEventDrawReject::OverlapScanout,
+        SharedEventWriteKind::CopiedGlobal => SharedEventDrawReject::OverlapCopiedGlobal,
+        SharedEventWriteKind::ZeroCopyGlobal => SharedEventDrawReject::OverlapZeroCopyGlobal,
+        SharedEventWriteKind::TerminalGuestWrite => SharedEventDrawReject::OverlapTerminalWrite,
+        SharedEventWriteKind::InternalResidentDestination => {
+            SharedEventDrawReject::OverlapInternalResident
+        }
+    }
+}
+
+fn direct_draw_dependencies_are_gpu_orderable(
     dependencies: &[SharedEventFence],
     checkpoints: &HashMap<SharedEventProducerId, SharedEventSignalCheckpoint>,
     footprint: &DirectDrawFootprint,
-) -> Result<(), SharedEventDrawReject> {
+    immutable_global_available: impl Fn(u64, u64) -> bool,
+) -> Result<DirectDrawAdmission, SharedEventDrawReject> {
+    let mut admission = DirectDrawAdmission::Disjoint;
     let mut dependencies = dependencies.to_vec();
     dependencies.sort_unstable_by_key(|fence| (fence.producer().queue_id(), fence.value()));
     for fence in dependencies {
@@ -401,16 +459,24 @@ fn direct_draw_dependencies_are_disjoint(
         if !checkpoint.footprint_complete {
             return Err(SharedEventDrawReject::IncompleteProducer);
         }
-        if checkpoint.pending_write_footprint.iter().any(|&producer| {
-            footprint
+        for &producer in &checkpoint.pending_write_footprint {
+            for &consumer in footprint
                 .ranges
                 .iter()
-                .any(|&consumer| consumer.overlaps_producer(producer))
-        }) {
-            return Err(SharedEventDrawReject::Overlap);
+                .filter(|&&consumer| consumer.overlaps_producer(producer))
+            {
+                if producer.kind == SharedEventWriteKind::CopiedGlobal
+                    && consumer.kind == DrawFootprintKind::GlobalRead
+                    && immutable_global_available(consumer.guest_address, consumer.byte_count)
+                {
+                    admission = DirectDrawAdmission::VersionedGlobal;
+                    continue;
+                }
+                return Err(overlap_rejection(producer.kind));
+            }
         }
     }
-    Ok(())
+    Ok(admission)
 }
 
 fn first_physical_overlap(
@@ -439,7 +505,8 @@ fn describe_consumer_bytes(footprint: &DirectDrawFootprint) -> String {
     [
         DrawFootprintKind::ColorAttachment,
         DrawFootprintKind::DepthAttachment,
-        DrawFootprintKind::Global,
+        DrawFootprintKind::GlobalRead,
+        DrawFootprintKind::GlobalWrite,
         DrawFootprintKind::ScalarEvaluationRead,
         DrawFootprintKind::Image,
     ]
@@ -502,18 +569,32 @@ impl MetalPresenter {
                 .get(&consumer_queue_id)
                 .ok_or(SharedEventDrawReject::IncompleteProducer)
                 .and_then(|state| {
-                    direct_draw_dependencies_are_disjoint(
+                    direct_draw_dependencies_are_gpu_orderable(
                         dependencies,
                         &state.resource_dependencies,
                         footprint,
+                        |address, byte_count| {
+                            self.shared_event_dependencies_supply_draw_global_range(
+                                consumer_queue_id,
+                                address,
+                                byte_count,
+                            )
+                        },
                     )
                 }),
         };
         match decision {
-            Ok(()) => {
+            Ok(DirectDrawAdmission::Disjoint) => {
                 self.statistics.shared_event_draw_disjoint_candidates = self
                     .statistics
                     .shared_event_draw_disjoint_candidates
+                    .saturating_add(1);
+            }
+            Ok(DirectDrawAdmission::VersionedGlobal) => {
+                self.statistics
+                    .shared_event_draw_versioned_global_candidates = self
+                    .statistics
+                    .shared_event_draw_versioned_global_candidates
                     .saturating_add(1);
             }
             Err(reject) => {
@@ -551,7 +632,7 @@ impl MetalPresenter {
                     draw.sequence,
                     decision
                         .as_ref()
-                        .map_or_else(|reject| reject.label(), |()| "disjoint"),
+                        .map_or_else(|reject| reject.label(), |admission| admission.label()),
                     footprint
                         .as_ref()
                         .map_or(0, DirectDrawFootprint::byte_count),
@@ -951,7 +1032,8 @@ mod tests {
         for kind in [
             DrawFootprintKind::ColorAttachment,
             DrawFootprintKind::DepthAttachment,
-            DrawFootprintKind::Global,
+            DrawFootprintKind::GlobalRead,
+            DrawFootprintKind::GlobalWrite,
             DrawFootprintKind::ScalarEvaluationRead,
             DrawFootprintKind::Image,
         ] {
@@ -968,6 +1050,37 @@ mod tests {
                 .fold(0_u64, |bytes, range| bytes + range.byte_count),
             2 * GUEST_PAGE_SIZE,
             "MRT0 and MRT1 remain covered after adjacent physical intervals coalesce"
+        );
+    }
+
+    #[test]
+    fn direct_draw_global_read_proof_rejects_store_opcodes_and_keeps_bindings_exact() {
+        let (_space, base) = mapped_space(16);
+        let mut draw = complete_draw(base);
+        let mut pixel = draw
+            .pixel_shader_evaluation
+            .as_deref()
+            .expect("pixel evaluation")
+            .clone();
+        pixel.global_memory_bindings[0].writable = false;
+        draw.pixel_shader_evaluation = Some(Arc::new(pixel));
+        let footprint = direct_draw_footprint(&draw, false).expect("complete draw footprint");
+        assert!(
+            footprint
+                .ranges
+                .iter()
+                .any(|range| range.kind == DrawFootprintKind::GlobalWrite),
+            "a false writable flag cannot make a decoded GlobalStore forwardable"
+        );
+
+        let first = DrawFootprintRange::new(DrawFootprintKind::GlobalRead, base, 64).unwrap();
+        let second =
+            DrawFootprintRange::new(DrawFootprintKind::GlobalRead, base + 64, 64).unwrap();
+        let exact = DirectDrawFootprint::from_ranges(vec![first, second]);
+        assert_eq!(
+            exact.ranges.len(),
+            2,
+            "adjacent immutable bindings need independent containment proofs"
         );
     }
 
@@ -1220,7 +1333,7 @@ mod tests {
             .expect("second alias")
             .get();
         let consumer = DirectDrawFootprint::from_ranges(vec![
-            DrawFootprintRange::new(DrawFootprintKind::Global, second + 64, 64)
+            DrawFootprintRange::new(DrawFootprintKind::GlobalRead, second + 64, 64)
                 .expect("consumer alias footprint"),
         ]);
         let producer = PhysicalFootprintRange::new(
@@ -1244,14 +1357,24 @@ mod tests {
         };
         let mut checkpoints = HashMap::from([(producer_id, checkpoint.clone())]);
         assert_eq!(
-            direct_draw_dependencies_are_disjoint(&[fence], &checkpoints, &consumer),
-            Err(SharedEventDrawReject::Overlap)
+            direct_draw_dependencies_are_gpu_orderable(
+                &[fence],
+                &checkpoints,
+                &consumer,
+                |_, _| false,
+            ),
+            Err(SharedEventDrawReject::OverlapResident)
         );
 
         checkpoints.get_mut(&producer_id).expect("checkpoint").fence =
             SharedEventFence::new(producer_id, 8);
         assert_eq!(
-            direct_draw_dependencies_are_disjoint(&[fence], &checkpoints, &consumer),
+            direct_draw_dependencies_are_gpu_orderable(
+                &[fence],
+                &checkpoints,
+                &consumer,
+                |_, _| false,
+            ),
             Err(SharedEventDrawReject::IncompleteProducer)
         );
         checkpoints.get_mut(&producer_id).expect("checkpoint").fence = fence;
@@ -1260,12 +1383,17 @@ mod tests {
             .expect("checkpoint")
             .footprint_complete = false;
         assert_eq!(
-            direct_draw_dependencies_are_disjoint(&[fence], &checkpoints, &consumer),
+            direct_draw_dependencies_are_gpu_orderable(
+                &[fence],
+                &checkpoints,
+                &consumer,
+                |_, _| false,
+            ),
             Err(SharedEventDrawReject::IncompleteProducer)
         );
 
         let rebound_consumer = DirectDrawFootprint::from_ranges(vec![DrawFootprintRange {
-            kind: DrawFootprintKind::Global,
+            kind: DrawFootprintKind::GlobalRead,
             guest_address: first + 32,
             byte_count: 64,
             mapping: GuestSharedMappingIdentity {
@@ -1279,13 +1407,77 @@ mod tests {
         };
         let rebound_checkpoints = HashMap::from([(producer_id, exact_checkpoint)]);
         assert_eq!(
-            direct_draw_dependencies_are_disjoint(
+            direct_draw_dependencies_are_gpu_orderable(
                 &[fence],
                 &rebound_checkpoints,
                 &rebound_consumer,
+                |_, _| false,
             ),
-            Ok(()),
+            Ok(DirectDrawAdmission::Disjoint),
             "identical virtual addresses rebound to different captured backings are disjoint"
+        );
+    }
+
+    #[test]
+    fn copied_global_overlap_requires_an_exact_immutable_read_version() {
+        let (_space, address) = mapped_space(2);
+        let consumer = DirectDrawFootprint::from_ranges(vec![
+            DrawFootprintRange::new(DrawFootprintKind::GlobalRead, address + 64, 64)
+                .expect("consumer global footprint"),
+        ]);
+        let producer = PhysicalFootprintRange::new(
+            SharedEventWriteKind::CopiedGlobal,
+            address + 32,
+            128,
+            remu_memory::guest_shared_backing_identity(address + 32, 128),
+        )
+        .expect("copied global producer footprint");
+        let producer_id = SharedEventProducerId::new(41);
+        let fence = SharedEventFence::new(producer_id, 7);
+        let checkpoint = SharedEventSignalCheckpoint {
+            fence,
+            global_writeback_count: 0,
+            guest_write_range_count: 0,
+            memory_write_count: 0,
+            global_versions: Vec::new(),
+            unresolved_write_ranges: Vec::new(),
+            pending_write_footprint: vec![producer],
+            footprint_complete: true,
+        };
+        let checkpoints = HashMap::from([(producer_id, checkpoint)]);
+
+        assert_eq!(
+            direct_draw_dependencies_are_gpu_orderable(
+                &[fence],
+                &checkpoints,
+                &consumer,
+                |candidate, byte_count| candidate == address + 64 && byte_count == 64,
+            ),
+            Ok(DirectDrawAdmission::VersionedGlobal)
+        );
+        assert_eq!(
+            direct_draw_dependencies_are_gpu_orderable(
+                &[fence],
+                &checkpoints,
+                &consumer,
+                |_, _| false,
+            ),
+            Err(SharedEventDrawReject::OverlapCopiedGlobal)
+        );
+
+        let writable = DirectDrawFootprint::from_ranges(vec![
+            DrawFootprintRange::new(DrawFootprintKind::GlobalWrite, address + 64, 64)
+                .expect("writable consumer global footprint"),
+        ]);
+        assert_eq!(
+            direct_draw_dependencies_are_gpu_orderable(
+                &[fence],
+                &checkpoints,
+                &writable,
+                |_, _| true,
+            ),
+            Err(SharedEventDrawReject::OverlapCopiedGlobal),
+            "a writable consumer needs a new ordered copy and cannot alias the retained version"
         );
     }
 }

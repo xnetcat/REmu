@@ -1592,6 +1592,7 @@ struct PresenterStatistics {
     shared_event_gpu_ordered_draws: u32,
     shared_event_draw_attempts: u32,
     shared_event_draw_disjoint_candidates: u32,
+    shared_event_draw_versioned_global_candidates: u32,
     shared_event_draw_internal_drains: u32,
     shared_event_draw_rejections: [u32; SHARED_EVENT_DRAW_REJECT_COUNT],
     shared_event_incomplete_signal_footprints: u32,
@@ -2461,7 +2462,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     }
     if presenter.shared_event_direct_draw_admission {
         eprintln!(
-            "[REMu][METAL] experimental disjoint direct-draw SharedEvent admission enabled"
+            "[REMu][METAL] experimental disjoint/fence-versioned direct-draw SharedEvent admission enabled"
         );
     }
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
