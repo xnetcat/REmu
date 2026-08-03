@@ -180,14 +180,25 @@ impl MetalPresenter {
             });
             let mut shared_event_gpu_ordered_compute = false;
             let mut shared_event_gpu_ordered_registered_wait = false;
+            let mut shared_event_gpu_ordered_draw = false;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
-                if !dependencies.is_empty()
-                    && let GpuEvent::IndexedDraw(draw) = &event
-                {
-                    self.observe_shared_event_direct_draw_preflight(queue_id, &dependencies, draw);
-                }
+                let direct_draw_candidate = if dependencies.is_empty() {
+                    false
+                } else if let GpuEvent::IndexedDraw(draw) = &event {
+                    self.observe_shared_event_direct_draw_preflight(
+                        queue_id,
+                        &dependencies,
+                        draw,
+                    )
+                } else {
+                    false
+                };
+                let direct_draw_gpu_orderable = direct_draw_candidate
+                    && self.per_queue_guest_batches
+                    && self.shared_event_direct_draw_admission;
                 let gpu_orderable = dependencies.is_empty()
+                    || direct_draw_gpu_orderable
                     || self.event_is_shared_event_gpu_orderable(source, &event);
                 if !gpu_orderable {
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
@@ -231,6 +242,7 @@ impl MetalPresenter {
                 {
                     shared_event_gpu_ordered_registered_wait = true;
                 }
+                shared_event_gpu_ordered_draw = direct_draw_gpu_orderable;
             }
             match event {
                 GpuEvent::QueueSubmission { .. } => {
@@ -605,10 +617,16 @@ impl MetalPresenter {
                         }
                         continue;
                     }
+                    let cpu_synchronization_epoch = self.guest_batch_cpu_synchronization_epoch;
                     let result = match key.as_ref() {
                         Ok(key) => self.execute_compiled_draw(&draw, key),
                         Err(error) => Err(error.clone()),
                     };
+                    self.record_shared_event_direct_draw_outcome(
+                        shared_event_gpu_ordered_draw,
+                        cpu_synchronization_epoch,
+                        result.is_ok(),
+                    );
                     if let Err(error) = result {
                         // Every dropped draw is counted so a scene pass failing each frame stays
                         // visible in the perf trail; the message still logs once per key.
@@ -772,6 +790,29 @@ impl MetalPresenter {
             let (address, byte_count) = cached.write_watch.range();
             acquire.overlaps(address, byte_count)
         })
+    }
+
+    pub(super) fn record_shared_event_direct_draw_outcome(
+        &mut self,
+        gpu_ordered: bool,
+        cpu_synchronization_epoch_before: u64,
+        encoded: bool,
+    ) {
+        if !gpu_ordered {
+            return;
+        }
+        if self.guest_batch_cpu_synchronization_epoch != cpu_synchronization_epoch_before {
+            self.statistics.shared_event_draw_internal_drains = self
+                .statistics
+                .shared_event_draw_internal_drains
+                .saturating_add(1);
+        }
+        if encoded {
+            self.statistics.shared_event_gpu_ordered_draws = self
+                .statistics
+                .shared_event_gpu_ordered_draws
+                .saturating_add(1);
+        }
     }
 
     /// Conservative host-effect gate for commands following an encoded Metal wait.

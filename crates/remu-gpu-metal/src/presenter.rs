@@ -1989,6 +1989,12 @@ struct MetalPresenter {
     /// Wakes AppKit immediately when a guest Metal batch reaches a terminal state.
     event_loop_waker: Option<EventLoopProxy<()>>,
     per_queue_guest_batches: bool,
+    /// Experimental B17 admission for direct draws proven disjoint from exact producer writes.
+    /// This remains independently opt-in so the classifier can collect an unbiased OFF baseline.
+    shared_event_direct_draw_admission: bool,
+    /// Monotonic marker for any explicit CPU settlement of guest Metal batches.
+    /// Interval statistics reset, so they cannot reliably identify a drain inside one draw.
+    guest_batch_cpu_synchronization_epoch: u64,
     active_guest_queue: Option<u64>,
     guest_queue_batches: HashMap<u64, GuestQueueBatchState>,
     gpu_wait_fences: GpuWaitFenceMap,
@@ -2186,6 +2192,11 @@ impl MetalPresenter {
                 .map_err(|error| format!("could not start Metal compiler worker: {error}"))?;
         }
         drop(shader_compile_results);
+        let per_queue_guest_batches = std::env::var_os("REMU_PER_QUEUE_BATCHES")
+            .is_some_and(|value| value == "1");
+        let shared_event_direct_draw_admission = per_queue_guest_batches
+            && std::env::var_os("REMU_SHARED_EVENT_DIRECT_DRAWS")
+                .is_some_and(|value| value == "1");
         Ok(Self {
             receiver: OrderedGpuEventReceiver::new(receiver),
             window: None,
@@ -2193,8 +2204,9 @@ impl MetalPresenter {
             layer: None,
             command_queue: Some(command_queue),
             event_loop_waker: None,
-            per_queue_guest_batches: std::env::var_os("REMU_PER_QUEUE_BATCHES")
-                .is_some_and(|value| value == "1"),
+            per_queue_guest_batches,
+            shared_event_direct_draw_admission,
+            guest_batch_cpu_synchronization_epoch: 0,
             active_guest_queue: None,
             guest_queue_batches: HashMap::new(),
             gpu_wait_fences: GpuWaitFenceMap::default(),
@@ -2316,6 +2328,11 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     presenter.event_loop_waker = Some(event_loop.create_proxy());
     if presenter.per_queue_guest_batches {
         eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
+    }
+    if presenter.shared_event_direct_draw_admission {
+        eprintln!(
+            "[REMu][METAL] experimental disjoint direct-draw SharedEvent admission enabled"
+        );
     }
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
     // Winit owns NSApplication's delegate and launch state. Calling `finishLaunching` or its

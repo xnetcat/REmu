@@ -491,7 +491,7 @@ impl MetalPresenter {
         consumer_queue_id: u64,
         dependencies: &[SharedEventFence],
         draw: &IndexedDraw,
-    ) {
+    ) -> bool {
         self.statistics.shared_event_draw_attempts =
             self.statistics.shared_event_draw_attempts.saturating_add(1);
         let footprint = direct_draw_footprint(draw, draw_diagnostics_are_host_effectful());
@@ -558,6 +558,7 @@ impl MetalPresenter {
                 );
             }
         }
+        decision.is_ok()
     }
 }
 
@@ -1001,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn structural_and_shader_coverage_exclusions_are_default_deny() {
+    fn opt_in_admission_keeps_structural_shader_diagnostic_and_special_rejections() {
         let (_space, base) = mapped_space(16);
         let draw = complete_draw(base);
         let mut cases = Vec::new();
@@ -1188,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn physical_alias_overlap_and_exact_checkpoint_rules_are_conservative() {
+    fn opt_in_admission_rejects_physical_alias_overlap_and_nonexact_checkpoints() {
         let mut space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("alias address space");
         let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("alias backing");
         let first = space
