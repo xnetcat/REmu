@@ -33,8 +33,9 @@ use super::super::submission::{
 use super::super::{
     CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
     PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SharedEventDrawReject, SharedEventFence, SharedEventProducerId, SharedEventSignalCheckpoint,
-    SharedEventWriteKind, UploadedGlobalBuffer,
+    SharedEventDrawReject, SharedEventFence, SharedEventHostEffectLatencyPhase,
+    SharedEventHostEffectLatencyState, SharedEventHostEffectLatencyStatistics,
+    SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -4902,11 +4903,18 @@ fn shared_event_host_effect_readiness_queries_only_exact_required_state() {
         SharedEventFence::new(first_producer, 5),
         SharedEventFence::new(second_producer, 2),
     ];
+    let started = Instant::now();
+    let mut latency = SharedEventHostEffectLatencyState::new(started);
+    let mut statistics = SharedEventHostEffectLatencyStatistics::default();
 
     let outstanding_queries = Cell::new(0);
-    let shared_queries = RefCell::new(Vec::new());
+    let consumer_queries = RefCell::new(Vec::new());
+    let prefix_queries = RefCell::new(Vec::new());
     let retired_queries = RefCell::new(Vec::new());
     assert!(!shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(10),
+        &mut statistics,
         7,
         Some(consumer_ack),
         &terminal_dependencies,
@@ -4915,45 +4923,113 @@ fn shared_event_host_effect_readiness_queries_only_exact_required_state() {
             false
         },
         |producer| {
-            shared_queries.borrow_mut().push(producer);
+            consumer_queries.borrow_mut().push(producer);
             Some(2)
         },
+        |_| panic!("producer prefixes are not queried before the consumer acknowledgement"),
         |producer| {
             retired_queries.borrow_mut().push(producer);
             Some(u64::MAX)
         },
     ));
     assert_eq!(outstanding_queries.get(), 0);
-    assert_eq!(&*shared_queries.borrow(), &[consumer]);
+    assert_eq!(&*consumer_queries.borrow(), &[consumer]);
     assert!(
         retired_queries.borrow().is_empty(),
         "terminal publication is not queried before the consumer reaches its acknowledgement"
     );
+    assert_eq!(
+        statistics
+            .phase(SharedEventHostEffectLatencyPhase::ConsumerAck)
+            .count,
+        0
+    );
 
-    shared_queries.borrow_mut().clear();
-    assert!(shared_event_host_effect_is_resolved(
+    consumer_queries.borrow_mut().clear();
+    assert!(!shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(20),
+        &mut statistics,
         7,
         Some(consumer_ack),
         &terminal_dependencies,
         |_| panic!("an acknowledgement must not fall back to queue-outstanding state"),
         |producer| {
-            shared_queries.borrow_mut().push(producer);
+            consumer_queries.borrow_mut().push(producer);
             (producer == consumer).then_some(3)
         },
+        |producer| {
+            prefix_queries.borrow_mut().push(producer);
+            match producer {
+                producer if producer == first_producer => Some(4),
+                producer if producer == second_producer => Some(2),
+                _ => None,
+            }
+        },
+        |_| panic!("terminal publication is not queried before the exact producer prefix"),
+    ));
+    assert_eq!(&*consumer_queries.borrow(), &[consumer]);
+    assert_eq!(&*prefix_queries.borrow(), &[first_producer]);
+    let ack = statistics.phase(SharedEventHostEffectLatencyPhase::ConsumerAck);
+    assert_eq!((ack.count, ack.total_ns, ack.maximum_ns), (1, 20, 20));
+
+    prefix_queries.borrow_mut().clear();
+    assert!(!shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(50),
+        &mut statistics,
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |producer| match producer {
+            producer if producer == first_producer => Some(5),
+            producer if producer == second_producer => Some(2),
+            _ => None,
+        },
+        |producer| {
+            retired_queries.borrow_mut().push(producer);
+            (producer == first_producer).then_some(4)
+        },
+    ));
+    assert_eq!(
+        statistics
+            .phase(SharedEventHostEffectLatencyPhase::ImmutablePrefix)
+            .total_ns,
+        30
+    );
+    assert_eq!(&*retired_queries.borrow(), &[first_producer]);
+
+    retired_queries.borrow_mut().clear();
+    assert!(shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(90),
+        &mut statistics,
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |_| panic!("the completed prefix phase is not queried again"),
         |producer| match producer {
             producer if producer == first_producer => Some(5),
             producer if producer == second_producer => Some(2),
             _ => None,
         },
     ));
+    let terminal = statistics.phase(SharedEventHostEffectLatencyPhase::HostTerminal);
     assert_eq!(
-        &*shared_queries.borrow(),
-        &[consumer],
-        "readiness polls only the exact acknowledgement timeline"
+        (terminal.count, terminal.total_ns, terminal.maximum_ns),
+        (1, 40, 40)
     );
 
     let no_ack_outstanding_queries = RefCell::new(Vec::new());
+    let mut no_ack_latency = SharedEventHostEffectLatencyState::new(started);
     assert!(!shared_event_host_effect_is_resolved(
+        &mut no_ack_latency,
+        started + Duration::from_nanos(100),
+        &mut SharedEventHostEffectLatencyStatistics::default(),
         7,
         None,
         &terminal_dependencies,
@@ -4962,6 +5038,7 @@ fn shared_event_host_effect_readiness_queries_only_exact_required_state() {
             true
         },
         |_| panic!("a missing acknowledgement must use consumer batch state"),
+        |_| panic!("producer prefixes must short-circuit behind outstanding consumer work"),
         |_| panic!("terminal publication must short-circuit behind outstanding consumer work"),
     ));
     assert_eq!(&*no_ack_outstanding_queries.borrow(), &[7]);
@@ -5044,6 +5121,7 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
         consumer_queue_id,
         consumer_ack: Some(consumer_ack),
         terminal_dependencies,
+        ..
     }) = presenter.receiver.blocked_queues.get(&0)
     else {
         panic!("the acquire must wait on a consumer-side host acknowledgement");

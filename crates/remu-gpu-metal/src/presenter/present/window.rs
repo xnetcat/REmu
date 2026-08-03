@@ -13,7 +13,7 @@ use super::super::{
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
     SHARED_HOST_KIND_WAIT, SharedEventDrawReject, WRITEBACK_TRIGGERS,
-    format_terminal_publication_report,
+    format_shared_event_host_effect_latency_report, format_terminal_publication_report,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -365,6 +365,17 @@ impl MetalPresenter {
                 f64::from(host_kinds[SHARED_HOST_KIND_FLIP]) / seconds,
                 f64::from(host_kinds[SHARED_HOST_KIND_UI]) / seconds,
                 f64::from(host_kinds[SHARED_HOST_KIND_OTHER]) / seconds,
+            );
+            let shared_event_host_effect_pending = self
+                .receiver
+                .shared_event_host_effect_pending_statistics(Instant::now());
+            eprintln!(
+                "{}",
+                format_shared_event_host_effect_latency_report(
+                    dispatch_window_ms,
+                    self.statistics.shared_event_host_effect_latency.take(),
+                    shared_event_host_effect_pending,
+                )
             );
             let head_join = self
                 .flip_completion_joins

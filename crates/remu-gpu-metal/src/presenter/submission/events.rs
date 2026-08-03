@@ -8,6 +8,7 @@ use super::super::{
 use super::{
     OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
     QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+    SharedEventHostEffectPendingStatistics,
 };
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, GpuWaitId};
 use std::collections::{HashMap, VecDeque};
@@ -311,7 +312,7 @@ impl OrderedGpuEventReceiver {
 
     pub(crate) fn try_recv(
         &mut self,
-        block_resolved: impl Fn(&QueueBlockReason) -> bool,
+        mut block_resolved: impl FnMut(&mut QueueBlockReason) -> bool,
     ) -> OrderedEventPoll {
         self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
@@ -322,7 +323,7 @@ impl OrderedGpuEventReceiver {
             | QueueBlockReason::GraphicsPipeline(_)
             | QueueBlockReason::ComputePipeline(_)) => !block_resolved(reason),
         });
-        if self.host_block.as_ref().is_some_and(|reason| match reason {
+        if self.host_block.as_mut().is_some_and(|reason| match reason {
             QueueBlockReason::GuestMemoryWait(_)
             | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
@@ -406,6 +407,22 @@ impl OrderedGpuEventReceiver {
         } else {
             OrderedEventPoll::Empty
         }
+    }
+
+    pub(crate) fn shared_event_host_effect_pending_statistics(
+        &self,
+        now: std::time::Instant,
+    ) -> SharedEventHostEffectPendingStatistics {
+        let mut statistics = SharedEventHostEffectPendingStatistics::default();
+        for reason in self.blocked_queues.values().chain(self.host_block.iter()) {
+            if let QueueBlockReason::GuestSharedEventHostEffect { latency, .. } = reason {
+                statistics.record(
+                    latency.phase,
+                    now.saturating_duration_since(latency.phase_started_at),
+                );
+            }
+        }
+        statistics
     }
 
     pub(crate) fn pop_queue_event(&mut self, queue_id: u64) -> Option<GpuEvent> {
@@ -754,6 +771,7 @@ impl OrderedGpuEventReceiver {
                                 consumer_queue_id,
                                 consumer_ack,
                                 terminal_dependencies,
+                                ..
                             } => {
                                 format!(
                                     "shared-event-host:q{consumer_queue_id}/ack:{}/terminal:{}",
