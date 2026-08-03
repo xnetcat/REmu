@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::WrittenRegion;
-use super::binding_fault::record_fragment_scalar_inline_binding;
+use super::binding_fault::{
+    ResourceKind, ResourceOwner, begin_resource_call_trace, record_action_before,
+    record_buffer_before, record_call_returned, record_depth_state_before, record_inline_before,
+    record_pipeline_before, record_sampler_before, record_texture_before,
+};
 use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
@@ -1336,6 +1340,16 @@ impl MetalPresenter {
             .active_open_guest_batch()
             .and_then(|batch| batch.render_pass.as_ref())
             .is_none_or(|open| open.key != render_pass_key);
+        begin_resource_call_trace(
+            draw.sequence,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            &self
+                .active_open_guest_batch()
+                .expect("guest command batch was opened above")
+                .command_buffer,
+            needs_new_render_pass,
+        );
         let pass = if needs_new_render_pass {
             let pass = RenderPassDescriptor::new();
             pass.set_render_target_width(u64::from(render_width));
@@ -1353,7 +1367,17 @@ impl MetalPresenter {
                     .ok_or_else(|| {
                         format!("Metal render pass has no color attachment {location}")
                     })?;
+                let attachment_call = record_texture_before(
+                    ResourceKind::ColorAttachment,
+                    u64::try_from(location).expect("color attachment location fits u64"),
+                    texture,
+                    (u64::from(targets[location].mip_level) << 32)
+                        | u64::from(targets[location].base_layer),
+                    ResourceOwner::ResidentTarget,
+                    "color-attachment",
+                );
                 attachment.set_texture(Some(texture));
+                record_call_returned(attachment_call);
                 attachment.set_level(u64::from(targets[location].mip_level));
                 if targets[location].texture_type == 10 {
                     attachment.set_depth_plane(u64::from(targets[location].base_layer));
@@ -1367,7 +1391,17 @@ impl MetalPresenter {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
                 if let Some(resolve_texture) = resolve_texture {
+                    let resolve_call = record_texture_before(
+                        ResourceKind::ColorResolve,
+                        u64::try_from(location).expect("color attachment location fits u64"),
+                        resolve_texture,
+                        (u64::from(targets[location].mip_level) << 32)
+                            | u64::from(targets[location].base_layer),
+                        ResourceOwner::ResidentTarget,
+                        "color-resolve",
+                    );
                     attachment.set_resolve_texture(Some(resolve_texture));
+                    record_call_returned(resolve_call);
                     attachment.set_store_action(MTLStoreAction::StoreAndMultisampleResolve);
                 } else {
                     attachment.set_store_action(MTLStoreAction::Store);
@@ -1377,7 +1411,16 @@ impl MetalPresenter {
                 let attachment = pass
                     .depth_attachment()
                     .ok_or("Metal render pass has no depth attachment")?;
+                let depth_call = record_texture_before(
+                    ResourceKind::DepthAttachment,
+                    0,
+                    texture,
+                    0,
+                    ResourceOwner::ResidentTarget,
+                    "depth-attachment",
+                );
                 attachment.set_texture(Some(texture));
+                record_call_returned(depth_call);
                 if depth.is_some_and(|depth| depth.layer_count > 1) {
                     // `depth.texture.address` already points at DB_DEPTH_VIEW's first selected
                     // slice, so the Metal view begins at slice zero and the render-pass array
@@ -1391,7 +1434,16 @@ impl MetalPresenter {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
                 if let Some(resolve_texture) = depth_resolve_texture.as_ref() {
+                    let resolve_call = record_texture_before(
+                        ResourceKind::DepthResolve,
+                        0,
+                        resolve_texture,
+                        0,
+                        ResourceOwner::ResidentTarget,
+                        "depth-resolve",
+                    );
                     attachment.set_resolve_texture(Some(resolve_texture));
+                    record_call_returned(resolve_call);
                     attachment.set_store_action(MTLStoreAction::StoreAndMultisampleResolve);
                 } else {
                     attachment.set_store_action(MTLStoreAction::Store);
@@ -1439,12 +1491,14 @@ impl MetalPresenter {
                         .render_pass_key_transitions
                         .record(key_transition.expect("an ended render pass had a key"));
                 }
+                let encoder_call = record_action_before(ResourceKind::Encoder, "new-render-encoder");
                 let encoder = batch
                     .command_buffer
                     .new_render_command_encoder(
                         pass.expect("new guest render pass descriptor was prepared"),
                     )
                     .to_owned();
+                record_call_returned(encoder_call);
                 encoder.set_label("REMu translated guest render pass");
                 batch.render_pass = Some(OpenGuestRenderPass {
                     key: render_pass_key,
@@ -1458,7 +1512,9 @@ impl MetalPresenter {
                 .as_ref()
                 .expect("compatible guest render pass was opened above")
                 .encoder;
+            let pipeline_call = record_pipeline_before(&pipeline);
             encoder.set_render_pipeline_state(&pipeline);
+            record_call_returned(pipeline_call);
             encoder.set_front_facing_winding(raster.front_winding);
             encoder.set_cull_mode(if diagnostic_disable_culling_for_draw
                 || uses_procedural_rectangle_stage
@@ -1471,7 +1527,9 @@ impl MetalPresenter {
             if !diagnostic_disable_depth_for_draw
                 && let Some(depth_stencil_state) = depth_stencil_state.as_ref()
             {
+                let depth_state_call = record_depth_state_before(depth_stencil_state);
                 encoder.set_depth_stencil_state(depth_stencil_state);
+                record_call_returned(depth_state_call);
             }
             encoder.set_blend_color(
                 f32::from_bits(
@@ -1502,9 +1560,29 @@ impl MetalPresenter {
                 export_global_argument_buffer.as_ref(),
             ) {
                 if uses_mesh_stage {
+                    let call = record_buffer_before(
+                        ResourceKind::MeshBuffer,
+                        u64::from(index),
+                        argument_buffer,
+                        0,
+                        argument_buffer.length(),
+                        ResourceOwner::DrawArgument,
+                        "vertex-global-argument",
+                    );
                     encoder.set_mesh_buffer(u64::from(index), Some(argument_buffer), 0);
+                    record_call_returned(call);
                 } else {
+                    let call = record_buffer_before(
+                        ResourceKind::VertexBuffer,
+                        u64::from(index),
+                        argument_buffer,
+                        0,
+                        argument_buffer.length(),
+                        ResourceOwner::DrawArgument,
+                        "vertex-global-argument",
+                    );
                     encoder.set_vertex_buffer(u64::from(index), Some(argument_buffer), 0);
+                    record_call_returned(call);
                 }
                 for (buffer, binding) in export_buffers
                     .iter()
@@ -1515,18 +1593,55 @@ impl MetalPresenter {
                     } else {
                         MTLResourceUsage::Read
                     };
+                    let call = record_buffer_before(
+                        ResourceKind::UseResource,
+                        u64::from(binding.scalar_address),
+                        &buffer.buffer,
+                        buffer.offset,
+                        u64::try_from(binding.byte_count)
+                            .expect("vertex global byte count fits u64"),
+                        ResourceOwner::DrawGlobal,
+                        "vertex-global-resource",
+                    );
                     encoder.use_resource_at(
                         &buffer.buffer,
                         usage,
                         export_resource_render_stage(uses_mesh_stage),
                     );
+                    record_call_returned(call);
                 }
             } else {
-                for (index, buffer) in export_buffer_indices.iter().zip(&export_buffers) {
+                for ((index, buffer), binding) in export_buffer_indices
+                    .iter()
+                    .zip(&export_buffers)
+                    .zip(&export_evaluation.global_memory_bindings)
+                {
                     if uses_mesh_stage {
+                        let call = record_buffer_before(
+                            ResourceKind::MeshBuffer,
+                            *index,
+                            &buffer.buffer,
+                            buffer.offset,
+                            u64::try_from(binding.byte_count)
+                                .expect("vertex global byte count fits u64"),
+                            ResourceOwner::DrawGlobal,
+                            "vertex-global",
+                        );
                         encoder.set_mesh_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                        record_call_returned(call);
                     } else {
+                        let call = record_buffer_before(
+                            ResourceKind::VertexBuffer,
+                            *index,
+                            &buffer.buffer,
+                            buffer.offset,
+                            u64::try_from(binding.byte_count)
+                                .expect("vertex global byte count fits u64"),
+                            ResourceOwner::DrawGlobal,
+                            "vertex-global",
+                        );
                         encoder.set_vertex_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                        record_call_returned(call);
                     }
                 }
             }
@@ -1534,7 +1649,17 @@ impl MetalPresenter {
                 pixel_global_argument_buffer_index,
                 pixel_global_argument_buffer.as_ref(),
             ) {
+                let call = record_buffer_before(
+                    ResourceKind::FragmentBuffer,
+                    u64::from(index),
+                    argument_buffer,
+                    0,
+                    argument_buffer.length(),
+                    ResourceOwner::DrawArgument,
+                    "pixel-global-argument",
+                );
                 encoder.set_fragment_buffer(u64::from(index), Some(argument_buffer), 0);
+                record_call_returned(call);
                 for (buffer, binding) in pixel_buffers
                     .iter()
                     .zip(&pixel_evaluation.global_memory_bindings)
@@ -1544,84 +1669,210 @@ impl MetalPresenter {
                     } else {
                         MTLResourceUsage::Read
                     };
+                    let call = record_buffer_before(
+                        ResourceKind::UseResource,
+                        u64::from(binding.scalar_address),
+                        &buffer.buffer,
+                        buffer.offset,
+                        u64::try_from(binding.byte_count)
+                            .expect("pixel global byte count fits u64"),
+                        ResourceOwner::DrawGlobal,
+                        "pixel-global-resource",
+                    );
                     encoder.use_resource_at(&buffer.buffer, usage, MTLRenderStages::Fragment);
+                    record_call_returned(call);
                 }
             } else {
-                for (index, buffer) in pixel_buffer_indices.iter().zip(&pixel_buffers) {
+                for ((index, buffer), binding) in pixel_buffer_indices
+                    .iter()
+                    .zip(&pixel_buffers)
+                    .zip(&pixel_evaluation.global_memory_bindings)
+                {
+                    let call = record_buffer_before(
+                        ResourceKind::FragmentBuffer,
+                        *index,
+                        &buffer.buffer,
+                        buffer.offset,
+                        u64::try_from(binding.byte_count)
+                            .expect("pixel global byte count fits u64"),
+                        ResourceOwner::DrawGlobal,
+                        "pixel-global",
+                    );
                     encoder.set_fragment_buffer(*index, Some(&buffer.buffer), buffer.offset);
+                    record_call_returned(call);
                 }
             }
             if uses_mesh_stage {
+                let call = record_inline_before(
+                    ResourceKind::MeshInline,
+                    u64::from(vertex_scalar_buffer_index),
+                    vertex_scalar_byte_count,
+                    "vertex-scalar-metadata",
+                );
                 encoder.set_mesh_bytes(
                     u64::from(vertex_scalar_buffer_index),
                     vertex_scalar_byte_count,
                     vertex_scalar_metadata.as_ptr().cast::<c_void>(),
                 );
+                record_call_returned(call);
             } else {
+                let call = record_inline_before(
+                    ResourceKind::VertexInline,
+                    u64::from(vertex_scalar_buffer_index),
+                    vertex_scalar_byte_count,
+                    "vertex-scalar-metadata",
+                );
                 encoder.set_vertex_bytes(
                     u64::from(vertex_scalar_buffer_index),
                     vertex_scalar_byte_count,
                     vertex_scalar_metadata.as_ptr().cast::<c_void>(),
                 );
+                record_call_returned(call);
             }
             if let Some(buffer) = diagnostic_vertex_position_buffer.as_ref() {
+                let call = record_buffer_before(
+                    ResourceKind::VertexBuffer,
+                    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+                    buffer,
+                    0,
+                    buffer.length(),
+                    ResourceOwner::PresenterDiagnostic,
+                    "diagnostic-vertex-position",
+                );
                 encoder.set_vertex_buffer(DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, Some(buffer), 0);
+                record_call_returned(call);
             }
-            record_fragment_scalar_inline_binding(
-                draw.sequence,
-                draw.export_shader_address,
-                draw.pixel_shader_address,
+            let fragment_scalar_call = record_inline_before(
+                ResourceKind::FragmentInline,
                 u64::from(pixel_scalar_buffer_index),
                 pixel_scalar_byte_count,
-                !needs_new_render_pass,
+                "pixel-scalar-metadata",
             );
             encoder.set_fragment_bytes(
                 u64::from(pixel_scalar_buffer_index),
                 pixel_scalar_byte_count,
                 pixel_scalar_metadata.as_ptr().cast::<c_void>(),
             );
+            record_call_returned(fragment_scalar_call);
             if let Some(buffer) = diagnostic_pixel_output_buffer.as_ref() {
+                let call = record_buffer_before(
+                    ResourceKind::FragmentBuffer,
+                    DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX,
+                    buffer,
+                    0,
+                    buffer.length(),
+                    ResourceOwner::PresenterDiagnostic,
+                    "diagnostic-pixel-output",
+                );
                 encoder.set_fragment_buffer(DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, Some(buffer), 0);
+                record_call_returned(call);
             }
             for (index, texture) in export_texture_indices.iter().zip(&export_textures) {
                 if uses_mesh_stage {
+                    let call = record_texture_before(
+                        ResourceKind::MeshTexture,
+                        *index,
+                        &texture.texture,
+                        0,
+                        ResourceOwner::ResidentSample,
+                        "vertex-sampled-texture",
+                    );
                     encoder.set_mesh_texture(*index, Some(&texture.texture));
+                    record_call_returned(call);
                 } else {
+                    let call = record_texture_before(
+                        ResourceKind::VertexTexture,
+                        *index,
+                        &texture.texture,
+                        0,
+                        ResourceOwner::ResidentSample,
+                        "vertex-sampled-texture",
+                    );
                     encoder.set_vertex_texture(*index, Some(&texture.texture));
+                    record_call_returned(call);
                 }
             }
             for (index, texture) in pixel_texture_indices.iter().zip(&pixel_textures) {
+                let call = record_texture_before(
+                    ResourceKind::FragmentTexture,
+                    *index,
+                    &texture.texture,
+                    0,
+                    ResourceOwner::ResidentSample,
+                    "pixel-sampled-texture",
+                );
                 encoder.set_fragment_texture(*index, Some(&texture.texture));
+                record_call_returned(call);
             }
             if let (Some(index), Some(buffer)) =
                 (vertex_sampler_buffer_index, export_sampler_buffer.as_ref())
             {
                 if uses_mesh_stage {
+                    let call = record_buffer_before(
+                        ResourceKind::MeshBuffer,
+                        u64::from(index),
+                        buffer,
+                        0,
+                        buffer.length(),
+                        ResourceOwner::DrawArgument,
+                        "vertex-sampler-argument",
+                    );
                     encoder.set_mesh_buffer(u64::from(index), Some(buffer), 0);
+                    record_call_returned(call);
                 } else {
+                    let call = record_buffer_before(
+                        ResourceKind::VertexBuffer,
+                        u64::from(index),
+                        buffer,
+                        0,
+                        buffer.length(),
+                        ResourceOwner::DrawArgument,
+                        "vertex-sampler-argument",
+                    );
                     encoder.set_vertex_buffer(u64::from(index), Some(buffer), 0);
+                    record_call_returned(call);
                 }
             } else {
                 for (index, sampler) in export_samplers.iter().enumerate() {
                     let index =
                         u64::try_from(index).map_err(|_| "vertex sampler index overflow")?;
                     if uses_mesh_stage {
+                        let call = record_sampler_before(ResourceKind::MeshSampler, index, sampler);
                         encoder.set_mesh_sampler_state(index, Some(sampler));
+                        record_call_returned(call);
                     } else {
+                        let call =
+                            record_sampler_before(ResourceKind::VertexSampler, index, sampler);
                         encoder.set_vertex_sampler_state(index, Some(sampler));
+                        record_call_returned(call);
                     }
                 }
             }
             if let (Some(index), Some(buffer)) =
                 (pixel_sampler_buffer_index, pixel_sampler_buffer.as_ref())
             {
+                let call = record_buffer_before(
+                    ResourceKind::FragmentBuffer,
+                    u64::from(index),
+                    buffer,
+                    0,
+                    buffer.length(),
+                    ResourceOwner::DrawArgument,
+                    "pixel-sampler-argument",
+                );
                 encoder.set_fragment_buffer(u64::from(index), Some(buffer), 0);
+                record_call_returned(call);
             } else {
                 for (index, sampler) in pixel_samplers.iter().enumerate() {
+                    let index =
+                        u64::try_from(index).map_err(|_| "pixel sampler index overflow")?;
+                    let call =
+                        record_sampler_before(ResourceKind::FragmentSampler, index, sampler);
                     encoder.set_fragment_sampler_state(
-                        u64::try_from(index).map_err(|_| "pixel sampler index overflow")?,
+                        index,
                         Some(sampler),
                     );
+                    record_call_returned(call);
                 }
             }
 
@@ -1637,13 +1888,31 @@ impl MetalPresenter {
                         0_u32,
                         u32::from_ne_bytes(ngg_mesh_base_vertex(draw).to_ne_bytes()),
                     ];
+                    let meshlet_call = record_buffer_before(
+                        ResourceKind::MeshBuffer,
+                        NGG_MESHLET_BUFFER_INDEX,
+                        &meshlets.buffer,
+                        0,
+                        meshlets.buffer.length(),
+                        ResourceOwner::MeshletCache,
+                        "ngg-meshlets",
+                    );
                     encoder.set_mesh_buffer(NGG_MESHLET_BUFFER_INDEX, Some(&meshlets.buffer), 0);
+                    record_call_returned(meshlet_call);
+                    let mesh_draw_call = record_inline_before(
+                        ResourceKind::MeshInline,
+                        NGG_MESH_DRAW_BUFFER_INDEX,
+                        u64::try_from(std::mem::size_of_val(&mesh_draw))
+                            .expect("mesh draw metadata size fits u64"),
+                        "ngg-mesh-draw",
+                    );
                     encoder.set_mesh_bytes(
                         NGG_MESH_DRAW_BUFFER_INDEX,
                         u64::try_from(std::mem::size_of_val(&mesh_draw))
                             .expect("mesh draw metadata size fits u64"),
                         mesh_draw.as_ptr().cast::<c_void>(),
                     );
+                    record_call_returned(mesh_draw_call);
                     static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
                     let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
                     if mesh_sequence <= 16 || mesh_sequence.is_power_of_two() {
@@ -1667,6 +1936,7 @@ impl MetalPresenter {
                             raster.front_winding,
                         );
                     }
+                    let draw_call = record_action_before(ResourceKind::Draw, "draw-mesh");
                     encoder.draw_mesh_threadgroups(
                         MTLSize::new(meshlets.group_count, u64::from(draw.instance_count), 1),
                         MTLSize::new(1, 1, 1),
@@ -1680,19 +1950,43 @@ impl MetalPresenter {
                             1,
                         ),
                     );
+                    record_call_returned(draw_call);
                 } else {
                     // A mesh-stage draw whose dispatch predicate declines encodes nothing at
                     // all; without a count that whole draw disappears without a trace.
                     super::stats::NOOP_DRAWS_MESH_DISPATCH_SKIPPED.fetch_add(1, Ordering::Relaxed);
                 }
             } else if diagnostic_force_triangle {
+                let draw_call = record_action_before(ResourceKind::Draw, "draw-diagnostic");
                 encoder.draw_primitives_instanced(MTLPrimitiveType::Triangle, 0, 3, 1);
+                record_call_returned(draw_call);
             } else if matches!(scissor, GuestScissor::Empty) {
                 // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
                 // primitive while preserving command-stream ordering.
                 super::stats::NOOP_DRAWS_EMPTY_SCISSOR.fetch_add(1, Ordering::Relaxed);
             } else if let Some(arguments) = indirect_arguments.as_ref() {
                 if let Some((index_buffer, index_type)) = indirect_index_buffer.as_ref() {
+                    let index_resource = record_buffer_before(
+                        ResourceKind::VertexBuffer,
+                        u64::MAX - 1,
+                        &index_buffer.buffer,
+                        index_buffer.offset,
+                        index_buffer.buffer.length().saturating_sub(index_buffer.offset),
+                        ResourceOwner::DrawGlobal,
+                        "draw-index-buffer",
+                    );
+                    record_call_returned(index_resource);
+                    let argument_resource = record_buffer_before(
+                        ResourceKind::VertexBuffer,
+                        u64::MAX,
+                        &arguments.buffer,
+                        arguments.offset,
+                        arguments.buffer.length().saturating_sub(arguments.offset),
+                        ResourceOwner::DrawArgument,
+                        "draw-indirect-arguments",
+                    );
+                    record_call_returned(argument_resource);
+                    let draw_call = record_action_before(ResourceKind::Draw, "draw-indexed-indirect");
                     encoder.draw_indexed_primitives_indirect(
                         primitive,
                         *index_type,
@@ -1701,14 +1995,38 @@ impl MetalPresenter {
                         &arguments.buffer,
                         arguments.offset,
                     );
+                    record_call_returned(draw_call);
                 } else {
+                    let argument_resource = record_buffer_before(
+                        ResourceKind::VertexBuffer,
+                        u64::MAX,
+                        &arguments.buffer,
+                        arguments.offset,
+                        arguments.buffer.length().saturating_sub(arguments.offset),
+                        ResourceOwner::DrawArgument,
+                        "draw-indirect-arguments",
+                    );
+                    record_call_returned(argument_resource);
+                    let draw_call = record_action_before(ResourceKind::Draw, "draw-indirect");
                     encoder.draw_primitives_indirect(
                         primitive,
                         &arguments.buffer,
                         arguments.offset,
                     );
+                    record_call_returned(draw_call);
                 }
             } else if let Some((_, index_buffer)) = indexed_draw.as_ref() {
+                let index_resource = record_buffer_before(
+                    ResourceKind::VertexBuffer,
+                    u64::MAX - 1,
+                    index_buffer,
+                    0,
+                    index_buffer.length(),
+                    ResourceOwner::DrawGlobal,
+                    "draw-index-buffer",
+                );
+                record_call_returned(index_resource);
+                let draw_call = record_action_before(ResourceKind::Draw, "draw-indexed");
                 encoder.draw_indexed_primitives_instanced_base_instance(
                     primitive,
                     indexed_count.expect("indexed draw count was precomputed"),
@@ -1719,6 +2037,7 @@ impl MetalPresenter {
                     i64::from(draw.base_vertex),
                     0,
                 );
+                record_call_returned(draw_call);
             } else if uses_procedural_rectangle_stage {
                 static LOGGED_PROCEDURAL_RECTANGLES: AtomicUsize = AtomicUsize::new(0);
                 let sequence = LOGGED_PROCEDURAL_RECTANGLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1728,14 +2047,17 @@ impl MetalPresenter {
                         draw.sequence, draw.index_count, draw.primitive_type,
                     );
                 }
+                let draw_call = record_action_before(ResourceKind::Draw, "draw-procedural");
                 encoder.draw_primitives_instanced(
                     MTLPrimitiveType::Triangle,
                     0,
                     3,
                     u64::from(draw.instance_count),
                 );
+                record_call_returned(draw_call);
             } else {
                 let first_vertex = i64::from(draw.index_offset) + i64::from(draw.base_vertex);
+                let draw_call = record_action_before(ResourceKind::Draw, "draw-primitives");
                 encoder.draw_primitives_instanced(
                     primitive,
                     u64::try_from(first_vertex)
@@ -1746,6 +2068,7 @@ impl MetalPresenter {
                     )),
                     u64::from(draw.instance_count),
                 );
+                record_call_returned(draw_call);
             }
         }
 
