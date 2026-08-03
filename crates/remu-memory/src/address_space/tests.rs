@@ -983,6 +983,12 @@ fn protect_committed_reserved_pages_have_resolvable_shared_backing() {
     let interior = page(reserved, 1).get();
     let identity = guest_shared_mapping_identity(interior, 2 * GUEST_PAGE_SIZE)
         .expect("committed pages resolve to a physical backing identity");
+    let retained = guest_shared_backing_range(interior, 2 * GUEST_PAGE_SIZE)
+        .expect("committed pages resolve to a retained backing view");
+    assert!(
+        retained.is_virtually_keyed(),
+        "committed-memory offsets cannot be retained as durable physical allocation identity"
+    );
     assert_eq!(
         guest_shared_backing_segments(interior, 2 * GUEST_PAGE_SIZE),
         Some(vec![GuestSharedBackingSegment {
@@ -1246,6 +1252,10 @@ fn shared_backing_view_is_coherent_across_disjoint_aliases_and_remaps() {
     assert_eq!(range.view_identity().backing_offset, 0);
     assert_eq!(range.resource_offset(), interior_offset);
     assert_eq!(range.view_byte_count(), two_pages);
+    assert!(
+        !range.is_virtually_keyed(),
+        "direct-memory backing offsets remain durable while the backing is retained"
+    );
 
     let view = range.map_view().expect("map the complete physical view");
     assert_eq!(view.byte_count(), two_pages);

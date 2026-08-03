@@ -405,6 +405,13 @@ impl MetalPresenter {
                             owner.source_offset,
                             Some(owner.physical_identity),
                         )?
+                    } else if let Some(backing) = &owner.guest_backing {
+                        self.upload_writable_global_buffer_from_guest_backing(
+                            device,
+                            effective_bindings[group],
+                            backing,
+                            owner.physical_identity,
+                        )?
                     } else {
                         let binding = effective_bindings[group];
                         if binding.data.len() != binding.byte_count {
@@ -425,6 +432,13 @@ impl MetalPresenter {
                         physical_identity: Some(binding_plan.physical_identity),
                         original_version: None,
                     });
+                } else if let Some(backing) = &binding_plan.guest_backing {
+                    uploaded.push(self.upload_shared_event_guest_global_buffer(
+                        device,
+                        effective_bindings[index],
+                        backing,
+                        binding_plan.physical_identity,
+                    )?);
                 } else {
                     uploaded.push(
                         self.upload_global_buffer_from_packet(device, effective_bindings[index])?,
@@ -781,7 +795,128 @@ impl MetalPresenter {
             original_version: Some(GlobalBufferOriginalVersion {
                 buffer: source,
                 offset: source_offset,
+                _retained_source: None,
             }),
+        })
+    }
+
+    /// Captures a retained physical guest range after the active SharedEvent wait entirely on
+    /// the GPU, then forks that immutable baseline into writable compute storage.
+    ///
+    /// The first blit observes the source in guest queue order. The second copies only from the
+    /// immutable baseline, so completion can diff the compute result even if guest aliases later
+    /// change. Retaining the no-copy source explicitly keeps its independent mmap alive until the
+    /// command buffer reaches a terminal state.
+    fn upload_writable_global_buffer_from_guest_backing(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+        backing: &GuestSharedBackingRange,
+        physical_identity: GuestSharedMappingIdentity,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        if binding.byte_count == 0 {
+            return Err("retained guest writable global source is empty".to_owned());
+        }
+        let source = self.upload_shared_event_guest_global_buffer(
+            device,
+            binding,
+            backing,
+            physical_identity,
+        )?;
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "retained guest writable global byte count does not fit Metal")?;
+        let baseline = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
+        baseline.set_label(&format!(
+            "REMu retained guest global baseline {:#x}/{byte_count:#x}",
+            binding.base_address,
+        ));
+        let destination = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
+        destination.set_label(&format!(
+            "REMu retained guest writable global {:#x}/{byte_count:#x}",
+            binding.base_address,
+        ));
+
+        self.ensure_active_open_guest_batch()?;
+        let batch = self
+            .active_open_guest_batch_mut()
+            .expect("retained guest global COW opened a guest batch");
+        batch.close_active_pass_encoders();
+        let blit = batch.command_buffer.new_blit_command_encoder();
+        blit.set_label("REMu snapshot retained guest global baseline");
+        blit.copy_from_buffer(&source.buffer, source.offset, &baseline, 0, byte_count);
+        blit.copy_from_buffer(&baseline, 0, &destination, 0, byte_count);
+        blit.end_encoding();
+
+        static GUEST_COW_COUNT: AtomicUsize = AtomicUsize::new(0);
+        let sequence = GUEST_COW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 16 || sequence.is_power_of_two() {
+            eprintln!(
+                "[REMu][METAL][GLOBAL-GUEST-COW] sequence={sequence} address={:#x} bytes={byte_count:#x} source={:p}+{:#x} baseline={:p} destination={:p} physical={physical_identity:?}",
+                binding.base_address,
+                source.buffer.as_ptr(),
+                source.offset,
+                baseline.as_ptr(),
+                destination.as_ptr(),
+            );
+        }
+        Ok(UploadedGlobalBuffer {
+            buffer: destination,
+            offset: 0,
+            guest_memory: false,
+            physical_identity: Some(physical_identity),
+            original_version: Some(GlobalBufferOriginalVersion {
+                buffer: baseline,
+                offset: 0,
+                _retained_source: Some(source.buffer),
+            }),
+        })
+    }
+
+    fn upload_shared_event_guest_global_buffer(
+        &self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+        backing: &GuestSharedBackingRange,
+        physical_identity: GuestSharedMappingIdentity,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "retained guest global byte count does not fit Metal")?;
+        let resolved_identity = GuestSharedMappingIdentity {
+            backing_id: backing.view_identity().backing_id,
+            backing_offset: backing
+                .view_identity()
+                .backing_offset
+                .checked_add(backing.resource_offset())
+                .ok_or("retained guest global physical identity overflows")?,
+        };
+        if resolved_identity != physical_identity {
+            return Err(format!(
+                "retained guest global identity changed expected={physical_identity:?} resolved={resolved_identity:?}"
+            ));
+        }
+        let buffer = metal_buffer_with_guest_backing_range(device, backing)
+            .ok_or("could not map retained guest global backing for Metal")?;
+        let end = backing
+            .resource_offset()
+            .checked_add(byte_count)
+            .ok_or("retained guest global range overflows")?;
+        if end > buffer.length() {
+            return Err(format!(
+                "retained guest global exceeds Metal buffer offset={} bytes={byte_count} length={}",
+                backing.resource_offset(),
+                buffer.length(),
+            ));
+        }
+        buffer.set_label(&format!(
+            "REMu retained guest global backing={:#x}+{:#x}/{byte_count:#x}",
+            physical_identity.backing_id, physical_identity.backing_offset,
+        ));
+        Ok(UploadedGlobalBuffer {
+            buffer,
+            offset: backing.resource_offset(),
+            guest_memory: true,
+            physical_identity: Some(physical_identity),
+            original_version: None,
         })
     }
 
@@ -1009,7 +1144,7 @@ impl MetalPresenter {
                     return None;
                 }
             };
-            let (source, offset, physical_identity) = match source {
+            let (source, offset, guest_backing, physical_identity) = match source {
                 QueuedGlobalReadSource::Buffer {
                     buffer,
                     offset,
@@ -1026,13 +1161,9 @@ impl MetalPresenter {
                         );
                         return None;
                     }
-                    (Some(buffer), offset, physical_identity)
+                    (Some(buffer), offset, None, physical_identity)
                 }
                 QueuedGlobalReadSource::None => {
-                    if binding.data.len() != binding.byte_count {
-                        trace_shared_compute_binding_reject(binding, "incomplete-packet-snapshot");
-                        return None;
-                    }
                     if dependency_write_footprint.iter().any(|producer| {
                         producer.mapping.backing_id == binding_identity.backing_id
                             && producer.mapping.backing_offset
@@ -1049,7 +1180,41 @@ impl MetalPresenter {
                         );
                         return None;
                     }
-                    (None, 0, binding_identity)
+                    if binding.data.len() == binding.byte_count {
+                        (None, 0, None, binding_identity)
+                    } else {
+                        let Some(backing) =
+                            guest_shared_backing_range(binding.base_address, byte_count)
+                        else {
+                            trace_shared_compute_binding_reject(
+                                binding,
+                                "incomplete-packet-snapshot",
+                            );
+                            return None;
+                        };
+                        if backing.is_virtually_keyed() {
+                            trace_shared_compute_binding_reject(
+                                binding,
+                                "virtually-keyed-guest-source",
+                            );
+                            return None;
+                        }
+                        let resolved_identity = GuestSharedMappingIdentity {
+                            backing_id: backing.view_identity().backing_id,
+                            backing_offset: backing
+                                .view_identity()
+                                .backing_offset
+                                .checked_add(backing.resource_offset())?,
+                        };
+                        if resolved_identity != binding_identity {
+                            trace_shared_compute_binding_reject(
+                                binding,
+                                "guest-source-identity-mismatch",
+                            );
+                            return None;
+                        }
+                        (None, 0, Some(backing), binding_identity)
+                    }
                 }
                 QueuedGlobalReadSource::Buffer {
                     guest_memory: true, ..
@@ -1075,6 +1240,7 @@ impl MetalPresenter {
             plans.push(SharedEventComputeGlobalBindingPlan {
                 source,
                 source_offset: offset,
+                guest_backing,
                 physical_identity,
                 byte_count,
                 writable_group: None,
@@ -1098,8 +1264,22 @@ impl MetalPresenter {
                 let exact = left_start == right_start
                     && plans[left].byte_count == plans[right].byte_count
                     && match (&plans[left].source, &plans[right].source) {
-                        (Some(left), Some(right)) => left.as_ptr() == right.as_ptr(),
-                        (None, None) => true,
+                        (Some(left_buffer), Some(right_buffer)) => {
+                            left_buffer.as_ptr() == right_buffer.as_ptr()
+                                && plans[left].guest_backing.is_none()
+                                && plans[right].guest_backing.is_none()
+                        }
+                        (None, None) => {
+                            match (&plans[left].guest_backing, &plans[right].guest_backing) {
+                                (None, None) => true,
+                                (Some(left), Some(right)) => {
+                                    left.view_identity() == right.view_identity()
+                                        && left.view_byte_count() == right.view_byte_count()
+                                        && left.resource_offset() == right.resource_offset()
+                                }
+                                _ => false,
+                            }
+                        }
                         _ => false,
                     }
                     && plans[left].source_offset == plans[right].source_offset;

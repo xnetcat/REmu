@@ -1588,6 +1588,161 @@ fn queued_writable_global_cow_copies_on_gpu_and_diffs_against_the_retained_basel
 }
 
 #[test]
+fn same_queue_compute_snapshots_unsnapshotted_physical_global_after_the_gpu_wait() {
+    const BYTE_COUNT: usize = 64;
+    let (_address_space, guest_address) = mapped_test_pages(1);
+    // SAFETY: `_address_space` owns a writable mapping covering BYTE_COUNT bytes.
+    unsafe {
+        std::ptr::write_bytes(guest_address as *mut u8, 0x11, BYTE_COUNT);
+    }
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    open_per_queue_batch(&mut presenter, 7);
+    let fence = presenter
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue exists")
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("queue fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(
+        presenter.guest_queue_batches.get(&7).expect("queue exists"),
+        fence,
+    );
+    assert!(checkpoint.footprint_complete);
+    assert!(checkpoint.pending_write_footprint.is_empty());
+    presenter
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue exists")
+        .resource_dependencies
+        .insert(fence.producer(), checkpoint);
+
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: guest_address,
+        instruction_pcs: vec![4].into(),
+        byte_count: BYTE_COUNT,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let evaluation = evaluation_with_global(binding.clone());
+    let dispatch = ComputeDispatch {
+        sequence: 3,
+        source: ComputeDispatchSource::Direct,
+        launch: ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([1, 1, 1]),
+            group_count: [1, 1, 1],
+            base_group: [0, 0, 0],
+            threads_per_group: [1, 1, 1],
+            wave_lane_count: 32,
+            lds_size_bytes: 0,
+            initiator: 1,
+        },
+        shader_address: 0x6100,
+        shader_prefix: [0; 4],
+        shader: Some(ShaderSnapshot {
+            header_address: 0x6100,
+            program: Arc::new(Program::new(
+                0x6100,
+                vec![Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Flat,
+                    opcode: Opcode::Known("GlobalStoreDword"),
+                    words: Vec::new(),
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        vector_destination: 0,
+                        scalar_address: Some(0),
+                        offset_bytes: 0,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                    })),
+                }],
+            )),
+            supplemental_programs: Arc::from([]),
+            metadata: None,
+        }),
+        shader_evaluation: Some(Arc::new(evaluation)),
+        shader_registers: Vec::new(),
+    };
+    let plan = presenter
+        .prepare_shared_event_direct_compute_plan(7, &[fence], &dispatch)
+        .expect("unsnapshotted physical binding is GPU-orderable");
+    assert!(plan.global_bindings[0].source.is_none());
+    assert!(plan.global_bindings[0].guest_backing.is_some());
+    assert_eq!(plan.global_bindings[0].writable_group, Some(0));
+
+    let uploaded = presenter
+        .upload_compute_global_buffers(
+            &device,
+            dispatch.shader_evaluation.as_deref().unwrap(),
+            Some(&plan),
+        )
+        .expect("retained physical source forks on the GPU");
+    assert_eq!(uploaded.len(), 1);
+    assert!(!uploaded[0].guest_memory);
+    assert!(uploaded[0].original_version.is_some());
+    {
+        let batch = presenter
+            .guest_queue_batches
+            .get_mut(&7)
+            .expect("queue exists")
+            .open_batch
+            .as_mut()
+            .expect("consumer batch remains open");
+        let mutate = batch.command_buffer.new_blit_command_encoder();
+        mutate.fill_buffer(&uploaded[0].buffer, metal::NSRange::new(8, 4), 0x22);
+        mutate.end_encoding();
+    }
+
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(
+        &uploaded,
+        dispatch.shader_evaluation.as_deref().unwrap(),
+        &mut pending,
+    )
+    .expect("retained guest baseline creates a completion writeback");
+    append_unique_global_writebacks(
+        &mut presenter
+            .guest_queue_batches
+            .get_mut(&7)
+            .expect("queue exists")
+            .open_batch
+            .as_mut()
+            .expect("consumer batch remains open")
+            .global_writebacks,
+        pending,
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("retained guest COW batch settles and publishes");
+
+    let mut observed = [0_u8; BYTE_COUNT];
+    // SAFETY: `_address_space` retains this mapped range through the assertion.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            guest_address as *const u8,
+            observed.as_mut_ptr(),
+            BYTE_COUNT,
+        );
+    }
+    assert!(observed[..8].iter().all(|&byte| byte == 0x11));
+    assert_eq!(&observed[8..12], &[0x22; 4]);
+    assert!(observed[12..].iter().all(|&byte| byte == 0x11));
+}
+
+#[test]
 fn partially_overlapping_zero_copy_writer_synchronizes_instead_of_aliasing_buffers() {
     let mut address_space = GuestAddressSpace::new(5 * GUEST_PAGE_SIZE).unwrap();
     let base = address_space.base();

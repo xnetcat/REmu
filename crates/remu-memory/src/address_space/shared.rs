@@ -59,6 +59,17 @@ impl GuestSharedBackingRange {
         self.resource_offset
     }
 
+    /// Whether offsets in this backing name guest virtual placement rather than durable
+    /// physical bytes.
+    ///
+    /// Async GPU consumers must not retain a virtually keyed range across allocator reuse: the
+    /// same `(backing, offset)` can then describe a different committed allocation. Physically
+    /// keyed direct-memory ranges remain stable while a retained backing clone exists.
+    #[must_use]
+    pub fn is_virtually_keyed(&self) -> bool {
+        self.backing.is_virtually_keyed()
+    }
+
     /// Maps the resolved backing interval read-write for a coherent CPU/GPU shared view.
     #[must_use]
     pub fn map_view(&self) -> Option<GuestSharedBackingView> {

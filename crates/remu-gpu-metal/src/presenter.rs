@@ -19,7 +19,9 @@ use remu_gpu::{
     ComputeDispatch, GpuEvent, GpuFlipWait, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite,
     IndexedDraw,
 };
-use remu_memory::{CpuWriteWatch, CpuWriteWatchRetirement, GuestSharedMappingIdentity};
+use remu_memory::{
+    CpuWriteWatch, CpuWriteWatchRetirement, GuestSharedBackingRange, GuestSharedMappingIdentity,
+};
 mod cache;
 mod completion;
 mod decode;
@@ -1521,6 +1523,9 @@ struct UploadedGlobalBuffer {
 struct GlobalBufferOriginalVersion {
     buffer: Buffer,
     offset: u64,
+    /// Keeps a no-copy physical backing view alive until the GPU baseline copy is terminal.
+    /// Ordinary retained GPU versions do not need this extra lease.
+    _retained_source: Option<Buffer>,
 }
 
 struct PendingGlobalWriteback {
@@ -1781,6 +1786,7 @@ struct SharedEventDirectDrawPlan {
 struct SharedEventComputeGlobalBindingPlan {
     source: Option<Buffer>,
     source_offset: u64,
+    guest_backing: Option<GuestSharedBackingRange>,
     physical_identity: GuestSharedMappingIdentity,
     byte_count: u64,
     writable_group: Option<usize>,
