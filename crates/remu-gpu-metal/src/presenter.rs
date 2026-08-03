@@ -1498,6 +1498,7 @@ struct PresenterStatistics {
     shared_event_host_blocks: u32,
     shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,
+    shared_event_acquire_noop_drops: u32,
     shared_event_gpu_ordered_registered_waits: u32,
     shared_event_gpu_ordered_compute_dispatches: u32,
     shared_event_gpu_ordered_draws: u32,

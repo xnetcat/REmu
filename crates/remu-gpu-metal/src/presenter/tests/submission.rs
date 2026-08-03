@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
-    append_unique_global_writebacks, append_unique_guest_write_ranges,
+    SharedEventEventDisposition, append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
     shared_event_host_effect_is_resolved,
 };
@@ -5559,6 +5559,216 @@ fn acquire_without_an_effective_cached_resource_is_gpu_orderable() {
             ..acquire
         }),
     ));
+}
+
+fn install_empty_shared_event_dependency(
+    presenter: &mut MetalPresenter,
+    consumer_queue_id: u64,
+    producer_queue_id: u64,
+) -> SharedEventFence {
+    presenter.set_active_guest_queue(Some(consumer_queue_id));
+    presenter
+        .ensure_active_open_guest_batch()
+        .expect("consumer queue state");
+    let producer = SharedEventProducerId::new(producer_queue_id);
+    let fence = SharedEventFence::new(producer, 1);
+    let checkpoint = SharedEventSignalCheckpoint {
+        fence,
+        global_writeback_count: 0,
+        guest_write_range_count: 0,
+        memory_write_count: 0,
+        global_versions: Vec::new(),
+        unresolved_write_ranges: Vec::new(),
+        pending_write_footprint: Vec::new(),
+        footprint_complete: true,
+    };
+    let consumer = presenter
+        .guest_queue_batches
+        .get_mut(&consumer_queue_id)
+        .expect("consumer queue exists");
+    consumer.host_dependencies.insert(producer, fence.value());
+    consumer.resource_dependencies.insert(producer, checkpoint);
+    fence
+}
+
+#[test]
+fn stable_clean_invalidating_acquire_is_dropped_without_running_the_executor() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_texture_space, texture) = mapped_test_pages(1);
+    ensure_watched_test_resident(&mut presenter, texture);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0,
+        size_bytes: 0,
+        poll_interval: 0,
+        gcr_control: 1,
+    };
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == texture)
+        .expect("watched resident key");
+    let before_texture = presenter.resident_guest_textures[&descriptor]
+        .texture
+        .as_ptr();
+
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::DropSemanticNoOp,
+    );
+    assert_eq!(
+        presenter.resident_guest_textures[&descriptor]
+            .texture
+            .as_ptr(),
+        before_texture,
+        "classification does not replace the resident texture"
+    );
+    assert!(presenter.resident_guest_textures[&descriptor].is_live());
+    assert!(
+        !presenter.resident_guest_textures[&descriptor]
+            .write_watch
+            .is_dirty()
+    );
+
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryAcquire(acquire)],
+        })
+        .expect("invalidating acquire submission");
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_acquire_noop_drops, 1);
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    assert_eq!(
+        presenter.resident_guest_textures[&descriptor]
+            .texture
+            .as_ptr(),
+        before_texture,
+        "the dropped receive-loop event never runs the texture replacement executor"
+    );
+    assert!(presenter.resident_guest_textures[&descriptor].is_live());
+}
+
+#[test]
+fn invalidating_acquire_rejects_overlapping_deferred_guest_publication() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_texture_space, texture) = mapped_test_pages(1);
+    ensure_watched_test_resident(&mut presenter, texture);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0,
+        size_bytes: 0,
+        poll_interval: 0,
+        gcr_control: 1,
+    };
+    let span = ResourceSpan::new(texture, GUEST_PAGE_SIZE as u64);
+    let pending_publication = PhysicalFootprintRange::new(
+        SharedEventWriteKind::TerminalGuestWrite,
+        texture,
+        GUEST_PAGE_SIZE as u64,
+        span.backing(),
+    )
+    .expect("mapped terminal publication footprint");
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue")
+        .resource_dependencies
+        .get_mut(&dependency.producer())
+        .expect("exact producer checkpoint")
+        .pending_write_footprint
+        .push(pending_publication);
+
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::HostEffect,
+        "a future guest-memory write can dirty the clean snapshot and must retire first"
+    );
+}
+
+#[test]
+fn invalidating_acquire_rejects_dirty_and_gpu_generation_mismatch() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_texture_space, texture) = mapped_test_pages(1);
+    ensure_watched_test_resident(&mut presenter, texture);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0,
+        size_bytes: 0,
+        poll_interval: 0,
+        gcr_control: 1,
+    };
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == texture)
+        .expect("watched resident key");
+    presenter
+        .resident_guest_textures
+        .get_mut(&descriptor)
+        .expect("watched resident")
+        .note_gpu_authored_whole_span();
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::HostEffect,
+        "GPU ownership from an older watch generation is not a no-op"
+    );
+    presenter
+        .resident_guest_textures
+        .get_mut(&descriptor)
+        .expect("watched resident")
+        .note_gpu_write();
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::DropSemanticNoOp,
+        "matching GPU ownership generations make the clean action empty"
+    );
+
+    // SAFETY: the test retains the live read/write guest mapping and deliberately exercises its
+    // write-watch fault path.
+    unsafe { std::ptr::write_volatile(texture as *mut u8, 0x5a) };
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::HostEffect,
+        "a dirty watched resource must run the normal acquire after terminal evidence"
+    );
 }
 
 #[test]

@@ -9,11 +9,12 @@ use super::{
     GuestMemoryWriteOperation, MetalPresenter, OrderedEventPoll, OrderedEventSource,
     OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
-    PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet, ResourceSpan,
+    PhysicalFootprintRange, PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet,
+    ResourceSpan,
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
-    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
-    WriteWatchRefresh, compute_pipeline_key, diagnostic_skip_export_shader,
+    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent, SharedEventWriteKind,
+    UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key, diagnostic_skip_export_shader,
     diagnostic_skip_pixel_shader, graphics_pipeline_key, guest_physical_ranges_overlap,
     guest_ranges_overlap, guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
@@ -44,6 +45,13 @@ pub(crate) use self::memory::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, release_value_for_wait,
 };
 pub(crate) use self::waits::read_guest_memory_wait_value;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SharedEventEventDisposition {
+    GpuOrderable,
+    DropSemanticNoOp,
+    HostEffect,
+}
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
@@ -173,9 +181,34 @@ impl MetalPresenter {
                 let direct_draw_gpu_orderable = direct_draw_candidate
                     && self.per_queue_guest_batches
                     && self.shared_event_direct_draw_admission;
-                let gpu_orderable = dependencies.is_empty()
-                    || direct_draw_gpu_orderable
-                    || self.event_is_shared_event_gpu_orderable(source, &event);
+                let disposition = if dependencies.is_empty() || direct_draw_gpu_orderable {
+                    SharedEventEventDisposition::GpuOrderable
+                } else {
+                    self.shared_event_event_disposition(queue_id, source, &dependencies, &event)
+                };
+                if disposition == SharedEventEventDisposition::DropSemanticNoOp {
+                    self.statistics.shared_event_acquire_noop_drops = self
+                        .statistics
+                        .shared_event_acquire_noop_drops
+                        .saturating_add(1);
+                    static STABLE_ACQUIRE_NOOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+                    let occurrence = STABLE_ACQUIRE_NOOP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if occurrence <= 16 || occurrence.is_power_of_two() {
+                        let GpuEvent::MemoryAcquire(acquire) = &event else {
+                            unreachable!("only ACQUIRE_MEM has a semantic-no-op disposition")
+                        };
+                        eprintln!(
+                            "[REMu][METAL][ACQUIRE-NOOP] occurrence={occurrence} base={:#x} bytes={:#x} gcr={:#x} watched-overlap=stable-clean action=drop",
+                            acquire.base_address, acquire.size_bytes, acquire.gcr_control,
+                        );
+                    }
+                    // The proof linearizes this cache action as empty. Never invoke the mutating
+                    // acquire executor after it: a later CPU store belongs to later synchronization
+                    // and must remain dirty for the next real resource use.
+                    self.receiver.finish_event(source);
+                    continue;
+                }
+                let gpu_orderable = disposition == SharedEventEventDisposition::GpuOrderable;
                 if !gpu_orderable {
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
                         Ok(acknowledgement) => acknowledgement,
@@ -766,6 +799,143 @@ impl MetalPresenter {
             let (address, byte_count) = cached.write_watch.range();
             acquire.overlaps(address, byte_count)
         })
+    }
+
+    pub(super) fn shared_event_event_disposition(
+        &self,
+        consumer_queue_id: u64,
+        source: OrderedEventSource,
+        dependencies: &[super::SharedEventFence],
+        event: &GpuEvent,
+    ) -> SharedEventEventDisposition {
+        if let GpuEvent::MemoryAcquire(acquire) = event
+            && acquire.invalidates_guest_resources()
+            && self.invalidating_acquire_has_watched_resource(*acquire)
+            && self.invalidating_acquire_is_stable_noop(consumer_queue_id, dependencies, *acquire)
+        {
+            return SharedEventEventDisposition::DropSemanticNoOp;
+        }
+        if self.event_is_shared_event_gpu_orderable(source, event) {
+            SharedEventEventDisposition::GpuOrderable
+        } else {
+            SharedEventEventDisposition::HostEffect
+        }
+    }
+
+    /// Proves that the normal ACQUIRE_MEM executor would leave every overlapping cached resource
+    /// byte-for-byte unchanged at one stable point.
+    ///
+    /// Presenter-owned map membership cannot change during this method. Write-watch and mapping
+    /// state can change on guest threads, so every complete token is sampled twice. Producer
+    /// checkpoint effects which eventually publish into guest RAM are also rejected when they
+    /// overlap a watched resource; a clean watch before that deferred publication is not a no-op.
+    pub(super) fn invalidating_acquire_is_stable_noop(
+        &self,
+        consumer_queue_id: u64,
+        dependencies: &[super::SharedEventFence],
+        acquire: GpuMemoryAcquire,
+    ) -> bool {
+        struct WatchedResource<'a> {
+            watch: &'a super::GuestTextureWriteWatch,
+            gpu_write_generations: Option<&'a [u64]>,
+            footprint: PhysicalFootprintRange,
+        }
+
+        fn watched_resource<'a>(
+            watch: &'a super::GuestTextureWriteWatch,
+            gpu_write_generations: Option<&'a [u64]>,
+        ) -> Option<WatchedResource<'a>> {
+            let (address, byte_count) = watch.range();
+            let span = ResourceSpan::new(address, byte_count);
+            let footprint = PhysicalFootprintRange::new(
+                SharedEventWriteKind::ResidentDestination,
+                address,
+                byte_count,
+                span.backing(),
+            )?;
+            Some(WatchedResource {
+                watch,
+                gpu_write_generations,
+                footprint,
+            })
+        }
+
+        let mut watched = Vec::new();
+        for resident in self.resident_guest_textures.values() {
+            let (address, byte_count) = resident.write_watch.range();
+            if !acquire.overlaps(address, byte_count) {
+                continue;
+            }
+            let Some(resource) = watched_resource(
+                &resident.write_watch,
+                resident
+                    .gpu_written()
+                    .then_some(resident.gpu_write_watch_generations.as_slice()),
+            ) else {
+                return false;
+            };
+            watched.push(resource);
+        }
+        for cached in self.sampled_texture_cache.values() {
+            let (address, byte_count) = cached.write_watch.range();
+            if !acquire.overlaps(address, byte_count) {
+                continue;
+            }
+            let Some(resource) = watched_resource(&cached.write_watch, None) else {
+                return false;
+            };
+            watched.push(resource);
+        }
+        if watched.is_empty() {
+            return false;
+        }
+
+        let first = watched
+            .iter()
+            .map(|resource| resource.watch.acquire_noop_token())
+            .collect::<Vec<_>>();
+        if first.iter().any(|token| !token.is_clean()) {
+            return false;
+        }
+
+        let Some(consumer) = self.guest_queue_batches.get(&consumer_queue_id) else {
+            return false;
+        };
+        for dependency in dependencies {
+            let Some(checkpoint) = consumer
+                .resource_dependencies
+                .get(&dependency.producer())
+                .filter(|checkpoint| checkpoint.fence == *dependency)
+            else {
+                return false;
+            };
+            if !checkpoint.footprint_complete {
+                return false;
+            }
+            if checkpoint.pending_write_footprint.iter().any(|producer| {
+                !matches!(
+                    producer.kind,
+                    SharedEventWriteKind::ResidentDestination
+                        | SharedEventWriteKind::InternalResidentDestination
+                ) && watched
+                    .iter()
+                    .any(|resource| resource.footprint.overlaps(*producer))
+            }) {
+                return false;
+            }
+        }
+
+        let second = watched
+            .iter()
+            .map(|resource| resource.watch.acquire_noop_token())
+            .collect::<Vec<_>>();
+        first == second
+            && second.iter().all(|token| token.is_clean())
+            && watched.iter().zip(&second).all(|(resource, token)| {
+                resource
+                    .gpu_write_generations
+                    .is_none_or(|generations| generations == token.generations())
+            })
     }
 
     pub(super) fn record_shared_event_direct_draw_outcome(
