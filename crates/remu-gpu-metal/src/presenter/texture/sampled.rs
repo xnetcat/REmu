@@ -1,23 +1,23 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, MetalTextureSwizzleChannels,
     RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
-    SAMPLED_ALIAS_WRITEBACK_BYTES,
-    SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey,
-    WriteWatchRefresh, comparison_depth32_upload, compressed_texture_block_extent,
+    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey, WriteWatchRefresh,
+    comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
-    resident_is_depth_array_face,
-    sampled_alias_descriptor, texture_element_layout, trace_image_descriptors,
-    trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
+    resident_is_depth_array_face, sampled_alias_descriptor, texture_element_layout,
+    trace_image_descriptors, trace_resident_texture_removal, trace_target_sampling,
+    trace_video_target_consumers,
 };
-use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
 use metal::foreign_types::ForeignType;
 use metal::{
     Device, MTLPixelFormat, MTLRegion, MTLStorageMode, MTLTextureType, MTLTextureUsage, NSRange,

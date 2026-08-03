@@ -1,13 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use metal::{
-    CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
-    MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
-};
-use remu_memory::CpuWriteWatchRetirement;
-use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
+use super::super::WrittenRegion;
 use super::super::refresh_resident_texture_write_watch;
 use super::super::texture::{
     ResidentSpanIndex, ResidentTextureMap, SpanQueryOrder, ensure_resident_texture_in_map,
@@ -18,15 +12,11 @@ use super::super::{
     RESIDENT_WRITE_ATTRIBUTION_MISSES, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_PUBLISHED,
     ResidencyState, StaleSource, TEXTURE_SNAPSHOT_COUNT, WritebackTrigger,
 };
-use std::sync::atomic::Ordering as AtomicOrdering;
-use super::super::WrittenRegion;
 use super::{
-    DecodedImageDescriptor, DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter,
-    ResourceSpan,
-    RangeSet, ResidentTextureActivity, ResidentTextureActivityStamp, WriteWatchRefresh,
+    DecodedImageDescriptor, DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter, RangeSet,
+    ResidentTextureActivity, ResidentTextureActivityStamp, ResourceSpan, WriteWatchRefresh,
     apply_image_destination_select, comparison_depth32_upload, copy_linear_to_tiled_at_z,
-    create_sampled_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_image_descriptor,
+    create_sampled_guest_texture, decode_guest_texture_linear_from_raw, decode_image_descriptor,
     decode_mode27_mip_chain_from_raw, depth_array_face_descriptor,
     depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
     guest_texture_byte_count, guest_texture_descriptors_overlap,
@@ -34,18 +24,25 @@ use super::{
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    guest_texture_raw_matches, guest_texture_raw_range,
-    image_destination_select_is_native, image_resource_descriptor_is_null, mode5_mip_chain_layout,
-    mode27_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
-    read_texture_linear, rematerialisation_blit_source_origin_y,
-    render_resolve_candidate_matches, resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats, resident_texture_eviction_plan,
-    resident_texture_ownership_stats, sampled_alias_descriptor, sampled_texture_cache_accepts,
-    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
-    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
-    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
-    write_watched_guest_texture_linear,
+    guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
+    image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
+    rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
+    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
+    resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
+    sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
+    sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
+    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
+    upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
 };
+use metal::{
+    CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
+    MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
+    MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
+};
+use remu_memory::CpuWriteWatchRetirement;
+use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 #[test]
 fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
@@ -286,9 +283,7 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
     let height_minus_one = sampled.height - 1;
     let resource_descriptor = vec![
         address_words as u32,
-        ((address_words >> 32) as u32 & 0xff)
-            | (22 << 20)
-            | ((width_minus_one & 3) << 30),
+        ((address_words >> 32) as u32 & 0xff) | (22 << 20) | ((width_minus_one & 3) << 30),
         (width_minus_one >> 2) | (height_minus_one << 14),
         0x204 | (24 << 20) | (9 << 28),
         sampled.pitch - 1,
@@ -2020,9 +2015,8 @@ fn guest_observable_writeback_retiles_gpu_pixels_and_pressure_eviction_drops_the
 
     // Host memory pressure is REmu's own event, so the pixels are dropped rather than staged in
     // a guest range no guest read named. The debt survives for a trigger that does name one.
-    let discarded_before =
-        RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
-            .load(AtomicOrdering::Relaxed);
+    let discarded_before = RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
+        .load(AtomicOrdering::Relaxed);
     let untouched = snapshot_guest_texture_raw(descriptor).expect("pre-eviction guest bytes");
     let (count, bytes) = presenter
         .garbage_collect_resident_textures_to_budget(0, 2, 8)
@@ -2109,7 +2103,9 @@ fn resident_writeback_publishes_only_the_bytes_the_gpu_authored() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let guest_pattern = (0..SURFACE_BYTES).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+    let guest_pattern = (0..SURFACE_BYTES)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
     memory
         .write(mapping, &guest_pattern)
         .expect("seed the guest allocation");
@@ -2222,7 +2218,9 @@ fn residency_trigger_keeps_the_debt_until_a_guest_read_asks_for_the_pixels() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let guest_pattern = (0..64 * 64 * 4).map(|index| (index % 253) as u8).collect::<Vec<_>>();
+    let guest_pattern = (0..64 * 64 * 4)
+        .map(|index| (index % 253) as u8)
+        .collect::<Vec<_>>();
     memory
         .write(address, &guest_pattern)
         .expect("seed the guest allocation");
@@ -2680,7 +2678,10 @@ fn a_contained_tenant_is_rematerialised_by_an_ordered_blit() {
             expected.extend_from_slice(&source_pixels[offset..offset + 4]);
         }
     }
-    assert_eq!(pixels, expected, "the blit must preserve every logical texel");
+    assert_eq!(
+        pixels, expected,
+        "the blit must preserve every logical texel"
+    );
     assert!(presenter.resident_guest_textures[&tenant].serves_reads());
     assert!(presenter.resident_guest_textures[&tenant].gpu_written());
 }
@@ -2880,8 +2881,7 @@ fn gpu_current_stale_state_never_fabricates_a_guest_memory_fallback() {
 
     let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
     let failures_before = OWNED_REMATERIALISE_FAILED.load(AtomicOrdering::Relaxed);
-    let layout_failures_before =
-        OWNED_REMATERIALISE_FAILED_LAYOUT.load(AtomicOrdering::Relaxed);
+    let layout_failures_before = OWNED_REMATERIALISE_FAILED_LAYOUT.load(AtomicOrdering::Relaxed);
     let error = presenter
         .ensure_resident_texture(&device, incompatible)
         .expect_err("GPU-only bytes cannot fall back to stale RAM");
@@ -3046,7 +3046,10 @@ fn mode27_gpu_retile_preserves_cross_format_alias_bytes_without_a_batch_boundary
         .open_guest_batch
         .take()
         .expect("retile/de-tile work remains in the open guest batch");
-    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    assert_eq!(
+        batch.command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued
+    );
     batch.command_buffer.commit();
     batch.command_buffer.wait_until_completed();
 
@@ -3055,11 +3058,8 @@ fn mode27_gpu_retile_preserves_cross_format_alias_bytes_without_a_batch_boundary
     let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
     copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
         .expect("CPU retile oracle");
-    let expected = decode_guest_texture_linear_from_raw(
-        target,
-        &source_raw[65_536..2 * 65_536],
-    )
-    .expect("CPU detile oracle");
+    let expected = decode_guest_texture_linear_from_raw(target, &source_raw[65_536..2 * 65_536])
+        .expect("CPU detile oracle");
     assert_eq!(actual, expected, "GPU retile/de-tile must be byte exact");
     assert!(presenter.resident_guest_textures[&target].serves_reads());
     assert!(presenter.resident_guest_textures[&target].gpu_written());
@@ -3148,10 +3148,7 @@ fn mode24_depth_rematerialisation_is_byte_exact_and_stays_in_the_guest_batch() {
         .ensure_resident_texture(&device, target)
         .expect("mode-24 depth target rematerialises")
         .texture;
-    assert!(std::ptr::eq(
-        old_target.as_ref(),
-        rematerialised.as_ref()
-    ));
+    assert!(std::ptr::eq(old_target.as_ref(), rematerialised.as_ref()));
     assert_eq!(
         OWNED_REMATERIALISE_DETILE.load(AtomicOrdering::Relaxed),
         detiles_before + 1
@@ -3165,7 +3162,10 @@ fn mode24_depth_rematerialisation_is_byte_exact_and_stays_in_the_guest_batch() {
         .open_guest_batch
         .take()
         .expect("mode-24 retile/de-tile remains in the open guest batch");
-    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    assert_eq!(
+        batch.command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued
+    );
     batch.command_buffer.commit();
     batch.command_buffer.wait_until_completed();
 
@@ -3244,10 +3244,8 @@ fn mode27_gpu_retile_merges_disjoint_current_owners_in_physical_byte_order() {
     for (owner_index, owner) in owners.into_iter().enumerate() {
         let mut linear = vec![0_u8; 128 * 128 * 4];
         for (byte_index, byte) in linear.iter_mut().enumerate() {
-            *byte = u8::try_from(
-                (owner_index * 53 + byte_index * 29 + byte_index / 127) & 0xff,
-            )
-            .expect("owner byte pattern");
+            *byte = u8::try_from((owner_index * 53 + byte_index * 29 + byte_index / 127) & 0xff)
+                .expect("owner byte pattern");
         }
         presenter.resident_guest_textures[&owner]
             .texture
@@ -3278,7 +3276,10 @@ fn mode27_gpu_retile_merges_disjoint_current_owners_in_physical_byte_order() {
         .open_guest_batch
         .take()
         .expect("owner merge remains ordered in the open batch");
-    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    assert_eq!(
+        batch.command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued
+    );
     batch.command_buffer.commit();
     batch.command_buffer.wait_until_completed();
 
@@ -3297,7 +3298,10 @@ fn mode27_gpu_retile_merges_disjoint_current_owners_in_physical_byte_order() {
     }
     let expected = decode_guest_texture_linear_from_raw(target, &expected_raw)
         .expect("CPU composite detile oracle");
-    assert_eq!(actual, expected, "every current owner must contribute its exact bytes");
+    assert_eq!(
+        actual, expected,
+        "every current owner must contribute its exact bytes"
+    );
     assert!(presenter.resident_guest_textures[&target].serves_reads());
     for owner in owners {
         assert!(matches!(
@@ -3406,17 +3410,15 @@ fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
         .open_guest_batch
         .take()
         .expect("volume detile remains in the open batch");
-    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    assert_eq!(
+        batch.command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued
+    );
     batch.command_buffer.commit();
     batch.command_buffer.wait_until_completed();
 
-    let actual = super::super::read_texture_volume_linear(
-        &device,
-        &queue,
-        &rematerialised,
-        volume,
-    )
-    .expect("volume readback");
+    let actual = super::super::read_texture_volume_linear(&device, &queue, &rematerialised, volume)
+        .expect("volume readback");
     let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
     copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
         .expect("CPU source retile oracle");
@@ -3431,7 +3433,10 @@ fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
             .expect("CPU volume detile oracle"),
         );
     }
-    assert_eq!(actual, expected, "surface-Z XOR must be preserved per slice");
+    assert_eq!(
+        actual, expected,
+        "surface-Z XOR must be preserved per slice"
+    );
 }
 
 #[test]
@@ -3531,19 +3536,19 @@ fn mode27_gpu_detile_reconstructs_nontail_and_mip_tail_levels() {
         .open_guest_batch
         .take()
         .expect("mip detile remains in the open batch");
-    assert_eq!(batch.command_buffer.status(), MTLCommandBufferStatus::NotEnqueued);
+    assert_eq!(
+        batch.command_buffer.status(),
+        MTLCommandBufferStatus::NotEnqueued
+    );
     batch.command_buffer.commit();
     batch.command_buffer.wait_until_completed();
 
     let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
     copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
         .expect("CPU source retile oracle");
-    let (_, expected_levels) = decode_mode27_mip_chain_from_raw(
-        mipped,
-        6,
-        &source_raw[..mip_layout.byte_count],
-    )
-    .expect("CPU mip detile oracle");
+    let (_, expected_levels) =
+        decode_mode27_mip_chain_from_raw(mipped, 6, &source_raw[..mip_layout.byte_count])
+            .expect("CPU mip detile oracle");
     for (level, expected) in expected_levels.iter().enumerate() {
         let actual = super::super::readback::read_texture_mip_linear(
             &device,
@@ -3692,7 +3697,10 @@ fn a_partially_superseded_tenant_stays_live_but_stops_serving_reads() {
     presenter.mark_resident_texture_written(writer);
 
     let tenant_resident = &presenter.resident_guest_textures[&tenant];
-    assert!(tenant_resident.is_live(), "half its bytes are still its own");
+    assert!(
+        tenant_resident.is_live(),
+        "half its bytes are still its own"
+    );
     assert!(!tenant_resident.serves_reads());
     assert_eq!(tenant_resident.owned.byte_count(), owned_before / 2);
 }
@@ -3726,11 +3734,10 @@ fn writes_across_overlapping_descriptors_keep_owned_sets_disjoint() {
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         bytes_per_pixel: 4,
     };
-    let descriptors = [0_u64, 512, 1024, 1536, 2048]
-        .map(|offset| GuestTextureDescriptor {
-            address: address + offset,
-            ..base
-        });
+    let descriptors = [0_u64, 512, 1024, 1536, 2048].map(|offset| GuestTextureDescriptor {
+        address: address + offset,
+        ..base
+    });
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
@@ -3745,11 +3752,15 @@ fn writes_across_overlapping_descriptors_keep_owned_sets_disjoint() {
     for index in [3_usize, 0, 4, 1, 2, 0, 3, 2, 4] {
         presenter.mark_resident_texture_written(descriptors[index]);
         if index == 2 {
-            for (left, right) in descriptors.iter().enumerate().flat_map(|(left, descriptor)| {
-                descriptors[left + 1..]
-                    .iter()
-                    .map(move |other| (*descriptor, *other))
-            }) {
+            for (left, right) in descriptors
+                .iter()
+                .enumerate()
+                .flat_map(|(left, descriptor)| {
+                    descriptors[left + 1..]
+                        .iter()
+                        .map(move |other| (*descriptor, *other))
+                })
+            {
                 assert!(
                     !presenter.resident_guest_textures[&left]
                         .owned
@@ -4602,12 +4613,10 @@ fn persistent_target_removes_per_draw_full_surface_transfers() {
 
 #[test]
 fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resident() {
+    use super::super::texture::{gpu_written_resident_serving_sampled_key, sampled_texture_key};
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
-    };
-    use super::super::texture::{
-        gpu_written_resident_serving_sampled_key, sampled_texture_key,
     };
 
     let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
@@ -4983,7 +4992,11 @@ fn resident_span_index_matches_the_linear_scan_after_random_inserts_and_removes(
             live.push(candidate);
             index.insert(candidate);
         }
-        assert_eq!(index.len(), live.len(), "index population drifted at step {step}");
+        assert_eq!(
+            index.len(),
+            live.len(),
+            "index population drifted at step {step}"
+        );
 
         let query = index_test_descriptor(&mut random, &bases, mapping_bytes);
         let span = ResourceSpan::for_texture(query).expect("query span");

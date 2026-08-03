@@ -121,7 +121,10 @@ fn apr_resolvers_reject_unreadable_guest_ranges_without_dereferencing_them() {
         &mut state,
     );
     assert_eq!(result, u64::MAX);
-    assert_eq!(read_guest_u32(thread_pointer + 0x40), libc::EFAULT.cast_unsigned());
+    assert_eq!(
+        read_guest_u32(thread_pointer + 0x40),
+        libc::EFAULT.cast_unsigned()
+    );
     assert_eq!(id, 0x1234_5678, "validation must precede output writes");
 
     write_guest_u32(thread_pointer + 0x40, 0);
@@ -139,7 +142,10 @@ fn apr_resolvers_reject_unreadable_guest_ranges_without_dereferencing_them() {
         &mut state,
     );
     assert_eq!(result, u64::MAX);
-    assert_eq!(read_guest_u32(thread_pointer + 0x40), libc::EFAULT.cast_unsigned());
+    assert_eq!(
+        read_guest_u32(thread_pointer + 0x40),
+        libc::EFAULT.cast_unsigned()
+    );
 
     set_current_guest_thread_pointer(0);
 }

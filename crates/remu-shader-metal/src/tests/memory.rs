@@ -437,10 +437,7 @@ fn structured_buffer_oob_honors_expanded_metal_binding_span() {
     let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
         .expect("expanded structured buffer load should lower");
     assert!(
-        shader
-            .source
-            .contains("max(")
-            && shader.source.contains("/ "),
+        shader.source.contains("max(") && shader.source.contains("/ "),
         "structured OOB must lift NUM_RECORDS from the expanded Metal binding length"
     );
     assert!(

@@ -155,9 +155,7 @@ fn voice_qos_init(arguments: [u64; 6]) -> u64 {
         return sce_kernel_error(VOICE_QOS_ERROR_INVALID_ARGUMENT);
     }
     let _cpu_affinity = arguments[2];
-    eprintln!(
-        "[REMu][VOICEQOS] initialized workspace={mem_block:#x} size={mem_size:#x} (offline)"
-    );
+    eprintln!("[REMu][VOICEQOS] initialized workspace={mem_block:#x} size={mem_size:#x} (offline)");
     0
 }
 

@@ -398,9 +398,7 @@ fn lowers_readlane_and_writelane_independently_of_exec() {
         MetalShaderStage::Pixel,
     );
     assert!(
-        write
-            .source
-            .contains("uint remu_v_8_lanes[32] = {};"),
+        write.source.contains("uint remu_v_8_lanes[32] = {};"),
         "pixel V_WRITELANE needs a private lane table"
     );
     assert!(
@@ -479,10 +477,10 @@ fn pixel_readlane_uses_writelane_private_lane_file() {
             .contains("remu_v_12_lanes[(remu_s_4) & 31u] = remu_s_2;")
     );
     assert!(
-        shader.source.contains("remu_s_8 = remu_v_12_lanes[(remu_s_4) & 31u]")
-            || shader
-                .source
-                .contains("remu_v_12_lanes[(remu_s_4) & 31u];"),
+        shader
+            .source
+            .contains("remu_s_8 = remu_v_12_lanes[(remu_s_4) & 31u]")
+            || shader.source.contains("remu_v_12_lanes[(remu_s_4) & 31u];"),
         "readlane must load the private table, not simd_shuffle: {}",
         shader.source
     );

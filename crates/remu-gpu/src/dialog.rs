@@ -113,7 +113,9 @@ static DIALOG_RESULT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Arms a new dialog poll slot and returns the sequence the presenter must complete against.
 #[must_use]
 pub fn begin_host_dialog() -> u64 {
-    let sequence = DIALOG_SEQUENCE.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    let sequence = DIALOG_SEQUENCE
+        .fetch_add(1, Ordering::AcqRel)
+        .wrapping_add(1);
     DIALOG_RESULT_CODE.store(HostDialogResultCode::None as i32, Ordering::Release);
     DIALOG_RESULT_SEQUENCE.store(0, Ordering::Release);
     DIALOG_STATE.store(DIALOG_PENDING, Ordering::Release);

@@ -526,13 +526,23 @@ fn np_web_api2_initialize_allocates_bounded_library_contexts() {
 #[test]
 fn np_web_api2_push_event_create_handle_allocates_offline_handles() {
     let mut state = ProbeDispatchState::default();
-    let handle = dispatch_probe_import("WV1GwM32NgY", [1, 0x1031_6681, 0, 0, 0, 0], [0; 6], &mut state);
+    let handle = dispatch_probe_import(
+        "WV1GwM32NgY",
+        [1, 0x1031_6681, 0, 0, 0, 0],
+        [0; 6],
+        &mut state,
+    );
     assert_eq!(handle, 1);
     assert_eq!(
         crate::known_nid_name("WV1GwM32NgY"),
         Some("sceNpWebApi2PushEventCreateHandle")
     );
-    assert!(state.services.np_web_api2_push_event_handles.contains_key(&1));
+    assert!(
+        state
+            .services
+            .np_web_api2_push_event_handles
+            .contains_key(&1)
+    );
 }
 
 #[test]
@@ -586,7 +596,14 @@ fn np_get_online_id_writes_a_fixed_offline_id() {
     assert_eq!(
         crate::dispatch_stateless_import(
             "XDncXQIJUSk",
-            [0x1000_0000, online_id.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
+            [
+                0x1000_0000,
+                online_id.as_mut_ptr().addr() as u64,
+                0,
+                0,
+                0,
+                0
+            ],
             [0; 6],
         ),
         Some(0)
@@ -601,7 +618,14 @@ fn voice_qos_init_accepts_a_caller_owned_workspace() {
     assert_eq!(
         crate::dispatch_stateless_import(
             "U8IfNl6-Css",
-            [workspace.as_mut_ptr().addr() as u64, 64, 0x2000_0000, 0, 0, 0],
+            [
+                workspace.as_mut_ptr().addr() as u64,
+                64,
+                0x2000_0000,
+                0,
+                0,
+                0
+            ],
             [0; 6],
         ),
         Some(0)

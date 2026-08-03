@@ -353,9 +353,7 @@ fn builds_procedural_rectangle_from_pixel_consumer_parameter_roles() {
     assert_eq!(shader.stage, MetalShaderStage::Vertex);
     assert_eq!(shader.interpolated_attribute_count, 4);
     assert!(
-        shader
-            .source
-            .contains("float2(-1.0f, -1.0f)")
+        shader.source.contains("float2(-1.0f, -1.0f)")
             && shader.source.contains("float2( 3.0f, -1.0f)")
             && shader.source.contains("float2(-1.0f,  3.0f)")
     );

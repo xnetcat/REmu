@@ -5,9 +5,9 @@ use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
     AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, GPU_EVENT_SINK_TEST,
-    VideoOutBufferAttributes, VideoOutState,
-    agc_apply_submission_registers, agc_pm4, compute_graphics_state, decode_agc_dma_data,
-    decode_agc_memory_acquire, decode_agc_memory_wait, low_u32,
+    VideoOutBufferAttributes, VideoOutState, agc_apply_submission_registers, agc_pm4,
+    compute_graphics_state, decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait,
+    low_u32,
 };
 
 fn append_native_memory_dma(
@@ -165,11 +165,7 @@ fn wait_flip_done_maps_exact_packet_arguments_to_the_registered_buffer() {
 
 #[test]
 fn wait_flip_done_rejects_a_non_native_packet_length() {
-    let packet = [
-        agc_pm4(3, AGC_IT_NOP, crate::AGC_R_WAIT_FLIP_DONE),
-        1,
-        0,
-    ];
+    let packet = [agc_pm4(3, AGC_IT_NOP, crate::AGC_R_WAIT_FLIP_DONE), 1, 0];
     let mut submission_count = 0;
     let result = crate::agc_parse_submission(
         packet.as_ptr().addr() as u64,
@@ -1353,7 +1349,10 @@ fn applies_direct_uconfig_vgt_index_type_to_graphics_index_size() {
     )
     .expect("direct user-config VGT_INDEX_TYPE packet");
 
-    assert_eq!(graphics.user_config_registers.get(&AGC_VGT_INDEX_TYPE), Some(&0x481));
+    assert_eq!(
+        graphics.user_config_registers.get(&AGC_VGT_INDEX_TYPE),
+        Some(&0x481)
+    );
     assert_eq!(graphics.index_size, 1);
 }
 

@@ -244,11 +244,7 @@ pub(super) fn kernel_fsync(arguments: [u64; 6]) -> u64 {
         .map_or_else(|error| sce_kernel_io_error(&error), |()| 0)
 }
 
-fn positional_write(
-    file: &std::fs::File,
-    source: &[u8],
-    offset: u64,
-) -> std::io::Result<usize> {
+fn positional_write(file: &std::fs::File, source: &[u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
         file.write_at(source, offset)

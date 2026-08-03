@@ -187,15 +187,17 @@ fn the_flip_status_reports_pending_depth_and_the_last_completed_flip() {
         "before any flip every field must read zero"
     );
 
-    state.pending_video_out_flips.push_back(PendingVideoOutFlip {
-        completion: remu_gpu::GpuFlipCompletion {
-            address: 0x2000,
-            buffer_index: 1,
-            flip_argument: 7,
-        },
-        handle: 1,
-        submit_process_time_counter: 210_000,
-    });
+    state
+        .pending_video_out_flips
+        .push_back(PendingVideoOutFlip {
+            completion: remu_gpu::GpuFlipCompletion {
+                address: 0x2000,
+                buffer_index: 1,
+                flip_argument: 7,
+            },
+            handle: 1,
+            submit_process_time_counter: 210_000,
+        });
     state.video_out.completed_flip_count = 3;
     state.video_out.last_completed_flip = Some(CompletedVideoOutFlip {
         process_time: 111,

@@ -278,7 +278,9 @@ fn snapshot_draw_indices_with_element_size(
 fn indices_look_like_u32_read_as_u16(indices: &[u32]) -> bool {
     indices.len() >= 4
         && indices.len() % 2 == 0
-        && indices.chunks_exact(2).all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
+        && indices
+            .chunks_exact(2)
+            .all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
         && indices.iter().step_by(2).any(|value| *value != 0)
 }
 

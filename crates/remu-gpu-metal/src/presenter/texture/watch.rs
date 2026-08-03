@@ -6,14 +6,13 @@ use super::{
     GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
-    TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+    StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, guest_texture_byte_count,
-    gpu_written_resident_serving_sampled_key,
-    mode5_mip_chain_layout, mode27_mip_chain_layout, record_texture_dirty_work_detail,
-    record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
-    StaleSource, texture_alias_trace_match, trace_alias_correlated_acquire,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
+    guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
+    retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
     trace_resident_texture_demotion, trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
@@ -268,12 +267,9 @@ impl MetalPresenter {
             // GPU-authored resident still owns the pixels (Octopath 0x80f27e0000 snapshots).
             // Prefer the resident's sparse content validation over the sampled watch dirty bit:
             // pitch-mismatched SRDs and component-reordered views share the same GPU image.
-            if let Some(resident_descriptor) = gpu_written_resident_serving_sampled_key(
-                &self.resident_guest_textures,
-                key,
-            ) && let Some(resident) = self
-                .resident_guest_textures
-                .get_mut(&resident_descriptor)
+            if let Some(resident_descriptor) =
+                gpu_written_resident_serving_sampled_key(&self.resident_guest_textures, key)
+                && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
                 && !resident.write_watch.content_has_changed()?
             {
                 resident.note_gpu_write();

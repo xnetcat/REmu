@@ -372,7 +372,6 @@ pub(crate) fn agc_dcb_set_registers_indirect(arguments: [u64; 6], packet_registe
     command
 }
 
-
 fn agc_copy_shader_register(source: u64, destination: u64) {
     write_guest_u32(destination, read_guest_u32(source));
     write_guest_u32(destination + 4, read_guest_u32(source + 4));

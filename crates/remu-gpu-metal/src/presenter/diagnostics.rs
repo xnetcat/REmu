@@ -46,15 +46,15 @@ pub(super) fn trace_image_descriptors() -> bool {
 /// lost channel swizzle.
 pub(super) fn trace_glyph_atlas() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("REMU_TRACE_GLYPH_ATLAS").is_some_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_GLYPH_ATLAS").is_some_and(|value| value == "1")
+    })
 }
 
 pub(super) fn diagnostic_dump_glyph_draw() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_DUMP_GLYPH_DRAW").is_some_and(|value| value == "1")
-    })
+    *ENABLED
+        .get_or_init(|| std::env::var_os("REMU_DUMP_GLYPH_DRAW").is_some_and(|value| value == "1"))
 }
 
 pub(super) fn evaluation_samples_glyph_atlas(evaluation: &ShaderEvaluation) -> bool {

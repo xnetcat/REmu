@@ -43,7 +43,11 @@ pub(crate) fn ces_mbcs_ucs_context_init(arguments: [u64; 6]) -> u64 {
 }
 
 /// Routes the CES entry points reached during Void Terrarium startup.
-pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], _state: &mut ProbeDispatchState) -> Option<u64> {
+pub(crate) fn dispatch(
+    nid: &str,
+    arguments: [u64; 6],
+    _state: &mut ProbeDispatchState,
+) -> Option<u64> {
     Some(match nid {
         "ZiDCxUUGbec" => ces_ucs_profile_init_sjis1997_cp932(arguments),
         "538bRGc6Zo8" => ces_mbcs_ucs_context_init(arguments),

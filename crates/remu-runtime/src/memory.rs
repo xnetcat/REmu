@@ -955,9 +955,7 @@ fn kernel_release_direct_memory_core(
     // backing object the kernel has dropped, and a later guest access faults SIGBUS rather than
     // SIGSEGV. Releases are infrequent and semantically decisive, so they are always recorded:
     // without this, a use-after-release is indistinguishable from memory that never existed.
-    eprintln!(
-        "[REMu][VM] released direct start={start:#x} length={length:#x} released={released}"
-    );
+    eprintln!("[REMu][VM] released direct start={start:#x} length={length:#x} released={released}");
     0
 }
 

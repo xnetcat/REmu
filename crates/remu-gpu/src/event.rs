@@ -38,7 +38,9 @@ pub enum GpuEvent {
     /// A modal host dialog the guest common-dialog ABIs poll until the user dismisses it.
     ShowHostDialog(HostDialogRequest),
     /// Forces any visible modal dialog closed (guest `Close` / `Terminate`).
-    HideHostDialog { sequence: u64 },
+    HideHostDialog {
+        sequence: u64,
+    },
     /// A non-modal toast (trophy unlock, notification) that does not block dialog polling.
     ShowHostToast(HostToastRequest),
     Flip {

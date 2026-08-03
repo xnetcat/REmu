@@ -447,8 +447,9 @@ fn containing_submission_sequence_is_attached_only_to_captured_flips() {
         7,
         vec![flip],
     ));
-    let remu_gpu::GpuEvent::QueueSubmission { queue_id, events } =
-        receiver.recv().expect("captured submission reaches presenter")
+    let remu_gpu::GpuEvent::QueueSubmission { queue_id, events } = receiver
+        .recv()
+        .expect("captured submission reaches presenter")
     else {
         panic!("captured work must retain its queue envelope");
     };

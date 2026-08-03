@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND0_CONTROL, CB_TARGET_MASK, DB_SHADER_CONTROL, DecodedRasterState,
-    DecodedRenderTarget, DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
+    CB_BLEND0_CONTROL, CB_TARGET_MASK, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
+    DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, VGT_GS_INSTANCE_CNT,
@@ -11,19 +11,17 @@ use super::{
     common_render_target_array_length, decode_depth_target, decode_render_targets,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
-    diagnostic_dump_target_pixel_instruction_count,
-    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
-    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
-    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
-    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_video_chain_selected_draw, evaluation_samples_glyph_atlas,
-    evaluation_samples_large_linear_video,
+    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
+    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
+    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
+    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
+    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
+    evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
     is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
     ngg_mesh_stage_for_draw, pixel_input_controls, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base,
-    register_value, video_target_binding_summary,
+    program_embeds_global_base, register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -53,7 +51,10 @@ const METAL_MESH_MAX_OUTPUTS: u32 = 256;
 /// pitch and exposes the NV12 padding as a green band. Only a genuinely memoryless stage may use
 /// the synthetic cover; every stage with guest resource traffic retains its translated vertex
 /// program and explicit PARAM exports.
-pub(crate) fn ngg_fullscreen_cover_draw(program: &remu_shader::Program, draw: &IndexedDraw) -> bool {
+pub(crate) fn ngg_fullscreen_cover_draw(
+    program: &remu_shader::Program,
+    draw: &IndexedDraw,
+) -> bool {
     if draw.indirect_arguments_address.is_some() {
         return false;
     }
@@ -80,16 +81,11 @@ pub(crate) fn noop_placeholder_cover_draw(draw: &IndexedDraw) -> bool {
     if draw.pixel_shader_address != 0 {
         return false;
     }
-    let target_mask =
-        register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
+    let target_mask = register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
     if target_mask != 0 {
         return false;
     }
-    if decode_depth_target(draw)
-        .ok()
-        .flatten()
-        .is_some()
-    {
+    if decode_depth_target(draw).ok().flatten().is_some() {
         return false;
     }
     draw.export_shader.as_ref().is_some_and(|shader| {
@@ -202,9 +198,7 @@ pub(crate) fn prepare_nonindexed_ngg_indices(draw: &IndexedDraw) -> Result<Arc<[
             }
             Ok(expand_point_list_indices(&indices))
         }
-        _ => Err(
-            "NGG source is not a non-indexed triangle list/strip or point list".to_owned(),
-        ),
+        _ => Err("NGG source is not a non-indexed triangle list/strip or point list".to_owned()),
     }
 }
 
@@ -222,8 +216,8 @@ fn expand_nonindexed_triangle_list(
             .checked_add(complete - 1)
             .ok_or("triangle-list vertex ID overflow")?;
     }
-    let index_count = usize::try_from(complete)
-        .map_err(|_| "triangle-list vertex count does not fit usize")?;
+    let index_count =
+        usize::try_from(complete).map_err(|_| "triangle-list vertex count does not fit usize")?;
     let mut indices = Vec::new();
     indices
         .try_reserve_exact(index_count)

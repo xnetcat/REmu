@@ -49,11 +49,10 @@ use self::ngs2::{
     NGS2_ERROR_INVALID_MODULE_LOCATION, NGS2_ERROR_INVALID_NUM_CHANNELS,
     NGS2_ERROR_INVALID_OUT_ADDRESS, NGS2_ERROR_INVALID_PARAM_ADDRESS,
     NGS2_ERROR_INVALID_VOICE_CONTROL_ADDRESS, NGS2_ERROR_INVALID_VOICE_CONTROL_ID,
-    NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE,
-    NGS2_ERROR_INVALID_VOICE_HANDLE, NGS2_ERROR_INVALID_VOICE_MATRIX_INDEX,
-    NGS2_ERROR_INVALID_VOICE_OUTPUT_INDEX, NGS2_ERROR_INVALID_VOICE_PARAM_ID,
-    NGS2_ERROR_INVALID_VOICE_PATCH_TYPE, NGS2_ERROR_INVALID_VOICE_SETUP_FLAG,
-    NGS2_ERROR_INVALID_WAVEFORM_ADDRESS,
+    NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE, NGS2_ERROR_INVALID_VOICE_HANDLE,
+    NGS2_ERROR_INVALID_VOICE_MATRIX_INDEX, NGS2_ERROR_INVALID_VOICE_OUTPUT_INDEX,
+    NGS2_ERROR_INVALID_VOICE_PARAM_ID, NGS2_ERROR_INVALID_VOICE_PATCH_TYPE,
+    NGS2_ERROR_INVALID_VOICE_SETUP_FLAG, NGS2_ERROR_INVALID_WAVEFORM_ADDRESS,
     NGS2_ERROR_INVALID_WAVEFORM_DATA, NGS2_ERROR_INVALID_WAVEFORM_FORMAT,
     NGS2_ERROR_INVALID_WAVEFORM_TYPE, NGS2_ERROR_UNKNOWN_WAVEFORM_FORMAT, NGS2_MAX_SAMPLE_RATE,
     NGS2_MAX_VOICE_CHANNELS, NGS2_MODULE_MAX_LOCATIONS, NGS2_RACK_MAX_MODULES,
@@ -82,10 +81,9 @@ use self::video_out::{
 };
 use self::video_out::{
     video_out_adjust_color, video_out_close, video_out_get_event_id, video_out_get_flip_status,
-    video_out_get_vblank_status,
-    video_out_initialize_output_options, video_out_is_output_supported,
-    video_out_submit_change_buffer_attribute2, video_out_unregister_buffers,
-    video_out_vrr_unpeg_from_fixed_rate, video_out_wait_vblank,
+    video_out_get_vblank_status, video_out_initialize_output_options,
+    video_out_is_output_supported, video_out_submit_change_buffer_attribute2,
+    video_out_unregister_buffers, video_out_vrr_unpeg_from_fixed_rate, video_out_wait_vblank,
 };
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.

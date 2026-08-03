@@ -168,10 +168,7 @@ impl Compiler<'_> {
         } else {
             self.temp("uint", "1u")
         };
-        let levels = self.temp(
-            "uint",
-            &format!("tex{binding_index}.get_num_mip_levels()"),
-        );
+        let levels = self.temp("uint", &format!("tex{binding_index}.get_num_mip_levels()"));
         let components = [width, height, depth, levels];
         let mut values = Vec::with_capacity(4);
         for (component, value) in components.iter().enumerate() {

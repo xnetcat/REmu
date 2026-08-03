@@ -424,8 +424,8 @@ pub(super) fn synthetic_data_import_target(nid: &str) -> Option<u64> {
 mod tests {
     use super::{
         direct_posix_pthread_set_specific, direct_runtime_import_target,
-        direct_sce_pthread_get_thread_id, direct_sce_pthread_self,
-        direct_sce_pthread_set_specific, native_libc_symbol_name,
+        direct_sce_pthread_get_thread_id, direct_sce_pthread_self, direct_sce_pthread_set_specific,
+        native_libc_symbol_name,
     };
 
     #[test]

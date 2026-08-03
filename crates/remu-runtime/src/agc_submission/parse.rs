@@ -126,7 +126,6 @@ pub(crate) fn agc_parse_graphics_submission(
     agc_parse_submission(command_address, dword_count, context)
 }
 
-
 /// Suppresses replay of recorded graphics prefixes.
 ///
 /// Prefix recovery re-executes PM4 that was recorded earlier and validated only by shape. A

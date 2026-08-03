@@ -166,7 +166,14 @@ fn draw_toast(fb: &mut SystemUiFramebuffer, request: &HostToastRequest) {
         14,
         [28, 30, 36, 235],
     );
-    fill_rect(fb, toast_x, toast_y, 6, toast_h, accent_for_kind(request.kind));
+    fill_rect(
+        fb,
+        toast_x,
+        toast_y,
+        6,
+        toast_h,
+        accent_for_kind(request.kind),
+    );
     let title = kind_title(request.kind, &request.title);
     draw_text(
         fb,
@@ -561,7 +568,10 @@ mod tests {
             None,
         );
         assert!(!fb.is_transparent());
-        assert_eq!(fb.rgba.len(), (SYSTEM_UI_WIDTH * SYSTEM_UI_HEIGHT * 4) as usize);
+        assert_eq!(
+            fb.rgba.len(),
+            (SYSTEM_UI_WIDTH * SYSTEM_UI_HEIGHT * 4) as usize
+        );
     }
 
     #[test]

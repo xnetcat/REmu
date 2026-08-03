@@ -494,9 +494,7 @@ pub(crate) fn av_player_init(arguments: [u64; 6], state: &mut ProbeDispatchState
     }
     let allocator_callbacks = [8_u64, 16, 24, 32].map(|offset| read_guest_u64(parameter + offset));
     if allocator_callbacks.contains(&0) {
-        eprintln!(
-            "[REMu][AVPLAYER] Init rejected allocator callbacks={allocator_callbacks:#x?}"
-        );
+        eprintln!("[REMu][AVPLAYER] Init rejected allocator callbacks={allocator_callbacks:#x?}");
         return 0;
     }
     // SAFETY: AvPlayerInitData is a fixed caller-owned structure of known minimum size.

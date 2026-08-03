@@ -9,7 +9,7 @@
 //! Recording the first trapped guest store after each watched-page rearm additionally identifies
 //! guest code which took CPU ownership of a later victim page.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::signal_text::DiagnosticBuffer;
 
@@ -265,7 +265,8 @@ pub fn record_guest_write(
     slot.submission.store(submission, Ordering::Relaxed);
     slot.site.store(site.index(), Ordering::Relaxed);
     slot.uniform.store(uniform, Ordering::Relaxed);
-    slot.stamp.store(sequence.wrapping_add(1), Ordering::Release);
+    slot.stamp
+        .store(sequence.wrapping_add(1), Ordering::Release);
 }
 
 /// Records the guest instruction which opened a watched host page for CPU writes.
@@ -294,11 +295,11 @@ pub(crate) fn record_guest_cpu_page_open(
     slot.byte_count.store(page_byte_count, Ordering::Relaxed);
     slot.payload.store(fault_address, Ordering::Relaxed);
     slot.submission.store(program_counter, Ordering::Relaxed);
-    slot
-        .site
+    slot.site
         .store(GuestWriteSite::GuestCpuPageOpen.index(), Ordering::Relaxed);
     slot.uniform.store(MIXED_PAYLOAD, Ordering::Relaxed);
-    slot.stamp.store(sequence.wrapping_add(1), Ordering::Release);
+    slot.stamp
+        .store(sequence.wrapping_add(1), Ordering::Release);
 }
 
 /// Returns the already-resolved journal state without consulting the environment.
@@ -524,9 +525,7 @@ fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut 
         let length = (end - start) as usize;
         // SAFETY: the pipe write copies the window into the pipe buffer; an unreadable window
         // returns EFAULT rather than raising a nested fault.
-        let probed = unsafe {
-            libc::write(probe_writer, start as *const std::ffi::c_void, length)
-        };
+        let probed = unsafe { libc::write(probe_writer, start as *const std::ffi::c_void, length) };
         buffer.clear();
         buffer.push_bytes(b"[REMu][JOURNAL] bytes at ");
         buffer.push_hexadecimal(start);
@@ -542,10 +541,7 @@ fn dump_anchor_neighbourhoods(fault_address: u64, anchors: &[u64], buffer: &mut 
             // SAFETY: the kernel just read this exact window through the probe write.
             let byte = unsafe { std::ptr::read_volatile(offset as *const u8) };
             let digits = b"0123456789abcdef";
-            buffer.push_bytes(&[
-                digits[(byte >> 4) as usize],
-                digits[(byte & 0xf) as usize],
-            ]);
+            buffer.push_bytes(&[digits[(byte >> 4) as usize], digits[(byte & 0xf) as usize]]);
         }
         buffer.push_bytes(b"\n");
         write_diagnostic(buffer);
@@ -613,9 +609,7 @@ impl JournalEntry {
 ///
 /// Runs in signal context: it must not allocate, so an unallocated ring reads as empty.
 fn read_slot(sequence: u64) -> Option<JournalEntry> {
-    let slot = SLOTS
-        .get()?
-        .get((sequence as usize) & (CAPACITY - 1))?;
+    let slot = SLOTS.get()?.get((sequence as usize) & (CAPACITY - 1))?;
     let stamp = slot.stamp.load(Ordering::Acquire);
     if stamp != sequence.wrapping_add(1) {
         return None;
@@ -780,15 +774,9 @@ mod tests {
     #[test]
     fn marks_a_uniformity_verdict_taken_from_less_than_the_published_run() {
         enable_journal();
-        record_guest_write(
-            GuestWriteSite::DmaCopy,
-            0x9100_0000,
-            0x2000,
-            &[0x00; 8],
-            7,
-        );
-        let entry = read_slot(NEXT_SEQUENCE.load(Ordering::Relaxed) - 1)
-            .expect("the newest entry is live");
+        record_guest_write(GuestWriteSite::DmaCopy, 0x9100_0000, 0x2000, &[0x00; 8], 7);
+        let entry =
+            read_slot(NEXT_SEQUENCE.load(Ordering::Relaxed) - 1).expect("the newest entry is live");
         assert_eq!(entry.uniform, 0x00 | SAMPLED_PAYLOAD);
         assert_eq!(entry.byte_count, 0x2000);
     }
@@ -797,12 +785,7 @@ mod tests {
     fn watched_guest_page_open_retains_the_exact_fault_and_guest_pc() {
         enable_journal();
         let _ = slots_for_recording();
-        record_guest_cpu_page_open(
-            0x900c_8d00_00,
-            0x4000,
-            0x900c_8d05_a0,
-            0x8012_3456_7,
-        );
+        record_guest_cpu_page_open(0x900c_8d00_00, 0x4000, 0x900c_8d05_a0, 0x8012_3456_7);
         let entry = read_slot(NEXT_SEQUENCE.load(Ordering::Relaxed) - 1)
             .expect("the watched guest page opening is live");
         assert!(entry.site == GuestWriteSite::GuestCpuPageOpen);

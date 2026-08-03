@@ -12,9 +12,8 @@ use thiserror::Error;
 
 mod guest_write_journal;
 pub use guest_write_journal::{
-    GUEST_WRITE_JOURNAL_VARIABLE, GuestWriteSite, address_looks_poisoned,
-    dump_guest_write_journal, guest_write_journal_enabled, record_guest_write,
-    report_unrecovered_signal,
+    GUEST_WRITE_JOURNAL_VARIABLE, GuestWriteSite, address_looks_poisoned, dump_guest_write_journal,
+    guest_write_journal_enabled, record_guest_write, report_unrecovered_signal,
 };
 
 mod signal_text;
@@ -46,8 +45,7 @@ pub use address_space::{
     guest_shared_backing_identity, guest_shared_backing_range, guest_shared_backing_ranges_overlap,
     guest_shared_backing_segments, guest_shared_mapping_epoch, guest_shared_mapping_identity,
     read_guest_shared_backing, write_guest_shared_backing, write_guest_shared_backing_at_identity,
-    write_guest_shared_backing_scattered,
-    write_guest_shared_backing_if_identity,
+    write_guest_shared_backing_if_identity, write_guest_shared_backing_scattered,
 };
 
 /// Guest page size is 16 KiB on every host. The sparse address-space backend that uses it is

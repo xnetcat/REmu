@@ -23,13 +23,13 @@ use super::{
 };
 mod archive;
 mod compile;
+#[cfg(test)]
+pub(crate) use self::compile::{MIN_VALID_METALLIB_BYTES, metallib_bytes_are_usable};
 pub(crate) use self::compile::{
     compile_metal_compute_library, compile_metal_library_with_tools, compile_metal_shader_library,
     dump_compute_shader_msl, dump_shader_pair_ir, dump_shader_pair_msl,
     invalidate_metal_library_cache, metal_cache_root, metal_compile_failure_is_transient,
 };
-#[cfg(test)]
-pub(crate) use self::compile::{metallib_bytes_are_usable, MIN_VALID_METALLIB_BYTES};
 mod program;
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
@@ -37,17 +37,16 @@ pub(crate) use self::program::{
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
     ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
-    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    program_uses_lds, rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
+    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask, pixel_scalars,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
+    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
 pub(crate) use self::program::{
-    lift_expanded_vertex_buffer_num_records, ngg_export_uses_general_lds,
-    ngg_mesh_draw_supported, procedural_rectangle_export_stage,
-    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
-    truncated_memoryless_ngg_rectangle_cover,
+    lift_expanded_vertex_buffer_num_records, ngg_export_uses_general_lds, ngg_mesh_draw_supported,
+    procedural_rectangle_export_stage, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
 };
 
 impl MetalPresenter {
@@ -575,11 +574,7 @@ impl MetalPresenter {
                         // across the letterboxed mid-band. Default every live parameter to UV;
                         // analysis still overrides when ImageSample provenance is complete.
                         let count = pixel_msl.interpolated_attribute_count.min(32);
-                        if count == 0 {
-                            0
-                        } else {
-                            (1u32 << count) - 1
-                        }
+                        if count == 0 { 0 } else { (1u32 << count) - 1 }
                     });
             remu_shader_metal::compile_procedural_rectangle_vertex(
                 pixel_msl.interpolated_attribute_count,

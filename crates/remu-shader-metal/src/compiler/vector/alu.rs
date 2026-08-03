@@ -77,7 +77,8 @@ impl Compiler<'_> {
                 // have consumed the current value.
                 self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
                 selected
-            } else if let Some(vgpr) = source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
+            } else if let Some(vgpr) =
+                source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
             {
                 // Pixel/vertex: read the private wave-VGPR table filled by V_WRITELANE. Metal
                 // fragment simdgroups often have only a 2x2 quad of active lanes, so shuffling
@@ -197,9 +198,7 @@ impl Compiler<'_> {
             }
             self.line(
                 3,
-                &format!(
-                    "if ({architectural_lane} == ({lane_index})) v[{destination}] = {value};"
-                ),
+                &format!("if ({architectural_lane} == ({lane_index})) v[{destination}] = {value};"),
             );
             return Ok(());
         }
@@ -935,10 +934,7 @@ impl Compiler<'_> {
     ///
     /// Returns the per-lane index VGPR when the pixel shader uses that AMD wave-serialization
     /// pattern so Metal can keep divergent fragment lanes alive.
-    pub(crate) fn pixel_movrels_serialization_index_vgpr(
-        &self,
-        cmpx: &Instruction,
-    ) -> Option<u32> {
+    pub(crate) fn pixel_movrels_serialization_index_vgpr(&self, cmpx: &Instruction) -> Option<u32> {
         if self.options.stage != crate::MetalShaderStage::Pixel {
             return None;
         }

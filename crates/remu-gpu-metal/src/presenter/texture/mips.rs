@@ -6,11 +6,10 @@ use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState, ResidentGuestTexture,
     ResidentTextureMap, WriteWatchRefresh, compressed_texture_block_extent,
-    copy_mode27_mip_level_to_linear,
-    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
-    record_mode27_work_detail, record_texture_work, refresh_resident_texture_write_watch,
-    resident_texture_for_sample, snapshot_watched_guest_range, trace_resident_texture_removal,
-    watch_resident_texture,
+    copy_mode27_mip_level_to_linear, decode_mode5_mip_chain_from_raw,
+    decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout, record_mode27_work_detail,
+    record_texture_work, refresh_resident_texture_write_watch, resident_texture_for_sample,
+    snapshot_watched_guest_range, trace_resident_texture_removal, watch_resident_texture,
 };
 use metal::{
     CommandBufferRef, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,

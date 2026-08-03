@@ -3,59 +3,54 @@
 
 use super::{
     CachedSampledTexture, DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget,
-    DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestTextureContentState,
-    GuestScissor, GuestTextureDescriptor, GuestTextureWatchRange,
+    DepthArrayKey, DepthArrayResidentTexture, DirectScanoutTexture, GuestScissor,
+    GuestTextureContentState, GuestTextureDescriptor, GuestTextureWatchRange,
     GuestTextureWriteWatch, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS,
     MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_SUBTRACT_TENANTS_SURVIVED,
-    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_FAILED,
-    OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED_CPU_GPU,
-    OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
-    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
-    RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState, ResidentGuestTexture,
-    ResourceSpan,
-    ResidentTextureActivityStamp, SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
+    OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_REMATERIALISE_BLIT,
+    OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED,
+    OWNED_REMATERIALISE_FAILED_CPU_GPU, OWNED_REMATERIALISE_FAILED_LAYOUT,
+    OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
+    OWNED_SUBTRACT_TENANTS_SURVIVED, RESIDENT_DEPTH_SAMPLE_HITS,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES, ResidencyState,
+    ResidentGuestTexture, ResidentTextureActivityStamp, ResourceSpan,
+    SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
     SampledTextureKey, ScanoutSnapshotTexture, StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES,
     TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED,
-    TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
+    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
     TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, UploadedImageTexture,
-    WriteWatchRefresh,
-    canonical_texture_bindings, compressed_texture_block_extent, copy_linear_to_tiled_at_z,
-    copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z, decode_image_descriptor,
-    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, fallback_image_descriptor,
-    guest_frame_fingerprint, guest_ranges_overlap, guest_texture_byte_count,
-    guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_color_view_storage,
+    WriteWatchRefresh, canonical_texture_bindings, compressed_texture_block_extent,
+    copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z,
+    decode_image_descriptor, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
+    fallback_image_descriptor, guest_frame_fingerprint, guest_ranges_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, initial_depth_clear_for_target, is_storage_image_opcode,
     is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
-    mode27_surface_z_xor,
-    record_mode27_work_detail, record_texture_dirty_work_detail,
+    mode27_surface_z_xor, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
     sampled_alias_descriptor, sampler_uses_normalized_coordinates, spans_overlap,
-    texture_element_layout, tiled_block_bytes, tiled_block_dimensions,
-    trace_glyph_atlas, trace_image_descriptors, trace_target_sampling,
-    trace_video_target_consumers,
+    texture_element_layout, tiled_block_bytes, tiled_block_dimensions, trace_glyph_atlas,
+    trace_image_descriptors, trace_target_sampling, trace_video_target_consumers,
 };
-#[cfg(test)]
-use remu_memory::{guest_shared_mapping_identity, write_guest_shared_backing};
 use remu_memory::{
     CpuWriteWatchRetirement, read_guest_shared_backing, write_guest_shared_backing_scattered,
 };
+#[cfg(test)]
+use remu_memory::{guest_shared_mapping_identity, write_guest_shared_backing};
 mod correlation;
 mod depth_array;
 mod extent;
 mod lifetime;
 mod mips;
 mod ranges;
-mod resident_map;
 mod residency;
+mod resident_map;
 mod retire;
 mod sampled;
 mod upload;
@@ -65,10 +60,9 @@ pub(crate) use self::correlation::{
     trace_alias_correlated_image_bindings, trace_residency_churn,
 };
 pub(crate) use self::depth_array::resident_is_depth_array_face;
-pub(crate) use self::extent::{WrittenRegion, resident_declared_span, written_byte_ranges};
-pub(crate) use self::ranges::RangeSet;
 #[cfg(test)]
 pub(crate) use self::depth_array::{depth_array_face_descriptor, depth_array_face_set_is_complete};
+pub(crate) use self::extent::{WrittenRegion, resident_declared_span, written_byte_ranges};
 pub(crate) use self::lifetime::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_eviction_plan,
@@ -78,12 +72,15 @@ pub(crate) use self::mips::{
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
-pub(crate) use self::resident_map::{ResidentTextureMap, SpanQueryOrder};
-#[cfg(test)]
-pub(crate) use self::resident_map::ResidentSpanIndex;
-pub(crate) use self::residency::{ensure_resident_texture_in_map, resident_texture_ownership_stats};
+pub(crate) use self::ranges::RangeSet;
 #[cfg(test)]
 pub(crate) use self::residency::rematerialisation_blit_source_origin_y;
+pub(crate) use self::residency::{
+    ensure_resident_texture_in_map, resident_texture_ownership_stats,
+};
+#[cfg(test)]
+pub(crate) use self::resident_map::ResidentSpanIndex;
+pub(crate) use self::resident_map::{ResidentTextureMap, SpanQueryOrder};
 pub(crate) use self::retire::{
     retire_multisample_textures_overlapping_writeback, retire_overlapping_sampled_textures,
     retire_sampled_texture, retire_sampled_textures_matching,
@@ -107,16 +104,16 @@ pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 pub(crate) use self::upload::{
     sampled_texture_cache_accepts, sampled_texture_cache_requires_eviction,
 };
+pub(crate) use self::watch::{
+    authored_segments, persistent_sampled_texture_write_watch,
+    refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
+    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
+    snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
+    snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
+    watch_sampled_texture, write_watched_guest_range,
+};
 #[cfg(test)]
 pub(crate) use self::watch::{guest_texture_raw_range, sampled_texture_raw_range};
-pub(crate) use self::watch::{
-    persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
-    refresh_sampled_texture_write_watch, sampled_texture_uses_exact_mode5_mips,
-    sampled_texture_uses_exact_mode27_mips, snapshot_guest_texture_raw,
-    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
-    authored_segments, watch_sampled_texture, write_watched_guest_range,
-};
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.
 /// Its members are `uint8_t` in the macOS SDK; keep the layout explicit because metal-rs 0.33

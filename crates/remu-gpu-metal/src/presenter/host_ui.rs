@@ -10,11 +10,11 @@
 
 use remu_gpu::{
     HostDialogButtons, HostDialogRequest, HostDialogResultCode, HostToastRequest,
-    SystemUiFramebuffer, complete_host_dialog, host_dialog_is_pending, host_pad_buttons_held,
-    rasterize_system_ui, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS,
+    PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, SystemUiFramebuffer, complete_host_dialog,
+    host_dialog_is_pending, host_pad_buttons_held, rasterize_system_ui,
 };
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use super::present::headless_metal_requested;
@@ -85,7 +85,9 @@ pub(crate) fn present_host_dialog(request: &HostDialogRequest) {
         complete_host_dialog(request.sequence, HostDialogResultCode::Cancel);
         return;
     }
-    let mut state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.dialog = Some(ActiveDialog {
         sequence: request.sequence,
         buttons: request.buttons,
@@ -97,7 +99,9 @@ pub(crate) fn present_host_dialog(request: &HostDialogRequest) {
 
 /// Dismisses a still-pending dialog when the guest calls Close/Terminate.
 pub(crate) fn hide_host_dialog(sequence: u64) {
-    let mut state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if state
         .dialog
         .as_ref()
@@ -120,7 +124,9 @@ pub(crate) fn present_host_toast(request: &HostToastRequest) {
     if headless_metal_requested() || auto_dismiss_dialogs_requested() {
         return;
     }
-    let mut state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let duration = Duration::from_millis(u64::from(request.duration_ms.max(1_500)));
     state.toast = Some(ActiveToast {
         request: request.clone(),
@@ -138,13 +144,17 @@ pub(crate) fn poll_host_ui() {
 /// True when a dialog or toast overlay should be composited this frame.
 #[must_use]
 pub(crate) fn system_ui_overlay_visible() -> bool {
-    let state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     state.framebuffer.is_some()
 }
 
 /// Takes a dirty overlay upload, if the rasterizer produced new pixels since the last take.
 pub(crate) fn take_system_ui_overlay_upload() -> Option<SystemUiFramebuffer> {
-    let mut state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if !state.dirty {
         return None;
     }
@@ -153,7 +163,9 @@ pub(crate) fn take_system_ui_overlay_upload() -> Option<SystemUiFramebuffer> {
 }
 
 fn poll_dialog_input() {
-    let mut state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(active) = state.dialog.as_ref() else {
         return;
     };
@@ -182,7 +194,9 @@ fn poll_dialog_input() {
 }
 
 fn poll_toast_expiry() {
-    let mut state = OVERLAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = OVERLAY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Some(active) = state.toast.as_ref() else {
         return;
     };

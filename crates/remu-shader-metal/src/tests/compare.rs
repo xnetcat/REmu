@@ -220,7 +220,9 @@ fn wave32_mesh_vcmp_into_s2_preserves_packed_s3_wave_fields() {
         "wave32 mesh V_CMP into s[2] must leave s[3] wave index/count intact"
     );
     assert!(
-        shader.source.contains("((remu_mesh_wave_count & 0xfu) << 28u)"),
+        shader
+            .source
+            .contains("((remu_mesh_wave_count & 0xfu) << 28u)"),
         "mesh prologue must still pack s3[31:28] wave count"
     );
 }

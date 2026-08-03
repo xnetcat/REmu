@@ -269,14 +269,17 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 continue;
             }
             let scalar_address = self.global_bindings[index].scalar_address;
-            let Some(live_index) = self.global_bindings.iter().enumerate().find_map(
-                |(candidate, binding)| {
-                    (candidate != index
-                        && binding.scalar_address == scalar_address
-                        && binding.base_address != 0)
-                    .then_some(candidate)
-                },
-            ) else {
+            let Some(live_index) =
+                self.global_bindings
+                    .iter()
+                    .enumerate()
+                    .find_map(|(candidate, binding)| {
+                        (candidate != index
+                            && binding.scalar_address == scalar_address
+                            && binding.base_address != 0)
+                            .then_some(candidate)
+                    })
+            else {
                 index += 1;
                 continue;
             };

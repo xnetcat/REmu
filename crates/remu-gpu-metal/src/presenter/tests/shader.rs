@@ -19,17 +19,15 @@ use super::{
     ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
     compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
     fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
-    image_component_class, missing_vertex_parameter_exports, ngg_export_uses_general_lds,
-    ngg_export_uses_wave64_exec, ngg_mesh_draw_supported, ngg_fullscreen_cover_draw,
-    ngg_memoryless_cover_export_stage,
+    image_component_class, lift_expanded_vertex_buffer_num_records,
+    missing_vertex_parameter_exports, ngg_export_uses_general_lds, ngg_export_uses_wave64_exec,
+    ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     procedural_rectangle_stage_for_draw, rectangle_coordinate_parameter_mask,
-    rectangle_draw_has_incomplete_interface, sampler_lod_bias,
-    truncated_memoryless_ngg_rectangle_cover,
-    lift_expanded_vertex_buffer_num_records, sampler_uses_normalized_coordinates,
+    rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
     shader_scalar_metadata, shader_scalar_metadata_for_registers,
-    speculative_pipeline_compile_in_flight_capacity, validate_compute_launch_for_metal,
-    wave64_split_blockers,
+    speculative_pipeline_compile_in_flight_capacity, truncated_memoryless_ngg_rectangle_cover,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
 fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
@@ -217,10 +215,7 @@ fn transient_compile_failure_is_retried_not_terminal() {
 fn metallib_bytes_are_usable_rejects_header_only_cache_entries() {
     use std::io::Write;
 
-    let directory = std::env::temp_dir().join(format!(
-        "remu-metallib-test-{}",
-        std::process::id()
-    ));
+    let directory = std::env::temp_dir().join(format!("remu-metallib-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     std::fs::create_dir_all(&directory).expect("create temp directory");
     let truncated = directory.join("truncated.metallib");
@@ -1329,7 +1324,10 @@ fn pixel_scalar_metadata_delivers_the_font_atlas_destination_select() {
     let words = shader_scalar_metadata_for_registers(&evaluation, &registers, 0x00c, 0)
         .expect("pixel scalar metadata fits");
 
-    assert_eq!(&words[..FONT_ATLAS_DESCRIPTOR.len()], &FONT_ATLAS_DESCRIPTOR);
+    assert_eq!(
+        &words[..FONT_ATLAS_DESCRIPTOR.len()],
+        &FONT_ATLAS_DESCRIPTOR
+    );
     assert_eq!(words[3], 0x9090_0800);
     assert_eq!(words[3] & 0xfff, 0x800);
 }

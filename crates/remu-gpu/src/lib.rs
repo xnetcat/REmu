@@ -19,10 +19,10 @@ pub use compute::{
 
 mod event;
 pub use event::{
-    GpuEvent, GpuFlipCompletion, GpuFlipWait, GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryCopySnapshot,
-    GpuMemoryCopySnapshotBudgetExceeded, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, GpuWaitId,
-    gpu_memory_copy_snapshot_statistics,
+    GpuEvent, GpuFlipCompletion, GpuFlipWait, GpuMemoryAcquire, GpuMemoryCopy,
+    GpuMemoryCopySnapshot, GpuMemoryCopySnapshotBudgetExceeded, GpuMemoryRelease,
+    GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage,
+    GpuWaitId, gpu_memory_copy_snapshot_statistics,
 };
 
 mod diagnostics;
@@ -68,15 +68,13 @@ pub use resource::{
 
 mod dialog;
 pub use dialog::{
-    HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResult,
-    HostDialogResultCode, HostToastRequest, begin_host_dialog, cancel_host_dialog,
-    complete_host_dialog, host_dialog_is_pending, host_dialog_result, reset_host_dialog_state,
+    HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResult, HostDialogResultCode,
+    HostToastRequest, begin_host_dialog, cancel_host_dialog, complete_host_dialog,
+    host_dialog_is_pending, host_dialog_result, reset_host_dialog_state,
 };
 
 mod system_ui;
-pub use system_ui::{
-    SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH, SystemUiFramebuffer, rasterize_system_ui,
-};
+pub use system_ui::{SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH, SystemUiFramebuffer, rasterize_system_ui};
 
 mod pad;
 pub use pad::{

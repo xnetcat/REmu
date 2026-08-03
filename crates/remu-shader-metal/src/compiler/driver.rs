@@ -14,12 +14,12 @@ use crate::compiler::control_flow::{
     ControlFlowLowering, LoweringFailure, analyze_control_flow, branch_target,
     combined_lowering_error, dispatcher_basic_blocks,
 };
+use crate::compiler::export::{mesh_export_vertex_vgpr, mesh_ngg_packed_export_sgpr};
 use crate::compiler::image::{
     ImageKind, image_component_type, is_storage_image, is_writable_image,
 };
 use crate::compiler::interface::{PixelInterpolation, interpolation_for_barycentric_vgpr};
 use crate::compiler::memory::is_lds_memory_instruction;
-use crate::compiler::export::{mesh_export_vertex_vgpr, mesh_ngg_packed_export_sgpr};
 use crate::{
     Compiler, METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError,
     MetalCompileOptions, MetalRegisterFootprint, MetalShader, MetalShaderStage,

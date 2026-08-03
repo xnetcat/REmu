@@ -9,9 +9,8 @@ use super::{
     DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE,
     DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedDepthTarget,
     DecodedRenderTarget, GuestTextureDescriptor, RenderTargetFormat, ResourceSpan,
-    decode_scanout_target,
-    effective_linear_pitch, guest_texture_byte_count, half_float_to_f32, register_value,
-    tiled_block_dimensions, trace_target_sampling, unsigned_float_to_f32,
+    decode_scanout_target, effective_linear_pitch, guest_texture_byte_count, half_float_to_f32,
+    register_value, tiled_block_dimensions, trace_target_sampling, unsigned_float_to_f32,
 };
 use metal::{MTLClearColor, MTLCompareFunction, MTLPixelFormat};
 use remu_gpu::{GpuRegister, IndexedDraw};

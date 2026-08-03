@@ -203,7 +203,10 @@ impl Compiler<'_> {
         let values = self.export_float_values(instruction, export)?;
         let maximum_layer = self.options.render_target_array_length - 1;
         let (destination, lane_guard) = match self.options.stage {
-            MetalShaderStage::Vertex => ("remu_out.render_target_array_index".to_owned(), String::new()),
+            MetalShaderStage::Vertex => (
+                "remu_out.render_target_array_index".to_owned(),
+                String::new(),
+            ),
             MetalShaderStage::Mesh => {
                 let max = self.options.mesh_max_vertex_count;
                 match self.mesh_export_vertex_vgpr {

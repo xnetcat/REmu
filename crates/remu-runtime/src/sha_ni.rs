@@ -66,11 +66,15 @@ unsafe fn install_sigill_handler_once() -> Result<(), i32> {
     action.sa_flags = libc::SA_SIGINFO;
     unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
     // SAFETY: PREVIOUS_SIGILL is uninitialized writable storage reserved for the prior action.
-    if unsafe { libc::sigaction(libc::SIGILL, &raw const action, PREVIOUS_SIGILL.as_mut_ptr()) } != 0
+    if unsafe {
+        libc::sigaction(
+            libc::SIGILL,
+            &raw const action,
+            PREVIOUS_SIGILL.as_mut_ptr(),
+        )
+    } != 0
     {
-        return Err(std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(1));
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(1));
     }
     Ok(())
 }
@@ -224,12 +228,7 @@ fn try_recover_sse4a(context: *mut std::ffi::c_void) -> bool {
             // rm[77:72].
             let source = read_xmm_u64(mcontext, rm);
             let mut value = read_xmm_u64(mcontext, reg);
-            value[0] = sse4a_insert(
-                value[0],
-                source[0],
-                source[1] as u8,
-                (source[1] >> 8) as u8,
-            );
+            value[0] = sse4a_insert(value[0], source[0], source[1] as u8, (source[1] >> 8) as u8);
             write_xmm_u64(mcontext, reg, value);
             true
         }
@@ -254,7 +253,11 @@ fn sse4a_field(length: u8, index: u8) -> (u32, u32, u64) {
         bits => bits,
     };
     let index = u32::from(index & 0x3f);
-    let mask = if bits == 64 { u64::MAX } else { (1 << bits) - 1 };
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1 << bits) - 1
+    };
     (bits, index, mask)
 }
 
@@ -321,9 +324,20 @@ fn report_unrecovered_sigill(information: *mut libc::siginfo_t, context: *mut st
             pc = state.__rip;
             // rsp/rbp are omitted: stack anchors only match legitimate out-parameter writes.
             for value in [
-                state.__rax, state.__rbx, state.__rcx, state.__rdx, state.__rdi, state.__rsi,
-                state.__r8, state.__r9, state.__r10, state.__r11, state.__r12, state.__r13,
-                state.__r14, state.__r15,
+                state.__rax,
+                state.__rbx,
+                state.__rcx,
+                state.__rdx,
+                state.__rdi,
+                state.__rsi,
+                state.__r8,
+                state.__r9,
+                state.__r10,
+                state.__r11,
+                state.__r12,
+                state.__r13,
+                state.__r14,
+                state.__r15,
             ] {
                 anchors[anchor_count] = value;
                 anchor_count += 1;
@@ -478,7 +492,9 @@ enum Sha1Op {
     Msg1,
     Msg2,
     Nexte,
-    Rnds4 { imm: u8 },
+    Rnds4 {
+        imm: u8,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -894,9 +910,6 @@ mod tests {
             0x1111_2222_3333_44AB
         );
         // Length zero replaces the whole low quadword.
-        assert_eq!(
-            super::sse4a_insert(u64::MAX, 0x1234, 0, 0),
-            0x1234
-        );
+        assert_eq!(super::sse4a_insert(u64::MAX, 0x1234, 0, 0), 0x1234);
     }
 }

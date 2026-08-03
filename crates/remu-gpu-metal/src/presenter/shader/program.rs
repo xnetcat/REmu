@@ -244,8 +244,7 @@ pub(crate) fn shader_scalar_metadata(evaluation: &ShaderEvaluation) -> Result<Ve
     for binding in &evaluation.global_memory_bindings {
         let effective = effective_global_memory_binding(evaluation, binding);
         if !std::ptr::eq(effective, binding) {
-            static ALIASED: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static ALIASED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let sequence = ALIASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if sequence <= 16 || sequence.is_power_of_two() {
                 eprintln!(
@@ -322,7 +321,8 @@ pub(crate) fn lift_expanded_vertex_buffer_num_records(
         if bound_bytes <= descriptor_bytes {
             continue;
         }
-        let expanded_records = u32::try_from(bound_bytes / u64::from(stride)).unwrap_or(num_records);
+        let expanded_records =
+            u32::try_from(bound_bytes / u64::from(stride)).unwrap_or(num_records);
         if expanded_records > num_records {
             scalar_metadata[scalar + 2] = expanded_records;
         }
@@ -603,10 +603,7 @@ pub(crate) fn ngg_mesh_stage_for_draw(
         return Ok(false);
     }
     // Non-indexed triangle lists still prefer VS when the meshlet ABI cannot prepare them.
-    if !draw.indexed
-        && draw.indirect_arguments_address.is_none()
-        && draw.primitive_type == 4
-    {
+    if !draw.indexed && draw.indirect_arguments_address.is_none() && draw.primitive_type == 4 {
         return Ok(false);
     }
     if procedural_rectangle_stage_for_draw(program, draw) {

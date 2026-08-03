@@ -34,7 +34,10 @@ pub(crate) fn rtld_thread_atexit_increment(
 /// Release a TLS-destructor reference previously taken for the module containing `dso_address`.
 ///
 /// Mirrors fpPS4: resolve the module, then drop one reference. Missing modules are a no-op.
-pub(crate) fn rtld_thread_atexit_decrement(dso_address: u64, state: &mut ProbeDispatchState) -> u64 {
+pub(crate) fn rtld_thread_atexit_decrement(
+    dso_address: u64,
+    state: &mut ProbeDispatchState,
+) -> u64 {
     let Some(module_base) = module_base_containing(dso_address, state) else {
         eprintln!(
             "[REMu][RTLD] thread-atexit decrement: no module contains address={dso_address:#x}"
@@ -88,20 +91,11 @@ mod tests {
     fn increment_pins_module_and_decrement_releases() {
         let mut state = state_with_module(0x1000_0000, 0x1001_0000);
         assert_eq!(rtld_thread_atexit_increment(0x1000_0100, &mut state), 0);
-        assert_eq!(
-            state.module_tls_destructor_refs.get(&0x1000_0000),
-            Some(&1)
-        );
+        assert_eq!(state.module_tls_destructor_refs.get(&0x1000_0000), Some(&1));
         assert_eq!(rtld_thread_atexit_increment(0x1000_0200, &mut state), 0);
-        assert_eq!(
-            state.module_tls_destructor_refs.get(&0x1000_0000),
-            Some(&2)
-        );
+        assert_eq!(state.module_tls_destructor_refs.get(&0x1000_0000), Some(&2));
         assert_eq!(rtld_thread_atexit_decrement(0x1000_0100, &mut state), 0);
-        assert_eq!(
-            state.module_tls_destructor_refs.get(&0x1000_0000),
-            Some(&1)
-        );
+        assert_eq!(state.module_tls_destructor_refs.get(&0x1000_0000), Some(&1));
         assert_eq!(rtld_thread_atexit_decrement(0x1000_0200, &mut state), 0);
         assert!(state.module_tls_destructor_refs.is_empty());
     }

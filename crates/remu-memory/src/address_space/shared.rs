@@ -644,7 +644,12 @@ pub fn write_guest_shared_backing_at_identity(
         .find(|record| record.backing.id() == identity.backing_id)
         .map(|record| record.backing.clone())
     else {
-        trace_refused_identity_write(&mappings, identity, byte_count, "backing has no live mapping");
+        trace_refused_identity_write(
+            &mappings,
+            identity,
+            byte_count,
+            "backing has no live mapping",
+        );
         return false;
     };
     if backing.is_virtually_keyed() {

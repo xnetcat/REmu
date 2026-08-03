@@ -389,15 +389,11 @@ pub(crate) fn np_trophy_register_context(
 /// This host has no PSN trophy metadata. The call validates the registered context and handle,
 /// zeroes the game-info record so the guest reads empty titles and zero trophy counts, and shows a
 /// one-shot host toast so the offline nature is visible rather than silent.
-pub(crate) fn np_trophy_get_game_info(
-    arguments: [u64; 6],
-    state: &mut ProbeDispatchState,
-) -> u64 {
+pub(crate) fn np_trophy_get_game_info(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     // Observed layout leaves ~0x98 bytes before the next stack slot the title keeps live.
     const GAME_INFO_SIZE: u64 = 0x90;
 
-    let (context, handle, game_info) =
-        (low_i32(arguments[0]), low_i32(arguments[1]), arguments[2]);
+    let (context, handle, game_info) = (low_i32(arguments[0]), low_i32(arguments[1]), arguments[2]);
     if game_info == 0 {
         return sce_kernel_error(np::TROPHY2_ERROR_INVALID_ARGUMENT);
     }

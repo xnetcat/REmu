@@ -5,22 +5,21 @@ use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    ResidentTextureActivityStamp, ResidentTextureMap,
-    SAMPLED_TEXTURE_CACHE_CAPACITY, SpanQueryOrder,
+    ResidentTextureActivityStamp, ResidentTextureMap, SAMPLED_TEXTURE_CACHE_CAPACITY,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey,
+    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey, SpanQueryOrder,
     UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
     create_sampled_guest_texture, decode_image_descriptor, decode_sampled_texture_linear_from_raw,
     ensure_mipmapped_resident_texture_in_map, ensure_resident_texture_in_map,
     fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage, is_storage_image_opcode, is_writable_image_opcode,
-    persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
-    refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
-    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
-    sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    is_storage_image_opcode, is_writable_image_opcode, persistent_sampled_texture_write_watch,
+    refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
+    render_resolve_candidate_matches, resident_color_view_sample_is_eligible,
+    resident_depth_sample_is_eligible, resident_texture_for_sample, retire_sampled_texture,
+    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_uses_exact_mode5_mips,
     sampled_texture_uses_exact_mode27_mips, sampler_uses_normalized_coordinates,
     snapshot_watched_sampled_texture_raw, storage_image_requires_mip_hierarchy,
     texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
@@ -37,6 +36,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 fn trace_glyph_atlas_linear(
     descriptor: GuestTextureDescriptor,
     destination_select: u32,
+    raw: &[u8],
     linear: &[u8],
 ) {
     if !trace_glyph_atlas()
@@ -92,6 +92,26 @@ fn trace_glyph_atlas_linear(
             descriptor.height,
         );
         return;
+    }
+    if expected == Some(raw.len()) {
+        let mut raw_pgm =
+            format!("P5\n{} {}\n255\n", descriptor.width, descriptor.height).into_bytes();
+        raw_pgm.extend_from_slice(raw);
+        let raw_path = output_dir.join(format!(
+            "glyph-atlas-raw-as-linear-{:#x}-dst-{destination_select:03x}.pgm",
+            descriptor.address
+        ));
+        if let Err(error) = std::fs::write(&raw_path, raw_pgm) {
+            eprintln!(
+                "[REMu][METAL][GLYPH-CONTENT] failed to write raw-as-linear {}: {error}",
+                raw_path.display(),
+            );
+        } else {
+            eprintln!(
+                "[REMu][METAL][GLYPH-CONTENT] dumped raw-as-linear {}",
+                raw_path.display(),
+            );
+        }
     }
     let mut pgm = format!("P5\n{} {}\n255\n", descriptor.width, descriptor.height).into_bytes();
     pgm.extend_from_slice(linear);
@@ -752,6 +772,7 @@ pub(crate) fn upload_image_textures(
                             trace_glyph_atlas_linear(
                                 descriptor.guest,
                                 descriptor.destination_select,
+                                &raw,
                                 &linear,
                             );
                             create_sampled_guest_texture(

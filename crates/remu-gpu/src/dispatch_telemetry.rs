@@ -174,9 +174,8 @@ impl DispatchTelemetry {
     const fn new() -> Self {
         Self {
             import_calls: [const { AtomicU64::new(0) }; DISPATCH_IMPORT_FAMILY_COUNT],
-            direct_import_calls: [const {
-                [const { AtomicU64::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT]
-            }; DIRECT_DISPATCH_STRIPE_COUNT],
+            direct_import_calls: [const { [const { AtomicU64::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT] };
+                DIRECT_DISPATCH_STRIPE_COUNT],
             dispatch_lock_acquire_wait: AtomicLatencyHistogram::new(),
             dispatch_lock_hold: AtomicLatencyHistogram::new(),
             gpu_publication_wait: AtomicLatencyHistogram::new(),
@@ -195,16 +194,16 @@ impl DispatchTelemetry {
 
     fn take(&self) -> DispatchTelemetrySample {
         let direct_import_calls = std::array::from_fn(|index| {
-            self.direct_import_calls.iter().fold(0_u64, |total, stripe| {
-                total.saturating_add(stripe[index].swap(0, Ordering::Relaxed))
-            })
+            self.direct_import_calls
+                .iter()
+                .fold(0_u64, |total, stripe| {
+                    total.saturating_add(stripe[index].swap(0, Ordering::Relaxed))
+                })
         });
-        let mut import_calls = std::array::from_fn(|index| {
-            self.import_calls[index].swap(0, Ordering::Relaxed)
-        });
-        import_calls[DispatchImportFamily::Direct as usize] = import_calls
-            [DispatchImportFamily::Direct as usize]
-            .saturating_add(
+        let mut import_calls =
+            std::array::from_fn(|index| self.import_calls[index].swap(0, Ordering::Relaxed));
+        import_calls[DispatchImportFamily::Direct as usize] =
+            import_calls[DispatchImportFamily::Direct as usize].saturating_add(
                 direct_import_calls
                     .iter()
                     .copied()

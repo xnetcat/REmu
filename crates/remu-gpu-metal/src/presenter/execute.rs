@@ -10,14 +10,12 @@ use super::{
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey,
-    GuestBatchFlushReason,
-    GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
-    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
-    PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
+    GuestBatchFlushReason, GuestBatchWork, GuestRenderPassKey, GuestScissor,
+    GuestTextureDescriptor, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX,
+    OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
     ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
-    append_unique_global_writebacks,
-    append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
-    capture_target_sample_textures, collect_pending_global_writebacks,
+    append_unique_global_writebacks, append_unique_guest_write_ranges, canonical_texture_bindings,
+    capture_guest_frame, capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop, compute_pipeline_key,
     compute_program_can_split_wave64, consume_color_metadata_clear, consume_depth_metadata_clear,
     create_global_argument_buffer, decode_color_eliminate_fast_clear_target,
@@ -25,18 +23,16 @@ use super::{
     decode_image_descriptor, decode_raster_state, decode_render_targets, decode_scissor,
     decode_viewport, diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
     diagnostic_context_register_snapshot, diagnostic_disable_culling, diagnostic_disable_depth,
-    guest_viewport_y_scale_is_negative,
-    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
-    diagnostic_dump_glyph_draw,
+    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa, diagnostic_dump_glyph_draw,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_index_count, diagnostic_dump_target_match_index,
-    diagnostic_dump_target_minimum_draw,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_vertex_pattern,
-    diagnostic_global_binding_head, diagnostic_overlapping_global_writers,
-    diagnostic_overlapping_memory_copies, diagnostic_overlapping_texture_writers,
-    diagnostic_related_texture_writers, diagnostic_shader_summary, diagnostic_target_draw_filter,
+    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_vertex_pattern, diagnostic_global_binding_head,
+    diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
+    diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
+    diagnostic_shader_summary, diagnostic_target_draw_filter,
     diagnostic_texture_depth_plane_summaries, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
     diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
@@ -45,21 +41,20 @@ use super::{
     dump_msl_compute_filter_matches, dump_shader_pair_msl, evaluation_samples_glyph_atlas,
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, guest_frame_fingerprint, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
-    initial_depth_clear_for_target,
+    guest_texture_descriptors_share_storage, guest_viewport_y_scale_is_negative, half_float_to_f32,
+    image_resource_descriptor_is_null, initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
     metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
     native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
     prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
-    read_texture_array_linear,
-    read_texture_linear, read_texture_volume_linear, rearm_color_metadata_clear, spans_overlap,
-    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_scanout_writer,
-    record_diagnostic_texture_writer, register_value, render_target_cmask_address,
-    render_target_fast_clear_color, resident_color_view_sample_is_eligible,
-    resident_depth_sample_is_eligible, sampled_image_bindings,
-    shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
-    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy, trace_glyph_atlas,
-    trace_image_descriptors,
+    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
+    record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
+    render_target_cmask_address, render_target_fast_clear_color,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    sampled_image_bindings, shader_scalar_metadata_for_registers,
+    should_record_diagnostic_target_writer, snapshot_guest_texture_raw, spans_overlap,
+    storage_image_requires_mip_hierarchy, trace_glyph_atlas, trace_image_descriptors,
     trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
 };
@@ -159,13 +154,10 @@ impl MetalPresenter {
             // MRT0 resident. Resolve transfers that resident to MRT1; EliminateFastClear
             // materializes the logical CMASK clear before later geometry loads the attachment.
             super::stats::NOOP_DRAWS_COLOR_OPERATION.fetch_add(1, Ordering::Relaxed);
-            if self
-                .active_open_guest_batch_mut()
-                .is_some_and(|batch| {
-                    batch.end_compute_pass();
-                    batch.end_render_pass()
-                })
-            {
+            if self.active_open_guest_batch_mut().is_some_and(|batch| {
+                batch.end_compute_pass();
+                batch.end_render_pass()
+            }) {
                 self.statistics.render_pass_ends_for_target_change = self
                     .statistics
                     .render_pass_ends_for_target_change
@@ -587,9 +579,7 @@ impl MetalPresenter {
             for binding in evaluation
                 .image_bindings
                 .iter()
-                .filter(|binding| {
-                    !image_resource_descriptor_is_null(&binding.resource_descriptor)
-                })
+                .filter(|binding| !image_resource_descriptor_is_null(&binding.resource_descriptor))
             {
                 if let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor)
                     && self
@@ -1338,8 +1328,7 @@ impl MetalPresenter {
         };
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
-            let batch = batch
-                .expect("guest command batch was opened above");
+            let batch = batch.expect("guest command batch was opened above");
             batch.work.push(GuestBatchWork::Draw {
                 sequence: draw.sequence,
                 indexed: draw.indexed,
@@ -1395,13 +1384,13 @@ impl MetalPresenter {
                 .encoder;
             encoder.set_render_pipeline_state(&pipeline);
             encoder.set_front_facing_winding(raster.front_winding);
-            encoder.set_cull_mode(if diagnostic_disable_culling_for_draw
-                || uses_procedural_rectangle_stage
-            {
-                MTLCullMode::None
-            } else {
-                raster.cull_mode
-            });
+            encoder.set_cull_mode(
+                if diagnostic_disable_culling_for_draw || uses_procedural_rectangle_stage {
+                    MTLCullMode::None
+                } else {
+                    raster.cull_mode
+                },
+            );
             encoder.set_triangle_fill_mode(raster.fill_mode);
             if !diagnostic_disable_depth_for_draw
                 && let Some(depth_stencil_state) = depth_stencil_state.as_ref()
@@ -1705,8 +1694,8 @@ impl MetalPresenter {
             // boundary so later compositor and interface passes cannot be skipped.
             self.note_pending_flip_target_write(target.texture);
         }
-        let dump_target_before_pixel_shader = diagnostic_dump_target_before_pixel_shader().is_some()
-            || diagnostic_dump_glyph_draw();
+        let dump_target_before_pixel_shader =
+            diagnostic_dump_target_before_pixel_shader().is_some() || diagnostic_dump_glyph_draw();
         let trace_scanout_writers = trace_scanout_writes();
         for target in &targets {
             if should_record_diagnostic_target_writer(
@@ -1738,8 +1727,7 @@ impl MetalPresenter {
             // while an earlier R32Float sample SRD shadowed them and forced CPU snapshots
             // (Octopath 0x8063d50000: depth_native=0 forever).
             if depth.write_enabled || depth_clear_value.is_some() {
-                let region =
-                    WrittenRegion::depth_target(scissor, depth_clear_value.is_some());
+                let region = WrittenRegion::depth_target(scissor, depth_clear_value.is_some());
                 if depth.sample_count > 1 {
                     self.mark_resident_texture_written_preserving_multisample_at(
                         depth.texture,
@@ -1859,14 +1847,13 @@ impl MetalPresenter {
                 (diagnostic_dump_video_chain_consumer()
                     && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed)
                         == draw.sequence)
-                .then(|| targets.first())
-                .flatten()
+                    .then(|| targets.first())
+                    .flatten()
             })
             .or_else(|| {
-                (diagnostic_dump_glyph_draw()
-                    && evaluation_samples_glyph_atlas(&pixel_evaluation))
-                .then(|| targets.first())
-                .flatten()
+                (diagnostic_dump_glyph_draw() && evaluation_samples_glyph_atlas(&pixel_evaluation))
+                    .then(|| targets.first())
+                    .flatten()
             });
         if draw.sequence >= diagnostic_dump_target_minimum_draw()
             && diagnostic_dump_target_index_count().is_none_or(|count| count == draw.index_count)
@@ -2093,26 +2080,22 @@ impl MetalPresenter {
                     && let Some(directory) = self.capture_directory.as_deref()
                 {
                     match native_texture_capture_to_bgra(&bytes, descriptor) {
-                        Some(bgra) => match capture_guest_frame(
-                            directory,
-                            &bgra,
-                            descriptor,
-                            fingerprint,
-                        ) {
-                            Ok(path) => eprintln!(
-                                "[REMu][METAL][GLYPH-POST-TARGET] draw={} fingerprint={fingerprint:016x} captured={}",
-                                draw.sequence,
-                                path.display(),
-                            ),
-                            Err(error) => eprintln!(
-                                "[REMu][METAL][GLYPH-POST-TARGET] draw={} capture failed: {error}",
-                                draw.sequence,
-                            ),
-                        },
+                        Some(bgra) => {
+                            match capture_guest_frame(directory, &bgra, descriptor, fingerprint) {
+                                Ok(path) => eprintln!(
+                                    "[REMu][METAL][GLYPH-POST-TARGET] draw={} fingerprint={fingerprint:016x} captured={}",
+                                    draw.sequence,
+                                    path.display(),
+                                ),
+                                Err(error) => eprintln!(
+                                    "[REMu][METAL][GLYPH-POST-TARGET] draw={} capture failed: {error}",
+                                    draw.sequence,
+                                ),
+                            }
+                        }
                         None => eprintln!(
                             "[REMu][METAL][GLYPH-POST-TARGET] draw={} conversion failed for {:?}",
-                            draw.sequence,
-                            descriptor.pixel_format,
+                            draw.sequence, descriptor.pixel_format,
                         ),
                     }
                 }

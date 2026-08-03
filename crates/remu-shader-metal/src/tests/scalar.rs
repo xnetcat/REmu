@@ -148,10 +148,16 @@ fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
         },
         MetalShaderStage::Pixel,
     );
-    assert!(saveexec32.source.contains("(uint)(uint64_t)simd_ballot(exec)"));
+    assert!(
+        saveexec32
+            .source
+            .contains("(uint)(uint64_t)simd_ballot(exec)")
+    );
     assert!(saveexec32.source.contains("s[20] = ") || saveexec32.source.contains("remu_s_20 = "));
     assert!(saveexec32.source.contains("s[126]") || saveexec32.source.contains("remu_s_126"));
-    assert!(saveexec32.source.contains("s[127] = 0u") || saveexec32.source.contains("remu_s_127 = 0u"));
+    assert!(
+        saveexec32.source.contains("s[127] = 0u") || saveexec32.source.contains("remu_s_127 = 0u")
+    );
     assert!(saveexec32.source.contains("exec = "));
 }
 

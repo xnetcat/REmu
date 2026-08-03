@@ -278,8 +278,10 @@ pub(super) fn ngs2_system_render(arguments: [u64; 6]) -> u64 {
     const NUM_CHANNELS_OFFSET: u64 = 20;
     for index in 0..buffer_count {
         let info = buffers.saturating_add(u64::from(index).saturating_mul(RENDER_BUFFER_INFO_SIZE));
-        if !process_guest_range_is_readable(info, usize::try_from(RENDER_BUFFER_INFO_SIZE).unwrap_or(usize::MAX))
-        {
+        if !process_guest_range_is_readable(
+            info,
+            usize::try_from(RENDER_BUFFER_INFO_SIZE).unwrap_or(usize::MAX),
+        ) {
             return sce_kernel_error(NGS2_ERROR_INVALID_OUT_ADDRESS);
         }
         let buffer = read_guest_u64(info + BUFFER_PTR_OFFSET);

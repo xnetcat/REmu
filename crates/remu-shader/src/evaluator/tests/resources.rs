@@ -144,9 +144,7 @@ fn inactive_buffer_loads_reuse_live_sibling_binding_for_same_sgpr_slot() {
         ],
         // s[4..7] = live buffer V# (base=0x10000, stride=0, records/bytes=336, OOB_SELECT=3 raw)
         // s[8] = 1 so the branch skips PC 8.
-        vec![
-            0, 0, 0, 0, 0x1_0000, 0, 336, 0x3000_0000, 1, 0, 0, 0,
-        ],
+        vec![0, 0, 0, 0, 0x1_0000, 0, 336, 0x3000_0000, 1, 0, 0, 0],
     );
 
     let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())

@@ -161,8 +161,11 @@ impl ResidentSpanIndex {
         self.virtual_intervals.remove(0, span.address(), descriptor);
         match span.backing() {
             Some(backing) => {
-                self.physical_intervals
-                    .remove(backing.backing_id, backing.backing_offset, descriptor);
+                self.physical_intervals.remove(
+                    backing.backing_id,
+                    backing.backing_offset,
+                    descriptor,
+                );
             }
             None => self.unresolved.retain(|candidate| candidate != descriptor),
         }

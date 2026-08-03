@@ -442,9 +442,9 @@ fn restores_ngg_packed_export_counts_after_empty_workaround_clobber() {
         "restore must read the low half of the pre-alloc SGPR"
     );
     assert!(
-        shader.source.contains(
-            "uint remu_ngg_verts = remu_ngg_hi != 0u ? remu_ngg_hi : remu_ngg_lo;"
-        ),
+        shader
+            .source
+            .contains("uint remu_ngg_verts = remu_ngg_hi != 0u ? remu_ngg_hi : remu_ngg_lo;"),
         "flat scan counts live in the low half; packed counts put verts in the high half"
     );
     assert!(
@@ -550,9 +550,9 @@ fn stages_ngg_mesh_vertex_exports_by_compacted_vertex_vgpr() {
         "compacted exports need a threadgroup staging array"
     );
     assert!(
-        shader
-            .source
-            .contains("if (exec && remu_v_18 < 64u) remu_mesh_staged_vertices[remu_v_18] = remu_out;"),
+        shader.source.contains(
+            "if (exec && remu_v_18 < 64u) remu_mesh_staged_vertices[remu_v_18] = remu_out;"
+        ),
         "EXP must stage remu_out under the compacted vertex VGPR"
     );
     assert!(

@@ -270,13 +270,21 @@ pub(crate) fn save_data_dialog_open(parameters: u64, state: &mut ProbeDispatchSt
 
 pub(crate) fn save_data_dialog_update_status(state: &mut ProbeDispatchState) -> u64 {
     poll_save_data_dialog(state);
-    state.services.save_data_dialog_status.cast_unsigned().into()
+    state
+        .services
+        .save_data_dialog_status
+        .cast_unsigned()
+        .into()
 }
 
 /// See [`message_dialog_get_status`]: a `GetStatus`-only poll loop must still make progress.
 pub(crate) fn save_data_dialog_get_status(state: &mut ProbeDispatchState) -> u64 {
     poll_save_data_dialog(state);
-    state.services.save_data_dialog_status.cast_unsigned().into()
+    state
+        .services
+        .save_data_dialog_status
+        .cast_unsigned()
+        .into()
 }
 
 pub(crate) fn save_data_dialog_close(state: &mut ProbeDispatchState) -> u64 {
@@ -303,9 +311,7 @@ pub(crate) fn save_data_dialog_get_result(output: u64, state: &ProbeDispatchStat
 }
 
 pub(crate) fn save_data_dialog_is_ready_to_display(state: &ProbeDispatchState) -> u64 {
-    u64::from(
-        state.services.save_data_dialog_status != COMMON_DIALOG_STATUS_NONE.cast_signed(),
-    )
+    u64::from(state.services.save_data_dialog_status != COMMON_DIALOG_STATUS_NONE.cast_signed())
 }
 
 /// Shows a non-modal trophy / notification toast on the host presenter.
@@ -564,17 +570,17 @@ fn apply_message_dialog_result(state: &mut ProbeDispatchState, code: HostDialogR
 fn apply_save_data_dialog_result(state: &mut ProbeDispatchState, code: HostDialogResultCode) {
     state.services.save_data_dialog_result_code = match code {
         HostDialogResultCode::Ok | HostDialogResultCode::Yes => SAVE_DATA_DIALOG_RESULT_OK,
-        HostDialogResultCode::Cancel
-        | HostDialogResultCode::No
-        | HostDialogResultCode::None => SAVE_DATA_DIALOG_RESULT_USER_CANCELED,
+        HostDialogResultCode::Cancel | HostDialogResultCode::No | HostDialogResultCode::None => {
+            SAVE_DATA_DIALOG_RESULT_USER_CANCELED
+        }
     };
 }
 
 fn apply_error_dialog_result(state: &mut ProbeDispatchState, code: HostDialogResultCode) {
     state.services.error_dialog_result_code = match code {
         HostDialogResultCode::Ok | HostDialogResultCode::Yes => MESSAGE_DIALOG_RESULT_OK,
-        HostDialogResultCode::Cancel
-        | HostDialogResultCode::No
-        | HostDialogResultCode::None => MESSAGE_DIALOG_RESULT_USER_CANCELED,
+        HostDialogResultCode::Cancel | HostDialogResultCode::No | HostDialogResultCode::None => {
+            MESSAGE_DIALOG_RESULT_USER_CANCELED
+        }
     };
 }

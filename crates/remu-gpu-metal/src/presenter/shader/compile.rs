@@ -53,7 +53,10 @@ fn dump_failed_metal_source(stage: &str, source: &str) {
         digest[0], digest[1], digest[2], digest[3]
     ));
     match std::fs::write(&path, source) {
-        Ok(()) => eprintln!("[REMu][METAL] wrote failing {stage} MSL to {}", path.display()),
+        Ok(()) => eprintln!(
+            "[REMu][METAL] wrote failing {stage} MSL to {}",
+            path.display()
+        ),
         Err(error) => eprintln!(
             "[REMu][METAL] could not write failing {stage} MSL to {}: {error}",
             path.display()
@@ -139,7 +142,10 @@ pub(crate) fn compile_metal_library_with_tools(
     let cache_path = metal_library_cache_path(source);
     if cache_path.is_file() {
         if !metallib_bytes_are_usable(&cache_path) {
-            let bytes = cache_path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            let bytes = cache_path
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
             eprintln!(
                 "[REMu][METAL] discarding truncated cached {stage} library {} ({bytes} bytes)",
                 cache_path.display()
@@ -200,7 +206,10 @@ pub(crate) fn compile_metal_library_with_tools(
         &format!("{stage} library link"),
     )?;
     if !metallib_bytes_are_usable(&library_path) {
-        let bytes = library_path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let bytes = library_path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
         return Err(format!(
             "{stage} library link produced an unusable metallib ({bytes} bytes)"
         ));

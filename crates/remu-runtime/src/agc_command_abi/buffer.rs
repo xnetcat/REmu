@@ -545,9 +545,9 @@ fn prune_submitted_recoverable_releases() {
             if !allocation.recoverable_release {
                 return true;
             }
-            !submitted.iter().any(|range| {
-                allocation.start >= range.start && allocation.end <= range.end
-            })
+            !submitted
+                .iter()
+                .any(|range| allocation.start >= range.start && allocation.end <= range.end)
         });
 }
 

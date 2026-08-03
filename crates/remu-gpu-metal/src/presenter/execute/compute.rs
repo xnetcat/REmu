@@ -5,13 +5,12 @@ use super::WrittenRegion;
 use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
     ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
-    append_unique_global_writebacks,
-    append_unique_guest_write_ranges, collect_pending_global_writebacks,
-    collect_pending_guest_write_ranges, compute_pipeline_key, compute_program_can_split_wave64,
-    create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
-    dump_msl_compute_filter_matches, image_resource_descriptor_is_null, is_storage_image_opcode,
-    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear,
+    append_unique_global_writebacks, append_unique_guest_write_ranges,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges, compute_pipeline_key,
+    compute_program_can_split_wave64, create_global_argument_buffer, decode_image_descriptor,
+    diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
     record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
@@ -265,12 +264,10 @@ impl MetalPresenter {
         collect_pending_guest_write_ranges(&buffers, evaluation, &mut pending_guest_write_ranges)?;
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
-            let batch = batch
-                .expect("guest command batch was opened above");
+            let batch = batch.expect("guest command batch was opened above");
             if batch.end_render_pass() {
-                statistics.render_pass_ends_for_compute = statistics
-                    .render_pass_ends_for_compute
-                    .saturating_add(1);
+                statistics.render_pass_ends_for_compute =
+                    statistics.render_pass_ends_for_compute.saturating_add(1);
             }
             batch.work.push(GuestBatchWork::Compute {
                 sequence: dispatch.sequence,

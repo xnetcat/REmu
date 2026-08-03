@@ -44,8 +44,8 @@ mod playgo;
 mod pthread;
 mod random;
 mod rtld_atexit;
-mod sha_ni;
 mod save_data;
+mod sha_ni;
 mod shader_cache;
 mod shader_eval;
 mod tls;
@@ -89,8 +89,7 @@ pub(crate) use agc_api::{
     AGC_R_ACQUIRE_MEM, AGC_R_CX_REGS_INDIRECT, AGC_R_DMA_DATA, AGC_R_DRAW_INDEX_AUTO,
     AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_SH_REGS_INDIRECT,
     AGC_R_UC_REGS_INDIRECT, AGC_R_WAIT_FLIP_DONE, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64,
-    AGC_R_WRITE_DATA,
-    AGC_SHADER_SH_REGISTER_COUNT_OFFSET, AGC_SHADER_SH_REGISTERS_OFFSET,
+    AGC_R_WRITE_DATA, AGC_SHADER_SH_REGISTER_COUNT_OFFSET, AGC_SHADER_SH_REGISTERS_OFFSET,
     AGC_SHADER_SPECIALS_OFFSET, AGC_SHADER_TYPE_OFFSET, AGC_SPI_PS_INPUT_CNTL_0,
     AGC_SPI_SHADER_PGM_HI_ES, AGC_SPI_SHADER_PGM_HI_PS, AGC_SPI_SHADER_PGM_LO_ES,
     AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_INDEX_TYPE, AGC_VGT_PRIMITIVE_TYPE,
@@ -245,9 +244,13 @@ pub(crate) use guest_sync::{
     GUEST_SYNC, GuestSyncState, guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock,
     guest_rwlock_unlock,
 };
-pub(crate) use guest_sync::{dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import};
+pub(crate) use guest_sync::{
+    dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import,
+};
 #[cfg(test)]
 pub(crate) use memory::BATCH_MAP_OPERATION_MAP_DIRECT;
+#[cfg(target_os = "macos")]
+pub(crate) use memory::map_flexible_memory_core;
 pub(crate) use memory::{
     allocate_direct_memory, allocate_main_direct_memory, available_direct_memory_size,
     available_flexible_memory_size, direct_memory_query, kernel_batch_map, kernel_batch_map_2,
@@ -255,8 +258,6 @@ pub(crate) use memory::{
     kernel_release_direct_memory, kernel_reserve_virtual_range, kernel_set_virtual_range_name,
     kernel_virtual_query, map_direct_memory, map_direct_memory_2, map_named_flexible_memory,
 };
-#[cfg(target_os = "macos")]
-pub(crate) use memory::map_flexible_memory_core;
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use memory::{host_protection_from_guest, process_mapping_contains};
 pub use nid_table::{known_nid_name, nid_display_name};
@@ -321,9 +322,8 @@ pub(crate) use save_data::{
 pub(crate) use save_data::{
     current_unix_seconds, read_guest_bytes, save_data_commit,
     save_data_create_transaction_resource, save_data_delete_transaction_resource,
-    save_data_dir_name_search, save_data_initialize,
-    save_data_mount3, save_data_prepare, save_data_save_icon, save_data_set_param,
-    save_data_umount2, write_guest_bytes,
+    save_data_dir_name_search, save_data_initialize, save_data_mount3, save_data_prepare,
+    save_data_save_icon, save_data_set_param, save_data_umount2, write_guest_bytes,
 };
 use sha1::{Digest, Sha1};
 pub(crate) use shader_cache::{
@@ -351,9 +351,9 @@ pub(crate) use link::{
     subtract_address, write_u64,
 };
 use tls::{GUEST_TLS_PREFIX_SIZE, GUEST_TLS_TCB_SIZE, tls_dtv_entry_offset};
-use unwind::{GuestModuleSegment, GuestUnwindModule};
 #[cfg(target_arch = "x86_64")]
 use unwind::register_guest_unwind_frames;
+use unwind::{GuestModuleSegment, GuestUnwindModule};
 #[cfg(test)]
 pub(crate) use video_out::{
     DEFAULT_FLIP_INTERVAL_MICROSECONDS, VIDEO_OUT_ERROR_RESOURCE_BUSY, VIDEO_OUT_FLIP_INTERVAL,
@@ -3109,10 +3109,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Missing attr objects fall back to Gen5 defaults. Titles sometimes pass a stack
             // attribute that was never routed through scePthreadMutexattrInit (zero-init / copy).
-            Some(
-                pthread_mutex_attr_state(call_args[1], &state)
-                    .unwrap_or_default(),
-            )
+            Some(pthread_mutex_attr_state(call_args[1], &state).unwrap_or_default())
         } else {
             None
         };
@@ -4014,8 +4011,8 @@ fn kernel_module_info_from_addr(arguments: [u64; 6], state: &ProbeDispatchState)
     let mut segments = module.segments.clone();
     if segments.is_empty() {
         // Fallback when segment metadata was unavailable at link time: one aggregate R+X range.
-        let size = u32::try_from((module.end - module.base).min(u64::from(u32::MAX)))
-            .unwrap_or(u32::MAX);
+        let size =
+            u32::try_from((module.end - module.base).min(u64::from(u32::MAX))).unwrap_or(u32::MAX);
         segments.push(GuestModuleSegment {
             address: module.base,
             size,
@@ -6151,16 +6148,13 @@ fn np_web_api2_push_event_create_handle(
     }
     let handle = state.services.next_np_web_api2_push_event_handle.max(1);
     state.services.next_np_web_api2_push_event_handle = handle.saturating_add(1);
-    state
-        .services
-        .np_web_api2_push_event_handles
-        .insert(
-            handle,
-            NpWebApi2PushEventHandleState {
-                library_context,
-                timeout: NpWebApi2TimeoutState::default(),
-            },
-        );
+    state.services.np_web_api2_push_event_handles.insert(
+        handle,
+        NpWebApi2PushEventHandleState {
+            library_context,
+            timeout: NpWebApi2TimeoutState::default(),
+        },
+    );
     signed_i32_return(handle)
 }
 
@@ -6997,7 +6991,10 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
         false
     };
     if registers == 0 || register_count < 2 {
-        return reject(0, format!("registers={registers:#x} count={register_count}"));
+        return reject(
+            0,
+            format!("registers={registers:#x} count={register_count}"),
+        );
     }
     // The program-address register each stage writes its code pointer into. `None` means the stage
     // has no program pair at all, which is a property of the stage rather than a gap here:
@@ -7067,8 +7064,8 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
                 .join(" ");
             // Single-line: the `#` alternate form pretty-prints `Some(..)` across three lines and
             // makes the record ungreppable, which defeats the point of logging it.
-            let program_low = program_low
-                .map_or_else(|| "none".to_owned(), |offset| format!("{offset:#x}"));
+            let program_low =
+                program_low.map_or_else(|| "none".to_owned(), |offset| format!("{offset:#x}"));
             eprintln!(
                 "[REMu][AGC] accepted shader registration type={shader_type} \
                  program_low={program_low} count={register_count} block=[{block}]"
@@ -7963,7 +7960,11 @@ unsafe fn host_aligned_malloc(alignment: usize, size: usize) -> *mut std::ffi::c
     let mut pointer = std::ptr::null_mut();
     // SAFETY: pointer is writable; alignment/size are host-representable.
     let result = unsafe { libc::posix_memalign(&raw mut pointer, alignment, size.max(1)) };
-    if result == 0 { pointer } else { std::ptr::null_mut() }
+    if result == 0 {
+        pointer
+    } else {
+        std::ptr::null_mut()
+    }
 }
 
 #[cfg(windows)]
@@ -8049,7 +8050,8 @@ fn guest_strcasecmp(left: u64, right: u64) -> u64 {
         return u64::from(left != right);
     }
     // SAFETY: strcasecmp's guest ABI contract supplies two NUL-terminated strings.
-    let result = unsafe { host_strcasecmp(left as *const libc::c_char, right as *const libc::c_char) };
+    let result =
+        unsafe { host_strcasecmp(left as *const libc::c_char, right as *const libc::c_char) };
     signed_i32_return(result)
 }
 
@@ -8889,9 +8891,7 @@ fn write_abi_gap_summary() {
     {
         let count = count.load(Ordering::Relaxed);
         if count != 0 {
-            eprintln!(
-                "[REMu][REPORT] declined shader registrations reason={reason} count={count}"
-            );
+            eprintln!("[REMu][REPORT] declined shader registrations reason={reason} count={count}");
         }
     }
     let recovered_sha_ni = sha_ni::recovered_sha_ni_count();

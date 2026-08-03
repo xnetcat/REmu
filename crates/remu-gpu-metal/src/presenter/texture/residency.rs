@@ -1,36 +1,34 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::super::completion::commit_and_settle;
 use super::super::cache::metal_buffer_with_guest_backing_range;
+use super::super::completion::commit_and_settle;
 use super::super::{
     FlushPolicy, GuestBatchFlushReason, WritebackTrigger, compile_metal_compute_library,
 };
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
     GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, OWNED_SUBTRACT_TENANTS_SURVIVED, RESIDENT_WRITE_ATTRIBUTION_MISSES,
-    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
-    OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
+    MultisampleTextureKey, OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU,
+    OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
     OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
-    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, RangeSet, ResidencyState,
-    ResidentGuestTexture,
-    ResidentTextureActivityStamp,
-    ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture, SpanQueryOrder, StaleSource,
-    WriteWatchRefresh, WrittenRegion,
-    create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
-    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
-    guest_texture_byte_count, guest_texture_descriptors_share_gpu_sample_storage,
-    guest_texture_descriptors_share_color_view_storage, guest_texture_descriptors_share_storage,
+    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
+    ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
+    SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
+    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
+    decode_sampled_texture_linear_from_raw, guest_texture_byte_count,
+    guest_texture_descriptors_share_color_view_storage,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
     promote_resident_mip_hierarchy, record_mode27_work_detail,
-    refresh_resident_texture_write_watch, resident_texture_eviction_plan, resident_texture_for_sample,
-    retire_overlapping_sampled_textures, retire_sampled_textures_overlapping_writeback,
-    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout, tiled_block_bytes,
-    tiled_block_dimensions,
-    trace_resident_texture_demotion, trace_resident_texture_removal, trace_residency_churn,
-    watch_guest_texture, watch_resident_texture, watch_sampled_texture, written_byte_ranges,
+    refresh_resident_texture_write_watch, resident_texture_eviction_plan,
+    resident_texture_for_sample, retire_overlapping_sampled_textures,
+    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
+    snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
+    texture_element_layout, tiled_block_bytes, tiled_block_dimensions, trace_residency_churn,
+    trace_resident_texture_demotion, trace_resident_texture_removal, watch_guest_texture,
+    watch_resident_texture, watch_sampled_texture, written_byte_ranges,
 };
 use metal::{
     Buffer, ComputePipelineState, Device, MTLBlitOption, MTLLoadAction, MTLOrigin, MTLRegion,
@@ -281,10 +279,7 @@ fn mode27_rematerialisation_subresources(
         27 => matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8 | 16),
         _ => false,
     };
-    if !valid_element_size
-        || resident.layer_count == 0
-        || resident.mip_level_count == 0
-    {
+    if !valid_element_size || resident.layer_count == 0 || resident.mip_level_count == 0 {
         return Err(format!(
             "GPU retile requires mode-24 1/2/4/8-byte or mode-27 1/2/4/8/16-byte storage, got mode={} bpe={} layers={} mips={}",
             tile_mode,
@@ -412,17 +407,13 @@ fn mode27_rematerialisation_subresources(
         Ok(())
     };
     if resident.mip_level_count > 1 {
-        let layout = mode27_mip_chain_layout(
-            resident.descriptor,
-            resident.mip_level_count,
-        )?;
+        let layout = mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
         for (level_index, level) in layout.levels.iter().enumerate() {
             push(
                 u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?,
                 u64::try_from(level.height).map_err(|_| "mip height does not fit u64")?,
                 u64::try_from(level.offset).map_err(|_| "mip offset does not fit u64")?,
-                u64::try_from(level.padded_width)
-                    .map_err(|_| "mip pitch does not fit u64")?,
+                u64::try_from(level.padded_width).map_err(|_| "mip pitch does not fit u64")?,
                 u64::try_from(layout.block_width)
                     .map_err(|_| "mip block width does not fit u64")?,
                 u64::try_from(layout.block_height)
@@ -445,10 +436,8 @@ fn mode27_rematerialisation_subresources(
                     .checked_mul(u64::from(surface_z))
                     .ok_or("GPU retile layer offset overflows")?,
                 u64::from(resident.descriptor.pitch),
-                u64::try_from(base_block_width)
-                    .map_err(|_| "block width does not fit u64")?,
-                u64::try_from(base_block_height)
-                    .map_err(|_| "block height does not fit u64")?,
+                u64::try_from(base_block_width).map_err(|_| "block width does not fit u64")?,
+                u64::try_from(base_block_height).map_err(|_| "block height does not fit u64")?,
                 0,
                 0,
                 false,
@@ -624,8 +613,7 @@ impl MetalPresenter {
             if debt.is_empty() {
                 continue;
             }
-            let (subresources, linear_length) =
-                mode27_rematerialisation_subresources(source)?;
+            let (subresources, linear_length) = mode27_rematerialisation_subresources(source)?;
             sources.push(Mode27RematerialisationInput {
                 texture: source.texture.clone(),
                 span,
@@ -652,15 +640,10 @@ impl MetalPresenter {
         }
         let guest = metal_buffer_with_guest_backing_range(&device, &backing_range)
             .ok_or("stale target guest backing cannot be exposed to Metal")?;
-        let scratch = device.new_buffer(
-            target_span.len(),
-            MTLResourceOptions::StorageModePrivate,
-        );
+        let scratch = device.new_buffer(target_span.len(), MTLResourceOptions::StorageModePrivate);
         scratch.set_label("REMu mode-27 rematerialisation tiled scratch");
-        let target_linear = device.new_buffer(
-            target_linear_length,
-            MTLResourceOptions::StorageModePrivate,
-        );
+        let target_linear =
+            device.new_buffer(target_linear_length, MTLResourceOptions::StorageModePrivate);
         target_linear.set_label("REMu mode-27 rematerialisation target linear");
 
         self.ensure_active_open_guest_batch()?;
@@ -684,19 +667,12 @@ impl MetalPresenter {
         initialize.end_encoding();
 
         for source in &sources {
-            let linear = device.new_buffer(
-                source.linear_length,
-                MTLResourceOptions::StorageModePrivate,
-            );
+            let linear =
+                device.new_buffer(source.linear_length, MTLResourceOptions::StorageModePrivate);
             linear.set_label("REMu mode-27 rematerialisation source linear");
             let blit = command_buffer.new_blit_command_encoder();
             blit.set_label("REMu linearize current texture owner");
-            encode_texture_to_linear_buffer(
-                blit,
-                &source.texture,
-                &linear,
-                &source.subresources,
-            );
+            encode_texture_to_linear_buffer(blit, &source.texture, &linear, &source.subresources);
             blit.end_encoding();
 
             let mut run_words = Vec::with_capacity(source.debt.runs().len() * 2);
@@ -767,12 +743,7 @@ impl MetalPresenter {
 
         let upload = command_buffer.new_blit_command_encoder();
         upload.set_label("REMu upload detiled stale target");
-        encode_linear_buffer_to_texture(
-            upload,
-            &target_linear,
-            &destination,
-            &target_subresources,
-        );
+        encode_linear_buffer_to_texture(upload, &target_linear, &destination, &target_subresources);
         upload.end_encoding();
         Ok(destination)
     }
@@ -802,16 +773,14 @@ pub(crate) fn rematerialisation_blit_source_origin_y(
         .checked_sub(source_span.range_start())?;
     match source.tile_mode {
         0 => {
-            let row_bytes = u64::from(source.pitch)
-                .checked_mul(u64::from(source.bytes_per_pixel))?;
-            (row_bytes != 0 && delta_bytes % row_bytes == 0)
-                .then_some(delta_bytes / row_bytes)
+            let row_bytes =
+                u64::from(source.pitch).checked_mul(u64::from(source.bytes_per_pixel))?;
+            (row_bytes != 0 && delta_bytes % row_bytes == 0).then_some(delta_bytes / row_bytes)
         }
         27 => {
             let block_bytes = tiled_block_bytes(27)?;
             let bytes_per_pixel = usize::try_from(source.bytes_per_pixel).ok()?;
-            let (block_width, block_height) =
-                tiled_block_dimensions(block_bytes, bytes_per_pixel)?;
+            let (block_width, block_height) = tiled_block_dimensions(block_bytes, bytes_per_pixel)?;
             let pitch = usize::try_from(source.pitch).ok()?;
             let blocks_per_row = pitch.div_ceil(block_width);
             let block_row_bytes = blocks_per_row.checked_mul(block_bytes)?;
@@ -984,8 +953,10 @@ impl MetalPresenter {
             .resident_guest_textures
             .get(&target_descriptor)
             .is_some_and(|resident| {
-                matches!(target_refresh, WriteWatchRefresh::Renewed { was_dirty: true })
-                    || resident.write_watch.content_validation_pending()
+                matches!(
+                    target_refresh,
+                    WriteWatchRefresh::Renewed { was_dirty: true }
+                ) || resident.write_watch.content_validation_pending()
                     || resident.write_watch.is_dirty()
             });
         let target_cpu_changed = target_cpu_may_have_changed
@@ -996,8 +967,7 @@ impl MetalPresenter {
                 .write_watch
                 .content_has_changed()?;
 
-        let StaleSource::Allocation { .. } = stale_source
-        else {
+        let StaleSource::Allocation { .. } = stale_source else {
             OWNED_REMATERIALISE_CPU.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         };
@@ -1039,7 +1009,10 @@ impl MetalPresenter {
                     .get_mut(candidate)
                     .expect("indexed rematerialisation candidate exists"),
             )?;
-            if matches!(refresh, WriteWatchRefresh::Replaced | WriteWatchRefresh::Reprotecting) {
+            if matches!(
+                refresh,
+                WriteWatchRefresh::Replaced | WriteWatchRefresh::Reprotecting
+            ) {
                 return failure(
                     RematerialisationFailureKind::Mapping,
                     format!(
@@ -1184,9 +1157,7 @@ impl MetalPresenter {
                                 .texture
                                 .height()
                                 .checked_sub(*source_origin_y)
-                                .is_some_and(|height| {
-                                    height >= u64::from(target_descriptor.height)
-                                })
+                                .is_some_and(|height| height >= u64::from(target_descriptor.height))
                     });
                 if let Some(source_origin_y) = source_origin_y {
                     let destination = self
@@ -1747,9 +1718,7 @@ impl MetalPresenter {
                 target.sample_count
             ));
         }
-        if !discard_guest_contents
-            && self.rematerialise_stale_resident_for_read(target.texture)?
-        {
+        if !discard_guest_contents && self.rematerialise_stale_resident_for_read(target.texture)? {
             return Ok(SelectedResidentTexture {
                 texture: self
                     .resident_guest_textures
@@ -1919,9 +1888,7 @@ impl MetalPresenter {
                 target.mip_level_count - 1
             ));
         }
-        if !discard_guest_contents
-            && self.rematerialise_stale_resident_for_read(target.texture)?
-        {
+        if !discard_guest_contents && self.rematerialise_stale_resident_for_read(target.texture)? {
             return Ok(SelectedResidentTexture {
                 texture: self
                     .resident_guest_textures
@@ -2503,7 +2470,10 @@ impl MetalPresenter {
                     // range, which supersedes every overlapping resident exactly as the
                     // descriptor-level retirement did.
                     resident_span => (
-                        resident_span.as_ref().map(RangeSet::for_span).unwrap_or_default(),
+                        resident_span
+                            .as_ref()
+                            .map(RangeSet::for_span)
+                            .unwrap_or_default(),
                         resident_span,
                     ),
                 }
@@ -2550,13 +2520,7 @@ impl MetalPresenter {
         writer: Option<GuestTextureDescriptor>,
         reason: &str,
     ) {
-        self.subtract_resident_authority(
-            span,
-            published,
-            writer,
-            StaleSource::GuestMemory,
-            reason,
-        );
+        self.subtract_resident_authority(span, published, writer, StaleSource::GuestMemory, reason);
     }
 
     /// Hands `writer`'s authority to guest RAM after its contents were published there.

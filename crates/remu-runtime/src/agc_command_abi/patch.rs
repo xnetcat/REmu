@@ -20,7 +20,10 @@ fn decline_indirect_patch(reason: &str, command: u64, expected_opcode: u32) -> u
         let header = (command != 0 && command.is_multiple_of(4))
             .then(|| crate::try_read_process_guest_u32(command))
             .flatten()
-            .map_or_else(|| "unreadable".to_owned(), |header| format!("{header:#010x}"));
+            .map_or_else(
+                || "unreadable".to_owned(),
+                |header| format!("{header:#010x}"),
+            );
         eprintln!(
             "[REMu][AGC] declined indirect-register patch sequence={sequence} \
              command={command:#x} header={header} expected-opcode={expected_opcode:#x} \

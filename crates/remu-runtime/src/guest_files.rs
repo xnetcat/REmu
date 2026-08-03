@@ -513,13 +513,7 @@ pub(crate) fn guest_fseek(handle: u64, offset: u64, whence: u64) -> u64 {
     #[cfg(windows)]
     let status = unsafe { windows_fseeki64(handle as *mut libc::FILE, offset, whence) };
     #[cfg(not(windows))]
-    let status = unsafe {
-        libc::fseek(
-            handle as *mut libc::FILE,
-            offset as libc::c_long,
-            whence,
-        )
-    };
+    let status = unsafe { libc::fseek(handle as *mut libc::FILE, offset as libc::c_long, whence) };
     signed_i32_return(status)
 }
 

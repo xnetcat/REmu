@@ -226,7 +226,11 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
         sce_kernel_error(error)
     };
     if !state.save_data_initialized {
-        return declined(SAVE_DATA_ERROR_NOT_INITIALIZED, "not-initialized", String::new());
+        return declined(
+            SAVE_DATA_ERROR_NOT_INITIALIZED,
+            "not-initialized",
+            String::new(),
+        );
     }
     let (mount, result) = (arguments[0], arguments[1]);
     if mount == 0 || result == 0 {
