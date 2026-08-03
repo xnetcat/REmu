@@ -613,7 +613,7 @@ impl ControlFlowGraph {
         }
         let reachable = self.reachable_blocks();
         let loops = self.natural_loops();
-        if !self.is_reducible() || loops_are_nested(&loops) {
+        if !self.is_reducible() {
             return self.dispatcher_over(&reachable);
         }
         let mut structurer = Structurer {
@@ -698,9 +698,11 @@ impl Structurer<'_> {
                 }
             }
 
-            // A nested loop header would be opened here, but `structure` bails to a dispatcher when
-            // any loop is nested, so the only loop header reached in a region is the one this
-            // region roots (handled above via `entering`).
+            // A loop header other than the one this region roots opens its own Loop node here,
+            // which is how cleanly nested natural loops structure recursively. An edge from an
+            // inner body to an outer header or exit (a multi-level continue/break) re-walks
+            // already-covered blocks instead, and the covers-each-reachable-block-once acceptance
+            // check in `structure` demotes that tree to the faithful dispatcher.
             if self.loops.contains_key(&current)
                 && loop_ctx.map(|(header, _)| header) != Some(current)
             {
@@ -773,18 +775,6 @@ impl Structurer<'_> {
         let body = self.region(header, None, Some((header, exit)), true);
         Some((StructuredCfg::Loop(Box::new(body)), exit))
     }
-}
-
-/// Whether any natural loop is nested inside another (its body contains a different loop header).
-fn loops_are_nested(loops: &BTreeMap<BlockId, NaturalLoop>) -> bool {
-    for outer in loops.values() {
-        for &other_header in loops.keys() {
-            if other_header != outer.header && outer.body.contains(&other_header) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Whether the structured tree names every reachable block exactly once. A dispatcher covers its
