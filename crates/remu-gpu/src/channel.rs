@@ -357,17 +357,19 @@ pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -
     let mut publication = PublicationGuard::new(&event);
     admitted();
     let sent = match event {
-        GpuEvent::QueueSubmission {
-            queue_id,
-            mut events,
-        } if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE => {
+        GpuEvent::QueueSubmission { queue_id, events }
+            if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE =>
+        {
+            // Splitting the leading chunk from a `Vec` with `split_off` copies the complete
+            // remaining tail on every iteration and leaves each published prefix retaining the
+            // previous tail's capacity. Consume the source allocation once instead, then build
+            // only the fixed-capacity chunks retained by the bounded presenter channel.
+            let mut remaining = events.into_iter();
             let mut all_sent = true;
-            loop {
-                let remaining = if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE {
-                    events.split_off(GPU_EVENT_SUBMISSION_CHUNK_SIZE)
-                } else {
-                    Vec::new()
-                };
+            while !remaining.as_slice().is_empty() {
+                let chunk_size = remaining.len().min(GPU_EVENT_SUBMISSION_CHUNK_SIZE);
+                let mut events = Vec::with_capacity(chunk_size);
+                events.extend(remaining.by_ref().take(chunk_size));
                 let work_item_count = events.len();
                 let flip_count = events
                     .iter()
@@ -389,12 +391,11 @@ pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -
                     break;
                 }
                 unpublished_waits.retain(|id| !chunk_waits.contains(id));
-                let finished = remaining.is_empty();
+                let finished = remaining.as_slice().is_empty();
                 publication.complete_chunk(finished);
                 if finished {
                     break;
                 }
-                events = remaining;
             }
             all_sent
         }
