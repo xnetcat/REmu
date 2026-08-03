@@ -215,7 +215,7 @@ pub(crate) use guest_files::kernel_stat_payload;
 #[cfg(test)]
 pub(crate) use guest_files::{
     DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, ImmutableAppPathCache, KernelDirectory,
-    resolve_immutable_app_path,
+    resolve_immutable_app_path, resolve_immutable_app_path_with_presence,
 };
 pub(crate) use guest_files::{
     KERNEL_FILES, KernelFileState, guest_fclose, guest_fopen, guest_fread, guest_fseek,
@@ -223,7 +223,7 @@ pub(crate) use guest_files::{
     guest_kernel_getdents, guest_kernel_lseek, guest_kernel_mkdir, guest_kernel_open,
     guest_kernel_read, guest_kernel_rmdir, guest_kernel_stat, guest_kernel_write,
     kernel_stat_payload_from_metadata, resolve_guest_path, resolve_path_beneath,
-    resolve_probe_guest_path,
+    resolve_probe_guest_path, resolve_probe_guest_path_with_presence,
 };
 pub(crate) use guest_libc::{
     dispatch_guest_numeric_parser, guest_ctype_table, guest_errno_address, guest_memcpy,
