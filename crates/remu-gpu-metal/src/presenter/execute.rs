@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::WrittenRegion;
+use super::binding_fault::record_fragment_scalar_inline_binding;
 use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
@@ -1502,6 +1503,14 @@ impl MetalPresenter {
             if let Some(buffer) = diagnostic_vertex_position_buffer.as_ref() {
                 encoder.set_vertex_buffer(DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, Some(buffer), 0);
             }
+            record_fragment_scalar_inline_binding(
+                draw.sequence,
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                u64::from(pixel_scalar_buffer_index),
+                pixel_scalar_byte_count,
+                !needs_new_render_pass,
+            );
             encoder.set_fragment_bytes(
                 u64::from(pixel_scalar_buffer_index),
                 pixel_scalar_byte_count,

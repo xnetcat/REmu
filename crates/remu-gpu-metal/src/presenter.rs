@@ -21,6 +21,7 @@ use remu_gpu::{
 };
 use remu_memory::{CpuWriteWatch, CpuWriteWatchRetirement, GuestSharedMappingIdentity};
 mod cache;
+mod binding_fault;
 mod completion;
 mod decode;
 mod diagnostics;
@@ -37,6 +38,7 @@ mod submission;
 mod texture;
 mod tiling;
 use self::cache::{GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT};
+use self::binding_fault::install_fragment_scalar_binding_fault_diagnostic;
 use self::decode::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_BLEND0_CONTROL,
     CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
@@ -2101,6 +2103,7 @@ struct MetalPresenter {
 
 impl MetalPresenter {
     fn new(receiver: Receiver<GpuEvent>) -> Result<Self, String> {
+        install_fragment_scalar_binding_fault_diagnostic();
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
         command_queue.set_label("REmu guest command queue");
