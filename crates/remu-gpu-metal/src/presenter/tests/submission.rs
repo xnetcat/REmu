@@ -4381,7 +4381,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let device = presenter.device.as_ref().expect("Metal device").clone();
-    let guest_address = 0x8004_2000_00;
+    let (_global_space, guest_address) = mapped_test_pages(1);
     let byte_count = 64_usize;
     let before_signal = device.new_buffer(
         u64::try_from(byte_count).unwrap(),
@@ -4406,7 +4406,10 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: None,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
         });
@@ -4425,7 +4428,10 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: None,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
         });
@@ -4451,11 +4457,61 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         presenter.shared_event_dependencies_supply_compute_globals(&evaluation),
         "an exact copied producer version is sufficient for direct buffer-only compute"
     );
+    assert!(
+        presenter.shared_event_dependencies_supply_draw_global_range(
+            0,
+            guest_address,
+            u64::try_from(byte_count).unwrap(),
+        ),
+        "the same retained version is sufficient for a read-only draw global"
+    );
     let uploaded = presenter
         .upload_global_buffer(&device, &binding)
         .expect("consumer forwards the retained checkpoint version");
     assert_eq!(uploaded.buffer.as_ptr(), before_signal.as_ptr());
     assert_ne!(uploaded.buffer.as_ptr(), after_signal.as_ptr());
+
+    let local_competitor = device.new_buffer(
+        u64::try_from(byte_count).unwrap(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .open_batch
+        .as_mut()
+        .expect("consumer batch remains open")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: local_competitor,
+            offset: 0,
+            guest_address,
+            byte_count,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
+            write_watch: None,
+            original_bytes: vec![0; byte_count],
+        });
+    assert!(
+        !presenter.shared_event_dependencies_supply_draw_global_range(
+            0,
+            guest_address,
+            u64::try_from(byte_count).unwrap(),
+        ),
+        "a local queued writer competes with the fence version"
+    );
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .open_batch
+        .as_mut()
+        .expect("consumer batch remains open")
+        .global_writebacks
+        .pop();
 
     let program = Arc::new(Program::new(0x5000, Vec::new()));
     let dispatch = ComputeDispatch {
@@ -4765,7 +4821,7 @@ fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
     );
     assert_eq!(
         presenter.statistics.shared_event_draw_rejections
-            [SharedEventDrawReject::Overlap.index()],
+            [SharedEventDrawReject::OverlapTerminalWrite.index()],
         1
     );
     assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);

@@ -719,6 +719,46 @@ impl MetalPresenter {
         selected
     }
 
+    /// True when a draw can consume this range without observing guest RAM or forcing a host
+    /// retirement. The producer checkpoint owns the exact copied Metal buffer version at its
+    /// signal; the consumer command buffer's already-encoded SharedEvent wait orders the read.
+    /// Any local queued writer or ambiguous producer version keeps the draw on the host gate.
+    pub(super) fn shared_event_dependencies_supply_draw_global_range(
+        &self,
+        consumer_queue_id: u64,
+        address: u64,
+        byte_count: u64,
+    ) -> bool {
+        let Some(consumer) = self.guest_queue_batches.get(&consumer_queue_id) else {
+            return false;
+        };
+        if consumer.open_batch.as_ref().is_some_and(|batch| {
+            !matches!(
+                queued_global_read_source_in_batch(batch, address, byte_count),
+                QueuedGlobalReadSource::None
+            )
+        }) || consumer.committed_batches.iter().any(|batch| {
+            !matches!(
+                queued_global_read_source_in_batch(batch, address, byte_count),
+                QueuedGlobalReadSource::None
+            )
+        }) {
+            return false;
+        }
+        matches!(
+            self.shared_event_dependency_global_read_source(
+                consumer_queue_id,
+                address,
+                byte_count,
+            ),
+            QueuedGlobalReadSource::Buffer {
+                guest_memory: false,
+                physical_identity: Some(_),
+                ..
+            }
+        )
+    }
+
     /// A direct compute dispatch can cross a GPU wait only when every global input is an exact
     /// immutable version retained by that wait and no earlier local writer competes with it.
     pub(super) fn shared_event_dependencies_supply_compute_globals(
