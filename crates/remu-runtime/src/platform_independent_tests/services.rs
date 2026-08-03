@@ -800,3 +800,82 @@ fn acm_contexts_are_distinct_handles_with_checked_lifetimes() {
         Some("sceAcmContextCreate")
     );
 }
+
+// --- R3: system-module registry -------------------------------------------------------------
+
+#[test]
+fn a_system_library_load_mints_a_stable_synthetic_handle() {
+    let mut state = ProbeDispatchState::default();
+    // A libSce* system module is served by the import dispatcher, so its load succeeds against a
+    // synthetic handle rather than failing NOT_FOUND.
+    let handle = crate::load_start_hle_system_module(
+        &mut state,
+        "/system/common/lib/libSceNpCppWebApi.sprx",
+    )
+    .expect("a libSce* system module is served through HLE");
+    assert!(handle >= crate::SYSTEM_MODULE_HANDLE_BASE);
+    // Re-loading the same module returns the handle it already got.
+    assert_eq!(
+        crate::load_start_hle_system_module(
+            &mut state,
+            "/system/common/lib/libSceNpCppWebApi.sprx"
+        ),
+        Some(handle)
+    );
+    // A distinct system module gets a distinct handle.
+    let other = crate::load_start_hle_system_module(&mut state, "libSceHttp.sprx")
+        .expect("a second system module is served too");
+    assert_ne!(handle, other);
+}
+
+#[test]
+fn a_non_system_module_is_not_given_a_synthetic_handle() {
+    let mut state = ProbeDispatchState::default();
+    // A bundled game plug-in that is genuinely absent stays absent: no handle is minted for it,
+    // so sceKernelLoadStartModule still fails NOT_FOUND for the caller.
+    assert_eq!(
+        crate::load_start_hle_system_module(&mut state, "GameLogic.prx"),
+        None
+    );
+    assert!(state.services.system_module_handles.is_empty());
+}
+
+#[test]
+fn the_system_module_predicate_matches_only_the_hle_library_namespace() {
+    assert!(crate::is_hle_system_module("libSceNpCppWebApi.sprx"));
+    assert!(crate::is_hle_system_module(
+        "/app0/sce_module/libSceFios2.prx"
+    ));
+    assert!(crate::is_hle_system_module("libkernel.sprx"));
+    assert!(crate::is_hle_system_module("libc.prx"));
+    assert!(!crate::is_hle_system_module("plugin.prx"));
+    assert!(!crate::is_hle_system_module("Media/Plugins/WwiseAudio.prx"));
+}
+
+// --- R4/R5: both NID oracles stay alive, and the demand tail stays named ---------------------
+
+#[test]
+fn nid_display_name_consults_the_hand_catalog_and_the_scenid_blob() {
+    // The hand-maintained hash catalog names the imports REmu has an ABI for.
+    assert!(crate::known_nid_name("wzvqT4UqKX8").is_some());
+    assert_eq!(
+        crate::nid_display_name("wzvqT4UqKX8"),
+        Some("sceKernelLoadStartModule")
+    );
+    // The .scenid-derived blob names the rest — including a PINNED export whose NID is not the
+    // hash of its own name, which name-guessing can never recover. The hand catalog misses it, so
+    // a name here proves the second oracle is alive and consulted after the first.
+    assert!(crate::known_nid_name("Jrs7UUkGOFo").is_none());
+    assert_eq!(
+        crate::nid_display_name("Jrs7UUkGOFo"),
+        Some("sceCoredumpGetStopInfoGpu")
+    );
+}
+
+#[test]
+fn an_unnameable_nid_stays_unnamed_rather_than_being_fabricated() {
+    // The demand-driven tail names an unimplemented import through nid_display_name, so a NID no
+    // oracle knows must resolve to None (the loud report then prints "unknown"), never a made-up
+    // name that would hide the gap.
+    assert!(crate::nid_display_name("////////////").is_none());
+}

@@ -419,6 +419,13 @@ struct ProbeDispatchState {
     next_thread_unique_id: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
     thread_attributes: BTreeMap<u64, PthreadAttrState>,
+    /// The emulated core REmu has placed each guest thread on, keyed by thread handle.
+    ///
+    /// This is `sceKernelGetCurrentCpu`'s honest answer: a real, stable scheduling placement REmu
+    /// commits to, not a value recomputed from the affinity mask on every call. A thread is placed
+    /// once, round-robin across the cores its affinity permits, and keeps that core until an
+    /// affinity change stops permitting it (a migration), at which point it is re-placed.
+    thread_running_cpu: BTreeMap<u64, u32>,
     detached_threads: BTreeSet<u64>,
     pthread_threads: BTreeMap<u64, PthreadThreadObject>,
     pthread_attributes: BTreeMap<u64, PthreadAttrObject>,
@@ -929,6 +936,10 @@ struct GuestExitCallback {
 struct RuntimeServiceState {
     libc_environment: Option<u64>,
     loaded_sysmodules: BTreeSet<i32>,
+    /// Synthetic module handles handed out for `sceKernelLoadStartModule("libSce*.sprx")` on
+    /// system modules REmu serves through HLE rather than by mapping a guest object. Keyed by the
+    /// requested path so a repeated load of the same module returns the handle it already got.
+    system_module_handles: BTreeMap<String, u32>,
     ult_runtime: Option<u64>,
     splash: SplashState,
     user_service: InitializationState,
@@ -1712,6 +1723,7 @@ fn retire_detached_guest_thread(handle: u64) {
         }
         state.thread_handles.remove(&handle);
         state.thread_attributes.remove(&handle);
+        state.thread_running_cpu.remove(&handle);
         state.pthread_threads.remove(&handle)
     };
     if let Some(object) = object {
@@ -1996,6 +2008,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }
     state.thread_handles.clear();
     state.thread_attributes.clear();
+    state.thread_running_cpu.clear();
     state.detached_threads.clear();
     for object in std::mem::take(&mut state.pthread_threads).into_values() {
         guest_free(object.handle);
@@ -3905,14 +3918,24 @@ fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
         .unwrap_or(&requested_path);
     let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = lock_probe_dispatch_for_write(dispatch);
-    let module = state.bundled_modules.iter_mut().find(|module| {
+    let bundled_index = state.bundled_modules.iter().position(|module| {
         module.name.eq_ignore_ascii_case(&requested_path)
             || Path::new(&module.name)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .is_some_and(|name| name.eq_ignore_ascii_case(requested_name))
     });
-    let Some(module) = module else {
+    let Some(bundled_index) = bundled_index else {
+        // No object of this name is mapped in the process. If the name is a system library REmu
+        // serves through HLE, its exports are already resolved by the import dispatcher, so the
+        // load succeeds against a synthetic handle rather than failing NOT_FOUND. Anything else is
+        // genuinely absent.
+        if let Some(handle) = load_start_hle_system_module(&mut state, &requested_path) {
+            if arguments[5] != 0 {
+                write_guest_u32(arguments[5], 0);
+            }
+            return u64::from(handle);
+        }
         let error = sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         if arguments[5] != 0 {
             write_guest_u32(arguments[5], low_u32(error));
@@ -3920,6 +3943,7 @@ fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
         eprintln!("[REMu][MODULE] load-start could not find {requested_path}");
         return error;
     };
+    let module = &mut state.bundled_modules[bundled_index];
     let handle = module.handle;
     let module_name = module.name.clone();
     let initializers = if module.started {
@@ -3938,6 +3962,56 @@ fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
         handle, module_name,
     );
     u64::from(handle)
+}
+
+/// The first synthetic handle handed to an HLE system module.
+///
+/// Bundled modules take small handles from their TLS module id, so this base is chosen far above
+/// any real module count to keep the two handle spaces disjoint. A synthetic handle is never
+/// dereferenced as a mapped object; it exists only so a title's `LoadStartModule` succeeds.
+const SYSTEM_MODULE_HANDLE_BASE: u32 = 0x5300_0000;
+
+/// Returns a synthetic module handle for a system library REmu implements through HLE, or `None`
+/// if the requested name is not one REmu serves.
+///
+/// A title that `LoadStartModule`s a `libSce*` / `libkernel` / `libc` system library expects a
+/// live handle it can pass to `sceKernelDlsym` and `sceKernelStopUnloadModule`; the library's
+/// exports are already routed to HLE at link time, so the honest answer is a stable handle, not
+/// NOT_FOUND. The handle is recorded per path so the same module always resolves to the same
+/// handle, and so `sceKernelGetModuleInfo`-style follow-ups can find it.
+fn load_start_hle_system_module(
+    state: &mut ProbeDispatchState,
+    requested_path: &str,
+) -> Option<u32> {
+    if !is_hle_system_module(requested_path) {
+        return None;
+    }
+    let handles = &mut state.services.system_module_handles;
+    if let Some(&handle) = handles.get(requested_path) {
+        return Some(handle);
+    }
+    let handle = SYSTEM_MODULE_HANDLE_BASE
+        .checked_add(u32::try_from(handles.len()).ok()?)
+        .expect("system module handle count stays within a u32 offset");
+    handles.insert(requested_path.to_owned(), handle);
+    eprintln!(
+        "[REMu][MODULE] load-start {requested_path} -> synthetic HLE handle {handle:#x} (system module served by import dispatch)"
+    );
+    Some(handle)
+}
+
+/// Reports whether a module name belongs to the system-library namespace REmu serves through HLE.
+///
+/// The predicate is deliberately narrow: bundled game plug-ins and engine modules never carry
+/// these prefixes, so a synthetic handle is only ever minted for a library whose ABI the runtime
+/// actually resolves.
+fn is_hle_system_module(name: &str) -> bool {
+    let file = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name)
+        .to_ascii_lowercase();
+    file.starts_with("libsce") || file.starts_with("libkernel") || file.starts_with("libc")
 }
 
 fn sce_symbol_nid(symbol: &str) -> String {
