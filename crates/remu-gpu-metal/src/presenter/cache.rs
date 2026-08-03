@@ -37,6 +37,26 @@ enum QueuedGlobalReadSource {
     Synchronize,
 }
 
+fn trace_shared_compute_binding_reject(binding: &GlobalMemoryBinding, reason: &'static str) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_SHARED_EVENT_COMPUTE").is_some_and(|value| value == "1")
+    }) {
+        return;
+    }
+    static OCCURRENCES: AtomicUsize = AtomicUsize::new(0);
+    let occurrence = OCCURRENCES.fetch_add(1, Ordering::Relaxed) + 1;
+    if occurrence <= 64 || occurrence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL][SHARED-COMPUTE-BINDING] occurrence={occurrence} address={:#x} bytes={} packet-bytes={} writable={} reason={reason}",
+            binding.base_address,
+            binding.byte_count,
+            binding.data.len(),
+            binding.writable,
+        );
+    }
+}
+
 fn read_indirect_guest_dwords(address: u64, byte_count: usize) -> Option<Vec<u32>> {
     let mut bytes = vec![0_u8; byte_count];
     if !read_guest_shared_backing(address, &mut bytes) {
@@ -969,43 +989,89 @@ impl MetalPresenter {
         let mut plans = Vec::with_capacity(effective_bindings.len());
         for binding in &effective_bindings {
             if binding.base_address == 0 || binding.byte_count == 0 {
+                trace_shared_compute_binding_reject(binding, "invalid-range");
                 return None;
             }
-            let byte_count = u64::try_from(binding.byte_count).ok()?;
-            let binding_identity = guest_shared_backing_identity(binding.base_address, byte_count)?;
-            let (source, offset, physical_identity) =
-                match self.queued_global_read_source(binding).ok()? {
-                    QueuedGlobalReadSource::Buffer {
-                        buffer,
-                        offset,
-                        guest_memory: false,
-                        physical_identity: Some(physical_identity),
-                    } => {
-                        if offset
-                            .checked_add(byte_count)
-                            .is_none_or(|end| end > buffer.length())
-                        {
-                            return None;
-                        }
-                        (Some(buffer), offset, physical_identity)
-                    }
-                    QueuedGlobalReadSource::None
-                        if binding.data.len() == binding.byte_count
-                            && !dependency_write_footprint.iter().any(|producer| {
-                                producer.mapping.backing_id == binding_identity.backing_id
-                                    && producer.mapping.backing_offset
-                                        < binding_identity.backing_offset.saturating_add(byte_count)
-                                    && binding_identity.backing_offset
-                                        < producer
-                                            .mapping
-                                            .backing_offset
-                                            .saturating_add(producer.byte_count)
-                            }) =>
+            let Some(byte_count) = u64::try_from(binding.byte_count).ok() else {
+                trace_shared_compute_binding_reject(binding, "invalid-byte-count");
+                return None;
+            };
+            let Some(binding_identity) =
+                guest_shared_backing_identity(binding.base_address, byte_count)
+            else {
+                trace_shared_compute_binding_reject(binding, "missing-identity");
+                return None;
+            };
+            let source = match self.queued_global_read_source(binding) {
+                Ok(source) => source,
+                Err(_) => {
+                    trace_shared_compute_binding_reject(binding, "source-error");
+                    return None;
+                }
+            };
+            let (source, offset, physical_identity) = match source {
+                QueuedGlobalReadSource::Buffer {
+                    buffer,
+                    offset,
+                    guest_memory: false,
+                    physical_identity: Some(physical_identity),
+                } => {
+                    if offset
+                        .checked_add(byte_count)
+                        .is_none_or(|end| end > buffer.length())
                     {
-                        (None, 0, binding_identity)
+                        trace_shared_compute_binding_reject(
+                            binding,
+                            "retained-source-out-of-bounds",
+                        );
+                        return None;
                     }
-                    _ => return None,
-                };
+                    (Some(buffer), offset, physical_identity)
+                }
+                QueuedGlobalReadSource::None => {
+                    if binding.data.len() != binding.byte_count {
+                        trace_shared_compute_binding_reject(binding, "incomplete-packet-snapshot");
+                        return None;
+                    }
+                    if dependency_write_footprint.iter().any(|producer| {
+                        producer.mapping.backing_id == binding_identity.backing_id
+                            && producer.mapping.backing_offset
+                                < binding_identity.backing_offset.saturating_add(byte_count)
+                            && binding_identity.backing_offset
+                                < producer
+                                    .mapping
+                                    .backing_offset
+                                    .saturating_add(producer.byte_count)
+                    }) {
+                        trace_shared_compute_binding_reject(
+                            binding,
+                            "dependency-overlap-without-version",
+                        );
+                        return None;
+                    }
+                    (None, 0, binding_identity)
+                }
+                QueuedGlobalReadSource::Buffer {
+                    guest_memory: true, ..
+                } => {
+                    trace_shared_compute_binding_reject(binding, "zero-copy-source");
+                    return None;
+                }
+                QueuedGlobalReadSource::Buffer {
+                    physical_identity: None,
+                    ..
+                } => {
+                    trace_shared_compute_binding_reject(
+                        binding,
+                        "retained-source-missing-identity",
+                    );
+                    return None;
+                }
+                QueuedGlobalReadSource::Synchronize => {
+                    trace_shared_compute_binding_reject(binding, "source-requires-synchronization");
+                    return None;
+                }
+            };
             plans.push(SharedEventComputeGlobalBindingPlan {
                 source,
                 source_offset: offset,
@@ -1038,6 +1104,10 @@ impl MetalPresenter {
                     }
                     && plans[left].source_offset == plans[right].source_offset;
                 if !exact {
+                    trace_shared_compute_binding_reject(
+                        effective_bindings[right],
+                        "partial-or-mixed-alias",
+                    );
                     return None;
                 }
             }
