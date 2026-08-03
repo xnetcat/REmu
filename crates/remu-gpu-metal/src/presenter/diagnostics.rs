@@ -617,6 +617,7 @@ enum DiagnosticScanoutWriterFilter {
     KnownScanout,
     Any1080Color,
     Addresses(Vec<u64>),
+    Any1080Addresses(Vec<u64>),
 }
 
 impl DiagnosticScanoutWriterFilter {
@@ -634,6 +635,11 @@ impl DiagnosticScanoutWriterFilter {
             Self::Addresses(addresses) => {
                 known_scanout && addresses.contains(&pixel_shader_address)
             }
+            Self::Any1080Addresses(addresses) => {
+                width == 1_920
+                    && height == 1_080
+                    && addresses.contains(&pixel_shader_address)
+            }
         }
     }
 }
@@ -646,12 +652,17 @@ fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWrite
     if value.eq_ignore_ascii_case("auto1080") {
         return DiagnosticScanoutWriterFilter::Any1080Color;
     }
-    let addresses = value
+    let (addresses, any_1080) = value
+        .strip_prefix("auto1080:")
+        .map_or((value, false), |addresses| (addresses, true));
+    let addresses = addresses
         .split(',')
         .filter_map(|part| parse_diagnostic_hex_address(part.trim()))
         .collect::<Vec<_>>();
     if addresses.is_empty() {
         DiagnosticScanoutWriterFilter::Disabled
+    } else if any_1080 {
+        DiagnosticScanoutWriterFilter::Any1080Addresses(addresses)
     } else {
         DiagnosticScanoutWriterFilter::Addresses(addresses)
     }
@@ -662,8 +673,9 @@ fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWrite
 /// This diagnostic is deliberately narrower than `REMU_TRACE_SCANOUT_WRITES`: a title can issue
 /// dozens of UI writers per frame, and settling all of them would perturb the workload beyond
 /// recognition. `auto` selects known scanout writers, `auto1080` selects any 1920x1080 color
-/// target (including targets seen before VideoOut identity is known), and a comma-separated list
-/// selects known scanout writers with matching pixel-shader addresses.
+/// target (including targets seen before VideoOut identity is known), a comma-separated list
+/// selects known scanout writers with matching pixel-shader addresses, and `auto1080:<list>`
+/// selects matching shaders on any 1080p color target.
 pub(super) fn diagnostic_scanout_writer_target_selected(
     pixel_shader_address: u64,
     known_scanout: bool,
@@ -673,10 +685,16 @@ pub(super) fn diagnostic_scanout_writer_target_selected(
     static FILTER: OnceLock<DiagnosticScanoutWriterFilter> = OnceLock::new();
     FILTER
         .get_or_init(|| {
-            std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITERS")
+            let filter = std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITERS")
                 .ok()
                 .map(|value| parse_diagnostic_scanout_writer_filter(&value))
-                .unwrap_or(DiagnosticScanoutWriterFilter::Disabled)
+                .unwrap_or(DiagnosticScanoutWriterFilter::Disabled);
+            if let DiagnosticScanoutWriterFilter::Any1080Addresses(addresses) = &filter {
+                eprintln!(
+                    "[REMu][METAL][SCANOUT-CAPTURE] filter=auto1080-shaders addresses={addresses:#x?}"
+                );
+            }
+            filter
         })
         .selects(pixel_shader_address, known_scanout, width, height)
 }
@@ -1815,6 +1833,15 @@ mod tests {
                 0x80d3_b70000
             ])
         );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter(
+                "auto1080:0x8051c40000,8051c80000,invalid"
+            ),
+            DiagnosticScanoutWriterFilter::Any1080Addresses(vec![
+                0x8051_c40000,
+                0x8051_c80000,
+            ])
+        );
     }
 
     #[test]
@@ -1838,6 +1865,8 @@ mod tests {
         let known = DiagnosticScanoutWriterFilter::KnownScanout;
         let any_1080 = DiagnosticScanoutWriterFilter::Any1080Color;
         let addresses = DiagnosticScanoutWriterFilter::Addresses(vec![0x80d3_b70000]);
+        let any_1080_addresses =
+            DiagnosticScanoutWriterFilter::Any1080Addresses(vec![0x80d3_b70000]);
 
         assert!(known.selects(0x1234, true, 1_280, 720));
         assert!(!known.selects(0x1234, false, 1_920, 1_080));
@@ -1846,6 +1875,9 @@ mod tests {
         assert!(addresses.selects(0x80d3_b70000, true, 1_920, 1_080));
         assert!(!addresses.selects(0x80d3_b70000, false, 1_920, 1_080));
         assert!(!addresses.selects(0x1234, true, 1_920, 1_080));
+        assert!(any_1080_addresses.selects(0x80d3_b70000, false, 1_920, 1_080));
+        assert!(!any_1080_addresses.selects(0x80d3_b70000, true, 1_280, 720));
+        assert!(!any_1080_addresses.selects(0x1234, true, 1_920, 1_080));
     }
 
     #[test]
