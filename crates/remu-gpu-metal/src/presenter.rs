@@ -2174,6 +2174,7 @@ impl MetalPresenter {
                                         &compiler_device,
                                         dispatch,
                                         key,
+                                        render_pipeline_archive.as_ref(),
                                     );
                                     ShaderCompileResult::Compute {
                                         key: key.clone(),

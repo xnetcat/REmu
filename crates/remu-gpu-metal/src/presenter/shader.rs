@@ -296,6 +296,7 @@ impl MetalPresenter {
         device: &Device,
         dispatch: &ComputeDispatch,
         key: &ComputePipelineKey,
+        pipeline_archive: Option<&PersistentRenderPipelineArchive>,
     ) -> Result<CompiledComputePipeline, String> {
         let snapshot = dispatch
             .shader
@@ -338,9 +339,13 @@ impl MetalPresenter {
             .map_err(|error| format!("Metal compute function: {error}"))?;
         let function_duration = function_started.elapsed();
         let pipeline_started = Instant::now();
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|error| format!("Metal compute pipeline: {error}"))?;
+        let pipeline = if let Some(archive) = pipeline_archive {
+            archive.new_compute_pipeline_state(device, &function)?
+        } else {
+            device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|error| format!("Metal compute pipeline: {error}"))?
+        };
         let pipeline_duration = pipeline_started.elapsed();
         Ok(CompiledComputePipeline {
             pipeline,
