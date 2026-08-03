@@ -2,7 +2,9 @@
 
 //! Allocation-free runtime-dispatch telemetry shared with the presenter sampler.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::cell::Cell;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Upper bounds for the first seven logarithmic latency buckets, in nanoseconds.
@@ -53,8 +55,8 @@ pub const DISPATCH_IMPORT_FAMILY_COUNT: usize = DispatchImportFamily::Stateful a
 
 /// Exact link-time runtime routes which bypass the captured-frame dispatcher.
 ///
-/// Recording the exact route costs the same one relaxed atomic increment as the former aggregate
-/// direct counter, so observing a high-volume route does not add a second increment to it.
+/// Recording the exact route publishes a thread-owned cumulative counter with one relaxed store;
+/// observing a high-volume route does not add a contended read/modify/write to the guest call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub enum DirectDispatchImport {
@@ -77,11 +79,85 @@ pub enum DirectDispatchImport {
 pub const DIRECT_DISPATCH_IMPORT_COUNT: usize =
     DirectDispatchImport::KernelGetProcessTimeCounter as usize + 1;
 const DIRECT_DISPATCH_STRIPE_COUNT: usize = 256;
+#[cfg(test)]
 static NEXT_DIRECT_DISPATCH_STRIPE: AtomicUsize = AtomicUsize::new(0);
 
+/// Direct imports are hot enough that even a relaxed read/modify/write can become visible under
+/// Rosetta. Each runtime thread therefore owns one publication stripe and writes monotonically
+/// increasing counters with ordinary relaxed stores. The sampler differences those published
+/// totals, retaining exact interval counts without putting a locked instruction on every import.
+/// Threads beyond the fixed stripe budget use the atomic overflow counters.
+static NEXT_PUBLISHED_DIRECT_DISPATCH_STRIPE: AtomicUsize = AtomicUsize::new(0);
+static REPORTED_DIRECT_DISPATCH_PUBLICATION: AtomicBool = AtomicBool::new(false);
+static PUBLISHED_DIRECT_DISPATCH_CALLS: [[AtomicU64; DIRECT_DISPATCH_IMPORT_COUNT];
+    DIRECT_DISPATCH_STRIPE_COUNT] =
+    [const { [const { AtomicU64::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT] };
+        DIRECT_DISPATCH_STRIPE_COUNT];
+static SAMPLED_DIRECT_DISPATCH_CALLS: [[AtomicU64; DIRECT_DISPATCH_IMPORT_COUNT];
+    DIRECT_DISPATCH_STRIPE_COUNT] =
+    [const { [const { AtomicU64::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT] };
+        DIRECT_DISPATCH_STRIPE_COUNT];
+static OVERFLOW_DIRECT_DISPATCH_CALLS: [AtomicU64; DIRECT_DISPATCH_IMPORT_COUNT] =
+    [const { AtomicU64::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT];
+static DIRECT_DISPATCH_SAMPLE_LOCK: Mutex<()> = Mutex::new(());
+
+struct PublishedDirectDispatchCounters {
+    stripe: Option<usize>,
+    calls: [Cell<u64>; DIRECT_DISPATCH_IMPORT_COUNT],
+}
+
+impl PublishedDirectDispatchCounters {
+    fn new() -> Self {
+        if !REPORTED_DIRECT_DISPATCH_PUBLICATION.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[REMu][PERF-DIRECT] thread-owned publication enabled stripes={DIRECT_DISPATCH_STRIPE_COUNT}"
+            );
+        }
+        let stripe = NEXT_PUBLISHED_DIRECT_DISPATCH_STRIPE.fetch_add(1, Ordering::Relaxed);
+        Self {
+            stripe: (stripe < DIRECT_DISPATCH_STRIPE_COUNT).then_some(stripe),
+            calls: [const { Cell::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT],
+        }
+    }
+
+    fn record(&self, import: DirectDispatchImport) {
+        let index = import as usize;
+        if let Some(stripe) = self.stripe {
+            let calls = self.calls[index].get().wrapping_add(1);
+            self.calls[index].set(calls);
+            PUBLISHED_DIRECT_DISPATCH_CALLS[stripe][index].store(calls, Ordering::Relaxed);
+        } else {
+            OVERFLOW_DIRECT_DISPATCH_CALLS[index].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+#[cfg(test)]
 thread_local! {
     static DIRECT_DISPATCH_STRIPE: usize =
         NEXT_DIRECT_DISPATCH_STRIPE.fetch_add(1, Ordering::Relaxed) % DIRECT_DISPATCH_STRIPE_COUNT;
+}
+
+thread_local! {
+    static PUBLISHED_DIRECT_DISPATCH_COUNTERS: PublishedDirectDispatchCounters =
+        PublishedDirectDispatchCounters::new();
+}
+
+fn take_published_direct_dispatch_calls() -> [u64; DIRECT_DISPATCH_IMPORT_COUNT] {
+    let _sample_guard = DIRECT_DISPATCH_SAMPLE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    std::array::from_fn(|index| {
+        let striped = PUBLISHED_DIRECT_DISPATCH_CALLS
+            .iter()
+            .zip(SAMPLED_DIRECT_DISPATCH_CALLS.iter())
+            .fold(0_u64, |total, (published, sampled)| {
+                let current = published[index].load(Ordering::Relaxed);
+                let previous = sampled[index].swap(current, Ordering::Relaxed);
+                total.saturating_add(current.wrapping_sub(previous))
+            });
+        striped.saturating_add(OVERFLOW_DIRECT_DISPATCH_CALLS[index].swap(0, Ordering::Relaxed))
+    })
 }
 
 /// One reset interval of latency observations.
@@ -164,6 +240,7 @@ impl AtomicLatencyHistogram {
 
 struct DispatchTelemetry {
     import_calls: [AtomicU64; DISPATCH_IMPORT_FAMILY_COUNT],
+    #[cfg(test)]
     direct_import_calls: [[AtomicU64; DIRECT_DISPATCH_IMPORT_COUNT]; DIRECT_DISPATCH_STRIPE_COUNT],
     dispatch_lock_acquire_wait: AtomicLatencyHistogram,
     dispatch_lock_hold: AtomicLatencyHistogram,
@@ -174,6 +251,7 @@ impl DispatchTelemetry {
     const fn new() -> Self {
         Self {
             import_calls: [const { AtomicU64::new(0) }; DISPATCH_IMPORT_FAMILY_COUNT],
+            #[cfg(test)]
             direct_import_calls: [const {
                 [const { AtomicU64::new(0) }; DIRECT_DISPATCH_IMPORT_COUNT]
             }; DIRECT_DISPATCH_STRIPE_COUNT],
@@ -187,6 +265,7 @@ impl DispatchTelemetry {
         self.import_calls[family as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     fn record_direct_import(&self, import: DirectDispatchImport) {
         DIRECT_DISPATCH_STRIPE.with(|stripe| {
             self.direct_import_calls[*stripe][import as usize].fetch_add(1, Ordering::Relaxed);
@@ -194,11 +273,14 @@ impl DispatchTelemetry {
     }
 
     fn take(&self) -> DispatchTelemetrySample {
+        #[cfg(test)]
         let direct_import_calls = std::array::from_fn(|index| {
             self.direct_import_calls.iter().fold(0_u64, |total, stripe| {
                 total.saturating_add(stripe[index].swap(0, Ordering::Relaxed))
             })
         });
+        #[cfg(not(test))]
+        let direct_import_calls = [0; DIRECT_DISPATCH_IMPORT_COUNT];
         let mut import_calls = std::array::from_fn(|index| {
             self.import_calls[index].swap(0, Ordering::Relaxed)
         });
@@ -229,7 +311,7 @@ pub fn record_dispatch_import(family: DispatchImportFamily) {
 
 /// Records the exact link-time runtime route which served one guest import.
 pub fn record_direct_dispatch_import(import: DirectDispatchImport) {
-    DISPATCH_TELEMETRY.record_direct_import(import);
+    PUBLISHED_DIRECT_DISPATCH_COUNTERS.with(|counters| counters.record(import));
 }
 
 /// Records time spent waiting to acquire the process-wide dispatch-state write lock.
@@ -251,13 +333,24 @@ pub fn record_gpu_publication_wait(duration: Duration) {
 
 /// Takes and resets every B10 counter as one telemetry interval.
 ///
-/// Individual atomic fields may receive a concurrent observation while the reset is in progress,
+/// Individual latency fields may receive a concurrent observation while the reset is in progress,
 /// so a duration exactly on the boundary may split its count, total and bucket between neighboring
-/// intervals. No field increment is lost: every field uses an atomic swap and every observation
-/// updates fixed storage without allocation.
+/// intervals. Direct imports publish cumulative thread-owned totals; the sampler serializes and
+/// differences them, so a boundary race can move a call into the next interval but cannot lose or
+/// double-count it. Every route updates fixed storage without allocation.
 #[must_use]
 pub fn take_dispatch_telemetry_sample() -> DispatchTelemetrySample {
-    DISPATCH_TELEMETRY.take()
+    let mut sample = DISPATCH_TELEMETRY.take();
+    sample.direct_import_calls = take_published_direct_dispatch_calls();
+    sample.import_calls[DispatchImportFamily::Direct as usize] =
+        sample.import_calls[DispatchImportFamily::Direct as usize].saturating_add(
+            sample
+                .direct_import_calls
+                .iter()
+                .copied()
+                .fold(0_u64, u64::saturating_add),
+        );
+    sample
 }
 
 #[cfg(test)]
@@ -265,7 +358,9 @@ mod tests {
     use super::{
         AtomicLatencyHistogram, DISPATCH_LATENCY_BUCKET_COUNT, DISPATCH_LATENCY_BUCKET_UPPER_NS,
         DirectDispatchImport, DispatchImportFamily, DispatchTelemetry,
+        record_direct_dispatch_import, take_dispatch_telemetry_sample,
     };
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     #[test]
@@ -335,5 +430,47 @@ mod tests {
             THREADS * CALLS_PER_THREAD
         );
         assert_eq!(telemetry.take(), super::DispatchTelemetrySample::default());
+    }
+
+    #[test]
+    fn published_direct_import_stores_preserve_counts_across_samples() {
+        const THREADS: u64 = 8;
+        const CALLS_PER_PHASE: u64 = 10_000;
+        let _ = take_dispatch_telemetry_sample();
+        let first_phase = Arc::new(Barrier::new(usize::try_from(THREADS).unwrap() + 1));
+        let second_phase = Arc::new(Barrier::new(usize::try_from(THREADS).unwrap() + 1));
+        std::thread::scope(|scope| {
+            for _ in 0..THREADS {
+                let first_phase = Arc::clone(&first_phase);
+                let second_phase = Arc::clone(&second_phase);
+                scope.spawn(move || {
+                    for _ in 0..CALLS_PER_PHASE {
+                        record_direct_dispatch_import(DirectDispatchImport::ScePthreadGetSpecific);
+                    }
+                    first_phase.wait();
+                    second_phase.wait();
+                    for _ in 0..CALLS_PER_PHASE {
+                        record_direct_dispatch_import(DirectDispatchImport::ScePthreadGetSpecific);
+                    }
+                });
+            }
+            first_phase.wait();
+            let first = take_dispatch_telemetry_sample();
+            assert_eq!(
+                first.direct_import_calls_for(DirectDispatchImport::ScePthreadGetSpecific),
+                THREADS * CALLS_PER_PHASE
+            );
+            second_phase.wait();
+        });
+        let second = take_dispatch_telemetry_sample();
+        assert_eq!(
+            second.direct_import_calls_for(DirectDispatchImport::ScePthreadGetSpecific),
+            THREADS * CALLS_PER_PHASE
+        );
+        assert_eq!(
+            take_dispatch_telemetry_sample()
+                .direct_import_calls_for(DirectDispatchImport::ScePthreadGetSpecific),
+            0
+        );
     }
 }
