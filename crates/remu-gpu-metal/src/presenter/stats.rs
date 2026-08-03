@@ -8,9 +8,9 @@ use super::{
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ pub(super) struct SharedEventHostEffectLatency {
 }
 
 impl SharedEventHostEffectLatency {
-    fn record(&mut self, duration: Duration) {
+    pub(super) fn record(&mut self, duration: Duration) {
         let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
         self.count = self.count.saturating_add(1);
         self.total_ns = self.total_ns.saturating_add(nanoseconds);
@@ -56,11 +56,7 @@ pub(super) struct SharedEventHostEffectLatencyStatistics {
 }
 
 impl SharedEventHostEffectLatencyStatistics {
-    pub(super) fn record(
-        &mut self,
-        phase: SharedEventHostEffectLatencyPhase,
-        duration: Duration,
-    ) {
+    pub(super) fn record(&mut self, phase: SharedEventHostEffectLatencyPhase, duration: Duration) {
         self.phases[phase as usize].record(duration);
     }
 
@@ -83,11 +79,7 @@ pub(super) struct SharedEventHostEffectPendingStatistics {
 }
 
 impl SharedEventHostEffectPendingStatistics {
-    pub(super) fn record(
-        &mut self,
-        phase: SharedEventHostEffectLatencyPhase,
-        age: Duration,
-    ) {
+    pub(super) fn record(&mut self, phase: SharedEventHostEffectLatencyPhase, age: Duration) {
         self.phases[phase as usize].record(age);
     }
 
@@ -130,6 +122,71 @@ pub(super) fn format_shared_event_host_effect_latency_report(
         pending_phase(SharedEventHostEffectLatencyPhase::ImmutablePrefix),
         pending_phase(SharedEventHostEffectLatencyPhase::HostTerminal),
     )
+}
+
+/// Bounded opt-in attribution for command buffers which publish a consumer-queue
+/// SharedEvent acknowledgement. Every duration belongs to a sampled acknowledgement batch;
+/// ordinary batches and disabled runs pay no clock or callback cost.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SharedEventAckPhaseStatistics {
+    pub(super) samples: u64,
+    pub(super) draws: u64,
+    pub(super) computes: u64,
+    pub(super) event_queue: SharedEventHostEffectLatency,
+    pub(super) cpu_translation: SharedEventHostEffectLatency,
+    pub(super) metal_encoding: SharedEventHostEffectLatency,
+    pub(super) ack_encoding: SharedEventHostEffectLatency,
+    pub(super) commit_call: SharedEventHostEffectLatency,
+    pub(super) commit_to_scheduled: SharedEventHostEffectLatency,
+    pub(super) scheduled_to_completed: SharedEventHostEffectLatency,
+    pub(super) kernel_to_gpu_start: SharedEventHostEffectLatency,
+    pub(super) gpu_execution: SharedEventHostEffectLatency,
+    pub(super) gpu_to_kernel_end: SharedEventHostEffectLatency,
+    pub(super) commit_to_ack: SharedEventHostEffectLatency,
+}
+
+impl SharedEventAckPhaseStatistics {
+    pub(super) fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+pub(super) fn format_shared_event_ack_phase_report(
+    window_ms: u128,
+    sample: SharedEventAckPhaseStatistics,
+) -> [String; 3] {
+    let compact = |latency: SharedEventHostEffectLatency| {
+        format!(
+            "{}/{}/{}/{}",
+            latency.count,
+            latency.total_ns,
+            latency.mean_ns(),
+            latency.maximum_ns,
+        )
+    };
+    [
+        format!(
+            "[REMu][PERF-SHARED-EVENT-ACK-PHASE] window_ms={window_ms} samples={} draws={} computes={} values=count/total_ns/mean_ns/max_ns",
+            sample.samples, sample.draws, sample.computes,
+        ),
+        format!(
+            "[REMu][PERF-SHARED-EVENT-ACK-PHASE] part=host event-queue={} cpu-translation={} metal-encoding={} ack-encoding={} commit-call={}",
+            compact(sample.event_queue),
+            compact(sample.cpu_translation),
+            compact(sample.metal_encoding),
+            compact(sample.ack_encoding),
+            compact(sample.commit_call),
+        ),
+        format!(
+            "[REMu][PERF-SHARED-EVENT-ACK-PHASE] part=native commit-scheduled={} scheduled-completed={} kernel-gpu-start={} gpu-execution={} gpu-kernel-end={} commit-ack={}",
+            compact(sample.commit_to_scheduled),
+            compact(sample.scheduled_to_completed),
+            compact(sample.kernel_to_gpu_start),
+            compact(sample.gpu_execution),
+            compact(sample.gpu_to_kernel_end),
+            compact(sample.commit_to_ack),
+        ),
+    ]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -667,6 +724,7 @@ impl PresenterStatistics {
             shared_event_fallbacks_no_exact_producer: 0,
             shared_event_fallbacks_timeline_overflow: 0,
             shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics::default(),
+            shared_event_ack_phases: SharedEventAckPhaseStatistics::default(),
             terminal_publication: TerminalPublicationStatistics::default(),
             gpu_execution_time: Duration::ZERO,
             presentation_queue_latency: Duration::ZERO,
@@ -679,11 +737,12 @@ impl PresenterStatistics {
 #[cfg(test)]
 mod tests {
     use super::{
-        SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT, SharedEventHostEffectLatencyPhase,
-        SharedEventHostEffectLatencyStatistics, SharedEventHostEffectPendingStatistics,
-        TERMINAL_PUBLICATION_TIMING_SAMPLES, TerminalPublicationPhase,
-        TerminalPublicationStatistics, TerminalPublicationTimer,
-        format_shared_event_host_effect_latency_report, format_terminal_publication_report,
+        SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT, SharedEventAckPhaseStatistics,
+        SharedEventHostEffectLatencyPhase, SharedEventHostEffectLatencyStatistics,
+        SharedEventHostEffectPendingStatistics, TERMINAL_PUBLICATION_TIMING_SAMPLES,
+        TerminalPublicationPhase, TerminalPublicationStatistics, TerminalPublicationTimer,
+        format_shared_event_ack_phase_report, format_shared_event_host_effect_latency_report,
+        format_terminal_publication_report,
     };
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -778,19 +837,50 @@ mod tests {
         let before = TERMINAL_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed);
         let mut timer = TerminalPublicationTimer::start_if(false);
         let mut statistics = TerminalPublicationStatistics::default();
-        timer.mark(
-            &mut statistics,
-            TerminalPublicationPhase::MetalTerminal,
-        );
-        timer.mark(
-            &mut statistics,
-            TerminalPublicationPhase::CompletionWake,
-        );
+        timer.mark(&mut statistics, TerminalPublicationPhase::MetalTerminal);
+        timer.mark(&mut statistics, TerminalPublicationPhase::CompletionWake);
         assert_eq!(statistics, TerminalPublicationStatistics::default());
         assert_eq!(
             TERMINAL_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed),
             before,
             "disabled terminal attribution must not sample the monotonic clock"
         );
+    }
+
+    #[test]
+    fn shared_event_ack_phase_report_names_each_serial_boundary() {
+        let mut statistics = SharedEventAckPhaseStatistics {
+            samples: 1,
+            draws: 2,
+            computes: 3,
+            ..SharedEventAckPhaseStatistics::default()
+        };
+        statistics.event_queue.record(Duration::from_nanos(10));
+        statistics.cpu_translation.record(Duration::from_nanos(20));
+        statistics.metal_encoding.record(Duration::from_nanos(30));
+        statistics.ack_encoding.record(Duration::from_nanos(40));
+        statistics.commit_call.record(Duration::from_nanos(50));
+        statistics
+            .commit_to_scheduled
+            .record(Duration::from_nanos(60));
+        statistics
+            .scheduled_to_completed
+            .record(Duration::from_nanos(70));
+        statistics
+            .kernel_to_gpu_start
+            .record(Duration::from_nanos(80));
+        statistics.gpu_execution.record(Duration::from_nanos(90));
+        statistics
+            .gpu_to_kernel_end
+            .record(Duration::from_nanos(100));
+        statistics.commit_to_ack.record(Duration::from_nanos(110));
+
+        let report = format_shared_event_ack_phase_report(5_000, statistics).join("\n");
+        assert!(report.contains("samples=1 draws=2 computes=3"));
+        assert!(report.contains("event-queue=1/10/10/10"));
+        assert!(report.contains("metal-encoding=1/30/30/30"));
+        assert!(report.contains("commit-scheduled=1/60/60/60"));
+        assert!(report.contains("gpu-execution=1/90/90/90"));
+        assert!(report.contains("commit-ack=1/110/110/110"));
     }
 }

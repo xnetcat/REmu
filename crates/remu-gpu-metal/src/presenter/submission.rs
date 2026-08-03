@@ -13,7 +13,8 @@ use super::{
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
     SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
-    SharedEventHostEffectLatencyState, SharedEventHostEffectPendingStatistics, WriteWatchRefresh,
+    SharedEventHostEffectLatencyPhase, SharedEventHostEffectLatencyState,
+    SharedEventHostEffectPendingStatistics, WriteWatchRefresh,
     compute_pipeline_key, diagnostic_skip_export_shader,
     diagnostic_skip_pixel_shader, graphics_pipeline_key, guest_physical_ranges_overlap,
     guest_ranges_overlap, guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
@@ -90,7 +91,8 @@ impl MetalPresenter {
             let guest_queue_batches = &self.guest_queue_batches;
             let shared_event_host_effect_latency =
                 &mut self.statistics.shared_event_host_effect_latency;
-            let (source, event) = match self.receiver.try_recv(|reason| match reason {
+            let mut observed_consumer_acks = Vec::new();
+            let poll = self.receiver.try_recv(|reason| match reason {
                 QueueBlockReason::GraphicsPipeline(key) => {
                     self.compiled_shader_pairs.contains_key(key)
                         || self.failed_shader_pairs.contains(key)
@@ -106,34 +108,46 @@ impl MetalPresenter {
                     consumer_ack,
                     terminal_dependencies,
                     latency,
-                } => shared_event_host_effect_is_resolved(
-                    latency,
-                    Instant::now(),
-                    shared_event_host_effect_latency,
-                    *consumer_queue_id,
-                    *consumer_ack,
-                    terminal_dependencies,
-                    |queue_id| {
-                        guest_queue_batches.get(&queue_id).is_some_and(|state| {
-                            state.open_batch.is_some() || !state.committed_batches.is_empty()
-                        })
-                    },
-                    |producer| {
-                        guest_queue_batches
-                            .get(&producer.queue_id())
-                            .map(|state| state.shared_event_timeline.event().signaled_value())
-                    },
-                    |producer| {
-                        guest_queue_batches
-                            .get(&producer.queue_id())
-                            .map(|state| state.shared_event_timeline.event().signaled_value())
-                    },
-                    |producer| {
-                        guest_queue_batches
-                            .get(&producer.queue_id())
-                            .map(|state| state.host_retired_fence_value)
-                    },
-                ),
+                } => {
+                    let now = Instant::now();
+                    let waiting_for_ack = latency.phase
+                        == SharedEventHostEffectLatencyPhase::ConsumerAck;
+                    let resolved = shared_event_host_effect_is_resolved(
+                        latency,
+                        now,
+                        shared_event_host_effect_latency,
+                        *consumer_queue_id,
+                        *consumer_ack,
+                        terminal_dependencies,
+                        |queue_id| {
+                            guest_queue_batches.get(&queue_id).is_some_and(|state| {
+                                state.open_batch.is_some() || !state.committed_batches.is_empty()
+                            })
+                        },
+                        |producer| {
+                            guest_queue_batches
+                                .get(&producer.queue_id())
+                                .map(|state| state.shared_event_timeline.event().signaled_value())
+                        },
+                        |producer| {
+                            guest_queue_batches
+                                .get(&producer.queue_id())
+                                .map(|state| state.shared_event_timeline.event().signaled_value())
+                        },
+                        |producer| {
+                            guest_queue_batches
+                                .get(&producer.queue_id())
+                                .map(|state| state.host_retired_fence_value)
+                        },
+                    );
+                    if waiting_for_ack
+                        && latency.phase != SharedEventHostEffectLatencyPhase::ConsumerAck
+                        && let Some(fence) = *consumer_ack
+                    {
+                        observed_consumer_acks.push((fence, now));
+                    }
+                    resolved
+                }
                 QueueBlockReason::FlipSafetyWait(wait) => {
                     wait.required_flip_sequence.is_none_or(|sequence| {
                         sequence <= self.safe_flip_sequence_prefix
@@ -143,7 +157,11 @@ impl MetalPresenter {
                                 .is_some_and(|safety| safety.safe)
                     })
                 }
-            }) {
+            });
+            for (fence, observed_at) in observed_consumer_acks {
+                self.record_shared_event_ack_observed(fence, observed_at);
+            }
+            let (source, event) = match poll {
                 OrderedEventPoll::Event { source, event } => (source, event),
                 OrderedEventPoll::Blocked => {
                     // Look ahead far enough to feed all compiler workers while memory-wait queues
@@ -163,6 +181,8 @@ impl MetalPresenter {
                     return PresenterFlow::Shutdown;
                 }
             };
+            let event_processing_started = Instant::now();
+            let event_queue_wait = self.receiver.last_event_queue_wait();
             self.set_active_guest_queue(match source {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
                 OrderedEventSource::Host { .. } => None,
@@ -190,6 +210,7 @@ impl MetalPresenter {
                     || direct_draw_gpu_orderable
                     || self.event_is_shared_event_gpu_orderable(source, &event);
                 if !gpu_orderable {
+                    let acknowledgement_started = Instant::now();
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
                         Ok(acknowledgement) => acknowledgement,
                         Err(error) => {
@@ -199,6 +220,15 @@ impl MetalPresenter {
                             None
                         }
                     };
+                    let acknowledgement_finished = Instant::now();
+                    self.prepare_shared_event_ack_phase_trace(
+                        acknowledgement,
+                        event_queue_wait,
+                        acknowledgement_started
+                            .saturating_duration_since(event_processing_started),
+                        acknowledgement_finished
+                            .saturating_duration_since(acknowledgement_started),
+                    );
                     if let Err(error) = self.flush_guest_command_batch(
                         FlushPolicy::Required,
                         GuestBatchFlushReason::SharedEventHostEffect,

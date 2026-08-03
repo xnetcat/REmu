@@ -29,7 +29,7 @@ impl SharedEventProducerId {
 }
 
 /// One exact point on a producer queue's monotonic `SharedEvent` timeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SharedEventFence {
     producer: SharedEventProducerId,
     value: u64,

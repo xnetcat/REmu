@@ -179,10 +179,12 @@ use self::stats::{
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, SharedEventHostEffectLatencyPhase,
+    SharedEventAckPhaseStatistics,
     SharedEventHostEffectLatencyStatistics, SharedEventHostEffectPendingStatistics,
     TerminalPublicationPhase,
     TerminalPublicationStatistics, TerminalPublicationTimer,
-    format_shared_event_host_effect_latency_report, format_terminal_publication_report,
+    format_shared_event_ack_phase_report, format_shared_event_host_effect_latency_report,
+    format_terminal_publication_report,
     process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
     take_texture_dirty_work_details, take_texture_snapshot_work_details,
@@ -1009,12 +1011,56 @@ struct ShaderFunctionCache {
 
 struct ScheduledGpuSubmission {
     ingress_sequence: u64,
+    ingested_at: Option<Instant>,
     events: VecDeque<GpuEvent>,
 }
 
 struct ScheduledHostEvent {
     ingress_sequence: u64,
+    ingested_at: Option<Instant>,
     event: GpuEvent,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SharedEventAckBatchCpuPhases {
+    translation: Duration,
+    metal_encoding: Duration,
+    draws: u64,
+    computes: u64,
+}
+
+#[derive(Debug)]
+struct PendingSharedEventAckTrace {
+    fence: SharedEventFence,
+    event_queue: Duration,
+    host_preflight: Duration,
+    ack_encoding: Duration,
+}
+
+#[derive(Debug, Default)]
+struct SharedEventAckNativeHostTimes {
+    scheduled_at: Option<Instant>,
+    completed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SharedEventAckTerminalTimes {
+    kernel_to_gpu_start: Duration,
+    gpu_execution: Duration,
+    gpu_to_kernel_end: Duration,
+}
+
+#[derive(Debug)]
+struct SharedEventAckTrace {
+    fence: SharedEventFence,
+    committed_at: Instant,
+    event_queue: Duration,
+    cpu: SharedEventAckBatchCpuPhases,
+    ack_encoding: Duration,
+    commit_call: Duration,
+    native_host: Arc<Mutex<SharedEventAckNativeHostTimes>>,
+    terminal: Option<SharedEventAckTerminalTimes>,
+    ack_observed_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -1062,6 +1108,9 @@ struct OrderedGpuEventReceiver {
     host_block: Option<QueueBlockReason>,
     next_ingress_sequence: u64,
     disconnected: bool,
+    event_queue_timing: bool,
+    last_event_ingested_at: Option<Instant>,
+    last_event_queue_wait: Duration,
     /// Count of queued small producer writes per 8-byte label cell (`address >> 3`).
     ///
     /// The dependency-ingress predicate must know whether an ingested queue can still satisfy
@@ -1550,6 +1599,7 @@ struct PresenterStatistics {
     shared_event_fallbacks_no_exact_producer: u32,
     shared_event_fallbacks_timeline_overflow: u32,
     shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics,
+    shared_event_ack_phases: SharedEventAckPhaseStatistics,
     terminal_publication: TerminalPublicationStatistics,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,
@@ -2040,6 +2090,13 @@ struct MetalPresenter {
     shared_event_direct_draw_admission: bool,
     /// Optional high-resolution attribution of presenter terminal-retirement work.
     terminal_publication_timing: bool,
+    /// Bounded command-buffer phase attribution for consumer acknowledgement batches.
+    shared_event_ack_phase_timing: bool,
+    shared_event_ack_phase_samples_remaining: u32,
+    shared_event_ack_batch_cpu: HashMap<u64, SharedEventAckBatchCpuPhases>,
+    pending_shared_event_ack_traces: HashMap<u64, PendingSharedEventAckTrace>,
+    shared_event_ack_traces: HashMap<usize, SharedEventAckTrace>,
+    shared_event_ack_trace_buffers_by_fence: HashMap<SharedEventFence, usize>,
     /// Monotonic marker for any explicit CPU settlement of guest Metal batches.
     /// Interval statistics reset, so they cannot reliably identify a drain inside one draw.
     guest_batch_cpu_synchronization_epoch: u64,
@@ -2248,13 +2305,23 @@ impl MetalPresenter {
                 .is_some_and(|value| value == "1");
         let terminal_publication_timing = std::env::var_os("REMU_GPU_TERMINAL_PHASES")
             .is_some_and(|value| value == "1");
+        let shared_event_ack_phase_timing = per_queue_guest_batches
+            && std::env::var_os("REMU_SHARED_EVENT_ACK_PHASES")
+                .is_some_and(|value| value == "1");
         if terminal_publication_timing {
             eprintln!(
                 "[REMu][PERF-GPU-TERMINAL] optional presenter terminal phase attribution enabled"
             );
         }
+        if shared_event_ack_phase_timing {
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-ACK-PHASE] bounded consumer acknowledgement attribution enabled samples-per-window=64"
+            );
+        }
+        let mut receiver = OrderedGpuEventReceiver::new(receiver);
+        receiver.set_event_queue_timing(shared_event_ack_phase_timing);
         Ok(Self {
-            receiver: OrderedGpuEventReceiver::new(receiver),
+            receiver,
             window: None,
             device: Some(device),
             layer: None,
@@ -2263,6 +2330,12 @@ impl MetalPresenter {
             per_queue_guest_batches,
             shared_event_direct_draw_admission,
             terminal_publication_timing,
+            shared_event_ack_phase_timing,
+            shared_event_ack_phase_samples_remaining: 64,
+            shared_event_ack_batch_cpu: HashMap::new(),
+            pending_shared_event_ack_traces: HashMap::new(),
+            shared_event_ack_traces: HashMap::new(),
+            shared_event_ack_trace_buffers_by_fence: HashMap::new(),
             guest_batch_cpu_synchronization_epoch: 0,
             active_guest_queue: None,
             guest_queue_batches: HashMap::new(),

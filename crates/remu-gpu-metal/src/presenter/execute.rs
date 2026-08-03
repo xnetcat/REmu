@@ -123,6 +123,7 @@ impl MetalPresenter {
     ) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let started = Instant::now();
+        let ack_phase_timing = self.shared_event_ack_phase_timing_enabled();
         let trace = draw.sequence <= 4 || draw.sequence.is_power_of_two();
         let targets = decode_render_targets(draw)?;
         let depth = decode_depth_target(draw)?;
@@ -1336,6 +1337,7 @@ impl MetalPresenter {
         } else {
             None
         };
+        let ack_metal_encoding_started = ack_phase_timing.then(Instant::now);
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
             let batch = batch
@@ -1675,6 +1677,7 @@ impl MetalPresenter {
                 );
             }
         }
+        let ack_metal_encoding_finished = ack_phase_timing.then(Instant::now);
 
         for (target, resident_descriptor) in targets.iter().zip(&target_resident_descriptors) {
             if target.direct_scanout {
@@ -2784,6 +2787,18 @@ impl MetalPresenter {
                     viewport.zfar,
                 );
             }
+        }
+        if let (Some(encoding_started), Some(encoding_finished)) =
+            (ack_metal_encoding_started, ack_metal_encoding_finished)
+        {
+            let finished = Instant::now();
+            self.record_shared_event_ack_batch_cpu_phases(
+                encoding_started
+                    .saturating_duration_since(started)
+                    .saturating_add(finished.saturating_duration_since(encoding_finished)),
+                encoding_finished.saturating_duration_since(encoding_started),
+                false,
+            );
         }
         let batch_full = self
             .active_open_guest_batch()
