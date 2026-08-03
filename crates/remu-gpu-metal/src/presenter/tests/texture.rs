@@ -54,6 +54,14 @@ fn upload_test_image_textures(
     presenter: &mut MetalPresenter,
     evaluation: &ShaderEvaluation,
 ) -> Vec<Texture> {
+    upload_test_image_textures_with_overrides(presenter, evaluation, &[])
+}
+
+fn upload_test_image_textures_with_overrides(
+    presenter: &mut MetalPresenter,
+    evaluation: &ShaderEvaluation,
+    overrides: &[SharedEventDrawTextureOverride],
+) -> Vec<Texture> {
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -73,7 +81,7 @@ fn upload_test_image_textures(
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
         ResidentTextureActivityStamp::default(),
-        &[],
+        overrides,
     )
     .expect("test image bindings upload")
     .into_iter()
@@ -1553,9 +1561,30 @@ fn load_before_store_binds_one_read_write_array_texture() {
 
     let (_combined_sender, combined_receiver) = std::sync::mpsc::channel();
     let mut combined = MetalPresenter::new(combined_receiver).expect("Metal presenter state");
-    let uploaded = upload_test_image_textures(&mut combined, &evaluation(vec![load, store]));
+    let sampled = fallback_image_descriptor(&load).expect("array fallback descriptor");
+    let device = combined.device.as_ref().expect("Metal device");
+    let retained_descriptor = TextureDescriptor::new();
+    retained_descriptor.set_texture_type(MTLTextureType::D2Array);
+    retained_descriptor.set_pixel_format(sampled.guest.pixel_format);
+    retained_descriptor.set_width(u64::from(sampled.guest.width));
+    retained_descriptor.set_height(u64::from(sampled.guest.height));
+    retained_descriptor.set_array_length(u64::from(sampled.layer_count.max(1)));
+    retained_descriptor.set_storage_mode(MTLStorageMode::Private);
+    retained_descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let retained = device.new_texture(&retained_descriptor);
+    let retained_pointer = retained.as_ptr();
+    let overrides = [SharedEventDrawTextureOverride {
+        sampled,
+        texture: retained,
+    }];
+    let uploaded = upload_test_image_textures_with_overrides(
+        &mut combined,
+        &evaluation(vec![load, store]),
+        &overrides,
+    );
     assert_eq!(uploaded.len(), 2);
     assert_eq!(uploaded[0].as_ptr(), uploaded[1].as_ptr());
+    assert_ne!(uploaded[0].as_ptr(), retained_pointer);
     assert_eq!(combined.fallback_texture_cache.len(), 1);
     for texture in &uploaded {
         assert_eq!(texture.texture_type(), MTLTextureType::D2Array);
