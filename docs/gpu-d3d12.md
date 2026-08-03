@@ -158,7 +158,23 @@ the failure. The executor now validates all direct and live-resolved indirect di
 shader/resource work. A subsequent 60-second DRED run rejected each oversized dispatch, completed
 six real flips, and reached submission 137 without device removal. One-shot removal reports now
 include DRED, page-fault, and available SDK debug-queue state; `REMU_TRACE_D3D12_BINDINGS=1` adds
-per-dispatch resource evidence for diagnosis.
+per-dispatch resource evidence for diagnosis. For buffers of at most 64 bytes, that trace includes
+the captured input, GPU readback, guarded publication result, and immediately observed guest words.
+This is intentionally opt-in because it snapshots live guest memory and produces high-volume logs.
+
+Translated-shader diagnostics are also opt-in. Set `REMU_DUMP_HLSL_DIR` to a directory to retain
+vertex/pixel HLSL and the corresponding typed guest IR. Compute programs are numerous, so they are
+only retained when `REMU_DUMP_HLSL_CS=all` or when that variable is the hexadecimal guest shader
+address printed in the AGC log (with or without `0x`). These files contain translated diagnostic
+material and must not be committed when they originate from a proprietary game.
+
+The Poppy counter pipeline has since been isolated further: a one-group reset clears a five-dword
+counter buffer, a 23x13 classifier accumulates into it, and a five-lane expander produces indirect
+triplets. Captured HLSL matches that flow and D3D12 readback observes valid reset/classifier output,
+but later ordered events can observe recycled guest bytes instead. A temporary Windows-only switch
+from identity leases to the live virtual address produced the same result, ruling out a stale mapped
+view as the sole cause. The remaining investigation is the event-completion/guest-reuse boundary;
+the oversized-dispatch rejection stays as a necessary device-safety check, not a compatibility fix.
 
 ## Crate and data-flow boundaries
 

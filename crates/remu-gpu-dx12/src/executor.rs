@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
@@ -691,12 +692,22 @@ impl Dx12GuestExecutor {
                 .global_memory_bindings
                 .iter()
                 .map(|binding| {
+                    let head = (binding.byte_count <= 64)
+                        .then(|| snapshot_global(binding).ok())
+                        .flatten()
+                        .map(|bytes| preview_words(&bytes))
+                        .unwrap_or_default();
                     format!(
-                        "{:#x}/{}:{}{}",
+                        "{:#x}/{}:{}{}{}",
                         binding.base_address,
                         binding.byte_count,
                         if binding.writable { "w" } else { "r" },
                         if binding.write_back_to_guest { "b" } else { "" },
+                        if head.is_empty() {
+                            String::new()
+                        } else {
+                            format!(":[{head}]")
+                        },
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1685,6 +1696,9 @@ impl Dx12GuestExecutor {
 
         let hlsl = translate_guest_shader(program, evaluation, options, threads_per_group)
             .map_err(|error| format!("{source_name} translation: {error}"))?;
+        if let Err(error) = dump_translated_shader(program, &hlsl, source_name) {
+            eprintln!("[REMu][D3D12] could not dump {source_name}: {error}");
+        }
         let compiled = self.compile_shader_cached(&hlsl, source_name)?;
         if self.translated_shader_cache.len() >= MAXIMUM_TRANSLATED_SHADER_CACHE_ENTRIES {
             // Bounded whole-cache eviction limits generated source/DXIL retention. Submitted draws
@@ -1905,6 +1919,48 @@ impl Dx12GuestExecutor {
             .insert(key, pipeline.clone());
         Ok(pipeline)
     }
+}
+
+/// Persist guest shader IR and translated HLSL for targeted Windows bring-up investigations.
+///
+/// `REMU_DUMP_HLSL_DIR` enables the dump. `REMU_DUMP_HLSL_CS` is deliberately required for
+/// compute shaders because games can compile hundreds of transient variants: use `all` or the
+/// hexadecimal guest shader address from the normal AGC log. Vertex and pixel shaders are dumped
+/// whenever the directory is enabled, matching the existing Metal diagnostics.
+fn dump_translated_shader(
+    program: &Program,
+    shader: &HlslShader,
+    source_name: &str,
+) -> Result<(), String> {
+    let Some(directory) = std::env::var_os("REMU_DUMP_HLSL_DIR") else {
+        return Ok(());
+    };
+    if source_name.starts_with("remu-cs-") {
+        let Some(filter) = std::env::var_os("REMU_DUMP_HLSL_CS") else {
+            return Ok(());
+        };
+        let filter = filter.to_string_lossy();
+        if !filter.eq_ignore_ascii_case("all") {
+            let filter = filter.strip_prefix("0x").unwrap_or(&filter);
+            let address = source_name
+                .strip_prefix("remu-cs-")
+                .and_then(|name| name.strip_suffix(".hlsl"));
+            if address != Some(filter) {
+                return Ok(());
+            }
+        }
+    }
+
+    let directory = Path::new(&directory);
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    let hlsl_path = directory.join(source_name);
+    std::fs::write(&hlsl_path, shader.source.as_bytes())
+        .map_err(|error| format!("write {}: {error}", hlsl_path.display()))?;
+    let stem = source_name.strip_suffix(".hlsl").unwrap_or(source_name);
+    let ir_path = directory.join(format!("{stem}-ir.txt"));
+    std::fs::write(&ir_path, format!("{:#?}\n", program.instructions))
+        .map_err(|error| format!("write {}: {error}", ir_path.display()))
 }
 
 fn dump_failed_graphics_pipeline(
@@ -6436,6 +6492,18 @@ fn write_back_globals(
         let current_bytes = bytes
             .get(..binding.byte_count)
             .ok_or("D3D12 writable global readback is shorter than its guest range")?;
+        if binding.byte_count <= 64
+            && std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
+        {
+            let guest_bytes = snapshot_global(binding)?;
+            eprintln!(
+                "[REMu][D3D12-WRITEBACK] address={:#x} baseline=[{}] gpu=[{}] guest=[{}]",
+                binding.base_address,
+                preview_words(&resource.original_bytes),
+                preview_words(current_bytes),
+                preview_words(&guest_bytes),
+            );
+        }
         let guard = resource
             .writeback_guard
             .as_ref()
@@ -6489,8 +6557,31 @@ fn write_back_globals(
                 0,
             )?,
         }
+        if binding.byte_count <= 64
+            && std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
+        {
+            let guest_bytes = snapshot_global(binding)?;
+            eprintln!(
+                "[REMu][D3D12-WRITEBACK] address={:#x} published=[{}]",
+                binding.base_address,
+                preview_words(&guest_bytes),
+            );
+        }
     }
     Ok(())
+}
+
+fn preview_words(bytes: &[u8]) -> String {
+    bytes
+        .chunks(4)
+        .take(16)
+        .map(|chunk| {
+            let mut word = [0_u8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            format!("{:08x}", u32::from_le_bytes(word))
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn write_changed_ranges_leased(
@@ -6511,7 +6602,17 @@ fn write_changed_ranges_leased(
             .ok_or_else(|| format!("D3D12 writable {resource_kind} changed address overflows"))?;
         let source = &current_bytes[start..end];
         let baseline = &original_bytes[start..end];
-        match lease.publish_run_if_baseline(run_offset, baseline, source) {
+        let outcome = lease.publish_run_if_baseline(run_offset, baseline, source);
+        if current_bytes.len() <= 64
+            && std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
+        {
+            eprintln!(
+                "[REMu][D3D12-WRITEBACK] address={address:#x} bytes={} guard=lease outcome={outcome:?} live_va_matches={}",
+                source.len(),
+                lease.live_va_matches(),
+            );
+        }
+        match outcome {
             LeasePublishOutcome::AppliedAtLiveVa => {
                 journal_guest_write(sites.live, address, source)
             }
