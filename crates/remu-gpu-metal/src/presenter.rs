@@ -193,7 +193,8 @@ use self::submission::{
     SAME_QUEUE_DMA_FILL_REJECT_COUNT, SHARED_EVENT_DRAW_REJECT_COUNT, SameQueueDmaFillReject,
     SharedEventDrawReject, append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
+    collect_shared_event_global_versions, completed_command_buffer_gpu_duration,
+    describe_guest_batch, guest_batch_writes_overlap,
 };
 #[cfg(test)]
 use self::submission::{
@@ -1507,11 +1508,19 @@ struct GuestQueueBatchState {
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
 }
 
+#[derive(Clone)]
 struct UploadedGlobalBuffer {
     buffer: Buffer,
     offset: u64,
     guest_memory: bool,
     physical_identity: Option<GuestSharedMappingIdentity>,
+    original_version: Option<GlobalBufferOriginalVersion>,
+}
+
+#[derive(Clone)]
+struct GlobalBufferOriginalVersion {
+    buffer: Buffer,
+    offset: u64,
 }
 
 struct PendingGlobalWriteback {
@@ -1522,6 +1531,7 @@ struct PendingGlobalWriteback {
     mapping_identity: Option<GuestSharedMappingIdentity>,
     write_watch: Option<CpuWriteWatch>,
     original_bytes: Vec<u8>,
+    original_version: Option<GlobalBufferOriginalVersion>,
 }
 
 struct PendingPresentation {
@@ -1648,6 +1658,9 @@ struct GuestCommandBatch {
     work: Vec<GuestBatchWork>,
     committed_at: Option<Instant>,
     global_upload_chunks: Vec<GlobalUploadChunk>,
+    /// Exact copied-buffer versions written by native work in this batch, including GPU-only
+    /// outputs which do not require guest publication at terminal completion.
+    global_buffer_versions: Vec<SharedEventGlobalBufferVersion>,
     global_writebacks: Vec<PendingGlobalWriteback>,
     guest_write_ranges: Vec<PendingGuestWriteRange>,
     memory_writes: Vec<PendingGuestMemoryWrite>,

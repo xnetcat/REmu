@@ -973,6 +973,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
+            global_buffer_versions: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),

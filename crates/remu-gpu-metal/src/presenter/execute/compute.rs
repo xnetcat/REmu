@@ -6,12 +6,12 @@ use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
     ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
     append_unique_global_writebacks, append_unique_guest_write_ranges,
-    collect_pending_global_writebacks, collect_pending_guest_write_ranges, compute_pipeline_key,
-    compute_program_can_split_wave64, create_global_argument_buffer, decode_image_descriptor,
-    diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
-    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
-    record_diagnostic_global_writers, record_diagnostic_texture_writer,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
+    collect_shared_event_global_versions, compute_pipeline_key, compute_program_can_split_wave64,
+    create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
+    dump_msl_compute_filter_matches, image_resource_descriptor_is_null, is_storage_image_opcode,
+    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
     storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
@@ -267,6 +267,8 @@ impl MetalPresenter {
         collect_pending_global_writebacks(&buffers, evaluation, &mut pending_writebacks)?;
         let mut pending_guest_write_ranges = Vec::new();
         collect_pending_guest_write_ranges(&buffers, evaluation, &mut pending_guest_write_ranges)?;
+        let mut produced_global_versions = Vec::new();
+        collect_shared_event_global_versions(&buffers, evaluation, &mut produced_global_versions)?;
         let ack_metal_encoding_started = ack_phase_started.map(|_| Instant::now());
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
@@ -357,6 +359,20 @@ impl MetalPresenter {
                 ),
                 (ComputeGrid::Threads(threads), _) => encoder
                     .dispatch_threads(MTLSize::new(threads[0], threads[1], threads[2]), local),
+            }
+            for version in produced_global_versions {
+                if let Some(existing) = batch.global_buffer_versions.iter_mut().find(|existing| {
+                    existing.byte_count == version.byte_count
+                        && match (existing.mapping_identity, version.mapping_identity) {
+                            (Some(existing), Some(version)) => existing == version,
+                            (None, None) => existing.guest_address == version.guest_address,
+                            _ => false,
+                        }
+                }) {
+                    *existing = version;
+                } else {
+                    batch.global_buffer_versions.push(version);
+                }
             }
         }
         let ack_metal_encoding_finished = ack_phase_started.map(|_| Instant::now());

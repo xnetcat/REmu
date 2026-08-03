@@ -86,6 +86,7 @@ impl MetalPresenter {
             offset: destination_offset,
             guest_memory: false,
             physical_identity: None,
+            original_version: None,
         })
     }
 }

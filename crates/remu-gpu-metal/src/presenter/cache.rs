@@ -3,12 +3,12 @@
 
 use super::{
     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
-    GlobalBufferCacheKey, GuestCommandBatch, MetalPresenter, NggSubgroupLimits,
-    PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
-    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
-    canonical_sampler_bindings, create_sampler_argument_buffer, describe_guest_batch,
-    effective_global_memory_binding, guest_batch_writes_overlap, guest_physical_ranges_overlap,
-    metal_buffer_with_bytes, prepare_ngg_meshlets,
+    GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
+    NggSubgroupLimits, PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY,
+    SamplerArgumentCacheKey, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
+    UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
+    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
+    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -371,8 +371,17 @@ impl MetalPresenter {
     ) -> Result<UploadedGlobalBuffer, String> {
         if binding.writable {
             return match source {
-                QueuedGlobalReadSource::Buffer { .. } => Err(
-                    "queued writable global source was not synchronized before staging".to_owned(),
+                QueuedGlobalReadSource::Buffer {
+                    buffer,
+                    offset,
+                    physical_identity,
+                    ..
+                } => self.upload_writable_global_buffer_from_gpu_version(
+                    device,
+                    binding,
+                    buffer,
+                    offset,
+                    physical_identity,
                 ),
                 QueuedGlobalReadSource::Synchronize => {
                     unreachable!("synchronizing global sources are handled before upload")
@@ -395,6 +404,7 @@ impl MetalPresenter {
                     offset,
                     guest_memory,
                     physical_identity,
+                    original_version: None,
                 })
             }
             QueuedGlobalReadSource::Synchronize => {
@@ -441,6 +451,7 @@ impl MetalPresenter {
                     offset: cached.offset,
                     guest_memory: false,
                     physical_identity: None,
+                    original_version: None,
                 });
             }
             let (buffer, offset) = self
@@ -460,6 +471,7 @@ impl MetalPresenter {
                 offset,
                 guest_memory: false,
                 physical_identity: None,
+                original_version: None,
             });
         }
         if let Some(cached) = self.global_buffer_cache.get(&key)
@@ -470,6 +482,7 @@ impl MetalPresenter {
                 offset: cached.offset,
                 guest_memory: false,
                 physical_identity: None,
+                original_version: None,
             });
         }
         // A stable guest address whose packet-time bytes keep changing is a transient constant
@@ -486,6 +499,7 @@ impl MetalPresenter {
                 offset,
                 guest_memory: false,
                 physical_identity: None,
+                original_version: None,
             });
         }
         if self.global_buffer_cache.len() >= GLOBAL_BUFFER_CACHE_CAPACITY
@@ -503,6 +517,7 @@ impl MetalPresenter {
                 offset,
                 guest_memory: false,
                 physical_identity: None,
+                original_version: None,
             });
         }
         let buffer = metal_buffer_with_bytes(device, &binding.data)?;
@@ -527,6 +542,7 @@ impl MetalPresenter {
             offset,
             guest_memory: false,
             physical_identity: None,
+            original_version: None,
         })
     }
 
@@ -591,6 +607,7 @@ impl MetalPresenter {
             offset: backing_range.resource_offset(),
             guest_memory: true,
             physical_identity: Some(physical_identity),
+            original_version: None,
         }))
     }
 
@@ -613,6 +630,71 @@ impl MetalPresenter {
             bytes.copy_from_slice(&binding.data);
         }
         self.new_exact_writable_global_buffer(device, binding, &bytes)
+    }
+
+    /// Forks an immutable queued producer version into writable consumer storage in GPU order.
+    ///
+    /// The active command buffer already contains any registered SharedEvent wait selected by
+    /// the scheduler. Closing its active encoder and appending this blit therefore establishes
+    /// `wait -> baseline copy -> consumer compute` without observing producer bytes on the CPU.
+    /// The source remains immutable and is retained as the completion-time diff baseline.
+    fn upload_writable_global_buffer_from_gpu_version(
+        &mut self,
+        device: &Device,
+        binding: &GlobalMemoryBinding,
+        source: Buffer,
+        source_offset: u64,
+        physical_identity: Option<GuestSharedMappingIdentity>,
+    ) -> Result<UploadedGlobalBuffer, String> {
+        if binding.byte_count == 0 {
+            return Err("queued writable global source is empty".to_owned());
+        }
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "queued writable global byte count does not fit Metal")?;
+        if source_offset
+            .checked_add(byte_count)
+            .is_none_or(|end| end > source.length())
+        {
+            return Err(format!(
+                "queued writable global source exceeds Metal buffer offset={source_offset} bytes={byte_count} length={}",
+                source.length(),
+            ));
+        }
+        let destination = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
+        destination.set_label(&format!(
+            "REMu COW writable global {:#x}/{byte_count:#x}",
+            binding.base_address,
+        ));
+        self.ensure_active_open_guest_batch()?;
+        let batch = self
+            .active_open_guest_batch_mut()
+            .expect("queued writable global COW opened a guest batch");
+        batch.close_active_pass_encoders();
+        let blit = batch.command_buffer.new_blit_command_encoder();
+        blit.set_label("REMu copy retained global baseline");
+        blit.copy_from_buffer(&source, source_offset, &destination, 0, byte_count);
+        blit.end_encoding();
+
+        static COW_COUNT: AtomicUsize = AtomicUsize::new(0);
+        let sequence = COW_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 16 || sequence.is_power_of_two() {
+            eprintln!(
+                "[REMu][METAL][GLOBAL-COW] sequence={sequence} address={:#x} bytes={byte_count:#x} source={:p}+{source_offset:#x} destination={:p} physical={physical_identity:?}",
+                binding.base_address,
+                source.as_ptr(),
+                destination.as_ptr(),
+            );
+        }
+        Ok(UploadedGlobalBuffer {
+            buffer: destination,
+            offset: 0,
+            guest_memory: false,
+            physical_identity,
+            original_version: Some(GlobalBufferOriginalVersion {
+                buffer: source,
+                offset: source_offset,
+            }),
+        })
     }
 
     fn new_exact_writable_global_buffer(
@@ -640,6 +722,7 @@ impl MetalPresenter {
             offset: 0,
             guest_memory: false,
             physical_identity: guest_shared_backing_identity(binding.base_address, byte_count),
+            original_version: None,
         })
     }
 
@@ -660,6 +743,7 @@ impl MetalPresenter {
             offset,
             guest_memory: false,
             physical_identity: None,
+            original_version: None,
         })
     }
 
@@ -673,14 +757,14 @@ impl MetalPresenter {
             let source =
                 queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
             if !matches!(source, QueuedGlobalReadSource::None) {
-                return Ok(synchronize_writable_global_source(binding, source));
+                return Ok(stageable_writable_global_source(binding, source));
             }
         }
         for batch in self.active_committed_guest_batches().iter().rev() {
             let source =
                 queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
             if !matches!(source, QueuedGlobalReadSource::None) {
-                return Ok(synchronize_writable_global_source(binding, source));
+                return Ok(stageable_writable_global_source(binding, source));
             }
         }
         if !self.per_queue_guest_batches {
@@ -694,7 +778,7 @@ impl MetalPresenter {
             binding.base_address,
             byte_count,
         );
-        Ok(synchronize_writable_global_source(binding, selected))
+        Ok(stageable_writable_global_source(binding, selected))
     }
 
     fn shared_event_dependency_global_read_source(
@@ -868,11 +952,19 @@ impl MetalPresenter {
     }
 }
 
-fn synchronize_writable_global_source(
+fn stageable_writable_global_source(
     binding: &GlobalMemoryBinding,
     source: QueuedGlobalReadSource,
 ) -> QueuedGlobalReadSource {
-    if binding.writable && matches!(source, QueuedGlobalReadSource::Buffer { .. }) {
+    if binding.writable
+        && matches!(
+            source,
+            QueuedGlobalReadSource::Buffer {
+                physical_identity: None,
+                ..
+            }
+        )
+    {
         QueuedGlobalReadSource::Synchronize
     } else {
         source
@@ -902,12 +994,21 @@ fn queued_global_read_source_in_batch_prefix(
     address: u64,
     byte_count: u64,
 ) -> QueuedGlobalReadSource {
+    let global_versions = &batch.global_buffer_versions;
     let global_writebacks = &batch.global_writebacks[..global_writeback_count];
     let guest_write_ranges = &batch.guest_write_ranges[..guest_write_range_count];
     let memory_writes = &batch.memory_writes[..memory_write_count];
     let overlaps = memory_writes
         .iter()
         .any(|write| write.overlaps(address, byte_count))
+        || global_versions.iter().any(|version| {
+            guest_physical_ranges_overlap(
+                version.guest_address,
+                version.byte_count,
+                address,
+                byte_count,
+            )
+        })
         || global_writebacks.iter().any(|writeback| {
             u64::try_from(writeback.byte_count).is_ok_and(|length| {
                 guest_physical_ranges_overlap(writeback.guest_address, length, address, byte_count)
@@ -926,6 +1027,41 @@ fn queued_global_read_source_in_batch_prefix(
         return QueuedGlobalReadSource::Synchronize;
     }
     let mut candidate: Option<(Buffer, u64, bool, Option<GuestSharedMappingIdentity>)> = None;
+    for version in global_versions {
+        match contained_global_version_offset(version, address, byte_count) {
+            QueuedWriteReadMatch::None => {}
+            QueuedWriteReadMatch::Synchronize => {
+                return QueuedGlobalReadSource::Synchronize;
+            }
+            QueuedWriteReadMatch::Buffer {
+                offset,
+                physical_identity,
+            } => {
+                if !merge_global_read_candidate(
+                    &mut candidate,
+                    &version.buffer,
+                    offset,
+                    false,
+                    physical_identity,
+                    byte_count,
+                ) {
+                    return QueuedGlobalReadSource::Synchronize;
+                }
+            }
+        }
+    }
+    if let Some((buffer, offset, guest_memory, physical_identity)) = candidate.take() {
+        // The first-class version journal is appended only after the producing native command.
+        // Its full-range COW baseline therefore subsumes older writeback/zero-copy producers for
+        // any contained read. Memory writes were checked above because they are terminal host
+        // effects and cannot be represented by this immutable Metal version.
+        return QueuedGlobalReadSource::Buffer {
+            buffer,
+            offset,
+            guest_memory,
+            physical_identity,
+        };
+    }
     for writeback in global_writebacks {
         match contained_global_writeback_offset(writeback, address, byte_count) {
             QueuedWriteReadMatch::None => {}

@@ -124,6 +124,9 @@ impl SharedEventSignalCheckpoint {
                 self.resident_texture_versions.push(version.clone());
             }
         }
+        for version in &batch.global_buffer_versions {
+            self.capture_global_version(version.clone());
+        }
         for writeback in &batch.global_writebacks[..global_writeback_count] {
             let Ok(byte_count) = u64::try_from(writeback.byte_count) else {
                 self.footprint_complete = false;
@@ -136,27 +139,7 @@ impl SharedEventSignalCheckpoint {
                 byte_count,
                 mapping_identity: writeback.mapping_identity,
             };
-            // Each writable copied binding gets fresh Metal storage. Replacing only the same
-            // exact guest-physical interval materializes the latest version as of this signal;
-            // partially overlapping intervals remain separate so consumers reject ambiguity.
-            if let Some(existing) = self.global_versions.iter_mut().find(|existing| {
-                existing.byte_count == version.byte_count
-                    && match (existing.mapping_identity, version.mapping_identity) {
-                        (Some(existing), Some(version)) => existing == version,
-                        (None, None) => existing.guest_address == version.guest_address,
-                        _ => false,
-                    }
-            }) {
-                *existing = version;
-            } else {
-                self.global_versions.push(version);
-            }
-            self.capture_physical_range(
-                SharedEventWriteKind::CopiedGlobal,
-                writeback.guest_address,
-                byte_count,
-                writeback.mapping_identity,
-            );
+            self.capture_global_version(version);
         }
         for range in &batch.guest_write_ranges[..guest_write_range_count] {
             self.unresolved_write_ranges
@@ -187,6 +170,30 @@ impl SharedEventSignalCheckpoint {
                 write.mapping_identity,
             );
         }
+    }
+
+    fn capture_global_version(&mut self, version: SharedEventGlobalBufferVersion) {
+        // Each writable copied binding gets fresh Metal storage. Replacing only the same exact
+        // guest-physical interval materializes the latest version as of this signal; partially
+        // overlapping intervals remain separate so consumers reject ambiguity.
+        if let Some(existing) = self.global_versions.iter_mut().find(|existing| {
+            existing.byte_count == version.byte_count
+                && match (existing.mapping_identity, version.mapping_identity) {
+                    (Some(existing), Some(version)) => existing == version,
+                    (None, None) => existing.guest_address == version.guest_address,
+                    _ => false,
+                }
+        }) {
+            *existing = version.clone();
+        } else {
+            self.global_versions.push(version.clone());
+        }
+        self.capture_physical_range(
+            SharedEventWriteKind::CopiedGlobal,
+            version.guest_address,
+            version.byte_count,
+            version.mapping_identity,
+        );
     }
 
     fn capture_physical_range(
@@ -1569,6 +1576,7 @@ fn new_guest_command_batch(
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
@@ -1846,7 +1854,14 @@ pub(crate) fn guest_batch_writes_overlap(
     address: u64,
     byte_count: u64,
 ) -> bool {
-    batch
+    batch.global_buffer_versions.iter().any(|version| {
+        guest_physical_ranges_overlap(
+            version.guest_address,
+            version.byte_count,
+            address,
+            byte_count,
+        )
+    }) || batch
         .guest_write_ranges
         .iter()
         .any(|range| pending_guest_write_range_overlaps(range, address, byte_count))
@@ -2031,16 +2046,22 @@ pub(crate) fn collect_pending_global_writebacks(
                 buffer.buffer.length()
             ));
         }
-        // This shared upload still contains the packet-time input because the owning command
-        // buffer has not been committed. Preserve it so completion can publish only bytes that
-        // the GPU actually changed, instead of restoring an entire stale CPU snapshot.
-        let original_bytes = unsafe {
-            std::slice::from_raw_parts(
-                buffer.buffer.contents().cast::<u8>().add(offset),
-                binding.byte_count,
-            )
-        }
-        .to_vec();
+        // Ordinary shared uploads still contain their packet-time input before commit. GPU-COW
+        // destinations do not: their baseline blit is intentionally pending behind a Metal
+        // event wait. Retain that immutable source and resolve it only after the consumer batch
+        // is terminal, when both source and destination are CPU-readable.
+        let (original_bytes, original_version) = if let Some(version) = &buffer.original_version {
+            (Vec::new(), Some(version.clone()))
+        } else {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.buffer.contents().cast::<u8>().add(offset),
+                    binding.byte_count,
+                )
+            }
+            .to_vec();
+            (bytes, None)
+        };
         pending.push(PendingGlobalWriteback {
             buffer: buffer.buffer.clone(),
             offset: buffer.offset,
@@ -2049,7 +2070,49 @@ pub(crate) fn collect_pending_global_writebacks(
             mapping_identity,
             write_watch,
             original_bytes,
+            original_version,
         });
+    }
+    Ok(())
+}
+
+pub(crate) fn collect_shared_event_global_versions(
+    buffers: &[UploadedGlobalBuffer],
+    evaluation: &ShaderEvaluation,
+    pending: &mut Vec<SharedEventGlobalBufferVersion>,
+) -> Result<(), String> {
+    if buffers.len() != evaluation.global_memory_bindings.len() {
+        return Err("Metal/global buffer binding count mismatch".to_owned());
+    }
+    for (buffer, binding) in buffers
+        .iter()
+        .zip(&evaluation.global_memory_bindings)
+        .filter(|(buffer, binding)| binding.writable && !buffer.guest_memory)
+    {
+        let byte_count = u64::try_from(binding.byte_count)
+            .map_err(|_| "writable global buffer byte count does not fit u64")?;
+        let mapping_identity = buffer
+            .physical_identity
+            .or_else(|| guest_shared_backing_identity(binding.base_address, byte_count));
+        let version = SharedEventGlobalBufferVersion {
+            buffer: buffer.buffer.clone(),
+            offset: buffer.offset,
+            guest_address: binding.base_address,
+            byte_count,
+            mapping_identity,
+        };
+        if let Some(existing) = pending.iter_mut().find(|existing| {
+            existing.byte_count == version.byte_count
+                && match (existing.mapping_identity, version.mapping_identity) {
+                    (Some(existing), Some(version)) => existing == version,
+                    (None, None) => existing.guest_address == version.guest_address,
+                    _ => false,
+                }
+        }) {
+            *existing = version;
+        } else {
+            pending.push(version);
+        }
     }
     Ok(())
 }
@@ -2132,13 +2195,7 @@ pub(crate) fn write_back_pending_globals(
 ) -> Result<Vec<&PendingGlobalWriteback>, String> {
     let mut applied = Vec::with_capacity(pending.len());
     for writeback in pending {
-        if writeback.original_bytes.len() != writeback.byte_count {
-            return Err(format!(
-                "writable global buffer snapshot length mismatch bytes={} snapshot={}",
-                writeback.byte_count,
-                writeback.original_bytes.len()
-            ));
-        }
+        let original_bytes = pending_global_original_bytes(writeback)?;
         let offset = usize::try_from(writeback.offset)
             .map_err(|_| "writable global buffer offset does not fit usize")?;
         let end = offset
@@ -2173,14 +2230,19 @@ pub(crate) fn write_back_pending_globals(
                     expected,
                     current,
                 );
-                write_changed_global_ranges_at_identity(writeback, current_bytes, expected)?
+                write_changed_global_ranges_at_identity(
+                    writeback,
+                    current_bytes,
+                    original_bytes,
+                    expected,
+                )?
             } else {
-                write_changed_global_ranges(writeback, current_bytes)?
+                write_changed_global_ranges(writeback, current_bytes, original_bytes)?
             }
         } else if let Some(write_watch) = writeback.write_watch.as_ref() {
-            match write_watch
-                .with_live_mapping(|| write_changed_global_ranges_direct(writeback, current_bytes))
-            {
+            match write_watch.with_live_mapping(|| {
+                write_changed_global_ranges_direct(writeback, current_bytes, original_bytes)
+            }) {
                 Ok(result) => {
                     result?;
                     GlobalWritebackOutcome::Applied
@@ -2203,7 +2265,7 @@ pub(crate) fn write_back_pending_globals(
         } else {
             #[cfg(test)]
             {
-                write_changed_global_ranges_direct(writeback, current_bytes)?;
+                write_changed_global_ranges_direct(writeback, current_bytes, original_bytes)?;
                 GlobalWritebackOutcome::Applied
             }
             #[cfg(not(test))]
@@ -2221,9 +2283,45 @@ pub(crate) fn write_back_pending_globals(
     Ok(applied)
 }
 
+fn pending_global_original_bytes(writeback: &PendingGlobalWriteback) -> Result<&[u8], String> {
+    let Some(version) = &writeback.original_version else {
+        if writeback.original_bytes.len() != writeback.byte_count {
+            return Err(format!(
+                "writable global buffer snapshot length mismatch bytes={} snapshot={}",
+                writeback.byte_count,
+                writeback.original_bytes.len(),
+            ));
+        }
+        return Ok(&writeback.original_bytes);
+    };
+    let offset = usize::try_from(version.offset)
+        .map_err(|_| "writable global baseline offset does not fit usize")?;
+    let end = offset
+        .checked_add(writeback.byte_count)
+        .ok_or("writable global baseline range overflow")?;
+    if u64::try_from(end).map_or(true, |end| end > version.buffer.length()) {
+        return Err(format!(
+            "writable global baseline exceeds Metal buffer offset={} bytes={} length={}",
+            version.offset,
+            writeback.byte_count,
+            version.buffer.length(),
+        ));
+    }
+    // SAFETY: the terminal PendingGlobalWriteback retains this shared source buffer, the bounds
+    // above cover the exact slice, and callers invoke this only after the consumer command buffer
+    // (including its baseline copy and compute write) reached a terminal state.
+    Ok(unsafe {
+        std::slice::from_raw_parts(
+            version.buffer.contents().cast::<u8>().add(offset),
+            writeback.byte_count,
+        )
+    })
+}
+
 fn write_changed_global_ranges(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
+    original_bytes: &[u8],
 ) -> Result<GlobalWritebackOutcome, String> {
     let expected = writeback
         .mapping_identity
@@ -2231,6 +2329,7 @@ fn write_changed_global_ranges(
     write_changed_global_ranges_with(
         writeback,
         current_bytes,
+        original_bytes,
         expected,
         GlobalWritePublishMode::RequireLiveVa,
     )
@@ -2239,11 +2338,13 @@ fn write_changed_global_ranges(
 fn write_changed_global_ranges_at_identity(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
+    original_bytes: &[u8],
     expected: GuestSharedMappingIdentity,
 ) -> Result<GlobalWritebackOutcome, String> {
     write_changed_global_ranges_with(
         writeback,
         current_bytes,
+        original_bytes,
         expected,
         GlobalWritePublishMode::ProducerIdentity,
     )
@@ -2258,20 +2359,17 @@ enum GlobalWritePublishMode {
 fn write_changed_global_ranges_with(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
+    original_bytes: &[u8],
     expected: GuestSharedMappingIdentity,
     mode: GlobalWritePublishMode,
 ) -> Result<GlobalWritebackOutcome, String> {
     let mut cursor = 0;
     while cursor < current_bytes.len() {
-        while cursor < current_bytes.len()
-            && current_bytes[cursor] == writeback.original_bytes[cursor]
-        {
+        while cursor < current_bytes.len() && current_bytes[cursor] == original_bytes[cursor] {
             cursor += 1;
         }
         let start = cursor;
-        while cursor < current_bytes.len()
-            && current_bytes[cursor] != writeback.original_bytes[cursor]
-        {
+        while cursor < current_bytes.len() && current_bytes[cursor] != original_bytes[cursor] {
             cursor += 1;
         }
         if start == cursor {
@@ -2417,20 +2515,17 @@ fn trace_discarded_stale_anonymous_global_writeback(
 fn write_changed_global_ranges_direct(
     writeback: &PendingGlobalWriteback,
     current_bytes: &[u8],
+    original_bytes: &[u8],
 ) -> Result<(), String> {
     let destination = usize::try_from(writeback.guest_address)
         .map_err(|_| "writable global buffer address does not fit usize")?;
     let mut cursor = 0;
     while cursor < current_bytes.len() {
-        while cursor < current_bytes.len()
-            && current_bytes[cursor] == writeback.original_bytes[cursor]
-        {
+        while cursor < current_bytes.len() && current_bytes[cursor] == original_bytes[cursor] {
             cursor += 1;
         }
         let start = cursor;
-        while cursor < current_bytes.len()
-            && current_bytes[cursor] != writeback.original_bytes[cursor]
-        {
+        while cursor < current_bytes.len() && current_bytes[cursor] != original_bytes[cursor] {
             cursor += 1;
         }
         if start == cursor {

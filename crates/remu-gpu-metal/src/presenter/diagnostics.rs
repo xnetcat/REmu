@@ -1980,6 +1980,7 @@ mod tests {
             offset: 9,
             guest_memory: false,
             physical_identity: None,
+            original_version: None,
         };
 
         assert_eq!(
@@ -2010,6 +2011,7 @@ mod tests {
             offset: 8,
             guest_memory: true,
             physical_identity: None,
+            original_version: None,
         };
         let snapshot = diagnostic_uploaded_global_binding_head(&binding, &uploaded);
 

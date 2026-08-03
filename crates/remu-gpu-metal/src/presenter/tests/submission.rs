@@ -27,16 +27,17 @@ use std::time::{Duration, Instant};
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
     SharedEventEventDisposition, append_unique_global_writebacks, append_unique_guest_write_ranges,
-    collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
+    collect_shared_event_global_versions, release_value_for_wait,
     shared_event_host_effect_is_resolved,
 };
 use super::super::{
     CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
     PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
     SameQueueDmaFillReject, SharedEventDrawReject, SharedEventFence,
-    SharedEventHostEffectLatencyPhase, SharedEventHostEffectLatencyState,
-    SharedEventHostEffectLatencyStatistics, SharedEventProducerId, SharedEventSignalCheckpoint,
-    SharedEventWriteKind, UploadedGlobalBuffer,
+    SharedEventGlobalBufferVersion, SharedEventHostEffectLatencyPhase,
+    SharedEventHostEffectLatencyState, SharedEventHostEffectLatencyStatistics,
+    SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -89,6 +90,7 @@ fn committed_per_queue_test_batch(
             work: Vec::new(),
             committed_at: Some(Instant::now()),
             global_upload_chunks: Vec::new(),
+            global_buffer_versions: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes,
@@ -409,6 +411,7 @@ fn record_zero_copy_guest_writer(
         offset: backing_range.resource_offset(),
         guest_memory: true,
         physical_identity: guest_shared_backing_identity(binding.base_address, byte_count),
+        original_version: None,
     };
     let evaluation = evaluation_with_global(binding.clone());
     let mut pending = Vec::new();
@@ -515,6 +518,7 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
@@ -736,6 +740,7 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
@@ -801,6 +806,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
@@ -877,6 +883,7 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
             mapping_identity: None,
             write_watch: None,
             original_bytes: vec![0; 64],
+            original_version: None,
         });
     let binding = GlobalMemoryBinding {
         scalar_address: 4,
@@ -964,6 +971,7 @@ fn queued_copied_writer_forwards_across_a_shifted_physical_alias() {
             mapping_identity: guest_shared_backing_identity(producer_address, producer_bytes),
             write_watch: None,
             original_bytes: vec![0; usize::try_from(producer_bytes).unwrap()],
+            original_version: None,
         });
     let consumer_binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -1425,6 +1433,13 @@ fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_evic
         &mut pending_consumer,
     )
     .unwrap();
+    let mut produced_versions = Vec::new();
+    collect_shared_event_global_versions(
+        std::slice::from_ref(&consumer),
+        &consumer_evaluation,
+        &mut produced_versions,
+    )
+    .unwrap();
     append_unique_global_writebacks(
         &mut presenter
             .open_guest_batch
@@ -1433,6 +1448,12 @@ fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_evic
             .global_writebacks,
         pending_consumer,
     );
+    presenter
+        .open_guest_batch
+        .as_mut()
+        .expect("producer batch stays open")
+        .global_buffer_versions
+        .extend(produced_versions);
 
     let third_binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -1452,6 +1473,118 @@ fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_evic
         third.buffer.as_ref()
     ));
     assert_eq!(third.offset, 16);
+}
+
+#[test]
+fn queued_writable_global_cow_copies_on_gpu_and_diffs_against_the_retained_baseline() {
+    const BYTE_COUNT: usize = 64;
+    let (_address_space, guest_address) = mapped_test_pages(1);
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+
+    let byte_count = u64::try_from(BYTE_COUNT).unwrap();
+    let identity = guest_shared_backing_identity(guest_address, byte_count)
+        .expect("mapped test range has an identity");
+    let source = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
+    // SAFETY: the newly allocated shared buffer contains BYTE_COUNT bytes.
+    unsafe {
+        std::ptr::write_bytes(source.contents().cast::<u8>(), 0, BYTE_COUNT);
+    }
+    {
+        let batch = presenter
+            .open_guest_batch
+            .as_mut()
+            .expect("producer batch remains open");
+        let fill = batch.command_buffer.new_blit_command_encoder();
+        fill.fill_buffer(&source, metal::NSRange::new(0, byte_count), 0x11);
+        fill.end_encoding();
+        batch
+            .global_buffer_versions
+            .push(SharedEventGlobalBufferVersion {
+                buffer: source.clone(),
+                offset: 0,
+                guest_address,
+                byte_count,
+                mapping_identity: Some(identity),
+            });
+        batch.global_writebacks.push(PendingGlobalWriteback {
+            buffer: source.clone(),
+            offset: 0,
+            guest_address,
+            byte_count: BYTE_COUNT,
+            mapping_identity: Some(identity),
+            write_watch: None,
+            original_bytes: vec![0; BYTE_COUNT],
+            original_version: None,
+        });
+    }
+
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: guest_address,
+        instruction_pcs: Default::default(),
+        byte_count: BYTE_COUNT,
+        data: vec![0; BYTE_COUNT],
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("queued producer version forks without host retirement");
+    assert_ne!(uploaded.buffer.as_ptr(), source.as_ptr());
+    assert!(uploaded.original_version.is_some());
+    assert!(presenter.committed_guest_batches.is_empty());
+
+    {
+        let batch = presenter
+            .open_guest_batch
+            .as_mut()
+            .expect("consumer batch remains open");
+        let mutate = batch.command_buffer.new_blit_command_encoder();
+        mutate.fill_buffer(&uploaded.buffer, metal::NSRange::new(8, 4), 0x22);
+        mutate.end_encoding();
+    }
+    let evaluation = evaluation_with_global(binding);
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("GPU baseline writeback is retained");
+    assert!(pending[0].original_bytes.is_empty());
+    assert!(pending[0].original_version.is_some());
+    append_unique_global_writebacks(
+        &mut presenter
+            .open_guest_batch
+            .as_mut()
+            .expect("consumer batch remains open")
+            .global_writebacks,
+        pending,
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("GPU COW batch settles and publishes");
+
+    let mut observed = [0_u8; BYTE_COUNT];
+    // SAFETY: `_address_space` retains this mapped range through the assertion.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            guest_address as *const u8,
+            observed.as_mut_ptr(),
+            BYTE_COUNT,
+        );
+    }
+    assert!(observed[..8].iter().all(|&byte| byte == 0x11));
+    assert_eq!(&observed[8..12], &[0x22; 4]);
+    assert!(observed[12..].iter().all(|&byte| byte == 0x11));
+    // SAFETY: source remains retained and shared after terminal retirement.
+    let source_bytes =
+        unsafe { std::slice::from_raw_parts(source.contents().cast::<u8>(), BYTE_COUNT) };
+    assert!(source_bytes.iter().all(|&byte| byte == 0x11));
 }
 
 #[test]
@@ -1655,6 +1788,7 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
@@ -1849,6 +1983,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 work: Vec::new(),
                 committed_at: None,
                 global_upload_chunks: Vec::new(),
+                global_buffer_versions: Vec::new(),
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
                 memory_writes,
@@ -1904,6 +2039,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
+            global_buffer_versions: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: vec![
@@ -1975,6 +2111,7 @@ fn fill_committed_guest_batch_budget(
                 work: Vec::new(),
                 committed_at: None,
                 global_upload_chunks: Vec::new(),
+                global_buffer_versions: Vec::new(),
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
                 memory_writes,
@@ -2107,6 +2244,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
@@ -2140,6 +2278,7 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         mapping_identity: None,
         write_watch: None,
         original_bytes: vec![0; destination.len()],
+        original_version: None,
     }])
     .expect("sliced global writeback");
     assert_eq!(destination, [9, 8, 7, 6]);
@@ -2165,6 +2304,7 @@ fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
         mapping_identity: None,
         write_watch: None,
         original_bytes: vec![1, 2, 3, 4],
+        original_version: None,
     }])
     .expect("changed global bytes write back");
 
@@ -2246,6 +2386,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
+            global_buffer_versions: Vec::new(),
             global_writebacks: vec![
                 PendingGlobalWriteback {
                     buffer: stale_buffer,
@@ -2255,6 +2396,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                     mapping_identity: Some(stale_identity),
                     write_watch: None,
                     original_bytes: vec![0; 4],
+                    original_version: None,
                 },
                 PendingGlobalWriteback {
                     buffer: valid_buffer,
@@ -2264,6 +2406,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                     mapping_identity: Some(valid_identity),
                     write_watch: None,
                     original_bytes: vec![0; 4],
+                    original_version: None,
                 },
             ],
             guest_write_ranges: Vec::new(),
@@ -2289,6 +2432,7 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
+            global_buffer_versions: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: vec![
@@ -2356,6 +2500,7 @@ fn malformed_global_writeback_remains_fatal() {
         mapping_identity: None,
         write_watch: None,
         original_bytes: vec![0; destination.len() - 1],
+        original_version: None,
     }])
     .err()
     .expect("a malformed snapshot must remain fatal");
@@ -2394,6 +2539,7 @@ fn anonymous_global_writeback_discards_replaced_guest_mapping() {
         mapping_identity: None,
         write_watch: Some(watch),
         original_bytes: vec![0; 4],
+        original_version: None,
     };
 
     address_space
@@ -2452,6 +2598,7 @@ fn anonymous_global_writeback_updates_the_pinned_guest_mapping() {
         mapping_identity: None,
         write_watch: Some(watch),
         original_bytes: vec![1, 2, 3, 4],
+        original_version: None,
     }])
     .expect("pinned anonymous writeback");
 
@@ -4390,6 +4537,66 @@ fn per_queue_flush_clears_only_its_transient_bindings() {
 }
 
 #[test]
+fn shared_event_checkpoint_retains_gpu_only_global_version_journal() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let (_global_space, guest_address) = mapped_test_pages(1);
+    let byte_count = 64_u64;
+    let buffer = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
+    open_per_queue_batch(&mut presenter, 41);
+    let producer = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists");
+    producer
+        .open_batch
+        .as_mut()
+        .expect("producer batch is open")
+        .global_buffer_versions
+        .push(SharedEventGlobalBufferVersion {
+            buffer: buffer.clone(),
+            offset: 0,
+            guest_address,
+            byte_count,
+            mapping_identity: guest_shared_backing_identity(guest_address, byte_count),
+        });
+    let fence = producer
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("producer fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(producer, fence);
+    assert!(checkpoint.footprint_complete);
+    assert_eq!(checkpoint.global_versions.len(), 1);
+    assert_eq!(
+        checkpoint.global_versions[0].buffer.as_ptr(),
+        buffer.as_ptr()
+    );
+
+    open_per_queue_batch(&mut presenter, 0);
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .resource_dependencies
+        .insert(fence.producer(), checkpoint);
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: guest_address,
+        instruction_pcs: Default::default(),
+        byte_count: usize::try_from(byte_count).unwrap(),
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("GPU-only checkpoint version forwards to the consumer");
+    assert_eq!(uploaded.buffer.as_ptr(), buffer.as_ptr());
+}
+
+#[test]
 fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
@@ -4426,6 +4633,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
+            original_version: None,
         });
     let fence = producer
         .shared_event_timeline
@@ -4448,6 +4656,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
+            original_version: None,
         });
 
     open_per_queue_batch(&mut presenter, 0);
@@ -4508,6 +4717,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
+            original_version: None,
         });
     assert!(
         !presenter.shared_event_dependencies_supply_draw_global_range(
@@ -5325,6 +5535,7 @@ fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
         mapping_identity: Some(copied_identity),
         write_watch: None,
         original_bytes: vec![0; 32],
+        original_version: None,
     });
     batch.guest_write_ranges.push(PendingGuestWriteRange {
         address: address + 64,

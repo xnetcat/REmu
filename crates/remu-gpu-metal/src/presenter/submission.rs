@@ -39,8 +39,8 @@ pub(crate) use self::batch::write_back_pending_globals;
 pub(crate) use self::batch::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
-    merge_guest_batch_result,
+    collect_shared_event_global_versions, completed_command_buffer_gpu_duration,
+    describe_guest_batch, guest_batch_writes_overlap, merge_guest_batch_result,
 };
 pub(crate) use self::draw_footprint::{SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject};
 pub(crate) use self::memory::{SAME_QUEUE_DMA_FILL_REJECT_COUNT, SameQueueDmaFillReject};
