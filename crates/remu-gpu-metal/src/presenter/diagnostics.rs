@@ -614,13 +614,37 @@ pub(super) fn trace_scanout_writes() -> bool {
 #[derive(Debug, Eq, PartialEq)]
 enum DiagnosticScanoutWriterFilter {
     Disabled,
-    All,
+    KnownScanout,
+    Any1080Color,
     Addresses(Vec<u64>),
 }
 
+impl DiagnosticScanoutWriterFilter {
+    fn selects(
+        &self,
+        pixel_shader_address: u64,
+        known_scanout: bool,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::KnownScanout => known_scanout,
+            Self::Any1080Color => width == 1_920 && height == 1_080,
+            Self::Addresses(addresses) => {
+                known_scanout && addresses.contains(&pixel_shader_address)
+            }
+        }
+    }
+}
+
 fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWriterFilter {
-    if value.trim().eq_ignore_ascii_case("auto") {
-        return DiagnosticScanoutWriterFilter::All;
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return DiagnosticScanoutWriterFilter::KnownScanout;
+    }
+    if value.eq_ignore_ascii_case("auto1080") {
+        return DiagnosticScanoutWriterFilter::Any1080Color;
     }
     let addresses = value
         .split(',')
@@ -637,32 +661,29 @@ fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWrite
 ///
 /// This diagnostic is deliberately narrower than `REMU_TRACE_SCANOUT_WRITES`: a title can issue
 /// dozens of UI writers per frame, and settling all of them would perturb the workload beyond
-/// recognition. The filter is either `auto` for every known scanout writer after the minimum
-/// draw, or comma-separated pixel-shader addresses in hexadecimal.
-pub(super) fn diagnostic_scanout_writer_selected(pixel_shader_address: u64) -> bool {
+/// recognition. `auto` selects known scanout writers, `auto1080` selects any 1920x1080 color
+/// target (including targets seen before VideoOut identity is known), and a comma-separated list
+/// selects known scanout writers with matching pixel-shader addresses.
+pub(super) fn diagnostic_scanout_writer_target_selected(
+    pixel_shader_address: u64,
+    known_scanout: bool,
+    width: u32,
+    height: u32,
+) -> bool {
     static FILTER: OnceLock<DiagnosticScanoutWriterFilter> = OnceLock::new();
-    match FILTER.get_or_init(|| {
+    FILTER
+        .get_or_init(|| {
             std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITERS")
                 .ok()
                 .map(|value| parse_diagnostic_scanout_writer_filter(&value))
                 .unwrap_or(DiagnosticScanoutWriterFilter::Disabled)
-        }) {
-        DiagnosticScanoutWriterFilter::Disabled => false,
-        DiagnosticScanoutWriterFilter::All => true,
-        DiagnosticScanoutWriterFilter::Addresses(addresses) => {
-            addresses.contains(&pixel_shader_address)
-        }
-    }
+        })
+        .selects(pixel_shader_address, known_scanout, width, height)
 }
 
 /// Allocates a bounded trace slot for a selected scanout writer.
-pub(super) fn diagnostic_scanout_writer_slot(
-    draw_sequence: u64,
-    pixel_shader_address: u64,
-) -> Option<u64> {
-    if draw_sequence < diagnostic_dump_target_minimum_draw()
-        || !diagnostic_scanout_writer_selected(pixel_shader_address)
-    {
+pub(super) fn diagnostic_scanout_writer_slot(draw_sequence: u64) -> Option<u64> {
+    if draw_sequence < diagnostic_dump_target_minimum_draw() {
         return None;
     }
     static LIMIT: OnceLock<u64> = OnceLock::new();
@@ -1800,12 +1821,31 @@ mod tests {
     fn scanout_writer_auto_filter_selects_runtime_discovered_writers() {
         assert_eq!(
             parse_diagnostic_scanout_writer_filter(" AUTO "),
-            DiagnosticScanoutWriterFilter::All
+            DiagnosticScanoutWriterFilter::KnownScanout
+        );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter(" auto1080 "),
+            DiagnosticScanoutWriterFilter::Any1080Color
         );
         assert_eq!(
             parse_diagnostic_scanout_writer_filter("invalid,,"),
             DiagnosticScanoutWriterFilter::Disabled
         );
+    }
+
+    #[test]
+    fn scanout_writer_filter_keeps_auto_strict_and_auto1080_extent_based() {
+        let known = DiagnosticScanoutWriterFilter::KnownScanout;
+        let any_1080 = DiagnosticScanoutWriterFilter::Any1080Color;
+        let addresses = DiagnosticScanoutWriterFilter::Addresses(vec![0x80d3_b70000]);
+
+        assert!(known.selects(0x1234, true, 1_280, 720));
+        assert!(!known.selects(0x1234, false, 1_920, 1_080));
+        assert!(any_1080.selects(0x1234, false, 1_920, 1_080));
+        assert!(!any_1080.selects(0x1234, false, 1_280, 720));
+        assert!(addresses.selects(0x80d3_b70000, true, 1_920, 1_080));
+        assert!(!addresses.selects(0x80d3_b70000, false, 1_920, 1_080));
+        assert!(!addresses.selects(0x1234, true, 1_920, 1_080));
     }
 
     #[test]

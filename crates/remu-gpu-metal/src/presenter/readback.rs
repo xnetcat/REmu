@@ -48,15 +48,8 @@ impl MetalPresenter {
         &mut self,
         slot: u64,
         draw: &IndexedDraw,
-        targets: &[DecodedRenderTarget],
+        target: DecodedRenderTarget,
     ) -> Result<(), String> {
-        let Some(target) = targets
-            .iter()
-            .find(|target| self.is_diagnostic_scanout_target(target))
-            .copied()
-        else {
-            return Ok(());
-        };
         let Some(capture_root) = self.capture_directory.clone() else {
             eprintln!(
                 "[REMu][METAL][SCANOUT-AFTER] slot={slot} draw={} ps={:#x} skipped: REMU_CAPTURE_DIR is unset",
