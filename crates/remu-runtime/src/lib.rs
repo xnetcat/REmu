@@ -4143,6 +4143,8 @@ fn process_time_since_nanos(now: u64, start: u64, counter: bool) -> u64 {
 
 fn reset_kernel_process_time() {
     PROCESS_START_NANOS.store(process_clock_nanos().max(1), Ordering::Release);
+    #[cfg(target_os = "macos")]
+    eprintln!("[REMu][TIME] process counter source=CLOCK_UPTIME_RAW-nanoseconds");
 }
 
 fn kernel_process_time(counter: bool) -> u64 {
