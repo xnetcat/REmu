@@ -26,6 +26,7 @@ use super::{
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 mod batch;
@@ -251,6 +252,9 @@ impl MetalPresenter {
                 }
                 let gpu_orderable = disposition == SharedEventEventDisposition::GpuOrderable;
                 if !gpu_orderable {
+                    if let GpuEvent::ComputeDispatch(dispatch) = &event {
+                        self.trace_shared_event_compute_gate(queue_id, &dependencies, dispatch);
+                    }
                     let acknowledgement_started = Instant::now();
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
                         Ok(acknowledgement) => acknowledgement,
@@ -1073,18 +1077,7 @@ impl MetalPresenter {
                 self.registered_wait_has_exact_shared_event_checkpoint(source, *id)
             }
             GpuEvent::ComputeDispatch(dispatch) => {
-                matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct)
-                    && dispatch.shader.as_ref().is_some_and(|snapshot| {
-                        dispatch
-                            .shader_evaluation
-                            .as_ref()
-                            .is_some_and(|evaluation| {
-                                compute_program_has_only_covered_readonly_buffers(
-                                    snapshot, evaluation,
-                                ) && self
-                                    .shared_event_dependencies_supply_compute_globals(evaluation)
-                            })
-                    })
+                self.shared_event_compute_reject(dispatch).is_none()
             }
             GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
                 self.active_open_guest_batch().is_some()
@@ -1132,6 +1125,93 @@ impl MetalPresenter {
                     .flat_map(|batch| &batch.signal_checkpoints)
                     .any(|checkpoint| checkpoint.fence == fence)
             })
+    }
+
+    fn shared_event_compute_reject(
+        &self,
+        dispatch: &remu_gpu::ComputeDispatch,
+    ) -> Option<SharedEventComputeReject> {
+        let snapshot = match dispatch.shader.as_ref() {
+            Some(snapshot) => snapshot,
+            None => return Some(SharedEventComputeReject::MissingShaderSnapshot),
+        };
+        let evaluation = match dispatch.shader_evaluation.as_ref() {
+            Some(evaluation) => evaluation,
+            None => return Some(SharedEventComputeReject::MissingShaderEvaluation),
+        };
+        compute_program_shared_event_reject(dispatch, snapshot, evaluation).or_else(|| {
+            (!self.shared_event_dependencies_supply_compute_globals(evaluation))
+                .then_some(SharedEventComputeReject::UnretainedGlobalVersion)
+        })
+    }
+
+    fn trace_shared_event_compute_gate(
+        &self,
+        consumer_queue_id: u64,
+        dependencies: &[super::SharedEventFence],
+        dispatch: &remu_gpu::ComputeDispatch,
+    ) {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        if !*ENABLED.get_or_init(|| {
+            std::env::var_os("REMU_TRACE_SHARED_EVENT_COMPUTE").is_some_and(|value| value == "1")
+        }) {
+            return;
+        }
+
+        static OCCURRENCES: AtomicUsize = AtomicUsize::new(0);
+        let occurrence = OCCURRENCES.fetch_add(1, Ordering::Relaxed) + 1;
+        if occurrence > 64 && !occurrence.is_power_of_two() {
+            return;
+        }
+
+        let reason = self
+            .shared_event_compute_reject(dispatch)
+            .map_or("non-compute-disposition", SharedEventComputeReject::label);
+        let (header_address, instruction_count, supplemental_count) =
+            dispatch.shader.as_ref().map_or((0, 0, 0), |snapshot| {
+                (
+                    snapshot.header_address,
+                    snapshot.program.instructions.len(),
+                    snapshot.supplemental_programs.len(),
+                )
+            });
+        let (global_count, writable_global_count, image_count, image_load_count, image_write_count) =
+            dispatch
+                .shader_evaluation
+                .as_ref()
+                .map_or((0, 0, 0, 0, 0), |evaluation| {
+                    (
+                        evaluation.global_memory_bindings.len(),
+                        evaluation
+                            .global_memory_bindings
+                            .iter()
+                            .filter(|binding| binding.writable)
+                            .count(),
+                        evaluation.image_bindings.len(),
+                        evaluation
+                            .image_bindings
+                            .iter()
+                            .filter(|binding| binding.opcode.starts_with("ImageLoad"))
+                            .count(),
+                        evaluation
+                            .image_bindings
+                            .iter()
+                            .filter(|binding| {
+                                binding.opcode.starts_with("ImageStore")
+                                    || binding.opcode.starts_with("ImageAtomic")
+                            })
+                            .count(),
+                    )
+                });
+        let dependency_text = dependencies
+            .iter()
+            .map(|fence| format!("q{}:{}", fence.producer().queue_id(), fence.value()))
+            .collect::<Vec<_>>()
+            .join(",");
+        eprintln!(
+            "[REMu][METAL][SHARED-COMPUTE-GATE] occurrence={occurrence} dispatch={} shader={:#x} header={header_address:#x} source={:?} consumer=q{consumer_queue_id} dependencies=[{dependency_text}] reason={reason} instructions={instruction_count} supplemental={supplemental_count} globals={global_count} writable-globals={writable_global_count} images={image_count} image-loads={image_load_count} image-writes={image_write_count}",
+            dispatch.sequence, dispatch.shader_address, dispatch.source,
+        );
     }
 }
 
@@ -1181,34 +1261,93 @@ pub(crate) fn shared_event_host_effect_is_resolved(
     terminal_reached
 }
 
-fn compute_program_has_only_covered_readonly_buffers(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SharedEventComputeReject {
+    IndirectDispatch,
+    MissingShaderSnapshot,
+    MissingShaderEvaluation,
+    SupplementalProgram,
+    NoGlobalBindings,
+    ImageBinding,
+    ImageInstruction,
+    GlobalStore,
+    GlobalAtomic,
+    UncoveredGlobalInstruction,
+    WritableGlobalBinding,
+    UnretainedGlobalVersion,
+}
+
+impl SharedEventComputeReject {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::IndirectDispatch => "indirect-dispatch",
+            Self::MissingShaderSnapshot => "missing-shader-snapshot",
+            Self::MissingShaderEvaluation => "missing-shader-evaluation",
+            Self::SupplementalProgram => "supplemental-program",
+            Self::NoGlobalBindings => "no-global-bindings",
+            Self::ImageBinding => "image-binding",
+            Self::ImageInstruction => "image-instruction",
+            Self::GlobalStore => "global-store",
+            Self::GlobalAtomic => "global-atomic",
+            Self::UncoveredGlobalInstruction => "uncovered-global-instruction",
+            Self::WritableGlobalBinding => "writable-global-binding",
+            Self::UnretainedGlobalVersion => "unretained-global-version",
+        }
+    }
+}
+
+fn compute_program_shared_event_reject(
+    dispatch: &remu_gpu::ComputeDispatch,
     snapshot: &remu_gpu::ShaderSnapshot,
     evaluation: &remu_shader::ShaderEvaluation,
-) -> bool {
-    if !snapshot.supplemental_programs.is_empty()
-        || evaluation.global_memory_bindings.is_empty()
-        || !evaluation.image_bindings.is_empty()
-    {
-        return false;
+) -> Option<SharedEventComputeReject> {
+    if !matches!(dispatch.source, remu_gpu::ComputeDispatchSource::Direct) {
+        return Some(SharedEventComputeReject::IndirectDispatch);
     }
+    if !snapshot.supplemental_programs.is_empty() {
+        return Some(SharedEventComputeReject::SupplementalProgram);
+    }
+    if evaluation.global_memory_bindings.is_empty() {
+        return Some(SharedEventComputeReject::NoGlobalBindings);
+    }
+    if !evaluation.image_bindings.is_empty() {
+        return Some(SharedEventComputeReject::ImageBinding);
+    }
+    if evaluation
+        .global_memory_bindings
+        .iter()
+        .any(|binding| binding.writable)
+    {
+        return Some(SharedEventComputeReject::WritableGlobalBinding);
+    }
+
     snapshot
         .program
         .instructions
         .iter()
-        .all(|instruction| match instruction.control {
-            Some(remu_shader::InstructionControl::Image(_)) => false,
+        .find_map(|instruction| match instruction.control {
+            Some(remu_shader::InstructionControl::Image(_)) => {
+                Some(SharedEventComputeReject::ImageInstruction)
+            }
             Some(
                 remu_shader::InstructionControl::GlobalMemory(_)
                 | remu_shader::InstructionControl::BufferMemory(_)
                 | remu_shader::InstructionControl::ScalarMemory(_),
             ) => {
-                !instruction.opcode.contains("Store")
-                    && !instruction.opcode.contains("Atomic")
-                    && evaluation
-                        .global_memory_bindings
-                        .iter()
-                        .any(|binding| binding.instruction_pcs.contains(&instruction.pc))
+                if instruction.opcode.contains("Store") {
+                    Some(SharedEventComputeReject::GlobalStore)
+                } else if instruction.opcode.contains("Atomic") {
+                    Some(SharedEventComputeReject::GlobalAtomic)
+                } else if !evaluation
+                    .global_memory_bindings
+                    .iter()
+                    .any(|binding| binding.instruction_pcs.contains(&instruction.pc))
+                {
+                    Some(SharedEventComputeReject::UncoveredGlobalInstruction)
+                } else {
+                    None
+                }
             }
-            _ => true,
+            _ => None,
         })
 }
