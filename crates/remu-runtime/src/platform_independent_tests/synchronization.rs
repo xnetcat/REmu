@@ -634,6 +634,58 @@ fn mutex_lookup_cache_does_not_resurrect_a_destroyed_generation() {
 }
 
 #[test]
+fn mutex_unlock_notifies_only_when_a_contender_is_waiting() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_1480;
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    crate::guest_sync::GUEST_MUTEX_WAKE_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(
+        crate::guest_sync::GUEST_MUTEX_WAKE_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an uncontended unlock has nobody to notify"
+    );
+
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    let contender = std::thread::spawn(move || {
+        assert_eq!(crate::guest_mutex_lock(address, false), 0);
+        assert_eq!(crate::guest_mutex_unlock(address), 0);
+    });
+    let entry = crate::guest_mutex_entry(address, false).expect("test mutex entry");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let waiters = entry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters;
+        if waiters == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest mutex contender did not block"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    contender.join().expect("guest mutex contender");
+    assert_eq!(
+        crate::guest_sync::GUEST_MUTEX_WAKE_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the single blocked contender needs exactly one host notification"
+    );
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+}
+
+#[test]
 fn mutex_unlock_rejects_missing_and_non_owner_mutexes() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
