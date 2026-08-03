@@ -53,6 +53,16 @@ pub use address_space::{
     write_guest_shared_backing_if_identity_and_baseline, write_guest_shared_backing_scattered,
 };
 
+/// Validated `GuestPtr` / `GuestSlice` access layer (plan M1). Depends on the shared-mapping
+/// registry, so it is available on the same hosts as [`GuestRangeLease`].
+#[cfg(target_os = "macos")]
+mod guest_ptr;
+#[cfg(target_os = "macos")]
+pub use guest_ptr::{
+    GuestAccessError, GuestAccessKind, GuestAccessPin, GuestPtr, GuestPtrOwned, GuestSlice,
+    GuestSliceOwned,
+};
+
 /// Guest page size is 16 KiB on every host. The sparse address-space backend that uses it is
 /// macOS-only today; analysis and page-alignment helpers still need the constant everywhere.
 #[cfg(not(target_os = "macos"))]

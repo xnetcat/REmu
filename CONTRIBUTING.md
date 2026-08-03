@@ -78,6 +78,9 @@ dumps, structured log diffs, and import audits (`scripts/audit-import-coverage.p
 headless runs (`REMU_HEADLESS_METAL=1`) for GPU validation and interactive windows only when
 window, input, or presentation behavior is itself under test.
 
+New `unsafe` outside `crates/remu-memory` must follow
+[docs/review-unsafe.md](docs/review-unsafe.md) (plan M4): name the invariant and who enforces it.
+
 ## Commits
 
 Keep commits small and focused, with lowercase imperative subjects (`resolve per-thread dynamic
