@@ -1271,6 +1271,7 @@ fn interactive_tick_captures_a_finalized_flip_before_accepting_its_replacement()
     ));
     std::fs::create_dir_all(&capture_directory).expect("create capture directory");
     presenter.capture_directory = Some(capture_directory.clone());
+    presenter.periodic_frame_capture = true;
 
     for flip_argument in [0x11, 0x22] {
         sender
@@ -1316,6 +1317,42 @@ fn interactive_tick_captures_a_finalized_flip_before_accepting_its_replacement()
             .expect("replacement scanout")
             .sequence,
         2
+    );
+    let _ = std::fs::remove_dir_all(capture_directory);
+}
+
+#[test]
+fn diagnostic_capture_root_does_not_enable_periodic_frame_capture() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let capture_directory = std::env::temp_dir().join(format!(
+        "remu-diagnostic-capture-root-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock follows Unix epoch")
+            .as_nanos(),
+    ));
+    std::fs::create_dir_all(&capture_directory).expect("create capture directory");
+    presenter.capture_directory = Some(capture_directory.clone());
+    presenter.periodic_frame_capture = false;
+    presenter.guest_bgra_bytes = vec![0xff; 4 * 4 * 4];
+
+    presenter.capture_guest_frame_if_changed(GuestTextureDescriptor {
+        address: 0x0070_1234_5600,
+        width: 4,
+        height: 4,
+        pitch: 4,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        bytes_per_pixel: 4,
+    });
+
+    assert_eq!(
+        std::fs::read_dir(&capture_directory)
+            .expect("read capture directory")
+            .count(),
+        0,
     );
     let _ = std::fs::remove_dir_all(capture_directory);
 }

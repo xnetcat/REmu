@@ -111,8 +111,8 @@ impl MetalPresenter {
         // becomes available. Do not let that fallback consume the capture interval: the first
         // translated snapshot is the authoritative evidence for what Metal is actually about to
         // present.
-        let first_translated_capture =
-            translated_snapshot.as_ref().is_some_and(|(descriptor, _)| {
+        let first_translated_capture = self.periodic_frame_capture
+            && translated_snapshot.as_ref().is_some_and(|(descriptor, _)| {
                 self.captured_guest_frames.len() < 128
                     && !self.captured_guest_frames.iter().any(
                         |(address, width, height, tile_mode, _)| {
@@ -126,7 +126,8 @@ impl MetalPresenter {
         if first_translated_capture {
             self.last_guest_capture = None;
         }
-        let capture_due = self.capture_directory.is_some()
+        let capture_due = self.periodic_frame_capture
+            && self.capture_directory.is_some()
             && (first_translated_capture
                 || self
                     .last_guest_capture

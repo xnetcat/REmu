@@ -1037,7 +1037,8 @@ impl MetalPresenter {
             bytes_per_row as u64,
         );
         self.active_translated_scanout = None;
-        let capture = (self.capture_directory.is_some()
+        let capture = (self.periodic_frame_capture
+            && self.capture_directory.is_some()
             && self
                 .last_guest_capture
                 .is_none_or(|last| last.elapsed() >= capture_interval()))

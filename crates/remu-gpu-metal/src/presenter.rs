@@ -2097,6 +2097,7 @@ struct MetalPresenter {
     pending_presentations: VecDeque<PendingPresentation>,
     statistics: PresenterStatistics,
     capture_directory: Option<PathBuf>,
+    periodic_frame_capture: bool,
     pressed_keys: HashSet<KeyCode>,
     shader_compile_sender: SyncSender<ShaderCompileRequest>,
     shader_compile_receiver: Receiver<ShaderCompileResult>,
@@ -2298,6 +2299,8 @@ impl MetalPresenter {
             pending_presentations: VecDeque::new(),
             statistics: PresenterStatistics::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
+            periodic_frame_capture: std::env::var_os("REMU_CAPTURE_FRAMES")
+                .is_some_and(|value| value == "1"),
             pressed_keys: HashSet::new(),
             shader_compile_sender,
             shader_compile_receiver,

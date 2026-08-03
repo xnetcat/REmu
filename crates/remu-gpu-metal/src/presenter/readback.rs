@@ -345,6 +345,9 @@ impl MetalPresenter {
     }
 
     pub(super) fn capture_guest_frame_if_changed(&mut self, descriptor: GuestTextureDescriptor) {
+        if !self.periodic_frame_capture {
+            return;
+        }
         let Some(directory) = self.capture_directory.as_deref() else {
             return;
         };
@@ -384,7 +387,8 @@ impl MetalPresenter {
         descriptor: GuestTextureDescriptor,
         native_bytes: &[u8],
     ) {
-        if self.capture_directory.is_none()
+        if !self.periodic_frame_capture
+            || self.capture_directory.is_none()
             || self
                 .last_guest_capture
                 .is_some_and(|last| last.elapsed() < capture_interval())
