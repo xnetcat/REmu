@@ -214,115 +214,231 @@ pub(super) fn native_libc_symbol_name(nid: &str) -> Option<&'static std::ffi::CS
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn record_direct_runtime_import(import: remu_gpu::DirectDispatchImport) {
-    remu_gpu::record_direct_dispatch_import(import);
+macro_rules! direct_runtime_import {
+    (
+        $plain:ident,
+        $instrumented:ident,
+        $import:ident,
+        ($($argument:ident: $argument_type:ty),* $(,)?) $body:block
+    ) => {
+        #[inline(always)]
+        extern "C" fn $plain($($argument: $argument_type),*) -> u64 $body
+
+        extern "C" fn $instrumented($($argument: $argument_type),*) -> u64 {
+            remu_gpu::record_direct_dispatch_import(remu_gpu::DirectDispatchImport::$import);
+            $plain($($argument),*)
+        }
+    };
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_sce_pthread_self() -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::ScePthreadSelf);
-    current_guest_thread_handle()
+direct_runtime_import!(
+    direct_sce_pthread_self,
+    instrumented_direct_sce_pthread_self,
+    ScePthreadSelf,
+    () { current_guest_thread_handle() }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_posix_pthread_self,
+    instrumented_direct_posix_pthread_self,
+    PosixPthreadSelf,
+    () { current_guest_thread_handle() }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_sce_pthread_get_thread_id,
+    instrumented_direct_sce_pthread_get_thread_id,
+    ScePthreadGetThreadId,
+    () { current_guest_thread_unique_id() }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_posix_pthread_get_specific,
+    instrumented_direct_posix_pthread_get_specific,
+    PosixPthreadGetSpecific,
+    (key: u64) { pthread_get_specific(low_u32(key)) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_sce_pthread_get_specific,
+    instrumented_direct_sce_pthread_get_specific,
+    ScePthreadGetSpecific,
+    (key: u64) { pthread_get_specific(low_u32(key)) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_posix_pthread_set_specific,
+    instrumented_direct_posix_pthread_set_specific,
+    PosixPthreadSetSpecific,
+    (key: u64, value: u64) {
+        posix_pthread_result(pthread_set_specific([key, value, 0, 0, 0, 0]))
+    }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_sce_pthread_set_specific,
+    instrumented_direct_sce_pthread_set_specific,
+    ScePthreadSetSpecific,
+    (key: u64, value: u64) { pthread_set_specific([key, value, 0, 0, 0, 0]) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_sce_guest_mutex_lock,
+    instrumented_direct_sce_guest_mutex_lock,
+    ScePthreadMutexLock,
+    (address: u64) { guest_mutex_lock(address, false) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_posix_guest_mutex_lock,
+    instrumented_direct_posix_guest_mutex_lock,
+    PosixPthreadMutexLock,
+    (address: u64) { guest_mutex_lock(address, false) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_sce_guest_mutex_unlock,
+    instrumented_direct_sce_guest_mutex_unlock,
+    ScePthreadMutexUnlock,
+    (address: u64) { guest_mutex_unlock(address) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_posix_guest_mutex_unlock,
+    instrumented_direct_posix_guest_mutex_unlock,
+    PosixPthreadMutexUnlock,
+    (address: u64) { guest_mutex_unlock(address) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_guest_rwlock_write_lock,
+    instrumented_direct_guest_rwlock_write_lock,
+    PosixPthreadRwlockWriteLock,
+    (address: u64) { guest_rwlock_lock(address, true, false) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_guest_rwlock_unlock,
+    instrumented_direct_guest_rwlock_unlock,
+    PosixPthreadRwlockUnlock,
+    (address: u64) { guest_rwlock_unlock(address) }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    direct_process_time_counter,
+    instrumented_direct_process_time_counter,
+    KernelGetProcessTimeCounter,
+    () { kernel_process_time(true) }
+);
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+macro_rules! direct_runtime_import_targets {
+    ($plain:ident, $instrumented:ident) => {
+        (
+            $plain as *const () as usize as u64,
+            $instrumented as *const () as usize as u64,
+        )
+    };
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_posix_pthread_self() -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadSelf);
-    current_guest_thread_handle()
+fn configured_direct_import_telemetry() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    static REPORTED: OnceLock<()> = OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_PERF_DIRECT_IMPORTS").is_some_and(|value| value == "1")
+    });
+    REPORTED.get_or_init(|| {
+        eprintln!(
+            "[REMu][PERF-DIRECT] link-time instrumentation={} environment=REMU_PERF_DIRECT_IMPORTS",
+            if enabled { "enabled" } else { "disabled" }
+        );
+    });
+    enabled
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_sce_pthread_get_thread_id() -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::ScePthreadGetThreadId);
-    current_guest_thread_unique_id()
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_posix_pthread_get_specific(key: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadGetSpecific);
-    pthread_get_specific(low_u32(key))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_sce_pthread_get_specific(key: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::ScePthreadGetSpecific);
-    pthread_get_specific(low_u32(key))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_posix_pthread_set_specific(key: u64, value: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadSetSpecific);
-    posix_pthread_result(pthread_set_specific([key, value, 0, 0, 0, 0]))
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_sce_pthread_set_specific(key: u64, value: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::ScePthreadSetSpecific);
-    pthread_set_specific([key, value, 0, 0, 0, 0])
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_sce_guest_mutex_lock(address: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::ScePthreadMutexLock);
-    guest_mutex_lock(address, false)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_posix_guest_mutex_lock(address: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadMutexLock);
-    guest_mutex_lock(address, false)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_sce_guest_mutex_unlock(address: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::ScePthreadMutexUnlock);
-    guest_mutex_unlock(address)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_posix_guest_mutex_unlock(address: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadMutexUnlock);
-    guest_mutex_unlock(address)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_guest_rwlock_write_lock(address: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadRwlockWriteLock);
-    guest_rwlock_lock(address, true, false)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_guest_rwlock_unlock(address: u64) -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::PosixPthreadRwlockUnlock);
-    guest_rwlock_unlock(address)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn direct_process_time_counter() -> u64 {
-    record_direct_runtime_import(remu_gpu::DirectDispatchImport::KernelGetProcessTimeCounter);
-    kernel_process_time(true)
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-pub(super) fn direct_runtime_import_target(nid: &str) -> Option<u64> {
+fn direct_runtime_import_targets(nid: &str) -> Option<(u64, u64)> {
     Some(match nid {
         // Unreal's archive/name parser calls these leaf TLS and synchronization operations
         // millions of times during startup. They already use dedicated sharded/thread-local
         // state and need neither the process dispatch lock nor a captured eight-XMM import frame.
-        "aI+OeCz8xrQ" => direct_sce_pthread_self as *const () as usize as u64,
-        "EotR8a3ASf4" => direct_posix_pthread_self as *const () as usize as u64,
-        "0-KXaS70xy4" => direct_posix_pthread_get_specific as *const () as usize as u64,
-        "eoht7mQOCmo" => direct_sce_pthread_get_specific as *const () as usize as u64,
-        "WrOLvHU0yQM" => direct_posix_pthread_set_specific as *const () as usize as u64,
-        "+BzXYkqYeLE" => direct_sce_pthread_set_specific as *const () as usize as u64,
-        "9UK1vLZQft4" => direct_sce_guest_mutex_lock as *const () as usize as u64,
-        "7H0iTOciTLo" => direct_posix_guest_mutex_lock as *const () as usize as u64,
-        "tn3VlD0hG60" => direct_sce_guest_mutex_unlock as *const () as usize as u64,
-        "2Z+PpY6CaJg" => direct_posix_guest_mutex_unlock as *const () as usize as u64,
-        "sIlRvQqsN2Y" => direct_guest_rwlock_write_lock as *const () as usize as u64,
-        "EgmLo6EWgso" => direct_guest_rwlock_unlock as *const () as usize as u64,
-        "EI-5-jlq2dE" => direct_sce_pthread_get_thread_id as *const () as usize as u64,
-        "fgxnMeTNUtY" => direct_process_time_counter as *const () as usize as u64,
+        "aI+OeCz8xrQ" => direct_runtime_import_targets!(
+            direct_sce_pthread_self,
+            instrumented_direct_sce_pthread_self
+        ),
+        "EotR8a3ASf4" => direct_runtime_import_targets!(
+            direct_posix_pthread_self,
+            instrumented_direct_posix_pthread_self
+        ),
+        "0-KXaS70xy4" => direct_runtime_import_targets!(
+            direct_posix_pthread_get_specific,
+            instrumented_direct_posix_pthread_get_specific
+        ),
+        "eoht7mQOCmo" => direct_runtime_import_targets!(
+            direct_sce_pthread_get_specific,
+            instrumented_direct_sce_pthread_get_specific
+        ),
+        "WrOLvHU0yQM" => direct_runtime_import_targets!(
+            direct_posix_pthread_set_specific,
+            instrumented_direct_posix_pthread_set_specific
+        ),
+        "+BzXYkqYeLE" => direct_runtime_import_targets!(
+            direct_sce_pthread_set_specific,
+            instrumented_direct_sce_pthread_set_specific
+        ),
+        "9UK1vLZQft4" => direct_runtime_import_targets!(
+            direct_sce_guest_mutex_lock,
+            instrumented_direct_sce_guest_mutex_lock
+        ),
+        "7H0iTOciTLo" => direct_runtime_import_targets!(
+            direct_posix_guest_mutex_lock,
+            instrumented_direct_posix_guest_mutex_lock
+        ),
+        "tn3VlD0hG60" => direct_runtime_import_targets!(
+            direct_sce_guest_mutex_unlock,
+            instrumented_direct_sce_guest_mutex_unlock
+        ),
+        "2Z+PpY6CaJg" => direct_runtime_import_targets!(
+            direct_posix_guest_mutex_unlock,
+            instrumented_direct_posix_guest_mutex_unlock
+        ),
+        "sIlRvQqsN2Y" => direct_runtime_import_targets!(
+            direct_guest_rwlock_write_lock,
+            instrumented_direct_guest_rwlock_write_lock
+        ),
+        "EgmLo6EWgso" => direct_runtime_import_targets!(
+            direct_guest_rwlock_unlock,
+            instrumented_direct_guest_rwlock_unlock
+        ),
+        "EI-5-jlq2dE" => direct_runtime_import_targets!(
+            direct_sce_pthread_get_thread_id,
+            instrumented_direct_sce_pthread_get_thread_id
+        ),
+        "fgxnMeTNUtY" => direct_runtime_import_targets!(
+            direct_process_time_counter,
+            instrumented_direct_process_time_counter
+        ),
         _ => return None,
+    })
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
+fn direct_runtime_import_target_with_telemetry(nid: &str, telemetry: bool) -> Option<u64> {
+    let (plain, instrumented) = direct_runtime_import_targets(nid)?;
+    Some(if telemetry { instrumented } else { plain })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+pub(super) fn direct_runtime_import_target(nid: &str) -> Option<u64> {
+    // The choice is made once while relocations are linked. Direct calls therefore contain no
+    // diagnostics branch in the guest hot path.
+    let (plain, instrumented) = direct_runtime_import_targets(nid)?;
+    Some(if configured_direct_import_telemetry() {
+        instrumented
+    } else {
+        plain
     })
 }
 
@@ -423,9 +539,10 @@ pub(super) fn synthetic_data_import_target(nid: &str) -> Option<u64> {
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 mod tests {
     use super::{
-        direct_posix_pthread_set_specific, direct_runtime_import_target,
-        direct_sce_pthread_get_thread_id, direct_sce_pthread_self,
-        direct_sce_pthread_set_specific, native_libc_symbol_name,
+        direct_posix_pthread_set_specific, direct_runtime_import_target_with_telemetry,
+        direct_sce_pthread_get_thread_id, direct_sce_pthread_self, direct_sce_pthread_set_specific,
+        instrumented_direct_sce_pthread_get_thread_id, instrumented_direct_sce_pthread_self,
+        native_libc_symbol_name,
     };
 
     #[test]
@@ -439,11 +556,11 @@ mod tests {
     #[test]
     fn pthread_set_specific_resolves_to_lock_free_leaf_targets() {
         assert_eq!(
-            direct_runtime_import_target("WrOLvHU0yQM"),
+            direct_runtime_import_target_with_telemetry("WrOLvHU0yQM", false),
             Some(direct_posix_pthread_set_specific as *const () as usize as u64)
         );
         assert_eq!(
-            direct_runtime_import_target("+BzXYkqYeLE"),
+            direct_runtime_import_target_with_telemetry("+BzXYkqYeLE", false),
             Some(direct_sce_pthread_set_specific as *const () as usize as u64)
         );
     }
@@ -455,6 +572,8 @@ mod tests {
         crate::set_current_guest_thread_unique_id(37);
         assert_eq!(direct_sce_pthread_self(), 0x9000_1234_0000);
         assert_eq!(direct_sce_pthread_get_thread_id(), 37);
+        assert_eq!(instrumented_direct_sce_pthread_self(), 0x9000_1234_0000);
+        assert_eq!(instrumented_direct_sce_pthread_get_thread_id(), 37);
         crate::set_current_guest_thread_handle(0);
         crate::set_current_guest_thread_unique_id(0);
 
@@ -466,6 +585,18 @@ mod tests {
         assert_eq!(
             sample.direct_import_calls_for(remu_gpu::DirectDispatchImport::ScePthreadGetThreadId),
             1
+        );
+    }
+
+    #[test]
+    fn direct_import_telemetry_is_selected_at_link_time() {
+        assert_eq!(
+            direct_runtime_import_target_with_telemetry("EI-5-jlq2dE", false),
+            Some(direct_sce_pthread_get_thread_id as *const () as usize as u64)
+        );
+        assert_eq!(
+            direct_runtime_import_target_with_telemetry("EI-5-jlq2dE", true),
+            Some(instrumented_direct_sce_pthread_get_thread_id as *const () as usize as u64)
         );
     }
 }
