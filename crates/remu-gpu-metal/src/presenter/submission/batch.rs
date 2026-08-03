@@ -555,32 +555,38 @@ impl MetalPresenter {
         &mut self,
         source: OrderedEventSource,
         sequence: u64,
-    ) {
+    ) -> bool {
         if !self.per_queue_guest_batches {
             if let Some(batch) = self.open_guest_batch.as_mut() {
                 batch.completion_sequences.push(sequence);
+                return super::guest_batch_completion_capacity_reached(
+                    batch.completion_sequences.len(),
+                );
             } else if let Some(batch) = self.committed_guest_batches.back_mut() {
                 batch.completion_sequences.push(sequence);
             } else {
                 self.publish_guest_submission_completion(sequence);
             }
-            return;
+            return false;
         }
         let OrderedEventSource::GuestQueue(queue_id) = source else {
             self.publish_guest_submission_completion(sequence);
-            return;
+            return false;
         };
         if let Some(state) = self.guest_queue_batches.get_mut(&queue_id) {
             if let Some(batch) = state.open_batch.as_mut() {
                 batch.completion_sequences.push(sequence);
-                return;
+                return super::guest_batch_completion_capacity_reached(
+                    batch.completion_sequences.len(),
+                );
             }
             if let Some(batch) = state.committed_batches.back_mut() {
                 batch.completion_sequences.push(sequence);
-                return;
+                return false;
             }
         }
         self.publish_guest_submission_completion(sequence);
+        false
     }
 
     pub(crate) fn active_transient_global_buffer_cache(
