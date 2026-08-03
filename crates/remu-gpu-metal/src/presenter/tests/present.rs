@@ -26,6 +26,24 @@ use super::{
 };
 
 #[test]
+fn presentation_runs_on_a_dedicated_metal_queue() {
+    // A4: the drawable present is committed on its own MTLCommandQueue, distinct from the guest
+    // command queue, so a present never queues behind guest submissions on one queue. Its ordering
+    // against the guest snapshot it samples is a SharedEvent wait (snapshot_wait), not a shared
+    // queue.
+    let (_sender, receiver) = gpu_event_channel();
+    let presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let guest = presenter.command_queue.as_ref().expect("guest command queue");
+    let present = presenter
+        .presentation_queue
+        .as_ref()
+        .expect("dedicated presentation queue");
+    // Distinct labels prove these are two separate MTLCommandQueue objects, not one shared queue.
+    assert_eq!(guest.label(), "REmu guest command queue");
+    assert_eq!(present.label(), "REmu presentation queue");
+}
+
+#[test]
 fn presenter_shows_and_hides_a_host_splash_without_guest_video_out() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");

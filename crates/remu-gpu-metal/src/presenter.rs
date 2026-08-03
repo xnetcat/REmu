@@ -2200,6 +2200,11 @@ struct MetalPresenter {
     device: Option<Device>,
     layer: Option<MetalLayer>,
     command_queue: Option<metal::CommandQueue>,
+    /// A4: presentation runs on its own `MTLCommandQueue`, distinct from the legacy guest command
+    /// queue, so a drawable present never serializes against guest submissions on one queue. Its
+    /// dependency on the guest snapshot it samples is expressed by a `SharedEvent` wait
+    /// (`snapshot_wait` in `present.rs`), not by sharing a queue.
+    presentation_queue: Option<metal::CommandQueue>,
     /// Wakes AppKit immediately when a guest Metal batch reaches a terminal state.
     event_loop_waker: Option<EventLoopProxy<()>>,
     per_queue_guest_batches: bool,
@@ -2330,6 +2335,11 @@ impl MetalPresenter {
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
         command_queue.set_label("REmu guest command queue");
+        // A4: a dedicated presentation queue. Ordering against the guest work it samples is a
+        // SharedEvent wait, so this queue can drain drawable presents without queueing behind
+        // guest submissions.
+        let presentation_queue = device.new_command_queue();
+        presentation_queue.set_label("REmu presentation queue");
         let presentation_resolution = PresentationResolution::from_environment()?;
         // Headless traces exercise the complete guest draw/compute/scanout path and capture the
         // finalized texture before CAMetalLayer presentation. They must not initialize the
@@ -2451,6 +2461,7 @@ impl MetalPresenter {
             device: Some(device),
             layer: None,
             command_queue: Some(command_queue),
+            presentation_queue: Some(presentation_queue),
             event_loop_waker: None,
             per_queue_guest_batches,
             shared_event_direct_draw_admission,

@@ -166,7 +166,11 @@ impl MetalPresenter {
         } else {
             MTLPixelFormat::BGRA8Unorm
         };
-        let (Some(layer), Some(queue)) = (self.layer.as_mut(), self.command_queue.as_ref()) else {
+        // A4: commit the drawable present on the dedicated presentation queue. Its ordering behind
+        // the guest snapshot it samples is the `snapshot_wait` SharedEvent wait below, not a shared
+        // queue.
+        let (Some(layer), Some(queue)) = (self.layer.as_mut(), self.presentation_queue.as_ref())
+        else {
             return;
         };
         // Present at most once per hardware vblank (plan E1). The display link's stamp wakes
