@@ -1266,14 +1266,13 @@ pub(super) fn diagnostic_uploaded_global_binding_head(
         if byte_count == 0 {
             return Ok(Vec::new());
         }
-        let contents = uploaded.buffer.contents().cast::<u8>();
-        if contents.is_null() {
-            return Err("Metal buffer storage is not CPU-visible".to_owned());
-        }
-        // SAFETY: the range helper proved `start + byte_count <= buffer.length()`. The caller
-        // completed every command buffer that can access this shared/managed resource, and
-        // `contents` was checked for CPU visibility before constructing the slice.
-        Ok(unsafe { std::slice::from_raw_parts(contents.add(start), byte_count) }.to_vec())
+        // The range helper proved `start + byte_count <= buffer.length()`, and the caller
+        // completed every command buffer that can access this shared/managed resource; a
+        // non-CPU-visible mapping yields a zero-length window.
+        super::MetalBytes::new(&uploaded.buffer)
+            .slice(start, byte_count)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| "Metal buffer storage is not CPU-visible".to_owned())
     });
     DiagnosticUploadedGlobalBinding {
         offset: uploaded.offset,
@@ -1962,9 +1961,10 @@ mod tests {
     fn uploaded_global_binding_snapshot_uses_submitted_offset_and_extent() {
         let device = Device::system_default().expect("Metal device");
         let buffer = device.new_buffer(24, MTLResourceOptions::StorageModeShared);
-        // SAFETY: the shared test buffer exposes exactly 24 writable bytes.
-        let contents =
-            unsafe { std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>(), 24) };
+        let bytes = super::super::MetalBytes::new(&buffer);
+        let contents = bytes
+            .slice_mut(0, 24)
+            .expect("the shared test buffer exposes exactly 24 writable bytes");
         contents.copy_from_slice(&(0_u8..24).collect::<Vec<_>>());
         let binding = GlobalMemoryBinding {
             scalar_address: 4,

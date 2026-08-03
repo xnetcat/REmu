@@ -1249,15 +1249,12 @@ impl MetalPresenter {
                     .ok_or("diagnostic pixel-output byte count overflow")?;
                 let buffer = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
                 buffer.set_label("REMu diagnostic pixel outputs");
-                // SAFETY: the newly allocated shared buffer exposes exactly `byte_count` bytes.
-                unsafe {
-                    std::ptr::write_bytes(
-                        buffer.contents().cast::<u8>(),
-                        0,
-                        usize::try_from(byte_count)
-                            .expect("diagnostic pixel-output byte count fits usize"),
-                    );
-                }
+                let byte_count = usize::try_from(byte_count)
+                    .expect("diagnostic pixel-output byte count fits usize");
+                assert!(
+                    super::MetalBytes::new(&buffer).fill(0, 0, byte_count),
+                    "the newly allocated shared buffer exposes exactly byte_count bytes"
+                );
                 self.diagnostic_pixel_output_buffer = Some(buffer);
             }
             self.diagnostic_pixel_output_buffer.clone()
@@ -2538,11 +2535,9 @@ impl MetalPresenter {
                         let indices = indexed_draw.as_ref()?.0.as_ref();
                         let word_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
                             .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)?;
-                        // SAFETY: the diagnostic buffer is allocated above with exactly this many
-                        // shared u32 words and the completed command batch is waited before readback.
-                        let words = unsafe {
-                            std::slice::from_raw_parts(buffer.contents().cast::<u32>(), word_count)
-                        };
+                        // The diagnostic buffer is allocated above with exactly this many shared
+                        // u32 words and the completed command batch is waited before readback.
+                        let words = super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
                         let mut seen = HashSet::new();
                         Some(
                             indices
@@ -2583,11 +2578,9 @@ impl MetalPresenter {
                         let word_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
                             .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)?
                             .checked_mul(5)?;
-                        // SAFETY: the shared diagnostic buffer is allocated with exactly this
-                        // many words and the command batch has completed before this readback.
-                        let words = unsafe {
-                            std::slice::from_raw_parts(buffer.contents().cast::<u32>(), word_count)
-                        };
+                        // The shared diagnostic buffer is allocated with exactly this many words
+                        // and the command batch has completed before this readback.
+                        let words = super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
                         let covered = words.chunks_exact(5).filter(|pixel| pixel[0] != 0).count();
                         let nonzero = words
                             .chunks_exact(5)
@@ -2946,16 +2939,14 @@ impl MetalPresenter {
                 .enumerate()
                 .filter(|(_, (binding, _))| binding.byte_count <= 4 * 1024 * 1024)
             {
-                let contents = uploaded.buffer.contents().cast::<u8>();
                 let offset = usize::try_from(uploaded.offset)
                     .map_err(|_| "video global-buffer offset does not fit usize")?;
-                if contents.is_null() {
+                // Every uploaded global buffer is shared CPU-visible storage; skip any that is not
+                // mapped or whose validated extent no longer fits (null contents -> zero length).
+                let uploaded_bytes = super::MetalBytes::new(&uploaded.buffer);
+                let Some(data) = uploaded_bytes.slice(offset, binding.byte_count) else {
                     continue;
-                }
-                // SAFETY: every uploaded global buffer is shared CPU-visible storage and the
-                // binding extent was validated when the buffer and its byte offset were created.
-                let data =
-                    unsafe { std::slice::from_raw_parts(contents.add(offset), binding.byte_count) };
+                };
                 let binding_path = directory.join(format!(
                     "draw-{}-export-binding-{index}-{:x}-{}.bin",
                     draw.sequence, binding.base_address, binding.byte_count,

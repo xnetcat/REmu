@@ -30,6 +30,7 @@ mod display_link;
 mod execute;
 mod format;
 mod host_ui;
+mod metal_bytes;
 mod present;
 mod readback;
 mod sampler;
@@ -160,6 +161,7 @@ use self::shader::{
     rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
     truncated_memoryless_ngg_rectangle_cover,
 };
+use self::metal_bytes::MetalBytes;
 use self::shared_event::{
     GpuWaitFenceMap, SharedEventFence, SharedEventProducerId, SharedEventTimeline,
 };

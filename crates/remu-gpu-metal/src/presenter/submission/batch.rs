@@ -1852,16 +1852,12 @@ impl GuestCommandBatch {
         bytes: &[u8],
     ) -> Result<(Buffer, u64), String> {
         let (buffer, offset) = self.reserve_global_upload(device, bytes.len())?;
-        if !bytes.is_empty() {
-            // SAFETY: the shared Metal buffer is at least `aligned_byte_count` bytes beyond
-            // `offset`, and the source slice remains live for the exact non-overlapping copy.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    buffer.contents().cast::<u8>().add(offset),
-                    bytes.len(),
-                );
-            }
+        if !bytes.is_empty() && !super::super::MetalBytes::new(&buffer).write(offset, bytes) {
+            return Err(format!(
+                "global upload range {offset}+{} exceeds Metal buffer length {}",
+                bytes.len(),
+                buffer.length()
+            ));
         }
         Ok((
             buffer,
@@ -1884,12 +1880,15 @@ impl GuestCommandBatch {
             return Err("guest global upload is empty".to_owned());
         }
         let (buffer, offset) = self.reserve_global_upload(device, byte_count)?;
-        // SAFETY: `reserve_global_upload` retained a shared Metal buffer with at least
-        // `byte_count` bytes at `offset`. The temporary slice is used only for this synchronous
-        // backing copy and cannot outlive or alias a second mutable arena reservation.
-        let destination = unsafe {
-            std::slice::from_raw_parts_mut(buffer.contents().cast::<u8>().add(offset), byte_count)
-        };
+        // `reserve_global_upload` retained a shared Metal buffer with at least `byte_count` bytes
+        // at `offset`. This mutable window is used only for the synchronous backing copy below.
+        let bytes = super::super::MetalBytes::new(&buffer);
+        let destination = bytes.slice_mut(offset, byte_count).ok_or_else(|| {
+            format!(
+                "guest global upload range {offset}+{byte_count} exceeds Metal buffer length {}",
+                buffer.length()
+            )
+        })?;
         if !read_guest_shared_backing(guest_address, destination) {
             return Err(format!(
                 "synchronized global binding {guest_address:#x}/{byte_count} has no readable guest backing"
@@ -2143,13 +2142,10 @@ pub(crate) fn collect_pending_global_writebacks(
         let (original_bytes, original_version) = if let Some(version) = &buffer.original_version {
             (Vec::new(), Some(version.clone()))
         } else {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    buffer.buffer.contents().cast::<u8>().add(offset),
-                    binding.byte_count,
-                )
-            }
-            .to_vec();
+            let bytes = super::super::MetalBytes::new(&buffer.buffer)
+                .slice(offset, binding.byte_count)
+                .ok_or("writable global source range exceeds its Metal buffer")?
+                .to_vec();
             (bytes, None)
         };
         pending.push(PendingGlobalWriteback {
@@ -2299,12 +2295,9 @@ pub(crate) fn write_back_pending_globals(
                 writeback.buffer.length()
             ));
         }
-        let current_bytes = unsafe {
-            std::slice::from_raw_parts(
-                writeback.buffer.contents().cast::<u8>().add(offset),
-                writeback.byte_count,
-            )
-        };
+        let current_bytes = super::super::MetalBytes::new(&writeback.buffer)
+            .slice(offset, writeback.byte_count)
+            .ok_or("writable global writeback range exceeds its Metal buffer")?;
         let outcome = if let Some(lease) = writeback.lease.as_ref() {
             let byte_count = u64::try_from(writeback.byte_count)
                 .map_err(|_| "writable global buffer byte count does not fit u64")?;
@@ -2390,15 +2383,11 @@ fn pending_global_original_bytes(writeback: &PendingGlobalWriteback) -> Result<&
             version.buffer.length(),
         ));
     }
-    // SAFETY: the terminal PendingGlobalWriteback retains this shared source buffer, the bounds
-    // above cover the exact slice, and callers invoke this only after the consumer command buffer
-    // (including its baseline copy and compute write) reached a terminal state.
-    Ok(unsafe {
-        std::slice::from_raw_parts(
-            version.buffer.contents().cast::<u8>().add(offset),
-            writeback.byte_count,
-        )
-    })
+    // The bounds above cover the exact slice, and callers invoke this only after the consumer
+    // command buffer (baseline copy + compute write) reached a terminal state.
+    super::super::MetalBytes::new(&version.buffer)
+        .slice(offset, writeback.byte_count)
+        .ok_or_else(|| "writable global baseline exceeds its Metal buffer".to_owned())
 }
 
 fn write_changed_global_ranges_leased(

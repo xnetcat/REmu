@@ -535,13 +535,12 @@ impl PendingTextureReadback {
         let staging_length = usize::try_from(self.layout.staging_length)
             .map_err(|_| "Metal texture readback staging size does not fit usize")?;
         let packed_length = self.layout.packed_length(self.height)?;
-        let contents = self.staging.contents().cast::<u8>();
-        if contents.is_null() {
-            return Err("Metal shared texture readback buffer has no CPU mapping".to_owned());
-        }
-        // SAFETY: The shared buffer remains owned by `self`, its completed blit wrote exactly
-        // `staging_length` bytes, and `contents` is non-null for this CPU-visible storage mode.
-        let staged = unsafe { std::slice::from_raw_parts(contents, staging_length) };
+        // The shared buffer remains owned by `self` and its completed blit wrote exactly
+        // `staging_length` bytes; a non-CPU-visible mapping yields a zero-length window.
+        let staging_bytes = super::MetalBytes::new(&self.staging);
+        let staged = staging_bytes.slice(0, staging_length).ok_or(
+            "Metal shared texture readback buffer has no CPU mapping or is smaller than declared",
+        )?;
         let mut packed = vec![0_u8; packed_length];
         for row in 0..usize::try_from(self.height).map_err(|_| "height does not fit usize")? {
             let source = row * staging_row;
@@ -1428,13 +1427,12 @@ pub(super) fn read_texture_volume_linear(
     let packed_length = packed_image
         .checked_mul(depth)
         .ok_or("Metal volume packed size overflows")?;
-    let contents = staging.contents().cast::<u8>();
-    if contents.is_null() {
-        return Err("Metal shared volume readback buffer has no CPU mapping".to_owned());
-    }
-    // SAFETY: the shared staging buffer remains live, and the completed blit initialized its
-    // complete declared extent.
-    let staged = unsafe { std::slice::from_raw_parts(contents, staging_length) };
+    // The shared staging buffer remains live and its completed blit initialized the full declared
+    // extent; a non-CPU-visible mapping yields a zero-length window.
+    let staging_bytes = super::MetalBytes::new(&staging);
+    let staged = staging_bytes.slice(0, staging_length).ok_or(
+        "Metal shared volume readback buffer has no CPU mapping or is smaller than declared",
+    )?;
     let mut packed = vec![0_u8; packed_length];
     for z in 0..depth {
         for y in 0..height {
