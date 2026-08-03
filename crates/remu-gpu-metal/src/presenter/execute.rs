@@ -718,6 +718,7 @@ impl MetalPresenter {
             .find(|target| {
                 diagnostic_scanout_writer_target_selected(
                     draw.pixel_shader_address,
+                    target.texture.address,
                     self.is_diagnostic_scanout_target(target),
                     target.texture.width,
                     target.texture.height,

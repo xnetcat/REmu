@@ -618,12 +618,14 @@ enum DiagnosticScanoutWriterFilter {
     Any1080Color,
     Addresses(Vec<u64>),
     Any1080Addresses(Vec<u64>),
+    TargetAddresses(Vec<u64>),
 }
 
 impl DiagnosticScanoutWriterFilter {
     fn selects(
         &self,
         pixel_shader_address: u64,
+        target_address: u64,
         known_scanout: bool,
         width: u32,
         height: u32,
@@ -640,6 +642,7 @@ impl DiagnosticScanoutWriterFilter {
                     && height == 1_080
                     && addresses.contains(&pixel_shader_address)
             }
+            Self::TargetAddresses(addresses) => addresses.contains(&target_address),
         }
     }
 }
@@ -652,17 +655,21 @@ fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWrite
     if value.eq_ignore_ascii_case("auto1080") {
         return DiagnosticScanoutWriterFilter::Any1080Color;
     }
-    let (addresses, any_1080) = value
+    let (addresses, mode) = value
         .strip_prefix("auto1080:")
-        .map_or((value, false), |addresses| (addresses, true));
+        .map(|addresses| (addresses, "auto1080"))
+        .or_else(|| value.strip_prefix("targets:").map(|addresses| (addresses, "targets")))
+        .unwrap_or((value, "known"));
     let addresses = addresses
         .split(',')
         .filter_map(|part| parse_diagnostic_hex_address(part.trim()))
         .collect::<Vec<_>>();
     if addresses.is_empty() {
         DiagnosticScanoutWriterFilter::Disabled
-    } else if any_1080 {
+    } else if mode == "auto1080" {
         DiagnosticScanoutWriterFilter::Any1080Addresses(addresses)
+    } else if mode == "targets" {
+        DiagnosticScanoutWriterFilter::TargetAddresses(addresses)
     } else {
         DiagnosticScanoutWriterFilter::Addresses(addresses)
     }
@@ -675,9 +682,11 @@ fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWrite
 /// recognition. `auto` selects known scanout writers, `auto1080` selects any 1920x1080 color
 /// target (including targets seen before VideoOut identity is known), a comma-separated list
 /// selects known scanout writers with matching pixel-shader addresses, and `auto1080:<list>`
-/// selects matching shaders on any 1080p color target.
+/// selects matching shaders on any 1080p color target. `targets:<list>` selects exact target
+/// addresses even while the guest is rendering the next inactive VideoOut buffer.
 pub(super) fn diagnostic_scanout_writer_target_selected(
     pixel_shader_address: u64,
+    target_address: u64,
     known_scanout: bool,
     width: u32,
     height: u32,
@@ -694,9 +703,20 @@ pub(super) fn diagnostic_scanout_writer_target_selected(
                     "[REMu][METAL][SCANOUT-CAPTURE] filter=auto1080-shaders addresses={addresses:#x?}"
                 );
             }
+            if let DiagnosticScanoutWriterFilter::TargetAddresses(addresses) = &filter {
+                eprintln!(
+                    "[REMu][METAL][SCANOUT-CAPTURE] filter=target-addresses addresses={addresses:#x?}"
+                );
+            }
             filter
         })
-        .selects(pixel_shader_address, known_scanout, width, height)
+        .selects(
+            pixel_shader_address,
+            target_address,
+            known_scanout,
+            width,
+            height,
+        )
 }
 
 /// Allocates a bounded trace slot for a selected scanout writer.
@@ -1842,6 +1862,13 @@ mod tests {
                 0x8051_c80000,
             ])
         );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter("targets:0xefc0000000,efc1000000"),
+            DiagnosticScanoutWriterFilter::TargetAddresses(vec![
+                0x00ef_c000_0000,
+                0x00ef_c100_0000,
+            ])
+        );
     }
 
     #[test]
@@ -1867,17 +1894,21 @@ mod tests {
         let addresses = DiagnosticScanoutWriterFilter::Addresses(vec![0x80d3_b70000]);
         let any_1080_addresses =
             DiagnosticScanoutWriterFilter::Any1080Addresses(vec![0x80d3_b70000]);
+        let target_addresses =
+            DiagnosticScanoutWriterFilter::TargetAddresses(vec![0x00ef_c000_0000]);
 
-        assert!(known.selects(0x1234, true, 1_280, 720));
-        assert!(!known.selects(0x1234, false, 1_920, 1_080));
-        assert!(any_1080.selects(0x1234, false, 1_920, 1_080));
-        assert!(!any_1080.selects(0x1234, false, 1_280, 720));
-        assert!(addresses.selects(0x80d3_b70000, true, 1_920, 1_080));
-        assert!(!addresses.selects(0x80d3_b70000, false, 1_920, 1_080));
-        assert!(!addresses.selects(0x1234, true, 1_920, 1_080));
-        assert!(any_1080_addresses.selects(0x80d3_b70000, false, 1_920, 1_080));
-        assert!(!any_1080_addresses.selects(0x80d3_b70000, true, 1_280, 720));
-        assert!(!any_1080_addresses.selects(0x1234, true, 1_920, 1_080));
+        assert!(known.selects(0x1234, 0, true, 1_280, 720));
+        assert!(!known.selects(0x1234, 0, false, 1_920, 1_080));
+        assert!(any_1080.selects(0x1234, 0, false, 1_920, 1_080));
+        assert!(!any_1080.selects(0x1234, 0, false, 1_280, 720));
+        assert!(addresses.selects(0x80d3_b70000, 0, true, 1_920, 1_080));
+        assert!(!addresses.selects(0x80d3_b70000, 0, false, 1_920, 1_080));
+        assert!(!addresses.selects(0x1234, 0, true, 1_920, 1_080));
+        assert!(any_1080_addresses.selects(0x80d3_b70000, 0, false, 1_920, 1_080));
+        assert!(!any_1080_addresses.selects(0x80d3_b70000, 0, true, 1_280, 720));
+        assert!(!any_1080_addresses.selects(0x1234, 0, true, 1_920, 1_080));
+        assert!(target_addresses.selects(0x1234, 0x00ef_c000_0000, false, 640, 360));
+        assert!(!target_addresses.selects(0x1234, 0x00ef_c100_0000, true, 1_920, 1_080));
     }
 
     #[test]
