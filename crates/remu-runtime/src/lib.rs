@@ -1327,6 +1327,7 @@ static AMPR_READ_STAGING_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 static AUDIO_OUT: OnceLock<Mutex<audio::AudioOutState>> = OnceLock::new();
 static AUDIO_OUT2: OnceLock<Mutex<AudioOut2State>> = OnceLock::new();
+#[cfg(not(target_os = "macos"))]
 static PROCESS_CLOCK_EPOCH: OnceLock<Instant> = OnceLock::new();
 static PROCESS_START_NANOS: AtomicU64 = AtomicU64::new(0);
 static NEXT_NET_POOL_HANDLE: AtomicUsize = AtomicUsize::new(1);
@@ -4102,6 +4103,24 @@ fn kernel_raise_exception(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
     0
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
+}
+
+/// Reads Darwin's raw uptime clock already scaled to the guest counter's 1 GHz unit.
+///
+/// `clock_gettime_nsec_np` avoids constructing and normalizing a `timespec` on an import that
+/// engines can call millions of times per second. `CLOCK_UPTIME_RAW` remains monotonic and uses
+/// the same suspend-excluding uptime domain as the previous `Instant` implementation.
+#[cfg(target_os = "macos")]
+#[inline(always)]
+fn process_clock_nanos() -> u64 {
+    // SAFETY: this Darwin function takes no pointer and returns the selected clock as nanoseconds.
+    unsafe { clock_gettime_nsec_np(libc::CLOCK_UPTIME_RAW) }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn process_clock_nanos() -> u64 {
     u64::try_from(
         PROCESS_CLOCK_EPOCH
@@ -4110,6 +4129,16 @@ fn process_clock_nanos() -> u64 {
             .as_nanos(),
     )
     .unwrap_or(u64::MAX)
+}
+
+#[inline(always)]
+fn process_time_since_nanos(now: u64, start: u64, counter: bool) -> u64 {
+    let elapsed_nanos = now.saturating_sub(start);
+    if counter {
+        elapsed_nanos
+    } else {
+        elapsed_nanos / 1_000
+    }
 }
 
 fn reset_kernel_process_time() {
@@ -4132,12 +4161,7 @@ fn kernel_process_time(counter: bool) -> u64 {
             Err(installed) => start = installed,
         }
     }
-    let elapsed_nanos = now.saturating_sub(start);
-    if counter {
-        elapsed_nanos
-    } else {
-        elapsed_nanos / 1_000
-    }
+    process_time_since_nanos(now, start, counter)
 }
 
 const SCE_AJM_ERROR_INVALID_PARAMETER: u32 = 0x8093_0005;
