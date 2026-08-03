@@ -4095,6 +4095,29 @@ fn per_queue_blocked_wait_flushes_only_its_queue_and_preserves_foreign_render_pa
     let encoder = q0_command_buffer
         .new_render_command_encoder(render_pass)
         .to_owned();
+    let queue_zero_clear_key = GuestRenderPassKey {
+        targets: vec![(
+            GuestTextureDescriptor {
+                address: 0xefc0_0000_00,
+                width: 4,
+                height: 4,
+                pitch: 4,
+                tile_mode: 0,
+                pixel_format: MTLPixelFormat::RGBA8Unorm,
+                bytes_per_pixel: 4,
+            },
+            1,
+            false,
+            2,
+            1,
+            0,
+            0,
+            1,
+            Some(17),
+        )],
+        depth: None,
+    };
+    let queue_zero_continuation = queue_zero_clear_key.continuation_after_color_loads();
     presenter
         .guest_queue_batches
         .get_mut(&0)
@@ -4103,12 +4126,9 @@ fn per_queue_blocked_wait_flushes_only_its_queue_and_preserves_foreign_render_pa
         .as_mut()
         .expect("q0 open batch")
         .render_pass = Some(OpenGuestRenderPass {
-        key: GuestRenderPassKey {
-            targets: Vec::new(),
-            depth: None,
-        },
-        encoder,
-    });
+            key: queue_zero_continuation.clone(),
+            encoder,
+        });
 
     open_per_queue_batch(&mut presenter, 41);
     let (_label_space, address) = mapped_test_label();
@@ -4131,13 +4151,14 @@ fn per_queue_blocked_wait_flushes_only_its_queue_and_preserves_foreign_render_pa
         presenter.guest_queue_batches[&41].committed_batches.len(),
         1
     );
-    assert!(
-        presenter.guest_queue_batches[&0]
-            .open_batch
-            .as_ref()
-            .is_some_and(|batch| batch.render_pass.is_some()),
-        "q41's CPU-fallback wait must not end q0's live render pass"
-    );
+    let queue_zero_open_key = &presenter.guest_queue_batches[&0]
+        .open_batch
+        .as_ref()
+        .and_then(|batch| batch.render_pass.as_ref())
+        .expect("q41's CPU-fallback wait must not end q0's live render pass")
+        .key;
+    assert_eq!(queue_zero_open_key, &queue_zero_continuation);
+    assert_ne!(queue_zero_open_key, &queue_zero_clear_key);
     presenter
         .wait_for_guest_command_batches()
         .expect("test queues drain");
