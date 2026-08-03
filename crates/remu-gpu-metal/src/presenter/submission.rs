@@ -30,6 +30,15 @@ mod draw_footprint;
 mod events;
 mod memory;
 mod waits;
+
+pub(super) fn event_loop_batches_require_flush(has_runnable_events: bool) -> bool {
+    !has_runnable_events
+}
+
+pub(super) fn guest_batch_completion_capacity_reached(completion_count: usize) -> bool {
+    completion_count >= super::GUEST_BATCH_COMPLETION_CAPACITY
+}
+
 #[cfg(test)]
 pub(crate) use self::batch::write_back_pending_globals;
 pub(crate) use self::batch::{
@@ -655,8 +664,19 @@ impl MetalPresenter {
                     // Batch across guest submissions without losing their individual completion
                     // identities. Graphics and compute queues can retire out of global sequence
                     // order, and the shared completion tracker exposes only the contiguous prefix.
-                    self.record_guest_submission_boundary(source, sequence);
+                    let completion_capacity_reached =
+                        self.record_guest_submission_boundary(source, sequence);
                     self.finalize_pending_flip_at_submission_boundary(source);
+                    if completion_capacity_reached
+                        && let Err(error) = self.flush_guest_command_batch(
+                            FlushPolicy::Required,
+                            GuestBatchFlushReason::WorkCapacity,
+                        )
+                    {
+                        eprintln!(
+                            "[REMu][METAL] completion-capacity submission failed: {error}"
+                        );
+                    }
                 }
                 GpuEvent::Shutdown => {
                     eprintln!("[REMu][METAL] guest runtime requested presenter shutdown");

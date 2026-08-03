@@ -31,10 +31,10 @@ use super::super::submission::{
     shared_event_host_effect_is_resolved,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
-    PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SharedEventDrawReject, SharedEventFence, SharedEventProducerId, SharedEventSignalCheckpoint,
-    SharedEventWriteKind, UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GUEST_BATCH_COMPLETION_CAPACITY, GlobalBufferCacheKey,
+    PendingGuestWriteRange, PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE,
+    SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT, SharedEventDrawReject, SharedEventFence,
+    SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -46,6 +46,36 @@ use super::{
     ResourceSpan, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
     read_texture_linear, write_back_pending_globals,
 };
+
+#[test]
+fn busy_event_loop_retains_batches_but_idle_callbacks_flush() {
+    assert!(!super::super::submission::event_loop_batches_require_flush(
+        true
+    ));
+    assert!(super::super::submission::event_loop_batches_require_flush(
+        false
+    ));
+}
+
+#[test]
+fn retained_busy_batch_has_a_finite_submission_completion_bound() {
+    assert!(GUEST_BATCH_COMPLETION_CAPACITY > 0);
+    assert!(
+        !super::super::submission::guest_batch_completion_capacity_reached(
+            GUEST_BATCH_COMPLETION_CAPACITY - 1,
+        )
+    );
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(
+            GUEST_BATCH_COMPLETION_CAPACITY,
+        )
+    );
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(
+            GUEST_BATCH_COMPLETION_CAPACITY + 1,
+        )
+    );
+}
 
 fn enable_per_queue_batches(presenter: &mut MetalPresenter) {
     presenter.per_queue_guest_batches = true;
@@ -4056,6 +4086,60 @@ fn per_queue_boundary_attaches_only_to_its_source_queue() {
             .is_empty(),
         "q0 boundary must not attach to another queue's newest committed batch"
     );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("test queues drain");
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+}
+
+#[test]
+fn completion_capacity_commits_only_the_source_queue_batch() {
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+
+    open_per_queue_batch(&mut presenter, 41);
+    let foreign = presenter.guest_queue_batches[&41]
+        .open_batch
+        .as_ref()
+        .expect("foreign queue remains open")
+        .command_buffer
+        .clone();
+    open_per_queue_batch(&mut presenter, 0);
+    for index in 0..GUEST_BATCH_COMPLETION_CAPACITY {
+        assert_eq!(
+            presenter.record_guest_submission_boundary(
+                OrderedEventSource::GuestQueue(0),
+                index as u64,
+            ),
+            index + 1 == GUEST_BATCH_COMPLETION_CAPACITY,
+            "only the exact completion bound requests a flush"
+        );
+    }
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::WorkCapacity)
+        .expect("completion capacity commits the source queue");
+
+    let source = presenter.guest_queue_batches[&0]
+        .committed_batches
+        .back()
+        .expect("source queue batch committed");
+    assert_eq!(
+        source.completion_sequences.len(),
+        GUEST_BATCH_COMPLETION_CAPACITY
+    );
+    assert!(presenter.guest_queue_batches[&0].open_batch.is_none());
+    assert!(std::ptr::eq(
+        presenter.guest_queue_batches[&41]
+            .open_batch
+            .as_ref()
+            .expect("foreign queue render pass is retained")
+            .command_buffer
+            .as_ref(),
+        foreign.as_ref()
+    ));
+
     presenter
         .wait_for_guest_command_batches()
         .expect("test queues drain");

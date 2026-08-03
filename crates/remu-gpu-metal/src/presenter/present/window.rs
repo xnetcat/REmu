@@ -1160,14 +1160,30 @@ pub(crate) fn presenter_window_attributes() -> winit::window::WindowAttributes {
 }
 
 impl MetalPresenter {
+    /// Commits opportunistic work only after every decoded guest queue becomes idle.
+    ///
+    /// AppKit callback boundaries are host scheduling details, not guest synchronization points.
+    /// Guest-visible waits, barriers, flip snapshots, and finite work/completion capacities still
+    /// commit explicitly; retaining a compatible encoder while work remains runnable avoids a
+    /// tile store and immediate attachment reload between adjacent callbacks.
+    fn flush_idle_event_loop_batches(&mut self) -> Result<(), String> {
+        if !super::super::submission::event_loop_batches_require_flush(
+            self.receiver.has_runnable_events(),
+        ) {
+            return Ok(());
+        }
+        self.flush_guest_command_batch(
+            FlushPolicy::Opportunistic,
+            GuestBatchFlushReason::EventLoop,
+        )
+    }
+
     pub(crate) fn service_interactive_presenter_before_wait(&mut self) -> PresenterFlow {
         let flow = self.receive_events();
         if flow == PresenterFlow::Shutdown {
             return flow;
         }
-        if let Err(error) = self
-            .flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
-        {
+        if let Err(error) = self.flush_idle_event_loop_batches() {
             eprintln!("[REMu][METAL] guest command batch submission failed: {error}");
         }
         self.retire_completed_presentations();
@@ -1297,10 +1313,7 @@ pub(crate) fn run_headless_presenter(receiver: Receiver<GpuEvent>) -> Result<(),
         let (flow, submission) = objc::rc::autoreleasepool(|| {
             let flow = presenter.receive_events();
             let submission = if flow == PresenterFlow::Continue {
-                presenter.flush_guest_command_batch(
-                    FlushPolicy::Opportunistic,
-                    GuestBatchFlushReason::EventLoop,
-                )
+                presenter.flush_idle_event_loop_batches()
             } else {
                 Ok(())
             };

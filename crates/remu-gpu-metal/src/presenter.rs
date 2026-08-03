@@ -273,6 +273,12 @@ const GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER: usize = 2;
 /// to WindowServer. Unreal transition scenes can otherwise put hundreds of full-resolution draws
 /// in one command buffer and monopolize the device for seconds.
 const GUEST_BATCH_WORK_CAPACITY: usize = 64;
+/// Bound guest submission completions retained by one open Metal command buffer.
+///
+/// Busy event-loop callbacks may keep compatible render passes open across callbacks, but guest
+/// submission retirement must still have a finite latency even when a queue never becomes idle.
+/// Matching the work bound keeps both retention paths subject to the same submission limit.
+const GUEST_BATCH_COMPLETION_CAPACITY: usize = GUEST_BATCH_WORK_CAPACITY;
 
 /// Maximum number of committed guest batches allowed ahead of the host GPU.
 ///
