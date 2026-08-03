@@ -1680,25 +1680,29 @@ fn new_guest_command_batch(
 fn settle_guest_batch_by(batch: &GuestCommandBatch, deadline: Instant) -> GuestBatchSettlement {
     let budget = deadline.saturating_duration_since(Instant::now());
     let settled = wait_until_settled_within(&batch.command_buffer, budget);
-    let queue = batch
-        .queue_id
-        .map_or_else(String::new, |queue_id| format!(" queue={queue_id}"));
-    let operation = format!(
-        "Metal guest command batch{queue} [{}]",
-        describe_guest_batch(&batch.work)
-    );
+    // Only the timeout and failure branches need the batch described, and both are rare. The
+    // common path — a batch that completed within budget — must not pay for formatting every
+    // draw in the stream, so the description is built lazily after the outcome is known.
+    let describe = || {
+        let queue = batch
+            .queue_id
+            .map_or_else(String::new, |queue_id| format!(" queue={queue_id}"));
+        format!(
+            "Metal guest command batch{queue} [{}]",
+            describe_guest_batch(&batch.work)
+        )
+    };
     if !settled {
         return GuestBatchSettlement::Pending(settle_timeout_message(
-            &operation,
+            &describe(),
             &batch.command_buffer,
         ));
     }
-    let status = batch.command_buffer.status();
-    if status == MTLCommandBufferStatus::Completed {
+    if batch.command_buffer.status() == MTLCommandBufferStatus::Completed {
         GuestBatchSettlement::Completed
     } else {
         GuestBatchSettlement::Failed(command_buffer_failure_message(
-            &operation,
+            &describe(),
             &batch.command_buffer,
         ))
     }
