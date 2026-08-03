@@ -12,7 +12,7 @@ use super::super::{
     RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState,
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
-    SHARED_HOST_KIND_WAIT, SharedEventDrawReject, WRITEBACK_TRIGGERS,
+    SHARED_HOST_KIND_WAIT, SameQueueDmaFillReject, SharedEventDrawReject, WRITEBACK_TRIGGERS,
     format_shared_event_ack_phase_report, format_shared_event_host_effect_latency_report,
     format_terminal_publication_report,
 };
@@ -341,6 +341,35 @@ impl MetalPresenter {
                 self.statistics.shared_event_error_advances,
                 f64::from(self.statistics.shared_event_fallbacks_no_exact_producer) / seconds,
                 self.statistics.shared_event_fallbacks_timeline_overflow,
+            );
+            let dma_fill_rejections = &self.statistics.shared_event_dma_fill_rejections;
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts={:.0}/s accepted={:.0}/s reject=cross-queue:{:.0}/s,non-immediate-source:{:.0}/s,destination-selector:{:.0}/s,source-snapshot:{:.0}/s,invalid-range:{:.0}/s,missing-identity:{:.0}/s,metadata-overlap:{:.0}/s,cache-overlap:{:.0}/s,incomplete-dependency:{:.0}/s,missing-open-batch:{:.0}/s",
+                f64::from(self.statistics.shared_event_dma_fill_attempts) / seconds,
+                f64::from(self.statistics.shared_event_gpu_ordered_dma_fills) / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::CrossQueue.index()])
+                    / seconds,
+                f64::from(
+                    dma_fill_rejections[SameQueueDmaFillReject::NonImmediateSource.index()],
+                ) / seconds,
+                f64::from(
+                    dma_fill_rejections[SameQueueDmaFillReject::DestinationSelector.index()],
+                ) / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::SourceSnapshot.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::InvalidRange.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::MissingIdentity.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::MetadataOverlap.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::CacheOverlap.index()])
+                    / seconds,
+                f64::from(
+                    dma_fill_rejections[SameQueueDmaFillReject::IncompleteDependency.index()],
+                ) / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::MissingOpenBatch.index()])
+                    / seconds,
             );
             let draw_rejections = &self.statistics.shared_event_draw_rejections;
             eprintln!(
@@ -1052,6 +1081,10 @@ impl MetalPresenter {
         self.statistics.shared_event_host_block_kinds = [0; super::super::SHARED_HOST_KIND_COUNT];
         self.statistics.shared_event_host_wakes = 0;
         self.statistics.shared_event_acquire_noop_drops = 0;
+        self.statistics.shared_event_dma_fill_attempts = 0;
+        self.statistics.shared_event_gpu_ordered_dma_fills = 0;
+        self.statistics.shared_event_dma_fill_rejections =
+            [0; super::super::SAME_QUEUE_DMA_FILL_REJECT_COUNT];
         self.statistics.shared_event_gpu_ordered_registered_waits = 0;
         self.statistics.shared_event_gpu_ordered_compute_dispatches = 0;
         self.statistics.shared_event_gpu_ordered_draws = 0;

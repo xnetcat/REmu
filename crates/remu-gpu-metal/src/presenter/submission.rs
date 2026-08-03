@@ -43,6 +43,7 @@ pub(crate) use self::batch::{
     merge_guest_batch_result,
 };
 pub(crate) use self::draw_footprint::{SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject};
+pub(crate) use self::memory::{SAME_QUEUE_DMA_FILL_REJECT_COUNT, SameQueueDmaFillReject};
 #[cfg(test)]
 pub(crate) use self::memory::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, release_value_for_wait,
@@ -199,6 +200,7 @@ impl MetalPresenter {
             let mut shared_event_gpu_ordered_registered_wait = false;
             let mut shared_event_gpu_ordered_draw = false;
             let mut shared_event_direct_draw_plan = None;
+            let mut prepared_same_queue_dma_fill = None;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
                 shared_event_direct_draw_plan = if dependencies.is_empty() {
@@ -215,7 +217,17 @@ impl MetalPresenter {
                 let direct_draw_gpu_orderable = shared_event_direct_draw_plan.is_some()
                     && self.per_queue_guest_batches
                     && self.shared_event_direct_draw_admission;
-                let disposition = if dependencies.is_empty() || direct_draw_gpu_orderable {
+                let same_queue_dma_fill = if dependencies.is_empty() {
+                    None
+                } else if let GpuEvent::MemoryCopy(copy) = &event {
+                    self.prepare_same_queue_immediate_fill(queue_id, &dependencies, copy)
+                } else {
+                    None
+                };
+                let disposition = if dependencies.is_empty()
+                    || direct_draw_gpu_orderable
+                    || same_queue_dma_fill.is_some()
+                {
                     SharedEventEventDisposition::GpuOrderable
                 } else {
                     self.shared_event_event_disposition(queue_id, source, &dependencies, &event)
@@ -297,6 +309,7 @@ impl MetalPresenter {
                     shared_event_gpu_ordered_registered_wait = true;
                 }
                 shared_event_gpu_ordered_draw = direct_draw_gpu_orderable;
+                prepared_same_queue_dma_fill = same_queue_dma_fill;
             }
             match event {
                 GpuEvent::QueueSubmission { .. } => {
@@ -464,7 +477,15 @@ impl MetalPresenter {
                 GpuEvent::MemoryCopy(copy) => {
                     let destination_address = copy.destination_address;
                     let byte_count = copy.byte_count;
-                    match self.execute_guest_memory_copy(copy) {
+                    let result = if let Some(prepared) = prepared_same_queue_dma_fill {
+                        let OrderedEventSource::GuestQueue(queue_id) = source else {
+                            unreachable!("same-queue DMA admission requires a guest queue")
+                        };
+                        self.queue_prepared_same_queue_immediate_fill(queue_id, &copy, prepared)
+                    } else {
+                        self.execute_guest_memory_copy(copy)
+                    };
+                    match result {
                         Ok(()) => self
                             .receiver
                             .retry_guest_memory_waits_overlapping(destination_address, byte_count),

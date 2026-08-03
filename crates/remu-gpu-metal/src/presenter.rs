@@ -193,10 +193,10 @@ use self::stats::{
     take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use self::submission::{
-    SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject, append_unique_global_writebacks,
-    append_unique_guest_write_ranges, collect_pending_global_writebacks,
-    collect_pending_guest_write_ranges, completed_command_buffer_gpu_duration,
-    describe_guest_batch, guest_batch_writes_overlap,
+    SAME_QUEUE_DMA_FILL_REJECT_COUNT, SHARED_EVENT_DRAW_REJECT_COUNT, SameQueueDmaFillReject,
+    SharedEventDrawReject, append_unique_global_writebacks, append_unique_guest_write_ranges,
+    collect_pending_global_writebacks, collect_pending_guest_write_ranges,
+    completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
 };
 #[cfg(test)]
 use self::submission::{
@@ -1592,6 +1592,9 @@ struct PresenterStatistics {
     shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,
     shared_event_acquire_noop_drops: u32,
+    shared_event_dma_fill_attempts: u32,
+    shared_event_gpu_ordered_dma_fills: u32,
+    shared_event_dma_fill_rejections: [u32; SAME_QUEUE_DMA_FILL_REJECT_COUNT],
     shared_event_gpu_ordered_registered_waits: u32,
     shared_event_gpu_ordered_compute_dispatches: u32,
     shared_event_gpu_ordered_draws: u32,
@@ -1810,6 +1813,9 @@ struct PendingGuestMemoryWrite {
     operation: GuestMemoryWriteOperation,
     mapping_identity: Option<GuestSharedMappingIdentity>,
     write_watch: Option<CpuWriteWatch>,
+    /// The command-processor write makes guest RAM authoritative for this destination.
+    /// Apply the cache transition only after the identity-pinned write actually publishes.
+    publishes_guest_memory_authority: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
