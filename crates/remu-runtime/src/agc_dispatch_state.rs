@@ -5,6 +5,7 @@
 //! never acquire ProbeDispatch. Publication ticket FIFO was retired earlier — `remu-gpu`'s
 //! `PublicationCoordinator` remains the per-queue FIFO authority.
 
+#![allow(dead_code)] // Read/with/reset helpers land with call-site migration off ProbeDispatch.
 use std::collections::BTreeMap;
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 

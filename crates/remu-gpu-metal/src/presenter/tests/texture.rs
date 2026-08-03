@@ -1098,7 +1098,7 @@ fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
     assert_eq!(watch.generations(), generations);
     assert!(!watch.is_dirty());
     let decoded = snapshot_watched_guest_texture_raw(descriptor, &watch).expect("updated snapshot");
-    assert!(decoded.iter().any(|&byte| byte == 0x3c));
+    assert!(decoded.contains(&0x3c));
 }
 
 #[test]

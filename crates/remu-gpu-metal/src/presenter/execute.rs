@@ -64,7 +64,7 @@ use super::{
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLScissorRect,
-    MTLSize, MTLStoreAction, MTLTextureType, MTLViewport, MTLWinding, RenderPassDescriptor,
+    MTLSize, MTLTextureType, MTLViewport, MTLWinding, RenderPassDescriptor,
 };
 use remu_gpu::IndexedDraw;
 use std::collections::{HashMap, HashSet};
@@ -1395,7 +1395,7 @@ impl MetalPresenter {
                 &device,
                 &mut self.visibility_result_buffer,
             );
-            super::attachment::attach_visibility_result_buffer(&pass, &visibility);
+            super::attachment::attach_visibility_result_buffer(pass, &visibility);
             Some(pass)
         } else {
             None
@@ -1945,7 +1945,7 @@ impl MetalPresenter {
                     .flatten()
             })
             .or_else(|| {
-                (diagnostic_dump_glyph_draw() && evaluation_samples_glyph_atlas(&pixel_evaluation))
+                (diagnostic_dump_glyph_draw() && evaluation_samples_glyph_atlas(pixel_evaluation))
                     .then(|| targets.first())
                     .flatten()
             });

@@ -83,8 +83,8 @@ pub(super) fn kernel_chmod(arguments: [u64; 6], state: &ProbeDispatchState) -> u
     #[cfg(unix)]
     {
         let mode = low_u32(arguments[1]) & KERNEL_MODE_BITS;
-        return std::fs::set_permissions(&host_path, PermissionsExt::from_mode(mode))
-            .map_or_else(|error| sce_kernel_io_error(&error), |()| 0);
+        std::fs::set_permissions(&host_path, PermissionsExt::from_mode(mode))
+            .map_or_else(|error| sce_kernel_io_error(&error), |()| 0)
     }
     #[cfg(not(unix))]
     {

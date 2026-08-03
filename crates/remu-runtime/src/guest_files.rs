@@ -744,7 +744,7 @@ pub(crate) fn guest_ftell(handle: u64) -> u64 {
     #[cfg(windows)]
     let position = unsafe { windows_ftelli64(handle as *mut libc::FILE) };
     #[cfg(not(windows))]
-    let position = unsafe { i64::from(libc::ftell(handle as *mut libc::FILE)) };
+    let position = unsafe { libc::ftell(handle as *mut libc::FILE) };
     if position < 0 {
         u64::MAX
     } else {

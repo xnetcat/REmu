@@ -337,72 +337,6 @@ fn metallib_tool_path(compiler: &Path) -> PathBuf {
     compiler.with_file_name("metallib")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        MetalCompileDirectory, canonical_tool_path, discover_bundled_metal_compiler,
-        metallib_tool_path,
-    };
-    use std::ffi::OsStr;
-    use std::fs::File;
-    use std::os::unix::fs::symlink;
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    #[test]
-    fn bundled_metal_compiler_is_discovered_without_configuration() {
-        // Plan F1: the persistent metallib/function caches are default-on, so the offline
-        // compiler must be found from the executable's ancestry, not from the environment.
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .expect("workspace root");
-        if !repo.join(".remu/toolchains").is_dir() {
-            eprintln!("skipped: this checkout carries no bundled Metal toolchain");
-            return;
-        }
-        let compiler = discover_bundled_metal_compiler()
-            .expect("a checkout with .remu/toolchains discovers its compiler");
-        assert_eq!(compiler.file_name(), Some(OsStr::new("metal")));
-        assert!(
-            compiler.with_file_name("metallib").is_file(),
-            "the discovered compiler must sit beside its metallib linker"
-        );
-    }
-
-    #[test]
-    fn metallib_tool_path_preserves_the_multicall_symlink_name() {
-        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
-        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "remu-metallib-path-test-{}-{sequence}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&directory).expect("create linker path test directory");
-        let directory = MetalCompileDirectory(directory);
-        let compiler = directory.0.join("metal");
-        let linker_target = directory.0.join("air-lld");
-        File::create(&compiler).expect("create compiler placeholder");
-        File::create(&linker_target).expect("create linker placeholder");
-        symlink("air-lld", directory.0.join("metallib")).expect("create multicall linker symlink");
-
-        let compiler = canonical_tool_path(compiler);
-        let linker = metallib_tool_path(&compiler);
-        assert_eq!(linker.file_name(), Some(OsStr::new("metallib")));
-        assert!(
-            std::fs::symlink_metadata(&linker)
-                .expect("inspect linker path")
-                .file_type()
-                .is_symlink(),
-            "the executable path must retain the multicall symlink"
-        );
-        assert_eq!(
-            std::fs::canonicalize(&linker).expect("resolve linker symlink"),
-            std::fs::canonicalize(linker_target).expect("resolve linker target")
-        );
-    }
-}
-
 pub(crate) fn run_metal_tool(command: &mut Command, operation: &str) -> Result<(), String> {
     let output = command
         .output()
@@ -475,4 +409,70 @@ pub(crate) fn dump_compute_shader_msl(
     let ir_path = directory.join(format!("cs-{compute_address:x}-ir.txt"));
     std::fs::write(&ir_path, format!("{instructions:#?}\n"))
         .map_err(|error| format!("could not write {}: {error}", ir_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MetalCompileDirectory, canonical_tool_path, discover_bundled_metal_compiler,
+        metallib_tool_path,
+    };
+    use std::ffi::OsStr;
+    use std::fs::File;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bundled_metal_compiler_is_discovered_without_configuration() {
+        // Plan F1: the persistent metallib/function caches are default-on, so the offline
+        // compiler must be found from the executable's ancestry, not from the environment.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("workspace root");
+        if !repo.join(".remu/toolchains").is_dir() {
+            eprintln!("skipped: this checkout carries no bundled Metal toolchain");
+            return;
+        }
+        let compiler = discover_bundled_metal_compiler()
+            .expect("a checkout with .remu/toolchains discovers its compiler");
+        assert_eq!(compiler.file_name(), Some(OsStr::new("metal")));
+        assert!(
+            compiler.with_file_name("metallib").is_file(),
+            "the discovered compiler must sit beside its metallib linker"
+        );
+    }
+
+    #[test]
+    fn metallib_tool_path_preserves_the_multicall_symlink_name() {
+        static NEXT_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
+        let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "remu-metallib-path-test-{}-{sequence}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).expect("create linker path test directory");
+        let directory = MetalCompileDirectory(directory);
+        let compiler = directory.0.join("metal");
+        let linker_target = directory.0.join("air-lld");
+        File::create(&compiler).expect("create compiler placeholder");
+        File::create(&linker_target).expect("create linker placeholder");
+        symlink("air-lld", directory.0.join("metallib")).expect("create multicall linker symlink");
+
+        let compiler = canonical_tool_path(compiler);
+        let linker = metallib_tool_path(&compiler);
+        assert_eq!(linker.file_name(), Some(OsStr::new("metallib")));
+        assert!(
+            std::fs::symlink_metadata(&linker)
+                .expect("inspect linker path")
+                .file_type()
+                .is_symlink(),
+            "the executable path must retain the multicall symlink"
+        );
+        assert_eq!(
+            std::fs::canonicalize(&linker).expect("resolve linker symlink"),
+            std::fs::canonicalize(linker_target).expect("resolve linker target")
+        );
+    }
 }

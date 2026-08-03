@@ -7,6 +7,8 @@
 //! raises `EXC_BAD_INSTRUCTION` / SIGILL. Recover by decoding the faulting instruction, applying
 //! the Intel SDM / Bochs semantics to the live XMM state, and advancing RIP.
 
+#![cfg_attr(not(target_arch = "x86_64"), allow(dead_code))] // SIGILL recovery installs from x86_64 probe_entry only.
+
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 

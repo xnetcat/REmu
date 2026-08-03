@@ -74,7 +74,7 @@ impl CompactRegisterDefaults {
     }
 
     fn build(self, address: u64) -> Option<Vec<u8>> {
-        if self.types.len() % 3 != 0 {
+        if !self.types.len().is_multiple_of(3) {
             return None;
         }
         let offsets = self.offsets();

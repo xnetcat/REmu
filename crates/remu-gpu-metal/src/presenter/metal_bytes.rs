@@ -82,7 +82,7 @@ impl<'a> MetalBytes<'a> {
         if !self.in_bounds(offset, byte_count) {
             return None;
         }
-        if (self.base as usize).wrapping_add(offset) % std::mem::align_of::<T>() != 0 {
+        if !(self.base as usize).wrapping_add(offset).is_multiple_of(std::mem::align_of::<T>()) {
             return None;
         }
         // SAFETY: bounds and `T`-alignment checked above; `_buffer` keeps the mapping live for

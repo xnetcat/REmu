@@ -29,7 +29,7 @@ pub(crate) struct ResidentTextureAgeBucket {
 
 impl ResidentTextureAgeBucket {
     fn record(&mut self, resident: &ResidentGuestTexture) {
-        let bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
+        let bytes = resident.texture.allocated_size();
         self.resident_count += 1;
         self.resident_bytes = self.resident_bytes.saturating_add(bytes);
         if resident.gpu_written() {
@@ -87,7 +87,7 @@ pub(crate) fn resident_texture_eviction_plan(
     maximum_evictions: usize,
 ) -> ResidentTextureEvictionPlan {
     let resident_bytes = residents.values().fold(0_u64, |total, resident| {
-        total.saturating_add(u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX))
+        total.saturating_add(resident.texture.allocated_size())
     });
     if resident_bytes <= byte_capacity || maximum_evictions == 0 {
         return ResidentTextureEvictionPlan {
@@ -128,7 +128,7 @@ pub(crate) fn resident_texture_eviction_plan(
                 resident.last_use.work,
                 resident.content_version,
                 resident.descriptor,
-                u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX),
+                resident.texture.allocated_size(),
             )
         })
         .collect::<Vec<_>>();
@@ -257,7 +257,7 @@ pub(crate) fn resident_texture_backing_overlap_stats(
         let resident = residents
             .get(&descriptor)
             .expect("overlap participant belongs to the resident map");
-        let bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
+        let bytes = resident.texture.allocated_size();
         stats.resident_count += 1;
         stats.resident_bytes = stats.resident_bytes.saturating_add(bytes);
         if resident.gpu_written() {

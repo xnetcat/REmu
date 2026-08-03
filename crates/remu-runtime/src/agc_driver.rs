@@ -304,7 +304,7 @@ fn submit_graphics(
             command_address,
             dword_count,
             &mut AgcSubmissionContext {
-                graphics: graphics,
+                graphics,
                 shaders: shader_registry,
                 video_out: &state.video_out,
                 submission_count: &mut state.agc_submission_count,

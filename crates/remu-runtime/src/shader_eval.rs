@@ -237,11 +237,10 @@ pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<
     // When VGT_INDEX_TYPE is stuck at the 16-bit CLEAR default but the buffer is 32-bit, small
     // indices decode as `(lo, 0)` pairs. Recover by re-reading as 32-bit before the snapshot is
     // frozen onto the draw (Metal prefers `index_snapshot` over a live re-read).
-    if element_size == 2 && indices_look_like_u32_read_as_u16(indices.as_ref()) {
-        if let Some(recovered) = snapshot_draw_indices_with_element_size(draw, 4) {
+    if element_size == 2 && indices_look_like_u32_read_as_u16(indices.as_ref())
+        && let Some(recovered) = snapshot_draw_indices_with_element_size(draw, 4) {
             return Some(recovered);
         }
-    }
     Some(indices)
 }
 
@@ -277,7 +276,7 @@ fn snapshot_draw_indices_with_element_size(
 
 fn indices_look_like_u32_read_as_u16(indices: &[u32]) -> bool {
     indices.len() >= 4
-        && indices.len() % 2 == 0
+        && indices.len().is_multiple_of(2)
         && indices
             .chunks_exact(2)
             .all(|pair| pair[1] == 0 && pair[0] < 0x1_0000)
@@ -405,21 +404,21 @@ pub(crate) fn evaluate_draw_shader_requests_parallel(
         (Some(Ok(export)), pixel) => (
             Some(evaluate_local(export, local_cache)),
             pixel.map(|result| {
-                result.and_then(|_| unreachable!("pixel request was not successful"))
+                result.map(|_| unreachable!("pixel request was not successful"))
             }),
         ),
         (export, Some(Ok(pixel))) => (
             export.map(|result| {
-                result.and_then(|_| unreachable!("export request was not successful"))
+                result.map(|_| unreachable!("export request was not successful"))
             }),
             Some(evaluate_local(pixel, local_cache)),
         ),
         (export, pixel) => (
             export.map(|result| {
-                result.and_then(|_| unreachable!("export request was not successful"))
+                result.map(|_| unreachable!("export request was not successful"))
             }),
             pixel.map(|result| {
-                result.and_then(|_| unreachable!("pixel request was not successful"))
+                result.map(|_| unreachable!("pixel request was not successful"))
             }),
         ),
     }

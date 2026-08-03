@@ -4,6 +4,7 @@
 //! that already hold [`LockLevel::ProbeDispatch`] may nest this lock (see
 //! [`lock_event_state_for_write`]); EventState critical sections must never acquire ProbeDispatch.
 
+#![allow(dead_code)] // with_/reset helpers exercised in tests; production still uses lock_* directly.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -78,7 +79,7 @@ pub(crate) fn reset_event_state_for_tests() {
 }
 
 /// Queues a kernel event under the EventState lock (coalesce on equeue/ident/filter).
-pub(crate) fn queue_kernel_event(mut event: KernelQueuedEvent) {
+pub(crate) fn queue_kernel_event(event: KernelQueuedEvent) {
     let (_h, mut events) = lock_event_state_for_write();
     queue_kernel_event_into(&mut events, event);
 }
@@ -131,7 +132,7 @@ mod tests {
     fn event_state_may_nest_under_probe_dispatch() {
         reset_event_state_for_tests();
         let _dispatch = LockHierarchyGuard::enter(LockLevel::ProbeDispatch);
-        let (_h, mut state) = lock_event_state_for_write();
+        let (_h, state) = lock_event_state_for_write();
         crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(3); });
         assert!(state.kernel_equeues.contains(&3));
     }

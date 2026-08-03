@@ -859,7 +859,7 @@ mod tests {
         let count = fields
             .iter()
             .find_map(|(name, value)| {
-                (*name == "perf_channel_count").then(|| match value {
+                (*name == "perf_channel_count").then_some(match value {
                     TelemetryValue::Unsigned(value) => *value,
                     _ => 0,
                 })

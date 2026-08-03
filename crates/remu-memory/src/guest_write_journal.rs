@@ -777,7 +777,7 @@ mod tests {
         record_guest_write(GuestWriteSite::DmaCopy, 0x9100_0000, 0x2000, &[0x00; 8], 7);
         let entry =
             read_slot(NEXT_SEQUENCE.load(Ordering::Relaxed) - 1).expect("the newest entry is live");
-        assert_eq!(entry.uniform, 0x00 | SAMPLED_PAYLOAD);
+        assert_eq!(entry.uniform, SAMPLED_PAYLOAD);
         assert_eq!(entry.byte_count, 0x2000);
     }
 

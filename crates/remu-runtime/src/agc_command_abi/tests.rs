@@ -1,4 +1,4 @@
-use super::buffer::scan_valid_command_stream_end;
+use super::buffer::{mark_graphics_release_allocation, scan_valid_command_stream_end};
 use super::*;
 
 struct CommandFixture {

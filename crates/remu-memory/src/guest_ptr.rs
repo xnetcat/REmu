@@ -558,7 +558,7 @@ fn require_fit<T>(pin: &GuestAccessPin, element_count: usize) -> Result<(), Gues
     if element_count == 0 {
         return Ok(());
     }
-    if address % (align_of::<T>() as u64) != 0 {
+    if !address.is_multiple_of(align_of::<T>() as u64) {
         return Err(GuestAccessError::Misaligned {
             address,
             type_name: std::any::type_name::<T>(),

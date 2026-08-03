@@ -205,8 +205,7 @@ impl MetalPresenter {
         let (metal_allocated_mib, metal_recommended_mib) =
             self.device.as_ref().map_or((0, 0), |device| {
                 (
-                    u64::try_from(device.current_allocated_size())
-                        .unwrap_or(u64::MAX)
+                    device.current_allocated_size()
                         .div_ceil(1024 * 1024),
                     device
                         .recommended_max_working_set_size()
@@ -717,7 +716,7 @@ impl MetalPresenter {
                     ResidencyState::Stale(_) => {
                         stale += 1;
                         stale_bytes = stale_bytes.saturating_add(
-                            u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX),
+                            resident.texture.allocated_size(),
                         );
                     }
                 }
@@ -754,7 +753,7 @@ impl MetalPresenter {
                 );
             }
             let texture_allocated_bytes = |texture: &metal::Texture| {
-                u64::try_from(texture.allocated_size()).unwrap_or(u64::MAX)
+                texture.allocated_size()
             };
             let resident_target_bytes =
                 self.resident_guest_textures

@@ -37,6 +37,7 @@ pub(super) enum FaultReason {
     LengthConversion,
     ProtectFailed,
     MaterializeFailed,
+    #[allow(dead_code)] // Reserved for SIGILL/write-watch overlap reports; label already wired.
     IllegalInstruction,
 }
 

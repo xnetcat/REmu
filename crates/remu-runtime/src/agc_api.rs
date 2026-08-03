@@ -163,7 +163,7 @@ const AGC_SHADER_SPECIAL_VGT_SHADER_STAGES_EN_OFFSET: u64 = 0x08;
 const AGC_SHADER_SPECIAL_VGT_GS_OUT_PRIM_TYPE_OFFSET: u64 = 0x20;
 const AGC_SHADER_SPECIAL_GE_USER_VGPR_EN_OFFSET: u64 = 0x28;
 
-pub(crate) fn agc_create_shader(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+pub(crate) fn agc_create_shader(arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     let destination = arguments[0];
     let header = arguments[1];
     let code = arguments[2];
@@ -745,7 +745,7 @@ pub(crate) fn find_shader_register(
 /// The fused stage is the back half with the front half's entry point: its register block is
 /// copied into caller-supplied scratch, the front half's checksum registers are carried over, and
 /// the program address registers are repointed at the front half's code.
-pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     let (fused, front, back, scratch) = (arguments[0], arguments[1], arguments[2], arguments[3]);
     let Some(stage) = fused_shader_stage(front, back) else {
         if trace_agc_programs() {

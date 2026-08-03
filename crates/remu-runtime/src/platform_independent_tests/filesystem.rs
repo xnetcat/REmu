@@ -399,11 +399,10 @@ fn persists_and_searches_transactional_save_data() {
         u32::from_le_bytes(mount_result[0x1c..0x20].try_into().unwrap()),
         1
     );
-    assert_eq!(
-        resolve_probe_guest_path(&state, "/savedata0/save.bin")
+    assert!(
+        !resolve_probe_guest_path(&state, "/savedata0/save.bin")
             .unwrap()
             .1,
-        false,
         "a transaction mount is not writable before Prepare"
     );
 
@@ -466,11 +465,10 @@ fn persists_and_searches_transactional_save_data() {
         save_data_commit([commit.as_ptr().addr() as u64, 0, 0, 0, 0, 0], &mut state,),
         0
     );
-    assert_eq!(
-        resolve_probe_guest_path(&state, "/savedata0/save.bin")
+    assert!(
+        !resolve_probe_guest_path(&state, "/savedata0/save.bin")
             .unwrap()
             .1,
-        false,
         "Commit closes the writable transaction window"
     );
     assert_eq!(
@@ -851,7 +849,7 @@ fn directory_records_pack_console_dirents_without_crossing_blocks() {
             offset += DIRENT_BLOCK_SIZE - offset % DIRENT_BLOCK_SIZE;
             continue;
         }
-        assert!(reclen >= DIRENT_HEADER_SIZE + namlen + 1);
+        assert!(reclen > DIRENT_HEADER_SIZE + namlen);
         // A record must lie entirely inside one 512-byte block.
         assert_eq!(
             offset / DIRENT_BLOCK_SIZE,

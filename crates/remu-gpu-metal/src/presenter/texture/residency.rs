@@ -843,7 +843,7 @@ pub(crate) fn resident_texture_ownership_stats(
     let mut backing_bases = HashSet::new();
     let mut backing_spans = HashSet::new();
     for resident in residents.values() {
-        let allocated_bytes = u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
+        let allocated_bytes = resident.texture.allocated_size();
         if resident.gpu_written() {
             stats.gpu_owned_count += 1;
             stats.gpu_owned_bytes = stats.gpu_owned_bytes.saturating_add(allocated_bytes);
@@ -1369,7 +1369,7 @@ impl MetalPresenter {
                 continue;
             };
             let allocated_bytes =
-                u64::try_from(resident.texture.allocated_size()).unwrap_or(u64::MAX);
+                resident.texture.allocated_size();
             let refresh = refresh_resident_texture_write_watch(resident)?;
             if refresh == WriteWatchRefresh::Reprotecting {
                 // A concurrent CPU write is changing watch ownership. Leave this resident in

@@ -200,7 +200,7 @@ impl MetalPresenter {
                     self.depth_array_textures.remove(&key);
                     continue;
                 };
-                if !self.depth_array_textures.contains_key(&key) {
+                self.depth_array_textures.entry(key).or_insert_with(|| {
                     let metal_descriptor = TextureDescriptor::new();
                     metal_descriptor.set_texture_type(MTLTextureType::D2Array);
                     metal_descriptor.set_pixel_format(faces[0].0.pixel_format());
@@ -214,14 +214,11 @@ impl MetalPresenter {
                         "REMu layered depth-sample assembly {:#x} x{}",
                         descriptor.guest.address, descriptor.layer_count
                     ));
-                    self.depth_array_textures.insert(
-                        key,
-                        DepthArrayResidentTexture {
+                    DepthArrayResidentTexture {
                             texture,
                             slice_versions: vec![u64::MAX; descriptor.layer_count as usize],
-                        },
-                    );
-                }
+                        }
+                });
                 let entry = self
                     .depth_array_textures
                     .get_mut(&key)

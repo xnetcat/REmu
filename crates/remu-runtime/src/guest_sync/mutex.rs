@@ -196,11 +196,10 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
         }
         existing.active.store(false, Ordering::Release);
         drop(mutex);
-        if let Some(removed) = shard.remove(&address) {
-            if removed.guest_object != 0 {
+        if let Some(removed) = shard.remove(&address)
+            && removed.guest_object != 0 {
                 guest_free(removed.guest_object);
             }
-        }
     }
     let entry = Arc::new(GuestMutexEntry {
         state: Mutex::new(GuestMutexState {

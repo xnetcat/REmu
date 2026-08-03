@@ -46,6 +46,7 @@ pub(super) const NGS2_ERROR_INVALID_VOICE_PARAM_ID: u32 = 0x804a_835a;
 pub(super) const NGS2_ERROR_INVALID_MATRIX_LEVEL_ADDRESS: u32 = 0x804a_835e;
 pub(super) const NGS2_ERROR_INVALID_VOICE_CONTROL_ADDRESS: u32 = 0x804a_8360;
 pub(super) const NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE: u32 = 0x804a_8361;
+#[allow(dead_code)] // SDK error; returned when a control id enum is validated end-to-end.
 pub(super) const NGS2_ERROR_INVALID_VOICE_CONTROL_ID: u32 = 0x804a_8362;
 pub(super) const NGS2_ERROR_INVALID_WAVEFORM_DATA: u32 = 0x804a_8430;
 pub(super) const NGS2_ERROR_INVALID_WAVEFORM_FORMAT: u32 = 0x804a_8431;

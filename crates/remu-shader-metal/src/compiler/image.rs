@@ -111,9 +111,8 @@ impl Compiler<'_> {
             return Err("sample operation resolved to a storage image".to_owned());
         }
         let native_2d_array = image.dimension == 5 && kind.texture_type == 13;
-        if (image.is_array && !native_2d_array)
-            || (!native_2d_array && !matches!(image.dimension, 0 | 1 | 2 | 3))
-        {
+        if !native_2d_array && (image.is_array || !matches!(image.dimension, 0..=3)) {
+
             return Err(format!(
                 "sampled image dimension {} array={} requires its matching Metal texture type",
                 image.dimension, image.is_array

@@ -198,7 +198,7 @@ impl AvPlayerDecoder {
         }
     }
 
-    pub(crate) fn retire(mut self) {
+    pub(crate) fn retire(self) {
         self.cancelled.store(true, Ordering::Release);
         if let Some(progress) = &self.progress {
             progress.queue_blocked.store(false, Ordering::Release);
@@ -583,12 +583,8 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             allocator_object: read_guest_u64(parameter + 8),
             allocate_texture_callback: read_guest_u64(parameter + 32),
             deallocate_texture_callback: read_guest_u64(parameter + 40),
-            event_object: (size >= 96)
-                .then(|| read_guest_u64(parameter + 88))
-                .unwrap_or(0),
-            event_callback: (size >= 104)
-                .then(|| read_guest_u64(parameter + 96))
-                .unwrap_or(0),
+            event_object: if size >= 96 { read_guest_u64(parameter + 88) } else { 0 },
+            event_callback: if size >= 104 { read_guest_u64(parameter + 96) } else { 0 },
             source: None,
             // Gen5 InitDataEx places autoStart after the event replacement, language pointer,
             // and debug level. Offset 0xa8 belongs to the first decoder-thread record; treating

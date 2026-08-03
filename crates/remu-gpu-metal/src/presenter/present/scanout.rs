@@ -27,9 +27,7 @@ impl MetalPresenter {
             return false;
         }
         if self
-            .registered_video_out_buffers
-            .iter()
-            .any(|address| *address == descriptor.address)
+            .registered_video_out_buffers.contains(&descriptor.address)
         {
             return true;
         }

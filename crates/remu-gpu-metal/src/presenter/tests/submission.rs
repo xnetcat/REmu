@@ -5823,7 +5823,7 @@ fn same_queue_wait_reg_mem_elides_the_redundant_self_event() {
         0
     );
     assert!(
-        presenter.receiver.blocked_queues.get(&0).is_none(),
+        !presenter.receiver.blocked_queues.contains_key(&0),
         "the elided wait leaves its queue runnable"
     );
     // The producer footprint stays recorded so same-queue DMA fills / direct draws consult it.
@@ -6453,7 +6453,7 @@ fn unresolved_or_ambiguous_signal_writes_make_the_checkpoint_unsafe() {
             0,
         )
         .expect("second footprint mapping");
-    let ambiguous_span = ResourceSpan::new(base.get() + GUEST_PAGE_SIZE as u64 - 16, 32);
+    let ambiguous_span = ResourceSpan::new(base.get() + GUEST_PAGE_SIZE - 16, 32);
     assert!(ambiguous_span.backing().is_none());
     let batch = state
         .open_batch
@@ -6816,11 +6816,11 @@ fn invalidating_acquire_rejects_overlapping_deferred_guest_publication() {
         poll_interval: 0,
         gcr_control: 1,
     };
-    let span = ResourceSpan::new(texture, GUEST_PAGE_SIZE as u64);
+    let span = ResourceSpan::new(texture, GUEST_PAGE_SIZE);
     let pending_publication = PhysicalFootprintRange::new(
         SharedEventWriteKind::TerminalGuestWrite,
         texture,
-        GUEST_PAGE_SIZE as u64,
+        GUEST_PAGE_SIZE,
         span.backing(),
     )
     .expect("mapped terminal publication footprint");

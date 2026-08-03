@@ -182,8 +182,10 @@ fn av_player_source_is_active_while_ready_before_start_and_inactive_after_stop()
     let Some(root) = av_player_generate_test_clip("ready-active") else {
         return;
     };
-    let mut state = ProbeDispatchState::default();
-    state.game_root = root.clone();
+    let mut state = ProbeDispatchState {
+        game_root: root.clone(),
+        ..Default::default()
+    };
     let handle = av_player_test_player(&mut state);
     {
         let player = state.av_player.players.get_mut(&handle).unwrap();
@@ -592,8 +594,10 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
     let Some(root) = av_player_generate_test_clip("prepare-pattern") else {
         return;
     };
-    let mut state = ProbeDispatchState::default();
-    state.game_root = root.clone();
+    let mut state = ProbeDispatchState {
+        game_root: root.clone(),
+        ..Default::default()
+    };
     let handle = av_player_test_player(&mut state);
     let source = b"/app0/media/clip.mp4\0";
     assert_eq!(
@@ -1068,8 +1072,10 @@ fn av_player_jump_to_time_seeks_the_decoder_instead_of_replaying_from_zero() {
     let Some(root) = av_player_generate_test_clip("jump-to-time") else {
         return;
     };
-    let mut state = ProbeDispatchState::default();
-    state.game_root = root.clone();
+    let mut state = ProbeDispatchState {
+        game_root: root.clone(),
+        ..Default::default()
+    };
     let handle = av_player_test_player(&mut state);
     let source = b"/app0/media/clip.mp4\0";
     assert_eq!(

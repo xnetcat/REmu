@@ -1117,7 +1117,7 @@ pub(crate) const fn disabled_metal_blend_attachment() -> MetalBlendAttachmentSta
 }
 
 fn transparent_premultiplied_fill_clear_enabled() -> bool {
-    !std::env::var_os("REMU_DISABLE_TRANSPARENT_FILL_CLEAR").is_some_and(|value| value == "1")
+    std::env::var_os("REMU_DISABLE_TRANSPARENT_FILL_CLEAR").is_none_or(|value| value != "1")
 }
 
 /// Chowdren resets effect layers with an untextured transparent-black fill using premultiplied

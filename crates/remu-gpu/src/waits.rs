@@ -151,56 +151,6 @@ impl GpuWaitRegistry {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn wait(address: u64, is_64_bit: bool) -> GpuMemoryWait {
-        GpuMemoryWait {
-            address,
-            reference: 1,
-            mask: u64::MAX,
-            compare_function: 3,
-            is_64_bit,
-        }
-    }
-
-    #[test]
-    fn overlap_index_includes_waits_beginning_before_the_producer() {
-        let mut registry = GpuWaitRegistry::default();
-        let conditions = [wait(0x1000, true), wait(0x1004, false), wait(0x2000, false)];
-        let ids = registry
-            .register_many(&conditions)
-            .expect("register test waits");
-
-        let overlapping = registry.pending_overlapping(0x1004, 4);
-        assert_eq!(overlapping.len(), 2);
-        assert!(overlapping.contains(&(ids[0], conditions[0])));
-        assert!(overlapping.contains(&(ids[1], conditions[1])));
-    }
-
-    #[test]
-    fn overlap_index_removes_retired_and_latched_waits() {
-        let mut registry = GpuWaitRegistry::default();
-        let conditions = [
-            wait(0x1000, false),
-            wait(0x1004, false),
-            wait(0x1008, false),
-        ];
-        let ids = registry
-            .register_many(&conditions)
-            .expect("register test waits");
-        registry.retire(ids[0]);
-        registry.record_producer(0x1004, false, 1);
-
-        assert_eq!(
-            registry.pending_overlapping(0x1000, 12),
-            vec![(ids[2], conditions[2])]
-        );
-        assert!(!registry.by_address.contains_key(&0x1000));
-    }
-}
-
 static GPU_WAITS: OnceLock<Mutex<GpuWaitRegistry>> = OnceLock::new();
 
 pub(crate) fn gpu_wait_registry() -> &'static Mutex<GpuWaitRegistry> {
@@ -281,4 +231,54 @@ pub fn pending_gpu_waits_overlapping(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .pending_overlapping(start, byte_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wait(address: u64, is_64_bit: bool) -> GpuMemoryWait {
+        GpuMemoryWait {
+            address,
+            reference: 1,
+            mask: u64::MAX,
+            compare_function: 3,
+            is_64_bit,
+        }
+    }
+
+    #[test]
+    fn overlap_index_includes_waits_beginning_before_the_producer() {
+        let mut registry = GpuWaitRegistry::default();
+        let conditions = [wait(0x1000, true), wait(0x1004, false), wait(0x2000, false)];
+        let ids = registry
+            .register_many(&conditions)
+            .expect("register test waits");
+
+        let overlapping = registry.pending_overlapping(0x1004, 4);
+        assert_eq!(overlapping.len(), 2);
+        assert!(overlapping.contains(&(ids[0], conditions[0])));
+        assert!(overlapping.contains(&(ids[1], conditions[1])));
+    }
+
+    #[test]
+    fn overlap_index_removes_retired_and_latched_waits() {
+        let mut registry = GpuWaitRegistry::default();
+        let conditions = [
+            wait(0x1000, false),
+            wait(0x1004, false),
+            wait(0x1008, false),
+        ];
+        let ids = registry
+            .register_many(&conditions)
+            .expect("register test waits");
+        registry.retire(ids[0]);
+        registry.record_producer(0x1004, false, 1);
+
+        assert_eq!(
+            registry.pending_overlapping(0x1000, 12),
+            vec![(ids[2], conditions[2])]
+        );
+        assert!(!registry.by_address.contains_key(&0x1000));
+    }
 }

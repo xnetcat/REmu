@@ -372,14 +372,12 @@ fn draw_wrapped_text(
     let char_h = 8 * scale + 4;
     let chars_per_line = (max_width / char_w).max(1) as usize;
     let mut line_y = y;
-    let mut lines = 0u32;
-    for line in wrap_text(text, chars_per_line) {
-        if lines >= max_lines {
+    for (lines, line) in wrap_text(text, chars_per_line).into_iter().enumerate() {
+        if lines as u32 >= max_lines {
             break;
         }
         draw_text(fb, x, line_y, &line, scale, rgba);
         line_y += char_h;
-        lines += 1;
     }
 }
 

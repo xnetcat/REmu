@@ -15,7 +15,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::ProcessGuestMemory;
 #[cfg(target_os = "macos")]
 use crate::cached_kernel_memory_readable_range_end;
-use remu_shader::GuestMemoryReader;
 
 pub(crate) const SHADER_EVALUATION_CACHE_CAPACITY: usize = 16 * 1024;
 
@@ -428,12 +427,11 @@ impl ShaderEvaluationCache {
                     .entries
                     .get(&old_key)
                     .is_some_and(|entry| entry.admission_id == admission_id);
-                if is_current {
-                    if let Some(retired) = self.entries.remove(&old_key) {
+                if is_current
+                    && let Some(retired) = self.entries.remove(&old_key) {
                         retire_shader_evaluation(retired.value);
                         self.evictions = self.evictions.saturating_add(1);
                     }
-                }
             }
             let admission_id = self.next_admission_id;
             self.next_admission_id = self.next_admission_id.wrapping_add(1);

@@ -43,10 +43,8 @@ pub(crate) use self::semaphore::guest_semaphore_wait;
 pub(crate) use self::semaphore::guest_semaphore_entry;
 #[cfg(test)]
 pub(crate) use self::state::GuestConditionState;
-pub(crate) use self::state::{GuestEventFlagState, guest_sync};
-#[cfg(test)]
-pub(crate) use self::state::GuestSemaphoreState;
-#[cfg(any(test, target_arch = "x86_64"))]
+pub(crate) use self::state::guest_sync;
+#[cfg(target_arch = "x86_64")]
 pub(crate) use self::state::{GUEST_SYNC, GuestSyncState};
 
 use self::event_flag::{
@@ -57,7 +55,7 @@ use self::semaphore::{
     guest_semaphore_create, guest_semaphore_delete, guest_semaphore_poll, guest_semaphore_signal,
 };
 use self::state::{
-    EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestMutexEntry, GuestMutexState,
+    GuestMutexEntry, GuestMutexState,
     MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
 };
 

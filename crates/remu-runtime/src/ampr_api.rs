@@ -618,185 +618,6 @@ fn ampr_read_guest_path_with(memory: &impl GuestMemoryReader, address: u64) -> O
     None
 }
 
-#[cfg(test)]
-mod guest_path_tests {
-    use std::cell::Cell;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-
-    use remu_shader::GuestMemoryReader;
-
-    use super::{ampr_read_guest_path_with, ampr_record_resolved_file};
-    use crate::ProbeDispatchState;
-
-    struct BoundedMemory {
-        base: u64,
-        bytes: Vec<u8>,
-        maximum_read: usize,
-        expose_prefix: bool,
-        reads: Cell<usize>,
-    }
-
-    impl GuestMemoryReader for BoundedMemory {
-        fn read(&self, address: u64, output: &mut [u8]) -> bool {
-            self.reads.set(self.reads.get() + 1);
-            if output.len() > self.maximum_read {
-                return false;
-            }
-            let Some(offset) = address
-                .checked_sub(self.base)
-                .and_then(|offset| usize::try_from(offset).ok())
-            else {
-                return false;
-            };
-            let Some(end) = offset.checked_add(output.len()) else {
-                return false;
-            };
-            let Some(source) = self.bytes.get(offset..end) else {
-                return false;
-            };
-            output.copy_from_slice(source);
-            true
-        }
-
-        fn readable_prefix_length(&self, address: u64, maximum_length: usize) -> Option<usize> {
-            if !self.expose_prefix {
-                return None;
-            }
-            let offset = address
-                .checked_sub(self.base)
-                .and_then(|offset| usize::try_from(offset).ok())?;
-            Some(
-                self.bytes
-                    .len()
-                    .saturating_sub(offset)
-                    .min(maximum_length)
-                    .min(self.maximum_read),
-            )
-        }
-    }
-
-    #[test]
-    fn mapped_apr_paths_are_read_in_bounded_chunks() {
-        let path = format!("/app0/{}", "asset/".repeat(100));
-        let mut bytes = path.as_bytes().to_vec();
-        bytes.push(0);
-        let memory = BoundedMemory {
-            base: 0x1000,
-            bytes,
-            maximum_read: 256,
-            expose_prefix: true,
-            reads: Cell::new(0),
-        };
-        assert_eq!(
-            ampr_read_guest_path_with(&memory, memory.base).as_deref(),
-            Some(path.as_str())
-        );
-        assert_eq!(memory.reads.get(), 3);
-    }
-
-    #[test]
-    fn apr_path_read_falls_back_when_a_reader_cannot_describe_its_boundary() {
-        let memory = BoundedMemory {
-            base: 0x2000,
-            bytes: b"/app0/config.ini\0".to_vec(),
-            maximum_read: 1,
-            expose_prefix: false,
-            reads: Cell::new(0),
-        };
-        assert_eq!(
-            ampr_read_guest_path_with(&memory, memory.base).as_deref(),
-            Some("/app0/config.ini")
-        );
-        assert_eq!(memory.reads.get(), memory.bytes.len() + 1);
-    }
-
-    #[test]
-    fn apr_path_read_rejects_unterminated_and_invalid_utf8_inputs() {
-        let unterminated = BoundedMemory {
-            base: 0x3000,
-            bytes: vec![b'x'; super::AMPR_MAX_PATH_BYTES],
-            maximum_read: 256,
-            expose_prefix: true,
-            reads: Cell::new(0),
-        };
-        assert_eq!(
-            ampr_read_guest_path_with(&unterminated, unterminated.base),
-            None
-        );
-
-        let invalid_utf8 = BoundedMemory {
-            base: 0x4000,
-            bytes: vec![0xff, 0],
-            maximum_read: 256,
-            expose_prefix: true,
-            reads: Cell::new(0),
-        };
-        assert_eq!(
-            ampr_read_guest_path_with(&invalid_utf8, invalid_utf8.base),
-            None
-        );
-    }
-
-    #[test]
-    fn repeated_apr_resolution_retains_only_a_matching_open_file() {
-        let file_id = 0x1234_5678;
-        let original_path = PathBuf::from("/host/assets/original.pak");
-        let replacement_path = PathBuf::from("/host/assets/collision.pak");
-        let retained = Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap());
-        let mut state = ProbeDispatchState::default();
-        state.ampr_files.insert(file_id, original_path.clone());
-        state.ampr_file_handles.insert(file_id, retained.clone());
-
-        ampr_record_resolved_file(&mut state, file_id, original_path);
-        assert!(Arc::ptr_eq(
-            state.ampr_file_handles.get(&file_id).unwrap(),
-            &retained
-        ));
-
-        ampr_record_resolved_file(&mut state, file_id, replacement_path.clone());
-        assert_eq!(state.ampr_files.get(&file_id), Some(&replacement_path));
-        assert!(!state.ampr_file_handles.contains_key(&file_id));
-    }
-
-    #[test]
-    fn distinct_paths_receive_dense_sequential_slot_ids() {
-        let mut state = ProbeDispatchState::default();
-        let first = state.intern_ampr_file_id(std::path::Path::new("/host/a.pak"));
-        let second = state.intern_ampr_file_id(std::path::Path::new("/host/b.pak"));
-        let third = state.intern_ampr_file_id(std::path::Path::new("/host/c.pak"));
-        // Dense, monotonic from one: distinct files can never collide, unlike the former hash.
-        assert_eq!((first, second, third), (Some(1), Some(2), Some(3)));
-        // Re-resolving a known path is stable, so a title's retained identifier keeps pointing at
-        // the same file across the whole run.
-        assert_eq!(
-            state.intern_ampr_file_id(std::path::Path::new("/host/a.pak")),
-            Some(1)
-        );
-        assert_eq!(state.ampr_next_file_id, 3);
-    }
-
-    #[test]
-    fn the_handle_cache_evicts_the_least_recently_used_beyond_the_budget() {
-        let file = Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap());
-        let mut state = ProbeDispatchState::default();
-        state.retain_ampr_file_handle_within(1, file.clone(), 2);
-        state.retain_ampr_file_handle_within(2, file.clone(), 2);
-        state.retain_ampr_file_handle_within(3, file.clone(), 2);
-        // The oldest handle is dropped once the budget is exceeded.
-        assert!(!state.ampr_file_handles.contains_key(&1));
-        assert!(state.ampr_file_handles.contains_key(&2));
-        assert!(state.ampr_file_handles.contains_key(&3));
-
-        // Re-retaining an entry promotes it, so the next eviction takes the genuinely-oldest one.
-        state.retain_ampr_file_handle_within(2, file.clone(), 2);
-        state.retain_ampr_file_handle_within(4, file.clone(), 2);
-        assert!(!state.ampr_file_handles.contains_key(&3));
-        assert!(state.ampr_file_handles.contains_key(&2));
-        assert!(state.ampr_file_handles.contains_key(&4));
-    }
-}
-
 pub(crate) fn ampr_resolve_paths_with_prefix(
     prefix_address: u64,
     path_list: u64,
@@ -1396,5 +1217,184 @@ pub(crate) fn ampr_wait_command_buffer(arguments: [u64; 6], state: &mut ProbeDis
         0
     } else {
         sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+    }
+}
+
+#[cfg(test)]
+mod guest_path_tests {
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use remu_shader::GuestMemoryReader;
+
+    use super::{ampr_read_guest_path_with, ampr_record_resolved_file};
+    use crate::ProbeDispatchState;
+
+    struct BoundedMemory {
+        base: u64,
+        bytes: Vec<u8>,
+        maximum_read: usize,
+        expose_prefix: bool,
+        reads: Cell<usize>,
+    }
+
+    impl GuestMemoryReader for BoundedMemory {
+        fn read(&self, address: u64, output: &mut [u8]) -> bool {
+            self.reads.set(self.reads.get() + 1);
+            if output.len() > self.maximum_read {
+                return false;
+            }
+            let Some(offset) = address
+                .checked_sub(self.base)
+                .and_then(|offset| usize::try_from(offset).ok())
+            else {
+                return false;
+            };
+            let Some(end) = offset.checked_add(output.len()) else {
+                return false;
+            };
+            let Some(source) = self.bytes.get(offset..end) else {
+                return false;
+            };
+            output.copy_from_slice(source);
+            true
+        }
+
+        fn readable_prefix_length(&self, address: u64, maximum_length: usize) -> Option<usize> {
+            if !self.expose_prefix {
+                return None;
+            }
+            let offset = address
+                .checked_sub(self.base)
+                .and_then(|offset| usize::try_from(offset).ok())?;
+            Some(
+                self.bytes
+                    .len()
+                    .saturating_sub(offset)
+                    .min(maximum_length)
+                    .min(self.maximum_read),
+            )
+        }
+    }
+
+    #[test]
+    fn mapped_apr_paths_are_read_in_bounded_chunks() {
+        let path = format!("/app0/{}", "asset/".repeat(100));
+        let mut bytes = path.as_bytes().to_vec();
+        bytes.push(0);
+        let memory = BoundedMemory {
+            base: 0x1000,
+            bytes,
+            maximum_read: 256,
+            expose_prefix: true,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&memory, memory.base).as_deref(),
+            Some(path.as_str())
+        );
+        assert_eq!(memory.reads.get(), 3);
+    }
+
+    #[test]
+    fn apr_path_read_falls_back_when_a_reader_cannot_describe_its_boundary() {
+        let memory = BoundedMemory {
+            base: 0x2000,
+            bytes: b"/app0/config.ini\0".to_vec(),
+            maximum_read: 1,
+            expose_prefix: false,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&memory, memory.base).as_deref(),
+            Some("/app0/config.ini")
+        );
+        assert_eq!(memory.reads.get(), memory.bytes.len() + 1);
+    }
+
+    #[test]
+    fn apr_path_read_rejects_unterminated_and_invalid_utf8_inputs() {
+        let unterminated = BoundedMemory {
+            base: 0x3000,
+            bytes: vec![b'x'; super::AMPR_MAX_PATH_BYTES],
+            maximum_read: 256,
+            expose_prefix: true,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&unterminated, unterminated.base),
+            None
+        );
+
+        let invalid_utf8 = BoundedMemory {
+            base: 0x4000,
+            bytes: vec![0xff, 0],
+            maximum_read: 256,
+            expose_prefix: true,
+            reads: Cell::new(0),
+        };
+        assert_eq!(
+            ampr_read_guest_path_with(&invalid_utf8, invalid_utf8.base),
+            None
+        );
+    }
+
+    #[test]
+    fn repeated_apr_resolution_retains_only_a_matching_open_file() {
+        let file_id = 0x1234_5678;
+        let original_path = PathBuf::from("/host/assets/original.pak");
+        let replacement_path = PathBuf::from("/host/assets/collision.pak");
+        let retained = Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap());
+        let mut state = ProbeDispatchState::default();
+        state.ampr_files.insert(file_id, original_path.clone());
+        state.ampr_file_handles.insert(file_id, retained.clone());
+
+        ampr_record_resolved_file(&mut state, file_id, original_path);
+        assert!(Arc::ptr_eq(
+            state.ampr_file_handles.get(&file_id).unwrap(),
+            &retained
+        ));
+
+        ampr_record_resolved_file(&mut state, file_id, replacement_path.clone());
+        assert_eq!(state.ampr_files.get(&file_id), Some(&replacement_path));
+        assert!(!state.ampr_file_handles.contains_key(&file_id));
+    }
+
+    #[test]
+    fn distinct_paths_receive_dense_sequential_slot_ids() {
+        let mut state = ProbeDispatchState::default();
+        let first = state.intern_ampr_file_id(std::path::Path::new("/host/a.pak"));
+        let second = state.intern_ampr_file_id(std::path::Path::new("/host/b.pak"));
+        let third = state.intern_ampr_file_id(std::path::Path::new("/host/c.pak"));
+        // Dense, monotonic from one: distinct files can never collide, unlike the former hash.
+        assert_eq!((first, second, third), (Some(1), Some(2), Some(3)));
+        // Re-resolving a known path is stable, so a title's retained identifier keeps pointing at
+        // the same file across the whole run.
+        assert_eq!(
+            state.intern_ampr_file_id(std::path::Path::new("/host/a.pak")),
+            Some(1)
+        );
+        assert_eq!(state.ampr_next_file_id, 3);
+    }
+
+    #[test]
+    fn the_handle_cache_evicts_the_least_recently_used_beyond_the_budget() {
+        let file = Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap());
+        let mut state = ProbeDispatchState::default();
+        state.retain_ampr_file_handle_within(1, file.clone(), 2);
+        state.retain_ampr_file_handle_within(2, file.clone(), 2);
+        state.retain_ampr_file_handle_within(3, file.clone(), 2);
+        // The oldest handle is dropped once the budget is exceeded.
+        assert!(!state.ampr_file_handles.contains_key(&1));
+        assert!(state.ampr_file_handles.contains_key(&2));
+        assert!(state.ampr_file_handles.contains_key(&3));
+
+        // Re-retaining an entry promotes it, so the next eviction takes the genuinely-oldest one.
+        state.retain_ampr_file_handle_within(2, file.clone(), 2);
+        state.retain_ampr_file_handle_within(4, file.clone(), 2);
+        assert!(!state.ampr_file_handles.contains_key(&3));
+        assert!(state.ampr_file_handles.contains_key(&2));
+        assert!(state.ampr_file_handles.contains_key(&4));
     }
 }

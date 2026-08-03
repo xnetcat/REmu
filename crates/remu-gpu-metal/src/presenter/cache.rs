@@ -272,10 +272,11 @@ impl MetalPresenter {
             .map(|binding| binding.sampler_descriptor.clone())
             .collect::<Vec<_>>();
         let key = (!sampled_descriptors.is_empty()).then(|| SamplerArgumentCacheKey {
-            function: buffer_index
-                .is_some()
-                .then_some(function.as_ptr() as usize)
-                .unwrap_or_default(),
+            function: if buffer_index.is_some() {
+                function.as_ptr() as usize
+            } else {
+                0
+            },
             buffer_index,
             descriptors: sampled_descriptors
                 .into_iter()
@@ -423,27 +424,25 @@ impl MetalPresenter {
                     destination
                 };
                 uploaded.push(destination);
+            } else if let Some(source) = &binding_plan.source {
+                uploaded.push(UploadedGlobalBuffer {
+                    buffer: source.clone(),
+                    offset: binding_plan.source_offset,
+                    guest_memory: false,
+                    physical_identity: Some(binding_plan.physical_identity),
+                    original_version: None,
+                });
+            } else if let Some(backing) = &binding_plan.guest_backing {
+                uploaded.push(self.upload_shared_event_guest_global_buffer(
+                    device,
+                    effective_bindings[index],
+                    backing,
+                    binding_plan.physical_identity,
+                )?);
             } else {
-                if let Some(source) = &binding_plan.source {
-                    uploaded.push(UploadedGlobalBuffer {
-                        buffer: source.clone(),
-                        offset: binding_plan.source_offset,
-                        guest_memory: false,
-                        physical_identity: Some(binding_plan.physical_identity),
-                        original_version: None,
-                    });
-                } else if let Some(backing) = &binding_plan.guest_backing {
-                    uploaded.push(self.upload_shared_event_guest_global_buffer(
-                        device,
-                        effective_bindings[index],
-                        backing,
-                        binding_plan.physical_identity,
-                    )?);
-                } else {
-                    uploaded.push(
-                        self.upload_global_buffer_from_packet(device, effective_bindings[index])?,
-                    );
-                }
+                uploaded.push(
+                    self.upload_global_buffer_from_packet(device, effective_bindings[index])?,
+                );
             }
         }
         Ok(uploaded)
@@ -1691,8 +1690,8 @@ fn contained_global_version_offset(
             ) {
                 let read_start = read_identity.backing_offset;
                 if producer_start < read_end && read_start < producer_end {
-                    if read_start >= producer_start && read_end <= producer_end {
-                        if let Some(offset) =
+                    if read_start >= producer_start && read_end <= producer_end
+                        && let Some(offset) =
                             version.offset.checked_add(read_start - producer_start)
                             && offset
                                 .checked_add(byte_count)
@@ -1703,7 +1702,6 @@ fn contained_global_version_offset(
                                 physical_identity: Some(read_identity),
                             };
                         }
-                    }
                     return QueuedWriteReadMatch::Synchronize;
                 }
             }
@@ -1845,8 +1843,8 @@ fn contained_global_writeback_offset(
         byte_count,
     );
     if let Some(producer_identity) = writeback.mapping_identity() {
-        if let Some(read_identity) = guest_shared_backing_identity(address, byte_count) {
-            if read_identity.backing_id == producer_identity.backing_id {
+        if let Some(read_identity) = guest_shared_backing_identity(address, byte_count)
+            && read_identity.backing_id == producer_identity.backing_id {
                 let producer_start = producer_identity.backing_offset;
                 if let (Some(producer_end), Some(read_end)) = (
                     producer_start.checked_add(writeback_byte_count),
@@ -1854,8 +1852,8 @@ fn contained_global_writeback_offset(
                 ) {
                     let read_start = read_identity.backing_offset;
                     if producer_start < read_end && read_start < producer_end {
-                        if read_start >= producer_start && read_end <= producer_end {
-                            if let Some(offset) =
+                        if read_start >= producer_start && read_end <= producer_end
+                            && let Some(offset) =
                                 writeback.offset.checked_add(read_start - producer_start)
                             {
                                 return QueuedWriteReadMatch::Buffer {
@@ -1863,12 +1861,10 @@ fn contained_global_writeback_offset(
                                     physical_identity: Some(read_identity),
                                 };
                             }
-                        }
                         return QueuedWriteReadMatch::Synchronize;
                     }
                 }
             }
-        }
         // VA recycled onto a different physical interval while this writeback is still queued.
         // Forward the live Metal buffer by virtual offset instead of Synchronize→guest snapshot:
         // draining then re-reading the remapped VA observes pre-dispatch bytes (Poppy tofu).

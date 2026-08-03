@@ -6,6 +6,7 @@
 //! (`sdk/target/include/app_content.h:328-334`, mount-point size
 //! `SCE_APP_CONTENT_MOUNTPOINT_DATA_MAXSIZE` = 16 at `:215`).
 
+#![cfg_attr(not(any(test, target_arch = "x86_64")), allow(dead_code))] // Static mounts rebuild from x86 probe configure + tests.
 use std::path::{Path, PathBuf};
 
 use crate::guest_files::{
@@ -77,6 +78,7 @@ impl VfsState {
         before != self.mounts.len()
     }
 
+    #[allow(dead_code)] // Reset helper for future title teardown / test isolation.
     pub(crate) fn clear(&mut self) {
         self.mounts.clear();
     }

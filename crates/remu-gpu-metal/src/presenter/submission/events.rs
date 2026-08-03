@@ -424,7 +424,7 @@ impl OrderedGpuEventReceiver {
         if self.pending_event_count() != 0 {
             OrderedEventPoll::Blocked
         } else if self.disconnected {
-            return OrderedEventPoll::Disconnected;
+            OrderedEventPoll::Disconnected
         } else {
             OrderedEventPoll::Empty
         }

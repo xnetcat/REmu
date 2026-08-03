@@ -282,11 +282,10 @@ pub(crate) fn shader_scalar_metadata_for_registers(
     let scalar_end = scalar_register_base
         .saturating_add(64)
         .min(evaluation.initial_scalar_registers.len());
-    for scalar_register in scalar_register_base..scalar_end {
-        let offset = u32::try_from(scalar_register - scalar_register_base)
+    for (offset, word) in words[scalar_register_base..scalar_end].iter_mut().enumerate() {
+        let offset = u32::try_from(offset)
             .map_err(|_| "shader scalar register offset does not fit u32")?;
-        words[scalar_register] =
-            register_value(shader_registers, user_data_register + offset).unwrap_or_default();
+        *word = register_value(shader_registers, user_data_register + offset).unwrap_or_default();
     }
     // Live SH/user-data reloads restore guest NUM_RECORDS after evaluation expanded the Metal
     // buffer for instanced vertex fetches. Without lifting NUM_RECORDS to the bound span,
@@ -384,7 +383,7 @@ pub(crate) fn rectangle_coordinate_parameter_mask(
             .find_map(|(index, instruction)| {
                 (instruction.opcode.starts_with("ImageSample")
                     || instruction.opcode.starts_with("ImageGather"))
-                .then(|| match instruction.control.as_ref() {
+                .then_some(match instruction.control.as_ref() {
                     Some(InstructionControl::Image(image)) => Some((index, image)),
                     _ => None,
                 })

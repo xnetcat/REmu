@@ -32,11 +32,6 @@ pub use self::relocation::RelocationStats;
 
 #[cfg(test)]
 pub(crate) use self::imports::{IMPORT_STUB_SIZE_USIZE, write_import_stub};
-pub(crate) use self::fs_decode::{
-    FsLoadBoundaryReport, FsLoadSite, collect_fs_decode_seed_addresses,
-    diagnose_fs_load_boundary_mismatches, report_fs_load_boundary_mismatches,
-    seed_offsets_in_region, seeded_fs_load_sites,
-};
 pub(crate) use self::modules::{
     LinkedGuestModule, MACOS_GUEST_PAGE_ALIGNMENT, PT_TLS, collect_initializer_array,
     discover_runtime_module_paths,

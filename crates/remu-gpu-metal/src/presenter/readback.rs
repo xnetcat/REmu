@@ -786,7 +786,7 @@ fn diagnostic_texture_numeric_range(
     descriptor: GuestTextureDescriptor,
 ) -> Option<DiagnosticTextureNumericRange> {
     let bytes_per_pixel = usize::try_from(descriptor.bytes_per_pixel).ok()?;
-    if bytes_per_pixel == 0 || plane.len() % bytes_per_pixel != 0 {
+    if bytes_per_pixel == 0 || !plane.len().is_multiple_of(bytes_per_pixel) {
         return None;
     }
     let mut minimum = [None; 4];

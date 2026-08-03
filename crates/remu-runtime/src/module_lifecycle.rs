@@ -19,11 +19,14 @@ use std::sync::{Condvar, Mutex, OnceLock};
 /// Per-module lifecycle phases. Only `Started` modules expose exports to `dlsym`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GuestModulePhase {
+    #[allow(dead_code)] // Matched in load/start; construction lands with finer load staging.
     Mapped,
     Relocated,
     Starting,
     Started,
+    #[allow(dead_code)] // Matched in dlsym gate; unload path constructs later.
     Stopping,
+    #[allow(dead_code)] // Matched in dlsym gate; unload path constructs later.
     Stopped,
 }
 
@@ -61,6 +64,7 @@ fn registry_pair() -> &'static (Mutex<GuestModuleRegistryState>, Condvar) {
 }
 
 /// Clears the registry and installs relocated (or already-started) modules from a fresh link.
+#[cfg_attr(not(any(test, target_arch = "x86_64")), allow(dead_code))]
 pub(crate) fn reset_guest_module_registry(modules: impl IntoIterator<Item = GuestModule>) {
     let (lock, condvar) = registry_pair();
     let mut state = lock
@@ -83,6 +87,7 @@ pub(crate) fn begin_load_start_module(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
+        #[allow(clippy::question_mark)] // `?` would exit the wait-loop; keep explicit None return.
         let Some(handle) = state
             .registry
             .by_handle
@@ -140,8 +145,8 @@ pub(crate) fn finish_load_start_module(handle: u32, succeeded: bool) {
     let mut state = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(module) = state.registry.by_handle.get_mut(&handle) {
-        if module.phase == GuestModulePhase::Starting {
+    if let Some(module) = state.registry.by_handle.get_mut(&handle)
+        && module.phase == GuestModulePhase::Starting {
             module.phase = if succeeded {
                 GuestModulePhase::Started
             } else {
@@ -150,7 +155,6 @@ pub(crate) fn finish_load_start_module(handle: u32, succeeded: bool) {
                 GuestModulePhase::Relocated
             };
         }
-    }
     condvar.notify_all();
 }
 
@@ -164,9 +168,7 @@ pub(crate) fn resolve_started_export(handle: u32, nid: &str) -> Option<u64> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     loop {
-        let Some(module) = state.registry.by_handle.get(&handle) else {
-            return None;
-        };
+        let module = state.registry.by_handle.get(&handle)?;
         match module.phase {
             GuestModulePhase::Starting => {
                 state = condvar

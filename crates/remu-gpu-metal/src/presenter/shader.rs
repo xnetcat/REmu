@@ -707,7 +707,7 @@ impl MetalPresenter {
             descriptor
                 .set_max_total_threads_per_mesh_threadgroup(u64::from(limits.threadgroup_threads));
             descriptor.set_mesh_threadgroup_size_is_multiple_of_thread_execution_width(
-                limits.threadgroup_threads % 32 == 0,
+                limits.threadgroup_threads.is_multiple_of(32),
             );
             for (location, target) in key.targets.iter().enumerate() {
                 let attachment = descriptor

@@ -146,20 +146,18 @@ pub fn build_control_flow_graph(program: &Program) -> ControlFlowGraph {
             && program.linked_transfer_target(instruction.pc).is_some();
         let is_exit = is_terminal(instruction.opcode) || instruction.opcode.is("SSetpcB64");
         if is_branch {
-            if let Some(target_pc) = branch_target_pc(program, index) {
-                if let Some(&target_index) = pc_to_index.get(&target_pc) {
+            if let Some(target_pc) = branch_target_pc(program, index)
+                && let Some(&target_index) = pc_to_index.get(&target_pc) {
                     leaders.insert(target_index);
                 }
-            }
             if index + 1 < instructions.len() {
                 leaders.insert(index + 1);
             }
         } else if is_linked {
-            if let Some(target_pc) = program.linked_transfer_target(instruction.pc) {
-                if let Some(&target_index) = pc_to_index.get(&target_pc) {
+            if let Some(target_pc) = program.linked_transfer_target(instruction.pc)
+                && let Some(&target_index) = pc_to_index.get(&target_pc) {
                     leaders.insert(target_index);
                 }
-            }
             if index + 1 < instructions.len() {
                 leaders.insert(index + 1);
             }
@@ -349,9 +347,9 @@ fn compute_dominators(successors: &[Vec<BlockId>], predecessors: &[Vec<BlockId>]
         }
     }
     // Unreachable blocks dominate only themselves (they never appear in a reachable path).
-    for block in 0..count {
-        if idom[block] == usize::MAX {
-            idom[block] = block;
+    for (block, idom_entry) in idom.iter_mut().enumerate().take(count) {
+        if *idom_entry == usize::MAX {
+            *idom_entry = block;
         }
     }
     Dominators { idom, position }

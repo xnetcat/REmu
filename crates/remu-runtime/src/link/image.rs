@@ -39,9 +39,12 @@ pub struct LinkedImage {
     pub(crate) unwind_fdes: Vec<GuestAddress>,
     #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) module_initializers: Vec<GuestAddress>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) bundled_modules: Vec<LinkedGuestModule>,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) unwind_modules: Vec<GuestUnwindModule>,
     /// Ifunc relocations whose guest resolvers run once at process entry (F2).
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     pub(crate) pending_ifunc_relocations: Vec<PendingIfunc>,
 }
 

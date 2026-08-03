@@ -13,14 +13,17 @@ mod occlusion;
 mod tbdr;
 mod zero_copy;
 
+#[allow(unused_imports)] // Seams re-exported for execute/residency migration; submodule tests cover them.
 pub(crate) use self::occlusion::{
     arm_visibility_counting, attach_visibility_result_buffer, ensure_visibility_result_buffer,
     occlusion_counter_releases, publish_occlusion_query_to_guest, visibility_result_buffer_byte_count,
 };
+#[allow(unused_imports)]
 pub(crate) use self::tbdr::{
     AttachmentStorePolicy, DepthConsumerHint, MsaaMemorylessDecision, MEMORYLESS_MSAA_MIN_DRAWS_PER_PASS,
     color_store_action, depth_store_action, msaa_memoryless_decision,
 };
+#[allow(unused_imports)]
 pub(crate) use self::zero_copy::{
     AttachmentZeroCopyDecision, attachment_zero_copy_decision, refuse_unproven_attachment_zero_copy,
 };

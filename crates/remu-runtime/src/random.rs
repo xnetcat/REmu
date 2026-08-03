@@ -48,7 +48,7 @@ fn fill_secure_random(bytes: &mut [u8]) -> Result<(), String> {
         if status == 0 {
             return Ok(());
         }
-        return Err(std::io::Error::last_os_error().to_string());
+        Err(std::io::Error::last_os_error().to_string())
     }
     #[cfg(not(unix))]
     {

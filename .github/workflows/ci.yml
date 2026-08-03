@@ -2,8 +2,7 @@
 # x86_64 target runs guest code under Rosetta 2, so both the native arm64 and the cross-built
 # x86_64 configurations are checked on Apple-Silicon runners. Tests run serially
 # (`--test-threads=1`): the runtime suite's residual global-counter cross-talk (docs/status.md)
-# is not yet fully removed, so serial remains the honest gate. Clippy runs informationally until
-# the pre-existing warning debt is cleared (plan H3); it does not gate merges yet.
+# is not yet fully removed, so serial remains the honest gate. Clippy denies warnings (plan H3).
 #
 # Plan E3 / H1 Tier B (remu replay --check over frame goldens) is intentionally absent: the
 # scripts-side harness is a loud stub (scripts/remu-replay.py exits 78) until remu-cli grows
@@ -52,11 +51,10 @@ jobs:
       - name: Tests (x86_64 under Rosetta, serial)
         run: cargo test --workspace --target x86_64-apple-darwin -- --test-threads=1
 
-      - name: Clippy (informational until the warning debt is cleared, plan H3)
-        continue-on-error: true
+      - name: Clippy (deny warnings, plan H3)
         run: |
-          cargo clippy --workspace --all-targets
-          cargo clippy --workspace --all-targets --target x86_64-apple-darwin
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --target x86_64-apple-darwin -- -D warnings
 
       # Tier B (plan H1 / E3): enable when remu replay + out-of-repo goldens exist.
       # - name: Replay goldens (E3)

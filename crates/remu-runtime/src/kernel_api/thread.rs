@@ -154,11 +154,10 @@ pub(super) fn kernel_current_cpu(state: &mut ProbeDispatchState) -> u64 {
 
 /// Returns the emulated core REmu is running `handle` on, placing it if it has none yet.
 fn placed_core(state: &mut ProbeDispatchState, handle: u64, affinity_mask: u64) -> u32 {
-    if let Some(&core) = state.thread_running_cpu.get(&handle) {
-        if core_is_permitted(affinity_mask, core) {
+    if let Some(&core) = state.thread_running_cpu.get(&handle)
+        && core_is_permitted(affinity_mask, core) {
             return core;
         }
-    }
     let permitted: Vec<u32> = (0..PS5_LOGICAL_CPU_COUNT)
         .filter(|&core| core_is_permitted(affinity_mask, core))
         .collect();

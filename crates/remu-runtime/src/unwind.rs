@@ -103,6 +103,7 @@ pub(crate) fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize,
 }
 
 #[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[allow(dead_code)] // probe_entry is x86_64-only; non-Rosetta hosts keep the diagnostic stub.
 pub(crate) fn register_guest_unwind_frames(image: &LinkedImage) -> Result<usize, LinkError> {
     // Host libunwind registration is a macOS x86_64 Rosetta path. Analysis and non-macOS hosts
     // still decode FDE inventories for diagnostics, but they do not register them with a native

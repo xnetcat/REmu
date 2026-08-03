@@ -414,14 +414,13 @@ pub(crate) fn upload_image_textures(
                 } else {
                     false
                 };
-                if replaced {
-                    if let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
+                if replaced
+                    && let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
                         trace_resident_texture_removal(
                             "sample-upload-mapping-replaced",
                             &resident,
                         );
                     }
-                }
             }
             let multisample_resolve = (!comparison && descriptor.texture_type == 9)
                 .then(|| {
@@ -831,8 +830,7 @@ pub(crate) fn upload_image_textures(
                     // levels, so charging it allowed a nominal 1.5 GiB cache to consume several
                     // GiB of unified memory. Keep the guest span as a conservative floor for
                     // drivers that report zero for texture views.
-                    let incoming_bytes = u64::try_from(texture.allocated_size())
-                        .unwrap_or(u64::MAX)
+                    let incoming_bytes = texture.allocated_size()
                         .max(write_watch.range().1);
                     let byte_capacity = sampled_texture_cache_byte_capacity();
                     let mut cached_bytes = sampled_texture_cache.values().fold(

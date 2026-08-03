@@ -65,14 +65,14 @@ pub(crate) fn attachment_zero_copy_decision(
             tile_mode: descriptor.tile_mode,
         };
     }
-    if descriptor.address % GUEST_PAGE_SIZE != 0 {
+    if !descriptor.address.is_multiple_of(GUEST_PAGE_SIZE) {
         return AttachmentZeroCopyDecision::Refused {
             reason: "attachment base is not guest-page aligned",
             address: descriptor.address,
             tile_mode: descriptor.tile_mode,
         };
     }
-    if byte_count % GUEST_PAGE_SIZE != 0 {
+    if !byte_count.is_multiple_of(GUEST_PAGE_SIZE) {
         return AttachmentZeroCopyDecision::Refused {
             reason: "attachment byte count is not guest-page aligned",
             address: descriptor.address,

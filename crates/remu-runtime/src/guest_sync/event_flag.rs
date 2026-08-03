@@ -27,7 +27,7 @@ pub(super) const EVENT_FLAG_CLEAR_ALL: u32 = 0x10;
 pub(super) const EVENT_FLAG_CLEAR_PATTERN: u32 = 0x20;
 
 pub(super) fn event_flag_attributes_valid(attributes: u32) -> bool {
-    matches!(attributes & 0x0f, 0 | 0x01 | 0x02)
+    matches!(attributes & 0x0f, 0..=0x02)
         && matches!(attributes & 0xf0, 0 | 0x10 | 0x20)
         && attributes & !0x33 == 0
 }

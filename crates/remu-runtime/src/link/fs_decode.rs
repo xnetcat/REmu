@@ -43,11 +43,9 @@ pub(crate) fn byte_scan_fs_load_offsets(bytes: &[u8]) -> Vec<usize> {
     }
     for offset in 0..=bytes.len() - FS_LOAD_ENCODING_LEN {
         if let Some(destination) = fs_load_destination(&bytes[offset..offset + FS_LOAD_ENCODING_LEN])
-        {
-            if destination != 4 {
+            && destination != 4 {
                 hits.push(offset);
             }
-        }
     }
     hits
 }
@@ -118,6 +116,7 @@ pub(crate) fn seeded_fs_load_sites(bytes: &[u8], seeds: &[usize]) -> (BTreeSet<u
 
 /// Compares the legacy byte scan to seeded decode. Boundary mismatches are the loud diagnostic
 /// that must ship before any rewrite trusts a scan hit.
+#[cfg_attr(not(test), allow(dead_code))] // F3 diagnostic; unit tests exercise it.
 pub(crate) fn diagnose_fs_load_boundary_mismatches(
     bytes: &[u8],
     seeds: &[usize],

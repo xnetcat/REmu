@@ -1283,10 +1283,10 @@ pub(crate) fn snapshot_guest_texture_raw(
     {
         // Tests also exercise the tiler with ordinary process-local allocations.
         // SAFETY: those test descriptors retain their complete source allocation.
-        return Ok(unsafe {
+        Ok(unsafe {
             std::slice::from_raw_parts(_source_address as *const u8, source_length)
         }
-        .to_vec());
+        .to_vec())
     }
     #[cfg(not(test))]
     Err(format!(
@@ -1403,9 +1403,7 @@ pub(crate) fn snapshot_watched_guest_range(
     let started = Instant::now();
     let caller_line = std::panic::Location::caller().line();
     let precise_tracking = write_watch.precise_tracking();
-    let dirty_page_ranges = precise_tracking
-        .then(|| write_watch.dirty_page_ranges())
-        .unwrap_or_default();
+    let dirty_page_ranges = if precise_tracking { write_watch.dirty_page_ranges() } else { Default::default() };
     let dirty_bytes = dirty_page_ranges
         .iter()
         .fold(0_u64, |total, (_, range_byte_count)| {
@@ -1626,7 +1624,7 @@ fn publish_segments_leased(
                         source.len()
                     ));
                 }
-                *bytes
+                bytes
             }
             _ => unreachable!("baseline source pairing"),
         };

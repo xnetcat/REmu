@@ -128,6 +128,7 @@ impl GuestSyncState {
         Some(waiter)
     }
 
+    #[allow(dead_code)] // Query helper for diagnostics / tests beside finish_condition_wait.
     pub(crate) fn condition_waiter_released(&self, waiter: u64) -> bool {
         self.condition_waiters
             .get(&waiter)

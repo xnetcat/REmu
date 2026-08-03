@@ -185,7 +185,7 @@ pub(crate) use audio_out2_abi::{
     trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_audio_out2_pcm,
     write_audio_out2_context_param, write_audio_out2_port_state,
 };
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub(crate) use av_player::av_player_nv12_layout;
 #[cfg(test)]
 pub(crate) use av_player::{
@@ -244,17 +244,18 @@ pub(crate) use guest_libc::{
 };
 #[cfg(test)]
 pub(crate) use guest_sync::{
-    EVENT_FLAG_WAIT_OR, GuestConditionState, GuestEventFlagState, GuestSemaphoreState,
+    EVENT_FLAG_WAIT_OR, GuestConditionState,
     dispatch_guest_sync_import, guest_condition_destroy, guest_condition_init,
     guest_condition_notify, guest_condition_wait, guest_condition_wait_with_interrupt,
     guest_event_flag_entry, guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry,
     guest_mutex_init, guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init,
     guest_semaphore_entry, guest_semaphore_wait, wake_all_guest_sync_for_exception,
 };
+#[cfg(target_arch = "x86_64")]
+pub(crate) use guest_sync::{GUEST_SYNC, GuestSyncState};
 #[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use guest_sync::{
-    GUEST_SYNC, GuestSyncState, guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock,
-    guest_rwlock_unlock,
+    guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock, guest_rwlock_unlock,
 };
 pub(crate) use guest_sync::{
     dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import,
@@ -471,6 +472,7 @@ struct ProbeDispatchState {
     thread_atexit_count_callback: u64,
     thread_atexit_report_callback: u64,
     /// Per-guest-thread counts `_sceKernelRtldThreadAtexitIncrement` accumulates for CRT teardown.
+    #[allow(dead_code)] // Cleared on process reset; Increment/Decrement wiring still uses module_tls_destructor_refs.
     thread_atexit_counts: BTreeMap<u64, u64>,
     thread_dtors_callback: u64,
     /// Pending `__cxa_thread_atexit` destructor references keyed by module base.
@@ -1394,6 +1396,7 @@ fn guest_exception_is_pending(thread: u64) -> bool {
 #[derive(Debug)]
 struct ImportTelemetry {
     nids: Box<[String]>,
+    #[allow(dead_code)] // C1 dual representation; cascade→u64 hot-path consumers land with the rewrite.
     nids_u64: Box<[u64]>,
     routes: import_routes::ImportRouteTable,
     seen: Box<[AtomicBool]>,
@@ -1627,6 +1630,7 @@ fn guest_thread_unique_id_key() -> Option<libc::pthread_key_t> {
 
 #[repr(C)]
 #[derive(Debug, Default)]
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 struct GuestThreadExitContext {
     stack_pointer: u64,
     continuation: u64,
@@ -4005,6 +4009,7 @@ fn resolve_pending_ifunc_relocations(image: &LinkedImage) {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
+#[allow(dead_code)] // probe_entry is x86_64-only; stub keeps the symbol for shared call shape.
 fn resolve_pending_ifunc_relocations(_image: &LinkedImage) {}
 
 fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
@@ -4397,6 +4402,7 @@ fn process_time_since_nanos(now: u64, start: u64, counter: bool) -> u64 {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn reset_kernel_process_time() {
     PROCESS_START_NANOS.store(process_clock_nanos().max(1), Ordering::Release);
     #[cfg(target_os = "macos")]
@@ -5058,9 +5064,7 @@ fn dispatch_probe_import(
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
         "HXzjK9yI30k" => video_out_add_flip_event(arguments, state),
         "Xru92wHJRmg" => video_out_add_vblank_event(arguments, state),
-        "w0hLuNarQxY" => (low_i32(arguments[0]) == 1)
-            .then_some(0)
-            .unwrap_or_else(|| sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE)),
+        "w0hLuNarQxY" => if low_i32(arguments[0]) == 1 { 0 } else { sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE) },
         // libScePad output structures must always be initialized; successful no-ops would expose
         // stale guest stack contents as controller capabilities and button state.
         // Prefer dispatch_pad_import for new NIDs; these arms remain for the probe path.
@@ -5487,6 +5491,7 @@ fn queue_kernel_event(_state: &mut ProbeDispatchState, event: KernelQueuedEvent)
     event_state::queue_kernel_event(event);
 }
 
+#[allow(dead_code)] // Thin wrapper over discard_kernel_events_into for call sites that own ProbeDispatch.
 fn discard_kernel_events(
     state: &mut ProbeDispatchState,
     should_discard: impl FnMut(&KernelQueuedEvent) -> bool,
@@ -6220,8 +6225,10 @@ fn ult_initialize(runtime: u64, state: &mut ProbeDispatchState) -> u64 {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 const MAXIMUM_SYSTEM_SPLASH_PIXELS: usize = 64 * 1024 * 1024;
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn load_system_splash(game_root: &Path) -> Result<(PathBuf, remu_gpu::GpuHostImage), String> {
     let path = resolve_path_beneath(game_root, "sce_sys/pic0.png")
         .filter(|path| path.is_file())
@@ -7747,6 +7754,7 @@ fn trace_guest_time() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TIME").is_some_and(|value| value == "1"))
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn trace_fiber() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_FIBER").is_some_and(|value| value == "1"))
@@ -8813,6 +8821,7 @@ pub fn report_abi_gap_summary() {
 /// where this summary — which allocates and takes locks — must not run. Since the counts are
 /// cumulative, a snapshot from a few seconds earlier answers the same questions, and crashing
 /// runs are exactly the ones whose gaps matter most.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn start_abi_gap_reporter() {
     /// Long enough to stay out of the way of a run's own output, short enough that the last
     /// snapshot before a crash is still representative.
@@ -8837,6 +8846,7 @@ fn start_abi_gap_reporter() {
 }
 
 /// Sums the reportable gap counts, so an unchanged run reprints nothing.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 fn abi_gap_fingerprint() -> u64 {
     let declines: u64 = DECLINED_SHADER_REGISTRATIONS
         .iter()

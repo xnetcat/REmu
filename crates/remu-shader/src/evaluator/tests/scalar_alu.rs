@@ -676,7 +676,7 @@ fn s_bitset_and_bitreplicate_modify_the_destination_pair() {
     );
     assert_eq!(
         (registers[4], registers[5]),
-        (u32::MAX, u32::MAX & !(1 << 7))
+        (u32::MAX, !(1 << 7))
     );
 
     registers[2] = 0b101;
