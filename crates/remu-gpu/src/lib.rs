@@ -3,9 +3,13 @@
 mod channel;
 pub use channel::{
     GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GPU_PENDING_EVENT_CAPACITY,
-    acquire_memory, clear_event_sink, emit_event, emit_event_with_admission, gpu_event_channel,
-    install_event_sink, pipeline_barrier,
+    GpuEventPublicationTiming, acquire_memory, clear_event_sink, emit_event,
+    emit_event_with_admission, emit_event_with_admission_and_timing, emit_event_with_timing,
+    gpu_event_channel, install_event_sink, pipeline_barrier,
 };
+
+mod startup;
+pub use startup::{StartupMilestone, begin_startup_timeline, record_startup_milestone};
 
 mod compute;
 pub use compute::{
@@ -37,8 +41,9 @@ mod dispatch_telemetry;
 pub use dispatch_telemetry::{
     DIRECT_DISPATCH_IMPORT_COUNT, DISPATCH_IMPORT_FAMILY_COUNT, DISPATCH_LATENCY_BUCKET_COUNT,
     DISPATCH_LATENCY_BUCKET_UPPER_NS, DirectDispatchImport, DispatchImportFamily,
-    DispatchLatencyHistogram, DispatchTelemetrySample, record_direct_dispatch_import,
-    record_dispatch_import, record_dispatch_lock_acquire_wait, record_dispatch_lock_hold,
+    DispatchLatencyHistogram, DispatchTelemetrySample, GpuPublicationPhase, GpuPublicationRoute,
+    format_gpu_publication_phase_report, record_direct_dispatch_import, record_dispatch_import,
+    record_dispatch_lock_acquire_wait, record_dispatch_lock_hold, record_gpu_publication_phase,
     record_gpu_publication_wait, take_dispatch_telemetry_sample,
 };
 

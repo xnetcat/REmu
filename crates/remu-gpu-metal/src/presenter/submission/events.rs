@@ -8,10 +8,12 @@ use super::super::{
 use super::{
     OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
     QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+    SharedEventHostEffectPendingStatistics,
 };
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, GpuWaitId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 fn dependency_ingress_budget() -> usize {
     if remu_gpu::gpu_work_items_pending() > GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD {
@@ -121,8 +123,19 @@ impl OrderedGpuEventReceiver {
             host_block: None,
             next_ingress_sequence: 0,
             disconnected: false,
+            event_queue_timing: false,
+            last_event_ingested_at: None,
+            last_event_queue_wait: Duration::ZERO,
             producer_labels: HashMap::new(),
         }
+    }
+
+    pub(crate) fn set_event_queue_timing(&mut self, enabled: bool) {
+        self.event_queue_timing = enabled;
+    }
+
+    pub(crate) fn last_event_queue_wait(&self) -> Duration {
+        self.last_event_queue_wait
     }
 
     fn index_queued_event_producers(&mut self, event: &GpuEvent) {
@@ -174,8 +187,12 @@ impl OrderedGpuEventReceiver {
             };
             let ingress_sequence = self.next_ingress_sequence;
             self.next_ingress_sequence = self.next_ingress_sequence.saturating_add(1);
+            let ingested_at = self.event_queue_timing.then(Instant::now);
             match event {
                 GpuEvent::QueueSubmission { queue_id, events } => {
+                    remu_gpu::record_startup_milestone(
+                        remu_gpu::StartupMilestone::FirstQueueSubmission,
+                    );
                     if events.is_empty() {
                         continue;
                     }
@@ -188,12 +205,14 @@ impl OrderedGpuEventReceiver {
                     self.submissions.entry(queue_id).or_default().push_back(
                         ScheduledGpuSubmission {
                             ingress_sequence,
+                            ingested_at,
                             events: events.into(),
                         },
                     );
                 }
                 event => self.host_events.push_back(ScheduledHostEvent {
                     ingress_sequence,
+                    ingested_at,
                     event,
                 }),
             }
@@ -308,7 +327,7 @@ impl OrderedGpuEventReceiver {
 
     pub(crate) fn try_recv(
         &mut self,
-        block_resolved: impl Fn(&QueueBlockReason) -> bool,
+        mut block_resolved: impl FnMut(&mut QueueBlockReason) -> bool,
     ) -> OrderedEventPoll {
         self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
@@ -319,7 +338,7 @@ impl OrderedGpuEventReceiver {
             | QueueBlockReason::GraphicsPipeline(_)
             | QueueBlockReason::ComputePipeline(_)) => !block_resolved(reason),
         });
-        if self.host_block.as_ref().is_some_and(|reason| match reason {
+        if self.host_block.as_mut().is_some_and(|reason| match reason {
             QueueBlockReason::GuestMemoryWait(_)
             | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
             reason @ (QueueBlockReason::FlipSafetyWait(_)
@@ -361,6 +380,10 @@ impl OrderedGpuEventReceiver {
                 .host_events
                 .pop_front()
                 .expect("host event exists after readiness check");
+            self.last_event_ingested_at = host.ingested_at;
+            self.last_event_queue_wait = host.ingested_at.map_or(Duration::ZERO, |at| {
+                Instant::now().saturating_duration_since(at)
+            });
             return OrderedEventPoll::Event {
                 source: OrderedEventSource::Host {
                     ingress_sequence: host.ingress_sequence,
@@ -405,6 +428,22 @@ impl OrderedGpuEventReceiver {
         }
     }
 
+    pub(crate) fn shared_event_host_effect_pending_statistics(
+        &self,
+        now: std::time::Instant,
+    ) -> SharedEventHostEffectPendingStatistics {
+        let mut statistics = SharedEventHostEffectPendingStatistics::default();
+        for reason in self.blocked_queues.values().chain(self.host_block.iter()) {
+            if let QueueBlockReason::GuestSharedEventHostEffect { latency, .. } = reason {
+                statistics.record(
+                    latency.phase,
+                    now.saturating_duration_since(latency.phase_started_at),
+                );
+            }
+        }
+        statistics
+    }
+
     pub(crate) fn pop_queue_event(&mut self, queue_id: u64) -> Option<GpuEvent> {
         let queue = self.submissions.get_mut(&queue_id)?;
         while queue
@@ -413,7 +452,12 @@ impl OrderedGpuEventReceiver {
         {
             queue.pop_front();
         }
+        let ingested_at = queue.front()?.ingested_at;
         let event = queue.front_mut()?.events.pop_front()?;
+        self.last_event_ingested_at = ingested_at;
+        self.last_event_queue_wait = ingested_at.map_or(Duration::ZERO, |at| {
+            Instant::now().saturating_duration_since(at)
+        });
         self.unindex_queued_event_producers(&event);
         Some(event)
     }
@@ -451,6 +495,7 @@ impl OrderedGpuEventReceiver {
             OrderedEventSource::Host { ingress_sequence } => {
                 self.host_events.push_front(ScheduledHostEvent {
                     ingress_sequence,
+                    ingested_at: self.last_event_ingested_at,
                     event,
                 });
                 self.host_block = Some(reason);
@@ -751,6 +796,7 @@ impl OrderedGpuEventReceiver {
                                 consumer_queue_id,
                                 consumer_ack,
                                 terminal_dependencies,
+                                ..
                             } => {
                                 format!(
                                     "shared-event-host:q{consumer_queue_id}/ack:{}/terminal:{}",

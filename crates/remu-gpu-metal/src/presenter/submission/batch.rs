@@ -9,16 +9,21 @@ use super::super::shared_event::{
     SharedEventBatchTerminalState, SharedEventFence, SharedEventProducerId,
     terminal_shared_event_advance,
 };
-use super::super::{FlushPolicy, GuestQueueBatchState, PresenterStatistics};
+use super::super::{
+    FlushPolicy, GuestQueueBatchState, PendingSharedEventAckTrace, PresenterStatistics,
+    SharedEventAckNativeHostTimes, SharedEventAckTerminalTimes, SharedEventAckTrace,
+    TerminalPublicationPhase, TerminalPublicationTimer,
+};
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
     GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter, OrderedEventSource,
-    PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange, UploadedGlobalBuffer,
+    PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use crate::presenter::{
-    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, SharedEventUnresolvedWriteRange,
+    PhysicalFootprintRange, SharedEventGlobalBufferVersion, SharedEventResidentTextureVersion,
+    SharedEventSignalCheckpoint, SharedEventUnresolvedWriteRange, SharedEventWriteKind,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -35,6 +40,7 @@ use remu_memory::{
 use remu_shader::ShaderEvaluation;
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static DISCARDED_STALE_GLOBAL_WRITEBACKS: AtomicUsize = AtomicUsize::new(0);
@@ -61,13 +67,66 @@ enum GlobalWritebackOutcome {
 }
 
 impl SharedEventSignalCheckpoint {
-    pub(crate) fn capture(batch: &GuestCommandBatch, fence: SharedEventFence) -> Self {
-        let global_writeback_count = batch.global_writebacks.len();
-        let guest_write_range_count = batch.guest_write_ranges.len();
-        let memory_write_count = batch.memory_writes.len();
-        let mut global_versions: Vec<SharedEventGlobalBufferVersion> = Vec::new();
-        for writeback in &batch.global_writebacks {
+    pub(crate) fn capture_queue_prefix(
+        state: &GuestQueueBatchState,
+        fence: SharedEventFence,
+    ) -> Self {
+        let batch = state
+            .open_batch
+            .as_ref()
+            .expect("a queue signal has an open batch");
+        let mut checkpoint = Self {
+            fence,
+            global_writeback_count: batch.global_writebacks.len(),
+            guest_write_range_count: batch.guest_write_ranges.len(),
+            memory_write_count: batch.memory_writes.len(),
+            global_versions: Vec::new(),
+            resident_texture_versions: Vec::new(),
+            unresolved_write_ranges: Vec::new(),
+            pending_write_footprint: Vec::new(),
+            footprint_complete: true,
+        };
+        for earlier in &state.committed_batches {
+            checkpoint.capture_batch_prefix(
+                earlier,
+                earlier.global_writebacks.len(),
+                earlier.guest_write_ranges.len(),
+                earlier.memory_writes.len(),
+            );
+        }
+        checkpoint.capture_batch_prefix(
+            batch,
+            checkpoint.global_writeback_count,
+            checkpoint.guest_write_range_count,
+            checkpoint.memory_write_count,
+        );
+        checkpoint
+    }
+
+    fn capture_batch_prefix(
+        &mut self,
+        batch: &GuestCommandBatch,
+        global_writeback_count: usize,
+        guest_write_range_count: usize,
+        memory_write_count: usize,
+    ) {
+        self.footprint_complete &= batch.resident_write_footprint_complete;
+        for &range in &batch.resident_write_footprint {
+            append_unique_physical_footprint(&mut self.pending_write_footprint, range);
+        }
+        for version in &batch.resident_texture_versions {
+            if let Some(existing) = self.resident_texture_versions.iter_mut().find(|existing| {
+                existing.span.backing() == version.span.backing()
+                    && existing.span.len() == version.span.len()
+            }) {
+                *existing = version.clone();
+            } else {
+                self.resident_texture_versions.push(version.clone());
+            }
+        }
+        for writeback in &batch.global_writebacks[..global_writeback_count] {
             let Ok(byte_count) = u64::try_from(writeback.byte_count) else {
+                self.footprint_complete = false;
                 continue;
             };
             let version = SharedEventGlobalBufferVersion {
@@ -80,7 +139,7 @@ impl SharedEventSignalCheckpoint {
             // Each writable copied binding gets fresh Metal storage. Replacing only the same
             // exact guest-physical interval materializes the latest version as of this signal;
             // partially overlapping intervals remain separate so consumers reject ambiguity.
-            if let Some(existing) = global_versions.iter_mut().find(|existing| {
+            if let Some(existing) = self.global_versions.iter_mut().find(|existing| {
                 existing.byte_count == version.byte_count
                     && match (existing.mapping_identity, version.mapping_identity) {
                         (Some(existing), Some(version)) => existing == version,
@@ -90,38 +149,274 @@ impl SharedEventSignalCheckpoint {
             }) {
                 *existing = version;
             } else {
-                global_versions.push(version);
+                self.global_versions.push(version);
             }
+            self.capture_physical_range(
+                SharedEventWriteKind::CopiedGlobal,
+                writeback.guest_address,
+                byte_count,
+                writeback.mapping_identity,
+            );
         }
-        let mut unresolved_write_ranges = batch
-            .guest_write_ranges
-            .iter()
-            .map(|range| SharedEventUnresolvedWriteRange {
-                guest_address: range.address,
-                byte_count: range.byte_count,
-                mapping_identity: Some(range.physical_identity),
-            })
-            .collect::<Vec<_>>();
-        unresolved_write_ranges.extend(batch.memory_writes.iter().map(|write| {
+        for range in &batch.guest_write_ranges[..guest_write_range_count] {
+            self.unresolved_write_ranges
+                .push(SharedEventUnresolvedWriteRange {
+                    guest_address: range.address,
+                    byte_count: range.byte_count,
+                    mapping_identity: Some(range.physical_identity),
+                });
+            self.capture_physical_range(
+                SharedEventWriteKind::ZeroCopyGlobal,
+                range.address,
+                range.byte_count,
+                Some(range.physical_identity),
+            );
+        }
+        for write in &batch.memory_writes[..memory_write_count] {
             let (guest_address, byte_count) = write.range();
-            SharedEventUnresolvedWriteRange {
+            self.unresolved_write_ranges
+                .push(SharedEventUnresolvedWriteRange {
+                    guest_address,
+                    byte_count,
+                    mapping_identity: write.mapping_identity,
+                });
+            self.capture_physical_range(
+                SharedEventWriteKind::TerminalGuestWrite,
                 guest_address,
                 byte_count,
-                mapping_identity: write.mapping_identity,
+                write.mapping_identity,
+            );
+        }
+    }
+
+    fn capture_physical_range(
+        &mut self,
+        kind: SharedEventWriteKind,
+        guest_address: u64,
+        byte_count: u64,
+        mapping: Option<GuestSharedMappingIdentity>,
+    ) {
+        match PhysicalFootprintRange::new(kind, guest_address, byte_count, mapping) {
+            Some(range) => {
+                append_unique_physical_footprint(&mut self.pending_write_footprint, range);
             }
-        }));
-        Self {
-            fence,
-            global_writeback_count,
-            guest_write_range_count,
-            memory_write_count,
-            global_versions,
-            unresolved_write_ranges,
+            None => self.footprint_complete = false,
         }
     }
 }
 
+impl PhysicalFootprintRange {
+    pub(crate) fn new(
+        kind: SharedEventWriteKind,
+        guest_address: u64,
+        byte_count: u64,
+        mapping: Option<GuestSharedMappingIdentity>,
+    ) -> Option<Self> {
+        let mapping = mapping?;
+        if byte_count == 0 || guest_address.checked_add(byte_count).is_none() {
+            return None;
+        }
+        mapping.backing_offset.checked_add(byte_count)?;
+        Some(Self {
+            kind,
+            guest_address,
+            byte_count,
+            mapping,
+        })
+    }
+
+    // This is the canonical physical comparator for the next disjoint-draw slice. The producer
+    // journal lands first so no draw is whitelisted against an incomplete footprint.
+    #[allow(dead_code)]
+    pub(crate) fn overlaps(self, other: Self) -> bool {
+        if self.mapping.backing_id != other.mapping.backing_id {
+            return false;
+        }
+        let Some(self_end) = self.mapping.backing_offset.checked_add(self.byte_count) else {
+            return true;
+        };
+        let Some(other_end) = other.mapping.backing_offset.checked_add(other.byte_count) else {
+            return true;
+        };
+        self.mapping.backing_offset < other_end && other.mapping.backing_offset < self_end
+    }
+}
+
+fn append_unique_physical_footprint(
+    destination: &mut Vec<PhysicalFootprintRange>,
+    range: PhysicalFootprintRange,
+) {
+    if !destination.contains(&range) {
+        destination.push(range);
+    }
+}
+
+impl GuestCommandBatch {
+    pub(crate) fn record_resident_texture_version(
+        &mut self,
+        version: SharedEventResidentTextureVersion,
+    ) {
+        if let Some(existing) = self.resident_texture_versions.iter_mut().find(|existing| {
+            existing.span.backing() == version.span.backing()
+                && existing.span.len() == version.span.len()
+        }) {
+            *existing = version;
+        } else {
+            self.resident_texture_versions.push(version);
+        }
+    }
+
+    pub(crate) fn record_resident_write_footprint(
+        &mut self,
+        kind: SharedEventWriteKind,
+        span: Option<super::super::ResourceSpan>,
+    ) {
+        let Some(span) = span else {
+            self.resident_write_footprint_complete = false;
+            return;
+        };
+        let Some(range) =
+            PhysicalFootprintRange::new(kind, span.address(), span.len(), span.backing())
+        else {
+            self.resident_write_footprint_complete = false;
+            return;
+        };
+        append_unique_physical_footprint(&mut self.resident_write_footprint, range);
+    }
+}
+
 impl MetalPresenter {
+    pub(crate) fn shared_event_ack_phase_timing_enabled(&self) -> bool {
+        self.shared_event_ack_phase_timing
+    }
+
+    pub(crate) fn record_shared_event_ack_batch_cpu_phases(
+        &mut self,
+        translation: Duration,
+        metal_encoding: Duration,
+        compute: bool,
+    ) {
+        if !self.shared_event_ack_phase_timing {
+            return;
+        }
+        let Some(queue_id) = self.active_guest_queue else {
+            return;
+        };
+        let phases = self.shared_event_ack_batch_cpu.entry(queue_id).or_default();
+        phases.translation = phases.translation.saturating_add(translation);
+        phases.metal_encoding = phases.metal_encoding.saturating_add(metal_encoding);
+        if compute {
+            phases.computes = phases.computes.saturating_add(1);
+        } else {
+            phases.draws = phases.draws.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn prepare_shared_event_ack_phase_trace(
+        &mut self,
+        fence: Option<SharedEventFence>,
+        event_queue: Duration,
+        host_preflight: Duration,
+        ack_encoding: Duration,
+    ) {
+        if !self.shared_event_ack_phase_timing
+            || self.shared_event_ack_phase_samples_remaining == 0
+            || self.shared_event_ack_traces.len() + self.pending_shared_event_ack_traces.len() >= 64
+        {
+            return;
+        }
+        let (Some(queue_id), Some(fence)) = (self.active_guest_queue, fence) else {
+            return;
+        };
+        self.shared_event_ack_phase_samples_remaining -= 1;
+        self.pending_shared_event_ack_traces.insert(
+            queue_id,
+            PendingSharedEventAckTrace {
+                fence,
+                event_queue,
+                host_preflight,
+                ack_encoding,
+            },
+        );
+    }
+
+    pub(crate) fn record_shared_event_ack_observed(
+        &mut self,
+        fence: SharedEventFence,
+        observed_at: Instant,
+    ) {
+        let Some(&command_buffer_key) = self.shared_event_ack_trace_buffers_by_fence.get(&fence)
+        else {
+            return;
+        };
+        if let Some(trace) = self.shared_event_ack_traces.get_mut(&command_buffer_key) {
+            trace.ack_observed_at = Some(observed_at);
+        }
+        self.finish_shared_event_ack_trace(command_buffer_key);
+    }
+
+    fn record_shared_event_ack_terminal(&mut self, command_buffer: &CommandBuffer) {
+        let command_buffer_key = command_buffer.as_ptr() as usize;
+        let Some(trace) = self.shared_event_ack_traces.get_mut(&command_buffer_key) else {
+            return;
+        };
+        trace.terminal = Some(completed_command_buffer_ack_timeline(command_buffer));
+        self.finish_shared_event_ack_trace(command_buffer_key);
+    }
+
+    fn finish_shared_event_ack_trace(&mut self, command_buffer_key: usize) {
+        let ready = self
+            .shared_event_ack_traces
+            .get(&command_buffer_key)
+            .is_some_and(|trace| trace.terminal.is_some() && trace.ack_observed_at.is_some());
+        if !ready {
+            return;
+        }
+        let trace = self
+            .shared_event_ack_traces
+            .remove(&command_buffer_key)
+            .expect("ready acknowledgement trace exists");
+        self.shared_event_ack_trace_buffers_by_fence
+            .remove(&trace.fence);
+        let terminal = trace.terminal.expect("ready trace has terminal timing");
+        let native_host = trace
+            .native_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let statistics = &mut self.statistics.shared_event_ack_phases;
+        statistics.samples = statistics.samples.saturating_add(1);
+        statistics.draws = statistics.draws.saturating_add(trace.cpu.draws);
+        statistics.computes = statistics.computes.saturating_add(trace.cpu.computes);
+        statistics.event_queue.record(trace.event_queue);
+        statistics.cpu_translation.record(trace.cpu.translation);
+        statistics.metal_encoding.record(trace.cpu.metal_encoding);
+        statistics.ack_encoding.record(trace.ack_encoding);
+        statistics.commit_call.record(trace.commit_call);
+        if let Some(scheduled_at) = native_host.scheduled_at {
+            statistics
+                .commit_to_scheduled
+                .record(scheduled_at.saturating_duration_since(trace.committed_at));
+            if let Some(completed_at) = native_host.completed_at {
+                statistics
+                    .scheduled_to_completed
+                    .record(completed_at.saturating_duration_since(scheduled_at));
+            }
+        }
+        statistics
+            .kernel_to_gpu_start
+            .record(terminal.kernel_to_gpu_start);
+        statistics.gpu_execution.record(terminal.gpu_execution);
+        statistics
+            .gpu_to_kernel_end
+            .record(terminal.gpu_to_kernel_end);
+        statistics.commit_to_ack.record(
+            trace
+                .ack_observed_at
+                .expect("ready trace has acknowledgement observation")
+                .saturating_duration_since(trace.committed_at),
+        );
+    }
+
     pub(crate) fn encode_active_guest_queue_host_ack(
         &mut self,
     ) -> Result<Option<super::super::SharedEventFence>, String> {
@@ -143,17 +438,34 @@ impl MetalPresenter {
                 return Ok(None);
             }
         };
-        let batch = state
+        {
+            let batch = state
+                .open_batch
+                .as_mut()
+                .expect("host acknowledgement opened a consumer batch");
+            batch.close_active_pass_encoders();
+            batch
+                .command_buffer
+                .encode_signal_event(state.shared_event_timeline.event(), fence.value());
+            batch.max_encoded_signal = Some(fence);
+        }
+        let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+        if !checkpoint.footprint_complete {
+            self.statistics.shared_event_incomplete_signal_footprints = self
+                .statistics
+                .shared_event_incomplete_signal_footprints
+                .saturating_add(1);
+        }
+        debug_assert!(
+            checkpoint.footprint_complete,
+            "shared-event host acknowledgement has an incomplete producer footprint"
+        );
+        state
             .open_batch
             .as_mut()
-            .expect("host acknowledgement opened a consumer batch");
-        batch.close_active_pass_encoders();
-        batch
-            .command_buffer
-            .encode_signal_event(state.shared_event_timeline.event(), fence.value());
-        batch.max_encoded_signal = Some(fence);
-        let checkpoint = SharedEventSignalCheckpoint::capture(batch, fence);
-        batch.signal_checkpoints.push(checkpoint);
+            .expect("host acknowledgement batch remains open")
+            .signal_checkpoints
+            .push(checkpoint);
         self.statistics.shared_event_signals =
             self.statistics.shared_event_signals.saturating_add(1);
         Ok(Some(fence))
@@ -194,30 +506,7 @@ impl MetalPresenter {
             .iter()
             .map(|(&producer, &value)| super::super::SharedEventFence::new(producer, value))
             .collect();
-        self.prune_retired_fence_write_ranges();
         unsignaled
-    }
-
-    pub(crate) fn prune_retired_fence_write_ranges(&mut self) {
-        let mut referenced = self
-            .gpu_wait_fences
-            .fences()
-            .map(|fence| (fence.producer(), fence.value()))
-            .collect::<std::collections::HashSet<_>>();
-        for state in self.guest_queue_batches.values() {
-            referenced.extend(
-                state
-                    .resource_dependencies
-                    .iter()
-                    .map(|(&producer, checkpoint)| (producer, checkpoint.fence.value())),
-            );
-        }
-        for (&queue_id, state) in &mut self.guest_queue_batches {
-            let producer = SharedEventProducerId::new(queue_id);
-            state
-                .retired_fence_write_ranges
-                .retain(|&value, _| referenced.contains(&(producer, value)));
-        }
     }
 
     pub(crate) fn set_active_guest_queue(&mut self, queue_id: Option<u64>) {
@@ -251,7 +540,6 @@ impl MetalPresenter {
                 host_retired_fence_value: 0,
                 host_dependencies: std::collections::HashMap::new(),
                 resource_dependencies: std::collections::HashMap::new(),
-                retired_fence_write_ranges: std::collections::BTreeMap::new(),
                 open_batch: None,
                 committed_batches: std::collections::VecDeque::new(),
                 transient_global_buffer_cache: std::collections::HashMap::new(),
@@ -525,9 +813,15 @@ impl MetalPresenter {
                         .committed_batches
                         .pop_front()
                         .expect("terminal front exists");
-                    let execution_error = (batch.command_buffer.status()
-                        == MTLCommandBufferStatus::Error)
-                        .then(|| {
+                    let mut timer =
+                        TerminalPublicationTimer::start_if(self.terminal_publication_timing);
+                    let terminal_status = batch.command_buffer.status();
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::MetalTerminal,
+                    );
+                    let execution_error =
+                        (terminal_status == MTLCommandBufferStatus::Error).then(|| {
                             command_buffer_failure_message(
                                 &format!(
                                     "Metal guest command batch queue={} [{}]",
@@ -537,10 +831,11 @@ impl MetalPresenter {
                                 &batch.command_buffer,
                             )
                         });
-                    let result = self.finish_terminal_guest_batch(&batch, execution_error);
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    self.publish_guest_batch_completion(&batch);
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::TerminalMetadata,
+                    );
+                    let result = self.complete_terminal_guest_batch(&batch, execution_error, timer);
                     if let Err(error) = result {
                         eprintln!(
                             "[REMu][METAL] queue {queue_id} guest batch finalization failed: {error}"
@@ -560,10 +855,21 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
-                    let result = self.finish_terminal_guest_batch(&batch, None);
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
-                    self.publish_guest_batch_completion(&batch);
+                    let mut timer =
+                        TerminalPublicationTimer::start_if(self.terminal_publication_timing);
+                    let terminal_status = (cfg!(debug_assertions)
+                        || self.terminal_publication_timing)
+                        .then(|| batch.command_buffer.status());
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::MetalTerminal,
+                    );
+                    debug_assert_eq!(terminal_status, Some(MTLCommandBufferStatus::Completed));
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::TerminalMetadata,
+                    );
+                    let result = self.complete_terminal_guest_batch(&batch, None, timer);
                     if let Err(error) = result {
                         eprintln!(
                             "[REMu][METAL] completed guest batch finalization failed: {error}"
@@ -575,6 +881,16 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
+                    let mut timer =
+                        TerminalPublicationTimer::start_if(self.terminal_publication_timing);
+                    let terminal_status = (cfg!(debug_assertions)
+                        || self.terminal_publication_timing)
+                        .then(|| batch.command_buffer.status());
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::MetalTerminal,
+                    );
+                    debug_assert_eq!(terminal_status, Some(MTLCommandBufferStatus::Error));
                     let execution_error = command_buffer_failure_message(
                         &format!(
                             "Metal guest command batch [{}]",
@@ -582,13 +898,15 @@ impl MetalPresenter {
                         ),
                         &batch.command_buffer,
                     );
-                    let result = self.finish_terminal_guest_batch(&batch, Some(execution_error));
-                    self.statistics.gpu_execution_time +=
-                        completed_command_buffer_gpu_duration(&batch.command_buffer);
+                    timer.mark(
+                        &mut self.statistics.terminal_publication,
+                        TerminalPublicationPhase::TerminalMetadata,
+                    );
+                    let result =
+                        self.complete_terminal_guest_batch(&batch, Some(execution_error), timer);
                     // A terminal native failure cannot be retried in-place. Publish both its
                     // ordered CPU labels and submission ID after reporting the error so the guest
                     // observes one failed queue item instead of a producerless 120-second wait.
-                    self.publish_guest_batch_completion(&batch);
                     if let Err(error) = result {
                         eprintln!("[REMu][METAL] {error}");
                     }
@@ -602,36 +920,45 @@ impl MetalPresenter {
         &mut self,
         batch: &GuestCommandBatch,
         execution_error: Option<String>,
+        timer: &mut TerminalPublicationTimer,
     ) -> Result<(), String> {
         let execution_succeeded = execution_error.is_none();
         let mut result = execution_error.map_or(Ok(()), Err);
-        if !execution_succeeded
-            && let (Some(queue_id), Some(maximum_fence)) =
-                (batch.queue_id, batch.max_encoded_signal)
-        {
-            let producer = SharedEventProducerId::new(queue_id);
-            let state = self
-                .guest_queue_batches
-                .get_mut(&queue_id)
-                .ok_or_else(|| format!("missing terminal guest queue {queue_id}"))?;
-            if let Some(value) = terminal_shared_event_advance(
-                SharedEventBatchTerminalState::Error,
-                producer,
-                state.shared_event_timeline.event().signaled_value(),
-                Some(maximum_fence),
-            )
-            .map_err(|error| error.to_string())?
+        let error_fence_advance = (|| {
+            if !execution_succeeded
+                && let (Some(queue_id), Some(maximum_fence)) =
+                    (batch.queue_id, batch.max_encoded_signal)
             {
-                state
-                    .shared_event_timeline
-                    .event()
-                    .set_signaled_value(value);
-                self.statistics.shared_event_error_advances = self
-                    .statistics
-                    .shared_event_error_advances
-                    .saturating_add(1);
+                let producer = SharedEventProducerId::new(queue_id);
+                let state = self
+                    .guest_queue_batches
+                    .get_mut(&queue_id)
+                    .ok_or_else(|| format!("missing terminal guest queue {queue_id}"))?;
+                if let Some(value) = terminal_shared_event_advance(
+                    SharedEventBatchTerminalState::Error,
+                    producer,
+                    state.shared_event_timeline.event().signaled_value(),
+                    Some(maximum_fence),
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    state
+                        .shared_event_timeline
+                        .event()
+                        .set_signaled_value(value);
+                    self.statistics.shared_event_error_advances = self
+                        .statistics
+                        .shared_event_error_advances
+                        .saturating_add(1);
+                }
             }
-        }
+            Ok::<(), String>(())
+        })();
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::ErrorFenceAdvance,
+        );
+        error_fence_advance?;
         if execution_succeeded {
             let writeback = write_back_pending_globals(&batch.global_writebacks);
             if let Ok(applied) = &writeback {
@@ -639,37 +966,20 @@ impl MetalPresenter {
             }
             result = merge_guest_batch_result(result, "global writeback", writeback.map(|_| ()));
         }
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::GlobalWriteback,
+        );
         // RELEASE_MEM, WRITE_DATA, and DMA fills are command-processor effects ordered after the
         // native work, not shader results. Once the Metal command buffer reaches either terminal
         // state, publish them even when the draw/dispatch or an unrelated global readback failed.
         // This matches the existing policy of retiring the submission after a native error while
         // retaining the error as the primary result.
         let result = self.publish_terminal_guest_memory_writes(&batch.memory_writes, result);
-        let retired_fence_ranges = batch
-            .signal_checkpoints
-            .iter()
-            .map(|checkpoint| {
-                let mut ranges = batch.memory_writes[..checkpoint.memory_write_count]
-                    .iter()
-                    .map(PendingGuestMemoryWrite::range)
-                    .collect::<Vec<_>>();
-                ranges.extend(
-                    batch.global_writebacks[..checkpoint.global_writeback_count]
-                        .iter()
-                        .filter_map(|writeback| {
-                            u64::try_from(writeback.byte_count)
-                                .ok()
-                                .map(|length| (writeback.guest_address, length))
-                        }),
-                );
-                ranges.extend(
-                    batch.guest_write_ranges[..checkpoint.guest_write_range_count]
-                        .iter()
-                        .map(|range| (range.address, range.byte_count)),
-                );
-                (checkpoint.fence.value(), ranges)
-            })
-            .collect::<Vec<_>>();
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::GuestMemoryWrites,
+        );
         if let (Some(queue_id), Some(maximum_fence)) = (batch.queue_id, batch.max_encoded_signal) {
             let state = self
                 .guest_queue_batches
@@ -677,11 +987,33 @@ impl MetalPresenter {
                 .expect("terminal queue state remains live");
             state.host_retired_fence_value =
                 state.host_retired_fence_value.max(maximum_fence.value());
-            for (fence_value, ranges) in retired_fence_ranges {
-                state.retired_fence_write_ranges.insert(fence_value, ranges);
-            }
         }
-        self.prune_retired_fence_write_ranges();
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::QueueRetirement,
+        );
+        result
+    }
+
+    fn complete_terminal_guest_batch(
+        &mut self,
+        batch: &GuestCommandBatch,
+        execution_error: Option<String>,
+        mut timer: TerminalPublicationTimer,
+    ) -> Result<(), String> {
+        self.record_shared_event_ack_terminal(&batch.command_buffer);
+        let result = self.finish_terminal_guest_batch(batch, execution_error, &mut timer);
+        self.statistics.gpu_execution_time +=
+            completed_command_buffer_gpu_duration(&batch.command_buffer);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::GpuTimeQuery,
+        );
+        self.publish_guest_batch_completion(batch);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::CompletionWake,
+        );
         result
     }
 
@@ -867,6 +1199,16 @@ impl MetalPresenter {
         let Some(mut batch) = state.open_batch.take() else {
             return settlement;
         };
+        let mut acknowledgement_cpu = self
+            .shared_event_ack_batch_cpu
+            .remove(&queue_id)
+            .unwrap_or_default();
+        let acknowledgement_trace = self.pending_shared_event_ack_traces.remove(&queue_id);
+        if let Some(trace) = &acknowledgement_trace {
+            acknowledgement_cpu.translation = acknowledgement_cpu
+                .translation
+                .saturating_add(trace.host_preflight);
+        }
         batch.end_compute_pass();
         if batch.end_render_pass() {
             self.statistics.render_pass_ends_for_batch_flush = self
@@ -875,11 +1217,39 @@ impl MetalPresenter {
                 .saturating_add(1);
         }
         state.transient_global_buffer_cache.clear();
-        batch.committed_at = Some(Instant::now());
+        let committed_at = Instant::now();
+        batch.committed_at = Some(committed_at);
         if let Some(waker) = completion_waker {
             attach_guest_batch_completion_waker(&batch.command_buffer, waker);
         }
+        let native_host = acknowledgement_trace
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(SharedEventAckNativeHostTimes::default())));
+        if let Some(native_host) = native_host.as_ref() {
+            attach_shared_event_ack_phase_handlers(&batch.command_buffer, Arc::clone(native_host));
+        }
+        let commit_started = Instant::now();
         batch.command_buffer.commit();
+        let commit_call = Instant::now().saturating_duration_since(commit_started);
+        if let (Some(trace), Some(native_host)) = (acknowledgement_trace, native_host) {
+            let command_buffer_key = batch.command_buffer.as_ptr() as usize;
+            self.shared_event_ack_trace_buffers_by_fence
+                .insert(trace.fence, command_buffer_key);
+            self.shared_event_ack_traces.insert(
+                command_buffer_key,
+                SharedEventAckTrace {
+                    fence: trace.fence,
+                    committed_at,
+                    event_queue: trace.event_queue,
+                    cpu: acknowledgement_cpu,
+                    ack_encoding: trace.ack_encoding,
+                    commit_call,
+                    native_host,
+                    terminal: None,
+                    ack_observed_at: None,
+                },
+            );
+        }
         state.committed_batches.push_back(batch);
         self.record_guest_batch_flush(reason);
         settlement
@@ -959,6 +1329,7 @@ impl MetalPresenter {
         let Some(batch) = self.committed_guest_batches.pop_front() else {
             return FrontBatchSettlement::Empty;
         };
+        let mut timer = TerminalPublicationTimer::start_if(self.terminal_publication_timing);
         let execution_error = match settle_guest_batch_by(&batch, deadline) {
             GuestBatchSettlement::Completed => None,
             GuestBatchSettlement::Failed(error) => Some(error),
@@ -967,10 +1338,15 @@ impl MetalPresenter {
                 return FrontBatchSettlement::Pending(error);
             }
         };
-        let result = self.finish_terminal_guest_batch(&batch, execution_error);
-        self.statistics.gpu_execution_time +=
-            completed_command_buffer_gpu_duration(&batch.command_buffer);
-        self.publish_guest_batch_completion(&batch);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::MetalTerminal,
+        );
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::TerminalMetadata,
+        );
+        let result = self.complete_terminal_guest_batch(&batch, execution_error, timer);
         FrontBatchSettlement::Retired(result)
     }
 
@@ -986,6 +1362,7 @@ impl MetalPresenter {
         else {
             return FrontBatchSettlement::Empty;
         };
+        let mut timer = TerminalPublicationTimer::start_if(self.terminal_publication_timing);
         let execution_error = match settle_guest_batch_by(&batch, deadline) {
             GuestBatchSettlement::Completed => None,
             GuestBatchSettlement::Failed(error) => Some(error),
@@ -998,10 +1375,15 @@ impl MetalPresenter {
                 return FrontBatchSettlement::Pending(error);
             }
         };
-        let result = self.finish_terminal_guest_batch(&batch, execution_error);
-        self.statistics.gpu_execution_time +=
-            completed_command_buffer_gpu_duration(&batch.command_buffer);
-        self.publish_guest_batch_completion(&batch);
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::MetalTerminal,
+        );
+        timer.mark(
+            &mut self.statistics.terminal_publication,
+            TerminalPublicationPhase::TerminalMetadata,
+        );
+        let result = self.complete_terminal_guest_batch(&batch, execution_error, timer);
         FrontBatchSettlement::Retired(result)
     }
 
@@ -1042,6 +1424,8 @@ impl MetalPresenter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), String> {
+        self.guest_batch_cpu_synchronization_epoch =
+            self.guest_batch_cpu_synchronization_epoch.saturating_add(1);
         if self.per_queue_guest_batches {
             return self.wait_for_guest_queue_command_batches_within(timeout);
         }
@@ -1151,6 +1535,30 @@ fn attach_guest_batch_completion_waker(
     command_buffer.add_completed_handler(&handler);
 }
 
+fn attach_shared_event_ack_phase_handlers(
+    command_buffer: &CommandBuffer,
+    native_host: Arc<Mutex<SharedEventAckNativeHostTimes>>,
+) {
+    let scheduled_times: Arc<Mutex<SharedEventAckNativeHostTimes>> = Arc::clone(&native_host);
+    let scheduled = ConcreteBlock::new(move |_| {
+        scheduled_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scheduled_at = Some(Instant::now());
+    })
+    .copy();
+    command_buffer.add_scheduled_handler(&scheduled);
+
+    let completed = ConcreteBlock::new(move |_| {
+        native_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed_at = Some(Instant::now());
+    })
+    .copy();
+    command_buffer.add_completed_handler(&completed);
+}
+
 fn new_guest_command_batch(
     queue_id: Option<u64>,
     command_buffer: CommandBuffer,
@@ -1164,6 +1572,9 @@ fn new_guest_command_batch(
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -1530,6 +1941,31 @@ pub(crate) fn completed_command_buffer_gpu_duration(command_buffer: &CommandBuff
         return Duration::ZERO;
     }
     Duration::from_secs_f64(end - start)
+}
+
+fn completed_command_buffer_ack_timeline(
+    command_buffer: &CommandBuffer,
+) -> SharedEventAckTerminalTimes {
+    let (kernel_start, kernel_end, gpu_start, gpu_end): (f64, f64, f64, f64) = unsafe {
+        (
+            msg_send![command_buffer.as_ref(), kernelStartTime],
+            msg_send![command_buffer.as_ref(), kernelEndTime],
+            msg_send![command_buffer.as_ref(), GPUStartTime],
+            msg_send![command_buffer.as_ref(), GPUEndTime],
+        )
+    };
+    let delta = |start: f64, end: f64| {
+        if start.is_finite() && end.is_finite() && start > 0.0 && end >= start {
+            Duration::from_secs_f64(end - start)
+        } else {
+            Duration::ZERO
+        }
+    };
+    SharedEventAckTerminalTimes {
+        kernel_to_gpu_start: delta(kernel_start, gpu_start),
+        gpu_execution: delta(gpu_start, gpu_end),
+        gpu_to_kernel_end: delta(gpu_end, kernel_end),
+    }
 }
 
 pub(crate) fn collect_pending_global_writebacks(

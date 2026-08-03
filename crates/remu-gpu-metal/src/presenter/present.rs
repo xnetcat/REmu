@@ -111,8 +111,8 @@ impl MetalPresenter {
         // becomes available. Do not let that fallback consume the capture interval: the first
         // translated snapshot is the authoritative evidence for what Metal is actually about to
         // present.
-        let first_translated_capture =
-            translated_snapshot.as_ref().is_some_and(|(descriptor, _)| {
+        let first_translated_capture = self.periodic_frame_capture
+            && translated_snapshot.as_ref().is_some_and(|(descriptor, _)| {
                 self.captured_guest_frames.len() < 128
                     && !self.captured_guest_frames.iter().any(
                         |(address, width, height, tile_mode, _)| {
@@ -126,7 +126,8 @@ impl MetalPresenter {
         if first_translated_capture {
             self.last_guest_capture = None;
         }
-        let capture_due = self.capture_directory.is_some()
+        let capture_due = self.periodic_frame_capture
+            && self.capture_directory.is_some()
             && (first_translated_capture
                 || self
                     .last_guest_capture
@@ -279,6 +280,11 @@ impl MetalPresenter {
         // Presentation is where a finalized flip becomes guest-visible; an unfinalized flip has no
         // snapshot in this drawable and stays pending.
         let flip_sequence = self.claim_flip_terminal(self.finalized_flip_sequence);
+        if flip_sequence.is_some() {
+            remu_gpu::record_startup_milestone(
+                remu_gpu::StartupMilestone::FirstGuestPresentSubmitted,
+            );
+        }
         self.pending_presentations.push_back(PendingPresentation {
             command_buffer,
             submitted_at: Instant::now(),

@@ -880,7 +880,8 @@ impl MetalPresenter {
                 .get(&descriptor)
                 .map(|resident| (resident.content_version, resident.gpu_written()));
             eprintln!(
-                "[REMu][METAL][SCANOUT-SNAPSHOT] sequence={sequence} address={address:#x} source={source} descriptor={descriptor:?} selected_state={selected_state:?} source_format={:?} snapshot_format={:?} pending={} finalized={} uploaded={} submitted={}",
+                "[REMu][METAL][SCANOUT-SNAPSHOT] sequence={sequence} address={address:#x} source={source} snapshot_queue={:?} descriptor={descriptor:?} selected_state={selected_state:?} source_format={:?} snapshot_format={:?} pending={} finalized={} uploaded={} submitted={}",
+                self.active_guest_queue,
                 source_texture.pixel_format(),
                 self.frame_texture
                     .as_ref()
@@ -1036,7 +1037,8 @@ impl MetalPresenter {
             bytes_per_row as u64,
         );
         self.active_translated_scanout = None;
-        let capture = (self.capture_directory.is_some()
+        let capture = (self.periodic_frame_capture
+            && self.capture_directory.is_some()
             && self
                 .last_guest_capture
                 .is_none_or(|last| last.elapsed() >= capture_interval()))

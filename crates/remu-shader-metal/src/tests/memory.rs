@@ -294,6 +294,40 @@ fn complete_memory_program() -> (Program, ShaderEvaluation) {
     (Program::new(0x1000, instructions), evaluation)
 }
 
+fn set_image_texture_type(
+    evaluation: &mut ShaderEvaluation,
+    binding_index: usize,
+    texture_type: u32,
+) {
+    let binding = &mut evaluation.image_bindings[binding_index];
+    let mut descriptor = binding.resource_descriptor.to_vec();
+    descriptor[3] = (descriptor[3] & 0x0fff_ffff) | (texture_type << 28);
+    binding.resource_descriptor = descriptor.into();
+}
+
+fn set_image_address_dimension(
+    program: Program,
+    evaluation: &mut ShaderEvaluation,
+    binding_index: usize,
+    dimension: u32,
+) -> Program {
+    let binding = &mut evaluation.image_bindings[binding_index];
+    binding.control.dimension = dimension;
+    binding.control.is_array = matches!(dimension, 4 | 5 | 7);
+    let pc = binding.pc;
+    let mut instructions = program.instructions;
+    let instruction = instructions
+        .iter_mut()
+        .find(|instruction| instruction.pc == pc)
+        .expect("image binding instruction must exist");
+    let Some(InstructionControl::Image(control)) = instruction.control.as_mut() else {
+        panic!("image binding instruction must carry image control");
+    };
+    control.dimension = dimension;
+    control.is_array = binding.control.is_array;
+    Program::new(program.address, instructions)
+}
+
 #[test]
 fn lowers_complete_decoded_global_mubuf_and_mtbuf_memory_surface() {
     let (program, evaluation) = complete_memory_program();
@@ -342,6 +376,77 @@ fn lowers_complete_decoded_global_mubuf_and_mtbuf_memory_surface() {
         shader.source.contains(" & 3ul"),
         "buffer descriptors must address their dynamically bound, dword-aligned Metal buffer without embedding the evaluated guest base"
     );
+}
+
+#[test]
+fn storage_images_preserve_2d_array_and_3d_resource_dimensions() {
+    let (program, mut array_store_evaluation) = complete_memory_program();
+    set_image_texture_type(&mut array_store_evaluation, 1, 13);
+    let array_store = compile_msl(
+        &program,
+        &array_store_evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("2D-array image store should lower");
+    assert!(
+        array_store
+            .source
+            .contains("texture2d_array<float, access::read_write> tex1")
+    );
+    assert!(array_store.source.contains("tex1.get_array_size()"));
+    let array_store_line = array_store
+        .source
+        .lines()
+        .find(|line| line.contains("tex1.write("))
+        .expect("2D-array store call");
+    assert!(array_store_line.contains("uint2("));
+    assert!(array_store_line.contains(", (uint)"));
+    assert!(!array_store_line.contains("uint3("));
+
+    let (program, mut array_load_evaluation) = complete_memory_program();
+    let program = set_image_address_dimension(program, &mut array_load_evaluation, 0, 5);
+    set_image_texture_type(&mut array_load_evaluation, 0, 13);
+    let array_load = compile_msl(
+        &program,
+        &array_load_evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("2D-array image load should lower");
+    assert!(
+        array_load
+            .source
+            .contains("texture2d_array<float, access::read> tex0")
+    );
+    assert!(array_load.source.contains("tex0.get_array_size()"));
+    let array_load_line = array_load
+        .source
+        .lines()
+        .find(|line| line.contains("tex0.read("))
+        .expect("2D-array load call");
+    assert!(array_load_line.contains("uint2("));
+    assert!(array_load_line.contains(", (uint)"));
+    assert!(!array_load_line.contains("uint3("));
+
+    let (program, mut volume_evaluation) = complete_memory_program();
+    set_image_texture_type(&mut volume_evaluation, 1, 10);
+    let volume = compile_msl(
+        &program,
+        &volume_evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("3D image store should lower");
+    assert!(
+        volume
+            .source
+            .contains("texture3d<float, access::read_write> tex1")
+    );
+    assert!(volume.source.contains("tex1.get_depth()"));
+    let volume_store_line = volume
+        .source
+        .lines()
+        .find(|line| line.contains("tex1.write("))
+        .expect("3D store call");
+    assert!(volume_store_line.contains("uint3("));
 }
 
 #[test]
@@ -554,28 +659,40 @@ fn generated_memory_msl_compiles_with_apple_metal() {
     });
     let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
         .expect("complete decoded VMEM surface should lower");
+    let (array_program, mut array_evaluation) = complete_memory_program();
+    let array_program = set_image_address_dimension(array_program, &mut array_evaluation, 0, 5);
+    set_image_texture_type(&mut array_evaluation, 0, 13);
+    set_image_texture_type(&mut array_evaluation, 1, 13);
+    let array_shader = compile_msl(
+        &array_program,
+        &array_evaluation,
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("2D-array image load and store should lower");
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
         "remu-memory-metal-{}-{sequence}",
         std::process::id()
     ));
     std::fs::create_dir_all(&directory).expect("create Metal memory test directory");
-    let source = directory.join("memory.metal");
-    let air = directory.join("memory.air");
-    std::fs::write(&source, shader.source).expect("write generated memory MSL");
-    let output = Command::new(&compiler)
-        .args(["-c", "-target", "air64-apple-macosx15.0"])
-        .arg("-fmetal-math-mode=safe")
-        .arg("-o")
-        .arg(&air)
-        .arg(&source)
-        .output()
-        .expect("run Apple Metal compiler");
-    assert!(
-        output.status.success(),
-        "memory MSL failed to compile:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    for (name, shader) in [("memory", shader), ("storage-array", array_shader)] {
+        let source = directory.join(format!("{name}.metal"));
+        let air = directory.join(format!("{name}.air"));
+        std::fs::write(&source, shader.source).expect("write generated memory MSL");
+        let output = Command::new(&compiler)
+            .args(["-c", "-target", "air64-apple-macosx15.0"])
+            .arg("-fmetal-math-mode=safe")
+            .arg("-o")
+            .arg(&air)
+            .arg(&source)
+            .output()
+            .expect("run Apple Metal compiler");
+        assert!(
+            output.status.success(),
+            "{name} MSL failed to compile:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     std::fs::remove_dir_all(directory).expect("remove Metal memory test directory");
 }

@@ -9,7 +9,8 @@ use metal::{
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
     GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, ShaderSnapshot, gpu_event_channel,
+    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw, ShaderSnapshot,
+    gpu_event_channel,
 };
 
 use remu_memory::{
@@ -25,12 +26,17 @@ use std::time::{Duration, Instant};
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
-    append_unique_global_writebacks, append_unique_guest_write_ranges,
+    SharedEventEventDisposition, append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
+    shared_event_host_effect_is_resolved,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, SHARED_HOST_KIND_ACQUIRE,
-    SHARED_HOST_KIND_WAIT, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
+    PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
+    SameQueueDmaFillReject, SharedEventDrawReject, SharedEventFence,
+    SharedEventHostEffectLatencyPhase, SharedEventHostEffectLatencyState,
+    SharedEventHostEffectLatencyStatistics, SharedEventProducerId, SharedEventSignalCheckpoint,
+    SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -39,8 +45,8 @@ use super::{
     MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OpenGuestRenderPass, OrderedEventPoll,
     OrderedEventSource, OrderedGpuEventReceiver, PendingFlip, PendingGlobalWriteback,
     PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity, QueueBlockReason,
-    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write, read_texture_linear,
-    write_back_pending_globals,
+    ResourceSpan, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
+    read_texture_linear, write_back_pending_globals,
 };
 
 fn enable_per_queue_batches(presenter: &mut MetalPresenter) {
@@ -86,6 +92,9 @@ fn committed_per_queue_test_batch(
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes,
+            resident_write_footprint: Vec::new(),
+            resident_texture_versions: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -141,21 +150,56 @@ fn flip_wait_blocks_only_its_queue_front_and_preserves_the_following_boundary() 
     assert_eq!(presenter.receiver.pending_event_count(), 0);
 }
 
-fn mapped_test_label() -> (GuestAddressSpace, u64) {
-    let mut address_space =
-        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest label address space");
-    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest label backing");
+fn mapped_test_pages(page_count: u64) -> (GuestAddressSpace, u64) {
+    let byte_count = page_count
+        .checked_mul(GUEST_PAGE_SIZE)
+        .expect("test mapping byte count");
+    let mut address_space = GuestAddressSpace::new(
+        byte_count
+            .checked_add(GUEST_PAGE_SIZE)
+            .expect("test address-space byte count"),
+    )
+    .expect("guest test address space");
+    let backing = GuestPhysicalBacking::new(byte_count).expect("guest test backing");
     let address = address_space
         .map_shared(
             GuestMapPlacement::Anywhere,
-            GUEST_PAGE_SIZE,
+            byte_count,
             GUEST_PAGE_SIZE,
             GuestProtection::READ_WRITE,
             &backing,
             0,
         )
-        .expect("guest label mapping");
+        .expect("guest test mapping");
     (address_space, address.get())
+}
+
+fn mapped_test_label() -> (GuestAddressSpace, u64) {
+    mapped_test_pages(1)
+}
+
+fn shared_event_depth_draw(address: u64) -> IndexedDraw {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader_address = 0x0080_07a8_0000;
+    draw.export_shader = Some(ShaderSnapshot {
+        header_address: draw.export_shader_address,
+        program: Arc::new(Program::new(draw.export_shader_address, Vec::new())),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    draw.export_shader_evaluation = Some(Arc::new(ShaderEvaluation {
+        initial_scalar_registers: Default::default(),
+        scalar_registers: Default::default(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    }));
+    super::append_depth_target_registers(&mut draw, address, 64, 64, 0xa000_0003, 0x66);
+    draw
 }
 
 fn read_test_label(address: u64) -> u32 {
@@ -474,6 +518,9 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: Some(OpenGuestRenderPass {
             key: GuestRenderPassKey {
                 targets: Vec::new(),
@@ -692,6 +739,9 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: Some(OpenGuestRenderPass {
             key: GuestRenderPassKey {
                 targets: Vec::new(),
@@ -754,6 +804,9 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -1605,6 +1658,9 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -1775,6 +1831,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         }),
         mapping_identity: None,
         write_watch: None,
+        publishes_guest_memory_authority: false,
     };
     let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
         address: completion_address,
@@ -1795,6 +1852,9 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
                 memory_writes,
+                resident_write_footprint: Vec::new(),
+                resident_texture_versions: Vec::new(),
+                resident_write_footprint_complete: true,
                 render_pass: None,
                 compute_encoder: None,
                 max_encoded_signal: None,
@@ -1853,6 +1913,9 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
                 }))
                 .expect("pin completion label mapping"),
             ],
+            resident_write_footprint: Vec::new(),
+            resident_texture_versions: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -1915,6 +1978,9 @@ fn fill_committed_guest_batch_budget(
                 global_writebacks: Vec::new(),
                 guest_write_ranges: Vec::new(),
                 memory_writes,
+                resident_write_footprint: Vec::new(),
+                resident_texture_versions: Vec::new(),
+                resident_write_footprint_complete: true,
                 render_pass: None,
                 compute_encoder: None,
                 max_encoded_signal: None,
@@ -2044,6 +2110,9 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         global_writebacks: Vec::new(),
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
         max_encoded_signal: None,
@@ -2199,6 +2268,9 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             ],
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
+            resident_write_footprint: Vec::new(),
+            resident_texture_versions: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -2226,6 +2298,9 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
                 }))
                 .expect("pin later completion label"),
             ],
+            resident_write_footprint: Vec::new(),
+            resident_texture_versions: Vec::new(),
+            resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
             max_encoded_signal: None,
@@ -4218,6 +4293,7 @@ fn per_queue_required_drain_has_one_deadline_and_continues_after_terminal_error(
         }),
         mapping_identity: None,
         write_watch: None,
+        publishes_guest_memory_authority: false,
     };
     let (_label_space, completion_address) = mapped_test_label();
     let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
@@ -4319,7 +4395,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let device = presenter.device.as_ref().expect("Metal device").clone();
-    let guest_address = 0x8004_2000_00;
+    let (_global_space, guest_address) = mapped_test_pages(1);
     let byte_count = 64_usize;
     let before_signal = device.new_buffer(
         u64::try_from(byte_count).unwrap(),
@@ -4344,7 +4420,10 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: None,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
         });
@@ -4352,13 +4431,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         .shared_event_timeline
         .allocate_fence()
         .expect("producer fence");
-    let checkpoint = SharedEventSignalCheckpoint::capture(
-        producer
-            .open_batch
-            .as_ref()
-            .expect("producer batch remains open"),
-        fence,
-    );
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(producer, fence);
     producer
         .open_batch
         .as_mut()
@@ -4369,7 +4442,10 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             offset: 0,
             guest_address,
             byte_count,
-            mapping_identity: None,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
             write_watch: None,
             original_bytes: vec![0; byte_count],
         });
@@ -4395,11 +4471,61 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         presenter.shared_event_dependencies_supply_compute_globals(&evaluation),
         "an exact copied producer version is sufficient for direct buffer-only compute"
     );
+    assert!(
+        presenter.shared_event_dependencies_supply_draw_global_range(
+            0,
+            guest_address,
+            u64::try_from(byte_count).unwrap(),
+        ),
+        "the same retained version is sufficient for a read-only draw global"
+    );
     let uploaded = presenter
         .upload_global_buffer(&device, &binding)
         .expect("consumer forwards the retained checkpoint version");
     assert_eq!(uploaded.buffer.as_ptr(), before_signal.as_ptr());
     assert_ne!(uploaded.buffer.as_ptr(), after_signal.as_ptr());
+
+    let local_competitor = device.new_buffer(
+        u64::try_from(byte_count).unwrap(),
+        MTLResourceOptions::StorageModeShared,
+    );
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .open_batch
+        .as_mut()
+        .expect("consumer batch remains open")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: local_competitor,
+            offset: 0,
+            guest_address,
+            byte_count,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
+            write_watch: None,
+            original_bytes: vec![0; byte_count],
+        });
+    assert!(
+        !presenter.shared_event_dependencies_supply_draw_global_range(
+            0,
+            guest_address,
+            u64::try_from(byte_count).unwrap(),
+        ),
+        "a local queued writer competes with the fence version"
+    );
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .open_batch
+        .as_mut()
+        .expect("consumer batch remains open")
+        .global_writebacks
+        .pop();
 
     let program = Arc::new(Program::new(0x5000, Vec::new()));
     let dispatch = ComputeDispatch {
@@ -4495,6 +4621,514 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
 }
 
 #[test]
+fn disjoint_direct_draw_admission_is_default_disabled() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = false;
+    let (_label_space, label) = mapped_test_label();
+    let (_depth_space, depth) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth))),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_disjoint_candidates, 1,
+        "the OFF arm still measures the exact candidate population"
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW], 1,
+        "default-OFF must preserve the existing draw host gate"
+    );
+    assert_eq!(
+        presenter
+            .statistics
+            .batch_flushes_for_shared_event_host_effect,
+        1
+    );
+    let Some(QueueBlockReason::GuestSharedEventHostEffect {
+        consumer_ack: Some(consumer_ack),
+        terminal_dependencies,
+        ..
+    }) = presenter.receiver.blocked_queues.get(&0)
+    else {
+        panic!("default-OFF draw must retain a consumer host acknowledgement");
+    };
+    assert_eq!(consumer_ack.producer().queue_id(), 0);
+    assert_eq!(terminal_dependencies.len(), 1);
+    assert_eq!(terminal_dependencies[0].producer().queue_id(), 41);
+    assert_eq!(read_test_label(label), 0, "producer has not host-retired");
+    assert!(
+        presenter.guest_queue_batches[&0]
+            .committed_batches
+            .iter()
+            .all(|batch| batch.completion_sequences.is_empty())
+    );
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("default-OFF acknowledgement and producer settle");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = true;
+    let (_label_space, label) = mapped_test_label();
+    let (_depth_space, depth) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth))),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_disjoint_candidates,
+        1
+    );
+    assert_eq!(presenter.statistics.shared_event_host_blocks, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        0
+    );
+    assert!(
+        !matches!(
+            presenter.receiver.blocked_queues.get(&0),
+            Some(QueueBlockReason::GuestSharedEventHostEffect { .. })
+        ),
+        "the cold pipeline may finish or fail during this drain, but it cannot reintroduce a host acknowledgement"
+    );
+    let consumer = &presenter.guest_queue_batches[&0];
+    let (&producer, checkpoint) = consumer
+        .resource_dependencies
+        .iter()
+        .next()
+        .expect("consumer retains one exact producer checkpoint");
+    assert_eq!(producer.queue_id(), 41);
+    assert_eq!(
+        consumer.host_dependencies.get(&producer),
+        Some(&checkpoint.fence.value())
+    );
+    assert!(checkpoint.footprint_complete);
+    assert_eq!(
+        consumer
+            .open_batch
+            .as_ref()
+            .expect("the wait remains in the open consumer batch")
+            .max_encoded_signal,
+        None,
+        "admission must not manufacture a consumer host acknowledgement"
+    );
+    assert_eq!(
+        read_test_label(label),
+        0,
+        "GPU signal is not host retirement"
+    );
+
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("consumer wait batch commits before its producer");
+    let consumer_commands = presenter.guest_queue_batches[&0]
+        .committed_batches
+        .back()
+        .expect("consumer wait batch is retained")
+        .command_buffer
+        .clone();
+    assert_ne!(
+        consumer_commands.status(),
+        metal::MTLCommandBufferStatus::Completed,
+        "the exact producer wait must hold a consumer committed first"
+    );
+    assert!(
+        presenter.guest_queue_batches[&0]
+            .committed_batches
+            .iter()
+            .all(|batch| batch.completion_sequences.is_empty())
+    );
+    assert_eq!(read_test_label(label), 0);
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("producer signal releases the exact consumer wait");
+    assert_eq!(
+        consumer_commands.status(),
+        metal::MTLCommandBufferStatus::Completed
+    );
+    assert_eq!(read_test_label(label), 1);
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = true;
+    let (_shared_space, shared_address) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: shared_address,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: shared_address,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(shared_address))),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_disjoint_candidates,
+        0
+    );
+    assert_eq!(
+        presenter.statistics.shared_event_draw_rejections
+            [SharedEventDrawReject::OverlapTerminalWrite.index()],
+        1
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        1
+    );
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestSharedEventHostEffect {
+            consumer_ack: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(read_test_label(shared_address), 0);
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("overlapping draw host gate and producer settle");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    presenter.shared_event_direct_draw_admission = true;
+    let (_label_space, label) = mapped_test_label();
+    let (_depth_space, depth) = mapped_test_pages(16);
+    let wait = GpuMemoryWait {
+        address: label,
+        reference: 1,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 41,
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+            address: label,
+            value: GpuMemoryReleaseValue::Immediate32(1),
+        })],
+    }));
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![GpuEvent::MemoryWait(wait)],
+    }));
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_waits, 1);
+    let checkpoint = presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue exists")
+        .resource_dependencies
+        .values_mut()
+        .next()
+        .expect("consumer retained the exact producer checkpoint");
+    checkpoint.footprint_complete = false;
+
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 0,
+        events: vec![GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(
+            depth
+        )))],
+    }));
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_draw_rejections
+            [SharedEventDrawReject::IncompleteProducer.index()],
+        1
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
+        1
+    );
+    assert!(matches!(
+        presenter.receiver.blocked_queues.get(&0),
+        Some(QueueBlockReason::GuestSharedEventHostEffect {
+            consumer_ack: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(read_test_label(label), 0);
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("incomplete-producer host gate and producer settle");
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn shared_event_direct_draw_outcome_counts_encoding_and_internal_drains_separately() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+
+    presenter.record_shared_event_direct_draw_outcome(
+        false,
+        presenter.guest_batch_cpu_synchronization_epoch,
+        true,
+    );
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
+    assert_eq!(presenter.statistics.shared_event_draw_internal_drains, 0);
+
+    let before = presenter.guest_batch_cpu_synchronization_epoch;
+    presenter.record_shared_event_direct_draw_outcome(true, before, true);
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 1);
+    assert_eq!(presenter.statistics.shared_event_draw_internal_drains, 0);
+
+    let before = presenter.guest_batch_cpu_synchronization_epoch;
+    presenter.guest_batch_cpu_synchronization_epoch += 1;
+    presenter.record_shared_event_direct_draw_outcome(true, before, false);
+    assert_eq!(
+        presenter.statistics.shared_event_gpu_ordered_draws, 1,
+        "a failed draw is not reported as encoded"
+    );
+    assert_eq!(
+        presenter.statistics.shared_event_draw_internal_drains, 1,
+        "an admitted draw which explicitly settles Metal work is never interpreted as a saved gate"
+    );
+}
+
+#[test]
+fn shared_event_host_effect_readiness_queries_only_exact_required_state() {
+    use std::cell::{Cell, RefCell};
+
+    let consumer = SharedEventProducerId::new(7);
+    let first_producer = SharedEventProducerId::new(41);
+    let second_producer = SharedEventProducerId::new(99);
+    let consumer_ack = SharedEventFence::new(consumer, 3);
+    let terminal_dependencies = [
+        SharedEventFence::new(first_producer, 5),
+        SharedEventFence::new(second_producer, 2),
+    ];
+    let started = Instant::now();
+    let mut latency = SharedEventHostEffectLatencyState::new(started);
+    let mut statistics = SharedEventHostEffectLatencyStatistics::default();
+
+    let outstanding_queries = Cell::new(0);
+    let consumer_queries = RefCell::new(Vec::new());
+    let prefix_queries = RefCell::new(Vec::new());
+    let retired_queries = RefCell::new(Vec::new());
+    assert!(!shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(10),
+        &mut statistics,
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| {
+            outstanding_queries.set(outstanding_queries.get() + 1);
+            false
+        },
+        |producer| {
+            consumer_queries.borrow_mut().push(producer);
+            Some(2)
+        },
+        |_| panic!("producer prefixes are not queried before the consumer acknowledgement"),
+        |producer| {
+            retired_queries.borrow_mut().push(producer);
+            Some(u64::MAX)
+        },
+    ));
+    assert_eq!(outstanding_queries.get(), 0);
+    assert_eq!(&*consumer_queries.borrow(), &[consumer]);
+    assert!(
+        retired_queries.borrow().is_empty(),
+        "terminal publication is not queried before the consumer reaches its acknowledgement"
+    );
+    assert_eq!(
+        statistics
+            .phase(SharedEventHostEffectLatencyPhase::ConsumerAck)
+            .count,
+        0
+    );
+
+    consumer_queries.borrow_mut().clear();
+    assert!(!shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(20),
+        &mut statistics,
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| panic!("an acknowledgement must not fall back to queue-outstanding state"),
+        |producer| {
+            consumer_queries.borrow_mut().push(producer);
+            (producer == consumer).then_some(3)
+        },
+        |producer| {
+            prefix_queries.borrow_mut().push(producer);
+            match producer {
+                producer if producer == first_producer => Some(4),
+                producer if producer == second_producer => Some(2),
+                _ => None,
+            }
+        },
+        |_| panic!("terminal publication is not queried before the exact producer prefix"),
+    ));
+    assert_eq!(&*consumer_queries.borrow(), &[consumer]);
+    assert_eq!(&*prefix_queries.borrow(), &[first_producer]);
+    let ack = statistics.phase(SharedEventHostEffectLatencyPhase::ConsumerAck);
+    assert_eq!((ack.count, ack.total_ns, ack.maximum_ns), (1, 20, 20));
+
+    prefix_queries.borrow_mut().clear();
+    assert!(!shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(50),
+        &mut statistics,
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |producer| match producer {
+            producer if producer == first_producer => Some(5),
+            producer if producer == second_producer => Some(2),
+            _ => None,
+        },
+        |producer| {
+            retired_queries.borrow_mut().push(producer);
+            (producer == first_producer).then_some(4)
+        },
+    ));
+    assert_eq!(
+        statistics
+            .phase(SharedEventHostEffectLatencyPhase::ImmutablePrefix)
+            .total_ns,
+        30
+    );
+    assert_eq!(&*retired_queries.borrow(), &[first_producer]);
+
+    retired_queries.borrow_mut().clear();
+    assert!(shared_event_host_effect_is_resolved(
+        &mut latency,
+        started + Duration::from_nanos(90),
+        &mut statistics,
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |_| panic!("the completed acknowledgement phase is not queried again"),
+        |_| panic!("the completed prefix phase is not queried again"),
+        |producer| match producer {
+            producer if producer == first_producer => Some(5),
+            producer if producer == second_producer => Some(2),
+            _ => None,
+        },
+    ));
+    let terminal = statistics.phase(SharedEventHostEffectLatencyPhase::HostTerminal);
+    assert_eq!(
+        (terminal.count, terminal.total_ns, terminal.maximum_ns),
+        (1, 40, 40)
+    );
+
+    let no_ack_outstanding_queries = RefCell::new(Vec::new());
+    let mut no_ack_latency = SharedEventHostEffectLatencyState::new(started);
+    assert!(!shared_event_host_effect_is_resolved(
+        &mut no_ack_latency,
+        started + Duration::from_nanos(100),
+        &mut SharedEventHostEffectLatencyStatistics::default(),
+        7,
+        None,
+        &terminal_dependencies,
+        |queue_id| {
+            no_ack_outstanding_queries.borrow_mut().push(queue_id);
+            true
+        },
+        |_| panic!("a missing acknowledgement must use consumer batch state"),
+        |_| panic!("producer prefixes must short-circuit behind outstanding consumer work"),
+        |_| panic!("terminal publication must short-circuit behind outstanding consumer work"),
+    ));
+    assert_eq!(&*no_ack_outstanding_queries.borrow(), &[7]);
+}
+
+#[test]
 fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
     remu_gpu::clear_event_sink();
     let (sender, receiver) = gpu_event_channel();
@@ -4546,6 +5180,22 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
         presenter.guest_queue_batches[&41].open_batch.is_some(),
         "a release-only producer still needs a queue-local signal batch"
     );
+    let checkpoint = presenter.guest_queue_batches[&41]
+        .open_batch
+        .as_ref()
+        .expect("release producer remains open")
+        .signal_checkpoints
+        .last()
+        .expect("release producer retained its signal checkpoint");
+    assert!(checkpoint.footprint_complete);
+    assert!(
+        checkpoint.pending_write_footprint.iter().any(|range| {
+            range.kind == SharedEventWriteKind::TerminalGuestWrite
+                && range.guest_address == label
+                && range.byte_count == 4
+        }),
+        "the exact release label must be captured before the signal checkpoint is frozen"
+    );
     assert_eq!(
         read_test_label(label),
         0,
@@ -4555,6 +5205,7 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
         consumer_queue_id,
         consumer_ack: Some(consumer_ack),
         terminal_dependencies,
+        ..
     }) = presenter.receiver.blocked_queues.get(&0)
     else {
         panic!("the acquire must wait on a consumer-side host acknowledgement");
@@ -4584,13 +5235,266 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
             .is_empty(),
         "host-retired producers no longer need cross-queue resource forwarding"
     );
-    assert!(
-        presenter.guest_queue_batches[&41]
-            .retired_fence_write_ranges
-            .is_empty(),
-        "retired fence ranges are pruned after the last wait/resource reference"
-    );
     remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn shared_event_checkpoint_includes_earlier_unretired_queue_writes() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest footprint address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest footprint backing");
+    let address = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest footprint mapping")
+        .get();
+
+    open_per_queue_batch(&mut presenter, 41);
+    presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists")
+        .open_batch
+        .as_mut()
+        .expect("producer batch is open")
+        .record_resident_write_footprint(
+            SharedEventWriteKind::ResidentDestination,
+            Some(ResourceSpan::new(address + 64, 128)),
+        );
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("earlier producer batch commits");
+    assert_eq!(
+        presenter.guest_queue_batches[&41].committed_batches.len(),
+        1
+    );
+
+    open_per_queue_batch(&mut presenter, 41);
+    let state = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue remains live");
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("release-only fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    let identity = guest_shared_backing_identity(address + 64, 128)
+        .expect("earlier producer has physical identity");
+    assert!(checkpoint.footprint_complete);
+    assert!(checkpoint.pending_write_footprint.iter().any(|range| {
+        range.kind == SharedEventWriteKind::ResidentDestination
+            && range.mapping == identity
+            && range.byte_count == 128
+    }));
+}
+
+#[test]
+fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let (_address_space, address) = mapped_test_label();
+    let buffer = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
+    let copied_identity =
+        guest_shared_backing_identity(address, 32).expect("copied global physical identity");
+    let zero_copy_identity = guest_shared_backing_identity(address + 64, 32)
+        .expect("zero-copy global physical identity");
+
+    open_per_queue_batch(&mut presenter, 41);
+    let state = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists");
+    let batch = state.open_batch.as_mut().expect("producer batch is open");
+    batch.global_writebacks.push(PendingGlobalWriteback {
+        buffer: buffer.clone(),
+        offset: 0,
+        guest_address: address,
+        byte_count: 32,
+        mapping_identity: Some(copied_identity),
+        write_watch: None,
+        original_bytes: vec![0; 32],
+    });
+    batch.guest_write_ranges.push(PendingGuestWriteRange {
+        address: address + 64,
+        byte_count: 32,
+        buffer,
+        offset: 64,
+        physical_identity: zero_copy_identity,
+    });
+    batch.memory_writes.push(
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            address: address + 128,
+            value: GpuMemoryReleaseValue::Immediate32(7),
+        }))
+        .expect("terminal label mapping is pinned"),
+    );
+    batch.record_resident_write_footprint(
+        SharedEventWriteKind::ResidentDestination,
+        Some(ResourceSpan::new(address + 192, 32)),
+    );
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("producer fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    assert!(checkpoint.footprint_complete);
+    for kind in [
+        SharedEventWriteKind::ResidentDestination,
+        SharedEventWriteKind::CopiedGlobal,
+        SharedEventWriteKind::ZeroCopyGlobal,
+        SharedEventWriteKind::TerminalGuestWrite,
+    ] {
+        assert!(
+            checkpoint
+                .pending_write_footprint
+                .iter()
+                .any(|range| range.kind == kind),
+            "checkpoint omitted {kind:?}"
+        );
+    }
+}
+
+#[test]
+fn shared_event_footprints_compare_physical_aliases() {
+    let mut address_space =
+        GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest alias address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest alias backing");
+    let first = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(address_space.base()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("first physical alias")
+        .get();
+    let second = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                address_space
+                    .base()
+                    .checked_add(2 * GUEST_PAGE_SIZE)
+                    .expect("second alias address"),
+            ),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("second physical alias")
+        .get();
+    let left = PhysicalFootprintRange::new(
+        SharedEventWriteKind::ResidentDestination,
+        first + 64,
+        128,
+        guest_shared_backing_identity(first + 64, 128),
+    )
+    .expect("first physical footprint");
+    let aliased = PhysicalFootprintRange::new(
+        SharedEventWriteKind::CopiedGlobal,
+        second + 96,
+        32,
+        guest_shared_backing_identity(second + 96, 32),
+    )
+    .expect("aliased physical footprint");
+    let disjoint = PhysicalFootprintRange::new(
+        SharedEventWriteKind::CopiedGlobal,
+        second + 256,
+        32,
+        guest_shared_backing_identity(second + 256, 32),
+    )
+    .expect("disjoint physical footprint");
+    assert_ne!(left.guest_address, aliased.guest_address);
+    assert!(left.overlaps(aliased));
+    assert!(!left.overlaps(disjoint));
+}
+
+#[test]
+fn unresolved_or_ambiguous_signal_writes_make_the_checkpoint_unsafe() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    open_per_queue_batch(&mut presenter, 41);
+
+    let state = presenter
+        .guest_queue_batches
+        .get_mut(&41)
+        .expect("producer queue exists");
+    state
+        .open_batch
+        .as_mut()
+        .expect("producer batch is open")
+        .record_resident_write_footprint(SharedEventWriteKind::InternalResidentDestination, None);
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("unresolved producer fence");
+    let unresolved = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    assert!(!unresolved.footprint_complete);
+
+    let mut address_space =
+        GuestAddressSpace::new(3 * GUEST_PAGE_SIZE).expect("ambiguous footprint address space");
+    let first_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("first footprint backing");
+    let second_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("second footprint backing");
+    let base = address_space.base();
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &first_backing,
+            0,
+        )
+        .expect("first footprint mapping");
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(
+                base.checked_add(GUEST_PAGE_SIZE)
+                    .expect("second footprint address"),
+            ),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &second_backing,
+            0,
+        )
+        .expect("second footprint mapping");
+    let ambiguous_span = ResourceSpan::new(base.get() + GUEST_PAGE_SIZE as u64 - 16, 32);
+    assert!(ambiguous_span.backing().is_none());
+    let batch = state
+        .open_batch
+        .as_mut()
+        .expect("producer batch remains open");
+    batch.resident_write_footprint.clear();
+    batch.resident_write_footprint_complete = true;
+    batch.record_resident_write_footprint(
+        SharedEventWriteKind::InternalResidentDestination,
+        Some(ambiguous_span),
+    );
+    let fence = state
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("ambiguous producer fence");
+    let ambiguous = SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+    assert!(!ambiguous.footprint_complete);
 }
 
 #[test]
@@ -4820,6 +5724,613 @@ fn acquire_without_an_effective_cached_resource_is_gpu_orderable() {
             ..acquire
         }),
     ));
+}
+
+fn install_empty_shared_event_dependency(
+    presenter: &mut MetalPresenter,
+    consumer_queue_id: u64,
+    producer_queue_id: u64,
+) -> SharedEventFence {
+    presenter.set_active_guest_queue(Some(consumer_queue_id));
+    presenter
+        .ensure_active_open_guest_batch()
+        .expect("consumer queue state");
+    let producer = SharedEventProducerId::new(producer_queue_id);
+    let fence = SharedEventFence::new(producer, 1);
+    let checkpoint = SharedEventSignalCheckpoint {
+        fence,
+        global_writeback_count: 0,
+        guest_write_range_count: 0,
+        memory_write_count: 0,
+        global_versions: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        unresolved_write_ranges: Vec::new(),
+        pending_write_footprint: Vec::new(),
+        footprint_complete: true,
+    };
+    let consumer = presenter
+        .guest_queue_batches
+        .get_mut(&consumer_queue_id)
+        .expect("consumer queue exists");
+    consumer.host_dependencies.insert(producer, fence.value());
+    consumer.resource_dependencies.insert(producer, checkpoint);
+    fence
+}
+
+#[test]
+fn stable_clean_invalidating_acquire_is_dropped_without_running_the_executor() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_texture_space, texture) = mapped_test_pages(1);
+    ensure_watched_test_resident(&mut presenter, texture);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0,
+        size_bytes: 0,
+        poll_interval: 0,
+        gcr_control: 1,
+    };
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == texture)
+        .expect("watched resident key");
+    let before_texture = presenter.resident_guest_textures[&descriptor]
+        .texture
+        .as_ptr();
+
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::DropSemanticNoOp,
+    );
+    assert_eq!(
+        presenter.resident_guest_textures[&descriptor]
+            .texture
+            .as_ptr(),
+        before_texture,
+        "classification does not replace the resident texture"
+    );
+    assert!(presenter.resident_guest_textures[&descriptor].is_live());
+    assert!(
+        !presenter.resident_guest_textures[&descriptor]
+            .write_watch
+            .is_dirty()
+    );
+
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryAcquire(acquire)],
+        })
+        .expect("invalidating acquire submission");
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_acquire_noop_drops, 1);
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    assert_eq!(
+        presenter.resident_guest_textures[&descriptor]
+            .texture
+            .as_ptr(),
+        before_texture,
+        "the dropped receive-loop event never runs the texture replacement executor"
+    );
+    assert!(presenter.resident_guest_textures[&descriptor].is_live());
+}
+
+#[test]
+fn invalidating_acquire_rejects_overlapping_deferred_guest_publication() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_texture_space, texture) = mapped_test_pages(1);
+    ensure_watched_test_resident(&mut presenter, texture);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0,
+        size_bytes: 0,
+        poll_interval: 0,
+        gcr_control: 1,
+    };
+    let span = ResourceSpan::new(texture, GUEST_PAGE_SIZE as u64);
+    let pending_publication = PhysicalFootprintRange::new(
+        SharedEventWriteKind::TerminalGuestWrite,
+        texture,
+        GUEST_PAGE_SIZE as u64,
+        span.backing(),
+    )
+    .expect("mapped terminal publication footprint");
+    presenter
+        .guest_queue_batches
+        .get_mut(&0)
+        .expect("consumer queue")
+        .resource_dependencies
+        .get_mut(&dependency.producer())
+        .expect("exact producer checkpoint")
+        .pending_write_footprint
+        .push(pending_publication);
+
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::HostEffect,
+        "a future guest-memory write can dirty the clean snapshot and must retire first"
+    );
+}
+
+#[test]
+fn invalidating_acquire_rejects_dirty_and_gpu_generation_mismatch() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_texture_space, texture) = mapped_test_pages(1);
+    ensure_watched_test_resident(&mut presenter, texture);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let acquire = GpuMemoryAcquire {
+        engine: 0,
+        cb_db_control: 0,
+        base_address: 0,
+        size_bytes: 0,
+        poll_interval: 0,
+        gcr_control: 1,
+    };
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == texture)
+        .expect("watched resident key");
+    presenter
+        .resident_guest_textures
+        .get_mut(&descriptor)
+        .expect("watched resident")
+        .note_gpu_authored_whole_span();
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::HostEffect,
+        "GPU ownership from an older watch generation is not a no-op"
+    );
+    presenter
+        .resident_guest_textures
+        .get_mut(&descriptor)
+        .expect("watched resident")
+        .note_gpu_write();
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::DropSemanticNoOp,
+        "matching GPU ownership generations make the clean action empty"
+    );
+
+    // SAFETY: the test retains the live read/write guest mapping and deliberately exercises its
+    // write-watch fault path.
+    unsafe { std::ptr::write_volatile(texture as *mut u8, 0x5a) };
+    assert_eq!(
+        presenter.shared_event_event_disposition(
+            0,
+            OrderedEventSource::GuestQueue(0),
+            &[dependency],
+            &GpuEvent::MemoryAcquire(acquire),
+        ),
+        SharedEventEventDisposition::HostEffect,
+        "a dirty watched resource must run the normal acquire after terminal evidence"
+    );
+}
+
+fn immediate_dma_fill(destination_address: u64, value: u32) -> GpuMemoryCopy {
+    GpuMemoryCopy {
+        source_address: u64::from(value),
+        destination_address,
+        byte_count: 4,
+        source_selection: 2,
+        destination_selection: 3,
+        source_snapshot: None,
+    }
+}
+
+#[test]
+fn same_queue_immediate_fill_attaches_and_publishes_only_at_terminal_retirement() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_destination_space, destination) = mapped_test_label();
+    // SAFETY: the retained test address space owns this aligned writable dword.
+    unsafe { std::ptr::write_volatile(destination as *mut u32, 0x1234_5678) };
+    let wait = GpuMemoryWait {
+        address: destination,
+        reference: 0,
+        mask: u64::from(u32::MAX),
+        compare_function: 3,
+        is_64_bit: false,
+    };
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 41,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("overlapping waiter submission");
+    let (wait_source, wait_event) = match presenter.receiver.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: event @ GpuEvent::MemoryWait(actual),
+        } => {
+            assert_eq!(actual, wait);
+            (source, event)
+        }
+        other => panic!("expected overlapping waiter, got {other:?}"),
+    };
+    presenter.receiver.block_event(
+        wait_source,
+        wait_event,
+        QueueBlockReason::GuestMemoryWait(wait),
+    );
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let fill = immediate_dma_fill(destination, 0);
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryCopy(fill.clone())],
+        })
+        .expect("same-queue immediate fill submission");
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_dma_fill_attempts, 1);
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_dma_fills, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[super::super::SHARED_HOST_KIND_DMA],
+        0,
+    );
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    assert!(
+        matches!(
+            presenter.receiver.blocked_queues.get(&41),
+            Some(QueueBlockReason::GuestMemoryWait(actual)) if *actual == wait
+        ),
+        "dequeue cannot retry a wait before the deferred fill is published"
+    );
+    assert_eq!(
+        read_test_label(destination),
+        0x1234_5678,
+        "zero fill is still in flight"
+    );
+    let state = &presenter.guest_queue_batches[&0];
+    assert_eq!(
+        state.host_dependencies[&dependency.producer()],
+        dependency.value()
+    );
+    let open = state
+        .open_batch
+        .as_ref()
+        .expect("same-q batch remains open");
+    assert!(matches!(
+        open.memory_writes.as_slice(),
+        [PendingGuestMemoryWrite {
+            operation: GuestMemoryWriteOperation::Fill {
+                address,
+                value: 0,
+                dword_count: 1,
+            },
+            mapping_identity: Some(_),
+            publishes_guest_memory_authority: true,
+            ..
+        }] if *address == destination
+    ));
+
+    // A cache/metadata consumer can appear after admission. The transition still belongs to
+    // terminal publication, not event dequeue.
+    presenter.color_metadata_clears.insert(destination, 0);
+    ensure_watched_test_resident(&mut presenter, destination);
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == destination)
+        .expect("late resident key");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter.ensure_direct_scanout_texture(&device, descriptor);
+    assert_eq!(presenter.color_metadata_clears[&destination], 0);
+    assert!(
+        !presenter.resident_guest_textures[&descriptor]
+            .write_watch
+            .is_dirty(),
+        "event dequeue cannot dirty the late cache"
+    );
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("same-q fill batch commits");
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("same-q fill batch retires");
+    assert!(
+        !presenter.receiver.blocked_queues.contains_key(&41),
+        "terminal publication wakes the overlapping wait"
+    );
+    assert_eq!(read_test_label(destination), 0);
+    assert_eq!(
+        presenter.color_metadata_clears[&destination],
+        u32::MAX,
+        "metadata authority changes only after the fill is published"
+    );
+    assert!(
+        presenter.resident_guest_textures[&descriptor]
+            .write_watch
+            .is_dirty(),
+        "terminal publication dirties every persistent cache alias"
+    );
+    assert!(
+        !presenter.direct_scanout_textures.contains_key(&destination),
+        "terminal publication retires private cache aliases without write watches"
+    );
+}
+
+#[test]
+fn same_queue_immediate_fill_rejects_every_unproven_shape() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_destination_space, destination) = mapped_test_label();
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let exact = [dependency];
+    let assert_reject = |presenter: &mut MetalPresenter,
+                         queue_id: u64,
+                         dependencies: &[SharedEventFence],
+                         copy: &GpuMemoryCopy,
+                         reason: SameQueueDmaFillReject| {
+        let before = presenter.statistics.shared_event_dma_fill_rejections[reason.index()];
+        assert!(
+            presenter
+                .prepare_same_queue_immediate_fill(queue_id, dependencies, copy)
+                .is_none()
+        );
+        assert_eq!(
+            presenter.statistics.shared_event_dma_fill_rejections[reason.index()],
+            before + 1,
+            "expected rejection {reason:?}"
+        );
+    };
+
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.source_selection = 3;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::NonImmediateSource,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.destination_selection = 0;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::DestinationSelector,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.source_snapshot = Some(
+        remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::<[u8]>::from([0; 4]))
+            .expect("snapshot budget"),
+    );
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::SourceSnapshot,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.byte_count = 2;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::UnsupportedWidth,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.byte_count = 8;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::UnsupportedWidth,
+    );
+    let copy = immediate_dma_fill(destination, 1);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::NonZeroImmediate,
+    );
+    let copy = immediate_dma_fill(destination + 2, 0);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::InvalidRange,
+    );
+    let cross_queue = [SharedEventFence::new(SharedEventProducerId::new(41), 1)];
+    assert_reject(
+        &mut presenter,
+        0,
+        &cross_queue,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::CrossQueue,
+    );
+    let incomplete = [SharedEventFence::new(SharedEventProducerId::new(0), 2)];
+    assert_reject(
+        &mut presenter,
+        0,
+        &incomplete,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::IncompleteDependency,
+    );
+    assert_reject(
+        &mut presenter,
+        0,
+        &[],
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::IncompleteDependency,
+    );
+
+    let mut anonymous_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("anonymous address space");
+    let anonymous = anonymous_space
+        .map_anonymous(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("anonymous destination");
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(anonymous.get(), 0),
+        SameQueueDmaFillReject::MissingIdentity,
+    );
+
+    presenter.color_metadata_clears.insert(destination, 0);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::MetadataOverlap,
+    );
+    presenter.color_metadata_clears.remove(&destination);
+    let descriptor = GuestTextureDescriptor {
+        address: destination,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter.ensure_direct_scanout_texture(&device, descriptor);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::CacheOverlap,
+    );
+    presenter.direct_scanout_textures.clear();
+    ensure_watched_test_resident(&mut presenter, destination);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::CacheOverlap,
+    );
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut no_batch = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut no_batch);
+    let missing_batch = [SharedEventFence::new(SharedEventProducerId::new(7), 1)];
+    assert_reject(
+        &mut no_batch,
+        7,
+        &missing_batch,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::MissingOpenBatch,
+    );
+}
+
+#[test]
+fn same_queue_immediate_fill_refuses_replaced_destination_without_cache_transition() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest destination space");
+    let original_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original destination backing");
+    let destination = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original destination mapping");
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let fill = immediate_dma_fill(destination.get(), 0);
+    let prepared = presenter
+        .prepare_same_queue_immediate_fill(0, &[dependency], &fill)
+        .expect("original exact mapping admits the fill");
+    presenter
+        .queue_prepared_same_queue_immediate_fill(0, &fill, prepared)
+        .expect("fill attaches to original queue batch");
+
+    address_space
+        .unmap(destination, GUEST_PAGE_SIZE)
+        .expect("unmap original destination");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement destination backing");
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(destination),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement destination mapping");
+    ensure_watched_test_resident(&mut presenter, destination.get());
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == destination.get())
+        .expect("replacement resident key");
+
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("stale fill batch commits");
+    let error = presenter
+        .wait_for_guest_command_batches()
+        .expect_err("stale exact identity must refuse publication");
+    assert!(
+        error.contains("mapping changed before completion"),
+        "{error}"
+    );
+    assert_eq!(read_test_label(destination.get()), 0);
+    assert!(
+        presenter.resident_guest_textures[&descriptor].is_live(),
+        "a refused write cannot publish guest-memory cache authority"
+    );
 }
 
 #[test]

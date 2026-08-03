@@ -22,6 +22,7 @@ use remu_gpu::{ComputeDispatch, ComputeGrid};
 use std::ffi::c_void;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 fn storage_image_requires_exact_preacquire(
     opcode: remu_shader::Opcode,
@@ -37,6 +38,9 @@ impl MetalPresenter {
         dispatch: &ComputeDispatch,
     ) -> Result<(), String> {
         self.retire_completed_guest_batches();
+        let ack_phase_started = self
+            .shared_event_ack_phase_timing_enabled()
+            .then(Instant::now);
         if dispatch.launch.base_group != [0; 3] {
             return Err(format!(
                 "Metal compute does not yet support nonzero base groups {:?}",
@@ -199,7 +203,7 @@ impl MetalPresenter {
                 }
             }
         }
-        self.synchronize_sampled_aliases(&[evaluation])?;
+        self.synchronize_sampled_aliases(&[evaluation], &[])?;
 
         self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[evaluation])?;
@@ -238,6 +242,7 @@ impl MetalPresenter {
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
             activity_stamp,
+            &[],
         )?;
         let (sampler_buffer, samplers) = self.cached_sampler_argument_buffer(
             &device,
@@ -262,6 +267,7 @@ impl MetalPresenter {
         collect_pending_global_writebacks(&buffers, evaluation, &mut pending_writebacks)?;
         let mut pending_guest_write_ranges = Vec::new();
         collect_pending_guest_write_ranges(&buffers, evaluation, &mut pending_guest_write_ranges)?;
+        let ack_metal_encoding_started = ack_phase_started.map(|_| Instant::now());
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
             let batch = batch.expect("guest command batch was opened above");
@@ -353,6 +359,7 @@ impl MetalPresenter {
                     .dispatch_threads(MTLSize::new(threads[0], threads[1], threads[2]), local),
             }
         }
+        let ack_metal_encoding_finished = ack_phase_started.map(|_| Instant::now());
         // GNM also clears HTILE through small compute fills. Follow shadPS4's conservative
         // metadata heuristic: a writable binding at a registered metadata base rearms the clear
         // unless XOR semantics indicate that this is an update rather than a fill.
@@ -445,6 +452,20 @@ impl MetalPresenter {
                 std::fs::write(&path, bytes)
                     .map_err(|error| format!("could not write {}: {error}", path.display()))?;
             }
+        }
+        if let (Some(started), Some(encoding_started), Some(encoding_finished)) = (
+            ack_phase_started,
+            ack_metal_encoding_started,
+            ack_metal_encoding_finished,
+        ) {
+            let finished = Instant::now();
+            self.record_shared_event_ack_batch_cpu_phases(
+                encoding_started
+                    .saturating_duration_since(started)
+                    .saturating_add(finished.saturating_duration_since(encoding_finished)),
+                encoding_finished.saturating_duration_since(encoding_started),
+                true,
+            );
         }
         if self
             .active_open_guest_batch()

@@ -258,6 +258,8 @@ if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
     REMU_TRACE_AVPLAYER_CONTENT=1
     REMU_TRACE_GUEST_THREADS=1
     REMU_TRACE_DISPATCH_STALLS=1
+    REMU_PERF_DIRECT_IMPORTS=1
+    REMU_GPU_TERMINAL_PHASES=1
     REMU_DUMP_MSL_DIR=$msl_dir
     REMU_DUMP_GRAPHICS_LDS_IR_DIR=$graphics_lds_ir_dir
     REMU_DUMP_SCANOUT_MSL_DIR=$scanout_msl_dir
@@ -268,7 +270,8 @@ if [ "${REMU_DEEP_TRACE:-0}" = 1 ]; then
     export REMU_TRACE_SHADER_OPCODES
     export REMU_TRACE_VFS REMU_TRACE_VM REMU_TRACE_SYNC REMU_TRACE_TIME
     export REMU_TRACE_AVPLAYER REMU_TRACE_AVPLAYER_CONTENT REMU_TRACE_GUEST_THREADS
-    export REMU_TRACE_DISPATCH_STALLS REMU_DUMP_MSL_DIR
+    export REMU_TRACE_DISPATCH_STALLS REMU_PERF_DIRECT_IMPORTS REMU_GPU_TERMINAL_PHASES
+    export REMU_DUMP_MSL_DIR
     export REMU_DUMP_GRAPHICS_LDS_IR_DIR REMU_DUMP_SCANOUT_MSL_DIR
 fi
 if [ -n "${REMU_TRACE_GUEST_CODE:-}" ] && [ -z "${REMU_DUMP_GUEST_CODE_DIR:-}" ]; then
@@ -377,7 +380,11 @@ if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
     echo "[REMu] headless Metal presenter enabled"
 fi
 set +e
-if [ "$capture_frames" = 1 ]; then
+# Ordered scanout-writer diagnostics also emit post-draw images through the presenter's capture
+# root. They do not enable periodic frame capture, but they still need the run-local directory;
+# otherwise the provenance trace succeeds while every requested pixel artifact is silently
+# skipped. Keep ordinary runs isolated from an inherited capture directory as before.
+if [ "$capture_frames" = 1 ] || [ -n "${REMU_DIAGNOSTIC_SCANOUT_WRITERS:-}" ]; then
     (
         cd "$launch_working_directory"
         "$script_dir/run-with-watchdog.sh" \

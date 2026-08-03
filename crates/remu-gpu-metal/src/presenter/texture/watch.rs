@@ -44,6 +44,35 @@ const CONTENT_FINGERPRINT_CHUNK_BYTES: u64 = 4 * 1024;
 /// re-examines it on the next use.
 const MAX_STABLE_SNAPSHOT_ATTEMPTS: u32 = 4;
 
+/// Read-only write-watch state used to prove that an ACQUIRE_MEM cache action is empty.
+///
+/// Every field is observed twice before an acquire can be dropped. The token deliberately contains
+/// both coarse and page-range dirty state: a protection fault or mapping transition which straddles
+/// one read must change the second complete token and conservatively reject the proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcquireNoOpWatchToken {
+    precise_tracking: bool,
+    retirement: Option<CpuWriteWatchRetirement>,
+    dirty: bool,
+    dirty_page_ranges: Vec<(u64, u64)>,
+    content_validation_pending: bool,
+    generations: Vec<u64>,
+}
+
+impl AcquireNoOpWatchToken {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.precise_tracking
+            && self.retirement.is_none()
+            && !self.dirty
+            && self.dirty_page_ranges.is_empty()
+            && !self.content_validation_pending
+    }
+
+    pub(crate) fn generations(&self) -> &[u64] {
+        &self.generations
+    }
+}
+
 impl MetalPresenter {
     pub(crate) fn synchronize_cpu_written_guest_resources(
         &mut self,
@@ -298,6 +327,17 @@ impl MetalPresenter {
 }
 
 impl GuestTextureWriteWatch {
+    pub(crate) fn acquire_noop_token(&self) -> AcquireNoOpWatchToken {
+        AcquireNoOpWatchToken {
+            precise_tracking: self.precise_tracking(),
+            retirement: self.retirement(),
+            dirty: self.is_dirty(),
+            dirty_page_ranges: self.dirty_page_ranges(),
+            content_validation_pending: self.content_validation_pending(),
+            generations: self.generations(),
+        }
+    }
+
     pub(crate) fn new(address: u64, byte_count: u64) -> Result<Self, String> {
         loop {
             let epoch = guest_shared_mapping_epoch();
@@ -1042,33 +1082,47 @@ pub(crate) fn watch_resident_texture(
     layer_count: u32,
     mip_level_count: u32,
 ) -> Result<GuestTextureWriteWatch, String> {
+    let byte_count =
+        resident_texture_raw_byte_count(descriptor, texture_type, layer_count, mip_level_count)?;
+    GuestTextureWriteWatch::new(descriptor.address, byte_count)
+}
+
+/// Returns the complete guest allocation extent used by a resident texture.
+///
+/// Residency watches and shared-event draw preflight deliberately share this calculation. A
+/// second attachment-footprint formula could silently omit mip tails, array faces, or tiled
+/// padding and admit a draw against an in-flight producer write.
+pub(crate) fn resident_texture_raw_byte_count(
+    descriptor: GuestTextureDescriptor,
+    texture_type: u32,
+    layer_count: u32,
+    mip_level_count: u32,
+) -> Result<u64, String> {
     if texture_type == 9 && layer_count == 1 {
         if mip_level_count == 1 {
-            watch_guest_texture(descriptor)
-        } else {
-            let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
-            GuestTextureWriteWatch::new(
-                descriptor.address,
-                u64::try_from(layout.byte_count)
-                    .map_err(|_| "mip chain byte count does not fit u64")?,
-            )
+            return guest_texture_byte_count(descriptor)
+                .ok_or_else(|| "resident texture byte count overflows".to_owned());
         }
-    } else {
-        if mip_level_count != 1 {
-            return Err(format!(
-                "mipmapped resident texture type={texture_type} layers={layer_count} is unsupported"
-            ));
-        }
-        watch_sampled_texture(DecodedImageDescriptor {
-            guest: descriptor,
-            span: ResourceSpan::for_texture(descriptor),
-            destination_select: 0,
-            base_mip_level: 0,
-            mip_level_count: 1,
-            texture_type,
-            layer_count,
-        })
+        let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
+        return u64::try_from(layout.byte_count)
+            .map_err(|_| "mip chain byte count does not fit u64".to_owned());
     }
+    if mip_level_count != 1 {
+        return Err(format!(
+            "mipmapped resident texture type={texture_type} layers={layer_count} is unsupported"
+        ));
+    }
+    let descriptor = DecodedImageDescriptor {
+        guest: descriptor,
+        span: ResourceSpan::for_texture(descriptor),
+        destination_select: 0,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type,
+        layer_count,
+    };
+    let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
+    u64::try_from(byte_count).map_err(|_| "resident texture byte count does not fit u64".to_owned())
 }
 
 pub(crate) fn refresh_sampled_texture_write_watch(

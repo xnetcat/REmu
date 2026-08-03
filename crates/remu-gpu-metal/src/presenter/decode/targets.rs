@@ -610,6 +610,23 @@ fn decode_render_target_slot(
 pub(crate) fn decode_depth_target(
     draw: &IndexedDraw,
 ) -> Result<Option<DecodedDepthTarget>, String> {
+    decode_depth_target_impl(draw, true)
+}
+
+/// Decodes depth attachment state without emitting optional target diagnostics.
+///
+/// The shared-event consumer classifier runs before a producer's terminal host publication and
+/// must not mutate the diagnostic history merely by inspecting a blocked draw.
+pub(crate) fn decode_depth_target_without_diagnostics(
+    draw: &IndexedDraw,
+) -> Result<Option<DecodedDepthTarget>, String> {
+    decode_depth_target_impl(draw, false)
+}
+
+fn decode_depth_target_impl(
+    draw: &IndexedDraw,
+    emit_diagnostics: bool,
+) -> Result<Option<DecodedDepthTarget>, String> {
     let control = register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default();
     let render_control =
         register_value(&draw.context_registers, DB_RENDER_CONTROL).unwrap_or_default();
@@ -763,7 +780,7 @@ pub(crate) fn decode_depth_target(
         address,
         ..base_texture
     };
-    if trace_target_sampling() {
+    if emit_diagnostics && trace_target_sampling() {
         static LOGGED_DEPTH_TARGETS: OnceLock<Mutex<HashSet<(u64, u32, u32, u32, u32, u32, u32)>>> =
             OnceLock::new();
         let key = (

@@ -8,12 +8,13 @@ use super::{
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
     RenderTargetFormat, RenderTargetPipelineState, ResourceSpan, decode_sampled_texture_format,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
-    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
+    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_target_address_matches, diagnostic_video_chain_selected_draw,
     effective_linear_pitch, evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, guest_texture_byte_count,
@@ -30,8 +31,8 @@ mod pipeline;
 mod scanout;
 mod targets;
 pub(crate) use self::image::{
-    decode_image_descriptor, fallback_image_descriptor, image_component_class,
-    sampled_alias_descriptor,
+    decode_image_descriptor, decode_image_descriptor_without_diagnostics,
+    fallback_image_descriptor, image_component_class, sampled_alias_descriptor,
 };
 pub(crate) use self::pipeline::{
     ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
@@ -55,9 +56,10 @@ pub(crate) use self::scanout::{
 pub(crate) use self::scanout::{decode_scanout_target, raw_video_out_texture_descriptor};
 pub(crate) use self::targets::{
     common_render_target_array_length, decode_color_eliminate_fast_clear_target,
-    decode_color_resolve_targets, decode_depth_target, decode_render_target_format,
-    decode_render_target_state, decode_render_targets, initial_depth_clear_for_target,
-    initial_render_target_clear_color, render_target_cmask_address, render_target_fast_clear_color,
+    decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
+    decode_render_target_format, decode_render_target_state, decode_render_targets,
+    initial_depth_clear_for_target, initial_render_target_clear_color, render_target_cmask_address,
+    render_target_fast_clear_color,
 };
 #[cfg(test)]
 pub(crate) use self::targets::{

@@ -97,23 +97,25 @@ pub(crate) use self::sampled::{
     create_sampled_guest_texture, decode_sampled_texture_linear_from_raw,
     gpu_written_resident_serving_sampled_key, resident_color_view_sample_is_eligible,
     resident_depth_sample_is_eligible, resident_texture_for_sample,
-    sampled_texture_cache_needs_reload, sampled_texture_key,
+    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_supports_access,
+    sampled_texture_usage,
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 #[cfg(test)]
 pub(crate) use self::upload::{
     sampled_texture_cache_accepts, sampled_texture_cache_requires_eviction,
 };
+#[cfg(test)]
+pub(crate) use self::watch::guest_texture_raw_range;
 pub(crate) use self::watch::{
     authored_segments, persistent_sampled_texture_write_watch,
     refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
+    resident_texture_raw_byte_count, sampled_texture_raw_range,
     sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
     snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
     watch_sampled_texture, write_watched_guest_range,
 };
-#[cfg(test)]
-pub(crate) use self::watch::{guest_texture_raw_range, sampled_texture_raw_range};
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.
 /// Its members are `uint8_t` in the macOS SDK; keep the layout explicit because metal-rs 0.33

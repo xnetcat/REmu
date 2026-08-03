@@ -35,6 +35,32 @@ pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT: usize = 1_080;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX: u64 = 30;
 
+/// Whether draw execution is under an opt-in diagnostic which can alter the normal presenter
+/// path, inspect native resources, drain Metal work, or write an artifact.
+///
+/// Shared-event draw preflight treats the diagnostic namespaces as default-deny. Keeping that
+/// policy here means a new `REMU_DUMP_*`, `REMU_TRACE_*`, or `REMU_DIAGNOSTIC_*` switch cannot be
+/// accidentally GPU-ordered merely because the scheduler's allow-list was not updated.
+pub(super) fn draw_diagnostics_are_host_effectful() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::vars_os().any(|(name, value)| {
+            let name = name.to_string_lossy();
+            let selected_namespace = name.starts_with("REMU_DUMP_")
+                || name.starts_with("REMU_TRACE_")
+                || name.starts_with("REMU_DIAGNOSTIC_");
+            let selected_capture = matches!(
+                name.as_ref(),
+                "REMU_CAPTURE_FRAMES" | "REMU_CAPTURE_TARGET_SAMPLES"
+            );
+            let selected_shader_skip = matches!(name.as_ref(), "REMU_SKIP_ES" | "REMU_SKIP_PS");
+            (selected_namespace || selected_capture || selected_shader_skip)
+                && !value.is_empty()
+                && value != "0"
+        })
+    })
+}
+
 pub(super) fn trace_image_descriptors() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_IMAGES").is_some_and(|value| value == "1"))
@@ -585,6 +611,133 @@ pub(super) fn trace_scanout_writes() -> bool {
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum DiagnosticScanoutWriterFilter {
+    Disabled,
+    KnownScanout,
+    Any1080Color,
+    Addresses(Vec<u64>),
+    Any1080Addresses(Vec<u64>),
+    TargetAddresses(Vec<u64>),
+}
+
+impl DiagnosticScanoutWriterFilter {
+    fn selects(
+        &self,
+        pixel_shader_address: u64,
+        target_address: u64,
+        known_scanout: bool,
+        width: u32,
+        height: u32,
+    ) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::KnownScanout => known_scanout,
+            Self::Any1080Color => width == 1_920 && height == 1_080,
+            Self::Addresses(addresses) => {
+                known_scanout && addresses.contains(&pixel_shader_address)
+            }
+            Self::Any1080Addresses(addresses) => {
+                width == 1_920 && height == 1_080 && addresses.contains(&pixel_shader_address)
+            }
+            Self::TargetAddresses(addresses) => addresses.contains(&target_address),
+        }
+    }
+}
+
+fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWriterFilter {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return DiagnosticScanoutWriterFilter::KnownScanout;
+    }
+    if value.eq_ignore_ascii_case("auto1080") {
+        return DiagnosticScanoutWriterFilter::Any1080Color;
+    }
+    let (addresses, mode) = value
+        .strip_prefix("auto1080:")
+        .map(|addresses| (addresses, "auto1080"))
+        .or_else(|| {
+            value
+                .strip_prefix("targets:")
+                .map(|addresses| (addresses, "targets"))
+        })
+        .unwrap_or((value, "known"));
+    let addresses = addresses
+        .split(',')
+        .filter_map(|part| parse_diagnostic_hex_address(part.trim()))
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        DiagnosticScanoutWriterFilter::Disabled
+    } else if mode == "auto1080" {
+        DiagnosticScanoutWriterFilter::Any1080Addresses(addresses)
+    } else if mode == "targets" {
+        DiagnosticScanoutWriterFilter::TargetAddresses(addresses)
+    } else {
+        DiagnosticScanoutWriterFilter::Addresses(addresses)
+    }
+}
+
+/// Selects scanout writers for an ordered, per-draw source/capture trace.
+///
+/// This diagnostic is deliberately narrower than `REMU_TRACE_SCANOUT_WRITES`: a title can issue
+/// dozens of UI writers per frame, and settling all of them would perturb the workload beyond
+/// recognition. `auto` selects known scanout writers, `auto1080` selects any 1920x1080 color
+/// target (including targets seen before VideoOut identity is known), a comma-separated list
+/// selects known scanout writers with matching pixel-shader addresses, and `auto1080:<list>`
+/// selects matching shaders on any 1080p color target. `targets:<list>` selects exact target
+/// addresses even while the guest is rendering the next inactive VideoOut buffer.
+pub(super) fn diagnostic_scanout_writer_target_selected(
+    pixel_shader_address: u64,
+    target_address: u64,
+    known_scanout: bool,
+    width: u32,
+    height: u32,
+) -> bool {
+    static FILTER: OnceLock<DiagnosticScanoutWriterFilter> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let filter = std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITERS")
+                .ok()
+                .map(|value| parse_diagnostic_scanout_writer_filter(&value))
+                .unwrap_or(DiagnosticScanoutWriterFilter::Disabled);
+            if let DiagnosticScanoutWriterFilter::Any1080Addresses(addresses) = &filter {
+                eprintln!(
+                    "[REMu][METAL][SCANOUT-CAPTURE] filter=auto1080-shaders addresses={addresses:#x?}"
+                );
+            }
+            if let DiagnosticScanoutWriterFilter::TargetAddresses(addresses) = &filter {
+                eprintln!(
+                    "[REMu][METAL][SCANOUT-CAPTURE] filter=target-addresses addresses={addresses:#x?}"
+                );
+            }
+            filter
+        })
+        .selects(
+            pixel_shader_address,
+            target_address,
+            known_scanout,
+            width,
+            height,
+        )
+}
+
+/// Allocates a bounded trace slot for a selected scanout writer.
+pub(super) fn diagnostic_scanout_writer_slot(draw_sequence: u64) -> Option<u64> {
+    if draw_sequence < diagnostic_dump_target_minimum_draw() {
+        return None;
+    }
+    static LIMIT: OnceLock<u64> = OnceLock::new();
+    let limit = *LIMIT.get_or_init(|| {
+        std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITER_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(96)
+    });
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let slot = NEXT.fetch_add(1, Ordering::Relaxed);
+    (slot < limit).then_some(slot)
+}
+
 pub(super) fn diagnostic_dump_target_before_pixel_shader() -> Option<u64> {
     static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
     *ADDRESS.get_or_init(|| {
@@ -771,6 +924,19 @@ pub(super) fn diagnostic_dump_target_address() -> Option<u64> {
         let value = value.strip_prefix("0x").unwrap_or(&value);
         u64::from_str_radix(value, 16).ok()
     })
+}
+
+pub(super) const fn diagnostic_target_address_matches(
+    expected: Option<u64>,
+    target_address: u64,
+    target_width: u32,
+    target_height: u32,
+) -> bool {
+    match expected {
+        Some(0) => target_width == 1_920 && target_height == 1_080,
+        Some(expected) => target_address == expected,
+        None => false,
+    }
 }
 
 pub(super) fn diagnostic_dump_target_pixel_shader() -> Option<u64> {
@@ -1678,6 +1844,71 @@ mod tests {
     }
 
     #[test]
+    fn scanout_writer_shader_filter_accepts_prefixed_and_plain_hex() {
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter(
+                "0x8059850000, 8051dc0000,invalid,,0X80d3b70000"
+            ),
+            DiagnosticScanoutWriterFilter::Addresses(vec![
+                0x8059_850000,
+                0x8051_dc0000,
+                0x80d3_b70000
+            ])
+        );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter("auto1080:0x8051c40000,8051c80000,invalid"),
+            DiagnosticScanoutWriterFilter::Any1080Addresses(vec![0x8051_c40000, 0x8051_c80000,])
+        );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter("targets:0xefc0000000,efc1000000"),
+            DiagnosticScanoutWriterFilter::TargetAddresses(vec![
+                0x00ef_c000_0000,
+                0x00ef_c100_0000,
+            ])
+        );
+    }
+
+    #[test]
+    fn scanout_writer_auto_filter_selects_runtime_discovered_writers() {
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter(" AUTO "),
+            DiagnosticScanoutWriterFilter::KnownScanout
+        );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter(" auto1080 "),
+            DiagnosticScanoutWriterFilter::Any1080Color
+        );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter("invalid,,"),
+            DiagnosticScanoutWriterFilter::Disabled
+        );
+    }
+
+    #[test]
+    fn scanout_writer_filter_keeps_auto_strict_and_auto1080_extent_based() {
+        let known = DiagnosticScanoutWriterFilter::KnownScanout;
+        let any_1080 = DiagnosticScanoutWriterFilter::Any1080Color;
+        let addresses = DiagnosticScanoutWriterFilter::Addresses(vec![0x80d3_b70000]);
+        let any_1080_addresses =
+            DiagnosticScanoutWriterFilter::Any1080Addresses(vec![0x80d3_b70000]);
+        let target_addresses =
+            DiagnosticScanoutWriterFilter::TargetAddresses(vec![0x00ef_c000_0000]);
+
+        assert!(known.selects(0x1234, 0, true, 1_280, 720));
+        assert!(!known.selects(0x1234, 0, false, 1_920, 1_080));
+        assert!(any_1080.selects(0x1234, 0, false, 1_920, 1_080));
+        assert!(!any_1080.selects(0x1234, 0, false, 1_280, 720));
+        assert!(addresses.selects(0x80d3_b70000, 0, true, 1_920, 1_080));
+        assert!(!addresses.selects(0x80d3_b70000, 0, false, 1_920, 1_080));
+        assert!(!addresses.selects(0x1234, 0, true, 1_920, 1_080));
+        assert!(any_1080_addresses.selects(0x80d3_b70000, 0, false, 1_920, 1_080));
+        assert!(!any_1080_addresses.selects(0x80d3_b70000, 0, true, 1_280, 720));
+        assert!(!any_1080_addresses.selects(0x1234, 0, true, 1_920, 1_080));
+        assert!(target_addresses.selects(0x1234, 0x00ef_c000_0000, false, 640, 360));
+        assert!(!target_addresses.selects(0x1234, 0x00ef_c100_0000, true, 1_920, 1_080));
+    }
+
+    #[test]
     fn automatic_target_filter_selects_only_display_extent() {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: None,
@@ -1688,6 +1919,28 @@ mod tests {
 
         assert!(filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_920, 1_080));
         assert!(!filter.matches(1, 0x0080_0e73_0000, 0x1234, 1_280, 720));
+    }
+
+    #[test]
+    fn target_address_selection_can_enable_pipeline_instrumentation() {
+        assert!(diagnostic_target_address_matches(
+            Some(0x00ef_c000_0000),
+            0x00ef_c000_0000,
+            1_280,
+            720
+        ));
+        assert!(diagnostic_target_address_matches(
+            Some(0),
+            0x00ef_c000_0000,
+            1_920,
+            1_080
+        ));
+        assert!(!diagnostic_target_address_matches(
+            Some(0),
+            0x00ef_c000_0000,
+            1_280,
+            720
+        ));
     }
 
     #[test]

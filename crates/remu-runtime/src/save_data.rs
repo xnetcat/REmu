@@ -40,24 +40,31 @@ pub(crate) fn sanitize_save_segment(value: &str) -> String {
 
 const SAVE_DATA_ERROR_PARAMETER: u32 = 0x809f_0000;
 const SAVE_DATA_ERROR_NOT_INITIALIZED: u32 = 0x809f_0001;
-const SAVE_DATA_ERROR_OUT_OF_MEMORY: u32 = 0x809f_0002;
-const SAVE_DATA_ERROR_BUSY: u32 = 0x809f_0003;
+pub(crate) const SAVE_DATA_ERROR_BUSY: u32 = 0x809f_0003;
 const SAVE_DATA_ERROR_NOT_MOUNTED: u32 = 0x809f_0004;
 pub(crate) const SAVE_DATA_ERROR_EXISTS: u32 = 0x809f_0007;
 pub(crate) const SAVE_DATA_ERROR_NOT_FOUND: u32 = 0x809f_0008;
 const SAVE_DATA_ERROR_INTERNAL: u32 = 0x809f_000b;
 const SAVE_DATA_ERROR_MOUNT_FULL: u32 = 0x809f_000c;
 const SAVE_DATA_ERROR_BAD_MOUNTED: u32 = 0x809f_000d;
+pub(crate) const SAVE_DATA_ERROR_RESOURCE_FULL: u32 = 0x809f_001a;
+pub(crate) const SAVE_DATA_ERROR_RESOURCE_BUSY: u32 = 0x809f_001b;
+pub(crate) const SAVE_DATA_ERROR_RESOURCE_INVALID: u32 = 0x809f_001c;
 const SAVE_DATA_DIR_NAME_SIZE: usize = 32;
 pub(crate) const SAVE_DATA_PARAM_SIZE: usize = 0x530;
 const SAVE_DATA_SEARCH_INFO_SIZE: usize = 0x30;
-const SAVE_DATA_BLOCK_SIZE: u64 = 32 * 1024;
-const SAVE_DATA_MIN_BLOCKS: u64 = 96;
+const SAVE_DATA_BLOCK_SIZE: u64 = 64 * 1024;
+const SAVE_DATA_MIN_BLOCKS: u64 = 48;
 const SAVE_DATA_MAX_ICON_SIZE: u64 = 16 * 1024 * 1024;
+const SAVE_DATA_TRANSACTION_RESOURCE_MAX_COUNT: u32 = 16;
+const SAVE_DATA_TRANSACTION_RESOURCE_MIN_SIZE: u64 = 786_432;
+const SAVE_DATA_TRANSACTION_RESOURCE_INVALID: u32 = u32::MAX;
 const SAVE_DATA_MOUNT_MODE_READ_ONLY: u32 = 1 << 0;
 const SAVE_DATA_MOUNT_MODE_READ_WRITE: u32 = 1 << 1;
 const SAVE_DATA_MOUNT_MODE_CREATE: u32 = 1 << 2;
 const SAVE_DATA_MOUNT_MODE_CREATE_IF_MISSING: u32 = 1 << 5;
+const SAVE_DATA_UMOUNT_MODE_COMMIT: u32 = 1 << 0;
+const SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC: u32 = 1 << 16;
 
 #[derive(Debug)]
 pub(crate) struct SaveDataSearchEntry {
@@ -83,6 +90,33 @@ pub(crate) fn save_data_initialize(state: &mut ProbeDispatchState) -> u64 {
             eprintln!("[REMu][SAVEDATA] initialize failed: {error}");
             sce_kernel_error(SAVE_DATA_ERROR_INTERNAL)
         }
+    }
+}
+
+pub(crate) fn save_data_terminate(state: &mut ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let mut cleanup_error = None;
+    for transaction in state.save_transactions.values() {
+        if transaction.staging_path.exists()
+            && let Err(error) = std::fs::remove_dir_all(&transaction.staging_path)
+        {
+            cleanup_error.get_or_insert(error);
+        }
+    }
+    state.save_mounts.clear();
+    state.save_transactions.clear();
+    state.prepared_save_resources.clear();
+    state.save_transaction_resources.clear();
+    state.next_save_transaction_resource = 1;
+    state.save_data_initialized = false;
+    if let Some(error) = cleanup_error {
+        eprintln!("[REMu][SAVEDATA] terminate cleanup failed: {error}");
+        sce_kernel_error(SAVE_DATA_ERROR_INTERNAL)
+    } else {
+        eprintln!("[REMu][SAVEDATA] terminated");
+        0
     }
 }
 
@@ -185,18 +219,34 @@ pub(crate) fn save_data_create_transaction_resource(
     if !state.save_data_initialized {
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
     }
-    if arguments[0] == 0 {
+    let memory_size = u64::from(low_u32(arguments[0]));
+    if memory_size < SAVE_DATA_TRANSACTION_RESOURCE_MIN_SIZE {
         return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     }
-    let id = state.next_save_transaction_resource.max(1);
-    let Some(next) = id.checked_add(1) else {
-        return sce_kernel_error(SAVE_DATA_ERROR_OUT_OF_MEMORY);
+    if state.save_transaction_resources.len()
+        >= usize::try_from(SAVE_DATA_TRANSACTION_RESOURCE_MAX_COUNT)
+            .expect("save transaction limit fits usize")
+    {
+        return sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_FULL);
+    }
+    let first = state
+        .next_save_transaction_resource
+        .clamp(1, SAVE_DATA_TRANSACTION_RESOURCE_MAX_COUNT);
+    let Some(id) = (0..SAVE_DATA_TRANSACTION_RESOURCE_MAX_COUNT)
+        .map(|offset| ((first - 1 + offset) % SAVE_DATA_TRANSACTION_RESOURCE_MAX_COUNT) + 1)
+        .find(|id| !state.save_transaction_resources.contains(id))
+    else {
+        return sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_FULL);
     };
-    state.next_save_transaction_resource = next;
+    state.next_save_transaction_resource = if id == SAVE_DATA_TRANSACTION_RESOURCE_MAX_COUNT {
+        1
+    } else {
+        id + 1
+    };
     state.save_transaction_resources.insert(id);
     eprintln!(
         "[REMu][SAVEDATA] transaction resource={id} memory_size={:#x}",
-        arguments[0]
+        memory_size
     );
     u64::from(id)
 }
@@ -209,9 +259,18 @@ pub(crate) fn save_data_delete_transaction_resource(
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
     }
     let resource = low_u32(arguments[0]);
-    if resource == 0 || !state.save_transaction_resources.remove(&resource) {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    if !state.save_transaction_resources.contains(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_INVALID);
     }
+    if state.prepared_save_resources.contains(&resource)
+        || state
+            .save_mounts
+            .values()
+            .any(|mounted| mounted.resource == resource)
+    {
+        return sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_BUSY);
+    }
+    state.save_transaction_resources.remove(&resource);
     eprintln!("[REMu][SAVEDATA] deleted transaction resource={resource}");
     0
 }
@@ -261,9 +320,11 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
             format!("user={user_id} dir={dir_name:?}"),
         );
     }
-    if resource != 0 && !state.save_transaction_resources.contains(&resource) {
+    if resource != SAVE_DATA_TRANSACTION_RESOURCE_INVALID
+        && !state.save_transaction_resources.contains(&resource)
+    {
         return declined(
-            SAVE_DATA_ERROR_PARAMETER,
+            SAVE_DATA_ERROR_RESOURCE_INVALID,
             "unknown-transaction-resource",
             format!("resource={resource}"),
         );
@@ -354,22 +415,96 @@ pub(crate) fn save_data_umount2(arguments: [u64; 6], state: &mut ProbeDispatchSt
     }
     // Gen5's Umount2 places the mount-point pointer in RSI; retain RDI as a compatibility fallback
     // for the older ABI that used the same export name.
-    let mount_point_address = if arguments[1] != 0 {
-        arguments[1]
+    let (mode, mount_point_address) = if arguments[1] != 0 {
+        (low_u32(arguments[0]), arguments[1])
     } else {
-        arguments[0]
+        (0, arguments[0])
     };
+    if mode & !(SAVE_DATA_UMOUNT_MODE_COMMIT | SAVE_DATA_UMOUNT_MODE_BACKUP_ASYNC) != 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
     let Some(mount_point) = read_guest_fixed_ascii(mount_point_address, 16) else {
         return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     };
     let Some(mounted) = state.save_mounts.get(&mount_point) else {
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND);
     };
-    if mounted.resource != 0 && state.prepared_save_resources.contains(&mounted.resource) {
-        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    let resource = mounted.resource;
+    if resource != SAVE_DATA_TRANSACTION_RESOURCE_INVALID
+        && state.prepared_save_resources.contains(&resource)
+    {
+        if mode & SAVE_DATA_UMOUNT_MODE_COMMIT == 0 {
+            return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+        }
+        let result = commit_save_data_resource(resource, state);
+        if result != 0 {
+            return result;
+        }
     }
     state.save_mounts.remove(&mount_point);
-    eprintln!("[REMu][SAVEDATA] unmounted {mount_point:?}");
+    eprintln!("[REMu][SAVEDATA] unmounted {mount_point:?} mode={mode:#x}");
+    0
+}
+
+pub(crate) fn save_data_delete(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    if !state.save_data_initialized {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_INITIALIZED);
+    }
+    let delete = arguments[0];
+    if delete == 0 {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let user_id = low_i32(u64::from(read_guest_u32(delete)));
+    let title_id_address = read_guest_u64(delete + 0x08);
+    let dir_name_address = read_guest_u64(delete + 0x10);
+    let Some(dir_name) = read_guest_fixed_ascii(dir_name_address, SAVE_DATA_DIR_NAME_SIZE) else {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    };
+    if user_id < 0 || dir_name.is_empty() {
+        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    }
+    let title_root = if title_id_address == 0 {
+        state.save_root.clone()
+    } else {
+        let Some(title_id) = read_guest_fixed_ascii(title_id_address, 10) else {
+            return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        };
+        if title_id.is_empty() {
+            return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        }
+        state
+            .save_root
+            .parent()
+            .unwrap_or(&state.save_root)
+            .join(sanitize_save_segment(&title_id))
+    };
+    let slot = title_root.join(sanitize_save_segment(&dir_name));
+    if state
+        .save_mounts
+        .values()
+        .any(|mounted| mounted.path == slot || mounted.committed_path == slot)
+    {
+        return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
+    }
+    if !slot.is_dir() {
+        return sce_kernel_error(SAVE_DATA_ERROR_NOT_FOUND);
+    }
+    if let Err(error) = std::fs::remove_dir_all(&slot) {
+        eprintln!(
+            "[REMu][SAVEDATA] delete failed user={user_id} dir={dir_name:?} path={:?}: {error}",
+            slot.display()
+        );
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    if let Err(error) = std::fs::File::open(&title_root).and_then(|directory| directory.sync_all())
+    {
+        eprintln!(
+            "[REMu][SAVEDATA] delete directory sync failed path={:?}: {error}",
+            title_root.display()
+        );
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    eprintln!("[REMu][SAVEDATA] deleted user={user_id} dir={dir_name:?}");
     0
 }
 
@@ -385,8 +520,8 @@ pub(crate) fn save_data_prepare(arguments: [u64; 6], state: &mut ProbeDispatchSt
         return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     };
     let resource = read_guest_u32(prepare_address);
-    if resource == 0 || !state.save_transaction_resources.contains(&resource) {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+    if !state.save_transaction_resources.contains(&resource) {
+        return sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_INVALID);
     }
     let Some(mounted) = state.save_mounts.get(&mount_point) else {
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
@@ -450,7 +585,7 @@ pub(crate) fn save_data_set_param(arguments: [u64; 6], state: &mut ProbeDispatch
     let Some(mounted) = state.save_mounts.get(&mount_point) else {
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
     };
-    if mounted.read_only {
+    if !save_data_mount_is_writable(mounted, state) {
         return sce_kernel_error(SAVE_DATA_ERROR_BAD_MOUNTED);
     }
     let mut param = match read_save_data_param(&mounted.path, &mounted.dir_name) {
@@ -517,7 +652,7 @@ pub(crate) fn save_data_save_icon(arguments: [u64; 6], state: &ProbeDispatchStat
     let Some(mounted) = state.save_mounts.get(&mount_point) else {
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
     };
-    if mounted.read_only {
+    if !save_data_mount_is_writable(mounted, state) {
         return sce_kernel_error(SAVE_DATA_ERROR_BAD_MOUNTED);
     }
     let buffer_address = read_guest_u64(icon_address);
@@ -551,8 +686,12 @@ pub(crate) fn save_data_commit(arguments: [u64; 6], state: &mut ProbeDispatchSta
     }
     let resource = read_guest_u32(commit_address);
     if !state.save_transaction_resources.contains(&resource) {
-        return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
+        return sce_kernel_error(SAVE_DATA_ERROR_RESOURCE_INVALID);
     }
+    commit_save_data_resource(resource, state)
+}
+
+fn commit_save_data_resource(resource: u32, state: &mut ProbeDispatchState) -> u64 {
     let Some(transaction) = state.save_transactions.get(&resource).cloned() else {
         return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
     };
@@ -571,6 +710,15 @@ pub(crate) fn save_data_commit(arguments: [u64; 6], state: &mut ProbeDispatchSta
     mounted.path.clone_from(&transaction.committed_path);
     eprintln!("[REMu][SAVEDATA] committed resource={resource}");
     0
+}
+
+pub(crate) fn save_data_mount_is_writable(
+    mounted: &SaveDataMount,
+    state: &ProbeDispatchState,
+) -> bool {
+    !mounted.read_only
+        && mounted.resource != SAVE_DATA_TRANSACTION_RESOURCE_INVALID
+        && state.prepared_save_resources.contains(&mounted.resource)
 }
 
 fn create_save_data_slot(slot: &Path, dir_name: &str, blocks: u64) -> std::io::Result<()> {

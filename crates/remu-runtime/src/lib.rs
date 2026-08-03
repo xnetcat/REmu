@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
@@ -214,7 +214,7 @@ pub(crate) use guest_files::kernel_stat_payload;
 #[cfg(test)]
 pub(crate) use guest_files::{
     DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, ImmutableAppPathCache, KernelDirectory,
-    resolve_immutable_app_path,
+    resolve_immutable_app_path, resolve_immutable_app_path_with_presence,
 };
 pub(crate) use guest_files::{
     KERNEL_FILES, KernelFileState, guest_fclose, guest_fopen, guest_fread, guest_fseek,
@@ -222,7 +222,7 @@ pub(crate) use guest_files::{
     guest_kernel_getdents, guest_kernel_lseek, guest_kernel_mkdir, guest_kernel_open,
     guest_kernel_read, guest_kernel_rmdir, guest_kernel_stat, guest_kernel_write,
     kernel_stat_payload_from_metadata, resolve_guest_path, resolve_path_beneath,
-    resolve_probe_guest_path,
+    resolve_probe_guest_path, resolve_probe_guest_path_with_presence,
 };
 pub(crate) use guest_libc::{
     dispatch_guest_numeric_parser, guest_ctype_table, guest_errno_address, guest_memcpy,
@@ -316,14 +316,17 @@ use remu_shader::GuestMemoryReader;
 pub(crate) use save_data::save_data_root;
 #[cfg(test)]
 pub(crate) use save_data::{
-    SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_PARAM_SIZE,
-    enumerate_save_data_entries, sanitize_save_segment, save_data_pattern_matches,
+    SAVE_DATA_ERROR_BUSY, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
+    SAVE_DATA_ERROR_RESOURCE_BUSY, SAVE_DATA_ERROR_RESOURCE_FULL, SAVE_DATA_ERROR_RESOURCE_INVALID,
+    SAVE_DATA_PARAM_SIZE, enumerate_save_data_entries, sanitize_save_segment,
+    save_data_pattern_matches,
 };
 pub(crate) use save_data::{
     current_unix_seconds, read_guest_bytes, save_data_commit,
-    save_data_create_transaction_resource, save_data_delete_transaction_resource,
-    save_data_dir_name_search, save_data_initialize, save_data_mount3, save_data_prepare,
-    save_data_save_icon, save_data_set_param, save_data_umount2, write_guest_bytes,
+    save_data_create_transaction_resource, save_data_delete, save_data_delete_transaction_resource,
+    save_data_dir_name_search, save_data_initialize, save_data_mount_is_writable, save_data_mount3,
+    save_data_prepare, save_data_save_icon, save_data_set_param, save_data_terminate,
+    save_data_umount2, write_guest_bytes,
 };
 use sha1::{Digest, Sha1};
 pub(crate) use shader_cache::{
@@ -1325,6 +1328,7 @@ static AMPR_READ_STAGING_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
 static AUDIO_OUT: OnceLock<Mutex<audio::AudioOutState>> = OnceLock::new();
 static AUDIO_OUT2: OnceLock<Mutex<AudioOut2State>> = OnceLock::new();
+#[cfg(not(target_os = "macos"))]
 static PROCESS_CLOCK_EPOCH: OnceLock<Instant> = OnceLock::new();
 static PROCESS_START_NANOS: AtomicU64 = AtomicU64::new(0);
 static NEXT_NET_POOL_HANDLE: AtomicUsize = AtomicUsize::new(1);
@@ -1425,8 +1429,21 @@ thread_local! {
     static KERNEL_MEMORY_READABLE_RANGES_CACHE: RefCell<Option<(usize, Arc<[(u64, u64)]>)>> = const { RefCell::new(None) };
 }
 
-static PTHREAD_KEY_GENERATIONS: [AtomicU64; 256] =
-    [const { AtomicU64::new(0) }; 256];
+/// Darwin implements `pthread_getspecific` as a direct read from the calling pthread's TSD.
+/// Keep a console thread's small integer ID there so the very hot direct import avoids resolving
+/// a Mach-O language-TLS variable on every call. The language-TLS copy remains authoritative as
+/// an exact fallback if the host cannot allocate the process-lifetime pthread key.
+#[cfg(target_os = "macos")]
+const GUEST_THREAD_UNIQUE_ID_KEY_UNINITIALIZED: usize = usize::MAX;
+#[cfg(target_os = "macos")]
+const GUEST_THREAD_UNIQUE_ID_KEY_FAILED: usize = usize::MAX - 1;
+#[cfg(target_os = "macos")]
+static GUEST_THREAD_UNIQUE_ID_KEY: AtomicUsize =
+    AtomicUsize::new(GUEST_THREAD_UNIQUE_ID_KEY_UNINITIALIZED);
+#[cfg(target_os = "macos")]
+static GUEST_THREAD_UNIQUE_ID_KEY_INIT: Once = Once::new();
+
+static PTHREAD_KEY_GENERATIONS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 static NEXT_PTHREAD_KEY_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_os = "macos")]
@@ -1511,11 +1528,69 @@ fn set_current_guest_thread_handle(thread_handle: u64) {
 }
 
 fn current_guest_thread_unique_id() -> u64 {
+    #[cfg(target_os = "macos")]
+    if let Some(key) = guest_thread_unique_id_key() {
+        // SAFETY: `key` was created once for the process and is never deleted. Values are small
+        // guest integer IDs encoded directly in the pointer bits; no pointer is dereferenced.
+        return unsafe { libc::pthread_getspecific(key) } as usize as u64;
+    }
     u64::from(CURRENT_GUEST_THREAD_UNIQUE_ID.get())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[inline(always)]
+fn direct_guest_thread_unique_id() -> u64 {
+    // The direct-import target is selected only after the process-lifetime pthread key exists.
+    // Every guest worker installs its ID before entering guest code, so the public TSD getter is
+    // the exact current guest identity and needs no per-call fallback branch.
+    let key = GUEST_THREAD_UNIQUE_ID_KEY.load(Ordering::Relaxed);
+    debug_assert!(key < GUEST_THREAD_UNIQUE_ID_KEY_FAILED);
+    // SAFETY: the link-time selection above proves the key is live and it is never deleted.
+    (unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }) as usize as u64
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn direct_guest_thread_unique_id_is_available() -> bool {
+    guest_thread_unique_id_key().is_some()
 }
 
 fn set_current_guest_thread_unique_id(unique_id: u32) {
     CURRENT_GUEST_THREAD_UNIQUE_ID.set(unique_id);
+    #[cfg(target_os = "macos")]
+    if let Some(key) = guest_thread_unique_id_key() {
+        // SAFETY: `key` remains valid for the process lifetime. A null value represents the
+        // existing zero/no-guest-thread state; positive IDs fit in pointer-sized storage.
+        let result = unsafe { libc::pthread_setspecific(key, unique_id as usize as *const _) };
+        debug_assert_eq!(
+            result, 0,
+            "a live pthread key must accept its per-thread value"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn guest_thread_unique_id_key() -> Option<libc::pthread_key_t> {
+    let mut key = GUEST_THREAD_UNIQUE_ID_KEY.load(Ordering::Acquire);
+    if key == GUEST_THREAD_UNIQUE_ID_KEY_UNINITIALIZED {
+        GUEST_THREAD_UNIQUE_ID_KEY_INIT.call_once(|| {
+            let mut key = 0;
+            // SAFETY: `key` points to writable storage and no destructor is needed for an integer
+            // encoded as a pointer value. The key intentionally lives until process termination.
+            let result = unsafe { libc::pthread_key_create(&mut key, None) };
+            if result == 0 {
+                eprintln!("[REMu][PTHREAD] guest thread-id source=darwin-pthread-tsd key={key}");
+                GUEST_THREAD_UNIQUE_ID_KEY.store(key as usize, Ordering::Release);
+            } else {
+                eprintln!(
+                    "[REMu][PTHREAD] guest thread-id source=rust-tlv-fallback pthread_error={result}"
+                );
+                GUEST_THREAD_UNIQUE_ID_KEY
+                    .store(GUEST_THREAD_UNIQUE_ID_KEY_FAILED, Ordering::Release);
+            }
+        });
+        key = GUEST_THREAD_UNIQUE_ID_KEY.load(Ordering::Acquire);
+    }
+    (key < GUEST_THREAD_UNIQUE_ID_KEY_FAILED).then_some(key as libc::pthread_key_t)
 }
 
 #[repr(C)]
@@ -2011,6 +2086,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }
     state.video_out = VideoOutState::default();
     game_root.clone_into(&mut state.game_root);
+    eprintln!("[REMu][VFS] direct immutable app path routing enabled");
     state.np_universal_data = np::UniversalDataState::default();
     state.np_game_intent = np::GameIntentState::default();
     state.np_trophy = np::TrophyState::default();
@@ -4096,6 +4172,24 @@ fn kernel_raise_exception(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
     0
 }
 
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn clock_gettime_nsec_np(clock_id: libc::clockid_t) -> u64;
+}
+
+/// Reads Darwin's raw uptime clock already scaled to the guest counter's 1 GHz unit.
+///
+/// `clock_gettime_nsec_np` avoids constructing and normalizing a `timespec` on an import that
+/// engines can call millions of times per second. `CLOCK_UPTIME_RAW` remains monotonic and uses
+/// the same suspend-excluding uptime domain as the previous `Instant` implementation.
+#[cfg(target_os = "macos")]
+#[inline(always)]
+fn process_clock_nanos() -> u64 {
+    // SAFETY: this Darwin function takes no pointer and returns the selected clock as nanoseconds.
+    unsafe { clock_gettime_nsec_np(libc::CLOCK_UPTIME_RAW) }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn process_clock_nanos() -> u64 {
     u64::try_from(
         PROCESS_CLOCK_EPOCH
@@ -4106,8 +4200,20 @@ fn process_clock_nanos() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+#[inline(always)]
+fn process_time_since_nanos(now: u64, start: u64, counter: bool) -> u64 {
+    let elapsed_nanos = now.saturating_sub(start);
+    if counter {
+        elapsed_nanos
+    } else {
+        elapsed_nanos / 1_000
+    }
+}
+
 fn reset_kernel_process_time() {
     PROCESS_START_NANOS.store(process_clock_nanos().max(1), Ordering::Release);
+    #[cfg(target_os = "macos")]
+    eprintln!("[REMu][TIME] process counter source=CLOCK_UPTIME_RAW-nanoseconds");
 }
 
 fn kernel_process_time(counter: bool) -> u64 {
@@ -4126,12 +4232,7 @@ fn kernel_process_time(counter: bool) -> u64 {
             Err(installed) => start = installed,
         }
     }
-    let elapsed_nanos = now.saturating_sub(start);
-    if counter {
-        elapsed_nanos
-    } else {
-        elapsed_nanos / 1_000
-    }
+    process_time_since_nanos(now, start, counter)
 }
 
 const SCE_AJM_ERROR_INVALID_PARAMETER: u32 = 0x8093_0005;
@@ -5143,6 +5244,7 @@ fn dispatch_probe_import(
         }
         // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
         "TywrFKCoLGY" => save_data_initialize(state),
+        "yKDy8S5yLA0" => save_data_terminate(state),
         "dyIhnXq-0SM" | "X4MYzukPc3g" => save_data_dir_name_search(arguments, state),
         "ZP4e7rlzOUk" => save_data_mount3(arguments, state),
         "gjRZNnw0JPE" => save_data_create_transaction_resource(arguments, state),
@@ -5152,6 +5254,7 @@ fn dispatch_probe_import(
         "85zul--eGXs" => save_data_set_param(arguments, state),
         "c88Yy54Mx0w" => save_data_save_icon(arguments, state),
         "ie7qhZ4X0Cc" => save_data_commit(arguments, state),
+        "S1GkePI17zQ" => save_data_delete(arguments, state),
         // User-service IDs use the retail slot encoding expected by the game's controller layer.
         "CdWp0oHWGr0" => write_output_i32(arguments[0], 0x1000_0000),
         "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
@@ -7234,6 +7337,7 @@ fn flush_deferred_gpu_publication_with_admission(
         );
     }
     let order = GPU_PUBLICATION_ORDER.get_or_init(|| (Mutex::new(0), Condvar::new()));
+    let order_started = Instant::now();
     let mut next = order
         .0
         .lock()
@@ -7244,6 +7348,7 @@ fn flush_deferred_gpu_publication_with_admission(
             .wait(next)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
+    let ticket_order_wait = order_started.elapsed();
     if traced {
         // Paired with `begin` and `end`, this identifies the blocking stage without changing the
         // ordered publisher: begin-without-turn is an order wait, while turn-without-end is
@@ -7255,11 +7360,15 @@ fn flush_deferred_gpu_publication_with_admission(
         [remu_gpu::GpuEvent::QueueSubmission { .. }]
     );
     let mut all_sent = true;
+    let barrier_started = Instant::now();
+    let barrier_acquire;
+    let mut channel_timing = remu_gpu::GpuEventPublicationTiming::default();
     if queue_only {
         let _queue_publication = GPU_PUBLICATION_BARRIER
             .get_or_init(|| RwLock::new(()))
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        barrier_acquire = barrier_started.elapsed();
         let event = publication
             .events
             .into_iter()
@@ -7268,7 +7377,7 @@ fn flush_deferred_gpu_publication_with_admission(
         // Assign the event its queue-local sequence while this process-order turn is still held.
         // Once assigned, independent hardware queues may enter the bounded channel concurrently;
         // a later event on this same queue still waits for its FIFO predecessor inside `remu-gpu`.
-        all_sent &= remu_gpu::emit_event_with_admission(event, move || {
+        let (sent, timing) = remu_gpu::emit_event_with_admission_and_timing(event, move || {
             debug_assert_eq!(*next, ticket);
             *next = next.saturating_add(1);
             order.1.notify_all();
@@ -7277,6 +7386,8 @@ fn flush_deferred_gpu_publication_with_admission(
                 eprintln!("[REMu][GPU][PUBLICATION] admitted ticket={ticket} queue-only=true");
             }
         });
+        all_sent &= sent;
+        channel_timing = timing;
     } else {
         // Display lifecycle events and any mixed publication are process-wide barriers. They must
         // neither overtake an active hardware queue nor be overtaken by a later queue.
@@ -7284,9 +7395,18 @@ fn flush_deferred_gpu_publication_with_admission(
             .get_or_init(|| RwLock::new(()))
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        barrier_acquire = barrier_started.elapsed();
         admitted();
         for event in publication.events {
-            all_sent &= remu_gpu::emit_event(event);
+            let (sent, timing) = remu_gpu::emit_event_with_timing(event);
+            all_sent &= sent;
+            channel_timing.setup = channel_timing.setup.saturating_add(timing.setup);
+            channel_timing.queue_fifo_wait = channel_timing
+                .queue_fifo_wait
+                .saturating_add(timing.queue_fifo_wait);
+            channel_timing.bounded_send = channel_timing
+                .bounded_send
+                .saturating_add(timing.bounded_send);
         }
         debug_assert_eq!(*next, ticket);
         *next = next.saturating_add(1);
@@ -7301,7 +7421,44 @@ fn flush_deferred_gpu_publication_with_admission(
             summary.queue_work_items,
         );
     }
-    remu_gpu::record_gpu_publication_wait(publication_started.elapsed());
+    let total = publication_started.elapsed();
+    let attributed = ticket_order_wait
+        .saturating_add(barrier_acquire)
+        .saturating_add(channel_timing.setup)
+        .saturating_add(channel_timing.queue_fifo_wait)
+        .saturating_add(channel_timing.bounded_send);
+    let residual = total.saturating_sub(attributed);
+    let route = if queue_only {
+        remu_gpu::GpuPublicationRoute::QueueOnly
+    } else {
+        remu_gpu::GpuPublicationRoute::Mixed
+    };
+    for (phase, duration) in [
+        (
+            remu_gpu::GpuPublicationPhase::TicketOrderWait,
+            ticket_order_wait,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::BarrierAcquire,
+            barrier_acquire,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::ChannelSetup,
+            channel_timing.setup,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::QueueFifoWait,
+            channel_timing.queue_fifo_wait,
+        ),
+        (
+            remu_gpu::GpuPublicationPhase::BoundedSend,
+            channel_timing.bounded_send,
+        ),
+        (remu_gpu::GpuPublicationPhase::Residual, residual),
+    ] {
+        remu_gpu::record_gpu_publication_phase(route, phase, duration);
+    }
+    remu_gpu::record_gpu_publication_wait(total);
     all_sent
 }
 
@@ -8699,6 +8856,7 @@ fn probe_entry(
         argument1: u64,
         argument2: u64,
     }
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::GuestProbeEntry);
     // Claim the budget before the process opens anything on the guest's behalf.
     #[cfg(unix)]
     raise_open_file_budget_once();
@@ -8725,6 +8883,7 @@ fn probe_entry(
         );
     }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::GuestRuntimeConfigured);
     if let Err(error) = sha_ni::install_sha_ni_sigill_recovery() {
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");
     }
@@ -8732,9 +8891,11 @@ fn probe_entry(
     start_abi_gap_reporter();
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::ModuleInitializersComplete);
     if timeout_seconds != 0 {
         start_diagnostic_timeout(timeout_seconds);
     }
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::GuestEntryBegin);
     let return_value = invoke_guest_entry_with_exit(
         image.memory.entry_address().get(),
         (&raw const parameters).addr() as u64,

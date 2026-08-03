@@ -7,8 +7,8 @@ use super::{
     compile_metal_shader_library, invalidate_metal_library_cache, metal_cache_root,
 };
 use metal::{
-    BinaryArchiveDescriptor, CompileOptions, Device, Function, RenderPipelineDescriptor,
-    RenderPipelineState, URL,
+    BinaryArchiveDescriptor, CompileOptions, ComputePipelineDescriptor, ComputePipelineState,
+    Device, Function, RenderPipelineDescriptor, RenderPipelineState, URL,
 };
 use sha1::{Digest, Sha1};
 use std::path::{Path, PathBuf};
@@ -107,6 +107,7 @@ impl PersistentRenderPipelineArchive {
             if loaded { "loaded" } else { "created" },
             path.display()
         );
+        eprintln!("[REMu][METAL] persistent compute pipelines share the render archive");
         Ok(Self {
             archive,
             path: Arc::new(path),
@@ -219,6 +220,109 @@ impl PersistentRenderPipelineArchive {
             // One checkpoint saves useful warm-up progress without turning a title transition
             // into nearly a gigabyte of synchronous archive writes. Clean shutdown still performs
             // the final serialization below.
+            if should_serialize {
+                self.serialize_or_quarantine_locked()?;
+            }
+            Ok(pipeline)
+        })
+    }
+
+    pub(crate) fn new_compute_pipeline_state(
+        &self,
+        device: &Device,
+        function: &Function,
+    ) -> Result<ComputePipelineState, String> {
+        let make_descriptor = || {
+            let descriptor = ComputePipelineDescriptor::new();
+            descriptor.set_label("REMu Gen5 compute");
+            descriptor.set_compute_function(Some(function));
+            descriptor
+        };
+        if self.loaded {
+            // Match the render path: keep ordinary archive hits concurrent, then teach the loaded
+            // archive only about a demonstrably slow miss. Compute scene transitions otherwise
+            // pay the same pipeline specialization cost again even though their metallibs persist.
+            let descriptor = make_descriptor();
+            let started = Instant::now();
+            let (pipeline, used_archive) = {
+                let _reader = self
+                    .driver_lock
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let used_archive = !self.archive_is_quarantined();
+                if used_archive {
+                    descriptor.set_binary_archives(&[&self.archive]);
+                }
+                let pipeline = device
+                    .new_compute_pipeline_state(&descriptor)
+                    .map_err(|error| format!("Metal compute pipeline: {error}"))?;
+                (pipeline, used_archive)
+            };
+            if used_archive && started.elapsed() >= SLOW_PIPELINE_ARCHIVE_ADMISSION {
+                let _writer = match self.driver_lock.try_write() {
+                    Ok(writer) => writer,
+                    Err(TryLockError::WouldBlock) => return Ok(pipeline),
+                    Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                };
+                if self.archive_is_quarantined() {
+                    return Ok(pipeline);
+                }
+                match self
+                    .archive
+                    .add_compute_pipeline_functions_with_descriptor(&descriptor)
+                {
+                    Ok(true) => {
+                        let should_serialize = {
+                            let mut state = self
+                                .state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state.record_addition_and_take_checkpoint(
+                                LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS,
+                            )
+                        };
+                        if should_serialize
+                            && let Err(error) = self.serialize_or_quarantine_locked()
+                        {
+                            eprintln!(
+                                "[REMu][METAL] slow-compute archive checkpoint failed: {error}"
+                            );
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "[REMu][METAL] could not admit slow compute pipeline to loaded archive: {error}"
+                    ),
+                }
+            }
+            return Ok(pipeline);
+        }
+
+        // A fresh archive must learn the descriptor before pipeline creation. Share the render
+        // driver's exclusive region so render and compute descriptors cannot race archive
+        // mutation or autorelease cleanup on the Rosetta Metal path.
+        let _driver = self
+            .driver_lock
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        objc::rc::autoreleasepool(|| {
+            let descriptor = make_descriptor();
+            descriptor.set_binary_archives(&[&self.archive]);
+            self.archive
+                .add_compute_pipeline_functions_with_descriptor(&descriptor)
+                .map_err(|error| {
+                    format!("could not add Metal compute pipeline to archive: {error}")
+                })?;
+            let should_serialize = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.record_addition_and_take_checkpoint(NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
+            };
+            let pipeline = device
+                .new_compute_pipeline_state(&descriptor)
+                .map_err(|error| format!("Metal compute pipeline: {error}"))?;
             if should_serialize {
                 self.serialize_or_quarantine_locked()?;
             }
@@ -484,11 +588,14 @@ pub(crate) fn metal_render_pipeline_archive_path(device: &Device) -> PathBuf {
 mod tests {
     use super::{
         LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS, NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS,
-        RenderPipelineArchiveState, archive_serialization_failure_indicates_poison,
-        pipeline_archive_quarantine_path, quarantine_pipeline_archive,
+        PersistentRenderPipelineArchive, RenderPipelineArchiveState,
+        archive_serialization_failure_indicates_poison, pipeline_archive_quarantine_path,
+        quarantine_pipeline_archive,
     };
+    use metal::{BinaryArchiveDescriptor, CompileOptions, Device};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, RwLock};
 
     static NEXT_TEST_DIRECTORY: AtomicUsize = AtomicUsize::new(0);
 
@@ -571,6 +678,49 @@ mod tests {
             !state
                 .record_addition_and_take_checkpoint(LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS)
         );
+    }
+
+    #[test]
+    fn fresh_archive_accepts_compute_pipeline_descriptors() {
+        let Some(device) = Device::system_default() else {
+            return;
+        };
+        objc::rc::autoreleasepool(|| {
+            let archive = device
+                .new_binary_archive_with_descriptor(&BinaryArchiveDescriptor::new())
+                .expect("create test binary archive");
+            let persistent = PersistentRenderPipelineArchive {
+                archive,
+                path: Arc::new(PathBuf::from("unused-compute-test.metallibarchive")),
+                loaded: false,
+                state: Arc::new(Mutex::new(RenderPipelineArchiveState::default())),
+                driver_lock: Arc::new(RwLock::new(())),
+            };
+            let options = CompileOptions::new();
+            let library = device
+                .new_library_with_source(
+                    concat!(
+                        "#include <metal_stdlib>\n",
+                        "using namespace metal;\n",
+                        "kernel void remu_compute_test() {}\n",
+                    ),
+                    &options,
+                )
+                .expect("compile test compute library");
+            let function = library
+                .get_function("remu_compute_test", None)
+                .expect("load test compute function");
+
+            persistent
+                .new_compute_pipeline_state(&device, &function)
+                .expect("archive-backed compute pipeline");
+
+            let state = persistent
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(state.additions, 1);
+        });
     }
 
     #[test]

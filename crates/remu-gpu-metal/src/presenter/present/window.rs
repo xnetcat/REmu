@@ -12,7 +12,9 @@ use super::super::{
     RESIDENT_WRITEBACK_PUBLISHED, RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidencyState,
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
-    SHARED_HOST_KIND_WAIT, WRITEBACK_TRIGGERS,
+    SHARED_HOST_KIND_WAIT, SameQueueDmaFillReject, SharedEventDrawReject, WRITEBACK_TRIGGERS,
+    format_shared_event_ack_phase_report, format_shared_event_host_effect_latency_report,
+    format_terminal_publication_report,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -122,6 +124,7 @@ impl MetalPresenter {
         window.focus_window();
         self.window = Some(window);
         self.layer = Some(layer);
+        remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::WindowReady);
         Ok(())
     }
 
@@ -268,6 +271,10 @@ impl MetalPresenter {
                 dispatch.gpu_publication_wait.buckets,
                 remu_gpu::DISPATCH_LATENCY_BUCKET_UPPER_NS,
             );
+            for line in remu_gpu::format_gpu_publication_phase_report(dispatch_window_ms, &dispatch)
+            {
+                eprintln!("{line}");
+            }
             let direct = |import| dispatch.direct_import_calls_for(import);
             use remu_gpu::DirectDispatchImport as DirectImport;
             eprintln!(
@@ -288,6 +295,23 @@ impl MetalPresenter {
                 direct(DirectImport::PosixPthreadRwlockWriteLock),
                 direct(DirectImport::PosixPthreadRwlockUnlock),
             );
+            if self.terminal_publication_timing {
+                for line in format_terminal_publication_report(
+                    dispatch_window_ms,
+                    self.statistics.terminal_publication.take(),
+                ) {
+                    eprintln!("{line}");
+                }
+            }
+            if self.shared_event_ack_phase_timing {
+                for line in format_shared_event_ack_phase_report(
+                    dispatch_window_ms,
+                    self.statistics.shared_event_ack_phases.take(),
+                ) {
+                    eprintln!("{line}");
+                }
+                self.shared_event_ack_phase_samples_remaining = 64;
+            }
             eprintln!(
                 "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s shared-host={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
                 f64::from(self.statistics.render_pass_ends_for_compute) / seconds,
@@ -304,16 +328,87 @@ impl MetalPresenter {
                 f64::from(self.statistics.batch_flushes_for_cpu_synchronization) / seconds,
             );
             eprintln!(
-                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
+                "[REMu][PERF-SHARED-EVENT] signals={:.0}/s waits={:.0}/s host-blocks={:.0}/s host-wakes={:.0}/s acquire-noop-drops={:.0}/s gpu-ordered-waits={:.0}/s gpu-ordered-compute={:.0}/s gpu-ordered-draw={:.0}/s footprint-incomplete={:.0}/s error-advances={} fallback-no-exact={:.0}/s fallback-overflow={}",
                 f64::from(self.statistics.shared_event_signals) / seconds,
                 f64::from(self.statistics.shared_event_waits) / seconds,
                 f64::from(self.statistics.shared_event_host_blocks) / seconds,
                 f64::from(self.statistics.shared_event_host_wakes) / seconds,
+                f64::from(self.statistics.shared_event_acquire_noop_drops) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_registered_waits) / seconds,
                 f64::from(self.statistics.shared_event_gpu_ordered_compute_dispatches,) / seconds,
+                f64::from(self.statistics.shared_event_gpu_ordered_draws) / seconds,
+                f64::from(self.statistics.shared_event_incomplete_signal_footprints) / seconds,
                 self.statistics.shared_event_error_advances,
                 f64::from(self.statistics.shared_event_fallbacks_no_exact_producer) / seconds,
                 self.statistics.shared_event_fallbacks_timeline_overflow,
+            );
+            let dma_fill_rejections = &self.statistics.shared_event_dma_fill_rejections;
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts={:.0}/s accepted={:.0}/s reject=cross-queue:{:.0}/s,non-immediate-source:{:.0}/s,destination-selector:{:.0}/s,source-snapshot:{:.0}/s,unsupported-width:{:.0}/s,nonzero-immediate:{:.0}/s,invalid-range:{:.0}/s,missing-identity:{:.0}/s,metadata-overlap:{:.0}/s,cache-overlap:{:.0}/s,incomplete-dependency:{:.0}/s,missing-open-batch:{:.0}/s",
+                f64::from(self.statistics.shared_event_dma_fill_attempts) / seconds,
+                f64::from(self.statistics.shared_event_gpu_ordered_dma_fills) / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::CrossQueue.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::NonImmediateSource.index()],)
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::DestinationSelector.index()],)
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::SourceSnapshot.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::UnsupportedWidth.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::NonZeroImmediate.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::InvalidRange.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::MissingIdentity.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::MetadataOverlap.index()])
+                    / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::CacheOverlap.index()])
+                    / seconds,
+                f64::from(
+                    dma_fill_rejections[SameQueueDmaFillReject::IncompleteDependency.index()],
+                ) / seconds,
+                f64::from(dma_fill_rejections[SameQueueDmaFillReject::MissingOpenBatch.index()])
+                    / seconds,
+            );
+            let draw_rejections = &self.statistics.shared_event_draw_rejections;
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-DRAW] attempts={:.0}/s disjoint-candidates={:.0}/s versioned-global-candidates={:.0}/s resident-image-candidates={:.0}/s internal-drains={:.0}/s admission={} reject=overlap-resident:{:.0}/s,overlap-scanout:{:.0}/s,overlap-copied-global:{:.0}/s,overlap-zero-copy-global:{:.0}/s,overlap-terminal-write:{:.0}/s,overlap-internal-resident:{:.0}/s,incomplete-producer:{:.0}/s,unresolved:{:.0}/s,indirect:{:.0}/s,shader-coverage:{:.0}/s,special-op:{:.0}/s,diagnostic:{:.0}/s,other:{:.0}/s",
+                f64::from(self.statistics.shared_event_draw_attempts) / seconds,
+                f64::from(self.statistics.shared_event_draw_disjoint_candidates) / seconds,
+                f64::from(
+                    self.statistics
+                        .shared_event_draw_versioned_global_candidates
+                ) / seconds,
+                f64::from(self.statistics.shared_event_draw_resident_image_candidates) / seconds,
+                f64::from(self.statistics.shared_event_draw_internal_drains) / seconds,
+                if self.shared_event_direct_draw_admission {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                f64::from(draw_rejections[SharedEventDrawReject::OverlapResident.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::OverlapScanout.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::OverlapCopiedGlobal.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::OverlapZeroCopyGlobal.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::OverlapTerminalWrite.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::OverlapInternalResident.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::IncompleteProducer.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Unresolved.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Indirect.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::ShaderCoverage.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::SpecialOperation.index()])
+                    / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Diagnostic.index()]) / seconds,
+                f64::from(draw_rejections[SharedEventDrawReject::Other.index()]) / seconds,
             );
             let host_kinds = &self.statistics.shared_event_host_block_kinds;
             eprintln!(
@@ -326,6 +421,17 @@ impl MetalPresenter {
                 f64::from(host_kinds[SHARED_HOST_KIND_FLIP]) / seconds,
                 f64::from(host_kinds[SHARED_HOST_KIND_UI]) / seconds,
                 f64::from(host_kinds[SHARED_HOST_KIND_OTHER]) / seconds,
+            );
+            let shared_event_host_effect_pending = self
+                .receiver
+                .shared_event_host_effect_pending_statistics(Instant::now());
+            eprintln!(
+                "{}",
+                format_shared_event_host_effect_latency_report(
+                    dispatch_window_ms,
+                    self.statistics.shared_event_host_effect_latency.take(),
+                    shared_event_host_effect_pending,
+                )
             );
             let head_join = self
                 .flip_completion_joins
@@ -976,8 +1082,23 @@ impl MetalPresenter {
         self.statistics.shared_event_host_blocks = 0;
         self.statistics.shared_event_host_block_kinds = [0; super::super::SHARED_HOST_KIND_COUNT];
         self.statistics.shared_event_host_wakes = 0;
+        self.statistics.shared_event_acquire_noop_drops = 0;
+        self.statistics.shared_event_dma_fill_attempts = 0;
+        self.statistics.shared_event_gpu_ordered_dma_fills = 0;
+        self.statistics.shared_event_dma_fill_rejections =
+            [0; super::super::SAME_QUEUE_DMA_FILL_REJECT_COUNT];
         self.statistics.shared_event_gpu_ordered_registered_waits = 0;
         self.statistics.shared_event_gpu_ordered_compute_dispatches = 0;
+        self.statistics.shared_event_gpu_ordered_draws = 0;
+        self.statistics.shared_event_draw_attempts = 0;
+        self.statistics.shared_event_draw_disjoint_candidates = 0;
+        self.statistics
+            .shared_event_draw_versioned_global_candidates = 0;
+        self.statistics.shared_event_draw_resident_image_candidates = 0;
+        self.statistics.shared_event_draw_internal_drains = 0;
+        self.statistics.shared_event_draw_rejections =
+            [0; super::super::SHARED_EVENT_DRAW_REJECT_COUNT];
+        self.statistics.shared_event_incomplete_signal_footprints = 0;
         self.statistics.shared_event_error_advances = 0;
         self.statistics.shared_event_fallbacks_no_exact_producer = 0;
         self.statistics.shared_event_fallbacks_timeline_overflow = 0;

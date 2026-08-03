@@ -9,10 +9,12 @@ use super::{
     GuestMemoryWriteOperation, MetalPresenter, OrderedEventPoll, OrderedEventSource,
     OrderedGpuEventReceiver, PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, PendingFlip,
     PendingGlobalWriteback, PendingGuestMemoryWrite, PendingGuestWriteRange,
-    PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet, ResourceSpan,
-    SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
+    PhysicalFootprintRange, PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet,
+    ResourceSpan, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
-    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent, UploadedGlobalBuffer,
+    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent,
+    SharedEventHostEffectLatencyPhase, SharedEventHostEffectLatencyState,
+    SharedEventHostEffectPendingStatistics, SharedEventWriteKind, UploadedGlobalBuffer,
     WriteWatchRefresh, compute_pipeline_key, diagnostic_skip_export_shader,
     diagnostic_skip_pixel_shader, graphics_pipeline_key, guest_physical_ranges_overlap,
     guest_ranges_overlap, guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
@@ -25,7 +27,9 @@ use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 mod batch;
+mod draw_footprint;
 mod events;
 mod memory;
 mod waits;
@@ -37,11 +41,20 @@ pub(crate) use self::batch::{
     completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
     merge_guest_batch_result,
 };
+pub(crate) use self::draw_footprint::{SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject};
+pub(crate) use self::memory::{SAME_QUEUE_DMA_FILL_REJECT_COUNT, SameQueueDmaFillReject};
 #[cfg(test)]
 pub(crate) use self::memory::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, release_value_for_wait,
 };
 pub(crate) use self::waits::read_guest_memory_wait_value;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SharedEventEventDisposition {
+    GpuOrderable,
+    DropSemanticNoOp,
+    HostEffect,
+}
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
@@ -77,37 +90,17 @@ impl MetalPresenter {
             // callback immediately releases its queue-local gate instead of remaining falsely
             // "active" until the next AppKit callback.
             self.receive_shader_compilations();
-            let shared_event_values = self
-                .guest_queue_batches
-                .iter()
-                .map(|(&queue_id, state)| {
-                    (
-                        super::SharedEventProducerId::new(queue_id),
-                        state.shared_event_timeline.event().signaled_value(),
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-            let guest_queue_outstanding = self
-                .guest_queue_batches
-                .iter()
-                .map(|(&queue_id, state)| {
-                    (
-                        queue_id,
-                        state.open_batch.is_some() || !state.committed_batches.is_empty(),
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-            let host_retired_values = self
-                .guest_queue_batches
-                .iter()
-                .map(|(&queue_id, state)| {
-                    (
-                        super::SharedEventProducerId::new(queue_id),
-                        state.host_retired_fence_value,
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-            let (source, event) = match self.receiver.try_recv(|reason| match reason {
+            // Read only the exact queue/fences named by a blocked host effect. Building three
+            // complete queue snapshots here made every dequeued GPU event allocate and poll every
+            // Metal SharedEvent, even when no SharedEvent host block existed. Queue state cannot
+            // mutate while `try_recv` runs on the presenter thread; native event values are
+            // monotonic, so each direct lookup preserves the same threshold proof without the
+            // command-stream-frequency full-map scan.
+            let guest_queue_batches = &self.guest_queue_batches;
+            let shared_event_host_effect_latency =
+                &mut self.statistics.shared_event_host_effect_latency;
+            let mut observed_consumer_acks = Vec::new();
+            let poll = self.receiver.try_recv(|reason| match reason {
                 QueueBlockReason::GraphicsPipeline(key) => {
                     self.compiled_shader_pairs.contains_key(key)
                         || self.failed_shader_pairs.contains(key)
@@ -122,26 +115,46 @@ impl MetalPresenter {
                     consumer_queue_id,
                     consumer_ack,
                     terminal_dependencies,
+                    latency,
                 } => {
-                    let consumer_reached_wait = consumer_ack.as_ref().map_or_else(
-                        || {
-                            !guest_queue_outstanding
-                                .get(consumer_queue_id)
-                                .copied()
-                                .unwrap_or(false)
+                    let now = Instant::now();
+                    let waiting_for_ack =
+                        latency.phase == SharedEventHostEffectLatencyPhase::ConsumerAck;
+                    let resolved = shared_event_host_effect_is_resolved(
+                        latency,
+                        now,
+                        shared_event_host_effect_latency,
+                        *consumer_queue_id,
+                        *consumer_ack,
+                        terminal_dependencies,
+                        |queue_id| {
+                            guest_queue_batches.get(&queue_id).is_some_and(|state| {
+                                state.open_batch.is_some() || !state.committed_batches.is_empty()
+                            })
                         },
-                        |fence| {
-                            shared_event_values
-                                .get(&fence.producer())
-                                .is_some_and(|value| *value >= fence.value())
+                        |producer| {
+                            guest_queue_batches
+                                .get(&producer.queue_id())
+                                .map(|state| state.shared_event_timeline.event().signaled_value())
+                        },
+                        |producer| {
+                            guest_queue_batches
+                                .get(&producer.queue_id())
+                                .map(|state| state.shared_event_timeline.event().signaled_value())
+                        },
+                        |producer| {
+                            guest_queue_batches
+                                .get(&producer.queue_id())
+                                .map(|state| state.host_retired_fence_value)
                         },
                     );
-                    consumer_reached_wait
-                        && terminal_dependencies.iter().all(|fence| {
-                            host_retired_values
-                                .get(&fence.producer())
-                                .is_some_and(|value| *value >= fence.value())
-                        })
+                    if waiting_for_ack
+                        && latency.phase != SharedEventHostEffectLatencyPhase::ConsumerAck
+                        && let Some(fence) = *consumer_ack
+                    {
+                        observed_consumer_acks.push((fence, now));
+                    }
+                    resolved
                 }
                 QueueBlockReason::FlipSafetyWait(wait) => {
                     wait.required_flip_sequence.is_none_or(|sequence| {
@@ -152,7 +165,11 @@ impl MetalPresenter {
                                 .is_some_and(|safety| safety.safe)
                     })
                 }
-            }) {
+            });
+            for (fence, observed_at) in observed_consumer_acks {
+                self.record_shared_event_ack_observed(fence, observed_at);
+            }
+            let (source, event) = match poll {
                 OrderedEventPoll::Event { source, event } => (source, event),
                 OrderedEventPoll::Blocked => {
                     // Look ahead far enough to feed all compiler workers while memory-wait queues
@@ -172,17 +189,69 @@ impl MetalPresenter {
                     return PresenterFlow::Shutdown;
                 }
             };
+            let event_processing_started = Instant::now();
+            let event_queue_wait = self.receiver.last_event_queue_wait();
             self.set_active_guest_queue(match source {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
                 OrderedEventSource::Host { .. } => None,
             });
             let mut shared_event_gpu_ordered_compute = false;
             let mut shared_event_gpu_ordered_registered_wait = false;
+            let mut shared_event_gpu_ordered_draw = false;
+            let mut shared_event_direct_draw_plan = None;
+            let mut prepared_same_queue_dma_fill = None;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
                 let dependencies = self.unsignaled_host_dependencies(queue_id);
-                let gpu_orderable = dependencies.is_empty()
-                    || self.event_is_shared_event_gpu_orderable(source, &event);
+                shared_event_direct_draw_plan = if dependencies.is_empty() {
+                    None
+                } else if let GpuEvent::IndexedDraw(draw) = &event {
+                    self.observe_shared_event_direct_draw_preflight(queue_id, &dependencies, draw)
+                } else {
+                    None
+                };
+                let direct_draw_gpu_orderable = shared_event_direct_draw_plan.is_some()
+                    && self.per_queue_guest_batches
+                    && self.shared_event_direct_draw_admission;
+                let same_queue_dma_fill = if dependencies.is_empty() {
+                    None
+                } else if let GpuEvent::MemoryCopy(copy) = &event {
+                    self.prepare_same_queue_immediate_fill(queue_id, &dependencies, copy)
+                } else {
+                    None
+                };
+                let disposition = if dependencies.is_empty()
+                    || direct_draw_gpu_orderable
+                    || same_queue_dma_fill.is_some()
+                {
+                    SharedEventEventDisposition::GpuOrderable
+                } else {
+                    self.shared_event_event_disposition(queue_id, source, &dependencies, &event)
+                };
+                if disposition == SharedEventEventDisposition::DropSemanticNoOp {
+                    self.statistics.shared_event_acquire_noop_drops = self
+                        .statistics
+                        .shared_event_acquire_noop_drops
+                        .saturating_add(1);
+                    static STABLE_ACQUIRE_NOOP_COUNT: AtomicUsize = AtomicUsize::new(0);
+                    let occurrence = STABLE_ACQUIRE_NOOP_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if occurrence <= 16 || occurrence.is_power_of_two() {
+                        let GpuEvent::MemoryAcquire(acquire) = &event else {
+                            unreachable!("only ACQUIRE_MEM has a semantic-no-op disposition")
+                        };
+                        eprintln!(
+                            "[REMu][METAL][ACQUIRE-NOOP] occurrence={occurrence} base={:#x} bytes={:#x} gcr={:#x} watched-overlap=stable-clean action=drop",
+                            acquire.base_address, acquire.size_bytes, acquire.gcr_control,
+                        );
+                    }
+                    // The proof linearizes this cache action as empty. Never invoke the mutating
+                    // acquire executor after it: a later CPU store belongs to later synchronization
+                    // and must remain dirty for the next real resource use.
+                    self.receiver.finish_event(source);
+                    continue;
+                }
+                let gpu_orderable = disposition == SharedEventEventDisposition::GpuOrderable;
                 if !gpu_orderable {
+                    let acknowledgement_started = Instant::now();
                     let acknowledgement = match self.encode_active_guest_queue_host_ack() {
                         Ok(acknowledgement) => acknowledgement,
                         Err(error) => {
@@ -192,6 +261,13 @@ impl MetalPresenter {
                             None
                         }
                     };
+                    let acknowledgement_finished = Instant::now();
+                    self.prepare_shared_event_ack_phase_trace(
+                        acknowledgement,
+                        event_queue_wait,
+                        acknowledgement_started.saturating_duration_since(event_processing_started),
+                        acknowledgement_finished.saturating_duration_since(acknowledgement_started),
+                    );
                     if let Err(error) = self.flush_guest_command_batch(
                         FlushPolicy::Required,
                         GuestBatchFlushReason::SharedEventHostEffect,
@@ -212,6 +288,7 @@ impl MetalPresenter {
                             consumer_queue_id: queue_id,
                             consumer_ack: acknowledgement,
                             terminal_dependencies: dependencies,
+                            latency: SharedEventHostEffectLatencyState::new(Instant::now()),
                         },
                     );
                     continue;
@@ -224,6 +301,8 @@ impl MetalPresenter {
                 {
                     shared_event_gpu_ordered_registered_wait = true;
                 }
+                shared_event_gpu_ordered_draw = direct_draw_gpu_orderable;
+                prepared_same_queue_dma_fill = same_queue_dma_fill;
             }
             match event {
                 GpuEvent::QueueSubmission { .. } => {
@@ -293,6 +372,9 @@ impl MetalPresenter {
                     tiling_mode,
                     ..
                 } => {
+                    remu_gpu::record_startup_milestone(
+                        remu_gpu::StartupMilestone::FirstFlipAccepted,
+                    );
                     self.statistics.guest_flips = self.statistics.guest_flips.saturating_add(1);
                     self.display = Some(DisplayConfiguration {
                         width,
@@ -388,10 +470,23 @@ impl MetalPresenter {
                 GpuEvent::MemoryCopy(copy) => {
                     let destination_address = copy.destination_address;
                     let byte_count = copy.byte_count;
-                    match self.execute_guest_memory_copy(copy) {
-                        Ok(()) => self
-                            .receiver
-                            .retry_guest_memory_waits_overlapping(destination_address, byte_count),
+                    let retry_waits_on_dequeue = prepared_same_queue_dma_fill.is_none();
+                    let result = if let Some(prepared) = prepared_same_queue_dma_fill {
+                        let OrderedEventSource::GuestQueue(queue_id) = source else {
+                            unreachable!("same-queue DMA admission requires a guest queue")
+                        };
+                        self.queue_prepared_same_queue_immediate_fill(queue_id, &copy, prepared)
+                    } else {
+                        self.execute_guest_memory_copy(copy)
+                    };
+                    match result {
+                        Ok(()) if retry_waits_on_dequeue => {
+                            self.receiver.retry_guest_memory_waits_overlapping(
+                                destination_address,
+                                byte_count,
+                            );
+                        }
+                        Ok(()) => {}
                         Err(error) => {
                             eprintln!("[REMu][METAL] DMA_DATA synchronization failed: {error}");
                         }
@@ -595,10 +690,23 @@ impl MetalPresenter {
                         }
                         continue;
                     }
+                    let cpu_synchronization_epoch = self.guest_batch_cpu_synchronization_epoch;
+                    let texture_overrides = if shared_event_gpu_ordered_draw {
+                        shared_event_direct_draw_plan
+                            .as_ref()
+                            .map_or(&[][..], |plan| plan.texture_overrides.as_slice())
+                    } else {
+                        &[]
+                    };
                     let result = match key.as_ref() {
-                        Ok(key) => self.execute_compiled_draw(&draw, key),
+                        Ok(key) => self.execute_compiled_draw(&draw, key, texture_overrides),
                         Err(error) => Err(error.clone()),
                     };
+                    self.record_shared_event_direct_draw_outcome(
+                        shared_event_gpu_ordered_draw,
+                        cpu_synchronization_epoch,
+                        result.is_ok(),
+                    );
                     if let Err(error) = result {
                         // Every dropped draw is counted so a scene pass failing each frame stays
                         // visible in the perf trail; the message still logs once per key.
@@ -640,6 +748,9 @@ impl MetalPresenter {
                             );
                         }
                     } else {
+                        remu_gpu::record_startup_milestone(
+                            remu_gpu::StartupMilestone::FirstEncodedDraw,
+                        );
                         self.statistics.encoded_draws =
                             self.statistics.encoded_draws.saturating_add(1);
                     }
@@ -761,6 +872,166 @@ impl MetalPresenter {
         })
     }
 
+    pub(super) fn shared_event_event_disposition(
+        &self,
+        consumer_queue_id: u64,
+        source: OrderedEventSource,
+        dependencies: &[super::SharedEventFence],
+        event: &GpuEvent,
+    ) -> SharedEventEventDisposition {
+        if let GpuEvent::MemoryAcquire(acquire) = event
+            && acquire.invalidates_guest_resources()
+            && self.invalidating_acquire_has_watched_resource(*acquire)
+            && self.invalidating_acquire_is_stable_noop(consumer_queue_id, dependencies, *acquire)
+        {
+            return SharedEventEventDisposition::DropSemanticNoOp;
+        }
+        if self.event_is_shared_event_gpu_orderable(source, event) {
+            SharedEventEventDisposition::GpuOrderable
+        } else {
+            SharedEventEventDisposition::HostEffect
+        }
+    }
+
+    /// Proves that the normal ACQUIRE_MEM executor would leave every overlapping cached resource
+    /// byte-for-byte unchanged at one stable point.
+    ///
+    /// Presenter-owned map membership cannot change during this method. Write-watch and mapping
+    /// state can change on guest threads, so every complete token is sampled twice. Producer
+    /// checkpoint effects which eventually publish into guest RAM are also rejected when they
+    /// overlap a watched resource; a clean watch before that deferred publication is not a no-op.
+    pub(super) fn invalidating_acquire_is_stable_noop(
+        &self,
+        consumer_queue_id: u64,
+        dependencies: &[super::SharedEventFence],
+        acquire: GpuMemoryAcquire,
+    ) -> bool {
+        struct WatchedResource<'a> {
+            watch: &'a super::GuestTextureWriteWatch,
+            gpu_write_generations: Option<&'a [u64]>,
+            footprint: PhysicalFootprintRange,
+        }
+
+        fn watched_resource<'a>(
+            watch: &'a super::GuestTextureWriteWatch,
+            gpu_write_generations: Option<&'a [u64]>,
+        ) -> Option<WatchedResource<'a>> {
+            let (address, byte_count) = watch.range();
+            let span = ResourceSpan::new(address, byte_count);
+            let footprint = PhysicalFootprintRange::new(
+                SharedEventWriteKind::ResidentDestination,
+                address,
+                byte_count,
+                span.backing(),
+            )?;
+            Some(WatchedResource {
+                watch,
+                gpu_write_generations,
+                footprint,
+            })
+        }
+
+        let mut watched = Vec::new();
+        for resident in self.resident_guest_textures.values() {
+            let (address, byte_count) = resident.write_watch.range();
+            if !acquire.overlaps(address, byte_count) {
+                continue;
+            }
+            let Some(resource) = watched_resource(
+                &resident.write_watch,
+                resident
+                    .gpu_written()
+                    .then_some(resident.gpu_write_watch_generations.as_slice()),
+            ) else {
+                return false;
+            };
+            watched.push(resource);
+        }
+        for cached in self.sampled_texture_cache.values() {
+            let (address, byte_count) = cached.write_watch.range();
+            if !acquire.overlaps(address, byte_count) {
+                continue;
+            }
+            let Some(resource) = watched_resource(&cached.write_watch, None) else {
+                return false;
+            };
+            watched.push(resource);
+        }
+        if watched.is_empty() {
+            return false;
+        }
+
+        let first = watched
+            .iter()
+            .map(|resource| resource.watch.acquire_noop_token())
+            .collect::<Vec<_>>();
+        if first.iter().any(|token| !token.is_clean()) {
+            return false;
+        }
+
+        let Some(consumer) = self.guest_queue_batches.get(&consumer_queue_id) else {
+            return false;
+        };
+        for dependency in dependencies {
+            let Some(checkpoint) = consumer
+                .resource_dependencies
+                .get(&dependency.producer())
+                .filter(|checkpoint| checkpoint.fence == *dependency)
+            else {
+                return false;
+            };
+            if !checkpoint.footprint_complete {
+                return false;
+            }
+            if checkpoint.pending_write_footprint.iter().any(|producer| {
+                !matches!(
+                    producer.kind,
+                    SharedEventWriteKind::ResidentDestination
+                        | SharedEventWriteKind::InternalResidentDestination
+                ) && watched
+                    .iter()
+                    .any(|resource| resource.footprint.overlaps(*producer))
+            }) {
+                return false;
+            }
+        }
+
+        let second = watched
+            .iter()
+            .map(|resource| resource.watch.acquire_noop_token())
+            .collect::<Vec<_>>();
+        first == second
+            && second.iter().all(|token| token.is_clean())
+            && watched.iter().zip(&second).all(|(resource, token)| {
+                resource
+                    .gpu_write_generations
+                    .is_none_or(|generations| generations == token.generations())
+            })
+    }
+
+    pub(super) fn record_shared_event_direct_draw_outcome(
+        &mut self,
+        gpu_ordered: bool,
+        cpu_synchronization_epoch_before: u64,
+        encoded: bool,
+    ) {
+        if !gpu_ordered {
+            return;
+        }
+        if self.guest_batch_cpu_synchronization_epoch != cpu_synchronization_epoch_before {
+            self.statistics.shared_event_draw_internal_drains = self
+                .statistics
+                .shared_event_draw_internal_drains
+                .saturating_add(1);
+        }
+        if encoded {
+            self.statistics.shared_event_gpu_ordered_draws = self
+                .statistics
+                .shared_event_gpu_ordered_draws
+                .saturating_add(1);
+        }
+    }
+
     /// Conservative host-effect gate for commands following an encoded Metal wait.
     pub(super) fn event_is_shared_event_gpu_orderable(
         &self,
@@ -862,6 +1133,52 @@ impl MetalPresenter {
                     .any(|checkpoint| checkpoint.fence == fence)
             })
     }
+}
+
+pub(crate) fn shared_event_host_effect_is_resolved(
+    latency: &mut super::SharedEventHostEffectLatencyState,
+    now: Instant,
+    statistics: &mut super::SharedEventHostEffectLatencyStatistics,
+    consumer_queue_id: u64,
+    consumer_ack: Option<super::SharedEventFence>,
+    terminal_dependencies: &[super::SharedEventFence],
+    mut queue_has_outstanding_batches: impl FnMut(u64) -> bool,
+    mut consumer_shared_event_value: impl FnMut(super::SharedEventProducerId) -> Option<u64>,
+    mut producer_shared_event_value: impl FnMut(super::SharedEventProducerId) -> Option<u64>,
+    mut host_retired_value: impl FnMut(super::SharedEventProducerId) -> Option<u64>,
+) -> bool {
+    if latency.phase == super::SharedEventHostEffectLatencyPhase::ConsumerAck {
+        let consumer_reached_wait = consumer_ack.map_or_else(
+            || !queue_has_outstanding_batches(consumer_queue_id),
+            |fence| {
+                consumer_shared_event_value(fence.producer())
+                    .is_some_and(|value| value >= fence.value())
+            },
+        );
+        if !consumer_reached_wait {
+            return false;
+        }
+        latency.complete_phase(now, statistics);
+    }
+
+    if latency.phase == super::SharedEventHostEffectLatencyPhase::ImmutablePrefix {
+        let immutable_prefix_reached = terminal_dependencies.iter().all(|fence| {
+            producer_shared_event_value(fence.producer())
+                .is_some_and(|value| value >= fence.value())
+        });
+        if !immutable_prefix_reached {
+            return false;
+        }
+        latency.complete_phase(now, statistics);
+    }
+
+    let terminal_reached = terminal_dependencies.iter().all(|fence| {
+        host_retired_value(fence.producer()).is_some_and(|value| value >= fence.value())
+    });
+    if terminal_reached {
+        latency.complete_phase(now, statistics);
+    }
+    terminal_reached
 }
 
 fn compute_program_has_only_covered_readonly_buffers(

@@ -152,6 +152,7 @@ pub(crate) fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -
 
 #[cfg(target_os = "macos")]
 fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
+    remu_gpu::begin_startup_timeline();
     let (linked, module_report) = match load_process_image(path) {
         Ok(process) => process,
         Err(error) => {
@@ -159,6 +160,7 @@ fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> Exi
             return ExitCode::FAILURE;
         }
     };
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::ProcessImageLinked);
     let image_name = module_report
         .entry_path
         .file_name()
@@ -171,6 +173,7 @@ fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> Exi
     // without limit.
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_event_sink(sender.clone());
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::EventSinkInstalled);
     let guest = std::thread::spawn(move || {
         let started = Instant::now();
         let result = linked.probe_entry(&image_name, &game_root, import_limit, timeout_seconds);

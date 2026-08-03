@@ -13,9 +13,10 @@ use super::{
     GuestBatchFlushReason, GuestBatchWork, GuestRenderPassKey, GuestScissor,
     GuestTextureDescriptor, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX,
     OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
-    append_unique_global_writebacks, append_unique_guest_write_ranges, canonical_texture_bindings,
-    capture_guest_frame, capture_target_sample_textures, collect_pending_global_writebacks,
+    ResidencyState, ResidentTextureActivityStamp, SharedEventDrawTextureOverride,
+    SharedEventWriteKind, SpanQueryOrder, StaleSource, append_unique_global_writebacks,
+    append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
+    capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, color_operation_is_raster_noop, compute_pipeline_key,
     compute_program_can_split_wave64, consume_color_metadata_clear, consume_depth_metadata_clear,
     create_global_argument_buffer, decode_color_eliminate_fast_clear_target,
@@ -32,6 +33,7 @@ use super::{
     diagnostic_force_msaa_vertex_pattern, diagnostic_global_binding_head,
     diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
     diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
+    diagnostic_scanout_writer_slot, diagnostic_scanout_writer_target_selected,
     diagnostic_shader_summary, diagnostic_target_draw_filter,
     diagnostic_texture_depth_plane_summaries, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
@@ -115,9 +117,11 @@ impl MetalPresenter {
         &mut self,
         draw: &IndexedDraw,
         key: &GraphicsPipelineKey,
+        shared_event_texture_overrides: &[SharedEventDrawTextureOverride],
     ) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let started = Instant::now();
+        let ack_phase_timing = self.shared_event_ack_phase_timing_enabled();
         let trace = draw.sequence <= 4 || draw.sequence.is_power_of_two();
         let targets = decode_render_targets(draw)?;
         let depth = decode_depth_target(draw)?;
@@ -582,6 +586,9 @@ impl MetalPresenter {
                 .filter(|binding| !image_resource_descriptor_is_null(&binding.resource_descriptor))
             {
                 if let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor)
+                    && !shared_event_texture_overrides
+                        .iter()
+                        .any(|retained| retained.matches(descriptor))
                     && self
                         .resident_guest_textures
                         .get(&descriptor.guest)
@@ -662,7 +669,10 @@ impl MetalPresenter {
                 }
             }
         }
-        self.synchronize_sampled_aliases(&[export_evaluation, pixel_evaluation])?;
+        self.synchronize_sampled_aliases(
+            &[export_evaluation, pixel_evaluation],
+            shared_event_texture_overrides,
+        )?;
 
         self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[export_evaluation, pixel_evaluation])?;
@@ -685,6 +695,7 @@ impl MetalPresenter {
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
             activity_stamp,
+            shared_event_texture_overrides,
         )?;
         let pixel_textures = upload_image_textures(
             "pixel",
@@ -699,7 +710,72 @@ impl MetalPresenter {
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
             activity_stamp,
+            shared_event_texture_overrides,
         )?;
+        let diagnostic_scanout_target = targets.iter().copied().find(|target| {
+            diagnostic_scanout_writer_target_selected(
+                draw.pixel_shader_address,
+                target.texture.address,
+                self.is_diagnostic_scanout_target(target),
+                target.texture.width,
+                target.texture.height,
+            )
+        });
+        let diagnostic_scanout_writer_slot =
+            diagnostic_scanout_target.and_then(|_| diagnostic_scanout_writer_slot(draw.sequence));
+        if let (Some(slot), Some(target)) =
+            (diagnostic_scanout_writer_slot, diagnostic_scanout_target)
+        {
+            eprintln!(
+                "[REMu][METAL][SCANOUT-SOURCE] slot={slot} kind=target draw={} es={:#x} ps={:#x} target={target:?}",
+                draw.sequence, draw.export_shader_address, draw.pixel_shader_address,
+            );
+            for (stage, evaluation, textures) in [
+                (
+                    "vertex",
+                    export_evaluation.as_ref(),
+                    export_textures.as_slice(),
+                ),
+                ("pixel", pixel_evaluation, pixel_textures.as_slice()),
+            ] {
+                for (binding_index, (binding, uploaded)) in canonical_texture_bindings(evaluation)
+                    .into_iter()
+                    .zip(textures)
+                    .enumerate()
+                {
+                    let resident = uploaded
+                        .selected_resident
+                        .and_then(|descriptor| self.resident_guest_textures.get(&descriptor));
+                    let resident_summary = resident.map(|resident| {
+                        (
+                            resident.descriptor,
+                            resident.state,
+                            resident.serves_reads(),
+                            resident.gpu_written(),
+                            resident.content_version,
+                            resident.owned.byte_count(),
+                            resident.gpu_authored.byte_count(),
+                            resident.last_use,
+                        )
+                    });
+                    eprintln!(
+                        "[REMu][METAL][SCANOUT-SOURCE] slot={slot} kind=binding draw={} es={:#x} ps={:#x} target={target:?} stage={stage} binding={binding_index} pc={:#x} op={} words={:08x?} requested={:?} selected={resident_summary:?} native={:?}/{}x{}/mips{}/layers{}",
+                        draw.sequence,
+                        draw.export_shader_address,
+                        draw.pixel_shader_address,
+                        binding.pc,
+                        binding.opcode,
+                        binding.resource_descriptor,
+                        uploaded.descriptor,
+                        uploaded.texture.pixel_format(),
+                        uploaded.texture.width(),
+                        uploaded.texture.height(),
+                        uploaded.texture.mipmap_level_count(),
+                        uploaded.texture.array_length(),
+                    );
+                }
+            }
+        }
         let (
             pipeline,
             vertex_function,
@@ -1326,6 +1402,7 @@ impl MetalPresenter {
         } else {
             None
         };
+        let ack_metal_encoding_started = ack_phase_timing.then(Instant::now);
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
             let batch = batch.expect("guest command batch was opened above");
@@ -1664,9 +1741,16 @@ impl MetalPresenter {
                 );
             }
         }
+        let ack_metal_encoding_finished = ack_phase_timing.then(Instant::now);
 
         for (target, resident_descriptor) in targets.iter().zip(&target_resident_descriptors) {
             if target.direct_scanout {
+                if let Some(batch) = self.active_open_guest_batch_mut() {
+                    batch.record_resident_write_footprint(
+                        SharedEventWriteKind::DirectScanoutTarget,
+                        target.span,
+                    );
+                }
                 self.mark_direct_scanout_initialized(target.texture.address);
             } else {
                 let region = WrittenRegion::render_target(*target, scissor);
@@ -1707,6 +1791,7 @@ impl MetalPresenter {
                     draw: draw.sequence,
                     export_shader: draw.export_shader_address,
                     pixel_shader: draw.pixel_shader_address,
+                    queue_id: self.active_guest_queue,
                 };
                 record_diagnostic_scanout_writer(target.texture.address, writer);
                 if trace_scanout_writers {
@@ -1784,6 +1869,11 @@ impl MetalPresenter {
                 );
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
+        }
+        if let (Some(slot), Some(target)) =
+            (diagnostic_scanout_writer_slot, diagnostic_scanout_target)
+        {
+            self.capture_scanout_writer_after_draw(slot, draw, target)?;
         }
         let diagnostic_target = diagnostic_target_draw_filter()
             .and_then(|filter| {
@@ -2761,6 +2851,18 @@ impl MetalPresenter {
                     viewport.zfar,
                 );
             }
+        }
+        if let (Some(encoding_started), Some(encoding_finished)) =
+            (ack_metal_encoding_started, ack_metal_encoding_finished)
+        {
+            let finished = Instant::now();
+            self.record_shared_event_ack_batch_cpu_phases(
+                encoding_started
+                    .saturating_duration_since(started)
+                    .saturating_add(finished.saturating_duration_since(encoding_finished)),
+                encoding_finished.saturating_duration_since(encoding_started),
+                false,
+            );
         }
         let batch_full = self
             .active_open_guest_batch()

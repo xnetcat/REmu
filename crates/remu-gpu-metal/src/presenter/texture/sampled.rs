@@ -1,7 +1,9 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::super::{FlushPolicy, GuestBatchFlushReason, WritebackTrigger};
+use super::super::{
+    FlushPolicy, GuestBatchFlushReason, SharedEventDrawTextureOverride, WritebackTrigger,
+};
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, MetalTextureSwizzleChannels,
     RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
@@ -36,6 +38,7 @@ impl MetalPresenter {
     pub(crate) fn synchronize_sampled_aliases(
         &mut self,
         evaluations: &[&ShaderEvaluation],
+        shared_event_texture_overrides: &[SharedEventDrawTextureOverride],
     ) -> Result<(), String> {
         let mut aliases = Vec::new();
         for &evaluation in evaluations {
@@ -52,6 +55,12 @@ impl MetalPresenter {
                     // reject the entire draw before the fallback can be installed.
                     continue;
                 };
+                if shared_event_texture_overrides
+                    .iter()
+                    .any(|retained| retained.matches(sampled))
+                {
+                    continue;
+                }
                 let comparison = image_is_comparison(binding.opcode);
                 let sampled_bytes = guest_texture_byte_count(sampled.guest).ok_or_else(|| {
                     format!(
@@ -283,6 +292,29 @@ pub(crate) fn sampled_texture_key(
         layer_count: descriptor.layer_count,
         comparison,
     }
+}
+
+pub(crate) fn sampled_texture_usage(
+    comparison: bool,
+    writable: bool,
+) -> Result<MTLTextureUsage, String> {
+    if comparison && writable {
+        return Err("comparison texture cannot be a writable storage image".to_owned());
+    }
+    Ok(if writable {
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+    } else {
+        MTLTextureUsage::ShaderRead
+    })
+}
+
+pub(crate) fn sampled_texture_supports_access(texture: &Texture, writable: bool) -> bool {
+    let required = if writable {
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+    } else {
+        MTLTextureUsage::ShaderRead
+    };
+    texture.usage().contains(required)
 }
 
 #[cfg(test)]
@@ -559,6 +591,7 @@ pub(crate) fn create_sampled_guest_texture(
     texture_type: u32,
     layer_count: u32,
     comparison: bool,
+    writable: bool,
 ) -> Result<Texture, String> {
     let (elements_wide, elements_high, _, bytes_per_element) = texture_element_layout(guest)?;
     let source_face_bytes = elements_wide
@@ -681,11 +714,7 @@ pub(crate) fn create_sampled_guest_texture(
         descriptor.set_array_length(u64::from(layer_count));
     }
     descriptor.set_storage_mode(MTLStorageMode::Shared);
-    descriptor.set_usage(if texture_type == 10 && !comparison {
-        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
-    } else {
-        MTLTextureUsage::ShaderRead
-    });
+    descriptor.set_usage(sampled_texture_usage(comparison, writable)?);
     let texture = device.new_texture(&descriptor);
     let bytes_per_row = u64::try_from(elements_wide)
         .expect("validated texture element width fits u64")

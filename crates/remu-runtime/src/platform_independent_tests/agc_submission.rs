@@ -32,6 +32,28 @@ fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
     assert!(crate::flush_deferred_gpu_publication(publication));
     let telemetry = remu_gpu::take_dispatch_telemetry_sample();
     assert_eq!(telemetry.gpu_publication_wait.count, 1);
+    for phase in [
+        remu_gpu::GpuPublicationPhase::TicketOrderWait,
+        remu_gpu::GpuPublicationPhase::BarrierAcquire,
+        remu_gpu::GpuPublicationPhase::ChannelSetup,
+        remu_gpu::GpuPublicationPhase::QueueFifoWait,
+        remu_gpu::GpuPublicationPhase::BoundedSend,
+        remu_gpu::GpuPublicationPhase::Residual,
+    ] {
+        assert_eq!(
+            telemetry
+                .gpu_publication_phase(remu_gpu::GpuPublicationRoute::Mixed, phase)
+                .count,
+            1,
+            "each exact phase receives one sample for the mixed publication"
+        );
+        assert_eq!(
+            telemetry
+                .gpu_publication_phase(remu_gpu::GpuPublicationRoute::QueueOnly, phase)
+                .count,
+            0
+        );
+    }
     assert!(matches!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown)));
     remu_gpu::record_gpu_event_consumed();
     remu_gpu::clear_event_sink();

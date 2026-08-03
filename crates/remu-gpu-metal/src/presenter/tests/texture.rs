@@ -1,16 +1,18 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::super::WrittenRegion;
-use super::super::refresh_resident_texture_write_watch;
 use super::super::texture::{
     ResidentSpanIndex, ResidentTextureMap, SpanQueryOrder, ensure_resident_texture_in_map,
+    sampled_texture_supports_access,
 };
 use super::super::{
     OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
     OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_VIEW,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_PUBLISHED,
     ResidencyState, StaleSource, TEXTURE_SNAPSHOT_COUNT, WritebackTrigger,
+};
+use super::super::{
+    SharedEventDrawTextureOverride, WrittenRegion, refresh_resident_texture_write_watch,
 };
 use super::{
     DecodedImageDescriptor, DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter, RangeSet,
@@ -35,14 +37,54 @@ use super::{
     snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
     upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
 };
+use metal::foreign_types::ForeignType;
 use metal::{
     CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
+    MTLTextureUsage, RenderPassDescriptor, Texture, TextureDescriptor,
 };
 use remu_memory::CpuWriteWatchRetirement;
 use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 use std::sync::atomic::Ordering as AtomicOrdering;
+
+fn upload_test_image_textures(
+    presenter: &mut MetalPresenter,
+    evaluation: &ShaderEvaluation,
+) -> Vec<Texture> {
+    upload_test_image_textures_with_overrides(presenter, evaluation, &[])
+}
+
+fn upload_test_image_textures_with_overrides(
+    presenter: &mut MetalPresenter,
+    evaluation: &ShaderEvaluation,
+    overrides: &[SharedEventDrawTextureOverride],
+) -> Vec<Texture> {
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    upload_image_textures(
+        "test",
+        &device,
+        &queue,
+        evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
+        overrides,
+    )
+    .expect("test image bindings upload")
+    .into_iter()
+    .map(|binding| binding.texture)
+    .collect()
+}
 
 #[test]
 fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
@@ -71,6 +113,130 @@ fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
         error.contains("no complete live shared backing"),
         "unexpected validation error: {error}"
     );
+}
+
+#[test]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+fn shared_event_texture_override_bypasses_replaced_guest_mapping_at_bind() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original backing");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement backing");
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original mapping");
+    let address = mapped.get();
+    let width = 32_u32;
+    let height = 32_u32;
+    let encoded = address >> 8;
+    let resource_descriptor = vec![
+        encoded as u32,
+        ((encoded >> 32) as u32 & 0xff) | 0x0380_0000 | (((width - 1) & 3) << 30),
+        ((width - 1) >> 2) | ((height - 1) << 14),
+        0x9000_0f2e,
+        width - 1,
+        0,
+        0,
+        0,
+    ];
+    let sampled = decode_image_descriptor(&resource_descriptor).expect("sample descriptor");
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            pc: 0x40,
+            opcode: Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(sampled.guest.pixel_format);
+    descriptor.set_width(u64::from(width));
+    descriptor.set_height(u64::from(height));
+    descriptor.set_storage_mode(MTLStorageMode::Private);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+    let retained = device.new_texture(&descriptor);
+    let retained_pointer = retained.as_ptr();
+    let overrides = [SharedEventDrawTextureOverride {
+        sampled,
+        texture: retained,
+    }];
+
+    memory
+        .unmap(mapped, GUEST_PAGE_SIZE)
+        .expect("remove original mapping");
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement mapping");
+    let uploaded = upload_image_textures(
+        "test",
+        &device,
+        &queue,
+        &evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
+        &overrides,
+    )
+    .expect("retained texture bind");
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(uploaded[0].texture.as_ptr(), retained_pointer);
+    assert!(presenter.sampled_texture_cache.is_empty());
+    assert!(presenter.sampled_texture_write_watches.is_empty());
 }
 
 #[test]
@@ -194,6 +360,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
         ResidentTextureActivityStamp::default(),
+        &[],
     )
     .expect("storage alias upload");
 
@@ -339,6 +506,7 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         &mut presenter.fallback_texture_cache,
         &mut presenter.next_sampled_texture_use,
         ResidentTextureActivityStamp::default(),
+        &[],
     )
     .expect("native depth sample upload");
     assert_eq!(uploaded.len(), 1);
@@ -1270,6 +1438,152 @@ fn sampled_texture_cache_key_ignores_shader_applied_component_selection() {
         super::sampled_texture_key(descriptor, false),
         super::sampled_texture_key(alternate, true)
     );
+}
+
+#[test]
+fn sampled_texture_usage_is_promoted_without_splitting_guest_image_identity() {
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let queue = device.new_command_queue();
+    let guest = GuestTextureDescriptor {
+        address: 0x10_0000,
+        width: 1,
+        height: 1,
+        pitch: 1,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let sampled = create_sampled_guest_texture(
+        &device,
+        &queue,
+        guest,
+        &[1, 2, 3, 4],
+        0,
+        1,
+        13,
+        1,
+        false,
+        false,
+    )
+    .expect("ordinary 2D-array sample texture");
+    assert_eq!(sampled.usage(), MTLTextureUsage::ShaderRead);
+    assert!(sampled_texture_supports_access(&sampled, false));
+    assert!(!sampled_texture_supports_access(&sampled, true));
+
+    let storage = create_sampled_guest_texture(
+        &device,
+        &queue,
+        guest,
+        &[1, 2, 3, 4],
+        0,
+        1,
+        13,
+        1,
+        false,
+        true,
+    )
+    .expect("writable 2D-array storage texture");
+    assert_eq!(
+        storage.usage(),
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+    );
+    assert!(sampled_texture_supports_access(&storage, false));
+    assert!(sampled_texture_supports_access(&storage, true));
+}
+
+#[test]
+fn load_before_store_binds_one_read_write_array_texture() {
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 13 << 28;
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1, 2],
+        vector_data: 4,
+        scalar_resource: 12,
+        scalar_sampler: 0,
+        dimension: 5,
+        is_array: true,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let mut store = ImageBinding {
+        pc: 0x38,
+        opcode: Opcode::Known("ImageStore"),
+        control: control.clone(),
+        resource_descriptor: resource_descriptor.clone().into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    };
+    let load = ImageBinding {
+        pc: 0x30,
+        opcode: Opcode::Known("ImageLoad"),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    };
+    store.control.vector_data = 8;
+    let evaluation = |image_bindings| ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings,
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+
+    let (_transition_sender, transition_receiver) = std::sync::mpsc::channel();
+    let mut transition = MetalPresenter::new(transition_receiver).expect("Metal presenter state");
+    let read_only = upload_test_image_textures(&mut transition, &evaluation(vec![load.clone()]));
+    assert_eq!(read_only.len(), 1);
+    assert!(!sampled_texture_supports_access(&read_only[0], true));
+    let promoted = upload_test_image_textures(&mut transition, &evaluation(vec![store.clone()]));
+    assert_eq!(promoted.len(), 1);
+    assert_ne!(read_only[0].as_ptr(), promoted[0].as_ptr());
+    assert!(sampled_texture_supports_access(&promoted[0], true));
+    let reused = upload_test_image_textures(&mut transition, &evaluation(vec![load.clone()]));
+    assert_eq!(reused.len(), 1);
+    assert_eq!(promoted[0].as_ptr(), reused[0].as_ptr());
+    assert_eq!(transition.fallback_texture_cache.len(), 1);
+
+    let (_combined_sender, combined_receiver) = std::sync::mpsc::channel();
+    let mut combined = MetalPresenter::new(combined_receiver).expect("Metal presenter state");
+    let sampled = fallback_image_descriptor(&load).expect("array fallback descriptor");
+    let device = combined.device.as_ref().expect("Metal device");
+    let retained_descriptor = TextureDescriptor::new();
+    retained_descriptor.set_texture_type(MTLTextureType::D2Array);
+    retained_descriptor.set_pixel_format(sampled.guest.pixel_format);
+    retained_descriptor.set_width(u64::from(sampled.guest.width));
+    retained_descriptor.set_height(u64::from(sampled.guest.height));
+    retained_descriptor.set_array_length(u64::from(sampled.layer_count.max(1)));
+    retained_descriptor.set_storage_mode(MTLStorageMode::Private);
+    retained_descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let retained = device.new_texture(&retained_descriptor);
+    let retained_pointer = retained.as_ptr();
+    let overrides = [SharedEventDrawTextureOverride {
+        sampled,
+        texture: retained,
+    }];
+    let uploaded = upload_test_image_textures_with_overrides(
+        &mut combined,
+        &evaluation(vec![load, store]),
+        &overrides,
+    );
+    assert_eq!(uploaded.len(), 2);
+    assert_eq!(uploaded[0].as_ptr(), uploaded[1].as_ptr());
+    assert_ne!(uploaded[0].as_ptr(), retained_pointer);
+    assert_eq!(combined.fallback_texture_cache.len(), 1);
+    for texture in &uploaded {
+        assert_eq!(texture.texture_type(), MTLTextureType::D2Array);
+        assert!(sampled_texture_supports_access(texture, true));
+    }
 }
 
 #[test]
@@ -4370,8 +4684,9 @@ fn cube_sampled_textures_serve_face_atlas_coordinates_as_2d_array_layers() {
             linear.push(u8::try_from(face * 36 + texel + 1).expect("identity texel fits u8"));
         }
     }
-    let texture = create_sampled_guest_texture(&device, &queue, guest, &linear, 0, 1, 11, 6, false)
-        .expect("six-face cube uploads as a 2D array");
+    let texture =
+        create_sampled_guest_texture(&device, &queue, guest, &linear, 0, 1, 11, 6, false, false)
+            .expect("six-face cube uploads as a 2D array");
     assert_eq!(texture.texture_type(), MTLTextureType::D2Array);
     assert_eq!(texture.array_length(), 6);
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::ThreadId;
 
@@ -10,7 +10,6 @@ use crate::PthreadMutexAttrState;
 
 #[derive(Debug, Default)]
 pub(crate) struct GuestSyncState {
-    pub(crate) rwlocks: HashMap<u64, GuestRwlockState>,
     pub(crate) conditions: HashMap<u64, GuestConditionState>,
     pub(crate) condition_waiters: HashMap<u64, GuestConditionWaiterState>,
     pub(crate) next_condition_waiter: u64,
@@ -145,6 +144,11 @@ pub(crate) struct GuestMutexState {
 pub(crate) struct GuestMutexEntry {
     pub(crate) state: Mutex<GuestMutexState>,
     pub(crate) wake: Condvar,
+    /// Cleared while holding `state` before this generation is removed from its shard.
+    ///
+    /// Thread-local lookup caches may keep the `Arc` alive after destruction, so every operation
+    /// rechecks this bit under `state` before observing or changing ownership.
+    pub(crate) active: AtomicBool,
     pub(crate) storage_address: u64,
     /// Opaque object installed in the guest's `ScePthreadMutex` storage by the init ABI.
     ///
@@ -159,7 +163,14 @@ pub(crate) struct GuestRwlockState {
     pub(crate) readers: HashMap<ThreadId, u32>,
     pub(crate) reader_total: u32,
     pub(crate) writer: Option<ThreadId>,
+    pub(crate) waiting_readers: u32,
     pub(crate) waiting_writers: u32,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GuestRwlockShard {
+    pub(crate) locks: Mutex<HashMap<u64, GuestRwlockState>>,
+    pub(crate) wake: Condvar,
 }
 
 impl Default for GuestMutexState {
@@ -200,9 +211,14 @@ pub(super) static MUTEX_CONTENTION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(super) const GUEST_MUTEX_SHARD_COUNT: usize = 64;
 
+pub(super) const GUEST_RWLOCK_SHARD_COUNT: usize = 64;
+
 pub(super) static GUEST_MUTEX_SHARDS: OnceLock<
     [Mutex<HashMap<u64, Arc<GuestMutexEntry>>>; GUEST_MUTEX_SHARD_COUNT],
 > = OnceLock::new();
+
+pub(super) static GUEST_RWLOCK_SHARDS: OnceLock<[GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT]> =
+    OnceLock::new();
 
 pub(crate) fn guest_sync() -> &'static (Mutex<GuestSyncState>, Condvar) {
     GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()))
@@ -215,4 +231,12 @@ pub(super) fn guest_mutex_shards()
 
 pub(super) fn guest_mutex_shard(address: u64) -> usize {
     usize::try_from(address >> 4).unwrap_or_default() & (GUEST_MUTEX_SHARD_COUNT - 1)
+}
+
+pub(super) fn guest_rwlock_shards() -> &'static [GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT] {
+    GUEST_RWLOCK_SHARDS.get_or_init(|| std::array::from_fn(|_| GuestRwlockShard::default()))
+}
+
+pub(super) fn guest_rwlock_shard(address: u64) -> usize {
+    usize::try_from(address >> 4).unwrap_or_default() & (GUEST_RWLOCK_SHARD_COUNT - 1)
 }

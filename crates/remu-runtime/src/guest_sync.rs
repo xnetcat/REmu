@@ -25,10 +25,14 @@ pub(crate) use self::condition::{
 #[cfg(test)]
 pub(crate) use self::event_flag::EVENT_FLAG_WAIT_OR;
 pub(crate) use self::event_flag::guest_event_flag_wait;
+#[cfg(test)]
+pub(crate) use self::mutex::GUEST_MUTEX_WAKE_COUNT;
 pub(crate) use self::mutex::{
     guest_mutex_destroy, guest_mutex_entry, guest_mutex_init, guest_mutex_lock, guest_mutex_unlock,
     guest_pthread_once,
 };
+#[cfg(test)]
+pub(crate) use self::rwlock::guest_rwlock_waiter_counts;
 pub(crate) use self::rwlock::{
     guest_rwlock_destroy, guest_rwlock_init, guest_rwlock_lock, guest_rwlock_unlock,
 };
@@ -48,7 +52,7 @@ use self::semaphore::{
 };
 use self::state::{
     EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestMutexEntry, GuestMutexState,
-    GuestRwlockState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
+    MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
 };
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

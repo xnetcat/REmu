@@ -44,15 +44,17 @@ use self::decode::{
     DEFAULT_CB_COLOR_CONTROL, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
     color_operation_is_raster_noop, decode_color_eliminate_fast_clear_target,
     decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,
-    decode_image_descriptor, decode_metal_blend_attachment, decode_raster_state,
-    decode_render_target_format, decode_render_targets, decode_scissor, decode_viewport,
-    fallback_image_descriptor, graphics_pipeline_key, guest_viewport_y_scale_is_negative,
-    image_component_class, initial_depth_clear_for_target, initial_render_target_clear_color,
-    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    ngg_mesh_base_vertex, noop_placeholder_cover_draw, prepare_indexed_ngg_indices,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
-    raw_video_out_texture_descriptor, read_draw_indices, register_value,
-    render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
+    decode_depth_target_without_diagnostics, decode_image_descriptor,
+    decode_image_descriptor_without_diagnostics, decode_metal_blend_attachment,
+    decode_raster_state, decode_render_target_format, decode_render_targets, decode_scissor,
+    decode_viewport, fallback_image_descriptor, graphics_pipeline_key,
+    guest_viewport_y_scale_is_negative, image_component_class, initial_depth_clear_for_target,
+    initial_render_target_clear_color, metal_color_write_mask, metal_nonindexed_vertex_count,
+    metal_primitive_type, ngg_mesh_base_vertex, noop_placeholder_cover_draw,
+    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
+    prepare_nonindexed_ngg_indices, raw_video_out_texture_descriptor, read_draw_indices,
+    register_value, render_target_cmask_address, render_target_fast_clear_color,
+    sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
@@ -78,9 +80,9 @@ use self::diagnostics::{
     diagnostic_capture_vertex_position, diagnostic_context_register_snapshot,
     diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
     diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa, diagnostic_dump_glyph_draw,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
-    diagnostic_dump_target_index_count, diagnostic_dump_target_match_index,
-    diagnostic_dump_target_minimum_draw,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_index_count,
+    diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
     diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
     diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
     diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
@@ -88,12 +90,14 @@ use self::diagnostics::{
     diagnostic_force_visible_clip_depth, diagnostic_global_binding_head,
     diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
     diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
-    diagnostic_scanout_writer, diagnostic_shader_summary, diagnostic_skip_export_shader,
-    diagnostic_skip_pixel_shader, diagnostic_target_draw_filter, diagnostic_texture_writer,
-    diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
-    diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
-    diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
-    diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
+    diagnostic_scanout_writer, diagnostic_scanout_writer_slot,
+    diagnostic_scanout_writer_target_selected, diagnostic_shader_summary,
+    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, diagnostic_target_address_matches,
+    diagnostic_target_draw_filter, diagnostic_texture_writer, diagnostic_texture_writer_enabled,
+    diagnostic_trace_all_target_contents, diagnostic_trace_target_contents,
+    diagnostic_trace_target_maximum_draw, diagnostic_trace_target_stride,
+    diagnostic_uploaded_global_binding_head, diagnostic_use_draw_merged_wave_counts,
+    diagnostic_video_chain_selected_draw, draw_diagnostics_are_host_effectful,
     dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
     dump_msl_pixel_filter_matches, evaluation_samples_glyph_atlas,
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
@@ -173,15 +177,21 @@ use self::stats::{
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    SharedEventAckPhaseStatistics, SharedEventHostEffectLatencyPhase,
+    SharedEventHostEffectLatencyStatistics, SharedEventHostEffectPendingStatistics,
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, process_memory_statistics, record_mode27_work_detail,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    take_mode27_work_details, take_texture_dirty_work_details, take_texture_snapshot_work_details,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, TerminalPublicationPhase, TerminalPublicationStatistics,
+    TerminalPublicationTimer, format_shared_event_ack_phase_report,
+    format_shared_event_host_effect_latency_report, format_terminal_publication_report,
+    process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
+    take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
 use self::submission::{
-    append_unique_global_writebacks, append_unique_guest_write_ranges,
+    SAME_QUEUE_DMA_FILL_REJECT_COUNT, SHARED_EVENT_DRAW_REJECT_COUNT, SameQueueDmaFillReject,
+    SharedEventDrawReject, append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
     completed_command_buffer_gpu_duration, describe_guest_batch, guest_batch_writes_overlap,
 };
@@ -195,10 +205,10 @@ use self::texture::{
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
-    retire_multisample_textures_overlapping_writeback, retire_sampled_textures_matching,
-    retire_sampled_textures_overlapping_writeback, snapshot_guest_texture_raw,
-    snapshot_watched_guest_range, storage_image_requires_mip_hierarchy,
-    trace_resident_texture_removal, upload_image_textures,
+    resident_texture_raw_byte_count, retire_multisample_textures_overlapping_writeback,
+    retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
+    sampled_texture_raw_range, snapshot_guest_texture_raw, snapshot_watched_guest_range,
+    storage_image_requires_mip_hierarchy, trace_resident_texture_removal, upload_image_textures,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
     write_watched_guest_texture_linear,
 };
@@ -213,8 +223,8 @@ use self::texture::{
     prepare_sampled_texture_upload, rematerialisation_blit_source_origin_y,
     resident_texture_eviction_plan, sampled_texture_cache_accepts,
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
-    sampled_texture_key, sampled_texture_raw_range, snapshot_guest_texture_linear,
-    snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
+    sampled_texture_key, snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
+    watch_guest_texture, write_guest_texture_linear,
 };
 use self::tiling::{
     ResourceSpan, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
@@ -679,6 +689,7 @@ struct DiagnosticScanoutWriter {
     draw: u64,
     export_shader: u64,
     pixel_shader: u64,
+    queue_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -954,6 +965,44 @@ struct ShaderFunctionStageCache {
     completed: Condvar,
 }
 
+#[derive(Clone, Debug)]
+struct SharedEventHostEffectLatencyState {
+    phase: SharedEventHostEffectLatencyPhase,
+    phase_started_at: Instant,
+}
+
+impl SharedEventHostEffectLatencyState {
+    fn new(now: Instant) -> Self {
+        Self {
+            phase: SharedEventHostEffectLatencyPhase::ConsumerAck,
+            phase_started_at: now,
+        }
+    }
+
+    fn complete_phase(
+        &mut self,
+        now: Instant,
+        statistics: &mut SharedEventHostEffectLatencyStatistics,
+    ) {
+        statistics.record(
+            self.phase,
+            now.saturating_duration_since(self.phase_started_at),
+        );
+        self.phase = match self.phase {
+            SharedEventHostEffectLatencyPhase::ConsumerAck => {
+                SharedEventHostEffectLatencyPhase::ImmutablePrefix
+            }
+            SharedEventHostEffectLatencyPhase::ImmutablePrefix => {
+                SharedEventHostEffectLatencyPhase::HostTerminal
+            }
+            SharedEventHostEffectLatencyPhase::HostTerminal => {
+                SharedEventHostEffectLatencyPhase::HostTerminal
+            }
+        };
+        self.phase_started_at = now;
+    }
+}
+
 #[derive(Clone, Default)]
 struct ShaderFunctionCache {
     vertex: Arc<ShaderFunctionStageCache>,
@@ -963,12 +1012,56 @@ struct ShaderFunctionCache {
 
 struct ScheduledGpuSubmission {
     ingress_sequence: u64,
+    ingested_at: Option<Instant>,
     events: VecDeque<GpuEvent>,
 }
 
 struct ScheduledHostEvent {
     ingress_sequence: u64,
+    ingested_at: Option<Instant>,
     event: GpuEvent,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SharedEventAckBatchCpuPhases {
+    translation: Duration,
+    metal_encoding: Duration,
+    draws: u64,
+    computes: u64,
+}
+
+#[derive(Debug)]
+struct PendingSharedEventAckTrace {
+    fence: SharedEventFence,
+    event_queue: Duration,
+    host_preflight: Duration,
+    ack_encoding: Duration,
+}
+
+#[derive(Debug, Default)]
+struct SharedEventAckNativeHostTimes {
+    scheduled_at: Option<Instant>,
+    completed_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SharedEventAckTerminalTimes {
+    kernel_to_gpu_start: Duration,
+    gpu_execution: Duration,
+    gpu_to_kernel_end: Duration,
+}
+
+#[derive(Debug)]
+struct SharedEventAckTrace {
+    fence: SharedEventFence,
+    committed_at: Instant,
+    event_queue: Duration,
+    cpu: SharedEventAckBatchCpuPhases,
+    ack_encoding: Duration,
+    commit_call: Duration,
+    native_host: Arc<Mutex<SharedEventAckNativeHostTimes>>,
+    terminal: Option<SharedEventAckTerminalTimes>,
+    ack_observed_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
@@ -980,11 +1073,13 @@ enum QueueBlockReason {
     /// publication wakes the exact overlapping wait after the label becomes guest-visible.
     GuestMemoryWaitPendingTerminal(GpuMemoryWait),
     /// Presenter-thread work must wait for both the consumer to cross its encoded wait and every
-    /// producer's terminal host-side publication.
+    /// producer's terminal host-side publication. `latency` observes the exact producer signal
+    /// between those gates but does not publish memory or relax readiness.
     GuestSharedEventHostEffect {
         consumer_queue_id: u64,
         consumer_ack: Option<SharedEventFence>,
         terminal_dependencies: Vec<SharedEventFence>,
+        latency: SharedEventHostEffectLatencyState,
     },
     FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
@@ -1014,6 +1109,9 @@ struct OrderedGpuEventReceiver {
     host_block: Option<QueueBlockReason>,
     next_ingress_sequence: u64,
     disconnected: bool,
+    event_queue_timing: bool,
+    last_event_ingested_at: Option<Instant>,
+    last_event_queue_wait: Duration,
     /// Count of queued small producer writes per 8-byte label cell (`address >> 3`).
     ///
     /// The dependency-ingress predicate must know whether an ingested queue can still satisfy
@@ -1404,7 +1502,6 @@ struct GuestQueueBatchState {
     host_retired_fence_value: u64,
     host_dependencies: HashMap<SharedEventProducerId, u64>,
     resource_dependencies: HashMap<SharedEventProducerId, SharedEventSignalCheckpoint>,
-    retired_fence_write_ranges: BTreeMap<u64, Vec<(u64, u64)>>,
     open_batch: Option<GuestCommandBatch>,
     committed_batches: VecDeque<GuestCommandBatch>,
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
@@ -1491,11 +1588,26 @@ struct PresenterStatistics {
     shared_event_host_blocks: u32,
     shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,
+    shared_event_acquire_noop_drops: u32,
+    shared_event_dma_fill_attempts: u32,
+    shared_event_gpu_ordered_dma_fills: u32,
+    shared_event_dma_fill_rejections: [u32; SAME_QUEUE_DMA_FILL_REJECT_COUNT],
     shared_event_gpu_ordered_registered_waits: u32,
     shared_event_gpu_ordered_compute_dispatches: u32,
+    shared_event_gpu_ordered_draws: u32,
+    shared_event_draw_attempts: u32,
+    shared_event_draw_disjoint_candidates: u32,
+    shared_event_draw_versioned_global_candidates: u32,
+    shared_event_draw_resident_image_candidates: u32,
+    shared_event_draw_internal_drains: u32,
+    shared_event_draw_rejections: [u32; SHARED_EVENT_DRAW_REJECT_COUNT],
+    shared_event_incomplete_signal_footprints: u32,
     shared_event_error_advances: u32,
     shared_event_fallbacks_no_exact_producer: u32,
     shared_event_fallbacks_timeline_overflow: u32,
+    shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics,
+    shared_event_ack_phases: SharedEventAckPhaseStatistics,
+    terminal_publication: TerminalPublicationStatistics,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,
     last_audio_output_frames: u64,
@@ -1539,6 +1651,23 @@ struct GuestCommandBatch {
     global_writebacks: Vec<PendingGlobalWriteback>,
     guest_write_ranges: Vec<PendingGuestWriteRange>,
     memory_writes: Vec<PendingGuestMemoryWrite>,
+    /// Immutable physical destinations written by native work encoded in this batch.
+    ///
+    /// CPU-published globals and command-processor writes remain in their existing vectors and
+    /// are folded into a signal checkpoint at capture time. This journal covers resident/cache
+    /// destinations whose Metal commands can still be in flight when a later queue waits on the
+    /// signal.
+    resident_write_footprint: Vec<PhysicalFootprintRange>,
+    /// Exact Metal texture versions produced by resident writes in this batch.
+    ///
+    /// Shared-event checkpoints retain these objects so a same-queue consumer can sample the
+    /// producer version directly without observing mutable guest RAM or a later residency-map
+    /// tenant. Only ordinary render/storage destinations enter this journal; internal
+    /// rematerialization and scanout work remain host dependencies.
+    resident_texture_versions: Vec<SharedEventResidentTextureVersion>,
+    /// False once native work was encoded for a destination without a stable physical identity.
+    /// Unknown identity must remain a host dependency; virtual non-overlap is not a proof.
+    resident_write_footprint_complete: bool,
     render_pass: Option<OpenGuestRenderPass>,
     compute_encoder: Option<ComputeCommandEncoder>,
     /// Highest SharedEvent signal encoded at an exact command-stream point in this batch.
@@ -1564,7 +1693,31 @@ struct SharedEventSignalCheckpoint {
     /// signal. Zero-copy guest buffers and CPU-published writes are deliberately excluded: their
     /// storage remains mutable and therefore cannot cross a queue on a GPU wait alone.
     global_versions: Vec<SharedEventGlobalBufferVersion>,
+    /// Exact resident texture objects visible at this queue signal.
+    resident_texture_versions: Vec<SharedEventResidentTextureVersion>,
     unresolved_write_ranges: Vec<SharedEventUnresolvedWriteRange>,
+    /// Complete physical write footprint of every unretired producer batch ordered before this
+    /// exact queue signal, including the signal-owning RELEASE_MEM label.
+    pending_write_footprint: Vec<PhysicalFootprintRange>,
+    footprint_complete: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SharedEventWriteKind {
+    ResidentDestination,
+    DirectScanoutTarget,
+    CopiedGlobal,
+    ZeroCopyGlobal,
+    TerminalGuestWrite,
+    InternalResidentDestination,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PhysicalFootprintRange {
+    kind: SharedEventWriteKind,
+    guest_address: u64,
+    byte_count: u64,
+    mapping: GuestSharedMappingIdentity,
 }
 
 #[derive(Clone, Debug)]
@@ -1574,6 +1727,41 @@ struct SharedEventGlobalBufferVersion {
     guest_address: u64,
     byte_count: u64,
     mapping_identity: Option<GuestSharedMappingIdentity>,
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventResidentTextureVersion {
+    texture: Texture,
+    descriptor: GuestTextureDescriptor,
+    texture_type: u32,
+    layer_count: u32,
+    mip_level_count: u32,
+    content_version: u64,
+    /// CPU-write generations at the exact GPU ownership boundary for this version.
+    gpu_write_watch_generations: Vec<u64>,
+    span: ResourceSpan,
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventDrawTextureOverride {
+    sampled: DecodedImageDescriptor,
+    texture: Texture,
+}
+
+impl SharedEventDrawTextureOverride {
+    fn matches(&self, sampled: DecodedImageDescriptor) -> bool {
+        self.sampled.guest == sampled.guest
+            && self.sampled.destination_select == sampled.destination_select
+            && self.sampled.base_mip_level == sampled.base_mip_level
+            && self.sampled.mip_level_count == sampled.mip_level_count
+            && self.sampled.texture_type == sampled.texture_type
+            && self.sampled.layer_count == sampled.layer_count
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventDirectDrawPlan {
+    texture_overrides: Vec<SharedEventDrawTextureOverride>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1622,6 +1810,9 @@ struct PendingGuestMemoryWrite {
     operation: GuestMemoryWriteOperation,
     mapping_identity: Option<GuestSharedMappingIdentity>,
     write_watch: Option<CpuWriteWatch>,
+    /// The command-processor write makes guest RAM authoritative for this destination.
+    /// Apply the cache transition only after the identity-pinned write actually publishes.
+    publishes_guest_memory_authority: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1921,7 +2112,7 @@ struct CachedNggMeshlets {
     primitive_count: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DecodedImageDescriptor {
     guest: GuestTextureDescriptor,
     span: Option<ResourceSpan>,
@@ -1948,6 +2139,21 @@ struct MetalPresenter {
     /// Wakes AppKit immediately when a guest Metal batch reaches a terminal state.
     event_loop_waker: Option<EventLoopProxy<()>>,
     per_queue_guest_batches: bool,
+    /// Experimental B17 admission for direct draws proven disjoint from exact producer writes.
+    /// This remains independently opt-in so the classifier can collect an unbiased OFF baseline.
+    shared_event_direct_draw_admission: bool,
+    /// Optional high-resolution attribution of presenter terminal-retirement work.
+    terminal_publication_timing: bool,
+    /// Bounded command-buffer phase attribution for consumer acknowledgement batches.
+    shared_event_ack_phase_timing: bool,
+    shared_event_ack_phase_samples_remaining: u32,
+    shared_event_ack_batch_cpu: HashMap<u64, SharedEventAckBatchCpuPhases>,
+    pending_shared_event_ack_traces: HashMap<u64, PendingSharedEventAckTrace>,
+    shared_event_ack_traces: HashMap<usize, SharedEventAckTrace>,
+    shared_event_ack_trace_buffers_by_fence: HashMap<SharedEventFence, usize>,
+    /// Monotonic marker for any explicit CPU settlement of guest Metal batches.
+    /// Interval statistics reset, so they cannot reliably identify a drain inside one draw.
+    guest_batch_cpu_synchronization_epoch: u64,
     active_guest_queue: Option<u64>,
     guest_queue_batches: HashMap<u64, GuestQueueBatchState>,
     gpu_wait_fences: GpuWaitFenceMap,
@@ -2041,6 +2247,7 @@ struct MetalPresenter {
     pending_presentations: VecDeque<PendingPresentation>,
     statistics: PresenterStatistics,
     capture_directory: Option<PathBuf>,
+    periodic_frame_capture: bool,
     pressed_keys: HashSet<KeyCode>,
     shader_compile_sender: SyncSender<ShaderCompileRequest>,
     shader_compile_receiver: Receiver<ShaderCompileResult>,
@@ -2084,7 +2291,7 @@ impl MetalPresenter {
         };
         let shader_compiler_workers = shader_compiler_worker_count();
         eprintln!(
-            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB",
+            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB exact-shared-event-readiness=true retired-fence-range-bookkeeping=false",
             SAMPLED_TEXTURE_CACHE_CAPACITY,
             sampled_texture_cache_byte_capacity().map_or(0, |bytes| bytes / (1024 * 1024)),
             resident_texture_cache_byte_capacity().map_or(0, |bytes| bytes / (1024 * 1024)),
@@ -2128,6 +2335,7 @@ impl MetalPresenter {
                                         &compiler_device,
                                         dispatch,
                                         key,
+                                        render_pipeline_archive.as_ref(),
                                     );
                                     ShaderCompileResult::Compute {
                                         key: key.clone(),
@@ -2145,15 +2353,43 @@ impl MetalPresenter {
                 .map_err(|error| format!("could not start Metal compiler worker: {error}"))?;
         }
         drop(shader_compile_results);
+        let per_queue_guest_batches =
+            std::env::var_os("REMU_PER_QUEUE_BATCHES").is_some_and(|value| value == "1");
+        let shared_event_direct_draw_admission = per_queue_guest_batches
+            && std::env::var_os("REMU_SHARED_EVENT_DIRECT_DRAWS").is_some_and(|value| value == "1");
+        let terminal_publication_timing =
+            std::env::var_os("REMU_GPU_TERMINAL_PHASES").is_some_and(|value| value == "1");
+        let shared_event_ack_phase_timing = per_queue_guest_batches
+            && std::env::var_os("REMU_SHARED_EVENT_ACK_PHASES").is_some_and(|value| value == "1");
+        if terminal_publication_timing {
+            eprintln!(
+                "[REMu][PERF-GPU-TERMINAL] optional presenter terminal phase attribution enabled"
+            );
+        }
+        if shared_event_ack_phase_timing {
+            eprintln!(
+                "[REMu][PERF-SHARED-EVENT-ACK-PHASE] bounded consumer acknowledgement attribution enabled samples-per-window=64"
+            );
+        }
+        let mut receiver = OrderedGpuEventReceiver::new(receiver);
+        receiver.set_event_queue_timing(shared_event_ack_phase_timing);
         Ok(Self {
-            receiver: OrderedGpuEventReceiver::new(receiver),
+            receiver,
             window: None,
             device: Some(device),
             layer: None,
             command_queue: Some(command_queue),
             event_loop_waker: None,
-            per_queue_guest_batches: std::env::var_os("REMU_PER_QUEUE_BATCHES")
-                .is_some_and(|value| value == "1"),
+            per_queue_guest_batches,
+            shared_event_direct_draw_admission,
+            terminal_publication_timing,
+            shared_event_ack_phase_timing,
+            shared_event_ack_phase_samples_remaining: 64,
+            shared_event_ack_batch_cpu: HashMap::new(),
+            pending_shared_event_ack_traces: HashMap::new(),
+            shared_event_ack_traces: HashMap::new(),
+            shared_event_ack_trace_buffers_by_fence: HashMap::new(),
+            guest_batch_cpu_synchronization_epoch: 0,
             active_guest_queue: None,
             guest_queue_batches: HashMap::new(),
             gpu_wait_fences: GpuWaitFenceMap::default(),
@@ -2227,6 +2463,8 @@ impl MetalPresenter {
             pending_presentations: VecDeque::new(),
             statistics: PresenterStatistics::new(),
             capture_directory: std::env::var_os("REMU_CAPTURE_DIR").map(PathBuf::from),
+            periodic_frame_capture: std::env::var_os("REMU_CAPTURE_FRAMES")
+                .is_some_and(|value| value == "1"),
             pressed_keys: HashSet::new(),
             shader_compile_sender,
             shader_compile_receiver,
@@ -2257,12 +2495,14 @@ struct GuestMipChainLayout {
 }
 
 pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::PresenterEnter);
     if headless_metal_requested() {
         return run_headless_presenter(receiver);
     }
     disable_appkit_state_restoration();
     eprintln!("[REMu][METAL] starting AppKit event loop");
     let mut presenter = MetalPresenter::new(receiver)?;
+    remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::PresenterResourcesReady);
     let mut builder = EventLoop::builder();
     builder
         .with_activation_policy(ActivationPolicy::Regular)
@@ -2273,6 +2513,11 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
     presenter.event_loop_waker = Some(event_loop.create_proxy());
     if presenter.per_queue_guest_batches {
         eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
+    }
+    if presenter.shared_event_direct_draw_admission {
+        eprintln!(
+            "[REMu][METAL] experimental disjoint/fence-versioned/resident-versioned direct-draw SharedEvent admission enabled"
+        );
     }
     event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
     // Winit owns NSApplication's delegate and launch state. Calling `finishLaunching` or its

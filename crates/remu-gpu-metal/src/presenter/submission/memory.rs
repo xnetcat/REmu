@@ -5,10 +5,11 @@ use super::super::WritebackTrigger;
 use super::{
     GuestMemoryWriteOperation, MetalPresenter, OrderedEventSource, PendingGlobalWriteback,
     PendingGuestMemoryWrite, RangeSet, ResourceSpan, WriteWatchRefresh, guest_batch_writes_overlap,
-    guest_ranges_overlap, guest_texture_byte_count, merge_guest_batch_result,
-    read_guest_memory_wait_value, rearm_color_metadata_clear, rearm_depth_metadata_clear,
-    record_diagnostic_memory_copy, refresh_resident_texture_write_watch,
-    retire_sampled_textures_matching, trace_resident_texture_removal,
+    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
+    merge_guest_batch_result, read_guest_memory_wait_value, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    refresh_resident_texture_write_watch, retire_sampled_textures_matching,
+    trace_resident_texture_removal,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use remu_gpu::{
@@ -20,25 +21,78 @@ use remu_memory::{
     notify_guest_memory_written, read_guest_shared_backing, write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
+
+pub(crate) const SAME_QUEUE_DMA_FILL_REJECT_COUNT: usize = 12;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(crate) enum SameQueueDmaFillReject {
+    CrossQueue,
+    NonImmediateSource,
+    DestinationSelector,
+    SourceSnapshot,
+    UnsupportedWidth,
+    NonZeroImmediate,
+    InvalidRange,
+    MissingIdentity,
+    MetadataOverlap,
+    CacheOverlap,
+    IncompleteDependency,
+    MissingOpenBatch,
+}
+
+impl SameQueueDmaFillReject {
+    pub(crate) const fn index(self) -> usize {
+        self as usize
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::CrossQueue => "cross-queue",
+            Self::NonImmediateSource => "non-immediate-source",
+            Self::DestinationSelector => "destination-selector",
+            Self::SourceSnapshot => "source-snapshot",
+            Self::UnsupportedWidth => "unsupported-width",
+            Self::NonZeroImmediate => "nonzero-immediate",
+            Self::InvalidRange => "invalid-range",
+            Self::MissingIdentity => "missing-identity",
+            Self::MetadataOverlap => "metadata-overlap",
+            Self::CacheOverlap => "cache-overlap",
+            Self::IncompleteDependency => "incomplete-dependency",
+            Self::MissingOpenBatch => "missing-open-batch",
+        }
+    }
+}
+
+pub(crate) struct PreparedSameQueueDmaFill {
+    pending: PendingGuestMemoryWrite,
+}
 
 impl MetalPresenter {
     pub(crate) fn publish_terminal_guest_memory_writes(
         &mut self,
         pending: &[PendingGuestMemoryWrite],
-        result: Result<(), String>,
+        mut result: Result<(), String>,
     ) -> Result<(), String> {
-        let publication = apply_pending_guest_memory_writes(pending);
-        if publication.is_ok() {
-            self.record_produced_guest_memory_writes(pending);
-            for write in pending {
+        for write in pending {
+            let publication = apply_pending_guest_memory_writes(std::slice::from_ref(write));
+            let published = publication.is_ok();
+            if published {
+                self.publish_deferred_dma_destination_authority(std::slice::from_ref(write));
+                self.record_produced_guest_memory_writes(std::slice::from_ref(write));
                 let (address, byte_count) = write.range();
                 self.receiver
                     .retry_guest_memory_waits_overlapping(address, byte_count);
             }
+            result =
+                merge_guest_batch_result(result, "ordered guest memory publication", publication);
+            if !published {
+                break;
+            }
         }
-        merge_guest_batch_result(result, "ordered guest memory publication", publication)
+        result
     }
 
     pub(crate) fn execute_guest_memory_release(
@@ -70,9 +124,227 @@ impl MetalPresenter {
             // through host polling. Open a queue-local batch for the signal; Metal FIFO order keeps
             // it behind earlier committed work, and host retirement remains FIFO as well.
             self.ensure_active_open_guest_batch()?;
+            // The release label is a terminal command-processor write owned by this exact queue
+            // point. Attach it before freezing the signal checkpoint so a consumer touching the
+            // label cannot be misclassified as disjoint while the store remains unpublished.
+            self.queue_pinned_guest_memory_write(pending)?;
             self.encode_guest_release_shared_event(queue_id, &matching_waits)?;
+            return Ok(());
         }
         self.queue_pinned_guest_memory_write(pending)
+    }
+
+    pub(crate) fn prepare_same_queue_immediate_fill(
+        &mut self,
+        queue_id: u64,
+        dependencies: &[super::super::SharedEventFence],
+        copy: &GpuMemoryCopy,
+    ) -> Option<PreparedSameQueueDmaFill> {
+        self.statistics.shared_event_dma_fill_attempts = self
+            .statistics
+            .shared_event_dma_fill_attempts
+            .saturating_add(1);
+        match self.prepare_same_queue_immediate_fill_inner(queue_id, dependencies, copy) {
+            Ok(prepared) => {
+                self.statistics.shared_event_gpu_ordered_dma_fills = self
+                    .statistics
+                    .shared_event_gpu_ordered_dma_fills
+                    .saturating_add(1);
+                static ACCEPTED: AtomicUsize = AtomicUsize::new(0);
+                let occurrence = ACCEPTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if occurrence <= 16 || occurrence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][SHARED-DMA-FILL] occurrence={occurrence} queue=q{queue_id} destination={:#x} bytes={:#x} value={:#010x} action=attach-terminal",
+                        copy.destination_address, copy.byte_count, copy.source_address as u32,
+                    );
+                }
+                Some(prepared)
+            }
+            Err(reason) => {
+                let rejects = &mut self.statistics.shared_event_dma_fill_rejections;
+                rejects[reason.index()] = rejects[reason.index()].saturating_add(1);
+                static REJECTED: AtomicUsize = AtomicUsize::new(0);
+                let occurrence = REJECTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if occurrence <= 16 || occurrence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][SHARED-DMA-FILL] occurrence={occurrence} queue=q{queue_id} destination={:#x} bytes={:#x} src-sel={} dst-sel={} action=host-gate reason={}",
+                        copy.destination_address,
+                        copy.byte_count,
+                        copy.source_selection,
+                        copy.destination_selection,
+                        reason.label(),
+                    );
+                }
+                None
+            }
+        }
+    }
+
+    fn prepare_same_queue_immediate_fill_inner(
+        &self,
+        queue_id: u64,
+        dependencies: &[super::super::SharedEventFence],
+        copy: &GpuMemoryCopy,
+    ) -> Result<PreparedSameQueueDmaFill, SameQueueDmaFillReject> {
+        if dependencies.is_empty()
+            || dependencies
+                .iter()
+                .any(|fence| fence.producer().queue_id() != queue_id)
+        {
+            return Err(if dependencies.is_empty() {
+                SameQueueDmaFillReject::IncompleteDependency
+            } else {
+                SameQueueDmaFillReject::CrossQueue
+            });
+        }
+        if copy.source_selection != 2 {
+            return Err(SameQueueDmaFillReject::NonImmediateSource);
+        }
+        if copy.destination_selection != 3 {
+            return Err(SameQueueDmaFillReject::DestinationSelector);
+        }
+        if copy.source_snapshot.is_some() {
+            return Err(SameQueueDmaFillReject::SourceSnapshot);
+        }
+        if copy.byte_count != 4 {
+            return Err(SameQueueDmaFillReject::UnsupportedWidth);
+        }
+        if copy.source_address as u32 != 0 {
+            return Err(SameQueueDmaFillReject::NonZeroImmediate);
+        }
+        if copy.destination_address == 0
+            || !copy.destination_address.is_multiple_of(4)
+            || copy
+                .destination_address
+                .checked_add(copy.byte_count)
+                .is_none()
+        {
+            return Err(SameQueueDmaFillReject::InvalidRange);
+        }
+
+        let Some(consumer) = self.guest_queue_batches.get(&queue_id) else {
+            return Err(SameQueueDmaFillReject::MissingOpenBatch);
+        };
+        if consumer.open_batch.is_none() {
+            return Err(SameQueueDmaFillReject::MissingOpenBatch);
+        }
+        for dependency in dependencies {
+            let Some(checkpoint) = consumer
+                .resource_dependencies
+                .get(&dependency.producer())
+                .filter(|checkpoint| checkpoint.fence == *dependency)
+            else {
+                return Err(SameQueueDmaFillReject::IncompleteDependency);
+            };
+            if !checkpoint.footprint_complete {
+                return Err(SameQueueDmaFillReject::IncompleteDependency);
+            }
+        }
+
+        let Some(identity) =
+            guest_shared_mapping_identity(copy.destination_address, copy.byte_count)
+        else {
+            return Err(SameQueueDmaFillReject::MissingIdentity);
+        };
+        let metadata_overlap = self
+            .color_metadata_clears
+            .keys()
+            .chain(self.depth_metadata_clears.keys())
+            .any(|&address| {
+                guest_physical_ranges_overlap(copy.destination_address, copy.byte_count, address, 4)
+            });
+        if metadata_overlap {
+            return Err(SameQueueDmaFillReject::MetadataOverlap);
+        }
+        let resident_overlap = self.resident_guest_textures.values().any(|resident| {
+            let (address, byte_count) = resident.write_watch.range();
+            guest_physical_ranges_overlap(
+                copy.destination_address,
+                copy.byte_count,
+                address,
+                byte_count,
+            )
+        });
+        let sampled_overlap = self.sampled_texture_cache.values().any(|cached| {
+            let (address, byte_count) = cached.write_watch.range();
+            guest_physical_ranges_overlap(
+                copy.destination_address,
+                copy.byte_count,
+                address,
+                byte_count,
+            )
+        });
+        let multisample_overlap = self.multisample_textures.keys().any(|key| {
+            guest_texture_byte_count(key.descriptor).is_none_or(|byte_count| {
+                guest_physical_ranges_overlap(
+                    copy.destination_address,
+                    copy.byte_count,
+                    key.descriptor.address,
+                    byte_count,
+                )
+            })
+        });
+        let direct_scanout_overlap = self.direct_scanout_textures.values().any(|cached| {
+            guest_texture_byte_count(cached.descriptor).is_none_or(|byte_count| {
+                guest_physical_ranges_overlap(
+                    copy.destination_address,
+                    copy.byte_count,
+                    cached.descriptor.address,
+                    byte_count,
+                )
+            })
+        });
+        let scanout_snapshot_overlap = self.scanout_snapshot_textures.values().any(|cached| {
+            guest_texture_byte_count(cached.descriptor).is_none_or(|byte_count| {
+                guest_physical_ranges_overlap(
+                    copy.destination_address,
+                    copy.byte_count,
+                    cached.descriptor.address,
+                    byte_count,
+                )
+            })
+        });
+        if resident_overlap
+            || sampled_overlap
+            || multisample_overlap
+            || direct_scanout_overlap
+            || scanout_snapshot_overlap
+        {
+            return Err(SameQueueDmaFillReject::CacheOverlap);
+        }
+
+        let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Fill {
+            address: copy.destination_address,
+            value: copy.source_address as u32,
+            dword_count: copy.byte_count / 4,
+        })
+        .map_err(|_| SameQueueDmaFillReject::MissingIdentity)?;
+        if pending.mapping_identity != Some(identity) {
+            return Err(SameQueueDmaFillReject::MissingIdentity);
+        }
+        Ok(PreparedSameQueueDmaFill { pending })
+    }
+
+    pub(crate) fn queue_prepared_same_queue_immediate_fill(
+        &mut self,
+        queue_id: u64,
+        copy: &GpuMemoryCopy,
+        prepared: PreparedSameQueueDmaFill,
+    ) -> Result<(), String> {
+        if self.active_guest_queue != Some(queue_id) {
+            return Err(format!(
+                "same-queue DMA fill lost active queue expected={queue_id} actual={:?}",
+                self.active_guest_queue,
+            ));
+        }
+        record_diagnostic_memory_copy(copy);
+        let batch = self
+            .guest_queue_batches
+            .get_mut(&queue_id)
+            .and_then(|state| state.open_batch.as_mut())
+            .ok_or_else(|| format!("same-queue DMA fill has no open q{queue_id} batch"))?;
+        batch.memory_writes.push(prepared.pending);
+        Ok(())
     }
 
     pub(crate) fn execute_guest_memory_copy(&mut self, copy: GpuMemoryCopy) -> Result<(), String> {
@@ -121,8 +393,10 @@ impl MetalPresenter {
                 value: copy.source_address as u32,
                 dword_count: copy.byte_count / 4,
             })?;
-            rearm_color_metadata_clear(&mut self.color_metadata_clears, copy.destination_address);
-            rearm_depth_metadata_clear(&mut self.depth_metadata_clears, copy.destination_address);
+            // The fill itself is a terminal command-processor publication. Cache and metadata
+            // authority must move at that same truthful point, not while the owning Metal batch
+            // is still in flight.
+            return Ok(());
         } else {
             copy.source_address
                 .checked_add(copy.byte_count)
@@ -280,7 +554,12 @@ impl MetalPresenter {
         // The copy made guest RAM authoritative for its destination. Resolving that range
         // physically also reaches residents mapped at an unrelated virtual address, which the
         // virtual-address scan this replaces could not see.
-        let destination_span = ResourceSpan::new(copy.destination_address, copy.byte_count);
+        self.publish_dma_destination_authority(copy.destination_address, copy.byte_count);
+        Ok(())
+    }
+
+    fn publish_dma_destination_authority(&mut self, address: u64, byte_count: u64) {
+        let destination_span = ResourceSpan::new(address, byte_count);
         self.note_guest_memory_authoritative(
             &destination_span,
             &RangeSet::for_span(&destination_span),
@@ -289,25 +568,64 @@ impl MetalPresenter {
         );
         self.multisample_textures.retain(|key, _| {
             guest_texture_byte_count(key.descriptor).is_none_or(|length| {
-                !guest_ranges_overlap(
-                    key.descriptor.address,
-                    length,
-                    copy.destination_address,
-                    copy.byte_count,
-                )
+                !guest_physical_ranges_overlap(key.descriptor.address, length, address, byte_count)
             })
         });
         retire_sampled_textures_matching(&mut self.sampled_texture_cache, |key, _| {
             guest_texture_byte_count(key.descriptor).is_some_and(|length| {
-                guest_ranges_overlap(
-                    key.descriptor.address,
+                guest_physical_ranges_overlap(key.descriptor.address, length, address, byte_count)
+            })
+        });
+        // Direct scanout and scanout snapshots are private Metal copies without write watches.
+        // Once DMA publishes guest RAM they cannot remain readable aliases of those bytes.
+        self.direct_scanout_textures.retain(|_, cached| {
+            guest_texture_byte_count(cached.descriptor).is_some_and(|length| {
+                !guest_physical_ranges_overlap(
+                    address,
+                    byte_count,
+                    cached.descriptor.address,
                     length,
-                    copy.destination_address,
-                    copy.byte_count,
                 )
             })
         });
-        Ok(())
+        self.scanout_snapshot_textures.retain(|_, cached| {
+            guest_texture_byte_count(cached.descriptor).is_some_and(|length| {
+                !guest_physical_ranges_overlap(
+                    address,
+                    byte_count,
+                    cached.descriptor.address,
+                    length,
+                )
+            })
+        });
+    }
+
+    fn publish_deferred_dma_destination_authority(&mut self, pending: &[PendingGuestMemoryWrite]) {
+        for write in pending
+            .iter()
+            .filter(|write| write.publishes_guest_memory_authority)
+        {
+            let (address, byte_count) = write.range();
+            let color_metadata = self
+                .color_metadata_clears
+                .keys()
+                .copied()
+                .filter(|&metadata| guest_physical_ranges_overlap(address, byte_count, metadata, 4))
+                .collect::<Vec<_>>();
+            for metadata in color_metadata {
+                rearm_color_metadata_clear(&mut self.color_metadata_clears, metadata);
+            }
+            let depth_metadata = self
+                .depth_metadata_clears
+                .keys()
+                .copied()
+                .filter(|&metadata| guest_physical_ranges_overlap(address, byte_count, metadata, 4))
+                .collect::<Vec<_>>();
+            for metadata in depth_metadata {
+                rearm_depth_metadata_clear(&mut self.depth_metadata_clears, metadata);
+            }
+            self.publish_dma_destination_authority(address, byte_count);
+        }
     }
 
     pub(crate) fn execute_guest_memory_write(
@@ -359,6 +677,7 @@ impl MetalPresenter {
             batch.memory_writes.push(write);
         } else {
             apply_pending_guest_memory_writes(std::slice::from_ref(&write))?;
+            self.publish_deferred_dma_destination_authority(std::slice::from_ref(&write));
             self.record_produced_guest_memory_writes(std::slice::from_ref(&write));
         }
         Ok(())
@@ -383,17 +702,35 @@ impl MetalPresenter {
                 return Ok(());
             }
         };
-        let batch = state
+        {
+            let batch = state
+                .open_batch
+                .as_mut()
+                .ok_or("shared-event release has no open producer batch")?;
+            batch.close_active_pass_encoders();
+            batch
+                .command_buffer
+                .encode_signal_event(state.shared_event_timeline.event(), fence.value());
+            batch.max_encoded_signal = Some(fence);
+        }
+        let checkpoint =
+            super::super::SharedEventSignalCheckpoint::capture_queue_prefix(state, fence);
+        if !checkpoint.footprint_complete {
+            self.statistics.shared_event_incomplete_signal_footprints = self
+                .statistics
+                .shared_event_incomplete_signal_footprints
+                .saturating_add(1);
+        }
+        debug_assert!(
+            checkpoint.footprint_complete,
+            "shared-event RELEASE_MEM has an incomplete producer footprint"
+        );
+        state
             .open_batch
             .as_mut()
-            .ok_or("shared-event release has no open producer batch")?;
-        batch.close_active_pass_encoders();
-        batch
-            .command_buffer
-            .encode_signal_event(state.shared_event_timeline.event(), fence.value());
-        batch.max_encoded_signal = Some(fence);
-        let checkpoint = super::super::SharedEventSignalCheckpoint::capture(batch, fence);
-        batch.signal_checkpoints.push(checkpoint);
+            .expect("shared-event release batch remains open")
+            .signal_checkpoints
+            .push(checkpoint);
         for &wait_id in matching_waits {
             let _ = self.gpu_wait_fences.bind_if_unbound(wait_id, fence);
         }
@@ -836,6 +1173,8 @@ pub(crate) fn pin_guest_memory_write(
     operation: GuestMemoryWriteOperation,
 ) -> Result<PendingGuestMemoryWrite, String> {
     validate_guest_memory_operation(&operation)?;
+    let publishes_guest_memory_authority =
+        matches!(operation, GuestMemoryWriteOperation::Fill { .. });
     let (address, byte_count) = operation.range();
     let mapping_identity = guest_shared_mapping_identity(address, byte_count);
     let write_watch = if mapping_identity.is_some() {
@@ -853,6 +1192,7 @@ pub(crate) fn pin_guest_memory_write(
         operation,
         mapping_identity,
         write_watch,
+        publishes_guest_memory_authority,
     })
 }
 
@@ -1094,10 +1434,10 @@ pub(crate) fn apply_pending_guest_memory_writes(
             );
             if matches!(
                 pending_write.operation,
-                GuestMemoryWriteOperation::Copy { .. }
+                GuestMemoryWriteOperation::Fill { .. } | GuestMemoryWriteOperation::Copy { .. }
             ) {
-                // The immediate copy path notified the watch layer as it wrote; the deferred
-                // application owes the same dirtying so armed views of the destination revalidate.
+                // Backing-identity writes bypass protected guest VAs. Publish the same dirtying
+                // that an address-space write would so every persistent alias watch revalidates.
                 let _ = notify_guest_memory_written(address, byte_count);
             }
         }

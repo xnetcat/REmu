@@ -481,6 +481,24 @@ fn pthread_threads_are_distinct_guest_pointer_objects() {
 }
 
 #[test]
+fn guest_integer_thread_id_tracks_each_thread_without_stale_values() {
+    crate::set_current_guest_thread_unique_id(41);
+    let worker = std::thread::spawn(|| {
+        let initial = crate::current_guest_thread_unique_id();
+        crate::set_current_guest_thread_unique_id(73);
+        let assigned = crate::current_guest_thread_unique_id();
+        crate::set_current_guest_thread_unique_id(0);
+        (initial, assigned, crate::current_guest_thread_unique_id())
+    });
+
+    assert_eq!(worker.join().unwrap(), (0, 73, 0));
+    assert_eq!(crate::current_guest_thread_unique_id(), 41);
+    crate::set_current_guest_thread_unique_id(99);
+    assert_eq!(crate::current_guest_thread_unique_id(), 99);
+    crate::set_current_guest_thread_unique_id(0);
+}
+
+#[test]
 fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
     let mut state = ProbeDispatchState::default();
     let mut first_key = u32::MAX;
@@ -516,8 +534,7 @@ fn pthread_keys_reuse_deleted_slots_and_clear_values_before_destructors() {
     assert_eq!(replacement_key, first_key);
     let replacement_generation = state.pthread_keys[&replacement_key].generation;
     crate::GUEST_PTHREAD_SPECIFIC.with_borrow_mut(|values| {
-        values[replacement_key as usize] =
-            (replacement_generation.saturating_sub(1), 0xdead_beef);
+        values[replacement_key as usize] = (replacement_generation.saturating_sub(1), 0xdead_beef);
     });
     assert_eq!(
         crate::pthread_get_specific(replacement_key),

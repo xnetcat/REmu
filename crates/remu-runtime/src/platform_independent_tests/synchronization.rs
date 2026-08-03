@@ -175,6 +175,87 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
     assert_eq!(crate::guest_rwlock_destroy(address), 0);
 }
 
+#[test]
+fn rwlock_waiters_keep_the_object_live_and_reinitialization_is_fresh() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_00c0;
+    let invalid = u64::from(libc::EINVAL.cast_unsigned());
+
+    assert_eq!(crate::guest_rwlock_init(0), invalid);
+    assert_eq!(crate::guest_rwlock_lock(0, true, false), invalid);
+    assert_eq!(crate::guest_rwlock_destroy(0), invalid);
+    assert_eq!(crate::guest_rwlock_unlock(0), invalid);
+    assert_eq!(crate::guest_rwlock_init(address), 0);
+    assert_eq!(
+        crate::guest_rwlock_init(address),
+        u64::from(libc::EBUSY.cast_unsigned())
+    );
+    assert_eq!(crate::guest_rwlock_lock(address, true, false), 0);
+    assert_eq!(
+        crate::guest_rwlock_lock(address, true, true),
+        u64::from(libc::EDEADLK.cast_unsigned())
+    );
+
+    let (acquired_sender, acquired_receiver) = std::sync::mpsc::channel();
+    let (release_sender, release_receiver) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        assert_eq!(
+            crate::guest_rwlock_unlock(address),
+            u64::from(libc::EPERM.cast_unsigned()),
+            "a non-owner cannot release the active writer"
+        );
+        let result = crate::guest_rwlock_lock(address, false, false);
+        acquired_sender
+            .send(result)
+            .expect("test receiver remains live");
+        if result == 0 {
+            release_receiver.recv().expect("reader release signal");
+            assert_eq!(crate::guest_rwlock_unlock(address), 0);
+        }
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if crate::guest_sync::guest_rwlock_waiter_counts(address) == Some((1, 0)) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest rwlock reader did not park"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        crate::guest_rwlock_destroy(address),
+        u64::from(libc::EBUSY.cast_unsigned()),
+        "an active writer and its queued reader keep the object live"
+    );
+
+    assert_eq!(crate::guest_rwlock_unlock(address), 0);
+    assert_eq!(
+        acquired_receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reader wakes after writer release"),
+        0
+    );
+    assert_eq!(
+        crate::guest_rwlock_destroy(address),
+        u64::from(libc::EBUSY.cast_unsigned()),
+        "the acquired reader keeps the object live"
+    );
+    release_sender.send(()).expect("reader remains live");
+    reader.join().expect("guest reader thread");
+
+    assert_eq!(crate::guest_rwlock_destroy(address), 0);
+    assert_eq!(crate::guest_rwlock_unlock(address), invalid);
+    assert_eq!(crate::guest_rwlock_init(address), 0);
+    assert_eq!(crate::guest_rwlock_lock(address, true, false), 0);
+    assert_eq!(crate::guest_rwlock_unlock(address), 0);
+    assert_eq!(crate::guest_rwlock_destroy(address), 0);
+}
+
 /// Every console-named reader/writer-lock NID, in dispatch order.
 const CONSOLE_RWLOCK_NIDS: [&str; 8] = [
     "6ULAa0fq4jA",
@@ -307,13 +388,8 @@ fn a_contended_console_named_write_lock_does_not_hold_the_dispatch_lock() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let waiting = crate::guest_sync()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rwlocks
-            .get(&address)
-            .map_or(0, |lock| lock.waiting_writers);
+        let waiting = crate::guest_sync::guest_rwlock_waiter_counts(address)
+            .map_or(0, |(_, waiting_writers)| waiting_writers);
         if waiting == 1 {
             break;
         }
@@ -421,13 +497,8 @@ fn rwlock_keeps_reader_priority_while_a_writer_is_waiting() {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        let waiting = crate::guest_sync()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .rwlocks
-            .get(&address)
-            .map_or(0, |lock| lock.waiting_writers);
+        let waiting = crate::guest_sync::guest_rwlock_waiter_counts(address)
+            .map_or(0, |(_, waiting_writers)| waiting_writers);
         if waiting == 1 {
             break;
         }
@@ -525,6 +596,93 @@ fn mutex_types_apply_gen5_same_thread_relock_semantics() {
     );
     assert_eq!(crate::guest_mutex_unlock(recursive), 0);
     assert_eq!(crate::guest_mutex_destroy(recursive), 0);
+}
+
+#[test]
+fn mutex_lookup_cache_does_not_resurrect_a_destroyed_generation() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_1450;
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    let first = crate::guest_mutex_entry(address, false).expect("first mutex generation");
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+
+    assert_eq!(
+        crate::guest_mutex_init(
+            address,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
+        0
+    );
+    let second = crate::guest_mutex_entry(address, false).expect("second mutex generation");
+    assert!(!std::sync::Arc::ptr_eq(&first, &second));
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    // A stale default-mutex generation would report EBUSY here. The replacement is recursive.
+    assert_eq!(crate::guest_mutex_lock(address, true), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+}
+
+#[test]
+fn mutex_unlock_notifies_only_when_a_contender_is_waiting() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let address = 0x7fff_0000_1480;
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    crate::guest_sync::GUEST_MUTEX_WAKE_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(
+        crate::guest_sync::GUEST_MUTEX_WAKE_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an uncontended unlock has nobody to notify"
+    );
+
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    let contender = std::thread::spawn(move || {
+        assert_eq!(crate::guest_mutex_lock(address, false), 0);
+        assert_eq!(crate::guest_mutex_unlock(address), 0);
+    });
+    let entry = crate::guest_mutex_entry(address, false).expect("test mutex entry");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let waiters = entry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .waiters;
+        if waiters == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "guest mutex contender did not block"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    contender.join().expect("guest mutex contender");
+    assert_eq!(
+        crate::guest_sync::GUEST_MUTEX_WAKE_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the single blocked contender needs exactly one host notification"
+    );
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
 }
 
 #[test]

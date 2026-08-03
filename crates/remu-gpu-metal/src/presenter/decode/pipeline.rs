@@ -10,12 +10,13 @@ use super::{
     VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
-    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_video_chain_selected_draw,
+    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_target_address_matches, diagnostic_video_chain_selected_draw,
     evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
     evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
     fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
@@ -766,10 +767,20 @@ pub(crate) fn pixel_depth_export_enabled(
 
 fn graphics_diagnostic_pipeline_state(
     draw: &IndexedDraw,
+    targets: &[DecodedRenderTarget],
     pixel_evaluation: &ShaderEvaluation,
     pixel_program: &remu_shader::Program,
     sample_count: u32,
 ) -> GraphicsDiagnosticPipelineState {
+    let selected_target = draw.sequence >= diagnostic_dump_target_minimum_draw()
+        && targets.iter().any(|target| {
+            diagnostic_target_address_matches(
+                diagnostic_dump_target_address(),
+                target.texture.address,
+                target.texture.width,
+                target.texture.height,
+            )
+        });
     let selected_shader = diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address)
         || diagnostic_dump_target_pixel_instruction_count()
             == Some(pixel_program.instructions.len())
@@ -790,14 +801,15 @@ fn graphics_diagnostic_pipeline_state(
         capture_pixel_output: diagnostic_capture_pixel_output()
             && ((sample_count > 1 && pixel_program.instructions.len() == 370)
                 || selected_shader
+                || selected_target
                 || samples_large_video),
         force_visible_clip_depth: sample_count > 1 && diagnostic_force_visible_clip_depth(),
         force_vertex_pattern: diagnostic_force_msaa_vertex_pattern()
-            && (sample_count > 1 || selected_shader),
+            && (sample_count > 1 || selected_shader || selected_target),
         force_vertex_fetch_id: diagnostic_force_vertex_fetch_id()
-            && (sample_count > 1 || selected_shader),
+            && (sample_count > 1 || selected_shader || selected_target),
         capture_vertex_position: diagnostic_capture_vertex_position()
-            && (sample_count > 1 || selected_shader || samples_large_video),
+            && (sample_count > 1 || selected_shader || selected_target || samples_large_video),
     }
 }
 
@@ -913,6 +925,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             && pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         diagnostics: graphics_diagnostic_pipeline_state(
             draw,
+            targets,
             pixel_evaluation,
             pixel_program,
             sample_count,

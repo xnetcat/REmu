@@ -17,6 +17,7 @@ use metal::{
 use remu_shader::ShaderEvaluation;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use super::super::SharedEventWriteKind;
 use super::{
     DecodedImageDescriptor, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     MetalPresenter, ResidentGuestTexture, decode_image_descriptor, guest_texture_byte_count,
@@ -274,6 +275,10 @@ impl MetalPresenter {
                     );
                 }
                 blit.end_encoding();
+                batch.record_resident_write_footprint(
+                    SharedEventWriteKind::InternalResidentDestination,
+                    descriptor.span,
+                );
             }
         }
         Ok(())

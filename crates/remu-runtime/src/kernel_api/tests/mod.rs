@@ -72,6 +72,9 @@ impl MountFixture {
                 read_only,
             },
         );
+        if !read_only {
+            state.prepared_save_resources.insert(1);
+        }
         Self { directory, state }
     }
 

@@ -4,9 +4,34 @@
 use super::{
     civil_from_unix_seconds, guest_clock_gettime, guest_kernel_convert_localtime_to_utc,
     guest_kernel_convert_utc_to_localtime, guest_kernel_gettimeofday, guest_posix_gettimeofday,
-    rtc_get_current_clock_local_time, rtc_get_current_tick, rtc_get_tick, rtc_set_tick,
-    unix_days_from_civil,
+    process_clock_nanos, process_time_since_nanos, rtc_get_current_clock_local_time,
+    rtc_get_current_tick, rtc_get_tick, rtc_set_tick, unix_days_from_civil,
 };
+
+#[test]
+fn process_clock_is_monotonic() {
+    let mut previous = process_clock_nanos();
+    for _ in 0..100_000 {
+        let current = process_clock_nanos();
+        assert!(current >= previous, "process clock moved backwards");
+        previous = current;
+    }
+}
+
+#[test]
+fn process_time_preserves_nanosecond_scaling_and_saturates() {
+    assert_eq!(
+        process_time_since_nanos(9_876_543, 1_000_000, true),
+        8_876_543
+    );
+    assert_eq!(process_time_since_nanos(9_876_543, 1_000_000, false), 8_876);
+    assert_eq!(process_time_since_nanos(1, u64::MAX, true), 0);
+    assert_eq!(process_time_since_nanos(u64::MAX, 0, true), u64::MAX);
+    assert_eq!(
+        process_time_since_nanos(u64::MAX, 0, false),
+        u64::MAX / 1_000
+    );
+}
 
 #[test]
 fn translates_console_clock_ids_to_realtime() {

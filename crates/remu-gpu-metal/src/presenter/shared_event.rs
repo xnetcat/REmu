@@ -29,7 +29,7 @@ impl SharedEventProducerId {
 }
 
 /// One exact point on a producer queue's monotonic `SharedEvent` timeline.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct SharedEventFence {
     producer: SharedEventProducerId,
     value: u64,
@@ -189,10 +189,6 @@ impl GpuWaitFenceMap {
             return false;
         }
         self.missing_once.insert(wait_id)
-    }
-
-    pub(crate) fn fences(&self) -> impl Iterator<Item = SharedEventFence> + '_ {
-        self.by_wait.values().copied()
     }
 
     #[cfg(test)]
