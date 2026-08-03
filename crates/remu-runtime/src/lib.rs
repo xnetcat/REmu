@@ -2013,6 +2013,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }
     state.video_out = VideoOutState::default();
     game_root.clone_into(&mut state.game_root);
+    eprintln!("[REMu][VFS] direct immutable app path routing enabled");
     state.np_universal_data = np::UniversalDataState::default();
     state.np_game_intent = np::GameIntentState::default();
     state.np_trophy = np::TrophyState::default();
