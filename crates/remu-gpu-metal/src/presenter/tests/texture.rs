@@ -4588,6 +4588,159 @@ fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
 }
 
 #[test]
+fn render_target_policy_rejects_residency_from_a_replaced_mapping() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let original_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original backing");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original target mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("original target resident");
+    assert!(
+        presenter
+            .render_target_has_live_resident_storage(
+                descriptor,
+                ResourceSpan::for_texture(descriptor),
+            )
+            .expect("original policy query")
+    );
+
+    memory
+        .unmap(address, GUEST_PAGE_SIZE)
+        .expect("retire original mapping");
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement target mapping");
+
+    assert!(
+        !presenter
+            .render_target_has_live_resident_storage(
+                descriptor,
+                ResourceSpan::for_texture(descriptor),
+            )
+            .expect("replacement policy query"),
+        "the retired backing must not suppress compressed-target first-use discard",
+    );
+    assert!(
+        !presenter.resident_guest_textures.contains_key(&descriptor),
+        "mapping replacement destroys the old allocation instead of demoting it",
+    );
+}
+
+#[test]
+fn render_target_policy_rematerialises_b15_stale_gpu_authority_before_discard() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("alias mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R32Float,
+        bytes_per_pixel: 4,
+    };
+    let target = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::R32Uint,
+        ..source
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    presenter
+        .ensure_resident_texture(&device, target)
+        .expect("target resident");
+    presenter.mark_resident_texture_written(source);
+    let source_version = presenter.resident_guest_textures[&source].content_version;
+    assert!(matches!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let views_before = OWNED_REMATERIALISE_VIEW.load(AtomicOrdering::Relaxed);
+    assert!(
+        presenter
+            .render_target_has_live_resident_storage(target, ResourceSpan::for_texture(target))
+            .expect("prepare stale target for load policy"),
+        "recoverable GPU authority is resident before DCC policy is selected",
+    );
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before,
+        "pre-policy rematerialisation must not round-trip through guest RAM",
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_VIEW.load(AtomicOrdering::Relaxed),
+        views_before + 1,
+    );
+    let resident = &presenter.resident_guest_textures[&target];
+    assert!(resident.serves_reads());
+    assert!(resident.gpu_written());
+    assert_eq!(resident.content_version, source_version);
+    assert!(
+        presenter.open_guest_batch.is_none(),
+        "a zero-copy rematerialisation cannot publish guest completion",
+    );
+}
+
+#[test]
 fn persistent_target_removes_per_draw_full_surface_transfers() {
     let frame_bytes = 3_840_u64 * 2_160 * 4;
     let draws = 100_u64;

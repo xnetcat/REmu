@@ -468,13 +468,11 @@ impl MetalPresenter {
                 target_resident_descriptors.push(None);
                 texture
             } else {
-                let has_resident_storage = self.resident_guest_textures.values().any(|resident| {
-                    resident.serves_reads()
-                        && guest_texture_descriptors_share_storage(
-                            resident.descriptor,
-                            target.texture,
-                        )
-                });
+                // Decide the attachment load policy only after residency has observed mapping
+                // replacement and restored any B15-demoted GPU authority. The ensure below is too
+                // late: this boolean decides whether DCC bytes are loaded or discarded.
+                let has_resident_storage = self
+                    .render_target_has_live_resident_storage(target.texture, target.span)?;
                 let metadata_clear_pending = consume_color_metadata_clear(
                     &mut self.color_metadata_clears,
                     render_target_cmask_address(target, &draw.context_registers)?,
