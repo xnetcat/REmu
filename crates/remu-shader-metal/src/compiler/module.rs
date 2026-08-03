@@ -177,10 +177,10 @@ impl Compiler<'_> {
                     _ => "depth2d",
                 }
             } else if kind.storage {
-                if metal_dim == 2 {
-                    "texture3d"
-                } else {
-                    "texture2d"
+                match metal_dim {
+                    2 => "texture3d",
+                    3 => "texture2d_array",
+                    _ => "texture2d",
                 }
             } else {
                 // Sampled views follow the SRD TYPE (see metal_image_dimension), not MIMG DIM.
