@@ -4,9 +4,7 @@
 use std::sync::atomic::Ordering;
 
 use super::{
-    ONCE_CALLBACKS, ProbeDispatchState, SCE_AJM_ERROR_INVALID_PARAMETER, SceAjmBatchInfo,
-    ajm_batch_initialize, ajm_finalize, ajm_initialize, ajm_instance_create, ajm_instance_destroy,
-    ajm_module_register, ajm_module_unregister, dispatch_probe_import, guest_pthread_once,
+    ONCE_CALLBACKS, ProbeDispatchState, dispatch_probe_import, guest_pthread_once,
     once_test_callback, sce_kernel_error, system_service_param_get_int, video_out_open,
 };
 
@@ -404,78 +402,6 @@ fn share_and_np_title_services_validate_and_retain_caller_data() {
 }
 
 #[test]
-fn ajm_batch_initialize_writes_only_the_five_qword_info_object() {
-    let batch = [0x5a_u8; 0x708];
-    let original_batch = batch;
-    let mut info_storage = [0xa5_u8; 0x48];
-    let info_address = info_storage[0x10..0x38].as_mut_ptr() as u64;
-
-    assert_eq!(
-        ajm_batch_initialize([
-            batch.as_ptr() as u64,
-            batch.len() as u64,
-            info_address,
-            0,
-            0,
-            0,
-        ]),
-        0
-    );
-
-    assert_eq!(
-        batch, original_batch,
-        "the caller-owned batch arena is preserved"
-    );
-    assert_eq!(&info_storage[..0x10], &[0xa5; 0x10]);
-    assert_eq!(&info_storage[0x38..], &[0xa5; 0x10]);
-    // SAFETY: info_address points at the initialized 0x28-byte subrange above.
-    let info = unsafe { std::ptr::read_unaligned(info_address as *const SceAjmBatchInfo) };
-    assert_eq!(
-        info,
-        SceAjmBatchInfo {
-            buffer: batch.as_ptr() as u64,
-            offset: 0,
-            size: batch.len() as u64,
-            last_good_job: 0,
-            last_good_job_return_address: 0,
-        }
-    );
-}
-
-#[test]
-fn ajm_batch_initialize_requires_the_ps5_info_output() {
-    let batch = [0x5a_u8; 0x708];
-    assert_eq!(
-        ajm_batch_initialize([batch.as_ptr() as u64, batch.len() as u64, 0, 0, 0, 0,]),
-        sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER)
-    );
-    assert!(batch.iter().all(|byte| *byte == 0x5a));
-}
-
-/// Gen5 tags the reserved argument with a library revision; only the low dword must be zero.
-#[test]
-fn ajm_initialize_accepts_a_revision_tagged_reserved_argument() {
-    let mut state = ProbeDispatchState::default();
-    let mut context = 0_u32;
-    assert_eq!(
-        ajm_initialize(
-            [0x3_0000_0000, (&raw mut context).addr() as u64, 0, 0, 0, 0],
-            &mut state,
-        ),
-        0
-    );
-    assert_ne!(context, 0);
-    // A non-zero low dword is still a malformed reserved value.
-    assert_ne!(
-        ajm_initialize(
-            [0x3_0000_0001, (&raw mut context).addr() as u64, 0, 0, 0, 0],
-            &mut state,
-        ),
-        0
-    );
-}
-
-#[test]
 fn ajm_initialize_allocates_stable_nonzero_context_ids() {
     let mut state = ProbeDispatchState::default();
     let mut first = 0_u32;
@@ -498,14 +424,19 @@ fn ajm_initialize_allocates_stable_nonzero_context_ids() {
         ),
         0
     );
-    assert_eq!((first, second), (1, 2));
-    assert!(state.ajm_contexts.contains_key(&first));
-    assert!(state.ajm_contexts.contains_key(&second));
+    assert_ne!(first, 0);
+    assert_eq!(second, first + 1);
     assert_eq!(
         crate::known_nid_name("dl+4eHSzUu4"),
         Some("sceAjmInitialize")
     );
     assert!(state.unimplemented_nids.is_empty());
+    for context in [first, second] {
+        assert_eq!(
+            crate::ajm_engine::dispatch("MHur6qCsUus", [u64::from(context), 0, 0, 0, 0, 0], [0; 6]),
+            Some(0)
+        );
+    }
 }
 
 #[test]
@@ -672,44 +603,44 @@ fn ampr_write_address_04_00_measure_matches_the_on_completion_size() {
 
 #[test]
 fn ajm_lifecycle_registers_codec_and_instances() {
-    let mut state = ProbeDispatchState::default();
+    // Every sceAjm* NID is served by the engine on the pre-lock stateless tier.
+    let call = |nid: &str, arguments: [u64; 6]| {
+        crate::dispatch_stateless_import(nid, arguments, [0; 6]).expect("the engine owns this NID")
+    };
     let mut context = 0_u32;
     let mut instance = 0_u32;
     let context_output = (&raw mut context).addr() as u64;
     let instance_output = (&raw mut instance).addr() as u64;
 
+    assert_eq!(call("dl+4eHSzUu4", [0, context_output, 0, 0, 0, 0]), 0);
+    assert_ne!(context, 0);
     assert_eq!(
-        ajm_initialize([0, context_output, 0, 0, 0, 0], &mut state),
-        0
+        call("Q3dyFuwGn64", [u64::from(context), 1, 0, 0, 0, 0]),
+        0,
+        "ATRAC9 registers exactly as hardware would; the missing host decoder reports when a batch runs"
     );
     assert_eq!(
-        ajm_module_register([u64::from(context), 1, 0, 0, 0, 0], &mut state),
-        0
-    );
-    assert_eq!(
-        ajm_instance_create(
-            [u64::from(context), 1, 1, instance_output, 0, 0],
-            &mut state,
+        call(
+            "AxoDrINp4J8",
+            [u64::from(context), 1, 1, instance_output, 0, 0]
         ),
         0
     );
-    assert_eq!(instance, 0x4001);
+    assert_eq!(instance, 0x4001, "instance ids encode their codec type");
     assert_eq!(
-        ajm_instance_destroy(
-            [u64::from(context), u64::from(instance), 0, 0, 0, 0],
-            &mut state,
+        call(
+            "RbLbuKv8zho",
+            [u64::from(context), u64::from(instance), 0, 0, 0, 0]
         ),
         0
     );
+    assert_eq!(call("Wi7DtlLV+KI", [u64::from(context), 1, 0, 0, 0, 0]), 0);
+    assert_eq!(call("MHur6qCsUus", [u64::from(context), 0, 0, 0, 0, 0]), 0);
     assert_eq!(
-        ajm_module_unregister([u64::from(context), 1, 0, 0, 0, 0], &mut state),
-        0
+        call("MHur6qCsUus", [u64::from(context), 0, 0, 0, 0, 0]),
+        sce_kernel_error(crate::ajm_engine::SCE_AJM_ERROR_INVALID_CONTEXT),
+        "the finalized context is gone"
     );
-    assert_eq!(
-        ajm_finalize([u64::from(context), 0, 0, 0, 0, 0], &mut state),
-        0
-    );
-    assert!(state.ajm_contexts.is_empty());
 }
 
 #[test]

@@ -6,10 +6,9 @@ mod ngs2_waveform;
 mod video_out;
 
 use super::*;
-use crate::AjmContextState;
+use crate::ajm_engine::SCE_AJM_ERROR_INVALID_PARAMETER;
 use crate::{
-    CompletedVideoOutFlip, PendingVideoOutFlip, SCE_AJM_ERROR_INVALID_CONTEXT,
-    SCE_AJM_ERROR_INVALID_PARAMETER, VIDEO_OUT_ERROR_INVALID_ADDRESS,
+    CompletedVideoOutFlip, PendingVideoOutFlip, VIDEO_OUT_ERROR_INVALID_ADDRESS,
     VIDEO_OUT_ERROR_INVALID_HANDLE, VIDEO_OUT_ERROR_INVALID_INDEX, VIDEO_OUT_ERROR_INVALID_VALUE,
     VideoOutBufferAttributes, audio, audio_out_error, kernel_process_time, sce_kernel_error,
 };
@@ -202,9 +201,6 @@ fn riff_container(samples: u32) -> Vec<u8> {
     data.resize(44 + payload as usize, 0);
     data
 }
-
-/// Context the memory-registration test publishes its regions under.
-const AJM_TEST_CONTEXT: u32 = 0x4176;
 
 /// Builds one padded layer III frame at 128 kbit/s, 44100 Hz, two channels.
 fn mp3_frame() -> Vec<u8> {

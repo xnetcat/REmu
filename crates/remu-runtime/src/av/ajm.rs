@@ -1,86 +1,13 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use crate::{
-    ProbeDispatchState, SCE_AJM_ERROR_INVALID_CONTEXT, SCE_AJM_ERROR_INVALID_PARAMETER,
-    guest_malloc, low_i32, low_u32, sce_kernel_error, write_guest_bytes,
-};
+//! Stateless `libSceAjm` helpers. The engine itself — contexts, instances, batches, memory
+//! registration — lives in `crate::ajm_engine`; this module keeps the error-string surface
+//! that needs no engine state.
+
+use crate::{guest_malloc, low_i32, write_guest_bytes};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
-
-/// Error the audio-job-manager entry points here add to the ones the main table already reports.
-pub(super) const SCE_AJM_ERROR_OUT_OF_RESOURCES: u32 = 0x8093_0007;
-
-/// Bytes one page of memory published to the audio coprocessor covers.
-pub(super) const AJM_MEMORY_PAGE_SIZE: u64 = 2 * 1024 * 1024;
-/// Pages one context may publish.
-///
-/// No console ceiling is published for this. The bound keeps a runaway caller from growing the
-/// region table without limit, and reports the same exhaustion error the hardware would.
-pub(super) const AJM_MEMORY_PAGE_LIMIT: u64 = 512;
-
-/// Regions each context has published, keyed by context and starting address.
-pub(super) static AJM_REGIONS: OnceLock<Mutex<BTreeMap<(u32, u64), u64>>> = OnceLock::new();
-
-/// Returns the process-wide table of published regions.
-pub(super) fn ajm_regions() -> std::sync::MutexGuard<'static, BTreeMap<(u32, u64), u64>> {
-    AJM_REGIONS
-        .get_or_init(|| Mutex::new(BTreeMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-/// Declares a region of guest memory available to the audio coprocessor.
-pub(super) fn ajm_memory_register(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    let (context, region, pages) = (low_u32(arguments[0]), arguments[1], arguments[2]);
-    if !state.ajm_contexts.contains_key(&context) {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    }
-    let Some(length) = pages.checked_mul(AJM_MEMORY_PAGE_SIZE) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    };
-    if region == 0
-        || pages == 0
-        || !region.is_multiple_of(AJM_MEMORY_PAGE_SIZE)
-        || region.checked_add(length).is_none()
-    {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    let mut regions = ajm_regions();
-    // A finalized context takes its regions with it; the table is only consulted here.
-    regions.retain(|&(owner, _), _| state.ajm_contexts.contains_key(&owner));
-    let mut published = 0_u64;
-    for (&(owner, start), &count) in regions.iter() {
-        if owner != context {
-            continue;
-        }
-        published = published.saturating_add(count);
-        let end = start.saturating_add(count.saturating_mul(AJM_MEMORY_PAGE_SIZE));
-        if region < end && start < region.saturating_add(length) {
-            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-        }
-    }
-    if published.saturating_add(pages) > AJM_MEMORY_PAGE_LIMIT {
-        return sce_kernel_error(SCE_AJM_ERROR_OUT_OF_RESOURCES);
-    }
-    regions.insert((context, region), pages);
-    0
-}
-
-/// Withdraws a region previously published to the audio coprocessor.
-pub(super) fn ajm_memory_unregister(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    let (context, region) = (low_u32(arguments[0]), arguments[1]);
-    if !state.ajm_contexts.contains_key(&context) {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    }
-    if region == 0 {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    if ajm_regions().remove(&(context, region)).is_none() {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    0
-}
 
 /// Returns the description a code carries.
 pub(super) fn ajm_error_text(code: i32) -> &'static str {

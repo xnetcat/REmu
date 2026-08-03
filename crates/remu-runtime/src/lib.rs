@@ -14,6 +14,7 @@ mod agc_register_defaults;
 mod agc_registers;
 mod agc_state;
 mod agc_submission;
+mod ajm_engine;
 mod ampr;
 mod ampr_api;
 mod audio;
@@ -451,8 +452,6 @@ struct ProbeDispatchState {
     bundled_modules: Vec<LinkedGuestModule>,
     unwind_modules: Vec<GuestUnwindModule>,
     installed_exception_handlers: BTreeMap<i32, u64>,
-    next_ajm_context: u32,
-    ajm_contexts: BTreeMap<u32, AjmContextState>,
     next_acm_context: u32,
     acm_contexts: BTreeSet<u32>,
     heap_trace_storage: Vec<u64>,
@@ -795,13 +794,6 @@ impl GuestMspace {
     fn usable_size(&self, address: u64) -> u64 {
         self.allocations.get(&address).copied().unwrap_or(0)
     }
-}
-
-#[derive(Debug, Default)]
-struct AjmContextState {
-    registered_codecs: BTreeSet<u32>,
-    next_instance: u32,
-    instances: BTreeSet<u32>,
 }
 
 const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x7f;
@@ -2039,8 +2031,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.bundled_modules.clone_from(&image.bundled_modules);
     state.unwind_modules.clone_from(&image.unwind_modules);
     state.installed_exception_handlers.clear();
-    state.next_ajm_context = 1;
-    state.ajm_contexts.clear();
+    ajm_engine::reset_for_new_process();
     state.next_acm_context = 1;
     state.acm_contexts.clear();
     *guest_exception_delivery()
@@ -4248,262 +4239,11 @@ fn kernel_process_time(counter: bool) -> u64 {
     process_time_since_nanos(now, start, counter)
 }
 
-const SCE_AJM_ERROR_INVALID_PARAMETER: u32 = 0x8093_0005;
-const SCE_AJM_ERROR_INVALID_CONTEXT: u32 = 0x8093_0002;
-const SCE_AJM_ERROR_INVALID_INSTANCE: u32 = 0x8093_0003;
-const SCE_AJM_ERROR_CODEC_ALREADY_REGISTERED: u32 = 0x8093_0009;
-const SCE_AJM_ERROR_CODEC_NOT_REGISTERED: u32 = 0x8093_000a;
-const SCE_AJM_ERROR_JOB_CREATION: u32 = 0x8093_0012;
-/// Sideband result written by control jobs (`result` + `internal_result`).
-const AJM_SIDEBAND_RESULT_SIZE: usize = 8;
-/// Bytes one control job (initialize / clear-context / gapless) occupies in a batch arena.
-const AJM_JOB_CONTROL_SIZE: u64 = 48;
-/// Smallest arena a caller may hand `sceAjmBatchInitialize`. One control job is 0x30 bytes;
-/// rejecting that size strands audio workers that build single-job batches.
-const AJM_BATCH_MIN_SIZE: u64 = AJM_JOB_CONTROL_SIZE;
-const AJM_BATCH_MAX_SIZE: u64 = 0x10_000;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SceAjmBatchInfo {
-    buffer: u64,
-    offset: u64,
-    size: u64,
-    last_good_job: u64,
-    last_good_job_return_address: u64,
-}
-
-const _: () = {
-    assert!(std::mem::size_of::<SceAjmBatchInfo>() == 0x28);
-    assert!(std::mem::offset_of!(SceAjmBatchInfo, buffer) == 0x00);
-    assert!(std::mem::offset_of!(SceAjmBatchInfo, offset) == 0x08);
-    assert!(std::mem::offset_of!(SceAjmBatchInfo, size) == 0x10);
-    assert!(std::mem::offset_of!(SceAjmBatchInfo, last_good_job) == 0x18);
-    assert!(std::mem::offset_of!(SceAjmBatchInfo, last_good_job_return_address) == 0x20);
-};
-
-/// Bytes the batch-error object a caller may supply occupies.
-///
-/// It carries an error code, the address of the offending job, a command offset, and that job's
-/// return address. Clearing fewer bytes than this leaves the trailing fields holding whatever the
-/// caller's stack held, and an engine that reads them back asserts on the garbage.
-const AJM_BATCH_ERROR_SIZE: u64 = 24;
-
-/// Identifiers handed out by [`ajm_batch_start`].
-static AJM_NEXT_BATCH: AtomicU32 = AtomicU32::new(0);
-
-/// `sceAjmBatchStart(context, info, priority, error, batchOut)`.
-///
-/// Accepts the batch the guest built and hands back an identifier it can wait on.
-///
-/// No decode runs. This host has no audio-job coprocessor and no general Ajm decoder, so a batch
-/// is accepted and retired without producing samples; the job result fields the guest reads back
-/// keep the zero-length output the arena was initialized with, which reports "nothing was
-/// decoded" rather than claiming samples that do not exist. A title consuming this gets silence
-/// on Ajm-decoded audio, and that is a real limitation, not a hidden one — but its control flow
-/// proceeds, where refusing the call strands the audio thread and with it everything downstream.
-fn ajm_batch_start(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    let info = arguments[1];
-    let error = arguments[3];
-    let output = arguments[4];
-    if !state.ajm_contexts.contains_key(&context) {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    }
-    if info == 0
-        || output == 0
-        || guest_output_pointer(output, std::mem::size_of::<u32>()).is_none()
-        || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none()
-    {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    if error != 0 {
-        if guest_output_pointer(error, AJM_BATCH_ERROR_SIZE as usize).is_none() {
-            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-        }
-        // No job failed, because no job ran.
-        guest_memset(error, 0, AJM_BATCH_ERROR_SIZE);
-    }
-    let batch = AJM_NEXT_BATCH
-        .fetch_add(1, Ordering::Relaxed)
-        .wrapping_add(1)
-        .max(1);
-    write_guest_u32(output, batch);
-    0
-}
-
-/// `sceAjmBatchWait(context, batch, timeout, error)`.
-///
-/// A batch this host accepted is already retired, so the wait completes immediately.
-fn ajm_batch_wait(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    let error = arguments[3];
-    if !state.ajm_contexts.contains_key(&context) {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    }
-    if error != 0 {
-        if guest_output_pointer(error, AJM_BATCH_ERROR_SIZE as usize).is_none() {
-            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-        }
-        guest_memset(error, 0, AJM_BATCH_ERROR_SIZE);
-    }
-    0
-}
-
-/// `sceAjmBatchCancel(context, batch)`.
-///
-/// Cancelling a retired batch is a no-op that the guest is entitled to call.
-fn ajm_batch_cancel(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if !state.ajm_contexts.contains_key(&low_u32(arguments[0])) {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    }
-    0
-}
-
-/// Bytes one `sceAjmBatchJobGetStatistics` job occupies in a batch arena.
-const AJM_JOB_GET_STATISTICS_SIZE: u64 = 88;
-/// Bytes the statistics result object occupies.
-const AJM_STATISTICS_RESULT_SIZE: usize = 48;
-
-/// Appends `job_size` bytes to a batch arena cursor and returns the reserved job address.
-fn ajm_append_batch_job(info: u64, job_size: u64) -> Result<u64, u32> {
-    if info == 0 || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none() {
-        return Err(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    // SAFETY: the complete cursor object was validated immediately above.
-    let mut batch_info = unsafe { std::ptr::read_unaligned(info as *const SceAjmBatchInfo) };
-    let Some(end) = batch_info.offset.checked_add(job_size) else {
-        return Err(SCE_AJM_ERROR_JOB_CREATION);
-    };
-    if batch_info.buffer == 0 || end > batch_info.size {
-        return Err(SCE_AJM_ERROR_JOB_CREATION);
-    }
-    let job = batch_info.buffer.wrapping_add(batch_info.offset);
-    guest_memset(job, 0, job_size);
-    batch_info.offset = end;
-    batch_info.last_good_job = job;
-    // The arena cursor's return-address field belongs to the job just appended, not to whatever
-    // occupied the slot before it.
-    batch_info.last_good_job_return_address = 0;
-    // SAFETY: the same validated cursor object.
-    unsafe {
-        std::ptr::write_unaligned(info as *mut SceAjmBatchInfo, batch_info);
-    }
-    Ok(job)
-}
-
-/// `sceAjmBatchJobGetStatistics(info, result)`.
-///
-/// Appends one statistics job to the caller's batch arena and clears the result object. The
-/// counters this host can honestly report are all zero: no decode work runs on a coprocessor here,
-/// so there is no elapsed time or job count to report, and reporting invented figures would be
-/// worse than reporting none. The append itself is real, because the guest reads the arena cursor
-/// back and builds the rest of its batch from it.
-fn ajm_batch_job_get_statistics(arguments: [u64; 6]) -> u64 {
-    let result = arguments[1];
-    if let Err(error) = ajm_append_batch_job(arguments[0], AJM_JOB_GET_STATISTICS_SIZE) {
-        return sce_kernel_error(error);
-    }
-    if result != 0 {
-        if guest_output_pointer(result, AJM_STATISTICS_RESULT_SIZE).is_none() {
-            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-        }
-        guest_memset(result, 0, AJM_STATISTICS_RESULT_SIZE as u64);
-    }
-    0
-}
-
-/// `sceAjmBatchJobInitialize(info, instance, codecParameters, parametersSize, result)`.
-///
-/// Appends one control job and clears the sideband result. This host has no Ajm codec coprocessor,
-/// so initialization records success for a live instance without consuming the parameter blob —
-/// the guest still advances its batch cursor and later Start/Wait calls retire the batch as silence.
-fn ajm_batch_job_initialize(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    let (info, instance, result) = (arguments[0], low_u32(arguments[1]), arguments[4]);
-    if let Err(error) = ajm_append_batch_job(info, AJM_JOB_CONTROL_SIZE) {
-        return sce_kernel_error(error);
-    }
-    let status = if state
-        .ajm_contexts
-        .values()
-        .any(|context| context.instances.contains(&instance))
-    {
-        0_i32
-    } else {
-        // Sideband decode-result "invalid parameter" (not the SCE_AJM_ERROR_* facility).
-        0x4_i32
-    };
-    if result != 0 {
-        if guest_output_pointer(result, AJM_SIDEBAND_RESULT_SIZE).is_none() {
-            return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-        }
-        guest_memset(result, 0, AJM_SIDEBAND_RESULT_SIZE as u64);
-        write_guest_u32(result, status as u32);
-    }
-    0
-}
-
-fn ajm_batch_initialize(arguments: [u64; 6]) -> u64 {
-    let batch = arguments[0];
-    let size = arguments[1];
-    let info = arguments[2];
-    let Ok(batch_size) = usize::try_from(size) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    };
-    if batch == 0
-        || info == 0
-        || !(AJM_BATCH_MIN_SIZE..=AJM_BATCH_MAX_SIZE).contains(&size)
-        || !process_guest_range_has_read_access(batch, batch_size)
-        || guest_output_pointer(info, std::mem::size_of::<SceAjmBatchInfo>()).is_none()
-    {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    // The arena belongs to the caller and may already contain allocator/debug state. The PS5 ABI
-    // initializes only this five-qword cursor; job builders subsequently append into `buffer`
-    // using `offset` and update the two last-good fields.
-    let batch_info = SceAjmBatchInfo {
-        buffer: batch,
-        offset: 0,
-        size,
-        last_good_job: 0,
-        last_good_job_return_address: 0,
-    };
-    // SAFETY: the complete 0x28-byte output object was validated above.
-    unsafe {
-        std::ptr::write_unaligned(info as *mut SceAjmBatchInfo, batch_info);
-    }
-    0
-}
-
 fn guest_zeroed_constructor(address: u64, size: u64) -> u64 {
     if address != 0 {
         guest_memset(address, 0, size);
     }
     address
-}
-
-fn ajm_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let reserved = arguments[0];
-    let output = arguments[1];
-    // Gen5 titles tag this argument with the library revision in its high dword and leave the low
-    // dword reserved. Rejecting the whole value as "must be zero" fails initialization for every
-    // revision-tagged caller, which makes an audio engine tear its threads down during startup.
-    if low_u32(reserved) != 0 || output == 0 {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-
-    let context = state.next_ajm_context.max(1);
-    state.next_ajm_context = context.saturating_add(1);
-    state.ajm_contexts.insert(
-        context,
-        AjmContextState {
-            next_instance: 1,
-            ..AjmContextState::default()
-        },
-    );
-    write_guest_u32(output, context);
-    eprintln!("[REMu][AJM] initialized context={context}");
-    0
 }
 
 /// `sceAcmContextCreate(contextOut)`.
@@ -4531,82 +4271,6 @@ fn acm_context_destroy(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u
     if !state.acm_contexts.remove(&context) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    0
-}
-
-fn ajm_module_register(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    let codec = low_u32(arguments[1]);
-    if arguments[2] != 0 {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    let Some(context_state) = state.ajm_contexts.get_mut(&context) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    };
-    if !context_state.registered_codecs.insert(codec) {
-        return sce_kernel_error(SCE_AJM_ERROR_CODEC_ALREADY_REGISTERED);
-    }
-    eprintln!("[REMu][AJM] registered codec={codec} context={context}");
-    0
-}
-
-fn ajm_module_unregister(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    let codec = low_u32(arguments[1]);
-    let Some(context_state) = state.ajm_contexts.get_mut(&context) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    };
-    context_state.registered_codecs.remove(&codec);
-    eprintln!("[REMu][AJM] unregistered codec={codec} context={context}");
-    0
-}
-
-fn ajm_instance_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    let codec = low_u32(arguments[1]);
-    let output = arguments[3];
-    if output == 0 {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_PARAMETER);
-    }
-    let Some(context_state) = state.ajm_contexts.get_mut(&context) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    };
-    if !context_state.registered_codecs.contains(&codec) {
-        return sce_kernel_error(SCE_AJM_ERROR_CODEC_NOT_REGISTERED);
-    }
-    let index = context_state.next_instance.max(1) & 0x3fff;
-    context_state.next_instance = index.saturating_add(1);
-    let instance = index | (codec << 14);
-    context_state.instances.insert(instance);
-    write_guest_u32(output, instance);
-    eprintln!(
-        "[REMu][AJM] created instance={instance:#x} codec={codec} context={context} flags={:#x}",
-        arguments[2]
-    );
-    0
-}
-
-fn ajm_instance_destroy(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    let instance = low_u32(arguments[1]);
-    let Some(context_state) = state.ajm_contexts.get_mut(&context) else {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    };
-    if !context_state.instances.remove(&instance) {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_INSTANCE);
-    }
-    eprintln!("[REMu][AJM] destroyed instance={instance:#x} context={context}");
-    0
-}
-
-fn ajm_finalize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    if context == 0 {
-        state.ajm_contexts.clear();
-    } else if state.ajm_contexts.remove(&context).is_none() {
-        return sce_kernel_error(SCE_AJM_ERROR_INVALID_CONTEXT);
-    }
-    eprintln!("[REMu][AJM] finalized context={context}");
     0
 }
 
@@ -4651,6 +4315,12 @@ fn dispatch_stateless_import(
         return Some(result);
     }
     if let Some(result) = platform_services::dispatch(nid, arguments) {
+        return Some(result);
+    }
+    // The audio-job engine owns every sceAjm* NID. It is served on this pre-lock tier so a
+    // blocking `sceAjmBatchWait` parks on the engine's own condition variable rather than
+    // holding the process-wide dispatch lock against the workers retiring its batch.
+    if let Some(result) = ajm_engine::dispatch(nid, arguments, stack_arguments) {
         return Some(result);
     }
     Some(match nid {
@@ -4708,7 +4378,6 @@ fn dispatch_stateless_import(
             NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64
         }
         "+o9816YQhqQ" => np_web_api2_initialize(arguments),
-        "MmpF1XsQiHw" => ajm_batch_initialize(arguments),
         "cK6bYHf-Q5E" | "-hJRce8wn1U" => guest_zeroed_constructor(arguments[0], 8),
         "WSOuge5IsCg" => guest_zeroed_constructor(arguments[0], 0x28),
         "TRO721eVt4g" => agc_dcb_reset_queue(arguments),
@@ -4852,20 +4521,9 @@ fn dispatch_probe_import(
             state.application_heap_api_address = arguments[0];
             0
         }
-        "dl+4eHSzUu4" => ajm_initialize(arguments, state),
         // ACM context handles. The batch/DSP entry points stay unserved.
         "ZIXln2K3XMk" => acm_context_create(arguments, state),
         "jBgBjAj02R8" => acm_context_destroy(arguments, state),
-        "Q3dyFuwGn64" => ajm_module_register(arguments, state),
-        "3cAg7xN995U" => ajm_batch_job_get_statistics(arguments),
-        "ezM2OhNxzck" => ajm_batch_job_initialize(arguments, state),
-        "5tOfnaClcqM" => ajm_batch_start(arguments, state),
-        "-qLsfDAywIY" => ajm_batch_wait(arguments, state),
-        "NVDXiUesSbA" => ajm_batch_cancel(arguments, state),
-        "Wi7DtlLV+KI" => ajm_module_unregister(arguments, state),
-        "AxoDrINp4J8" => ajm_instance_create(arguments, state),
-        "RbLbuKv8zho" => ajm_instance_destroy(arguments, state),
-        "MHur6qCsUus" => ajm_finalize(arguments, state),
         // Bundled PRXs are mapped, relocated, and initialized before the main executable. Runtime
         // module loads must still resolve those objects to their stable process-local handles;
         // Unity treats a negative return here as a plug-in load failure and skips assembly setup.

@@ -15,15 +15,16 @@
 
 use crate::{ProbeDispatchState, process_guest_range_is_readable};
 mod ajm;
+// The audio-job-manager batch, instance, and memory entry points are served by
+// `crate::ajm_engine` on the pre-lock dispatch tier; this module keeps only the stateless
+// string/parse helpers of `libSceAjm`.
 mod audio_out;
 mod mp3;
 mod ngs2;
 mod ngs2_voice;
 mod ngs2_waveform;
 mod video_out;
-#[cfg(test)]
-use self::ajm::{AJM_MEMORY_PAGE_LIMIT, AJM_MEMORY_PAGE_SIZE};
-use self::ajm::{ajm_memory_register, ajm_memory_unregister, ajm_str_error};
+use self::ajm::ajm_str_error;
 #[cfg(test)]
 use self::audio_out::{
     AUDIO_OUT_ERROR_INVALID_ARG, AUDIO_OUT_ERROR_INVALID_MIXLEVEL, AUDIO_OUT_MIXLEVEL_MAXIMUM,
@@ -102,7 +103,7 @@ pub(crate) fn dispatch(
     if let Some(result) = dispatch_ngs2(nid, arguments) {
         return Some(result);
     }
-    if let Some(result) = dispatch_ajm(nid, arguments, state) {
+    if let Some(result) = dispatch_ajm(nid, arguments) {
         return Some(result);
     }
     dispatch_audio_out(nid, arguments)
@@ -152,10 +153,8 @@ fn dispatch_ngs2(nid: &str, arguments: [u64; 6]) -> Option<u64> {
 }
 
 /// Handles the audio-job-manager entry points this module owns.
-fn dispatch_ajm(nid: &str, arguments: [u64; 6], state: &ProbeDispatchState) -> Option<u64> {
+fn dispatch_ajm(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
-        "bkRHEYG6lEM" => ajm_memory_register(arguments, state),
-        "pIpGiaYkHkM" => ajm_memory_unregister(arguments, state),
         "AxhcqVv5AYU" => ajm_str_error(arguments[0]),
         "eDFeTyi+G3Y" => ajm_dec_mp3_parse_frame(arguments),
         _ => return None,
