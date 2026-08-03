@@ -234,8 +234,8 @@ fn instruction_terminates_program(instruction: &Instruction) -> bool {
 }
 
 pub(crate) fn forward_branch_target(instruction: &Instruction) -> Result<Option<u32>, DecodeError> {
-    if instruction.encoding != ShaderEncoding::Sopp
-        || !matches!(
+    let sopp_branch = instruction.encoding == ShaderEncoding::Sopp
+        && matches!(
             instruction.opcode.known_name(),
             Some(
                 "SBranch"
@@ -246,8 +246,12 @@ pub(crate) fn forward_branch_target(instruction: &Instruction) -> Result<Option<
                     | "SCbranchExecz"
                     | "SCbranchExecnz"
             )
-        )
-    {
+        );
+    // S_CALL_B64 is a SOPK-encoded relative transfer; its subroutine target extends the
+    // decodable stream exactly like a forward branch target.
+    let sopk_call =
+        instruction.encoding == ShaderEncoding::Sopk && instruction.opcode.is("SCallB64");
+    if !sopp_branch && !sopk_call {
         return Ok(None);
     }
     let offset = i16::from_ne_bytes(

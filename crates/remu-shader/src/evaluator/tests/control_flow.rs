@@ -618,3 +618,83 @@ fn nested_vector_branches_around_a_loop_stay_within_the_evaluation_budget() {
         "tail binding missing: {bindings:?}"
     );
 }
+
+#[test]
+fn s_call_enters_the_subroutine_and_the_indirect_return_resumes_the_call_site() {
+    // A real encoded program: main body calls a subroutine placed after its endpgm; the
+    // subroutine returns through S_SETPC_B64 on the register-known return address. Before this
+    // support every call abandoned the path as the "subroutine-call" truncation class.
+    let program = crate::decode_program(
+        0x1000,
+        &[
+            0xb000_0005, // s_movk_i32 s0, 5
+            0xba0a_0002, // s_call_b64 s[10:11], +2 (subroutine at pc 16)
+            0xb001_0009, // s_movk_i32 s1, 9 (return continuation)
+            0xbf81_0000, // s_endpgm
+            0xb000_002a, // s_movk_i32 s0, 42 (subroutine body)
+            0xbe80_200a, // s_setpc_b64 s[10:11] (return)
+        ],
+    )
+    .expect("call/return program decodes");
+    let shader = ShaderState {
+        program: Arc::new(program),
+        user_data: Vec::new().into(),
+        compute_system_registers: None,
+        user_data_scalar_register_base: 0,
+    };
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("call/return evaluation");
+
+    assert_eq!(
+        evaluation.scalar_registers[0], 42,
+        "the subroutine body ran"
+    );
+    assert_eq!(
+        evaluation.scalar_registers[1], 9,
+        "the return resumed at the call continuation"
+    );
+    assert_eq!(
+        evaluation.scalar_registers[10], 0x1008,
+        "the call linked the architectural return address"
+    );
+    assert_eq!(evaluation.scalar_registers[11], 0);
+}
+
+#[test]
+fn an_unresolvable_indirect_transfer_still_ends_the_path_quietly() {
+    // S_SETPC_B64 on a register value that names no instruction in the program keeps its
+    // truncation behavior: the path ends, prior discovery survives, and no error is fabricated.
+    let program = crate::decode_program(
+        0x1000,
+        &[
+            0xb000_0007, // s_movk_i32 s0, 7
+            0xbe80_200a, // s_setpc_b64 s[10:11] (s[10:11] holds 0 -> unresolvable)
+            0xb000_0063, // s_movk_i32 s0, 99 (unreachable)
+            0xbf81_0000, // s_endpgm
+        ],
+    )
+    .expect("indirect transfer program decodes");
+    let shader = ShaderState {
+        program: Arc::new(program),
+        user_data: Vec::new().into(),
+        compute_system_registers: None,
+        user_data_scalar_register_base: 0,
+    };
+
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect("unresolvable transfer evaluation");
+
+    assert_eq!(
+        evaluation.scalar_registers[0], 7,
+        "state before the abandoned transfer is preserved"
+    );
+}

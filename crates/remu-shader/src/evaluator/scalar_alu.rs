@@ -41,7 +41,32 @@ pub(crate) fn execute_scalar_alu(
     exec_mask: &mut u64,
     scalar_condition: &mut bool,
 ) -> Result<(), EvaluationError> {
+    match instruction.opcode.known_name() {
+        // Wait-count and mode-register writes adjust hardware state that carries no SGPR or SCC
+        // effect; they are architectural no-ops for scalar resource discovery.
+        Some(
+            "SVersion" | "SSetregB32" | "SSetregImm32B32" | "SWaitcntVscnt" | "SWaitcntVmcnt"
+            | "SWaitcntExpcnt" | "SWaitcntLgkmcnt",
+        ) => return Ok(()),
+        // S_GETREG_B32 reads hardware state (MODE/STATUS/TRAPSTS) this evaluator deliberately
+        // does not model. Returning a fabricated value could steer descriptor selection, so the
+        // gap stays loud instead.
+        Some("SGetregB32") | None => {
+            return Err(EvaluationError::UnsupportedScalarOpcode {
+                pc: instruction.pc,
+                opcode: instruction.opcode,
+            });
+        }
+        Some(_) => {}
+    }
     let destination = scalar_destination(instruction)?;
+    if instruction.opcode.is("SCmovkI32") {
+        if *scalar_condition {
+            registers[destination as usize] =
+                i32::from(low_u16(instruction.sources[0].value).cast_signed()).cast_unsigned();
+        }
+        return Ok(());
+    }
     if instruction.opcode.is("SMovkI32") {
         registers[destination as usize] =
             i32::from(low_u16(instruction.sources[0].value).cast_signed()).cast_unsigned();
@@ -82,8 +107,80 @@ pub(crate) fn execute_scalar_alu(
     if execute_save_exec(instruction, registers, exec_mask, scalar_condition)? {
         return Ok(());
     }
+    if execute_relative_move(instruction, destination, registers, exec_mask)? {
+        return Ok(());
+    }
 
-    if instruction.opcode.is("SBcnt1I32B64") {
+    if instruction.opcode.is("SCmovB64") {
+        let value = evaluate_operand64(
+            instruction
+                .sources
+                .first()
+                .ok_or_else(|| invalid(instruction, "64-bit source"))?,
+            registers,
+            *exec_mask,
+        )
+        .ok_or_else(|| invalid(instruction, "64-bit source"))?;
+        if *scalar_condition {
+            write_scalar_pair(registers, destination, value, exec_mask);
+        }
+        return Ok(());
+    }
+
+    if matches!(
+        instruction.opcode.known_name(),
+        Some("SBitset0B64" | "SBitset1B64")
+    ) {
+        let index = evaluate_operand(
+            instruction
+                .sources
+                .first()
+                .ok_or_else(|| invalid(instruction, "bit index source"))?,
+            registers,
+        )
+        .ok_or_else(|| invalid(instruction, "bit index source"))?
+            & 63;
+        let current = read_scalar_pair(registers, destination)
+            .ok_or_else(|| invalid(instruction, "64-bit destination pair"))?;
+        let value = if instruction.opcode.is("SBitset0B64") {
+            current & !(1_u64 << index)
+        } else {
+            current | (1_u64 << index)
+        };
+        write_scalar_pair(registers, destination, value, exec_mask);
+        return Ok(());
+    }
+
+    if instruction.opcode.is("SBitreplicateB64B32") {
+        let source = evaluate_operand(
+            instruction
+                .sources
+                .first()
+                .ok_or_else(|| invalid(instruction, "bit-replicate source"))?,
+            registers,
+        )
+        .ok_or_else(|| invalid(instruction, "bit-replicate source"))?;
+        let mut value = 0_u64;
+        for bit in 0..32 {
+            if source >> bit & 1 != 0 {
+                value |= 0b11 << (bit * 2);
+            }
+        }
+        write_scalar_pair(registers, destination, value, exec_mask);
+        return Ok(());
+    }
+
+    if matches!(
+        instruction.opcode.known_name(),
+        Some(
+            "SBcnt1I32B64"
+                | "SBcnt0I32B64"
+                | "SFF0I32B64"
+                | "SFF1I32B64"
+                | "SFlbitI32B64"
+                | "SFlbitI32I64"
+        )
+    ) {
         let source = evaluate_operand64(
             instruction
                 .sources
@@ -93,15 +190,33 @@ pub(crate) fn execute_scalar_alu(
             *exec_mask,
         )
         .ok_or_else(|| invalid(instruction, "64-bit source"))?;
-        let result = source.count_ones();
+        // Only the bit counts define SCC; the bit scans leave it untouched (RDNA2 ISA).
+        let (result, sets_condition) = match instruction.opcode.known_name() {
+            Some("SBcnt1I32B64") => (source.count_ones(), true),
+            Some("SBcnt0I32B64") => (source.count_zeros(), true),
+            Some("SFF0I32B64") => (first_set_bit_position_64(!source), false),
+            Some("SFF1I32B64") => (first_set_bit_position_64(source), false),
+            Some("SFlbitI32B64") => (last_set_bit_position_64(source), false),
+            Some("SFlbitI32I64") => {
+                let magnitude = if source.cast_signed() < 0 {
+                    !source
+                } else {
+                    source
+                };
+                (last_set_bit_position_64(magnitude), false)
+            }
+            _ => unreachable!(),
+        };
         registers[destination as usize] = result;
-        *scalar_condition = result != 0;
+        if sets_condition {
+            *scalar_condition = result != 0;
+        }
         return Ok(());
     }
 
     if matches!(
         instruction.opcode.known_name(),
-        Some("SMovB64" | "SWqmB64" | "SNotB64")
+        Some("SMovB64" | "SWqmB64" | "SNotB64" | "SBrevB64" | "SQuadmaskB64")
     ) {
         let mut value = evaluate_operand64(
             instruction
@@ -119,6 +234,18 @@ pub(crate) fn execute_scalar_alu(
             let quad_any =
                 (value | (value >> 1) | (value >> 2) | (value >> 3)) & 0x1111_1111_1111_1111;
             value = quad_any.wrapping_mul(0xf);
+            *scalar_condition = value != 0;
+        } else if instruction.opcode.is("SBrevB64") {
+            // S_BREV writes no SCC (RDNA2 ISA).
+            value = value.reverse_bits();
+        } else if instruction.opcode.is("SQuadmaskB64") {
+            let mut mask = 0_u64;
+            for quad in 0..16 {
+                if value >> (quad * 4) & 0xf != 0 {
+                    mask |= 1 << quad;
+                }
+            }
+            value = mask;
             *scalar_condition = value != 0;
         }
         write_scalar_pair(registers, destination, value, exec_mask);
@@ -290,24 +417,72 @@ pub(crate) fn execute_scalar_alu(
     }
     if matches!(
         instruction.opcode.known_name(),
-        Some("SNotB32" | "SBrevB32" | "SBcnt1I32B32" | "SFF1I32B32" | "SBitset1B32")
+        Some(
+            "SNotB32"
+                | "SBrevB32"
+                | "SBcnt0I32B32"
+                | "SBcnt1I32B32"
+                | "SFF0I32B32"
+                | "SFF1I32B32"
+                | "SFlbitI32B32"
+                | "SFlbitI32"
+                | "SSextI32I8"
+                | "SSextI32I16"
+                | "SBitset0B32"
+                | "SBitset1B32"
+                | "SWqmB32"
+                | "SQuadmaskB32"
+                | "SAbsI32"
+                | "SCmovB32"
+        )
     ) {
-        let result = match instruction.opcode.known_name() {
-            Some("SNotB32") => !left,
-            Some("SBrevB32") => left.reverse_bits(),
-            Some("SBcnt1I32B32") => left.count_ones(),
-            Some("SFF1I32B32") => {
-                if left == 0 {
-                    u32::MAX
-                } else {
-                    left.trailing_zeros()
-                }
+        // Only the logical/count operations define SCC; moves, bit reverses, bit scans, sign
+        // extensions and bit sets leave it untouched (RDNA2 ISA).
+        let (result, sets_condition) = match instruction.opcode.known_name() {
+            Some("SNotB32") => (!left, true),
+            Some("SBrevB32") => (left.reverse_bits(), false),
+            Some("SBcnt0I32B32") => (left.count_zeros(), true),
+            Some("SBcnt1I32B32") => (left.count_ones(), true),
+            Some("SFF0I32B32") => (first_set_bit_position_32(!left), false),
+            Some("SFF1I32B32") => (first_set_bit_position_32(left), false),
+            Some("SFlbitI32B32") => (last_set_bit_position_32(left), false),
+            Some("SFlbitI32") => {
+                let magnitude = if left.cast_signed() < 0 { !left } else { left };
+                (last_set_bit_position_32(magnitude), false)
             }
-            Some("SBitset1B32") => registers[destination as usize] | (1 << (left & 31)),
+            Some("SSextI32I8") => (i32::from((left & 0xff) as u8 as i8).cast_unsigned(), false),
+            Some("SSextI32I16") => (
+                i32::from(low_u16(left).cast_signed()).cast_unsigned(),
+                false,
+            ),
+            Some("SBitset0B32") => (registers[destination as usize] & !(1 << (left & 31)), false),
+            Some("SBitset1B32") => (registers[destination as usize] | (1 << (left & 31)), false),
+            Some("SWqmB32") => {
+                let quad_any = (left | (left >> 1) | (left >> 2) | (left >> 3)) & 0x1111_1111;
+                (quad_any.wrapping_mul(0xf), true)
+            }
+            Some("SQuadmaskB32") => {
+                let mut mask = 0_u32;
+                for quad in 0..8 {
+                    if left >> (quad * 4) & 0xf != 0 {
+                        mask |= 1 << quad;
+                    }
+                }
+                (mask, true)
+            }
+            Some("SAbsI32") => (left.cast_signed().wrapping_abs().cast_unsigned(), true),
+            Some("SCmovB32") => (
+                if *scalar_condition {
+                    left
+                } else {
+                    registers[destination as usize]
+                },
+                false,
+            ),
             _ => unreachable!(),
         };
         registers[destination as usize] = result;
-        if !instruction.opcode.is("SBitset1B32") {
+        if sets_condition {
             *scalar_condition = result != 0;
         }
         return Ok(());
@@ -805,6 +980,118 @@ pub(crate) fn execute_scalar_compare_k(
         }
     };
     Ok(result)
+}
+
+/// Bit position of the least significant set bit, or `-1` (all ones) when the value is zero.
+const fn first_set_bit_position_32(value: u32) -> u32 {
+    if value == 0 {
+        u32::MAX
+    } else {
+        value.trailing_zeros()
+    }
+}
+
+const fn first_set_bit_position_64(value: u64) -> u32 {
+    if value == 0 {
+        u32::MAX
+    } else {
+        value.trailing_zeros()
+    }
+}
+
+/// Bit position counted from the most significant bit of the first set bit, or `-1` when zero.
+const fn last_set_bit_position_32(value: u32) -> u32 {
+    if value == 0 {
+        u32::MAX
+    } else {
+        value.leading_zeros()
+    }
+}
+
+const fn last_set_bit_position_64(value: u64) -> u32 {
+    if value == 0 {
+        u32::MAX
+    } else {
+        value.leading_zeros()
+    }
+}
+
+/// Executes the M0-relative scalar moves. Returns `false` when the opcode is not one of them.
+///
+/// The dynamic index is exact here because the evaluator tracks M0 (`s124`) like every other
+/// scalar register. An index escaping the register file is a loud error rather than a wrap:
+/// hardware behavior is undefined there and continuing would fabricate a value.
+fn execute_relative_move(
+    instruction: &Instruction,
+    destination: u32,
+    registers: &mut [u32; SCALAR_REGISTER_COUNT],
+    exec_mask: &mut u64,
+) -> Result<bool, EvaluationError> {
+    let name = instruction.opcode.known_name();
+    if !matches!(
+        name,
+        Some("SMovrelsB32" | "SMovrelsB64" | "SMovreldB32" | "SMovreldB64")
+    ) {
+        return Ok(false);
+    }
+    let width = if matches!(name, Some("SMovrelsB64" | "SMovreldB64")) {
+        2_u32
+    } else {
+        1
+    };
+    let m0 = registers[124];
+    let relative = |base: u32| -> Result<u32, EvaluationError> {
+        let index = base
+            .checked_add(m0)
+            .filter(|index| index.saturating_add(width - 1) < SCALAR_REGISTER_COUNT_U32)
+            .ok_or_else(|| invalid(instruction, "relative scalar register index"))?;
+        Ok(index)
+    };
+    match name {
+        Some("SMovrelsB32" | "SMovrelsB64") => {
+            let base = match instruction.sources.first() {
+                Some(Operand {
+                    kind: OperandKind::ScalarRegister,
+                    value,
+                }) => *value,
+                _ => return Err(invalid(instruction, "relative scalar source")),
+            };
+            let source = relative(base)?;
+            if width == 2 {
+                let value = read_scalar_pair(registers, source)
+                    .ok_or_else(|| invalid(instruction, "relative scalar source pair"))?;
+                write_scalar_pair(registers, destination, value, exec_mask);
+            } else {
+                registers[destination as usize] = registers[source as usize];
+            }
+        }
+        _ => {
+            let target = relative(destination)?;
+            if width == 2 {
+                let value = evaluate_operand64(
+                    instruction
+                        .sources
+                        .first()
+                        .ok_or_else(|| invalid(instruction, "relative move source"))?,
+                    registers,
+                    *exec_mask,
+                )
+                .ok_or_else(|| invalid(instruction, "relative move source"))?;
+                write_scalar_pair(registers, target, value, exec_mask);
+            } else {
+                let value = evaluate_operand(
+                    instruction
+                        .sources
+                        .first()
+                        .ok_or_else(|| invalid(instruction, "relative move source"))?,
+                    registers,
+                )
+                .ok_or_else(|| invalid(instruction, "relative move source"))?;
+                registers[target as usize] = value;
+            }
+        }
+    }
+    Ok(true)
 }
 
 pub(crate) fn read_scalar_pair(

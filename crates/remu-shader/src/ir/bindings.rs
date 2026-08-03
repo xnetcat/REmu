@@ -17,7 +17,140 @@ pub struct ImageBinding {
     pub mip_level: Option<u32>,
 }
 
+/// Native texture type carried in descriptor DWORD3 bits 31:28.
+///
+/// The field and values are the SDK's `Agc::Core::Texture`: `Type m_type : 4` closes DWORD3
+/// (agc/core/texture.h:249) and the values are k1d=8 through k2dArrayMsaa=15
+/// (agc/core/texture.h:54-63). Values below 8 do not name a valid texture descriptor.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TextureDescriptorType {
+    OneD,
+    TwoD,
+    ThreeD,
+    Cube,
+    OneDArray,
+    TwoDArray,
+    TwoDMsaa,
+    TwoDMsaaArray,
+}
+
+/// The native signature shape an image instruction addresses, derived from the MIMG `DIM` field.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ImageSignatureClass {
+    OneD,
+    TwoD,
+    ThreeD,
+    Cube,
+    OneDArray,
+    TwoDArray,
+    TwoDMsaa,
+    TwoDMsaaArray,
+}
+
+/// How the bound descriptor's native type must be presented to satisfy the instruction's
+/// coordinate model. The instruction DIM decides the signature; the descriptor TYPE decides the
+/// stored layout; a backend resolves any disagreement with a texture view — or refuses loudly.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ImageViewReinterpretation {
+    /// Descriptor TYPE and instruction DIM agree (or no live descriptor constrains the shape).
+    Direct,
+    /// A cubemap addressed with 2D-array coordinates: its six-faces-per-slice array layout
+    /// (the SDK's array view on `kCubemap`, agc/core/texture.h:321).
+    CubeFacesAsArray,
+    /// A 2D-array descriptor sampled with cube coordinates: re-view six slices as a cube.
+    ArrayAsCube,
+    /// A non-array access over an array descriptor: the base slice.
+    ArrayBaseSlice,
+    /// An array access over a single-layer descriptor: a one-element array view.
+    SingleLayerAsArray,
+    /// No coherent view exists; the backend must refuse this draw loudly, never guess.
+    Incompatible,
+}
+
 impl ImageBinding {
+    /// The descriptor's native texture type, when a live descriptor with a valid TYPE nibble is
+    /// bound (DWORD3 bits 31:28, agc/core/texture.h:249; values texture.h:54-63).
+    #[must_use]
+    pub fn descriptor_type(&self) -> Option<TextureDescriptorType> {
+        if self.resource_descriptor.iter().all(|word| *word == 0) {
+            return None;
+        }
+        match self.resource_descriptor.get(3)? >> 28 {
+            8 => Some(TextureDescriptorType::OneD),
+            9 => Some(TextureDescriptorType::TwoD),
+            10 => Some(TextureDescriptorType::ThreeD),
+            11 => Some(TextureDescriptorType::Cube),
+            12 => Some(TextureDescriptorType::OneDArray),
+            13 => Some(TextureDescriptorType::TwoDArray),
+            14 => Some(TextureDescriptorType::TwoDMsaa),
+            15 => Some(TextureDescriptorType::TwoDMsaaArray),
+            _ => None,
+        }
+    }
+
+    /// The signature shape the instruction's MIMG `DIM` field addresses.
+    #[must_use]
+    pub fn signature_class(&self) -> ImageSignatureClass {
+        match self.control.dimension {
+            0 => ImageSignatureClass::OneD,
+            2 => ImageSignatureClass::ThreeD,
+            3 => ImageSignatureClass::Cube,
+            4 => ImageSignatureClass::OneDArray,
+            5 => ImageSignatureClass::TwoDArray,
+            6 => ImageSignatureClass::TwoDMsaa,
+            7 => ImageSignatureClass::TwoDMsaaArray,
+            _ => ImageSignatureClass::TwoD,
+        }
+    }
+
+    /// Reconciles the descriptor's native TYPE against the instruction's DIM signature.
+    #[must_use]
+    pub fn view_reinterpretation(&self) -> ImageViewReinterpretation {
+        let Some(descriptor_type) = self.descriptor_type() else {
+            return ImageViewReinterpretation::Direct;
+        };
+        let native_class = match descriptor_type {
+            TextureDescriptorType::OneD => ImageSignatureClass::OneD,
+            TextureDescriptorType::TwoD => ImageSignatureClass::TwoD,
+            TextureDescriptorType::ThreeD => ImageSignatureClass::ThreeD,
+            TextureDescriptorType::Cube => ImageSignatureClass::Cube,
+            TextureDescriptorType::OneDArray => ImageSignatureClass::OneDArray,
+            TextureDescriptorType::TwoDArray => ImageSignatureClass::TwoDArray,
+            TextureDescriptorType::TwoDMsaa => ImageSignatureClass::TwoDMsaa,
+            TextureDescriptorType::TwoDMsaaArray => ImageSignatureClass::TwoDMsaaArray,
+        };
+        let signature = self.signature_class();
+        if native_class == signature {
+            return ImageViewReinterpretation::Direct;
+        }
+        match (descriptor_type, signature) {
+            // A cubemap is stored as six slices per element; both the array view of a cube and a
+            // cube view of an array are exact layout reinterpretations.
+            (TextureDescriptorType::Cube, ImageSignatureClass::TwoDArray) => {
+                ImageViewReinterpretation::CubeFacesAsArray
+            }
+            (TextureDescriptorType::TwoDArray, ImageSignatureClass::Cube) => {
+                ImageViewReinterpretation::ArrayAsCube
+            }
+            // Dimension-preserving array/non-array disagreement selects the base slice or wraps
+            // the single layer.
+            (TextureDescriptorType::OneDArray, ImageSignatureClass::OneD)
+            | (
+                TextureDescriptorType::TwoDArray | TextureDescriptorType::Cube,
+                ImageSignatureClass::TwoD,
+            )
+            | (TextureDescriptorType::TwoDMsaaArray, ImageSignatureClass::TwoDMsaa) => {
+                ImageViewReinterpretation::ArrayBaseSlice
+            }
+            (TextureDescriptorType::OneD, ImageSignatureClass::OneDArray)
+            | (TextureDescriptorType::TwoD, ImageSignatureClass::TwoDArray)
+            | (TextureDescriptorType::TwoDMsaa, ImageSignatureClass::TwoDMsaaArray) => {
+                ImageViewReinterpretation::SingleLayerAsArray
+            }
+            _ => ImageViewReinterpretation::Incompatible,
+        }
+    }
+
     /// Returns whether two guest image instructions can use one native texture binding.
     ///
     /// Descriptor identity alone is insufficient: Metal encodes the component/dimension type and

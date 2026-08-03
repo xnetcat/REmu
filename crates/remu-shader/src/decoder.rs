@@ -20,7 +20,7 @@ use scalar::{
 };
 use vector::{
     decode_vintrp, decode_vop_extension, decode_vop1, decode_vop2, decode_vop3, decode_vop3p,
-    decode_vopc, is_vop3b_opcode,
+    decode_vopc, is_vop3b_opcode, vop1_writes_vector_pair,
 };
 
 #[cfg(test)]
@@ -152,25 +152,24 @@ fn required_word(
     })
 }
 
-fn known_frame(
-    pc: u32,
-    word: u32,
+/// Frames one instruction whose length is fully determined by the encoding word itself.
+///
+/// An opcode outside the semantic table decodes as a typed [`Opcode::Raw`] value instead of
+/// failing the whole shader: the framing stays exact, the evaluator refuses raw scalar
+/// operations loudly, and a backend reports the precise per-opcode translation gap.
+#[allow(clippy::cast_possible_truncation)]
+fn frame_or_raw(
     encoding: ShaderEncoding,
-    opcode_code: u32,
+    family: RawOpcodeFamily,
+    code: u32,
     name: Option<&'static str>,
     dwords: usize,
-) -> Result<Frame, DecodeError> {
-    let name = name.ok_or(DecodeError::UnknownOpcode {
-        pc,
+) -> Frame {
+    Frame {
         encoding,
-        opcode: opcode_code,
-        word,
-    })?;
-    Ok(Frame {
-        encoding,
-        opcode: Opcode::from_static(name),
+        opcode: name.map_or_else(|| Opcode::raw(family, code as u16), Opcode::from_static),
         dwords,
-    })
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -221,7 +220,28 @@ fn create_instruction(
                 kind: OperandKind::EncodedConstant,
                 value: word & 0xffff,
             });
-            destinations.push(Operand::scalar((word >> 16) & 0x7f));
+            if opcode.is("SVersion") {
+                // A pure toolchain hint: the SDST field carries no register operand.
+            } else if opcode.is("SSetregB32") {
+                // The SDST field is the value READ into the hardware register.
+                sources.push(Operand::scalar((word >> 16) & 0x7f));
+            } else if opcode.is("SSetregImm32B32") {
+                if let Some(literal) = literal {
+                    sources.push(literal_operand(literal));
+                }
+            } else if matches!(
+                opcode.known_name(),
+                Some("SWaitcntVscnt" | "SWaitcntVmcnt" | "SWaitcntExpcnt" | "SWaitcntLgkmcnt")
+            ) {
+                // The SDST field supplies an additional wait count and is read, not written.
+                sources.push(Operand::source((word >> 16) & 0x7f, None));
+            } else {
+                destinations.push(Operand::scalar((word >> 16) & 0x7f));
+            }
+        }
+        ShaderEncoding::Smrd if opcode.known_name().is_none() => {
+            // A raw scalar-memory opcode has unknown field semantics; fabricating operands or a
+            // load control from them could invent a binding. The backend reports the gap.
         }
         ShaderEncoding::Smrd => {
             let scalar_base = ((word >> 9) & 0x3f) * 2;
@@ -249,6 +269,9 @@ fn create_instruction(
                 immediate_offset_bytes,
                 dynamic_offset_register,
             }));
+        }
+        ShaderEncoding::Smem if opcode.known_name().is_none() => {
+            // Same rule as raw SMRD: nothing may be fabricated from unknown fields.
         }
         ShaderEncoding::Smem => {
             let extra = words[1];
@@ -286,6 +309,8 @@ fn create_instruction(
             );
             if opcode.is("VReadfirstlaneB32") {
                 destinations.push(Operand::scalar((word >> 17) & 0x7f));
+            } else if vop1_writes_vector_pair(opcode) {
+                push_vector_range(&mut destinations, (word >> 17) & 0xff, 2);
             } else {
                 destinations.push(Operand::vector((word >> 17) & 0xff));
             }
@@ -393,6 +418,10 @@ fn create_instruction(
                 attribute: (word >> 10) & 0x3f,
                 channel: (word >> 8) & 3,
             }));
+        }
+        ShaderEncoding::Flat if opcode.known_name().is_none() => {
+            // Raw FLAT-encoded operations keep exact framing but expose no operands: an unknown
+            // operation's address fields must never turn into a guest-memory binding.
         }
         ShaderEncoding::Flat => {
             control = Some(decode_global_memory(

@@ -743,13 +743,16 @@ fn decodes_global_vdst_vdata_address_modes_and_twelve_bit_offset() {
 }
 
 #[test]
-fn rejects_reserved_scalar_opcode_instead_of_emitting_a_placeholder() {
-    let error = decode_program(0x1000, &[0xbe80_0000]).expect_err("reserved SOP1 opcode");
+fn reserved_scalar_opcodes_decode_as_typed_raw_values() {
+    // A reserved SOP1 code no longer kills the whole shader at decode; the evaluator refuses it
+    // loudly if it sits on an executed path, and a backend reports the exact per-opcode gap.
+    let program =
+        decode_program(0x1000, &[0xbe80_0000, 0xbf81_0000]).expect("reserved SOP1 decodes as raw");
     assert!(matches!(
-        error,
-        DecodeError::UnknownOpcode {
-            encoding: ShaderEncoding::Sop1,
-            ..
+        program.instructions[0].opcode,
+        Opcode::Raw {
+            family: RawOpcodeFamily::Sop1,
+            code: 0
         }
     ));
 }
@@ -875,14 +878,14 @@ fn decodes_absdiff_at_the_rdna2_sop2_opcode() {
     assert!(frame.opcode.is("SAbsdiffI32"));
 
     let reserved = 0x8000_0000 | (45 << 23);
-    assert!(matches!(
-        decode_frame(0, &[reserved]),
-        Err(DecodeError::UnknownOpcode {
-            encoding: ShaderEncoding::Sop2,
-            opcode: 45,
-            ..
-        })
-    ));
+    let frame = decode_frame(0, &[reserved]).expect("reserved SOP2 decodes as raw");
+    assert_eq!(
+        frame.opcode,
+        Opcode::Raw {
+            family: RawOpcodeFamily::Sop2,
+            code: 45,
+        }
+    );
 }
 
 #[test]
@@ -1177,15 +1180,17 @@ fn a_global_atomic_returns_to_its_vdst_only_when_glc_requests_it() {
 #[test]
 fn scratch_segment_has_no_atomic_encodings_and_stays_loud() {
     // SCRATCH (segment 1) shares the load/store numbers but has no atomic block; an atomic OP in
-    // that segment is genuinely undefined and must remain a loud UnknownOpcode, not a fabrication.
+    // that segment is genuinely undefined. It decodes as a typed raw value with exact framing —
+    // the evaluator and backend refuse raw operations loudly, and nothing fabricates semantics.
     let word = flat_word(0x32, 1);
-    assert!(matches!(
-        decode_frame(0, &[word, 0]),
-        Err(DecodeError::UnknownOpcode {
-            encoding: ShaderEncoding::Flat,
-            ..
-        })
-    ));
+    let frame = decode_frame(0, &[word, 0]).expect("undefined SCRATCH atomic decodes as raw");
+    assert_eq!(
+        frame.opcode,
+        Opcode::Raw {
+            family: RawOpcodeFamily::Flat,
+            code: 0x32,
+        }
+    );
 }
 
 #[test]
@@ -1293,4 +1298,522 @@ fn decodes_the_full_gfx10_image_sample_gather_lattice() {
             frame.opcode
         );
     }
+}
+
+#[test]
+fn decodes_benign_sopp_hint_opcodes_as_known_non_branches() {
+    // SOPP hints adjust hardware wait/mode/priority state only. Every one of them previously
+    // failed the whole shader with UnknownOpcode; a single S_DENORM_MODE killed the draw.
+    let words = [
+        0xbf83_0000, // s_wakeup
+        0xbf8d_0000, // s_sethalt 0
+        0xbf8e_0001, // s_sleep 1
+        0xbf8f_0003, // s_setprio 3
+        0xbf93_0000, // s_icache_inv
+        0xbf94_0000, // s_incperflevel 0
+        0xbf95_0000, // s_decperflevel 0
+        0xbfa2_0000, // s_wait_idle
+        0xbfa4_0003, // s_round_mode 3
+        0xbfa5_000f, // s_denorm_mode 15
+        0xbfa8_0000, // s_ttracedata_imm 0
+        0xbf81_0000, // s_endpgm
+    ];
+    let program = decode_program(0x1000, &words).expect("benign SOPP hints decode");
+    let names = [
+        "SWakeup",
+        "SSethalt",
+        "SSleep",
+        "SSetprio",
+        "SIcacheInv",
+        "SIncperflevel",
+        "SDecperflevel",
+        "SWaitIdle",
+        "SRoundMode",
+        "SDenormMode",
+        "STtracedataImm",
+    ];
+    for (instruction, name) in program.instructions.iter().zip(names) {
+        assert_eq!(instruction.encoding, ShaderEncoding::Sopp);
+        assert!(
+            instruction.opcode.is(name),
+            "expected {name}, got {}",
+            instruction.opcode
+        );
+    }
+    assert_eq!(program.instructions[11].opcode, Opcode::END_PROGRAM);
+}
+
+#[test]
+fn sopp_end_program_variants_terminate_the_stream() {
+    for word in [0xbf9b_0000_u32, 0xbf9e_0000] {
+        // s_endpgm_saved / s_endpgm_ordered_ps_done end the wave exactly like s_endpgm. Decoding
+        // them as the terminator (the S_CODE_END precedent) stops the stream scan correctly.
+        let program = decode_program(0x1000, &[word, 0xdead_beef]).expect("end-program variant");
+        assert_eq!(program.instructions.len(), 1);
+        assert_eq!(program.instructions[0].opcode, Opcode::END_PROGRAM);
+    }
+}
+
+#[test]
+fn decodes_benign_sopk_hints_and_scalar_waitcnt_shapes() {
+    let program = decode_program(
+        0x1000,
+        &[
+            0xb080_1234, // s_version 0x1234
+            0xb105_0007, // s_cmovk_i32 s5, 7
+            0xb885_f801, // s_getreg_b32 s5, hwreg(...)
+            0xb905_f801, // s_setreg_b32 hwreg(...), s5
+            0xb985_f801, // s_setreg_imm32_b32 hwreg(...), 0x11223344
+            0x1122_3344,
+            0xbafd_0000, // s_waitcnt_vscnt null, 0
+            0xbb05_0001, // s_waitcnt_vmcnt s5, 1
+            0xbbfd_0002, // s_waitcnt_expcnt null, 2
+            0xbc05_0003, // s_waitcnt_lgkmcnt s5, 3
+            0xbf81_0000, // s_endpgm
+        ],
+    )
+    .expect("benign SOPK program");
+
+    let version = &program.instructions[0];
+    assert!(version.opcode.is("SVersion"));
+    assert!(version.destinations.is_empty(), "s_version writes no SGPR");
+
+    let cmovk = &program.instructions[1];
+    assert!(cmovk.opcode.is("SCmovkI32"));
+    assert_eq!(cmovk.destinations, [Operand::scalar(5)]);
+
+    let getreg = &program.instructions[2];
+    assert!(getreg.opcode.is("SGetregB32"));
+    assert_eq!(getreg.destinations, [Operand::scalar(5)]);
+
+    let setreg = &program.instructions[3];
+    assert!(setreg.opcode.is("SSetregB32"));
+    assert!(setreg.destinations.is_empty(), "s_setreg writes no SGPR");
+    assert_eq!(setreg.sources[1], Operand::scalar(5));
+
+    let setreg_imm = &program.instructions[4];
+    assert!(setreg_imm.opcode.is("SSetregImm32B32"));
+    assert_eq!(
+        setreg_imm.words.len(),
+        2,
+        "s_setreg_imm32_b32 carries a literal"
+    );
+    assert!(setreg_imm.destinations.is_empty());
+    assert_eq!(
+        setreg_imm.sources[1],
+        Operand {
+            kind: OperandKind::LiteralConstant,
+            value: 0x1122_3344,
+        }
+    );
+
+    for (index, name) in [
+        (5, "SWaitcntVscnt"),
+        (6, "SWaitcntVmcnt"),
+        (7, "SWaitcntExpcnt"),
+        (8, "SWaitcntLgkmcnt"),
+    ] {
+        let waitcnt = &program.instructions[index];
+        assert!(
+            waitcnt.opcode.is(name),
+            "expected {name}, got {}",
+            waitcnt.opcode
+        );
+        assert!(
+            waitcnt.destinations.is_empty(),
+            "{name} reads its SDST field"
+        );
+    }
+    // The register-relative wait count is a read of the SDST field, not a write.
+    assert_eq!(program.instructions[6].sources[1], Operand::scalar(5));
+}
+
+#[test]
+fn decodes_the_sop1_unary_and_relative_move_batch() {
+    // SOP1 word: 0xbe80_0000 | sdst<<16 | code<<8 | ssrc.
+    let cases: &[(u32, &str)] = &[
+        (0xbe85_0503, "SCmovB32"),            // s_cmov_b32 s5, s3
+        (0xbe84_0602, "SCmovB64"),            // s_cmov_b64 s[4:5], s[2:3]
+        (0xbe85_0903, "SWqmB32"),             // s_wqm_b32 s5, s3
+        (0xbe84_0c02, "SBrevB64"),            // s_brev_b64 s[4:5], s[2:3]
+        (0xbe85_0d03, "SBcnt0I32B32"),        // s_bcnt0_i32_b32 s5, s3
+        (0xbe85_0e02, "SBcnt0I32B64"),        // s_bcnt0_i32_b64 s5, s[2:3]
+        (0xbe85_1103, "SFF0I32B32"),          // s_ff0_i32_b32 s5, s3
+        (0xbe85_1202, "SFF0I32B64"),          // s_ff0_i32_b64 s5, s[2:3]
+        (0xbe85_1402, "SFF1I32B64"),          // s_ff1_i32_b64 s5, s[2:3]
+        (0xbe85_1503, "SFlbitI32B32"),        // s_flbit_i32_b32 s5, s3
+        (0xbe85_1602, "SFlbitI32B64"),        // s_flbit_i32_b64 s5, s[2:3]
+        (0xbe85_1703, "SFlbitI32"),           // s_flbit_i32 s5, s3
+        (0xbe85_1802, "SFlbitI32I64"),        // s_flbit_i32_i64 s5, s[2:3]
+        (0xbe85_1903, "SSextI32I8"),          // s_sext_i32_i8 s5, s3
+        (0xbe85_1a03, "SSextI32I16"),         // s_sext_i32_i16 s5, s3
+        (0xbe85_1b03, "SBitset0B32"),         // s_bitset0_b32 s5, s3
+        (0xbe84_1c03, "SBitset0B64"),         // s_bitset0_b64 s[4:5], s3
+        (0xbe84_1e03, "SBitset1B64"),         // s_bitset1_b64 s[4:5], s3
+        (0xbe85_2c03, "SQuadmaskB32"),        // s_quadmask_b32 s5, s3
+        (0xbe84_2d02, "SQuadmaskB64"),        // s_quadmask_b64 s[4:5], s[2:3]
+        (0xbe85_2e03, "SMovrelsB32"),         // s_movrels_b32 s5, s3
+        (0xbe84_2f02, "SMovrelsB64"),         // s_movrels_b64 s[4:5], s[2:3]
+        (0xbe85_3003, "SMovreldB32"),         // s_movreld_b32 s5, s3
+        (0xbe84_3102, "SMovreldB64"),         // s_movreld_b64 s[4:5], s[2:3]
+        (0xbe85_3403, "SAbsI32"),             // s_abs_i32 s5, s3
+        (0xbe84_3603, "SBitreplicateB64B32"), // s_bitreplicate_b64_b32 s[4:5], s3
+    ];
+    for &(word, name) in cases {
+        let program =
+            decode_program(0x1000, &[word, 0xbf81_0000]).expect("SOP1 batch instruction decodes");
+        let instruction = &program.instructions[0];
+        assert_eq!(instruction.encoding, ShaderEncoding::Sop1);
+        assert!(
+            instruction.opcode.is(name),
+            "word 0x{word:08X}: expected {name}, got {}",
+            instruction.opcode
+        );
+    }
+}
+
+#[test]
+fn decodes_s_call_and_scans_past_endpgm_to_its_forward_subroutine() {
+    // s_call_b64 s[10:11], +2 jumps over the endpgm to the subroutine; the decoder must keep
+    // scanning to the call target exactly as it does for forward branches.
+    let words = [
+        0xba0a_0001, // s_call_b64 s[10:11], +1 (target pc 8)
+        0xbf81_0000, // s_endpgm at pc 4
+        0xb005_002a, // s_movk_i32 s5, 42 at pc 8
+        0xbf81_0000, // s_endpgm
+    ];
+    let program = decode_program(0x1000, &words).expect("call target extends the scan");
+    assert_eq!(program.instructions.len(), 4);
+    assert!(program.instructions[0].opcode.is("SCallB64"));
+    assert_eq!(program.instructions[0].destinations, [Operand::scalar(10)]);
+    assert!(program.instructions[2].opcode.is("SMovkI32"));
+}
+
+#[test]
+fn decodes_the_complete_global_atomic_set_with_return_shapes() {
+    let atomics: &[(u32, &str, u32, u32)] = &[
+        // (code, name, data dwords, returned dwords with GLC)
+        (0x30, "GlobalAtomicSwap", 1, 1),
+        (0x31, "GlobalAtomicCmpswap", 2, 1),
+        (0x34, "GlobalAtomicCsub", 1, 1),
+        (0x3e, "GlobalAtomicFcmpswap", 2, 1),
+        (0x3f, "GlobalAtomicFmin", 1, 1),
+        (0x40, "GlobalAtomicFmax", 1, 1),
+        (0x50, "GlobalAtomicSwapX2", 2, 2),
+        (0x51, "GlobalAtomicCmpswapX2", 4, 2),
+        (0x52, "GlobalAtomicAddX2", 2, 2),
+        (0x53, "GlobalAtomicSubX2", 2, 2),
+        (0x55, "GlobalAtomicSminX2", 2, 2),
+        (0x56, "GlobalAtomicUminX2", 2, 2),
+        (0x57, "GlobalAtomicSmaxX2", 2, 2),
+        (0x58, "GlobalAtomicUmaxX2", 2, 2),
+        (0x59, "GlobalAtomicAndX2", 2, 2),
+        (0x5a, "GlobalAtomicOrX2", 2, 2),
+        (0x5b, "GlobalAtomicXorX2", 2, 2),
+        (0x5c, "GlobalAtomicIncX2", 2, 2),
+        (0x5d, "GlobalAtomicDecX2", 2, 2),
+        (0x5e, "GlobalAtomicFcmpswapX2", 4, 2),
+        (0x5f, "GlobalAtomicFminX2", 2, 2),
+        (0x60, "GlobalAtomicFmaxX2", 2, 2),
+    ];
+    for &(code, name, data_dwords, returned_dwords) in atomics {
+        let word = flat_word(code, 2) | (1 << 16); // GLC returns the pre-op value
+        let extra = 2 | (4 << 8) | (0x7f << 16) | (8 << 24); // vaddr=2 vdata=4 saddr=null vdst=8
+        let frame = decode_frame(0, &[word, extra]).expect("GLOBAL atomic frame");
+        let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+        // vaddr pair (null SADDR) then the data registers.
+        let data_sources = &instruction.sources[2..];
+        assert_eq!(
+            data_sources.len() as u32,
+            data_dwords,
+            "{name} data register count"
+        );
+        assert_eq!(
+            instruction.destinations.len() as u32,
+            returned_dwords,
+            "{name} GLC return register count"
+        );
+        assert_eq!(instruction.destinations[0], Operand::vector(8));
+    }
+    // CSUB is GLOBAL-only; a SCRATCH or FLAT encoding of it is undefined and stays raw.
+    for segment in [0_u32, 1] {
+        let frame = decode_frame(0, &[flat_word(0x34, segment), 0])
+            .expect("undefined CSUB segment decodes as raw");
+        assert_eq!(
+            frame.opcode,
+            Opcode::Raw {
+                family: RawOpcodeFamily::Flat,
+                code: 0x34,
+            }
+        );
+    }
+}
+
+#[test]
+fn decodes_scratch_memory_without_treating_offsets_as_guest_pointers() {
+    // SCRATCH with SADDR: the scalar register is a private-space offset and VADDR is disabled.
+    let word = flat_word(0x0c, 1); // scratch_load_dword
+    let extra = (5 << 16) | (7 << 24); // saddr=5, vdst=7
+    let frame = decode_frame(0, &[word, extra]).expect("SCRATCH load frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert!(instruction.opcode.is("ScratchLoadDword"));
+    assert_eq!(instruction.sources, [Operand::scalar(5)]);
+    assert_eq!(instruction.destinations, [Operand::vector(7)]);
+    assert!(matches!(
+        instruction.control,
+        Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+            scalar_address: None,
+            ..
+        }))
+    ));
+
+    // Without SADDR the 32-bit VADDR is the only address register: no phantom vaddr+1 pair.
+    let word = flat_word(0x1a, 1); // scratch_store_short
+    let extra = 3 | (9 << 8) | (0x7f << 16);
+    let frame = decode_frame(0, &[word, extra]).expect("SCRATCH store frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert!(instruction.opcode.is("ScratchStoreShort"));
+    assert_eq!(
+        instruction.sources,
+        [Operand::vector(3), Operand::vector(9)]
+    );
+    assert!(instruction.destinations.is_empty());
+}
+
+#[test]
+fn decodes_global_addtid_operations_without_a_vaddr() {
+    // ADDTID addressing has no VADDR at all; the address is SADDR + offset + tid*4.
+    let word = flat_word(0x16, 2); // global_load_dword_addtid
+    let extra = (6 << 16) | (11 << 24);
+    let frame = decode_frame(0, &[word, extra]).expect("ADDTID frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert!(instruction.opcode.is("GlobalLoadDwordAddtid"));
+    assert_eq!(instruction.sources, [Operand::scalar(6)]);
+    assert_eq!(instruction.destinations, [Operand::vector(11)]);
+
+    // ADDTID is GLOBAL-only; the other segments leave the code undefined and raw.
+    for segment in [0_u32, 1] {
+        let frame = decode_frame(0, &[flat_word(0x16, segment), 0])
+            .expect("undefined ADDTID segment decodes as raw");
+        assert_eq!(
+            frame.opcode,
+            Opcode::Raw {
+                family: RawOpcodeFamily::Flat,
+                code: 0x16,
+            }
+        );
+    }
+}
+
+#[test]
+fn decodes_lds_byte_and_short_transfers() {
+    // DS word: 0xd800_0000 | code<<18; extra: addr | data0<<8 | vdst<<24.
+    let cases: &[(u32, &str, usize, usize)] = &[
+        // (code, name, source count, destination count)
+        (0x1e, "DsWriteB8", 2, 0),
+        (0x1f, "DsWriteB16", 2, 0),
+        (0x39, "DsReadI8", 1, 1),
+        (0x3a, "DsReadU8", 1, 1),
+        (0x3b, "DsReadI16", 1, 1),
+        (0x3c, "DsReadU16", 1, 1),
+    ];
+    for &(code, name, source_count, destination_count) in cases {
+        let word = 0xd800_0000 | (code << 18);
+        let extra = 1 | (2 << 8) | (5 << 24);
+        let frame = decode_frame(0, &[word, extra]).expect("DS byte/short frame");
+        let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+        assert_eq!(instruction.sources.len(), source_count, "{name} sources");
+        assert_eq!(
+            instruction.destinations.len(),
+            destination_count,
+            "{name} destinations"
+        );
+    }
+}
+
+#[test]
+fn decodes_the_vop1_f64_f16_and_bit_scan_batch() {
+    // VOP1 word: 0x7e00_0000 | vdst<<17 | code<<9 | src0.
+    let cases: &[(u32, &str, usize)] = &[
+        // (code, name, destination register count)
+        (0x03, "VCvtI32F64", 1),
+        (0x04, "VCvtF64I32", 2),
+        (0x0f, "VCvtF32F64", 1),
+        (0x10, "VCvtF64F32", 2),
+        (0x15, "VCvtU32F64", 1),
+        (0x16, "VCvtF64U32", 2),
+        (0x17, "VTruncF64", 2),
+        (0x18, "VCeilF64", 2),
+        (0x19, "VRndneF64", 2),
+        (0x1a, "VFloorF64", 2),
+        (0x1b, "VPipeflush", 1),
+        (0x2f, "VRcpF64", 2),
+        (0x31, "VRsqF64", 2),
+        (0x34, "VSqrtF64", 2),
+        (0x39, "VFfbhU32", 1),
+        (0x3b, "VFfbhI32", 1),
+        (0x3c, "VFrexpExpI32F64", 1),
+        (0x3d, "VFrexpMantF64", 2),
+        (0x3e, "VFractF64", 2),
+        (0x3f, "VFrexpExpI32F32", 1),
+        (0x40, "VFrexpMantF32", 1),
+        (0x50, "VCvtF16U16", 1),
+        (0x51, "VCvtF16I16", 1),
+        (0x53, "VCvtI16F16", 1),
+        (0x59, "VFrexpMantF16", 1),
+        (0x5a, "VFrexpExpI16F16", 1),
+        (0x5b, "VFloorF16", 1),
+        (0x5c, "VCeilF16", 1),
+        (0x5d, "VTruncF16", 1),
+        (0x5e, "VRndneF16", 1),
+        (0x5f, "VFractF16", 1),
+        (0x60, "VSinF16", 1),
+        (0x61, "VCosF16", 1),
+        (0x62, "VSatPkU8I16", 1),
+        (0x63, "VCvtNormI16F16", 1),
+        (0x64, "VCvtNormU16F16", 1),
+        (0x65, "VSwapB32", 1),
+    ];
+    for &(code, name, destination_count) in cases {
+        let word = 0x7e00_0000 | (4 << 17) | (code << 9) | 0x100 | 2; // v4, v2
+        let program =
+            decode_program(0x1000, &[word, 0xbf81_0000]).expect("VOP1 batch instruction decodes");
+        let instruction = &program.instructions[0];
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+        assert_eq!(
+            instruction.destinations.len(),
+            destination_count,
+            "{name} destination registers"
+        );
+        assert_eq!(instruction.destinations[0], Operand::vector(4));
+    }
+}
+
+#[test]
+fn decodes_the_vop2_legacy_and_i24_multiplies() {
+    // VOP2 word: vdst<<17 | code<<25 | vsrc1<<9 | src0.
+    for (code, name) in [
+        (0x06_u32, "VFmacLegacyF32"),
+        (0x07, "VMulLegacyF32"),
+        (0x09, "VMulI32I24"),
+        (0x0a, "VMulHiI32I24"),
+        (0x3c, "VPkFmacF16"),
+    ] {
+        let word = (code << 25) | (4 << 17) | (3 << 9) | 0x100 | 2;
+        let program =
+            decode_program(0x1000, &[word, 0xbf81_0000]).expect("VOP2 batch instruction decodes");
+        let instruction = &program.instructions[0];
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+    }
+}
+
+#[test]
+fn decodes_f64_and_16_bit_vector_compares_and_the_class_family() {
+    // VOPC word: 0x7c00_0000 | code<<17 | vsrc1<<9 | src0.
+    let cases: &[(u32, &str)] = &[
+        (0x21, "VCmpLtF64"),
+        (0x22, "VCmpEqF64"),
+        (0x26, "VCmpGeF64"),
+        (0x2f, "VCmpTruF64"),
+        (0x31, "VCmpxLtF64"),
+        (0x3e, "VCmpxNltF64"),
+        (0x89, "VCmpLtI16"),
+        (0x8a, "VCmpEqI16"),
+        (0x8e, "VCmpGeI16"),
+        (0x8f, "VCmpClassF16"),
+        (0x98, "VCmpxClassF32"),
+        (0x99, "VCmpxLtI16"),
+        (0x9f, "VCmpxClassF16"),
+        (0xa8, "VCmpClassF64"),
+        (0xa9, "VCmpLtU16"),
+        (0xae, "VCmpGeU16"),
+        (0xb8, "VCmpxClassF64"),
+        (0xb9, "VCmpxLtU16"),
+        (0xbe, "VCmpxGeU16"),
+    ];
+    for &(code, name) in cases {
+        let word = 0x7c00_0000 | (code << 17) | (3 << 9) | 0x100 | 2;
+        let program =
+            decode_program(0x1000, &[word, 0xbf81_0000]).expect("VOPC batch instruction decodes");
+        let instruction = &program.instructions[0];
+        assert!(
+            instruction.opcode.is(name),
+            "code 0x{code:X}: expected {name}, got {}",
+            instruction.opcode
+        );
+    }
+}
+
+#[test]
+fn unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the_shader() {
+    // Every family whose framing is fully determined by the encoding word keeps unknown opcodes
+    // as typed Raw values: the whole-shader decode kill becomes a per-opcode backend gap.
+    let raw_words: &[(u32, RawOpcodeFamily, u16)] = &[
+        (0xbe85_6903, RawOpcodeFamily::Sop1, 0x69), // reserved SOP1
+        (0x9f94_0c0a, RawOpcodeFamily::Sop2, 0x3f), // reserved SOP2
+        (0xbf3f_0c0a, RawOpcodeFamily::Sopc, 0x3f), // reserved SOPC
+        (0xbfaa_0000, RawOpcodeFamily::Sopp, 0x2a), // reserved SOPP hint space
+        (0xbd85_0007, RawOpcodeFamily::Sopk, 0x1b), // reserved SOPK
+        (0x7e00_d504, RawOpcodeFamily::Vop1, 0x6a), // reserved VOP1
+        (0x7dd8_0704, RawOpcodeFamily::Vopc, 0xec), // reserved VOPC
+        (0x1a08_0704, RawOpcodeFamily::Vop2, 0x0d), // VOP2 space beyond the table
+        (0xd8f4_0000, RawOpcodeFamily::Ds, 0x3d),   // DS code outside the table
+        (0xdd04_8000, RawOpcodeFamily::Flat, 0x41), // GLOBAL code outside the table
+    ];
+    for &(word, family, code) in raw_words {
+        let program = decode_program(0x1000, &[word, 0xbf81_0000])
+            .unwrap_or_else(|error| panic!("raw fallback for {family:?}: {error}"));
+        let instruction = &program.instructions[0];
+        match instruction.opcode {
+            Opcode::Raw {
+                family: decoded_family,
+                code: decoded_code,
+            } => {
+                assert_eq!(decoded_family, family, "word 0x{word:08X}");
+                assert_eq!(decoded_code, code, "word 0x{word:08X}");
+            }
+            other => panic!("word 0x{word:08X} decoded as {other} instead of a raw opcode"),
+        }
+    }
+
+    // A raw SOP2 with a literal operand still consumes its literal dword; the following
+    // instruction stays correctly framed.
+    let program = decode_program(0x1000, &[0x9f94_00ff, 0x1122_3344, 0xbf81_0000])
+        .expect("raw SOP2 with literal");
+    assert_eq!(program.instructions[0].words.len(), 2);
+    assert_eq!(program.instructions[1].opcode, Opcode::END_PROGRAM);
+
+    // A raw scalar-memory opcode carries no operands or control: nothing may fabricate a
+    // scalar load or a binding from an unknown operation's fields.
+    let program =
+        decode_program(0x1000, &[0xf780_0000, 0x0000_0000, 0xbf81_0000]).expect("raw SMEM decodes");
+    let instruction = &program.instructions[0];
+    assert!(matches!(
+        instruction.opcode,
+        Opcode::Raw {
+            family: RawOpcodeFamily::Smem,
+            ..
+        }
+    ));
+    assert!(instruction.sources.is_empty());
+    assert!(instruction.destinations.is_empty());
+    assert!(instruction.control.is_none());
 }

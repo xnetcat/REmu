@@ -11,13 +11,13 @@ mod resources;
 mod scalar_alu;
 
 #[cfg(test)]
+use crate::Operand;
+#[cfg(test)]
 use crate::{BufferMemoryControl, GlobalMemoryControl, ImageControl, ScalarMemoryControl};
 use crate::{
     GlobalMemoryBinding, GuestMemoryReader, ImageBinding, Instruction, InstructionControl, Opcode,
-    ShaderEncoding, ShaderEvaluation, ShaderState, VertexInputBinding,
+    OperandKind, ShaderEncoding, ShaderEvaluation, ShaderState, VertexInputBinding,
 };
-#[cfg(test)]
-use crate::{Operand, OperandKind};
 use control_flow::{
     ScalarPath, VisitedPaths, branch_condition_depends_on_vector_state, branch_taken,
     branch_target, is_scalar_branch, scalar_recurrence_state, scalar_state_hash,
@@ -27,7 +27,8 @@ use resources::decode_buffer_descriptor;
 #[cfg(test)]
 use scalar_alu::execute_scalar_binary;
 use scalar_alu::{
-    execute_scalar_alu, execute_scalar_compare, execute_scalar_compare_k, write_scalar_pair,
+    execute_scalar_alu, execute_scalar_compare, execute_scalar_compare_k, read_scalar_pair,
+    scalar_destination, write_scalar_pair,
 };
 
 // Descriptor-control fields can retain extended scalar indices even when ordinary source operand
@@ -432,11 +433,72 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             if instruction.opcode == Opcode::END_PROGRAM {
                 break;
             }
-            if instruction.opcode.is("SSetpcB64") {
-                let Some(target_pc) = self.state.program.linked_transfer_target(instruction.pc)
-                else {
+            if instruction.opcode.is("SCallB64") {
+                // The call target is a static relative PC; the return address written to the
+                // destination pair is the architectural guest address of the next instruction,
+                // which the S_SETPC_B64 return below resolves exactly.
+                let target_pc = branch_target(instruction)?;
+                let target_index = self
+                    .state
+                    .program
+                    .instructions
+                    .binary_search_by_key(&target_pc, |candidate| candidate.pc)
+                    .map_err(|_| EvaluationError::InvalidBranchTarget {
+                        pc: instruction.pc,
+                        target: target_pc,
+                    })?;
+                let destination = scalar_destination(instruction)?;
+                let return_address = self
+                    .state
+                    .program
+                    .instruction_address(instruction.pc)
+                    .wrapping_add(4);
+                write_scalar_pair(
+                    &mut path.registers,
+                    destination,
+                    return_address,
+                    &mut path.exec_mask,
+                );
+                path.instruction_index = target_index;
+                continue;
+            }
+            if instruction.opcode.is("SSetpcB64") || instruction.opcode.is("SSwappcB64") {
+                let register_target = instruction
+                    .sources
+                    .first()
+                    .filter(|source| source.kind == OperandKind::ScalarRegister)
+                    .and_then(|source| read_scalar_pair(&path.registers, source.value))
+                    .and_then(|address| self.state.program.pc_for_instruction_address(address));
+                if instruction.opcode.is("SSwappcB64")
+                    && let Ok(destination) = scalar_destination(instruction)
+                {
+                    let return_address = self
+                        .state
+                        .program
+                        .instruction_address(instruction.pc)
+                        .wrapping_add(4);
+                    write_scalar_pair(
+                        &mut path.registers,
+                        destination,
+                        return_address,
+                        &mut path.exec_mask,
+                    );
+                }
+                let target_pc = if let Some(target_pc) =
+                    self.state.program.linked_transfer_target(instruction.pc)
+                {
+                    target_pc
+                } else if let Some(target_pc) = register_target {
+                    // The transfer register holds an address this evaluator itself produced
+                    // (S_GETPC/S_CALL arithmetic), so the indirect edge is exact.
+                    target_pc
+                } else {
                     record_truncated_evaluation(
-                        "unlinked-indirect-branch",
+                        if instruction.opcode.is("SSwappcB64") {
+                            "subroutine-call"
+                        } else {
+                            "unlinked-indirect-branch"
+                        },
                         self.state.program.instruction_address(instruction.pc),
                     );
                     break;
@@ -576,13 +638,6 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 instruction.encoding,
                 ShaderEncoding::Sop1 | ShaderEncoding::Sop2 | ShaderEncoding::Sopk
             ) {
-                if instruction.opcode.is("SSwappcB64") {
-                    record_truncated_evaluation(
-                        "subroutine-call",
-                        self.state.program.instruction_address(instruction.pc),
-                    );
-                    break;
-                }
                 execute_scalar_alu(
                     instruction,
                     self.state.program.instruction_address(instruction.pc),

@@ -12,7 +12,8 @@ mod controls;
 mod liveness;
 
 pub use bindings::{
-    GlobalMemoryBinding, ImageBinding, ImageBindingSlotMap, ShaderEvaluation, VertexInputBinding,
+    GlobalMemoryBinding, ImageBinding, ImageBindingSlotMap, ImageSignatureClass,
+    ImageViewReinterpretation, ShaderEvaluation, TextureDescriptorType, VertexInputBinding,
     image_is_comparison,
 };
 pub use controls::{
@@ -217,9 +218,22 @@ impl fmt::Display for Operand {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum RawOpcodeFamily {
+    Sop1,
+    Sop2,
+    Sopc,
+    Sopk,
+    Sopp,
+    Smrd,
+    Smem,
+    Vop1,
+    Vop2,
+    Vopc,
     Vop3,
     Vop3b,
     Vop3p,
+    Vintrp,
+    Ds,
+    Flat,
     Mubuf,
     Mimg,
 }
@@ -380,6 +394,7 @@ impl Program {
                         | "SCbranchExecnz"
                         | "SSetpcB64"
                         | "SSwappcB64"
+                        | "SCallB64"
                 )
             )
         });
@@ -569,6 +584,30 @@ impl Program {
             .get(&pc)
             .copied()
             .unwrap_or_else(|| self.address.wrapping_add(u64::from(pc)))
+    }
+
+    /// Maps a guest instruction address back onto its compiler PC, when it names an instruction
+    /// boundary of this program. This is the exact inverse of [`Program::instruction_address`]:
+    /// continuation instructions resolve through their recorded absolute addresses, and a PC that
+    /// belongs to a rebased continuation never aliases a front-range address.
+    #[must_use]
+    pub fn pc_for_instruction_address(&self, address: u64) -> Option<u32> {
+        if let Some((pc, _)) = self
+            .linked_instruction_addresses
+            .iter()
+            .find(|(_, candidate)| **candidate == address)
+        {
+            return Some(*pc);
+        }
+        let offset = address.checked_sub(self.address)?;
+        let pc = u32::try_from(offset).ok()?;
+        if self.linked_instruction_addresses.contains_key(&pc) {
+            return None;
+        }
+        self.instructions
+            .binary_search_by_key(&pc, |instruction| instruction.pc)
+            .ok()
+            .map(|_| pc)
     }
 
     #[must_use]

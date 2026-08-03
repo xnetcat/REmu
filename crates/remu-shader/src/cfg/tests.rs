@@ -385,8 +385,11 @@ fn a_do_while_loop_with_an_inner_if_matches_the_graph() {
 }
 
 #[test]
-fn a_nested_loop_falls_back_to_a_faithful_dispatcher() {
+fn a_nested_natural_loop_reconstructs_as_a_loop_within_a_loop() {
     // Outer 0..; inner 1<->2; 0 -> 1; 2 -> {1 inner-back, 3}; 3 -> {0 outer-back, 4}; 4 terminal.
+    // Both loops are natural and single-exit, so the strict structurer must produce a Loop node
+    // whose body contains the inner Loop — the dispatcher (with its step cap in the backend) is
+    // reserved for shapes that genuinely cannot be structured.
     let cfg = graph(&[
         (BlockExit::Unconditional, &[1]),
         (BlockExit::Unconditional, &[2]),
@@ -394,7 +397,34 @@ fn a_nested_loop_falls_back_to_a_faithful_dispatcher() {
         (BlockExit::Conditional, &[0, 4]),
         (BlockExit::Terminal, &[]),
     ]);
-    assert!(matches!(cfg.structure(), StructuredCfg::Dispatcher { .. }));
+    fn loop_nesting_depth(node: &StructuredCfg) -> usize {
+        match node {
+            StructuredCfg::Loop(body) => 1 + loop_nesting_depth(body),
+            StructuredCfg::Sequence(nodes) => {
+                nodes.iter().map(loop_nesting_depth).max().unwrap_or(0)
+            }
+            StructuredCfg::If {
+                then_branch,
+                else_branch,
+                ..
+            } => loop_nesting_depth(then_branch).max(
+                else_branch
+                    .as_ref()
+                    .map_or(0, |branch| loop_nesting_depth(branch)),
+            ),
+            _ => 0,
+        }
+    }
+    let structured = cfg.structure();
+    assert!(
+        !matches!(structured, StructuredCfg::Dispatcher { .. }),
+        "a clean nested loop must not need the dispatcher"
+    );
+    assert_eq!(
+        loop_nesting_depth(&structured),
+        2,
+        "expected a Loop nested within a Loop, got {structured:?}"
+    );
     assert_structured_matches_graph(&cfg, ALL_ORACLES);
 }
 
