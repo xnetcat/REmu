@@ -162,7 +162,7 @@ fn setpc_terminates_direct_lowering_without_emitting_a_dynamic_pc_operation() {
 }
 
 #[test]
-fn setpc_deactivates_each_forward_control_flow_path() {
+fn setpc_terminates_each_structured_conditional_arm() {
     let program = Program::new(
         0x1000,
         vec![
@@ -185,10 +185,16 @@ fn setpc_deactivates_each_forward_control_flow_path() {
         &empty_evaluation(),
         &MetalCompileOptions::compute(0),
     )
-    .expect("terminal setpc must lower in forward conditional blocks");
+    .expect("terminal setpc must lower in structured conditional arms");
 
-    assert!(!shader.register_footprint.direct_control_flow);
-    assert_eq!(shader.source.matches("active = false;").count(), 2);
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(
+        shader.source.contains("if (scc)") || shader.source.contains("if (!(scc))"),
+        "if-diamond must lower as structured MSL if"
+    );
+    // Structured arms skip the terminal transfer itself; both paths simply end the function.
+    assert!(!shader.source.contains("while (active)"));
+    assert!(!shader.source.contains("switch (pc)"));
 }
 
 #[test]
@@ -300,6 +306,156 @@ fn swappc_remains_a_nonterminal_unsupported_dynamic_call() {
 }
 
 #[test]
+fn structured_reducible_while_loop_emits_msl_while_without_a_step_cap() {
+    // Header at pc 0: taken edge exits, fall-through is the body; body branches back.
+    // remu-shader's StructuredCfg proves this shape; Metal must emit `while (true)` / `break`
+    // instead of the step-capped PC dispatcher (the truncation class Q3 deletes).
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                // end=4, imm=2 → target pc 12 (exit).
+                words: vec![2],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SBranch"),
+                // end=12, imm=-3 → target pc 0 (header).
+                words: vec![0xfffd],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("reducible while should lower through StructuredCfg");
+
+    assert!(
+        shader.register_footprint.direct_control_flow,
+        "structured lowering is direct (no PC machine)"
+    );
+    assert!(
+        shader.source.contains("while (true)"),
+        "expected structured while, got: {}",
+        shader
+            .source
+            .lines()
+            .filter(|line| line.contains("while") || line.contains("steps"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        shader.source.contains("break;"),
+        "loop exit must be a structural break"
+    );
+    assert!(
+        !shader.source.contains("while (active)"),
+        "must not retain the step-capped dispatcher"
+    );
+    assert!(
+        !shader.source.contains("switch (pc)"),
+        "must not retain the PC switch"
+    );
+    assert!(
+        !shader.source.contains("steps >="),
+        "structured reducible loops must not carry a step-cap truncation"
+    );
+}
+
+#[test]
+fn irreducible_control_flow_keeps_the_step_capped_dispatcher_as_loud_fallback() {
+    // Two-entry loop (irreducible): StructuredCfg demotes to Dispatcher; Metal must keep the
+    // existing PC machine rather than inventing structured MSL from an unproven tree.
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SBranch"),
+                // Jump into the middle of the cycle (pc 8).
+                words: vec![1],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                // Backward to pc 4 — second entry into the cycle.
+                words: vec![0xfffe],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("irreducible CF falls back to the dispatcher");
+
+    assert!(!shader.register_footprint.direct_control_flow);
+    assert!(shader.source.contains("while (active)"));
+    assert!(shader.source.contains("switch (pc)"));
+    assert!(
+        shader.source.contains("if (steps >="),
+        "Dispatcher fallback retains the step-cap seam for unproven shapes"
+    );
+}
+
+#[test]
 fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arrays() {
     let program = Program::new(
         0x1000,
@@ -340,8 +496,14 @@ fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arra
     )
     .expect("forward conditional program should lower");
 
-    assert!(!shader.register_footprint.direct_control_flow);
-    assert!(shader.source.contains("if (active && pc == 0u)"));
+    // Proven if-diamond → StructuredCfg → nested MSL if (no PC machine, no step-cap).
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(
+        shader.source.contains("if (scc)") || shader.source.contains("if (!(scc))"),
+        "structured if must gate on the scalar branch predicate: {}",
+        shader.source
+    );
+    assert!(!shader.source.contains("if (active && pc =="));
     assert!(!shader.source.contains("while (active)"));
     assert!(!shader.source.contains("switch (pc)"));
     assert!(!shader.source.contains("uint s[128]"));
@@ -349,7 +511,7 @@ fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arra
 }
 
 #[test]
-fn forward_chain_checks_once_per_basic_block_instead_of_once_per_instruction() {
+fn structured_if_emits_then_arm_instructions_inline() {
     let program = Program::new(
         0x1000,
         vec![
@@ -418,26 +580,21 @@ fn forward_chain_checks_once_per_basic_block_instead_of_once_per_instruction() {
     )
     .expect("conditional blocks should lower");
 
-    for pc in [0, 4, 16, 20] {
-        assert!(
-            shader
-                .source
-                .contains(&format!("if (active && pc == {pc}u)"))
-        );
-    }
-    for pc in [8, 12] {
-        assert!(
-            !shader
-                .source
-                .contains(&format!("if (active && pc == {pc}u)"))
-        );
-    }
-    assert_eq!(shader.source.matches("if (active && pc == ").count(), 4);
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(
+        shader.source.contains("if (scc)") || shader.source.contains("if (!(scc))"),
+        "expected structured if"
+    );
+    // Both arms' ALU work is present; the PC dispatcher is gone.
+    assert!(shader.source.contains("remu_v_2") || shader.source.contains("v[2]"));
+    assert!(shader.source.contains("remu_v_5") || shader.source.contains("v[5]") || shader.source.contains("remu_v_3"));
+    assert!(!shader.source.contains("if (active && pc =="));
     assert!(!shader.source.contains("while (active)"));
+    assert!(!shader.source.contains("switch (pc)"));
 }
 
 #[test]
-fn backward_conditional_control_flow_keeps_the_bounded_dispatcher() {
+fn reducible_backward_conditional_emits_structured_while_without_a_step_cap() {
     let program = Program::new(
         0x1000,
         vec![
@@ -476,19 +633,34 @@ fn backward_conditional_control_flow_keeps_the_bounded_dispatcher() {
         &empty_evaluation(),
         &MetalCompileOptions::compute(0),
     )
-    .expect("backward conditional program should retain dispatcher");
+    .expect("reducible backward conditional should structure");
 
-    assert!(!shader.register_footprint.direct_control_flow);
-    assert!(shader.source.contains("while (active)"));
-    assert!(shader.source.contains("switch (pc)"));
-    // Small programs keep the 16k floor; larger glyph-class shaders scale with insn count.
-    assert!(shader.source.contains("if (steps >= 16384u)"));
+    assert!(shader.register_footprint.direct_control_flow);
+    assert!(shader.source.contains("while (true)"));
+    assert!(!shader.source.contains("while (active)"));
+    assert!(!shader.source.contains("switch (pc)"));
+    assert!(
+        !shader.source.contains("steps >="),
+        "reducible loops must not retain the step-cap truncation class"
+    );
 }
 
 #[test]
-fn large_dispatcher_programs_scale_the_step_limit_with_instruction_count() {
+fn large_irreducible_dispatcher_programs_scale_the_step_limit_with_instruction_count() {
+    // Force the Dispatcher seam (irreducible two-entry cycle) so the step-cap path still exists
+    // for unproven shapes; reducible loops now structure and must not hit this arm.
     let mut instructions = Vec::new();
-    for index in 0..600 {
+    instructions.push(Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::Known("SBranch"),
+        // Enter the cycle at pc 8 (skip the VMov at pc 4).
+        words: vec![1],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    });
+    for index in 1..600 {
         let pc = u32::try_from(index * 4).expect("pc fits");
         instructions.push(Instruction {
             pc,
@@ -500,7 +672,7 @@ fn large_dispatcher_programs_scale_the_step_limit_with_instruction_count() {
             control: None,
         });
     }
-    // Backward branch so lowering keeps the PC dispatcher.
+    // Backward branch to pc 4 — second entry into the cycle (irreducible with the SBranch above).
     instructions.push(Instruction {
         pc: u32::try_from(instructions.len() * 4).expect("pc fits"),
         encoding: ShaderEncoding::Sopp,
@@ -524,7 +696,7 @@ fn large_dispatcher_programs_scale_the_step_limit_with_instruction_count() {
         &empty_evaluation(),
         &MetalCompileOptions::compute(0),
     )
-    .expect("large backward program should lower");
+    .expect("large irreducible program should lower via Dispatcher");
     // 602 instructions * 32 = 19264 > 16384 floor.
     assert!(
         shader.source.contains("if (steps >= 19264u)"),
@@ -539,11 +711,21 @@ fn large_dispatcher_programs_scale_the_step_limit_with_instruction_count() {
 
 #[test]
 fn cyclic_wave64_readfirstlane_retains_shared_records_and_reuse_barrier() {
+    // Irreducible cycle so StructuredCfg demotes to Dispatcher (shared readfirstlane records).
     let program = Program::new(
         0x1000,
         vec![
             Instruction {
                 pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SBranch"),
+                words: vec![1],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
                 encoding: ShaderEncoding::Vop1,
                 opcode: Opcode::Known("VReadfirstlaneB32"),
                 words: vec![0],
@@ -552,7 +734,7 @@ fn cyclic_wave64_readfirstlane_retains_shared_records_and_reuse_barrier() {
                 control: None,
             },
             Instruction {
-                pc: 4,
+                pc: 8,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::Known("SCbranchScc1"),
                 words: vec![0xfffe],
@@ -561,7 +743,7 @@ fn cyclic_wave64_readfirstlane_retains_shared_records_and_reuse_barrier() {
                 control: None,
             },
             Instruction {
-                pc: 8,
+                pc: 12,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::END_PROGRAM,
                 words: vec![0xbf81_0000],

@@ -7,12 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use remu_shader::{
-    Instruction, InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
+    BasicBlock, Instruction, InstructionControl, OperandKind, Program, ShaderEvaluation,
+    StructuredCfg, image_is_comparison,
 };
 
 use crate::compiler::control_flow::{
     ControlFlowLowering, LoweringFailure, analyze_control_flow, branch_target,
-    combined_lowering_error, dispatcher_basic_blocks,
+    combined_lowering_error, dispatcher_basic_blocks, scalar_branch_taken_condition,
 };
 use crate::compiler::export::{mesh_export_vertex_vgpr, mesh_ngg_packed_export_sgpr};
 use crate::compiler::image::{
@@ -227,6 +228,14 @@ impl<'a> Compiler<'a> {
                     }
                 }
             }
+            ControlFlowLowering::Structured { tree, blocks } => {
+                if let Err(message) = self.emit_structured_cfg(&tree, &blocks, 2, &mut failures, &mut failed_opcodes)
+                {
+                    // Structural emission failure (missing condition block, etc.) — surface as a
+                    // loud interface error rather than a silently truncated dispatcher body.
+                    return Err(MetalCompileError::InvalidInterface(message));
+                }
+            }
             ControlFlowLowering::Forward | ControlFlowLowering::Dispatcher => {
                 // Dispatch whole basic blocks instead of one instruction per switch iteration.
                 // The architectural PC only has to be materialized at control-flow boundaries;
@@ -269,7 +278,10 @@ impl<'a> Compiler<'a> {
             return Err(error);
         }
 
-        let direct_control_flow = matches!(self.control_flow, ControlFlowLowering::Direct(_));
+        let direct_control_flow = matches!(
+            self.control_flow,
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. }
+        );
         let (source, register_references) = self.emit_module()?;
         let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
             .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
@@ -367,20 +379,14 @@ impl<'a> Compiler<'a> {
             "SCbranchScc0" | "SCbranchScc1" | "SCbranchVccz" | "SCbranchVccnz"
             | "SCbranchExecz" | "SCbranchExecnz" => {
                 if !dispatched {
+                    // Structured lowering consumes the condition at the If/Loop node; the
+                    // condition block emits every preceding instruction but not the branch itself.
                     return Err("conditional branch reached direct control-flow lowering".into());
                 }
                 let target = branch_target(instruction)?;
                 let fallthrough =
                     next_pc.ok_or_else(|| "conditional branch has no fallthrough".to_owned())?;
-                let condition = match name {
-                    "SCbranchScc0" => "!scc",
-                    "SCbranchScc1" => "scc",
-                    "SCbranchVccz" => "(s[106] | s[107]) == 0u",
-                    "SCbranchVccnz" => "(s[106] | s[107]) != 0u",
-                    "SCbranchExecz" => "(s[126] | s[127]) == 0u",
-                    "SCbranchExecnz" => "(s[126] | s[127]) != 0u",
-                    _ => unreachable!(),
-                };
+                let condition = scalar_branch_taken_condition(name)?;
                 self.line(
                     3,
                     &format!("pc = ({condition}) ? {target}u : {fallthrough}u;"),
@@ -479,7 +485,165 @@ impl<'a> Compiler<'a> {
         }
         Ok(())
     }
+
+    /// Emits a proven Dispatcher-free [`StructuredCfg`] as nested MSL `if`/`while`.
+    ///
+    /// Control transfers are structural (no PC machine, no step-cap). Terminal and unconditional
+    /// branch instructions inside blocks are skipped — the tree edges already encode them.
+    fn emit_structured_cfg(
+        &mut self,
+        tree: &StructuredCfg,
+        blocks: &[BasicBlock],
+        indent: usize,
+        failures: &mut Vec<LoweringFailure>,
+        failed_opcodes: &mut BTreeSet<remu_shader::Opcode>,
+    ) -> Result<(), String> {
+        match tree {
+            StructuredCfg::Block(block_id) => {
+                self.emit_structured_block(*block_id, blocks, indent, failures, failed_opcodes, false)?;
+            }
+            StructuredCfg::Sequence(nodes) => {
+                for node in nodes {
+                    self.emit_structured_cfg(node, blocks, indent, failures, failed_opcodes)?;
+                }
+            }
+            StructuredCfg::If {
+                condition,
+                then_is_taken_edge,
+                then_branch,
+                else_branch,
+            } => {
+                let taken = self.emit_structured_condition_block(
+                    *condition,
+                    blocks,
+                    indent,
+                    failures,
+                    failed_opcodes,
+                )?;
+                let predicate = if *then_is_taken_edge == 1 {
+                    taken
+                } else {
+                    format!("!({taken})")
+                };
+                self.line(indent, &format!("if ({predicate}) {{"));
+                self.emit_structured_cfg(then_branch, blocks, indent + 1, failures, failed_opcodes)?;
+                self.line(indent, "}");
+                if let Some(else_branch) = else_branch {
+                    self.line(indent, "else {");
+                    self.emit_structured_cfg(
+                        else_branch,
+                        blocks,
+                        indent + 1,
+                        failures,
+                        failed_opcodes,
+                    )?;
+                    self.line(indent, "}");
+                }
+            }
+            StructuredCfg::Loop(body) => {
+                self.line(indent, "while (true) {");
+                self.emit_structured_cfg(body, blocks, indent + 1, failures, failed_opcodes)?;
+                self.line(indent, "}");
+            }
+            StructuredCfg::Continue => {
+                self.line(indent, "continue;");
+            }
+            StructuredCfg::Break => {
+                self.line(indent, "break;");
+            }
+            StructuredCfg::Dispatcher { .. } => {
+                return Err(
+                    "StructuredCfg::Dispatcher reached structured MSL emission — refusing to emit step-capped control flow from an unproven tree"
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Emits the non-branch prefix of a condition block and returns the MSL taken-edge predicate.
+    fn emit_structured_condition_block(
+        &mut self,
+        block_id: usize,
+        blocks: &[BasicBlock],
+        indent: usize,
+        failures: &mut Vec<LoweringFailure>,
+        failed_opcodes: &mut BTreeSet<remu_shader::Opcode>,
+    ) -> Result<String, String> {
+        let block = blocks
+            .get(block_id)
+            .ok_or_else(|| format!("StructuredCfg condition block {block_id} is missing"))?;
+        if block.instructions.is_empty() {
+            return Err(format!("StructuredCfg condition block {block_id} is empty"));
+        }
+        let branch_index = block.instructions.end - 1;
+        self.emit_structured_block(block_id, blocks, indent, failures, failed_opcodes, true)?;
+        let branch = &self.program.instructions[branch_index];
+        let name = branch
+            .opcode
+            .known_name()
+            .ok_or_else(|| format!("condition block {block_id} does not end in a named branch"))?;
+        scalar_branch_taken_condition(name).map(str::to_owned)
+    }
+
+    fn emit_structured_block(
+        &mut self,
+        block_id: usize,
+        blocks: &[BasicBlock],
+        indent: usize,
+        failures: &mut Vec<LoweringFailure>,
+        failed_opcodes: &mut BTreeSet<remu_shader::Opcode>,
+        skip_terminal_transfer: bool,
+    ) -> Result<(), String> {
+        let block = blocks
+            .get(block_id)
+            .ok_or_else(|| format!("StructuredCfg block {block_id} is missing"))?;
+        let last = block.instructions.end.saturating_sub(1);
+        for index in block.instructions.clone() {
+            let instruction = &self.program.instructions[index];
+            let is_last = index == last;
+            if skip_terminal_transfer && is_last {
+                continue;
+            }
+            if is_last && is_structured_control_transfer(instruction) {
+                // Structural edges already encode S_BRANCH / S_ENDPGM / linked S_SETPC.
+                continue;
+            }
+            // Indent structured bodies by rewriting through a temporary indent bump: emit at the
+            // default dispatcher indent (3) then is wrong for nested depth. Use `line(indent, …)`
+            // via a small adapter — emit_instruction hard-codes indent 3, so temporarily patch by
+            // emitting then… actually emit_instruction uses self.line(3, …). For nested structured
+            // CF we need variable indent. Approach: emit_instruction always uses indent 3 relative
+            // to body start; structured body is inlined like Direct (indent 2 prelude in module).
+            // Nested if/while add their own braces at `indent`; instructions inside stay at indent+1
+            // only if emit_instruction cooperates.
+            //
+            // Practical choice matching Direct: keep instruction emission at indent 3 and accept
+            // that nested structured braces use indent 2/3/4 while instructions stay at 3. That is
+            // valid MSL (whitespace-insensitive) — braces still nest correctly.
+            if let Err(message) = self.emit_instruction(instruction, index, false)
+                && failed_opcodes.insert(instruction.opcode)
+            {
+                failures.push(LoweringFailure {
+                    pc: instruction.pc,
+                    opcode: instruction.opcode,
+                    message,
+                });
+            }
+            let _ = indent; // braces carry nesting; instruction lines stay at the Direct indent.
+        }
+        Ok(())
+    }
 }
+
+fn is_structured_control_transfer(instruction: &Instruction) -> bool {
+    match instruction.opcode.known_name() {
+        Some("SEndpgm" | "SSetpcB64" | "SBranch") => true,
+        Some(name) if name.starts_with("SCbranch") => true,
+        _ => false,
+    }
+}
+
 fn validate_interface(options: &MetalCompileOptions) -> Result<(), MetalCompileError> {
     if !(1..=VECTOR_REGISTER_COUNT).contains(&options.allocated_vector_register_count) {
         return Err(MetalCompileError::InvalidInterface(format!(

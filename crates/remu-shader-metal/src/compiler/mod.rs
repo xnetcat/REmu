@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use remu_shader::{ImageBindingSlotMap, OperandKind, Program, ShaderEvaluation};
+use remu_shader::{ImageBindingSlotMap, OperandKind, Program, ShaderEvaluation, StructuredCfg};
 
 use crate::compiler::control_flow::ControlFlowLowering;
 use crate::compiler::image::ImageKind;
@@ -75,6 +75,14 @@ impl Compiler<'_> {
         self.is_threadgroup_stage() && self.options.wave_lane_count == 64
     }
 
+    fn control_flow_may_revisit_instruction_sites(&self) -> bool {
+        match &self.control_flow {
+            ControlFlowLowering::Dispatcher => true,
+            ControlFlowLowering::Structured { tree, .. } => structured_cfg_contains_loop(tree),
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Forward => false,
+        }
+    }
+
     /// Upper bound on dispatcher loop iterations before the shader aborts.
     ///
     /// Poppy's Slate glyph PS is ~2.7k guest instructions with dozens of relative-move
@@ -96,12 +104,13 @@ impl Compiler<'_> {
     /// Returns the number of half-wave exchange records when every static `V_READFIRSTLANE` owns
     /// disjoint storage.
     ///
-    /// Direct and forward-only control flow is acyclic, so an invocation can execute each static
-    /// instruction at most once. Giving every site its own records removes the second whole-group
-    /// barrier which otherwise protects a reused record from the next instruction. Dispatcher
-    /// shaders can revisit a site and must retain the reused-record protocol.
+    /// Direct, forward-only, and structured-If control flow is acyclic, so an invocation can
+    /// execute each static instruction at most once. Giving every site its own records removes the
+    /// second whole-group barrier which otherwise protects a reused record from the next
+    /// instruction. Dispatcher shaders and structured loops can revisit a site and must retain the
+    /// reused-record protocol.
     fn disjoint_readfirstlane_slot_count(&self) -> Option<usize> {
-        if !self.split_wave64() || matches!(self.control_flow, ControlFlowLowering::Dispatcher) {
+        if !self.split_wave64() || self.control_flow_may_revisit_instruction_sites() {
             return None;
         }
         let site_count = self.readfirstlane_site_count();
@@ -252,5 +261,26 @@ impl Compiler<'_> {
         self.next_temp += 1;
         self.line(3, &format!("{ty} {name} = {expression};"));
         name
+    }
+}
+
+fn structured_cfg_contains_loop(tree: &StructuredCfg) -> bool {
+    match tree {
+        StructuredCfg::Loop(_) => true,
+        StructuredCfg::Sequence(nodes) => nodes.iter().any(structured_cfg_contains_loop),
+        StructuredCfg::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            structured_cfg_contains_loop(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| structured_cfg_contains_loop(branch))
+        }
+        StructuredCfg::Block(_)
+        | StructuredCfg::Continue
+        | StructuredCfg::Break
+        | StructuredCfg::Dispatcher { .. } => false,
     }
 }

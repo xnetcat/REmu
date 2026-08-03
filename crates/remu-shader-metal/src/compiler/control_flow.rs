@@ -1,11 +1,14 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Control-flow analysis and the choice between straight-line and dispatcher lowering.
+//! Control-flow analysis and the choice between straight-line, structured, and dispatcher lowering.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use remu_shader::{Instruction, Opcode, Program, ShaderEncoding};
+use remu_shader::{
+    BasicBlock, Instruction, Opcode, Program, ShaderEncoding, StructuredCfg,
+    build_control_flow_graph,
+};
 
 use crate::MetalCompileError;
 
@@ -14,11 +17,52 @@ pub(crate) enum ControlFlowLowering {
     /// Instruction indices in their exact execution order. This includes forward or backward
     /// unconditional branches, provided the resulting path is acyclic.
     Direct(Vec<usize>),
+    /// Fully structured reducible control flow from [`remu_shader::ControlFlowGraph::structure`].
+    /// Emitted as nested MSL `if`/`while` with no architectural PC machine and no step-cap.
+    Structured {
+        tree: StructuredCfg,
+        blocks: Vec<BasicBlock>,
+    },
     /// Conditional control flow whose every encoded edge moves forward. Each basic block can be
     /// considered once in guest-PC order, without a per-invocation loop or switch dispatcher.
+    ///
+    /// Prefer [`ControlFlowLowering::Structured`] when the remu-shader structurer proves a
+    /// Dispatcher-free tree; this arm remains for shapes the structurer demotes.
     Forward,
-    /// Conditional control flow or a cycle still requires the bounded architectural PC machine.
+    /// Irreducible or non-canonical reducible shape: the bounded architectural PC machine.
+    /// Step-cap truncation remains possible on this arm — that is the documented seam until the
+    /// structurer can prove every title shape (or the backend refuses irreducible shaders).
     Dispatcher,
+}
+
+/// True when `structure()` produced only Sequence/If/Loop/Block/Continue/Break — never a
+/// [`StructuredCfg::Dispatcher`]. That is the anti-truncation proof for structured MSL emission.
+pub(crate) fn structured_cfg_is_fully_reducible(tree: &StructuredCfg) -> bool {
+    match tree {
+        StructuredCfg::Block(_) | StructuredCfg::Continue | StructuredCfg::Break => true,
+        StructuredCfg::Sequence(nodes) => nodes.iter().all(structured_cfg_is_fully_reducible),
+        StructuredCfg::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            structured_cfg_is_fully_reducible(then_branch)
+                && else_branch
+                    .as_ref()
+                    .is_none_or(|branch| structured_cfg_is_fully_reducible(branch))
+        }
+        StructuredCfg::Loop(body) => structured_cfg_is_fully_reducible(body),
+        StructuredCfg::Dispatcher { .. } => false,
+    }
+}
+
+fn structured_cfg_needs_structured_emission(tree: &StructuredCfg) -> bool {
+    match tree {
+        StructuredCfg::If { .. } | StructuredCfg::Loop(_) => true,
+        StructuredCfg::Sequence(nodes) => nodes.iter().any(structured_cfg_needs_structured_emission),
+        StructuredCfg::Block(_) | StructuredCfg::Continue | StructuredCfg::Break => false,
+        StructuredCfg::Dispatcher { .. } => false,
+    }
 }
 
 /// One opcode a lowering attempt could not translate. Failures are kept per distinct opcode, so a
@@ -79,6 +123,20 @@ pub(crate) fn branch_target(instruction: &Instruction) -> Result<u32, String> {
     u32::try_from(target).map_err(|_| "branch target is outside the Gen5 PC range".to_owned())
 }
 
+/// MSL boolean expression for a scalar conditional branch's taken edge (same predicates the
+/// dispatcher PC machine uses).
+pub(crate) fn scalar_branch_taken_condition(name: &str) -> Result<&'static str, String> {
+    Ok(match name {
+        "SCbranchScc0" => "!scc",
+        "SCbranchScc1" => "scc",
+        "SCbranchVccz" => "(s[106] | s[107]) == 0u",
+        "SCbranchVccnz" => "(s[106] | s[107]) != 0u",
+        "SCbranchExecz" => "(s[126] | s[127]) == 0u",
+        "SCbranchExecnz" => "(s[126] | s[127]) != 0u",
+        _ => return Err(format!("not a scalar conditional branch: {name}")),
+    })
+}
+
 pub(crate) fn analyze_control_flow(
     program: &Program,
 ) -> Result<ControlFlowLowering, MetalCompileError> {
@@ -124,6 +182,22 @@ pub(crate) fn analyze_control_flow(
         }
     }
 
+    // Prefer remu-shader's StructuredCfg when it proves a Dispatcher-free reducible tree that
+    // actually needs structured emission (If/Loop). That path deletes the step-cap truncation
+    // class for those shapes. Anything the structurer demotes to Dispatcher falls through to the
+    // legacy Forward/Dispatcher arms below — loud in the sense that we never emit structured MSL
+    // from an unproven tree (silently-wrong pixels risk).
+    let cfg = build_control_flow_graph(program);
+    let structured = cfg.structure();
+    if structured_cfg_is_fully_reducible(&structured)
+        && structured_cfg_needs_structured_emission(&structured)
+    {
+        return Ok(ControlFlowLowering::Structured {
+            tree: structured,
+            blocks: cfg.blocks().to_vec(),
+        });
+    }
+
     let forward_only = program
         .instructions
         .iter()
@@ -134,6 +208,8 @@ pub(crate) fn analyze_control_flow(
     let mut index = 0_usize;
     while let Some(instruction) = program.instructions.get(index) {
         if !visited.insert(index) {
+            // Irreducible / non-canonical cycle: keep the step-capped PC machine. Seam: step-cap
+            // truncation is still possible here; StructuredCfg refused to prove this shape.
             return Ok(ControlFlowLowering::Dispatcher);
         }
         path.push(index);

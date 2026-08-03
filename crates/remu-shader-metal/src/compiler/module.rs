@@ -405,7 +405,7 @@ impl Compiler<'_> {
                 source
                     .push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
             }
-            ControlFlowLowering::Direct(_) => {}
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. } => {}
         }
         if matches!(
             self.options.stage,
@@ -592,7 +592,9 @@ impl Compiler<'_> {
             }
         }
         match self.control_flow {
-            ControlFlowLowering::Direct(_) => source.push_str(&self.body),
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. } => {
+                source.push_str(&self.body)
+            }
             ControlFlowLowering::Forward => source.push_str(&self.body),
             ControlFlowLowering::Dispatcher => {
                 let step_limit = self.dispatcher_step_limit();
