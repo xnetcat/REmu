@@ -254,6 +254,7 @@ fn dma_uses_packet_time_cpu_snapshot_after_source_reuse() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     presenter
         .execute_guest_memory_copy(GpuMemoryCopy {
             source_address: source,
@@ -344,6 +345,7 @@ fn dma_ignores_cpu_snapshot_when_an_ordered_gpu_source_is_authoritative() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -396,12 +398,9 @@ fn record_zero_copy_guest_writer(
     device: &Device,
     binding: &GlobalMemoryBinding,
 ) -> UploadedGlobalBuffer {
-    let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal queue")
-        .clone();
-    presenter.ensure_open_guest_batch(&queue);
+    presenter
+        .ensure_active_open_guest_batch()
+        .expect("active guest batch opens");
     let byte_count = u64::try_from(binding.byte_count).expect("binding byte count fits u64");
     let backing_range = guest_shared_backing_range(binding.base_address, byte_count)
         .expect("synthetic zero-copy writer range resolves");
@@ -419,8 +418,7 @@ fn record_zero_copy_guest_writer(
         .expect("zero-copy producer provenance is recorded");
     append_unique_guest_write_ranges(
         &mut presenter
-            .open_guest_batch
-            .as_mut()
+            .active_open_guest_batch_mut()
             .expect("open guest batch")
             .guest_write_ranges,
         pending,
@@ -483,6 +481,8 @@ fn native_metal_draw_arguments_match_the_gen5_indirect_layouts() {
 fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -647,6 +647,8 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
 fn post_flip_release_mem_precedes_the_exact_flip_completion() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let _ = remu_gpu::take_gpu_completed_flips();
     let submission_sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
     let flip = PendingFlip {
@@ -706,6 +708,8 @@ fn post_flip_release_mem_precedes_the_exact_flip_completion() {
 fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -793,15 +797,18 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
 fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal queue")
-        .clone();
+        .active_guest_command_queue()
+        .expect("guest Metal queue");
     let command_buffer = queue.new_command_buffer().to_owned();
     let original_command_buffer = command_buffer.clone();
-    presenter.open_guest_batch = Some(GuestCommandBatch {
-        queue_id: None,
+    presenter
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue 7 batch state exists")
+        .open_batch = Some(GuestCommandBatch {
+        queue_id: Some(7),
         command_buffer,
         work: Vec::new(),
         committed_at: None,
@@ -833,7 +840,14 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         presenter.receive_events(),
         super::PresenterFlow::Continue
     ));
-    assert!(presenter.open_guest_batch.is_none());
+    assert!(
+        presenter
+            .guest_queue_batches
+            .get(&7)
+            .expect("queue 7 batch state exists")
+            .open_batch
+            .is_none()
+    );
     assert_eq!(presenter.statistics.submitted_guest_batches, 1);
     assert_eq!(
         presenter
@@ -842,7 +856,10 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         1
     );
     let committed = presenter
-        .committed_guest_batches
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue 7 batch state exists")
+        .committed_batches
         .pop_front()
         .expect("barrier retains the nonblocking committed batch");
     assert!(std::ptr::eq(
@@ -861,6 +878,8 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
 fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -948,6 +967,8 @@ fn queued_copied_writer_forwards_across_a_shifted_physical_alias() {
         .unwrap();
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -1064,6 +1085,7 @@ fn disjoint_guest_aliases_share_one_coherent_physical_global_buffer() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let buffer = metal_buffer_with_guest_backing_range(&device, &disjoint_range)
         .expect("create the physical no-copy Metal view");
@@ -1176,6 +1198,8 @@ fn writable_physical_alias_uses_exact_staging_and_preserves_adjacent_bytes() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -1283,6 +1307,8 @@ fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -1390,6 +1416,7 @@ fn exact_writeback_skips_runs_the_guest_wrote_after_capture() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -1488,6 +1515,8 @@ fn remapped_writeback_skips_guest_recycled_physical_pages() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -1607,6 +1636,7 @@ fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_evic
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let producer_binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -1660,15 +1690,13 @@ fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_evic
     .unwrap();
     append_unique_global_writebacks(
         &mut presenter
-            .open_guest_batch
-            .as_mut()
+            .active_open_guest_batch_mut()
             .expect("producer batch stays open")
             .global_writebacks,
         pending_consumer,
     );
     presenter
-        .open_guest_batch
-        .as_mut()
+        .active_open_guest_batch_mut()
         .expect("producer batch stays open")
         .global_buffer_versions
         .extend(produced_versions);
@@ -1699,6 +1727,8 @@ fn queued_writable_global_cow_copies_on_gpu_and_diffs_against_the_retained_basel
     let (_address_space, guest_address) = mapped_test_pages(1);
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -1987,6 +2017,7 @@ fn partially_overlapping_zero_copy_writer_synchronizes_instead_of_aliasing_buffe
         .unwrap();
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let producer_binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -2033,6 +2064,7 @@ fn ambiguous_zero_copy_writer_resources_synchronize_before_read() {
         .unwrap();
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let first_binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -2050,8 +2082,7 @@ fn ambiguous_zero_copy_writer_resources_synchronize_before_read() {
     let conflicting_buffer =
         device.new_buffer(GUEST_PAGE_SIZE, MTLResourceOptions::StorageModeShared);
     presenter
-        .open_guest_batch
-        .as_mut()
+        .active_open_guest_batch_mut()
         .expect("producer batch stays open")
         .guest_write_ranges
         .push(super::super::PendingGuestWriteRange {
@@ -2101,6 +2132,7 @@ fn remapped_zero_copy_writer_address_synchronizes_before_reuse() {
         .unwrap();
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let producer_binding = GlobalMemoryBinding {
         scalar_address: 0,
@@ -2150,6 +2182,8 @@ fn remapped_zero_copy_writer_address_synchronizes_before_reuse() {
 fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let queue = presenter
         .command_queue
         .as_ref()
@@ -2325,6 +2359,8 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
 fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let queue = presenter
         .command_queue
         .as_ref()
@@ -2392,6 +2428,8 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
 fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let queue = presenter
         .command_queue
         .as_ref()
@@ -2504,6 +2542,8 @@ fn fill_committed_guest_batch_budget(
 fn required_flush_commits_at_the_in_flight_batch_budget() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let queue = presenter
         .command_queue
         .as_ref()
@@ -2565,6 +2605,8 @@ fn required_flush_commits_at_the_in_flight_batch_budget() {
 fn opportunistic_flush_defers_at_the_in_flight_batch_budget() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let queue = presenter
         .command_queue
         .as_ref()
@@ -2766,6 +2808,8 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
 
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device");
     let queue = presenter
         .command_queue
@@ -7169,4 +7213,14 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
         .expect("cross-queue release and acknowledgement settle");
     assert_eq!(read_test_label(label), 1);
     remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn per_queue_batch_flags_default_on_and_honour_the_zero_kill_switch() {
+    use std::ffi::OsStr;
+    use super::super::graduated_flag_enabled;
+    assert!(graduated_flag_enabled(None));
+    assert!(!graduated_flag_enabled(Some(OsStr::new("0"))));
+    assert!(graduated_flag_enabled(Some(OsStr::new("1"))));
+    assert!(graduated_flag_enabled(Some(OsStr::new(""))));
 }

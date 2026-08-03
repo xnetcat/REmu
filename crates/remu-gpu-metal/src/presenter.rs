@@ -356,6 +356,12 @@ fn resident_texture_cache_byte_capacity() -> Option<u64> {
     })
 }
 
+/// Graduated flags (plan A1) default on; the environment value survives one cycle as a
+/// kill-switch, where only an explicit `0` disables the behaviour.
+fn graduated_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value != Some(std::ffi::OsStr::new("0"))
+}
+
 fn resident_texture_lifetime_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1496,9 +1502,10 @@ struct CachedGlobalBuffer {
 
 /// Metal submission state owned by one logical guest GPU queue.
 ///
-/// The feature-gated B17 path deliberately keeps this separate from the legacy shared queue
-/// fields below. That makes disabling `REMU_PER_QUEUE_BATCHES` preserve the old object graph and
-/// submission behaviour exactly while the queue-local path can be validated independently.
+/// The B17 per-queue path is the default (plan A1). It deliberately stays separate from the
+/// legacy shared queue fields below so the `REMU_PER_QUEUE_BATCHES=0` kill-switch preserves the
+/// old object graph and submission behaviour exactly for one cycle, after which the legacy path
+/// is deleted.
 struct GuestQueueBatchState {
     command_queue: metal::CommandQueue,
     shared_event_timeline: SharedEventTimeline,
@@ -2387,9 +2394,11 @@ impl MetalPresenter {
         }
         drop(shader_compile_results);
         let per_queue_guest_batches =
-            std::env::var_os("REMU_PER_QUEUE_BATCHES").is_some_and(|value| value == "1");
+            graduated_flag_enabled(std::env::var_os("REMU_PER_QUEUE_BATCHES").as_deref());
         let shared_event_direct_draw_admission = per_queue_guest_batches
-            && std::env::var_os("REMU_SHARED_EVENT_DIRECT_DRAWS").is_some_and(|value| value == "1");
+            && graduated_flag_enabled(
+                std::env::var_os("REMU_SHARED_EVENT_DIRECT_DRAWS").as_deref(),
+            );
         let terminal_publication_timing =
             std::env::var_os("REMU_GPU_TERMINAL_PHASES").is_some_and(|value| value == "1");
         let shared_event_ack_phase_timing = per_queue_guest_batches

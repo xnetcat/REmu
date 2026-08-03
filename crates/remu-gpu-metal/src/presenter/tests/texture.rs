@@ -2903,6 +2903,8 @@ fn a_contained_tenant_is_rematerialised_by_an_ordered_blit() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -3036,6 +3038,8 @@ fn a_typed_alias_is_rematerialised_as_a_zero_copy_view() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let source_texture = presenter
         .ensure_resident_texture(&device, source)
@@ -3116,6 +3120,8 @@ fn guest_memory_stale_state_takes_the_counted_snapshot_fallback() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let old_texture = presenter
         .ensure_resident_texture(&device, target)
@@ -3184,6 +3190,8 @@ fn gpu_current_stale_state_never_fabricates_a_guest_memory_fallback() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     presenter
         .ensure_resident_texture(&device, source)
@@ -3305,6 +3313,8 @@ fn mode27_gpu_retile_preserves_cross_format_alias_bytes_without_a_batch_boundary
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -3424,6 +3434,8 @@ fn mode24_depth_rematerialisation_is_byte_exact_and_stays_in_the_guest_batch() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -3539,6 +3551,8 @@ fn mode27_gpu_retile_merges_disjoint_current_owners_in_physical_byte_order() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -3685,6 +3699,8 @@ fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue
@@ -3808,6 +3824,8 @@ fn mode27_gpu_detile_reconstructs_nontail_and_mip_tail_levels() {
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let queue = presenter
         .command_queue

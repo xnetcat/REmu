@@ -334,6 +334,9 @@ fn pending_flip_without_a_source_retries_at_the_submission_boundary() {
 fn a_write_to_the_other_registered_buffer_waits_for_its_own_flip() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // The ordered event loop establishes the logical queue identity before any flip work;
+    // mirror it for the graduated per-queue default.
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let front = GuestTextureDescriptor {
         address: 0xefc0_0000_00,
@@ -936,12 +939,11 @@ fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
 fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    presenter.set_active_guest_queue(Some(7));
     let _ = remu_gpu::take_gpu_completed_flips();
     let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal queue")
-        .clone();
+        .active_guest_command_queue()
+        .expect("guest Metal queue");
     presenter.display = Some(DisplayConfiguration {
         width: 640,
         height: 360,
@@ -966,9 +968,12 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
     // overtaken the frame's effects.
     let outstanding = queue.new_command_buffer().to_owned();
     presenter
-        .committed_guest_batches
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue 7 batch state exists")
+        .committed_batches
         .push_back(GuestCommandBatch {
-            queue_id: None,
+            queue_id: Some(7),
             command_buffer: outstanding.clone(),
             work: Vec::new(),
             committed_at: None,
@@ -1080,6 +1085,7 @@ fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary
     // publish the bare clear: the cover's own output would then look like the next frame.
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let descriptor = GuestTextureDescriptor {
         address: 0x0070_1234_5600,
@@ -1232,6 +1238,9 @@ fn translated_scanout_resolution_prefers_the_current_resident_object() {
 fn interactive_tick_captures_a_finalized_flip_before_accepting_its_replacement() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // This flip arrives host-sourced: no logical queue identity is active, which must select
+    // the host-ordered snapshot fallback rather than reading this synthetic guest address out
+    // of process memory.
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let descriptor = GuestTextureDescriptor {
         address: 0x0070_1234_5600,
@@ -1363,6 +1372,7 @@ fn diagnostic_capture_root_does_not_enable_periodic_frame_capture() {
 fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = super::MetalPresenter::new(receiver).expect("Metal presenter state");
+    presenter.set_active_guest_queue(Some(7));
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let descriptor = GuestTextureDescriptor {
         address: 0x0070_1234_5600,
@@ -1404,11 +1414,11 @@ fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
             .is_some()
     );
     assert!(presenter.direct_scanout_needs_initial_clear(descriptor.address));
+    // Guest paints ride the logical queue's Metal queue; the flip snapshot blit is committed
+    // there too, so using it keeps paint -> snapshot -> mutation ordered like production.
     let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal queue")
-        .clone();
+        .active_guest_command_queue()
+        .expect("guest Metal queue");
     let pass = RenderPassDescriptor::new();
     let attachment = pass
         .color_attachments()

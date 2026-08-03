@@ -808,30 +808,17 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self.active_guest_command_queue()?;
         let snapshot = self.ensure_scanout_snapshot_texture(&device, descriptor);
-        // End and commit every producer encoder before the flip. Per-queue mode publishes an
-        // explicit fence after this private-to-private copy because presentation and surface-less
-        // retirement use the legacy host queue; queue submission order alone cannot order them.
-        self.flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::FlipSnapshot)?;
-        let snapshot_ready = if self.per_queue_guest_batches {
-            let queue_id = self
-                .active_guest_queue
-                .ok_or("translated scanout has no active guest queue")?;
-            let state = self.guest_queue_batches.get_mut(&queue_id).ok_or_else(|| {
-                format!("translated scanout guest queue {queue_id} is unavailable")
-            })?;
-            Some(
-                state
-                    .shared_event_timeline
-                    .allocate_fence()
-                    .map_err(|error| error.to_string())?,
-            )
-        } else {
-            None
-        };
+        // End and commit every producer encoder before the flip, then order the snapshot copy:
+        // a queue-sourced flip rides its producing queue and publishes a fence for the legacy
+        // host queue's presentation side; a host-sourced flip snapshots on the host queue behind
+        // explicit waits on every guest queue's committed work.
+        let (queue, snapshot_ready, cross_queue_waits) = self.scanout_snapshot_ordering()?;
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu ordered VideoOut snapshot");
+        for (event, value) in &cross_queue_waits {
+            command_buffer.encode_wait_for_event(event, *value);
+        }
         let blit = command_buffer.new_blit_command_encoder();
         blit.set_label("REMu translated scanout snapshot");
         blit.copy_from_texture(

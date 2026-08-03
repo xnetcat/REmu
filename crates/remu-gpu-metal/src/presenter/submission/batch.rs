@@ -529,6 +529,74 @@ impl MetalPresenter {
         unsignaled
     }
 
+    /// Selects the command queue and ordering for a translated scanout snapshot.
+    ///
+    /// A queue-sourced flip snapshots on its producing queue and publishes a fence because
+    /// presentation and surface-less retirement run on the legacy host queue. A host-sourced
+    /// flip (interactive tick, video-out service) has no producing queue: it snapshots on the
+    /// legacy host queue itself, ordered behind every guest queue's committed work by waiting
+    /// on each timeline at its newest committed fence value. Only committed batches have their
+    /// signals encoded, so these waits cannot wedge the queue.
+    pub(crate) fn scanout_snapshot_ordering(
+        &mut self,
+    ) -> Result<
+        (
+            metal::CommandQueue,
+            Option<super::super::SharedEventFence>,
+            Vec<(metal::SharedEvent, u64)>,
+        ),
+        String,
+    > {
+        if !self.per_queue_guest_batches || self.active_guest_queue.is_some() {
+            let queue = self.active_guest_command_queue()?;
+            self.flush_guest_command_batch(
+                FlushPolicy::Required,
+                GuestBatchFlushReason::FlipSnapshot,
+            )?;
+            let snapshot_ready = if self.per_queue_guest_batches {
+                let queue_id = self
+                    .active_guest_queue
+                    .expect("per-queue snapshot ordering checked its active queue");
+                let state = self.guest_queue_batches.get_mut(&queue_id).ok_or_else(|| {
+                    format!("translated scanout guest queue {queue_id} is unavailable")
+                })?;
+                Some(
+                    state
+                        .shared_event_timeline
+                        .allocate_fence()
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+            return Ok((queue, snapshot_ready, Vec::new()));
+        }
+        self.flush_all_guest_command_batches_by(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::FlipSnapshot,
+            Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT,
+        )?;
+        let cross_queue_waits = self
+            .guest_queue_batches
+            .values()
+            .filter_map(|state| {
+                let newest = state
+                    .committed_batches
+                    .iter()
+                    .filter_map(|batch| batch.max_encoded_signal)
+                    .map(|fence| fence.value())
+                    .max()?;
+                Some((state.shared_event_timeline.event_owned(), newest))
+            })
+            .collect();
+        let queue = self
+            .command_queue
+            .as_ref()
+            .cloned()
+            .ok_or("Metal command queue is unavailable")?;
+        Ok((queue, None, cross_queue_waits))
+    }
+
     pub(crate) fn set_active_guest_queue(&mut self, queue_id: Option<u64>) {
         self.active_guest_queue = if self.per_queue_guest_batches {
             queue_id

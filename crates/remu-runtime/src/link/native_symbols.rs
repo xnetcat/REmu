@@ -351,22 +351,6 @@ macro_rules! direct_runtime_import_targets {
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-fn configured_direct_import_telemetry() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    static REPORTED: OnceLock<()> = OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_PERF_DIRECT_IMPORTS").is_some_and(|value| value == "1")
-    });
-    REPORTED.get_or_init(|| {
-        eprintln!(
-            "[REMu][PERF-DIRECT] link-time instrumentation={} environment=REMU_PERF_DIRECT_IMPORTS",
-            if enabled { "enabled" } else { "disabled" }
-        );
-    });
-    enabled
-}
-
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn direct_runtime_import_targets(nid: &str) -> Option<(u64, u64)> {
     Some(match nid {
         // Unreal's archive/name parser calls these leaf TLS and synchronization operations
@@ -441,22 +425,13 @@ fn direct_runtime_import_targets(nid: &str) -> Option<(u64, u64)> {
     })
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
-fn direct_runtime_import_target_with_telemetry(nid: &str, telemetry: bool) -> Option<u64> {
-    let (plain, instrumented) = direct_runtime_import_targets(nid)?;
-    Some(if telemetry { instrumented } else { plain })
-}
-
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub(super) fn direct_runtime_import_target(nid: &str) -> Option<u64> {
-    // The choice is made once while relocations are linked. Direct calls therefore contain no
-    // diagnostics branch in the guest hot path.
-    let (plain, instrumented) = direct_runtime_import_targets(nid)?;
-    Some(if configured_direct_import_telemetry() {
-        instrumented
-    } else {
-        plain
-    })
+    // Direct calls always link the telemetry thunk (graduated, plan A1). The counter increment
+    // is a relaxed atomic on state the thunks already own, so there is no diagnostics branch in
+    // the guest hot path and no environment selection.
+    let (_plain, instrumented) = direct_runtime_import_targets(nid)?;
+    Some(instrumented)
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -556,10 +531,10 @@ pub(super) fn synthetic_data_import_target(nid: &str) -> Option<u64> {
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 mod tests {
     use super::{
-        direct_posix_pthread_set_specific, direct_runtime_import_target_with_telemetry,
-        direct_sce_pthread_get_thread_id, direct_sce_pthread_self, direct_sce_pthread_set_specific,
+        direct_runtime_import_target, direct_sce_pthread_get_thread_id, direct_sce_pthread_self,
+        instrumented_direct_posix_pthread_set_specific,
         instrumented_direct_sce_pthread_get_thread_id, instrumented_direct_sce_pthread_self,
-        native_libc_symbol_name,
+        instrumented_direct_sce_pthread_set_specific, native_libc_symbol_name,
     };
 
     #[test]
@@ -573,12 +548,12 @@ mod tests {
     #[test]
     fn pthread_set_specific_resolves_to_lock_free_leaf_targets() {
         assert_eq!(
-            direct_runtime_import_target_with_telemetry("WrOLvHU0yQM", false),
-            Some(direct_posix_pthread_set_specific as *const () as usize as u64)
+            direct_runtime_import_target("WrOLvHU0yQM"),
+            Some(instrumented_direct_posix_pthread_set_specific as *const () as usize as u64)
         );
         assert_eq!(
-            direct_runtime_import_target_with_telemetry("+BzXYkqYeLE", false),
-            Some(direct_sce_pthread_set_specific as *const () as usize as u64)
+            direct_runtime_import_target("+BzXYkqYeLE"),
+            Some(instrumented_direct_sce_pthread_set_specific as *const () as usize as u64)
         );
     }
 
@@ -606,13 +581,11 @@ mod tests {
     }
 
     #[test]
-    fn direct_import_telemetry_is_selected_at_link_time() {
+    fn direct_import_targets_always_carry_telemetry() {
+        // Graduated (plan A1): the telemetry thunk is the only link target; there is no
+        // environment selection.
         assert_eq!(
-            direct_runtime_import_target_with_telemetry("EI-5-jlq2dE", false),
-            Some(direct_sce_pthread_get_thread_id as *const () as usize as u64)
-        );
-        assert_eq!(
-            direct_runtime_import_target_with_telemetry("EI-5-jlq2dE", true),
+            direct_runtime_import_target("EI-5-jlq2dE"),
             Some(instrumented_direct_sce_pthread_get_thread_id as *const () as usize as u64)
         );
     }
