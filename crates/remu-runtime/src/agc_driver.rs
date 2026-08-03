@@ -675,7 +675,6 @@ fn has_capacity(cursor_up: u64, cursor_down: u64, reserved: u32, needed: u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::GPU_EVENT_SINK_TEST;
 
     struct CommandFixture {
         descriptor: Box<[u64; 7]>,
@@ -732,11 +731,8 @@ mod tests {
 
     #[test]
     fn a_graphics_submission_parses_its_stream_and_requests_a_completion_event() {
-        let _event_guard = GPU_EVENT_SINK_TEST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (sender, receiver) = remu_gpu::gpu_event_channel();
-        remu_gpu::install_event_sink(sender);
+        remu_gpu::install_thread_local_event_sink(sender);
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let mut state = ProbeDispatchState::default();
@@ -757,7 +753,7 @@ mod tests {
                 Some(remu_gpu::GpuEvent::SubmissionBoundary(1))
             )
         ));
-        remu_gpu::clear_event_sink();
+        remu_gpu::clear_thread_local_event_sink();
     }
 
     #[test]
@@ -807,11 +803,8 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_every_listed_command_buffer() {
-        let _event_guard = GPU_EVENT_SINK_TEST
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (sender, receiver) = remu_gpu::gpu_event_channel();
-        remu_gpu::install_event_sink(sender);
+        remu_gpu::install_thread_local_event_sink(sender);
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let addresses = [address, address];
@@ -845,7 +838,7 @@ mod tests {
                 )
             ));
         }
-        remu_gpu::clear_event_sink();
+        remu_gpu::clear_thread_local_event_sink();
     }
 
     #[test]

@@ -11,7 +11,7 @@ use super::{
     AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE, AGC_IT_SET_SH_REG_INDIRECT, AGC_R_ACB_RESET,
     AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState,
     AgcShaderRegistry, AgcSubmitPacket, AlignedComputeProgram, AlignedIndirectArguments,
-    GPU_EVENT_SINK_TEST, ProbeDispatchState, VideoOutBufferAttributes, VideoOutState,
+    ProbeDispatchState, VideoOutBufferAttributes, VideoOutState,
     agc_apply_set_base, agc_color_target_state, agc_dcb_draw_index_auto, agc_dcb_set_index_buffer,
     agc_dcb_set_num_instances, agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
     compute_graphics_state, draw_required_vertex_record_count, low_u32, read_guest_u64,
@@ -196,9 +196,6 @@ fn scanout_lookahead_is_submission_bounded_and_not_limited_by_channel_capacity()
 
 #[test]
 fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut indices = [0_u16, 1, 2, 2, 3, 0];
     let index_address = indices.as_ptr().addr() as u64;
     let commands = [
@@ -210,7 +207,7 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
         2,
     ];
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut graphics = AgcGraphicsState::default();
     let mut shaders = AgcShaderRegistry::default();
     let mut submission_count = 0;
@@ -228,7 +225,7 @@ fn executes_native_draw_index_2_with_embedded_index_base_and_count() {
         },
     )
     .expect("native DRAW_INDEX_2 submission");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 
     let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("indexed draw event") else {
         panic!("DRAW_INDEX_2 emitted a non-draw event");
@@ -567,9 +564,6 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
 
 #[test]
 fn constant_targetless_draw_does_not_overwrite_ordered_scanout() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let address = 0x0070_1234_5600_u64;
     let target = remu_gpu::GpuColorTarget {
         slot: 0,
@@ -586,7 +580,7 @@ fn constant_targetless_draw_does_not_overwrite_ordered_scanout() {
     let video_out = targetless_scanout_test_video(address);
     let (commands, expected_acquire) = targetless_barrier_acquire_flip_commands();
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
 
     let mut submission_count = 0;
     let mut flips = Vec::new();
@@ -604,7 +598,7 @@ fn constant_targetless_draw_does_not_overwrite_ordered_scanout() {
         },
     )
     .expect("ordered targetless submission");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 
     let remu_gpu::GpuEvent::IndexedDraw(draw) = receiver.recv().expect("constant draw event")
     else {
@@ -641,9 +635,6 @@ fn constant_targetless_draw_does_not_overwrite_ordered_scanout() {
 
 #[test]
 fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let program = AlignedComputeProgram([0, 0, 0, 0]);
     let program_address = program.0.as_ptr().addr() as u64;
     let (_, shaders) = compute_graphics_state(program_address);
@@ -690,7 +681,7 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
         flags: [0; 4],
     };
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut state = ProbeDispatchState {
         agc_shader_registry: shaders,
         ..ProbeDispatchState::default()
@@ -701,7 +692,7 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
         &mut state,
     );
     let submission_event = receiver.recv_timeout(std::time::Duration::from_secs(1));
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 
     assert_eq!(result, 0);
     let remu_gpu::GpuEvent::QueueSubmission { queue_id, events } =

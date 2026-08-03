@@ -4,7 +4,7 @@
 use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
-    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, GPU_EVENT_SINK_TEST,
+    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry,
     VideoOutBufferAttributes, VideoOutState, agc_apply_submission_registers, agc_pm4,
     compute_graphics_state, decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait,
     low_u32,
@@ -520,9 +520,6 @@ fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early()
 
 #[test]
 fn emits_ordered_gen5_release_and_wait_label_operations() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut label = 0_u64;
     let label_address = (&raw mut label).addr() as u64;
     let commands = [
@@ -545,7 +542,7 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
         0,
     ];
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut graphics = AgcGraphicsState::default();
     let mut shaders = AgcShaderRegistry::default();
     let mut submission_count = 0;
@@ -562,7 +559,7 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
         },
     )
     .expect("release/wait submission");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 
     assert_eq!(
         receiver.recv().expect("release event"),
@@ -587,9 +584,6 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
 
 #[test]
 fn executes_indirect_command_buffer_events_before_following_waits() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut label = 0_u32;
     let label_address = (&raw mut label).addr() as u64;
     let indirect = [
@@ -617,7 +611,7 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
         0,
     ];
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut graphics = AgcGraphicsState::default();
     let mut shaders = AgcShaderRegistry::default();
     let mut submission_count = 0;
@@ -634,7 +628,7 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
         },
     )
     .expect("indirect release and direct wait submission");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 
     assert_eq!(
         receiver.recv().expect("indirect release event"),
@@ -659,9 +653,6 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
 
 #[test]
 fn emits_ordered_standard_and_agc_write_data_operations() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut labels = [0_u32; 4];
     let label_address = labels.as_mut_ptr().addr() as u64;
     let commands = [
@@ -678,7 +669,7 @@ fn emits_ordered_standard_and_agc_write_data_operations() {
         0x99aa_bbcc,
     ];
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut graphics = AgcGraphicsState::default();
     let mut shaders = AgcShaderRegistry::default();
     let mut submission_count = 0;
@@ -695,7 +686,7 @@ fn emits_ordered_standard_and_agc_write_data_operations() {
         },
     )
     .expect("write-data submission");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 
     assert_eq!(
         receiver.recv().expect("standard write event"),

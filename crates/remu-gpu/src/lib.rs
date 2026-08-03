@@ -5,8 +5,9 @@ pub use channel::{
     GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GPU_PENDING_EVENT_CAPACITY,
     GpuEventPublicationTiming, acquire_memory, clear_event_sink, emit_event,
     emit_event_with_admission, emit_event_with_admission_and_timing, emit_event_with_timing,
-    gpu_event_channel, install_event_sink, pipeline_barrier,
+    gpu_event_channel, install_event_sink, install_thread_local_event_sink, pipeline_barrier,
 };
+pub use channel::clear_thread_local_event_sink;
 
 mod startup;
 pub use startup::{StartupMilestone, begin_startup_timeline, record_startup_milestone};

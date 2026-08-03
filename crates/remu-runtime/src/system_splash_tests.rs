@@ -1,5 +1,5 @@
 use super::{
-    GPU_EVENT_SINK_TEST, ProbeDispatchState, SplashState, load_system_splash,
+    ProbeDispatchState, SplashState, load_system_splash,
     system_service_hide_splash,
 };
 
@@ -38,12 +38,9 @@ fn installed_splash_loads_case_insensitively_as_rgba8() {
 
 #[test]
 fn hide_splash_publishes_one_idempotent_presenter_event() {
-    let _event_guard = GPU_EVENT_SINK_TEST
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut state = ProbeDispatchState::default();
 
     assert_eq!(system_service_hide_splash(&mut state), 0);
@@ -57,5 +54,5 @@ fn hide_splash_publishes_one_idempotent_presenter_event() {
         receiver.try_recv(),
         Err(std::sync::mpsc::TryRecvError::Empty)
     );
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }

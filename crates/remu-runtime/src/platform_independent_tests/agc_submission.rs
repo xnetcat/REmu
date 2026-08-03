@@ -389,7 +389,7 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let mut state = ProbeDispatchState {
         agc_submission_count: 41,
         ..ProbeDispatchState::default()
@@ -402,7 +402,7 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
     assert!(state.pending_agc_user_interrupts.is_empty());
 
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     crate::request_agc_submission_completion(&mut state, 0, Vec::new());
     state.agc_submission_count = 42;
     crate::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
@@ -436,7 +436,7 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
             events,
         }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(42)]
     ));
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
@@ -444,9 +444,9 @@ fn containing_submission_sequence_is_attached_only_to_captured_flips() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let address = 0x0070_1234_5600;
     let mut state = ProbeDispatchState {
         agc_submission_count: 73,
@@ -495,7 +495,7 @@ fn containing_submission_sequence_is_attached_only_to_captured_flips() {
         flip_argument: 0x1234,
     });
     let _ = remu_gpu::take_gpu_completed_flips();
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
@@ -680,7 +680,7 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         ..ProbeDispatchState::default()
     };
     let (sender, receiver) = remu_gpu::gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
 
     let result = video_out_submit_flip([1, 0, 0, 0x1234, 0, 0], &mut state);
     crate::QUEUED_FLIPS.with(|queued| queued.set(0));
@@ -721,7 +721,7 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
     );
     assert_eq!(state.video_out.completed_flip_count, 1);
     assert!(receiver.try_recv().is_err());
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]

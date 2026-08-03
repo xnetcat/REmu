@@ -86,12 +86,29 @@ fn publication_timing_now() -> Instant {
     Instant::now()
 }
 
+// A per-thread event sink override. When a thread installs one, every event it emits is
+// delivered exclusively to that thread's receiver and never to the process-global sink. This is
+// the isolation the test suite needs (plan E2): the emitting thread — a test — cannot deliver
+// into a receiver another test installed, which is the process-global cross-talk that made the
+// suite order-dependent and required `--test-threads=1`. Production never installs one, so the
+// global sink path is unchanged.
+thread_local! {
+    static THREAD_LOCAL_EVENT_SINK: std::cell::RefCell<Option<SyncSender<GpuEvent>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 struct ActiveEventSender {
     sender: SyncSender<GpuEvent>,
+    /// A thread-local sink owns no share of the global `active_publishers` count, so its drop
+    /// must not touch that lifecycle counter.
+    thread_local: bool,
 }
 
 impl Drop for ActiveEventSender {
     fn drop(&mut self) {
+        if self.thread_local {
+            return;
+        }
         let Some((state, idle)) = GPU_EVENT_SINK.get() else {
             return;
         };
@@ -153,13 +170,43 @@ fn reset_event_sink_state() {
 }
 
 fn active_event_sender() -> Option<ActiveEventSender> {
+    if let Some(sender) = THREAD_LOCAL_EVENT_SINK.with(|cell| cell.borrow().clone()) {
+        return Some(ActiveEventSender {
+            sender,
+            thread_local: true,
+        });
+    }
     let (state, _) = GPU_EVENT_SINK.get()?;
     let mut state = state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sender = state.sender.as_ref()?.clone();
     state.active_publishers = state.active_publishers.saturating_add(1);
-    Some(ActiveEventSender { sender })
+    Some(ActiveEventSender {
+        sender,
+        thread_local: false,
+    })
+}
+
+/// Installs an event sink scoped to the calling thread (plan E2).
+///
+/// Events emitted on this thread are delivered only to `sender` and never touch the
+/// process-global sink, so concurrent callers on other threads cannot deliver into this
+/// receiver. Tests use this instead of [`install_event_sink`] so the suite runs in parallel.
+/// The counters and the publication coordinator remain process-global and are reset here for a
+/// clean per-test baseline; a test that also asserts on those must still not run concurrently
+/// with another that mutates them.
+pub fn install_thread_local_event_sink(sender: SyncSender<GpuEvent>) {
+    THREAD_LOCAL_EVENT_SINK.with(|cell| *cell.borrow_mut() = Some(sender));
+    reset_publication_coordinator();
+    reset_event_sink_state();
+}
+
+/// Removes the calling thread's event sink override.
+pub fn clear_thread_local_event_sink() {
+    THREAD_LOCAL_EVENT_SINK.with(|cell| *cell.borrow_mut() = None);
+    reset_publication_coordinator();
+    reset_event_sink_state();
 }
 
 fn register_publication(event: &GpuEvent) -> Publication {
@@ -534,10 +581,53 @@ pub fn pipeline_barrier(barrier: GpuPipelineBarrier) {
 }
 
 #[cfg(test)]
+mod isolation_tests {
+    use super::{
+        clear_thread_local_event_sink, emit_event, gpu_event_channel, install_event_sink,
+        install_thread_local_event_sink,
+    };
+    use crate::GpuEvent;
+
+    #[test]
+    fn a_thread_local_sink_isolates_emission_from_the_process_global_sink() {
+        // A global sink stands in for a receiver another test installed on another thread.
+        let (global_sender, global_receiver) = gpu_event_channel();
+        install_event_sink(global_sender);
+
+        let (local_sender, local_receiver) = gpu_event_channel();
+        install_thread_local_event_sink(local_sender);
+        assert!(emit_event(GpuEvent::HideHostDialog { sequence: 7 }));
+
+        assert!(
+            matches!(
+                local_receiver.try_recv(),
+                Ok(GpuEvent::HideHostDialog { sequence: 7 })
+            ),
+            "the event reaches this thread's own receiver"
+        );
+        assert!(
+            global_receiver.try_recv().is_err(),
+            "the event must never leak to the process-global sink"
+        );
+
+        clear_thread_local_event_sink();
+        assert!(emit_event(GpuEvent::HideHostDialog { sequence: 8 }));
+        assert!(
+            matches!(
+                global_receiver.try_recv(),
+                Ok(GpuEvent::HideHostDialog { sequence: 8 })
+            ),
+            "clearing the override restores the process-global path"
+        );
+        super::clear_event_sink();
+    }
+}
+
+#[cfg(test)]
 mod timing_tests {
     use super::{
-        GPU_PUBLICATION_TIMING_SAMPLES, clear_event_sink, emit_event, emit_event_with_timing,
-        gpu_event_channel, install_event_sink,
+        GPU_PUBLICATION_TIMING_SAMPLES, clear_thread_local_event_sink, emit_event,
+        emit_event_with_timing, gpu_event_channel, install_thread_local_event_sink,
     };
     use crate::GpuEvent;
     use std::sync::atomic::Ordering;
@@ -545,7 +635,7 @@ mod timing_tests {
     #[test]
     fn ordinary_emit_path_takes_no_publication_timestamps() {
         let (sender, receiver) = gpu_event_channel();
-        install_event_sink(sender);
+        install_thread_local_event_sink(sender);
         let before = GPU_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed);
         assert!(emit_event(GpuEvent::HideHostDialog { sequence: 1 }));
         assert_eq!(
@@ -559,6 +649,6 @@ mod timing_tests {
         assert!(emit_event_with_timing(GpuEvent::HideHostDialog { sequence: 2 }).0);
         assert!(GPU_PUBLICATION_TIMING_SAMPLES.load(Ordering::Relaxed) > before);
         receiver.recv().expect("timed event reaches receiver");
-        clear_event_sink();
+        clear_thread_local_event_sink();
     }
 }
