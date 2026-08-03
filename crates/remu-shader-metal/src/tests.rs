@@ -23,6 +23,7 @@ mod image;
 mod interface;
 mod lane;
 mod memory;
+mod ngg_registers;
 mod scalar;
 mod vector_alu;
 mod vop3p;
