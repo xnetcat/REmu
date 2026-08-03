@@ -3,9 +3,10 @@
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 use crate::{
-    current_guest_thread_handle, current_guest_thread_unique_id, guest_mutex_lock,
-    guest_mutex_unlock, guest_rwlock_lock, guest_rwlock_unlock, kernel_process_time, low_u32,
-    posix_pthread_result, pthread_get_specific, pthread_set_specific,
+    current_guest_thread_handle, current_guest_thread_unique_id, direct_guest_thread_unique_id,
+    direct_guest_thread_unique_id_is_available, guest_mutex_lock, guest_mutex_unlock,
+    guest_rwlock_lock, guest_rwlock_unlock, kernel_process_time, low_u32, posix_pthread_result,
+    pthread_get_specific, pthread_set_specific,
 };
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
@@ -250,6 +251,13 @@ direct_runtime_import!(
     direct_sce_pthread_get_thread_id,
     instrumented_direct_sce_pthread_get_thread_id,
     ScePthreadGetThreadId,
+    () { direct_guest_thread_unique_id() }
+);
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+direct_runtime_import!(
+    fallback_direct_sce_pthread_get_thread_id,
+    instrumented_fallback_direct_sce_pthread_get_thread_id,
+    ScePthreadGetThreadId,
     () { current_guest_thread_unique_id() }
 );
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -412,10 +420,19 @@ fn direct_runtime_import_targets(nid: &str) -> Option<(u64, u64)> {
             direct_guest_rwlock_unlock,
             instrumented_direct_guest_rwlock_unlock
         ),
-        "EI-5-jlq2dE" => direct_runtime_import_targets!(
-            direct_sce_pthread_get_thread_id,
-            instrumented_direct_sce_pthread_get_thread_id
-        ),
+        "EI-5-jlq2dE" => {
+            if direct_guest_thread_unique_id_is_available() {
+                direct_runtime_import_targets!(
+                    direct_sce_pthread_get_thread_id,
+                    instrumented_direct_sce_pthread_get_thread_id
+                )
+            } else {
+                direct_runtime_import_targets!(
+                    fallback_direct_sce_pthread_get_thread_id,
+                    instrumented_fallback_direct_sce_pthread_get_thread_id
+                )
+            }
+        },
         "fgxnMeTNUtY" => direct_runtime_import_targets!(
             direct_process_time_counter,
             instrumented_direct_process_time_counter

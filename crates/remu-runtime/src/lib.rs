@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
@@ -1428,6 +1428,20 @@ thread_local! {
     static KERNEL_MEMORY_READABLE_RANGES_CACHE: RefCell<Option<(usize, Arc<[(u64, u64)]>)>> = const { RefCell::new(None) };
 }
 
+/// Darwin implements `pthread_getspecific` as a direct read from the calling pthread's TSD.
+/// Keep a console thread's small integer ID there so the very hot direct import avoids resolving
+/// a Mach-O language-TLS variable on every call. The language-TLS copy remains authoritative as
+/// an exact fallback if the host cannot allocate the process-lifetime pthread key.
+#[cfg(target_os = "macos")]
+const GUEST_THREAD_UNIQUE_ID_KEY_UNINITIALIZED: usize = usize::MAX;
+#[cfg(target_os = "macos")]
+const GUEST_THREAD_UNIQUE_ID_KEY_FAILED: usize = usize::MAX - 1;
+#[cfg(target_os = "macos")]
+static GUEST_THREAD_UNIQUE_ID_KEY: AtomicUsize =
+    AtomicUsize::new(GUEST_THREAD_UNIQUE_ID_KEY_UNINITIALIZED);
+#[cfg(target_os = "macos")]
+static GUEST_THREAD_UNIQUE_ID_KEY_INIT: Once = Once::new();
+
 static PTHREAD_KEY_GENERATIONS: [AtomicU64; 256] =
     [const { AtomicU64::new(0) }; 256];
 static NEXT_PTHREAD_KEY_GENERATION: AtomicU64 = AtomicU64::new(1);
@@ -1514,11 +1528,69 @@ fn set_current_guest_thread_handle(thread_handle: u64) {
 }
 
 fn current_guest_thread_unique_id() -> u64 {
+    #[cfg(target_os = "macos")]
+    if let Some(key) = guest_thread_unique_id_key() {
+        // SAFETY: `key` was created once for the process and is never deleted. Values are small
+        // guest integer IDs encoded directly in the pointer bits; no pointer is dereferenced.
+        return unsafe { libc::pthread_getspecific(key) } as usize as u64;
+    }
     u64::from(CURRENT_GUEST_THREAD_UNIQUE_ID.get())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[inline(always)]
+fn direct_guest_thread_unique_id() -> u64 {
+    // The direct-import target is selected only after the process-lifetime pthread key exists.
+    // Every guest worker installs its ID before entering guest code, so the public TSD getter is
+    // the exact current guest identity and needs no per-call fallback branch.
+    let key = GUEST_THREAD_UNIQUE_ID_KEY.load(Ordering::Relaxed);
+    debug_assert!(key < GUEST_THREAD_UNIQUE_ID_KEY_FAILED);
+    // SAFETY: the link-time selection above proves the key is live and it is never deleted.
+    (unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }) as usize as u64
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+fn direct_guest_thread_unique_id_is_available() -> bool {
+    guest_thread_unique_id_key().is_some()
 }
 
 fn set_current_guest_thread_unique_id(unique_id: u32) {
     CURRENT_GUEST_THREAD_UNIQUE_ID.set(unique_id);
+    #[cfg(target_os = "macos")]
+    if let Some(key) = guest_thread_unique_id_key() {
+        // SAFETY: `key` remains valid for the process lifetime. A null value represents the
+        // existing zero/no-guest-thread state; positive IDs fit in pointer-sized storage.
+        let result = unsafe { libc::pthread_setspecific(key, unique_id as usize as *const _) };
+        debug_assert_eq!(
+            result, 0,
+            "a live pthread key must accept its per-thread value"
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn guest_thread_unique_id_key() -> Option<libc::pthread_key_t> {
+    let mut key = GUEST_THREAD_UNIQUE_ID_KEY.load(Ordering::Acquire);
+    if key == GUEST_THREAD_UNIQUE_ID_KEY_UNINITIALIZED {
+        GUEST_THREAD_UNIQUE_ID_KEY_INIT.call_once(|| {
+            let mut key = 0;
+            // SAFETY: `key` points to writable storage and no destructor is needed for an integer
+            // encoded as a pointer value. The key intentionally lives until process termination.
+            let result = unsafe { libc::pthread_key_create(&mut key, None) };
+            if result == 0 {
+                eprintln!("[REMu][PTHREAD] guest thread-id source=darwin-pthread-tsd key={key}");
+                GUEST_THREAD_UNIQUE_ID_KEY.store(key as usize, Ordering::Release);
+            } else {
+                eprintln!(
+                    "[REMu][PTHREAD] guest thread-id source=rust-tlv-fallback pthread_error={result}"
+                );
+                GUEST_THREAD_UNIQUE_ID_KEY
+                    .store(GUEST_THREAD_UNIQUE_ID_KEY_FAILED, Ordering::Release);
+            }
+        });
+        key = GUEST_THREAD_UNIQUE_ID_KEY.load(Ordering::Acquire);
+    }
+    (key < GUEST_THREAD_UNIQUE_ID_KEY_FAILED).then_some(key as libc::pthread_key_t)
 }
 
 #[repr(C)]
