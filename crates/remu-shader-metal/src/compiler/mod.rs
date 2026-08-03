@@ -21,6 +21,7 @@ use crate::{MetalCompileOptions, MetalShaderStage};
 pub(crate) mod control_flow;
 pub(crate) mod driver;
 pub(crate) mod export;
+pub(crate) mod hlsl;
 pub(crate) mod image;
 pub(crate) mod interface;
 pub(crate) mod memory;
@@ -38,6 +39,7 @@ pub(crate) struct Compiler<'a> {
     program: &'a Program,
     evaluation: &'a ShaderEvaluation,
     options: &'a MetalCompileOptions,
+    dialect: SourceDialect,
     pub(crate) body: String,
     pub(crate) next_temp: u32,
     vertex_outputs: BTreeSet<u32>,
@@ -48,7 +50,17 @@ pub(crate) struct Compiler<'a> {
     control_flow: ControlFlowLowering,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceDialect {
+    Metal,
+    Hlsl,
+}
+
 impl Compiler<'_> {
+    pub(crate) const fn is_hlsl(&self) -> bool {
+        matches!(self.dialect, SourceDialect::Hlsl)
+    }
+
     fn is_threadgroup_stage(&self) -> bool {
         matches!(
             self.options.stage,

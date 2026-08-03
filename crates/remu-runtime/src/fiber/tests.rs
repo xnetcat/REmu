@@ -5,6 +5,13 @@ use std::sync::atomic::Ordering;
 
 use super::*;
 
+fn serialize_fiber_test() -> std::sync::MutexGuard<'static, ()> {
+    static FIBER_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    FIBER_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// A sixteen-byte-aligned stack standing in for the guest's fiber context memory.
 #[repr(C, align(16))]
 struct FiberStack([u8; 0x8000]);
@@ -42,7 +49,7 @@ impl FiberObject {
 fn initialize_fiber(
     fiber: &FiberObject,
     stack: &FiberStack,
-    entry: unsafe extern "C" fn(u64, u64),
+    entry: unsafe extern "sysv64" fn(u64, u64),
     argument_on_initialize: u64,
 ) -> u64 {
     let name = c"test-fiber";
@@ -62,7 +69,7 @@ fn initialize_fiber(
 /// Records what a fiber entry observed, so the test can prove the switch carried real values.
 static OBSERVED: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
 
-unsafe extern "C" fn yields_once(argument_on_initialize: u64, argument_on_run_to: u64) {
+unsafe extern "sysv64" fn yields_once(argument_on_initialize: u64, argument_on_run_to: u64) {
     OBSERVED
         .lock()
         .unwrap()
@@ -77,6 +84,7 @@ unsafe extern "C" fn yields_once(argument_on_initialize: u64, argument_on_run_to
 
 #[test]
 fn a_fiber_runs_on_its_own_stack_and_yields_back_with_both_arguments() {
+    let _serialized = serialize_fiber_test();
     OBSERVED.lock().unwrap().clear();
 
     let fiber = FiberObject::default();
@@ -133,7 +141,7 @@ static SECOND_FIBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 /// Marks an arrival the test expects never to happen.
 const UNEXPECTED: u64 = 0xffff;
 
-unsafe extern "C" fn switches_to_peer(_argument_on_initialize: u64, argument_on_run_to: u64) {
+unsafe extern "sysv64" fn switches_to_peer(_argument_on_initialize: u64, argument_on_run_to: u64) {
     OBSERVED.lock().unwrap().push((1, argument_on_run_to));
     let mut argument_on_run = 0_u64;
     let result = switch_fiber([
@@ -152,7 +160,7 @@ unsafe extern "C" fn switches_to_peer(_argument_on_initialize: u64, argument_on_
     return_to_thread([0, 0, 0, 0, 0, 0]);
 }
 
-unsafe extern "C" fn switches_back(_argument_on_initialize: u64, argument_on_run_to: u64) {
+unsafe extern "sysv64" fn switches_back(_argument_on_initialize: u64, argument_on_run_to: u64) {
     OBSERVED.lock().unwrap().push((2, argument_on_run_to));
     let result = switch_fiber([FIRST_FIBER.load(Ordering::Acquire), 0x6666, 0, 0, 0, 0]);
     // A switch away must not return here; record it so the test fails rather than aborts.
@@ -162,6 +170,7 @@ unsafe extern "C" fn switches_back(_argument_on_initialize: u64, argument_on_run
 
 #[test]
 fn one_fiber_switches_directly_to_another_and_back() {
+    let _serialized = serialize_fiber_test();
     OBSERVED.lock().unwrap().clear();
     let first = FiberObject::default();
     let first_stack = FiberStack::new();
@@ -217,7 +226,7 @@ fn one_fiber_switches_directly_to_another_and_back() {
     );
 }
 
-unsafe extern "C" fn reports_self(_argument_on_initialize: u64, _argument_on_run_to: u64) {
+unsafe extern "sysv64" fn reports_self(_argument_on_initialize: u64, _argument_on_run_to: u64) {
     let mut self_fiber = 0_u64;
     let result = get_self((&raw mut self_fiber).addr() as u64);
     OBSERVED.lock().unwrap().push((result, self_fiber));
@@ -227,6 +236,7 @@ unsafe extern "C" fn reports_self(_argument_on_initialize: u64, _argument_on_run
 
 #[test]
 fn a_running_fiber_can_identify_itself() {
+    let _serialized = serialize_fiber_test();
     OBSERVED.lock().unwrap().clear();
     let fiber = FiberObject::default();
     let stack = FiberStack::new();
@@ -241,6 +251,7 @@ fn a_running_fiber_can_identify_itself() {
 
 #[test]
 fn fiber_entry_points_reject_calls_from_outside_a_fiber() {
+    let _serialized = serialize_fiber_test();
     assert!(fiber_context().is_null());
     let mut value = 0_u64;
     assert_eq!(
@@ -256,6 +267,7 @@ fn fiber_entry_points_reject_calls_from_outside_a_fiber() {
 
 #[test]
 fn initialize_validates_its_arguments_before_publishing_the_object() {
+    let _serialized = serialize_fiber_test();
     let fiber = FiberObject::default();
     let stack = FiberStack::new();
     let name = c"n";
@@ -306,6 +318,7 @@ fn initialize_validates_its_arguments_before_publishing_the_object() {
 
 #[test]
 fn an_uninitialized_or_finalized_fiber_cannot_be_run() {
+    let _serialized = serialize_fiber_test();
     let fiber = FiberObject::default();
     let stack = FiberStack::new();
     assert_eq!(
@@ -329,6 +342,7 @@ fn an_uninitialized_or_finalized_fiber_cannot_be_run() {
 
 #[test]
 fn opt_param_initialize_publishes_the_magic_initialize_checks_for() {
+    let _serialized = serialize_fiber_test();
     let mut opt_param = [0_u64; 2];
     let address = opt_param.as_mut_ptr().addr() as u64;
     assert_eq!(opt_param_initialize(0), fiber_error(SCE_FIBER_ERROR_NULL));
@@ -364,6 +378,7 @@ fn opt_param_initialize_publishes_the_magic_initialize_checks_for() {
 
 #[test]
 fn get_info_and_rename_report_the_object_the_guest_supplied() {
+    let _serialized = serialize_fiber_test();
     let fiber = FiberObject::default();
     let stack = FiberStack::new();
     assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0x77), 0);
@@ -402,6 +417,7 @@ fn get_info_and_rename_report_the_object_the_guest_supplied() {
 
 #[test]
 fn a_long_name_is_truncated_to_the_abi_limit() {
+    let _serialized = serialize_fiber_test();
     let fiber = FiberObject::default();
     let stack = FiberStack::new();
     let long = c"0123456789abcdef0123456789abcdef0123456789";
@@ -442,6 +458,7 @@ static NESTED_TARGET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 
 #[test]
 fn nested_run_is_refused_rather_than_stranding_the_outer_frame() {
+    let _serialized = serialize_fiber_test();
     OBSERVED.lock().unwrap().clear();
     let inner = FiberObject::default();
     let inner_stack = FiberStack::new();
@@ -463,7 +480,7 @@ fn nested_run_is_refused_rather_than_stranding_the_outer_frame() {
     );
 }
 
-unsafe extern "C" fn attempts_nested_run(_initialize: u64, _run_to: u64) {
+unsafe extern "sysv64" fn attempts_nested_run(_initialize: u64, _run_to: u64) {
     // A second `run` on a thread already inside a fiber has no way back and must be refused.
     let result = run([NESTED_TARGET.load(Ordering::Acquire), 0, 0, 0, 0, 0]);
     OBSERVED.lock().unwrap().push((result, 0));
@@ -475,7 +492,7 @@ unsafe extern "C" fn attempts_nested_run(_initialize: u64, _run_to: u64) {
 static MIGRATED_FIBER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static MIGRATED_RESULT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
-unsafe extern "C" fn yields_then_reports_resume(
+unsafe extern "sysv64" fn yields_then_reports_resume(
     _argument_on_initialize: u64,
     _argument_on_run_to: u64,
 ) {
@@ -495,6 +512,7 @@ unsafe extern "C" fn yields_then_reports_resume(
 /// suspending thread's slot, which by then is null, and the resume reports a permission error.
 #[test]
 fn a_suspended_fiber_resumes_on_a_different_thread() {
+    let _serialized = serialize_fiber_test();
     OBSERVED.lock().unwrap().clear();
     MIGRATED_RESULT.store(u64::MAX, Ordering::Release);
     let fiber = FiberObject::default();

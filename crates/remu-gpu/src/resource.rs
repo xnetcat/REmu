@@ -92,6 +92,15 @@ pub struct IndexedDraw {
     /// earlier GPU pass can still be producing the argument dwords. Backends must consume this
     /// buffer in queue order instead.
     pub indirect_arguments_address: Option<u64>,
+    /// Optional guest address containing the live draw count for a native
+    /// `DRAW_{INDEX_}INDIRECT_MULTI` packet.
+    ///
+    /// `indirect_draw_index` is compared with this value at ordered execution time. The packet's
+    /// maximum count is represented by the number of emitted draw events, while this address may
+    /// be written by an earlier GPU operation after command decoding has finished.
+    pub indirect_count_address: Option<u64>,
+    /// Zero-based draw number within a native multi-draw packet.
+    pub indirect_draw_index: u32,
     pub instance_count: u32,
     pub index_buffer_address: u64,
     pub index_resource_address: u64,

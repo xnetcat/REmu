@@ -39,8 +39,15 @@ impl Compiler<'_> {
             let offset = u32::try_from(index)
                 .map_err(|_| "scalar load destination count overflow".to_owned())?
                 * 4;
+            let load = if self.is_hlsl()
+                && !self.evaluation.global_memory_bindings[binding_index].writable
+            {
+                "remu_load_u32_ro"
+            } else {
+                "remu_load_u32"
+            };
             let expression =
-                format!("remu_load_u32(b{binding_index}, {address} + {offset}u, {binding_length})");
+                format!("{load}(b{binding_index}, {address} + {offset}u, {binding_length})");
             self.store_scalar(destination.value, &expression);
         }
         Ok(())

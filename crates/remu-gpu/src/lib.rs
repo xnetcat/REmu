@@ -91,10 +91,11 @@ pub use system_ui::{SYSTEM_UI_HEIGHT, SYSTEM_UI_WIDTH, SystemUiFramebuffer, rast
 
 mod pad;
 pub use pad::{
-    HostPadState, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN, PAD_BUTTON_L1,
-    PAD_BUTTON_L2, PAD_BUTTON_L3, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS, PAD_BUTTON_R1,
-    PAD_BUTTON_R2, PAD_BUTTON_R3, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE,
-    PAD_BUTTON_UP, host_pad_buttons_held, host_pad_state, set_host_pad_state,
+    HostPadState, HostPadVibration, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, PAD_BUTTON_DOWN,
+    PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_L3, PAD_BUTTON_LEFT, PAD_BUTTON_OPTIONS,
+    PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_R3, PAD_BUTTON_RIGHT, PAD_BUTTON_SQUARE,
+    PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, host_pad_buttons_held, host_pad_state, host_pad_vibration,
+    set_host_pad_state, set_host_pad_vibration,
 };
 
 #[cfg(test)]

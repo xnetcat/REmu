@@ -20,26 +20,30 @@ mod signal_text;
 
 #[cfg(target_os = "macos")]
 mod write_watch;
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+#[path = "write_watch_windows.rs"]
+mod write_watch;
+#[cfg(any(target_os = "macos", windows))]
 pub use write_watch::notify_guest_memory_written;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub use write_watch::notify_guest_memory_written_excluding;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub use write_watch::{
-    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement, GuestReadMaterializer,
-    set_read_watch_materializer,
+    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement,
 };
+#[cfg(target_os = "macos")]
+pub use write_watch::{GuestReadMaterializer, set_read_watch_materializer};
 
 /// Non-macOS builds have no unified-memory write-watch backend to notify.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 #[must_use]
 pub const fn notify_guest_memory_written(_address: u64, _byte_count: u64) -> bool {
     false
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod address_space;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub use address_space::{
     AddressSpaceError, GUEST_PAGE_SIZE, GuardedBackingWrite, GuestAddressSpace, GuestMapCoalescing,
     GuestMapPlacement, GuestPhysicalBacking, GuestProtection, GuestRangeLease,
@@ -65,7 +69,7 @@ pub use guest_ptr::{
 
 /// Guest page size is 16 KiB on every host. The sparse address-space backend that uses it is
 /// macOS-only today; analysis and page-alignment helpers still need the constant everywhere.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub const GUEST_PAGE_SIZE: u64 = 16 * 1024;
 
 pub const PS5_MAIN_IMAGE_BASE: GuestAddress = GuestAddress::new(0x0000_0008_0000_0000);
@@ -166,6 +170,7 @@ impl GuestImage {
         auxiliary_reserve_size: u64,
     ) -> Result<Self, MappingError> {
         let page_size = host_page_size()?;
+        let allocation_granularity = host_allocation_granularity()?;
         let mut minimum = u64::MAX;
         let mut maximum = 0_u64;
         for segment in &executable.load_segments {
@@ -183,7 +188,11 @@ impl GuestImage {
             return Err(MappingError::NoLoadSegments);
         }
 
-        let mapping_start = align_down(minimum, page_size);
+        // Windows reserves address space on allocation-granularity boundaries (normally 64 KiB),
+        // even though protection and commitment remain page-granular (normally 4 KiB). Keeping
+        // these concepts separate lets 16 KiB-aligned guest segments retain their exact virtual
+        // addresses while the owning reservation satisfies VirtualAlloc's stricter requirement.
+        let mapping_start = align_down(minimum, allocation_granularity);
         let image_end = align_up(maximum, page_size)?;
         let mapping_end = image_end
             .checked_add(auxiliary_reserve_size)
@@ -638,6 +647,11 @@ fn host_page_size() -> Result<u64, MappingError> {
     Ok(page_size)
 }
 
+#[cfg(unix)]
+fn host_allocation_granularity() -> Result<u64, MappingError> {
+    host_page_size()
+}
+
 #[cfg(windows)]
 fn host_page_size() -> Result<u64, MappingError> {
     let mut info = SystemInfo::zeroed();
@@ -652,8 +666,27 @@ fn host_page_size() -> Result<u64, MappingError> {
     Ok(page_size)
 }
 
+#[cfg(windows)]
+fn host_allocation_granularity() -> Result<u64, MappingError> {
+    let mut info = SystemInfo::zeroed();
+    // SAFETY: `info` is a valid SYSTEM_INFO buffer for GetSystemInfo.
+    unsafe {
+        GetSystemInfo(&raw mut info);
+    }
+    let allocation_granularity = u64::from(info.dw_allocation_granularity);
+    if allocation_granularity == 0 || !allocation_granularity.is_power_of_two() {
+        return Err(MappingError::InvalidHostPageSize);
+    }
+    Ok(allocation_granularity)
+}
+
 #[cfg(not(any(unix, windows)))]
 fn host_page_size() -> Result<u64, MappingError> {
+    Err(MappingError::UnsupportedPlatform)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn host_allocation_granularity() -> Result<u64, MappingError> {
     Err(MappingError::UnsupportedPlatform)
 }
 
@@ -827,7 +860,7 @@ unsafe extern "system" {
     fn GetSystemInfo(lp_system_info: *mut SystemInfo);
 }
 
-#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
+#[cfg(all(test, target_arch = "x86_64", any(target_os = "macos", windows)))]
 mod tests {
     use std::io::Cursor;
 

@@ -64,7 +64,7 @@ const REGISTER_ARRAY_WORST_CASE_BYTES: u64 = 12;
 /// A range packet holds an opcode dword and a first-offset dword ahead of its values.
 const REGISTER_RANGE_HEADER_BYTES: u64 = 8;
 
-type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.
 pub(crate) fn dispatch(
@@ -628,7 +628,11 @@ mod tests {
 
     #[test]
     fn a_full_command_buffer_is_grown_through_the_guest_callback() {
-        unsafe extern "C" fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
+        unsafe extern "sysv64" fn grow(
+            command_buffer: u64,
+            requested: u32,
+            user_data: u64,
+        ) -> bool {
             if requested != 4 {
                 return false;
             }

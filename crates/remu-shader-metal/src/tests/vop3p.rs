@@ -414,6 +414,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
             MetalShaderStage::Compute => MetalCompileOptions {
                 stage,
                 required_vertex_output_count: 0,
+                required_vertex_output_locations: None,
                 vertex_output_control: 0,
                 render_target_array_length: 1,
                 pixel_outputs: Vec::new(),

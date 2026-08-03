@@ -7,14 +7,15 @@ use std::sync::Arc;
 
 use super::{
     AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_DRAW_INDEX_INDIRECT,
-    AGC_IT_DRAW_INDIRECT, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP,
-    AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE, AGC_IT_SET_SH_REG_INDIRECT, AGC_R_ACB_RESET,
-    AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState,
-    AgcShaderRegistry, AgcSubmitPacket, AlignedComputeProgram, AlignedIndirectArguments,
-    ProbeDispatchState, VideoOutBufferAttributes, VideoOutState, agc_apply_set_base,
-    agc_color_target_state, agc_dcb_draw_index_auto, agc_dcb_set_index_buffer,
-    agc_dcb_set_num_instances, agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4,
-    compute_graphics_state, draw_required_vertex_record_count, low_u32, read_guest_u64,
+    AGC_IT_DRAW_INDEX_INDIRECT_MULTI, AGC_IT_DRAW_INDIRECT, AGC_IT_INDEX_BASE,
+    AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
+    AGC_IT_SET_SH_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState,
+    AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry, AgcSubmitPacket,
+    AlignedComputeProgram, AlignedIndirectArguments, GPU_EVENT_SINK_TEST, ProbeDispatchState,
+    VideoOutBufferAttributes, VideoOutState, agc_apply_set_base, agc_color_target_state,
+    agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
+    agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, compute_graphics_state,
+    draw_required_vertex_record_count, low_u32, read_guest_u64,
     targetless_barrier_acquire_flip_commands, targetless_scanout_test_draw,
     targetless_scanout_test_shader_state, targetless_scanout_test_video, write_guest_u32,
     write_guest_u64,
@@ -420,6 +421,93 @@ fn executes_indexed_indirect_draw_with_all_five_argument_fields() {
     assert_eq!(graphics.shader_registers.get(&0x08c), None);
     assert_eq!(graphics.shader_registers.get(&0x08d), None);
     assert_eq!(graphics.shader_registers.get(&0x08e), None);
+}
+
+#[test]
+fn indexed_indirect_multi_preserves_stride_draw_id_and_live_count_metadata() {
+    #[repr(C, align(8))]
+    struct MultiDrawArguments([u32; 10]);
+
+    let arguments = MultiDrawArguments([3, 1, 0, 0, 4, 6, 2, 1, (-3_i32) as u32, 9]);
+    let arguments_address = arguments.0.as_ptr().addr() as u64;
+    let live_count = 1_u32;
+    let count_address = (&raw const live_count).addr() as u64;
+    let packet = [
+        agc_pm4(10, AGC_IT_DRAW_INDEX_INDIRECT_MULTI, 0),
+        0,
+        0x08d_008c,
+        0x08e,
+        0x08f | (1 << 30) | (1 << 31),
+        2,
+        low_u32(count_address),
+        low_u32(count_address >> 32),
+        20,
+        2,
+    ];
+    let mut graphics = AgcGraphicsState {
+        indirect_args_address: arguments_address,
+        ..AgcGraphicsState::default()
+    };
+    let mut shaders = AgcShaderRegistry::default();
+    let mut flips = Vec::new();
+    let mut event_writes = Vec::new();
+
+    let (result, events) = crate::capture_agc_gpu_events(|| {
+        crate::agc_handle_submission_packet(
+            crate::AgcSubmissionPacket {
+                address: packet.as_ptr().addr() as u64,
+                length: 10,
+                opcode: AGC_IT_DRAW_INDEX_INDIRECT_MULTI,
+                register: 0,
+                predicated: false,
+            },
+            &mut graphics,
+            &mut shaders,
+            &VideoOutState::default(),
+            &mut flips,
+            &mut event_writes,
+            None,
+        )
+    });
+    result.expect("indexed indirect multi-draw");
+
+    let [
+        remu_gpu::GpuEvent::IndexedDraw(first),
+        remu_gpu::GpuEvent::IndexedDraw(second),
+    ] = events.as_slice()
+    else {
+        panic!("multi-draw emitted unexpected events: {events:?}");
+    };
+    assert_eq!(first.indirect_arguments_address, Some(arguments_address));
+    assert_eq!(
+        second.indirect_arguments_address,
+        Some(arguments_address + 20)
+    );
+    assert_eq!(first.indirect_count_address, Some(count_address));
+    assert_eq!(second.indirect_count_address, Some(count_address));
+    assert_eq!(first.indirect_draw_index, 0);
+    assert_eq!(second.indirect_draw_index, 1);
+    assert_eq!((first.index_count, first.instance_count), (3, 1));
+    assert_eq!((second.index_count, second.instance_count), (6, 2));
+    assert_eq!(second.index_offset, 1);
+    assert_eq!(second.base_vertex, -3);
+    assert_eq!(
+        first
+            .shader_registers
+            .iter()
+            .find(|register| register.offset == 0x08f)
+            .map(|register| register.value),
+        Some(0)
+    );
+    assert_eq!(
+        second
+            .shader_registers
+            .iter()
+            .find(|register| register.offset == 0x08f)
+            .map(|register| register.value),
+        Some(1)
+    );
+    assert_eq!(graphics.shader_registers.get(&0x08f), None);
 }
 
 #[test]

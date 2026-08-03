@@ -23,13 +23,15 @@ use std::sync::{Mutex, MutexGuard};
 
 use crate::{
     KERNEL_EVENT_FILTER_USER, KERNEL_FILES, KernelFileState, ProbeDispatchState,
-    SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND,
-    current_guest_thread_handle, guest_errno_address, guest_kernel_rmdir, guest_posix_file_result,
-    kernel_process_time, kernel_register_event, low_i32, posix_pthread_result,
-    process_guest_range_is_readable, pthread_attr_set_inherit_schedule,
-    pthread_attr_set_schedule_param, pthread_get_schedule_param, pthread_rename, read_guest_u16,
-    read_guest_u64, sce_kernel_error, signed_i32_return, terminate_probe, write_guest_u32,
+    SCE_KERNEL_ERROR_NOT_FOUND, current_guest_thread_handle, guest_errno_address,
+    guest_kernel_rmdir, guest_posix_file_result, kernel_process_time, kernel_register_event,
+    low_i32, posix_pthread_result, process_guest_range_is_readable,
+    pthread_attr_set_inherit_schedule, pthread_attr_set_schedule_param, pthread_get_schedule_param,
+    pthread_rename, read_guest_u16, read_guest_u64, sce_kernel_error, signed_i32_return,
+    terminate_probe, write_guest_u32,
 };
+#[cfg(target_os = "macos")]
+use crate::{SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT};
 mod aio;
 mod filesystem;
 mod net;

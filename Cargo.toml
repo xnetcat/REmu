@@ -3,6 +3,7 @@ members = [
     "crates/remu-cli",
     "crates/remu-core",
     "crates/remu-gpu",
+    "crates/remu-gpu-dx12",
     "crates/remu-gpu-metal",
     "crates/remu-loader",
     "crates/remu-memory",
@@ -25,6 +26,7 @@ cc = "1.2"
 clap = { version = "4.5", features = ["derive"] }
 core-graphics-types = "0.2"
 cpal = "0.18"
+hassle-rs = "0.12"
 iced-x86 = "1.21"
 libc = "0.2"
 metal = { version = "0.33", features = ["private"] }
@@ -35,6 +37,7 @@ smallvec = "1.15"
 symphonia = { version = "0.5.4", default-features = false, features = ["aac"] }
 thiserror = "2.0"
 winit = "0.30"
+windows = "0.62.2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -856,7 +856,7 @@ fn command_buffer_reservation_and_alignment_are_enforced() {
 
 #[test]
 fn invokes_the_gen5_growth_callback_before_allocating() {
-    unsafe extern "C" fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
+    unsafe extern "sysv64" fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
         if requested != 7 {
             return false;
         }

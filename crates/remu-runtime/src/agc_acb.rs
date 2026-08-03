@@ -76,7 +76,7 @@ const MAX_WORKLOAD_ID: u32 = 63;
 const MAX_WORKLOAD_IDS: u64 = 64;
 const WORKLOAD_ID_BYTES: u64 = 4;
 
-type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.
 pub(crate) fn dispatch(
@@ -763,7 +763,11 @@ mod tests {
 
     #[test]
     fn a_full_command_buffer_is_grown_through_the_guest_callback() {
-        unsafe extern "C" fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
+        unsafe extern "sysv64" fn grow(
+            command_buffer: u64,
+            requested: u32,
+            user_data: u64,
+        ) -> bool {
             if requested != 2 {
                 return false;
             }

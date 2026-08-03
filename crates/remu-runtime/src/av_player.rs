@@ -722,7 +722,7 @@ pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallb
 }
 
 pub(crate) fn invoke_av_player_event_callback(callback: AvPlayerEventCallback) {
-    type Callback = unsafe extern "C" fn(u64, u64, u64, u64);
+    type Callback = unsafe extern "sysv64" fn(u64, u64, u64, u64);
     if !process_guest_range_is_readable(callback.function, 1) {
         eprintln!(
             "[REMu][AVPLAYER] rejected unreadable event={} callback={:#x}",
@@ -757,7 +757,7 @@ pub(crate) fn invoke_av_player_event_callback(callback: AvPlayerEventCallback) {
 pub(crate) fn invoke_av_player_texture_deallocations(
     deallocations: Vec<AvPlayerTextureDeallocation>,
 ) {
-    type DeallocateTexture = unsafe extern "C" fn(u64, u64);
+    type DeallocateTexture = unsafe extern "sysv64" fn(u64, u64);
     for deallocation in deallocations {
         if deallocation.address == 0 {
             continue;
@@ -815,7 +815,7 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
         );
         return;
     }
-    type AllocateTexture = unsafe extern "C" fn(u64, u32, u32) -> u64;
+    type AllocateTexture = unsafe extern "sysv64" fn(u64, u32, u32) -> u64;
     // SAFETY: InitEx supplies the live guest texture-allocation callback and opaque allocator
     // object. This runs before the process dispatch lock is acquired, so the allocator may call
     // kernel memory exports while it obtains GPU-visible storage.

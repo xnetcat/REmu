@@ -246,6 +246,7 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
         &MetalCompileOptions {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -445,6 +446,7 @@ fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
         &MetalCompileOptions {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),

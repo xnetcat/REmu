@@ -1332,7 +1332,7 @@ static BLOCKED_EVENT_RELEASED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// A guest event handler that never returns until the test releases it.
-extern "C" fn av_player_blocking_event_callback(
+extern "sysv64" fn av_player_blocking_event_callback(
     _object: u64,
     _event: u64,
     _source: u64,

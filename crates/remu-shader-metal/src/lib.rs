@@ -165,10 +165,14 @@ impl NggRegisters {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MetalCompileOptions {
     pub stage: MetalShaderStage,
     pub required_vertex_output_count: u32,
+    /// Exact vertex parameter locations consumed by the linked pixel stage. `None` retains the
+    /// legacy count-based interface; D3D12 supplies `Some` so unused guest exports do not shift
+    /// later DXIL linkage registers.
+    pub required_vertex_output_locations: Option<Vec<u32>>,
     /// Raw `PA_CL_VS_OUT_CNTL` state used to map `EXP POS1..3` onto clip/cull distances and
     /// miscellaneous fixed-function vertex outputs.
     ///
@@ -247,6 +251,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Vertex,
             required_vertex_output_count,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -280,6 +285,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs,
@@ -309,6 +315,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -338,6 +345,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -381,6 +389,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Mesh,
             required_vertex_output_count,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -491,6 +500,134 @@ pub struct MetalRegisterFootprint {
     pub direct_control_flow: bool,
 }
 
+/// D3D12 binding-table ABI emitted with a translated HLSL shader.
+///
+/// Root constant `b0` contains the shader-visible descriptor index of a structured `uint` table.
+/// Word zero selects the initial-SGPR buffer, followed by global-memory descriptors, image
+/// descriptors, and sampler-heap indices. Global memory uses raw UAV descriptors so the same
+/// generated code preserves guest loads, stores, and atomics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HlslBindingLayout {
+    /// Root constants: descriptor-table index, exact dispatch limit XYZ, and base group XYZ.
+    pub root_constant_words: u32,
+    pub binding_table_words: u32,
+    pub global_buffer_count: u32,
+    pub texture_count: u32,
+    pub sampler_count: u32,
+    pub threadgroup_memory_bytes: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HlslShader {
+    pub source: String,
+    pub entry_point: String,
+    pub target_profile: String,
+    pub stage: MetalShaderStage,
+    pub bindings: HlslBindingLayout,
+    pub vertex_inputs: Vec<VertexInputBinding>,
+    pub interpolated_attribute_count: u32,
+    /// Ordered physical `TEXCOORD` locations consumed by a pixel shader.
+    pub interpolated_attribute_locations: Vec<u32>,
+    pub register_footprint: MetalRegisterFootprint,
+}
+
+/// Evaluation state that can change generated HLSL, excluding per-draw resource addresses and
+/// captured bytes. D3D12 backends can use this as a translation-cache key while still uploading
+/// the current evaluation's descriptors and data for every dispatch or draw.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HlslEvaluationKey {
+    initial_scalar_register_count: usize,
+    global_bindings: Vec<HlslGlobalBindingKey>,
+    image_bindings: Vec<HlslImageBindingKey>,
+    image_kinds: Vec<HlslImageKindKey>,
+    texture_count: u32,
+    sampler_count: u32,
+    compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HlslGlobalBindingKey {
+    scalar_address: u32,
+    instruction_pcs: Vec<u32>,
+    writable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HlslImageBindingKey {
+    pc: u32,
+    opcode: Opcode,
+    texture_slot: u32,
+    sampler_slot: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HlslImageKindKey {
+    component: u8,
+    storage: bool,
+    writable: bool,
+    comparison: bool,
+    dimension: u32,
+    texture_type: u32,
+}
+
+impl HlslEvaluationKey {
+    /// Extracts exactly the evaluated resource topology consumed by HLSL generation.
+    #[must_use]
+    pub fn new(evaluation: &ShaderEvaluation) -> Self {
+        let slots = evaluation.image_binding_slots();
+        let image_bindings = evaluation
+            .image_bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| HlslImageBindingKey {
+                pc: binding.pc,
+                opcode: binding.opcode,
+                texture_slot: slots.texture_slots[index],
+                sampler_slot: slots.sampler_slots[index],
+            })
+            .collect();
+        let mut image_kinds = Vec::with_capacity(slots.texture_count as usize);
+        for (index, binding) in evaluation.image_bindings.iter().enumerate() {
+            if slots.texture_slots[index] as usize != image_kinds.len() {
+                continue;
+            }
+            let component = match compiler::image::image_component_type(binding) {
+                "uint" => 1,
+                "int" => 2,
+                _ => 0,
+            };
+            image_kinds.push(HlslImageKindKey {
+                component,
+                storage: compiler::image::is_storage_image(binding.opcode),
+                writable: compiler::image::is_writable_image(binding.opcode),
+                comparison: remu_shader::image_is_comparison(binding.opcode),
+                dimension: binding.control.dimension,
+                texture_type: binding
+                    .resource_descriptor
+                    .get(3)
+                    .map_or(0, |word| (word >> 28) & 0xf),
+            });
+        }
+        Self {
+            initial_scalar_register_count: evaluation.initial_scalar_registers.len(),
+            global_bindings: evaluation
+                .global_memory_bindings
+                .iter()
+                .map(|binding| HlslGlobalBindingKey {
+                    scalar_address: binding.scalar_address,
+                    instruction_pcs: binding.instruction_pcs.iter().copied().collect(),
+                    writable: binding.writable,
+                })
+                .collect(),
+            image_bindings,
+            image_kinds,
+            texture_count: slots.texture_count,
+            sampler_count: slots.sampler_count,
+            compute_system_registers: evaluation.compute_system_registers,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MetalCompileError {
     #[error("shader program is empty")]
@@ -517,6 +654,24 @@ pub fn compile_msl(
     options: &MetalCompileOptions,
 ) -> Result<MetalShader, MetalCompileError> {
     Compiler::new(program, evaluation, options)?.compile()
+}
+
+/// Lowers one decoded Gen5 shader to SM 6.6 HLSL for Direct3D 12.
+///
+/// `threads_per_group` is part of a compute shader's DXIL identity because HLSL declares it in
+/// the entry-point attribute. Graphics callers pass `[1, 1, 1]`.
+///
+/// # Errors
+///
+/// Returns an error for invalid launch dimensions, an interface that cannot be represented by
+/// D3D12, or any guest instruction without exact lowering semantics.
+pub fn compile_hlsl(
+    program: &Program,
+    evaluation: &ShaderEvaluation,
+    options: &MetalCompileOptions,
+    threads_per_group: [u32; 3],
+) -> Result<HlslShader, MetalCompileError> {
+    Compiler::new_hlsl(program, evaluation, options)?.compile_hlsl(threads_per_group)
 }
 
 /// Builds the fixed-function equivalent of the common fused ES/GS rectangle expansion used for

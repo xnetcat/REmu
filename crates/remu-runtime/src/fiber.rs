@@ -280,7 +280,7 @@ unsafe fn switch_to_fiber(fiber: u64, argument_on_run_to: u64, context: *mut Fib
 /// # Safety
 ///
 /// Called only from [`switch::fiber_switch_entry`] with a live thread context.
-pub(crate) unsafe extern "C" fn fiber_force_quit(value: u64) -> ! {
+pub(crate) unsafe extern "sysv64" fn fiber_force_quit(value: u64) -> ! {
     let context = fiber_context();
     assert!(
         !context.is_null(),

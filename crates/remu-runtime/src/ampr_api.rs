@@ -76,7 +76,7 @@ fn ampr_destination_has_write_access(
     let Some(end) = address.checked_add(length_u64) else {
         return false;
     };
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     if let Some(memory) = state.kernel_memory.as_ref() {
         let start = remu_core::GuestAddress::new(address);
         if memory.contains_virtual_address(start) {

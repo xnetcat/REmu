@@ -583,6 +583,47 @@ fn maps_logical_pixel_input_to_physical_vertex_parameter() {
 }
 
 #[test]
+fn hlsl_prunes_unconsumed_vertex_outputs_to_match_pixel_signature() {
+    let mut controls = identity_pixel_input_controls();
+    controls[0] = PixelInputControl::from_register(0);
+    controls[1] = PixelInputControl::from_register(2);
+
+    let mut pixel_options = MetalCompileOptions::pixel(Vec::new(), 1 << 1, 1 << 1);
+    pixel_options.pixel_input_controls = controls;
+    let pixel = compile_hlsl(
+        &Program::new(
+            0x1000,
+            vec![
+                interpolation_instruction(0, 0, 0, 1, 8),
+                interpolation_instruction(4, 1, 0, 1, 9),
+            ],
+        ),
+        &empty_evaluation(),
+        &pixel_options,
+        [1, 1, 1],
+    )
+    .expect("sparse pixel interface should lower to HLSL");
+    assert_eq!(pixel.interpolated_attribute_locations, vec![0, 2]);
+
+    let vertex_program =
+        decode_program(0x1000, &[0xbf81_0000]).expect("minimal vertex program decodes");
+    let mut vertex_options = MetalCompileOptions::vertex(pixel.interpolated_attribute_count);
+    vertex_options.required_vertex_output_locations =
+        Some(pixel.interpolated_attribute_locations.clone());
+    let vertex = compile_hlsl(
+        &vertex_program,
+        &empty_evaluation(),
+        &vertex_options,
+        [1, 1, 1],
+    )
+    .expect("sparse vertex interface should lower to HLSL");
+
+    assert!(vertex.source.contains("float4 param0 : TEXCOORD0;"));
+    assert!(vertex.source.contains("float4 param2 : TEXCOORD2;"));
+    assert!(!vertex.source.contains("TEXCOORD1"));
+}
+
+#[test]
 fn materializes_architectural_pixel_input_default_two() {
     let mut controls = identity_pixel_input_controls();
     controls[0] = PixelInputControl::from_register((1 << 5) | (2 << 8));

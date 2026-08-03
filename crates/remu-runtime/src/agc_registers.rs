@@ -1104,8 +1104,12 @@ pub(crate) enum AgcSubmissionError {
     IndirectDrawAddressOverflow,
     #[error("indirect graphics draw arguments at 0x{0:016X} are not readable")]
     UnreadableIndirectDrawArguments(u64),
-    #[error("indirect graphics draw packet opcode 0x{0:02X} is not implemented")]
-    UnsupportedIndirectDrawPacket(u32),
+    #[error("indirect graphics draw count at 0x{0:016X} is not readable")]
+    UnreadableIndirectDrawCount(u64),
+    #[error("indirect graphics multi-draw count {0} exceeds the safety limit")]
+    IndirectDrawCountTooLarge(u32),
+    #[error("indirect graphics multi-draw stride {0} is not dword aligned")]
+    InvalidIndirectDrawStride(u32),
     #[error("CLEAR_STATE packet has {actual} dwords, expected 2")]
     ClearStatePacketLength { actual: u32 },
     #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]

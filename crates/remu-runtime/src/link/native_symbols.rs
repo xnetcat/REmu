@@ -454,7 +454,7 @@ pub(super) const fn native_import_target(_nid: &str) -> Option<u64> {
     None
 }
 
-extern "C" fn synthetic_data_noop(
+extern "sysv64" fn synthetic_data_noop(
     _argument0: u64,
     _argument1: u64,
     _argument2: u64,

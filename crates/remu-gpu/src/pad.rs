@@ -59,6 +59,14 @@ impl Default for HostPadState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HostPadVibration {
+    /// Low-frequency/large-motor strength in the guest's 0..=255 range.
+    pub large_motor: u8,
+    /// High-frequency/small-motor strength in the guest's 0..=255 range.
+    pub small_motor: u8,
+}
+
 static HOST_PAD_BUTTONS: AtomicU32 = AtomicU32::new(0);
 
 static HOST_PAD_PRESSED_EDGES: AtomicU32 = AtomicU32::new(0);
@@ -66,6 +74,8 @@ static HOST_PAD_PRESSED_EDGES: AtomicU32 = AtomicU32::new(0);
 static HOST_PAD_AXES: AtomicU32 = AtomicU32::new(0x8080_8080);
 
 static HOST_PAD_TRIGGERS: AtomicU32 = AtomicU32::new(0);
+
+static HOST_PAD_VIBRATION: AtomicU32 = AtomicU32::new(0);
 
 pub fn set_host_pad_state(state: HostPadState) {
     let axes = u32::from_le_bytes([state.left_x, state.left_y, state.right_x, state.right_y]);
@@ -100,5 +110,37 @@ pub fn host_pad_state() -> HostPadState {
         right_y,
         l2,
         r2,
+    }
+}
+
+pub fn set_host_pad_vibration(vibration: HostPadVibration) {
+    HOST_PAD_VIBRATION.store(
+        u32::from_le_bytes([vibration.large_motor, vibration.small_motor, 0, 0]),
+        Ordering::Release,
+    );
+}
+
+#[must_use]
+pub fn host_pad_vibration() -> HostPadVibration {
+    let [large_motor, small_motor, _, _] = HOST_PAD_VIBRATION.load(Ordering::Acquire).to_le_bytes();
+    HostPadVibration {
+        large_motor,
+        small_motor,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostPadVibration, host_pad_vibration, set_host_pad_vibration};
+
+    #[test]
+    fn vibration_snapshot_publishes_both_motors_atomically() {
+        let expected = HostPadVibration {
+            large_motor: 0x25,
+            small_motor: 0xd4,
+        };
+        set_host_pad_vibration(expected);
+        assert_eq!(host_pad_vibration(), expected);
+        set_host_pad_vibration(HostPadVibration::default());
     }
 }

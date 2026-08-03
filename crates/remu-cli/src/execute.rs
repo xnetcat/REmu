@@ -4,7 +4,7 @@
 
 use std::path::Path;
 use std::process::ExitCode;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::time::{Duration, Instant};
 
 pub(crate) fn map(path: &Path) -> ExitCode {
@@ -138,20 +138,24 @@ pub(crate) fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> E
 }
 
 pub(crate) fn run_game(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
     {
-        let _ = (path, import_limit, timeout_seconds);
-        eprintln!("error: run requires the macOS Metal presenter");
-        return ExitCode::FAILURE;
+        run_game_native(path, import_limit, timeout_seconds)
     }
     #[cfg(target_os = "macos")]
     {
-        run_game_metal(path, import_limit, timeout_seconds)
+        run_game_native(path, import_limit, timeout_seconds)
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let _ = (path, import_limit, timeout_seconds);
+        eprintln!("error: no native graphics presenter is available on this host");
+        ExitCode::FAILURE
     }
 }
 
-#[cfg(target_os = "macos")]
-fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
+#[cfg(any(target_os = "macos", windows))]
+fn run_game_native(path: &Path, import_limit: usize, timeout_seconds: u32) -> ExitCode {
     remu_gpu::begin_startup_timeline();
     let (linked, module_report) = match load_process_image(path) {
         Ok(process) => process,
@@ -197,7 +201,10 @@ fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> Exi
         result
     });
 
+    #[cfg(target_os = "macos")]
     let presenter_result = remu_gpu_metal::run_presenter(receiver);
+    #[cfg(windows)]
+    let presenter_result = remu_gpu_dx12::run_presenter(receiver);
     remu_gpu::clear_event_sink();
     remu_runtime::report_shader_opcode_coverage();
     if let Err(error) = presenter_result {

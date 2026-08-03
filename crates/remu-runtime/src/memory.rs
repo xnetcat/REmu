@@ -1,14 +1,14 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::atomic::Ordering;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::{Arc, RwLock};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use remu_core::GuestAddress;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestMapPlacement};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use crate::{
     KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION,
     MACOS_GUEST_PAGE_ALIGNMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
@@ -21,7 +21,7 @@ use crate::{
     SCE_KERNEL_ERROR_NOT_FOUND, read_guest_cstring, sce_kernel_error,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_memory_mut(
     state: &mut ProbeDispatchState,
 ) -> Result<&mut kernel_memory::KernelMemory, kernel_memory::KernelMemoryError> {
@@ -34,7 +34,7 @@ fn kernel_memory_mut(
         .expect("kernel memory was initialized immediately above"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn refresh_kernel_memory_readable_ranges(memory: &kernel_memory::KernelMemory) {
     *KERNEL_MEMORY_READABLE_RANGES
         .get_or_init(|| RwLock::new(Arc::from([])))
@@ -44,7 +44,7 @@ fn refresh_kernel_memory_readable_ranges(memory: &kernel_memory::KernelMemory) {
     KERNEL_MEMORY_READABLE_RANGES_GENERATION.fetch_add(1, Ordering::Release);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
     use kernel_memory::KernelMemoryError;
 
@@ -83,7 +83,7 @@ fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
     sce_kernel_error(code)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     const DIRECT_MEMORY_SIZE: u64 = kernel_memory::DIRECT_MEMORY_SIZE;
     let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
@@ -134,7 +134,7 @@ pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispa
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn allocate_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
@@ -145,7 +145,7 @@ pub(crate) fn allocate_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDis
 /// allocators call this before reserving their pool, so the arguments are normalized exactly as
 /// [`allocate_direct_memory`] normalizes its own: whatever this reports, the caller's next
 /// allocation of that span has to succeed.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn available_direct_memory_size(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -198,7 +198,7 @@ pub(crate) fn available_direct_memory_size(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn available_direct_memory_size(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -211,7 +211,7 @@ pub(crate) fn available_direct_memory_size(
 /// Reports how much of the flexible-memory budget the guest has not mapped yet. Engines read this
 /// once to size their own flexible pool and again while mapping into it, so it has to fall as
 /// mappings are made rather than report a fixed total.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn available_flexible_memory_size(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -232,7 +232,7 @@ pub(crate) fn available_flexible_memory_size(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn available_flexible_memory_size(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -240,7 +240,7 @@ pub(crate) fn available_flexible_memory_size(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn allocate_main_direct_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -258,7 +258,7 @@ pub(crate) fn allocate_main_direct_memory(
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn allocate_main_direct_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -266,7 +266,7 @@ pub(crate) fn allocate_main_direct_memory(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn direct_memory_query(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let offset = arguments[0];
     let find_next = arguments[1] & 1 != 0;
@@ -288,17 +288,17 @@ pub(crate) fn direct_memory_query(arguments: [u64; 6], state: &mut ProbeDispatch
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn direct_memory_query(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     map_direct_memory_core(arguments, None, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_direct_memory_2(
     arguments: [u64; 6],
     alignment: u64,
@@ -318,7 +318,7 @@ pub(crate) fn map_direct_memory_2(
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn map_direct_memory_core(
     arguments: [u64; 6],
     memory_type: Option<i32>,
@@ -396,12 +396,12 @@ fn map_direct_memory_core(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_direct_memory_2(
     _arguments: [u64; 6],
     _alignment: u64,
@@ -410,7 +410,7 @@ pub(crate) fn map_direct_memory_2(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_named_flexible_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -440,7 +440,7 @@ pub(crate) fn map_named_flexible_memory(
 /// Shared placement and mapping behavior for every flexible-memory entry point.
 ///
 /// The named, unnamed, and batch forms differ only in how the caller supplies the range name.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_flexible_memory_core(
     output: u64,
     length: u64,
@@ -481,7 +481,7 @@ pub(crate) fn map_flexible_memory_core(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_flexible_memory_core(
     _output: u64,
     _length: u64,
@@ -493,7 +493,7 @@ pub(crate) fn map_flexible_memory_core(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_named_flexible_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -512,12 +512,12 @@ const BATCH_MAP_OPERATION_TYPE_PROTECT: u32 = 4;
 /// `MAP_FIXED`. The single-argument batch entry point always maps at the caller's addresses.
 const KERNEL_MAP_FIXED: u64 = 0x10;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_batch_map(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     kernel_batch_map_core(arguments, KERNEL_MAP_FIXED, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_batch_map_2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     kernel_batch_map_core(arguments, arguments[3], state)
 }
@@ -527,7 +527,7 @@ pub(crate) fn kernel_batch_map_2(arguments: [u64; 6], state: &mut ProbeDispatchS
 /// Each entry is executed in order and the batch stops at the first rejected entry, reporting how
 /// many entries completed. The count is written even when the batch fails, because the guest uses
 /// it to resume or unwind a partially applied batch; only a null output pointer skips it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_batch_map_core(arguments: [u64; 6], flags: u64, state: &mut ProbeDispatchState) -> u64 {
     let (entries, output) = (arguments[0], arguments[2]);
     let count = low_i32(arguments[1]);
@@ -591,18 +591,18 @@ fn kernel_batch_map_core(arguments: [u64; 6], flags: u64, state: &mut ProbeDispa
     result
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_batch_map(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_batch_map_2(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
 /// Reprotects a range and assigns it a new guest memory type in the same operation.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_mtypeprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (address, length) = (arguments[0], arguments[1]);
     let memory_type = low_i32(arguments[2]);
@@ -640,12 +640,12 @@ pub(crate) fn kernel_mtypeprotect(arguments: [u64; 6], state: &mut ProbeDispatch
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_mtypeprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_reserve_virtual_range(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -693,7 +693,7 @@ pub(crate) fn kernel_reserve_virtual_range(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_reserve_virtual_range(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -711,7 +711,7 @@ pub(crate) fn kernel_set_virtual_range_name(arguments: [u64; 6]) -> u64 {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let address = arguments[0];
     let length = arguments[1];
@@ -746,16 +746,33 @@ pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchStat
         let Ok(host_length) = usize::try_from(aligned_length) else {
             return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
         };
-        // SAFETY: The range was page-aligned and bounds-checked against the live process image.
-        let result = unsafe {
-            libc::mprotect(
-                host_address as *mut libc::c_void,
-                host_length,
-                host_protection_from_guest(protection),
-            )
+        #[cfg(target_os = "macos")]
+        let succeeded = {
+            // SAFETY: The range was page-aligned and bounds-checked against the live process image.
+            (unsafe {
+                libc::mprotect(
+                    host_address as *mut libc::c_void,
+                    host_length,
+                    host_protection_from_guest(protection),
+                )
+            }) == 0
+        };
+        #[cfg(windows)]
+        let succeeded = {
+            let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+            // SAFETY: The range was page-aligned and bounds-checked against the live process image.
+            unsafe {
+                windows::Win32::System::Memory::VirtualProtect(
+                    host_address as *const std::ffi::c_void,
+                    host_length,
+                    windows_host_protection_from_guest(protection),
+                    &raw mut old,
+                )
+            }
+            .is_ok()
         };
         drop(reprotection);
-        if result != 0 {
+        if !succeeded {
             return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         }
         if trace_guest_vm() {
@@ -786,7 +803,7 @@ pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchStat
     0
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) const fn process_mapping_contains(
     mapping_start: u64,
     mapping_end: u64,
@@ -815,12 +832,41 @@ pub(crate) const fn host_protection_from_guest(raw: i32) -> i32 {
     protection
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+const fn windows_host_protection_from_guest(
+    raw: i32,
+) -> windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS {
+    use windows::Win32::System::Memory::{
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
+        PAGE_READWRITE,
+    };
+
+    let readable = raw & (0x01 | 0x02 | 0x10) != 0;
+    let writable = raw & (0x02 | 0x20) != 0;
+    let executable = raw & 0x04 != 0;
+    if executable {
+        if writable {
+            PAGE_EXECUTE_READWRITE
+        } else if readable {
+            PAGE_EXECUTE_READ
+        } else {
+            PAGE_EXECUTE
+        }
+    } else if writable {
+        PAGE_READWRITE
+    } else if readable {
+        PAGE_READONLY
+    } else {
+        PAGE_NOACCESS
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_mprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     const VIRTUAL_QUERY_INFO_SIZE: u64 = 72;
     let (query, flags, output, output_size) = (
@@ -867,12 +913,12 @@ pub(crate) fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchSta
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_virtual_query(_arguments: [u64; 6], _state: &ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (address, length) = (arguments[0], arguments[1]);
     if address == 0
@@ -900,12 +946,12 @@ pub(crate) fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState)
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_munmap(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_release_direct_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -913,7 +959,7 @@ pub(crate) fn kernel_release_direct_memory(
     kernel_release_direct_memory_core(arguments, false, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_checked_release_direct_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -921,7 +967,7 @@ pub(crate) fn kernel_checked_release_direct_memory(
     kernel_release_direct_memory_core(arguments, true, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_release_direct_memory_core(
     arguments: [u64; 6],
     checked: bool,
@@ -959,7 +1005,7 @@ fn kernel_release_direct_memory_core(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_release_direct_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -967,7 +1013,7 @@ pub(crate) fn kernel_release_direct_memory(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_checked_release_direct_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,

@@ -11,9 +11,11 @@ use super::shared::{
 };
 use super::{
     AddressSpaceError, CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement,
-    GuestPhysicalBacking, GuestProtection, Vma, VmaKind, align_up, checked_end, host_error,
-    host_pointer, host_size, overlap_error, require_aligned,
+    GuestPhysicalBacking, GuestProtection, Vma, VmaKind, align_up, checked_end, overlap_error,
+    require_aligned,
 };
+#[cfg(target_os = "macos")]
+use super::{host_error, host_pointer, host_size};
 
 impl GuestAddressSpace {
     pub(super) fn validate_allocation(size: u64, alignment: u64) -> Result<(), AddressSpaceError> {
@@ -221,31 +223,38 @@ impl GuestAddressSpace {
         size: u64,
         protection: GuestProtection,
     ) -> Result<(), AddressSpaceError> {
+        #[cfg(windows)]
+        let _ = protection;
         debug_assert!(start >= self.base().get());
         debug_assert!(start.saturating_add(size) <= self.end);
         let _mapping_mutation = begin_shared_mapping_mutation();
         CpuWriteWatch::retire_overlapping(start, size);
-        let pointer = host_pointer(start)?;
-        // SAFETY: Placement validation proves this fixed range lies entirely inside our host
-        // reservation and does not cover another mapped VMA.
-        let result = unsafe {
-            libc::mmap(
-                pointer,
-                host_size(size)?,
-                protection.host_flags(),
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if result == libc::MAP_FAILED {
-            return Err(host_error(
-                "anonymous mapping",
-                start,
-                checked_end(start, size)?,
-            ));
+        #[cfg(target_os = "macos")]
+        {
+            let pointer = host_pointer(start)?;
+            // SAFETY: Placement validation proves this fixed range lies entirely inside our host
+            // reservation and does not cover another mapped VMA.
+            let result = unsafe {
+                libc::mmap(
+                    pointer,
+                    host_size(size)?,
+                    protection.host_flags(),
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if result == libc::MAP_FAILED {
+                return Err(host_error(
+                    "anonymous mapping",
+                    start,
+                    checked_end(start, size)?,
+                ));
+            }
+            debug_assert_eq!(result, pointer);
         }
-        debug_assert_eq!(result, pointer);
+        #[cfg(windows)]
+        self.reservation.restore_placeholder(start, size)?;
         // The fixed anonymous mapping just replaced every byte in the range with zeros without a
         // single byte store; record it so a zero-poisoned crash can name it.
         crate::record_guest_write(crate::GuestWriteSite::MapZero, start, size, &[0], 0);
@@ -271,31 +280,37 @@ impl GuestAddressSpace {
             })
             .collect::<Vec<_>>();
         CpuWriteWatch::retire_overlapping(start, size);
-        let pointer = host_pointer(start)?;
-        let offset = libc::off_t::try_from(backing_offset).map_err(|_| {
-            AddressSpaceError::HostSizeOverflow {
-                value: backing_offset,
+        #[cfg(target_os = "macos")]
+        {
+            let pointer = host_pointer(start)?;
+            let offset = libc::off_t::try_from(backing_offset).map_err(|_| {
+                AddressSpaceError::HostSizeOverflow {
+                    value: backing_offset,
+                }
+            })?;
+            // SAFETY: Placement and backing validation prove both the fixed VA range and file range.
+            let result = unsafe {
+                libc::mmap(
+                    pointer,
+                    host_size(size)?,
+                    protection.host_flags(),
+                    libc::MAP_FIXED | libc::MAP_SHARED,
+                    backing.inner.descriptor,
+                    offset,
+                )
+            };
+            if result == libc::MAP_FAILED {
+                return Err(host_error(
+                    "shared mapping",
+                    start,
+                    checked_end(start, size)?,
+                ));
             }
-        })?;
-        // SAFETY: Placement and backing validation prove both the fixed VA range and file range.
-        let result = unsafe {
-            libc::mmap(
-                pointer,
-                host_size(size)?,
-                protection.host_flags(),
-                libc::MAP_FIXED | libc::MAP_SHARED,
-                backing.inner.descriptor,
-                offset,
-            )
-        };
-        if result == libc::MAP_FAILED {
-            return Err(host_error(
-                "shared mapping",
-                start,
-                checked_end(start, size)?,
-            ));
+            debug_assert_eq!(result, pointer);
         }
-        debug_assert_eq!(result, pointer);
+        #[cfg(windows)]
+        self.reservation
+            .map_shared(start, size, protection, backing, backing_offset)?;
         register_shared_mapping_range(start, size, backing, backing_offset);
         Ok(())
     }

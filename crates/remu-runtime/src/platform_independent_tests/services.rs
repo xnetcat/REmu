@@ -184,9 +184,31 @@ fn pad_get_handle_observes_the_primary_controller_lifecycle() {
         dispatch_probe_import("xk0AcarP3V4", primary, [0; 6], &mut state),
         sce_kernel_error(crate::SCE_PAD_ERROR_ALREADY_OPENED)
     );
+    let vibration = [0x25_u8, 0xd4];
+    assert_eq!(
+        dispatch_probe_import(
+            "yFVnOdGxvZY",
+            [1, vibration.as_ptr().addr() as u64, 0, 0, 0, 0,],
+            [0; 6],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        remu_gpu::host_pad_vibration(),
+        remu_gpu::HostPadVibration {
+            large_motor: 0x25,
+            small_motor: 0xd4,
+        }
+    );
     assert_eq!(
         dispatch_probe_import("6ncge5+l5Qs", [1, 0, 0, 0, 0, 0], [0; 6], &mut state),
         0
+    );
+    assert_eq!(
+        remu_gpu::host_pad_vibration(),
+        remu_gpu::HostPadVibration::default(),
+        "closing the pad must stop host rumble"
     );
     assert_eq!(
         dispatch_probe_import("u1GRHp+oWoY", primary, [0; 6], &mut state),

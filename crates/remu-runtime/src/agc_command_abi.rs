@@ -29,7 +29,9 @@ pub(crate) use self::buffer::{
     track_graphics_command_allocation, track_graphics_submission,
 };
 #[cfg(test)]
-pub(crate) use self::buffer::{graphics_tracking_test_guard, track_graphics_allocation};
+pub(crate) use self::buffer::{
+    graphics_tracking_test_guard, mark_graphics_release_allocation, track_graphics_allocation,
+};
 use self::common::{
     cb_branch, cb_dispatch, cb_nop, cb_release_mem, cb_set_register_range, cb_set_sh_registers,
     type_two_packet,
@@ -110,7 +112,7 @@ const R_RELEASE_MEM: u32 = 0x18;
 const VGT_INDEX_TYPE: u32 = 0x243;
 const MAX_PACKET_DWORDS: u32 = 0x4001;
 
-type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
+type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IndirectRegisterKind {

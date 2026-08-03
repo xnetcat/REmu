@@ -7,9 +7,11 @@ use std::time::Duration;
 use super::{
     AmprCommandBufferState, ProbeDispatchState, SCE_KERNEL_ERROR_NOT_FOUND,
     ampr_command_buffer_write_address_on_completion, ampr_command_buffer_write_kernel_event_queue,
-    ampr_submit_command_buffer, create_ampr_test_file, dispatch_probe_import,
-    kernel_add_ampr_event, read_guest_u32, sce_kernel_error, set_current_guest_thread_pointer,
-    write_guest_u32,
+    ampr_submit_command_buffer, create_ampr_test_file, kernel_add_ampr_event, sce_kernel_error,
+};
+#[cfg(target_os = "macos")]
+use super::{
+    dispatch_probe_import, read_guest_u32, set_current_guest_thread_pointer, write_guest_u32,
 };
 
 #[cfg(target_os = "macos")]

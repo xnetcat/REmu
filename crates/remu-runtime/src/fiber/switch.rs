@@ -30,7 +30,7 @@ use super::{FiberContext, FiberData};
 // unit than its callers, which intermittently left the mangled symbol undefined at link time as
 // unrelated code in this crate shifted partitioning.
 #[unsafe(export_name = "remu_fiber_set_jmp")]
-pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberContext) -> u32 {
+pub(super) unsafe extern "sysv64" fn fiber_set_jmp(_context: *mut FiberContext) -> u32 {
     core::arch::naked_asm!(
         "mov [rdi + 0x00], rax",
         // The return address is the resume point: a later long jump puts it back on the restored
@@ -64,7 +64,7 @@ pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberContext) -> u3
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(export_name = "remu_fiber_long_jmp")]
-pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberContext) -> ! {
+pub(super) unsafe extern "sysv64" fn fiber_long_jmp(_context: *mut FiberContext) -> ! {
     core::arch::naked_asm!(
         // Restore the saved rounding and masking bits while keeping the live exception flags,
         // which are sticky status the resumed code may still be reading.
@@ -110,7 +110,7 @@ pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberContext) -> !
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(export_name = "remu_fiber_switch_entry")]
-pub(super) unsafe extern "C" fn fiber_switch_entry(
+pub(super) unsafe extern "sysv64" fn fiber_switch_entry(
     _data: *const FiberData,
     _set_floating_point: u32,
 ) -> ! {

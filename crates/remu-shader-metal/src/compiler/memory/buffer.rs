@@ -25,6 +25,7 @@ impl Compiler<'_> {
             return Err("MUBUF LDS transfer must encode M0 in VDATA".to_owned());
         }
         if self.options.stage == MetalShaderStage::Vertex
+            && !self.is_hlsl()
             && let Some(input) = self
                 .evaluation
                 .vertex_inputs
@@ -59,6 +60,7 @@ impl Compiler<'_> {
         let binding_length = self.global_binding_length(binding_index);
         let scalar_offset = self.raw_source(instruction, 2)?;
         let vector_index = if self.options.stage == MetalShaderStage::Vertex
+            && !self.is_hlsl()
             && self.options.diagnostic_force_vertex_fetch_id
             && name.starts_with("BufferLoadFormat")
             && control.index_enabled
@@ -249,6 +251,13 @@ impl Compiler<'_> {
 
         if load {
             let (width, signed, d16, high) = raw_load_shape(name)?;
+            let read_only_suffix = if self.is_hlsl()
+                && !self.evaluation.global_memory_bindings[binding_index].writable
+            {
+                "_ro"
+            } else {
+                ""
+            };
             if lds {
                 if !self.is_threadgroup_stage() {
                     return Err("memory-to-LDS transfers require a Metal compute stage".to_owned());
@@ -270,13 +279,13 @@ impl Compiler<'_> {
                 };
                 let loaded = match width {
                     1 => format!(
-                        "remu_load_u8(b{binding_index}, {component_address}, {binding_length})"
+                        "remu_load_u8{read_only_suffix}(b{binding_index}, {component_address}, {binding_length})"
                     ),
                     2 => format!(
-                        "remu_load_u16(b{binding_index}, {component_address}, {binding_length})"
+                        "remu_load_u16{read_only_suffix}(b{binding_index}, {component_address}, {binding_length})"
                     ),
                     4 => format!(
-                        "remu_load_u32(b{binding_index}, {component_address}, {binding_length})"
+                        "remu_load_u32{read_only_suffix}(b{binding_index}, {component_address}, {binding_length})"
                     ),
                     _ => unreachable!("raw load widths are fixed"),
                 };
@@ -455,10 +464,17 @@ impl Compiler<'_> {
                     "remu_format_layout({data_format}, {component}u, {byte_offset}, {bit_offset}, {bits});"
                 ),
             );
+            let load = if self.is_hlsl()
+                && !self.evaluation.global_memory_bindings[binding_index].writable
+            {
+                "remu_load_format_bits_ro"
+            } else {
+                "remu_load_format_bits"
+            };
             let raw = self.temp(
                 "uint",
                 &format!(
-                    "{oob} || {bits} == 0u ? 0u : remu_load_format_bits(b{binding_index}, {address}, {byte_offset}, {bit_offset}, {bits})"
+                    "{oob} || {bits} == 0u ? 0u : {load}(b{binding_index}, {address}, {byte_offset}, {bit_offset}, {bits})"
                 ),
             );
             let missing = if component == 3 {

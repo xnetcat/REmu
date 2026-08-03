@@ -5,6 +5,20 @@
 
 use crate::{process_guest_range_has_read_access, sce_kernel_error, write_guest_bytes};
 
+#[cfg(windows)]
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x2;
+
+#[cfg(windows)]
+#[link(name = "bcrypt")]
+unsafe extern "system" {
+    fn BCryptGenRandom(
+        algorithm: *mut std::ffi::c_void,
+        buffer: *mut u8,
+        byte_count: u32,
+        flags: u32,
+    ) -> i32;
+}
+
 /// Maximum request size accepted by `sceRandomGetRandomNumber`.
 pub(crate) const SCE_RANDOM_MAX_SIZE: usize = 64;
 /// Returned when the buffer is null (with nonzero size) or `size` exceeds [`SCE_RANDOM_MAX_SIZE`].
@@ -50,7 +64,26 @@ fn fill_secure_random(bytes: &mut [u8]) -> Result<(), String> {
         }
         Err(std::io::Error::last_os_error().to_string())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let byte_count = u32::try_from(bytes.len())
+            .map_err(|_| "secure random request is too large".to_owned())?;
+        // SAFETY: the system-preferred provider requires a null algorithm handle and writes at
+        // most byte_count bytes into the live slice.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                byte_count,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status == 0 {
+            return Ok(());
+        }
+        Err(format!("BCryptGenRandom failed with NTSTATUS {status:#x}"))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = bytes;
         Err("secure random is unavailable on this host".to_owned())

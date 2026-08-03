@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use crate::process_guest_range_has_read_access;
 
 const MAX_QUEUED_AUDIO_SECONDS: usize = 2;
+const HOST_AUDIO_RETRY_DELAY: Duration = Duration::from_secs(1);
+const HOST_AUDIO_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 // Thirty-two 256-frame grains cover roughly 170 ms at 48 kHz, enough to ride
 // through the 80-100 ms render stalls seen while Gen5 pipelines compile.
 const AUDIO_PREBUFFER_FRAMES: usize = 8_192;
@@ -427,8 +429,10 @@ struct HostAudio {
     sample_rate: u32,
     channels: usize,
     mixer: Arc<Mutex<AudioMixer>>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     _stream: cpal::Stream,
+    #[cfg(any(target_os = "macos", windows))]
+    rebuild_required: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for HostAudio {
@@ -441,7 +445,7 @@ impl fmt::Debug for HostAudio {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 impl HostAudio {
     fn open() -> Result<Self, String> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -481,6 +485,8 @@ impl HostAudio {
         let mixer = Arc::new(Mutex::new(AudioMixer::default()));
         let callback_mixer = Arc::clone(&mixer);
         DEVICE_CLOCK_LIVE.store(true, Ordering::Release);
+        let rebuild_required = Arc::new(AtomicBool::new(false));
+        let callback_rebuild_required = Arc::clone(&rebuild_required);
         let stream = device
             .build_output_stream(
                 config,
@@ -494,8 +500,16 @@ impl HostAudio {
                         .snapshot_queues();
                     AudioMixer::write_interleaved(&queues, output, channels);
                 },
-                |error| eprintln!("[REMu][AUDIO] host stream error: {error}"),
-                None,
+                move |error| {
+                    let rebuild = stream_error_requires_rebuild(error.kind());
+                    if rebuild {
+                        callback_rebuild_required.store(true, Ordering::Release);
+                    }
+                    eprintln!(
+                        "[REMu][AUDIO] host stream error rebuild_required={rebuild}: {error}"
+                    );
+                },
+                Some(HOST_AUDIO_OPEN_TIMEOUT),
             )
             .map_err(|error| error.to_string())?;
         stream.play().map_err(|error| error.to_string())?;
@@ -504,15 +518,71 @@ impl HostAudio {
             channels,
             mixer,
             _stream: stream,
+            rebuild_required,
         })
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+impl HostAudio {
+    fn requires_rebuild(&self) -> bool {
+        #[cfg(any(target_os = "macos", windows))]
+        {
+            self.rebuild_required.load(Ordering::Acquire)
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            false
+        }
+    }
+}
+
+fn stream_error_requires_rebuild(kind: cpal::ErrorKind) -> bool {
+    !matches!(
+        kind,
+        cpal::ErrorKind::DeviceChanged | cpal::ErrorKind::RealtimeDenied | cpal::ErrorKind::Xrun
+    )
+}
+
+fn route_ports_to_mixer(
+    ports: &mut BTreeMap<i32, AudioPort>,
+    sample_rate: u32,
+    mixer: &Arc<Mutex<AudioMixer>>,
+) {
+    let maximum_queued_frames =
+        usize::try_from(sample_rate).unwrap_or(48_000) * MAX_QUEUED_AUDIO_SECONDS;
+    let mut mixer = mixer
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (&handle, port) in ports {
+        port.resampler = (port.frequency != sample_rate)
+            .then(|| StreamingStereoResampler::new(port.frequency, sample_rate));
+        mixer.add_port(handle, maximum_queued_frames);
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 impl HostAudio {
     fn open() -> Result<Self, String> {
         Err("host audio backend is not implemented on this platform".to_owned())
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostAudioInfo {
+    pub sample_rate: u32,
+    pub channels: usize,
+}
+
+/// Opens, starts, and drops the default output stream without requiring guest audio.
+///
+/// This is intentionally the same path used by `AudioOutState`, so the CLI probe validates the
+/// real CoreAudio or WASAPI configuration rather than merely enumerating an endpoint.
+pub fn probe_host_audio() -> Result<HostAudioInfo, String> {
+    let host = HostAudio::open()?;
+    Ok(HostAudioInfo {
+        sample_rate: host.sample_rate,
+        channels: host.channels,
+    })
 }
 
 #[derive(Debug, Default)]
@@ -523,6 +593,10 @@ pub(crate) struct AudioOutState {
     successful_closes: u64,
     ports: BTreeMap<i32, AudioPort>,
     host: Option<HostAudio>,
+    host_recovery_enabled: bool,
+    host_opened_once: bool,
+    host_retry_after: Option<Instant>,
+    host_reroute_counter: u16,
 }
 
 impl AudioOutState {
@@ -530,6 +604,7 @@ impl AudioOutState {
     pub(crate) fn use_timed_sink_for_test(&mut self) {
         self.initialized = true;
         self.host = None;
+        self.host_recovery_enabled = false;
     }
 
     pub(crate) fn initialize(&mut self) {
@@ -537,16 +612,60 @@ impl AudioOutState {
             return;
         }
         self.initialized = true;
+        self.host_recovery_enabled = true;
+        self.try_open_host_output(Instant::now());
+    }
+
+    fn ensure_host_output(&mut self) {
+        if !self.host_recovery_enabled {
+            return;
+        }
+        if self
+            .host
+            .as_ref()
+            .is_some_and(|host| !host.requires_rebuild())
+        {
+            return;
+        }
+        if self.host.take().is_some() {
+            eprintln!("[REMu][AUDIO] rebuilding invalidated host output stream");
+            self.host_retry_after = None;
+        }
+        let now = Instant::now();
+        if self.host_retry_after.is_some_and(|deadline| now < deadline) {
+            return;
+        }
+        self.try_open_host_output(now);
+    }
+
+    fn try_open_host_output(&mut self, now: Instant) {
         match HostAudio::open() {
             Ok(host) => {
-                eprintln!(
-                    "[REMu][AUDIO] opened host output at {} Hz with {} channels",
-                    host.sample_rate, host.channels
-                );
+                let rerouted = self.host_opened_once;
+                route_ports_to_mixer(&mut self.ports, host.sample_rate, &host.mixer);
                 self.host = Some(host);
+                self.host_retry_after = None;
+                if rerouted {
+                    self.host_reroute_counter = self.host_reroute_counter.saturating_add(1);
+                    let host = self.host.as_ref().expect("host was just installed");
+                    eprintln!(
+                        "[REMu][AUDIO] recovered host output at {} Hz with {} channels reroute={}",
+                        host.sample_rate, host.channels, self.host_reroute_counter
+                    );
+                } else {
+                    let host = self.host.as_ref().expect("host was just installed");
+                    eprintln!(
+                        "[REMu][AUDIO] opened host output at {} Hz with {} channels",
+                        host.sample_rate, host.channels
+                    );
+                }
+                self.host_opened_once = true;
             }
             Err(error) => {
-                eprintln!("[REMu][AUDIO] host output unavailable; using timed sink: {error}");
+                self.host_retry_after = Some(now + HOST_AUDIO_RETRY_DELAY);
+                eprintln!(
+                    "[REMu][AUDIO] host output unavailable; using timed sink and retrying: {error}"
+                );
             }
         }
     }
@@ -577,6 +696,7 @@ impl AudioOutState {
         if !self.initialized {
             return Err(AudioOutError::NotOpened);
         }
+        self.ensure_host_output();
         let user_id = low_i32(arguments[0]);
         let port_type = low_i32(arguments[1]);
         let buffer_frames = low_u32(arguments[3]);
@@ -748,13 +868,14 @@ impl AudioOutState {
         // SceAudioOutPortState (audioout.h:453-461): u16 output route, u8 channel count, reserved
         // byte, i16 volume, u16 reroute counter, u64 flags, two reserved u64s — 0x20 bytes total.
         // The emulated host is a stereo primary route; volume is invalid for primary outputs and
-        // the reroute counter remains zero until the host device actually changes.
+        // the reroute counter changes only after the host stream is rebuilt.
         // SAFETY: the ABI supplies one writable 0x20-byte SceAudioOutPortState object.
         unsafe {
             std::ptr::write_bytes(output as *mut u8, 0, AUDIO_OUT_PORT_STATE_SIZE);
             std::ptr::write_unaligned(output as *mut u16, 1);
             std::ptr::write_unaligned((output + 2) as *mut u8, 2);
             std::ptr::write_unaligned((output + 4) as *mut i16, -1);
+            std::ptr::write_unaligned((output + 6) as *mut u16, self.host_reroute_counter);
         }
         Ok(())
     }
@@ -812,6 +933,7 @@ impl AudioOutState {
         arguments: [u64; 6],
         overflow_policy: HostOverflowPolicy,
     ) -> Result<Duration, AudioOutError> {
+        self.ensure_host_output();
         let handle = low_i32(arguments[0]);
         let source_address = arguments[1];
         if !self.ports.contains_key(&handle) {
@@ -1029,11 +1151,12 @@ mod tests {
         AUDIO_OUT_PORT_STATE_SIZE, AUDIO_PREBUFFER_FRAMES, AudioFormat, AudioMixer, AudioOutError,
         AudioOutState, AudioPort, AudioQueue, MAX_QUEUED_AUDIO_SECONDS, QUEUE_REBUFFERING,
         QUEUE_RUNNING, SampleEncoding, StreamingStereoResampler, advance_device_clock_for_test,
-        decode_stereo_frames, reset_device_clock_for_test,
+        decode_stereo_frames, reset_device_clock_for_test, route_ports_to_mixer,
+        stream_error_requires_rebuild,
     };
     use std::collections::BTreeMap;
-    use std::sync::Arc;
     use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     fn stereo_audio_port() -> AudioPort {
@@ -1160,6 +1283,8 @@ mod tests {
             successful_closes: 0,
             ports,
             host: None,
+            host_reroute_counter: 3,
+            ..AudioOutState::default()
         };
         let mut output = [0xa5_u8; 48];
 
@@ -1171,7 +1296,8 @@ mod tests {
         assert_eq!(u16::from_le_bytes(output[0..2].try_into().unwrap()), 1);
         assert_eq!(output[2], 2);
         assert_eq!(i16::from_le_bytes(output[4..6].try_into().unwrap()), -1);
-        assert_eq!(&output[6..AUDIO_OUT_PORT_STATE_SIZE], &[0; 26]);
+        assert_eq!(u16::from_le_bytes(output[6..8].try_into().unwrap()), 3);
+        assert_eq!(&output[8..AUDIO_OUT_PORT_STATE_SIZE], &[0; 24]);
         assert_eq!(&output[AUDIO_OUT_PORT_STATE_SIZE..], &[0xa5; 16]);
     }
 
@@ -1256,6 +1382,7 @@ mod tests {
             successful_closes: 0,
             ports,
             host: None,
+            ..AudioOutState::default()
         };
         let gains = [0.125_f32, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0];
 
@@ -1264,6 +1391,47 @@ mod tests {
             .expect("the AudioOut2 port owns a live backend port");
 
         assert_eq!(state.ports.get(&1).unwrap().channel_volume, gains);
+    }
+
+    #[test]
+    fn host_stream_error_policy_rebuilds_only_when_the_route_cannot_continue() {
+        for kind in [
+            cpal::ErrorKind::DeviceBusy,
+            cpal::ErrorKind::DeviceNotAvailable,
+            cpal::ErrorKind::HostUnavailable,
+            cpal::ErrorKind::StreamInvalidated,
+            cpal::ErrorKind::BackendError,
+        ] {
+            assert!(stream_error_requires_rebuild(kind), "{kind:?}");
+        }
+        for kind in [
+            cpal::ErrorKind::DeviceChanged,
+            cpal::ErrorKind::RealtimeDenied,
+            cpal::ErrorKind::Xrun,
+        ] {
+            assert!(!stream_error_requires_rebuild(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn recovered_host_rebinds_open_ports_and_retargets_resamplers() {
+        let mut port = stereo_audio_port();
+        port.frequency = 44_100;
+        port.resampler = Some(StreamingStereoResampler::new(44_100, 48_000));
+        let mut ports = BTreeMap::from([(7, port)]);
+        let mixer = Arc::new(Mutex::new(AudioMixer::default()));
+
+        route_ports_to_mixer(&mut ports, 96_000, &mixer);
+
+        let resampler = ports[&7]
+            .resampler
+            .as_ref()
+            .expect("rate mismatch requires a replacement resampler");
+        assert_eq!(resampler.source_rate, 44_100);
+        assert_eq!(resampler.destination_rate, 96_000);
+        let mixer = mixer.lock().unwrap();
+        assert!(mixer.queues.contains_key(&7));
+        assert!(mixer.queues[&7].frames.capacity() >= 96_000 * MAX_QUEUED_AUDIO_SECONDS);
     }
 
     #[test]

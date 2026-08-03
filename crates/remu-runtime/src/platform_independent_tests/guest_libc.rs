@@ -3,10 +3,29 @@
 
 use super::{
     ProbeDispatchState, compare_i32, dispatch_guest_numeric_parser, guest_free,
-    guest_global_locale, guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr,
-    guest_wmemcmp, guest_wmemcpy, guest_wmemmove, low_f32, read_guest_u16, read_guest_u64,
-    sce_kernel_error,
+    guest_global_locale, guest_qsort, guest_snprintf, guest_tolower_table, guest_toupper_table,
+    guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, low_f32, read_guest_u16,
+    read_guest_u64, sce_kernel_error,
 };
+
+#[test]
+fn snprintf_returns_the_full_length_and_terminates_a_truncated_buffer() {
+    let mut destination = [0xaa_u8; 9];
+    let format = c"pool-%s-%04u";
+    let name = c"poppy";
+
+    let result = guest_snprintf([
+        destination.as_mut_ptr().addr() as u64,
+        destination.len() as u64,
+        format.as_ptr().addr() as u64,
+        name.as_ptr().addr() as u64,
+        42,
+        0,
+    ]);
+
+    assert_eq!(result, 15);
+    assert_eq!(&destination, b"pool-pop\0");
+}
 
 #[test]
 fn copies_gen5_wide_characters_as_two_byte_elements() {
@@ -49,7 +68,7 @@ fn exposes_a_stable_dinkumware_global_locale() {
     let vtable = read_guest_u64(locale);
     let retain = read_guest_u64(vtable + 0x10);
     // SAFETY: guest_global_locale installs this exact process-local C ABI function pointer.
-    let retain: extern "C" fn(u64) -> u64 = unsafe {
+    let retain: extern "sysv64" fn(u64) -> u64 = unsafe {
         std::mem::transmute(usize::try_from(retain).expect("function pointer fits usize"))
     };
 

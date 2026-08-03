@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
+#[cfg(target_os = "macos")]
 use std::io;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -167,7 +168,13 @@ impl GuestAddressSpace {
         Self::validate_allocation(size, alignment)?;
         let start = self.resolve_mapping_placement(placement, size, alignment)?;
         let end = checked_end(start, size)?;
+        #[cfg(target_os = "macos")]
         self.map_host_anonymous(start, size, protection)?;
+        #[cfg(windows)]
+        {
+            let backing = GuestPhysicalBacking::new(size)?;
+            self.map_host_shared(start, size, protection, &backing, 0)?;
+        }
         self.remove_metadata_range(start, end);
         self.vmas.insert(
             start,
@@ -395,19 +402,25 @@ impl GuestAddressSpace {
             }
             let _mapping_mutation = shared::begin_shared_mapping_mutation();
             let reprotection = CpuWriteWatch::begin_reprotect_overlapping(sub_start, sub_size);
-            // SAFETY: Validation proves this subrange is claimed inside our host reservation.
-            let result = unsafe {
-                libc::mprotect(
-                    host_pointer(sub_start)?,
-                    host_size(sub_size)?,
-                    protection.host_flags(),
-                )
-            };
-            drop(reprotection);
-            if result != 0 {
-                self.normalize();
-                return Err(host_error("protection change", sub_start, sub_end));
+            #[cfg(target_os = "macos")]
+            {
+                // SAFETY: Validation proves this subrange is claimed inside our host reservation.
+                let result = unsafe {
+                    libc::mprotect(
+                        host_pointer(sub_start)?,
+                        host_size(sub_size)?,
+                        protection.host_flags(),
+                    )
+                };
+                if result != 0 {
+                    self.normalize();
+                    return Err(host_error("protection change", sub_start, sub_end));
+                }
             }
+            #[cfg(windows)]
+            self.reservation
+                .protect_mapped(sub_start, sub_size, protection)?;
+            drop(reprotection);
             if let Some(vma) = self.vmas.get_mut(&sub_start) {
                 vma.protection = protection;
             }
@@ -545,13 +558,20 @@ fn validate_space_size(size: u64) -> Result<(), AddressSpaceError> {
 }
 
 fn host_page_size() -> Result<u64, AddressSpaceError> {
-    // SAFETY: sysconf has no pointer preconditions.
-    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let size = u64::try_from(raw).map_err(|_| AddressSpaceError::InvalidHostPageSize)?;
-    if !size.is_power_of_two() {
-        return Err(AddressSpaceError::InvalidHostPageSize);
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: sysconf has no pointer preconditions.
+        let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let size = u64::try_from(raw).map_err(|_| AddressSpaceError::InvalidHostPageSize)?;
+        if !size.is_power_of_two() {
+            return Err(AddressSpaceError::InvalidHostPageSize);
+        }
+        Ok(size)
     }
-    Ok(size)
+    #[cfg(windows)]
+    {
+        Ok(4096)
+    }
 }
 
 fn next_mapping_id() -> u64 {
@@ -613,6 +633,7 @@ fn overlap_error(start: u64, end: u64, vma: &Vma) -> AddressSpaceError {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn host_error(operation: &'static str, start: u64, end: u64) -> AddressSpaceError {
     AddressSpaceError::HostOperationFailed {
         operation,

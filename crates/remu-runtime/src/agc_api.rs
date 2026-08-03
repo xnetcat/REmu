@@ -94,6 +94,7 @@ pub(crate) const AGC_IT_DRAW_INDEX_INDIRECT: u32 = 0x25;
 pub(crate) const AGC_IT_INDEX_BASE: u32 = 0x26;
 pub(crate) const AGC_IT_DRAW_INDEX_2: u32 = 0x27;
 pub(crate) const AGC_IT_INDEX_TYPE: u32 = 0x2a;
+pub(crate) const AGC_IT_DRAW_INDIRECT_MULTI: u32 = 0x2c;
 pub(crate) const AGC_IT_DRAW_INDEX_AUTO: u32 = 0x2d;
 pub(crate) const AGC_IT_NUM_INSTANCES: u32 = 0x2f;
 pub(crate) const AGC_IT_DRAW_INDEX_OFFSET: u32 = 0x35;

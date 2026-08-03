@@ -534,6 +534,11 @@ fn bounds_runtime_vertex_buffers_to_the_draws_referenced_records() {
     assert!(evaluation.vertex_inputs.is_empty());
     assert_eq!(evaluation.global_memory_bindings.len(), 1);
     assert_eq!(evaluation.global_memory_bindings[0].data.len(), 96);
+    assert!(!evaluation.global_memory_bindings[0].writable);
+    assert!(
+        !evaluation.global_memory_bindings[0].write_back_to_guest,
+        "a live read-only buffer must not force backend readback"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------

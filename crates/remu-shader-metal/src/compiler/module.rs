@@ -787,7 +787,7 @@ pub(crate) fn contains_register_reference(source: &str, kind: char, register: u3
     })
 }
 
-fn scalarize_register_state(
+pub(crate) fn scalarize_register_state(
     source: &str,
 ) -> Result<(String, RegisterReferences), MetalCompileError> {
     const MARKER: &str = "    /* REMU_REGISTER_STATE */\n";

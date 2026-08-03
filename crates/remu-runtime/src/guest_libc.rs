@@ -343,14 +343,15 @@ pub(crate) fn guest_mspace_create(arguments: [u64; 6], state: &mut ProbeDispatch
         return 0;
     };
     let (base, capacity) = (arguments[1], arguments[2]);
-    let Some(end) = base.checked_add(capacity) else {
+    if base.checked_add(capacity).is_none() {
         return 0;
-    };
+    }
     if base == 0 || capacity == 0 {
         return 0;
     }
     #[cfg(target_os = "macos")]
     {
+        let end = base + capacity;
         let Some(mapping) = state
             .kernel_memory
             .as_ref()

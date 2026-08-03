@@ -396,6 +396,8 @@ pub(crate) fn agc_emit_draw(
         draw_flags,
         future_scanout_target,
         None,
+        None,
+        0,
     );
 }
 
@@ -411,6 +413,8 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
     draw_flags: u32,
     future_scanout_target: Option<AgcVideoOutTarget>,
     indirect_arguments_address: Option<u64>,
+    indirect_count_address: Option<u64>,
+    indirect_draw_index: u32,
 ) {
     if element_count == 0 && indirect_arguments_address.is_none() {
         return;
@@ -481,6 +485,8 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         sequence: graphics.emitted_draws,
         indexed,
         indirect_arguments_address,
+        indirect_count_address,
+        indirect_draw_index,
         instance_count: if indirect_arguments_address.is_some() {
             graphics.instance_count
         } else {
