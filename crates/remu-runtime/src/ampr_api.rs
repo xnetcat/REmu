@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::os::unix::fs::FileExt;
 #[cfg(windows)]
 use std::os::windows::fs::FileExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use remu_shader::GuestMemoryReader;
@@ -375,12 +375,62 @@ pub(crate) fn ampr_command_buffer_reset(
     0
 }
 
-fn ampr_file_id(path: &str) -> u32 {
-    path.as_bytes()
-        .iter()
-        .fold(2_166_136_261_u32, |hash, byte| {
-            (hash ^ u32::from(*byte)).wrapping_mul(16_777_619)
-        })
+/// Upper bound on APR descriptors held open simultaneously (G1).
+///
+/// Sits well under the raised host descriptor budget (`DESCRIPTOR_CEILING = 10240` in `lib.rs`) so
+/// the guest's own open files, sockets, and the emulator's host resources keep their headroom while
+/// the APR cache still keeps the working set of recently-read assets warm.
+pub(crate) const AMPR_MAX_OPEN_HANDLES: usize = 2048;
+
+impl ProbeDispatchState {
+    /// Returns the stable slot identifier for a resolved host path, allocating one on first use.
+    ///
+    /// Identifiers are dense and monotonic from one, so distinct paths never share an identifier —
+    /// the collision the former FNV-32-of-path scheme could produce (serving a different file's
+    /// bytes through a colliding id) is impossible by construction. `None` is returned only if the
+    /// 32-bit identifier space is exhausted, which a single process cannot reach in practice.
+    pub(crate) fn intern_ampr_file_id(&mut self, host_path: &Path) -> Option<u32> {
+        if let Some(id) = self.ampr_file_ids.get(host_path) {
+            return Some(*id);
+        }
+        let id = self.ampr_next_file_id.checked_add(1)?;
+        if id == AMPR_INVALID_FILE_ID {
+            return None;
+        }
+        self.ampr_next_file_id = id;
+        self.ampr_file_ids.insert(host_path.to_owned(), id);
+        Some(id)
+    }
+
+    /// Retains an open APR descriptor, evicting the least-recently-used one past the budget.
+    fn retain_ampr_file_handle(&mut self, file_id: u32, file: Arc<std::fs::File>) {
+        self.retain_ampr_file_handle_within(file_id, file, AMPR_MAX_OPEN_HANDLES);
+    }
+
+    /// Retains a descriptor under an explicit budget so the eviction policy is unit-testable.
+    fn retain_ampr_file_handle_within(
+        &mut self,
+        file_id: u32,
+        file: Arc<std::fs::File>,
+        capacity: usize,
+    ) {
+        self.ampr_handle_order.retain(|id| *id != file_id);
+        self.ampr_file_handles.insert(file_id, file);
+        self.ampr_handle_order.push_back(file_id);
+        while self.ampr_file_handles.len() > capacity.max(1) {
+            let Some(evicted) = self.ampr_handle_order.pop_front() else {
+                break;
+            };
+            self.ampr_file_handles.remove(&evicted);
+        }
+    }
+
+    /// Drops a descriptor and its recency record together so no stale identifier lingers in the
+    /// eviction order after a path remapping.
+    fn forget_ampr_file_handle(&mut self, file_id: u32) {
+        self.ampr_file_handles.remove(&file_id);
+        self.ampr_handle_order.retain(|id| *id != file_id);
+    }
 }
 
 /// Optional outputs and inputs shared by every APR path-resolution entry point.
@@ -708,6 +758,43 @@ mod guest_path_tests {
         assert_eq!(state.ampr_files.get(&file_id), Some(&replacement_path));
         assert!(!state.ampr_file_handles.contains_key(&file_id));
     }
+
+    #[test]
+    fn distinct_paths_receive_dense_sequential_slot_ids() {
+        let mut state = ProbeDispatchState::default();
+        let first = state.intern_ampr_file_id(std::path::Path::new("/host/a.pak"));
+        let second = state.intern_ampr_file_id(std::path::Path::new("/host/b.pak"));
+        let third = state.intern_ampr_file_id(std::path::Path::new("/host/c.pak"));
+        // Dense, monotonic from one: distinct files can never collide, unlike the former hash.
+        assert_eq!((first, second, third), (Some(1), Some(2), Some(3)));
+        // Re-resolving a known path is stable, so a title's retained identifier keeps pointing at
+        // the same file across the whole run.
+        assert_eq!(
+            state.intern_ampr_file_id(std::path::Path::new("/host/a.pak")),
+            Some(1)
+        );
+        assert_eq!(state.ampr_next_file_id, 3);
+    }
+
+    #[test]
+    fn the_handle_cache_evicts_the_least_recently_used_beyond_the_budget() {
+        let file = Arc::new(std::fs::File::open(std::env::current_exe().unwrap()).unwrap());
+        let mut state = ProbeDispatchState::default();
+        state.retain_ampr_file_handle_within(1, file.clone(), 2);
+        state.retain_ampr_file_handle_within(2, file.clone(), 2);
+        state.retain_ampr_file_handle_within(3, file.clone(), 2);
+        // The oldest handle is dropped once the budget is exceeded.
+        assert!(!state.ampr_file_handles.contains_key(&1));
+        assert!(state.ampr_file_handles.contains_key(&2));
+        assert!(state.ampr_file_handles.contains_key(&3));
+
+        // Re-retaining an entry promotes it, so the next eviction takes the genuinely-oldest one.
+        state.retain_ampr_file_handle_within(2, file.clone(), 2);
+        state.retain_ampr_file_handle_within(4, file.clone(), 2);
+        assert!(!state.ampr_file_handles.contains_key(&3));
+        assert!(state.ampr_file_handles.contains_key(&2));
+        assert!(state.ampr_file_handles.contains_key(&4));
+    }
 }
 
 pub(crate) fn ampr_resolve_paths_with_prefix(
@@ -766,7 +853,14 @@ fn ampr_resolve_one_path(
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
-    let file_id = ampr_file_id(guest_path);
+    let Some(file_id) = state.intern_ampr_file_id(&host_path) else {
+        eprintln!(
+            "[REMu][AMPR] resolve exhausted the APR identifier space at guest={guest_path:?} \
+             host={:?}",
+            host_path.display()
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_OUT_OF_MEMORY);
+    };
     ampr_record_resolved_file(state, file_id, host_path.clone());
     if ids != 0 {
         write_guest_u32(ids + index * 4, file_id);
@@ -797,7 +891,7 @@ fn ampr_resolve_one_path(
 fn ampr_record_resolved_file(state: &mut ProbeDispatchState, file_id: u32, host_path: PathBuf) {
     let previous = state.ampr_files.insert(file_id, host_path.clone());
     if previous.as_ref() != Some(&host_path) {
-        state.ampr_file_handles.remove(&file_id);
+        state.forget_ampr_file_handle(file_id);
     }
 }
 
@@ -1107,7 +1201,9 @@ where
 
     let mut state = lock_probe_dispatch_for_write(dispatch);
     for (file_id, file) in files {
-        state.ampr_file_handles.entry(file_id).or_insert(file);
+        // Retain through the LRU cache so the descriptor working set stays bounded under the
+        // raised fd budget; a re-read of a cached file also promotes it here.
+        state.retain_ampr_file_handle(file_id, file);
     }
     let Some(command) = state.ampr_command_buffers.get(&command_buffer) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);

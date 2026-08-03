@@ -434,6 +434,21 @@ struct ProbeDispatchState {
     pthread_keys: BTreeMap<u32, PthreadKeyState>,
     ampr_files: BTreeMap<u32, PathBuf>,
     ampr_file_handles: BTreeMap<u32, Arc<std::fs::File>>,
+    /// Stable slot identifier assigned to each resolved host path (G1).
+    ///
+    /// Replaces the former FNV-32-of-path scheme: two distinct paths could hash to one identifier,
+    /// and a title that held the colliding id then read a different file's bytes. A slot is
+    /// allocated once per distinct host path and reused on every later resolution of that path, so
+    /// distinct files can never share an identifier.
+    ampr_file_ids: BTreeMap<PathBuf, u32>,
+    /// Next unused APR slot identifier. Identifiers are dense and monotonic from one.
+    ampr_next_file_id: u32,
+    /// APR open-handle recency, front = least-recently-used (G1).
+    ///
+    /// The descriptor cache retains one open file per APR read; without a bound it grows to one
+    /// descriptor per file a title has ever read and eventually exhausts the raised fd budget. This
+    /// order evicts the least-recently-used handle once the cache exceeds `AMPR_MAX_OPEN_HANDLES`.
+    ampr_handle_order: VecDeque<u32>,
     ampr_command_buffers: BTreeMap<u64, AmprCommandBufferState>,
     next_apr_submission_id: u32,
     apr_submissions: BTreeSet<u32>,
@@ -2113,6 +2128,9 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .unwrap_or_else(std::sync::PoisonError::into_inner) = KernelFileState::default();
     state.ampr_files.clear();
     state.ampr_file_handles.clear();
+    state.ampr_file_ids.clear();
+    state.ampr_next_file_id = 0;
+    state.ampr_handle_order.clear();
     state.save_root = save_data_root(game_root);
     if let Err(error) = std::fs::create_dir_all(state.save_root.join("download0")) {
         eprintln!(
