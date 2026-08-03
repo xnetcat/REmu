@@ -362,6 +362,47 @@ Q W 457 queue depth changes. RP-end target-address churn (~180 addr/s) remains i
 UE's render-target rotation and cannot be collapsed without incorrect Metal attachment reuse.
 Soft cursor/glow and post-composite sampling past title remain open graphics gaps.
 
+### Host writebacks corrupt recycled guest heap, and the corruption widens with queue depth
+
+The UE title's `MallocBinned3 Corruption Canary was 0x40404040` fatal and its two secondary crash
+faces (poison-pointer SIGSEGV, null-deref in the fatal handler) reproduced in four of six
+120-second runs on 2026-08-03. The guest-write journal (`REMU_GUEST_WRITE_JOURNAL=1`) attributed
+two crashes with write-level certainty: `site=global-writeback-identity` published scattered
+uniform-0x40 runs — DCC fast-clear key bytes, the GPU's own output — into guest ranges the
+allocator had recycled, immediately before the guest dereferenced the pattern.
+
+Two windows exist, and only one is closable at publish time:
+
+- **Guest wrote after capture, before publish.** Closed on 2026-08-03: every writable-global
+  writeback run now publishes only while the destination bytes still equal the capture-time
+  baseline, compared and written under the registry lock. A run the guest has since written is
+  skipped whole and reported (`kept guest bytes over a writable global writeback run`). The
+  glyph-motivated producer-identity publish still lands for untouched pages.
+- **Guest recycles after publish.** Still open, and structural: the journal shows baseline-clean
+  publishes whose target the allocator hands out moments later. A userspace `free()` touches no
+  mapping, so no admission check can see it. The publishes are correctly ordered GPU effects
+  arriving seconds late — the guest frees pooled render targets on a frame-lag heuristic that
+  assumes GPU work retires within frames, and a 350–700-item queue backlog stretches one frame
+  to seconds. The corruption rate is therefore a function of queue depth: the deeper the stall,
+  the wider every free-versus-publish race. The structural fixes are the `GuestRangeLease`
+  design (audit B21) or collapsing the backlog itself; a content-keyed or title-keyed gate is
+  not acceptable.
+
+The texture-writeback family has the same two windows. Its capture-to-publish window is still
+guarded only by generations sampled after the multi-millisecond readback, and the admission
+fingerprint check runs before it; the partial-chunk staleness of `record_content_snapshot`
+makes a publish-time full-baseline check produce false positives, so closing that window needs
+the chunk bookkeeping reworked first.
+
+The load/movie phase this corruption fires in ran at 2–4 FPS with GPU 16–20% on 2026-08-03
+(0.7–0.9 FPS at the 2026-08-02 audit). Its dominant cost is no longer diagnostics: `CB wait`
+was 92–112/s of ~100 command buffers/s — nearly every Metal command buffer is committed by a
+blocked same-queue `WAIT_REG_MEM`, executing the pipeline synchronously one wait at a time.
+Dispatch-lock wait time was ~17% of wall in the same windows. A transient variant of the same
+phase blocks on a cold pipeline compile (`active=3` for two windows) and resolves; the
+permanent-looking "wedge" recorded at `Q W683` was this phase with the guest dying of the
+corruption above before escaping it.
+
 ### The runtime test suite is order-dependent
 
 `cargo test -p remu-runtime --lib` fails intermittently, at roughly a one-in-three rate, in
