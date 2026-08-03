@@ -33,9 +33,10 @@ use metal::{
 };
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
-    CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_backing_identity,
-    read_guest_shared_backing, write_guest_shared_backing_at_identity,
-    write_guest_shared_backing_if_identity,
+    CpuWriteWatch, GuardedBackingWrite, GuestSharedMappingIdentity, GuestWriteSite,
+    guest_shared_backing_identity, read_guest_shared_backing,
+    write_guest_shared_backing_at_identity_with_baseline,
+    write_guest_shared_backing_if_identity_and_baseline,
 };
 use remu_shader::ShaderEvaluation;
 use std::io::ErrorKind;
@@ -44,6 +45,20 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static DISCARDED_STALE_GLOBAL_WRITEBACKS: AtomicUsize = AtomicUsize::new(0);
+static KEPT_GUEST_BYTES_WRITEBACK_RUNS: AtomicUsize = AtomicUsize::new(0);
+
+/// Reports a changed run left untouched because the guest wrote inside it after the capture.
+///
+/// This is the loud form of the continuity guard: a writeback that yields to newer guest bytes
+/// trades corruption for at-worst stale GPU output, and the trade must stay visible.
+fn trace_kept_guest_bytes_over_writeback(address: u64, byte_count: usize, mode: &str) {
+    let sequence = KEPT_GUEST_BYTES_WRITEBACK_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL] kept guest bytes over a writable global writeback run sequence={sequence} mode={mode} address={address:#x} bytes={byte_count}: the guest wrote inside the range after capture"
+        );
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum GuestBatchSettlement {
@@ -2395,75 +2410,107 @@ fn write_changed_global_ranges_with(
         };
         let byte_count = u64::try_from(cursor - start)
             .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
-        let published = match mode {
-            GlobalWritePublishMode::RequireLiveVa => write_guest_shared_backing_if_identity(
-                address,
-                range_identity,
-                &current_bytes[start..cursor],
-            ),
+        let source = &current_bytes[start..cursor];
+        let baseline = &original_bytes[start..cursor];
+        let outcome = match mode {
+            GlobalWritePublishMode::RequireLiveVa => {
+                write_guest_shared_backing_if_identity_and_baseline(
+                    address,
+                    range_identity,
+                    baseline,
+                    source,
+                )
+            }
             GlobalWritePublishMode::ProducerIdentity => {
                 trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
-                write_guest_shared_backing_at_identity(
+                write_guest_shared_backing_at_identity_with_baseline(
                     range_identity,
-                    &current_bytes[start..cursor],
+                    baseline,
+                    source,
                 )
             }
         };
-        if published {
-            journal_guest_write(
-                match mode {
-                    GlobalWritePublishMode::RequireLiveVa => GuestWriteSite::GlobalWriteback,
-                    GlobalWritePublishMode::ProducerIdentity => {
-                        GuestWriteSite::GlobalWritebackIdentity
+        match outcome {
+            GuardedBackingWrite::Applied => {
+                journal_guest_write(
+                    match mode {
+                        GlobalWritePublishMode::RequireLiveVa => GuestWriteSite::GlobalWriteback,
+                        GlobalWritePublishMode::ProducerIdentity => {
+                            GuestWriteSite::GlobalWritebackIdentity
+                        }
+                    },
+                    address,
+                    byte_count,
+                    source,
+                );
+            }
+            GuardedBackingWrite::GuestModified => {
+                trace_kept_guest_bytes_over_writeback(
+                    address,
+                    cursor - start,
+                    match mode {
+                        GlobalWritePublishMode::RequireLiveVa => "live-va",
+                        GlobalWritePublishMode::ProducerIdentity => "producer-identity",
+                    },
+                );
+            }
+            GuardedBackingWrite::Unavailable => {
+                let current = guest_shared_backing_identity(address, byte_count);
+                if matches!(mode, GlobalWritePublishMode::RequireLiveVa)
+                    && current != Some(range_identity)
+                {
+                    // VA moved mid-publish; fall back to the captured producer pages, still
+                    // yielding to any guest store that landed after the capture.
+                    trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
+                    match write_guest_shared_backing_at_identity_with_baseline(
+                        range_identity,
+                        baseline,
+                        source,
+                    ) {
+                        GuardedBackingWrite::Applied => {
+                            journal_guest_write(
+                                GuestWriteSite::GlobalWritebackIdentity,
+                                address,
+                                byte_count,
+                                source,
+                            );
+                            continue;
+                        }
+                        GuardedBackingWrite::GuestModified => {
+                            trace_kept_guest_bytes_over_writeback(
+                                address,
+                                cursor - start,
+                                "va-moved-fallback",
+                            );
+                            continue;
+                        }
+                        GuardedBackingWrite::Unavailable => {
+                            trace_discarded_stale_global_writeback(
+                                address,
+                                cursor - start,
+                                "during completion",
+                                range_identity,
+                                current,
+                            );
+                            return Ok(GlobalWritebackOutcome::DiscardedStale);
+                        }
                     }
-                },
-                address,
-                byte_count,
-                &current_bytes[start..cursor],
-            );
-        }
-        if !published {
-            let current = guest_shared_backing_identity(address, byte_count);
-            if matches!(mode, GlobalWritePublishMode::RequireLiveVa)
-                && current != Some(range_identity)
-            {
-                // VA moved mid-publish; fall back to the captured producer pages.
-                trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
-                if write_guest_shared_backing_at_identity(
-                    range_identity,
-                    &current_bytes[start..cursor],
-                ) {
-                    journal_guest_write(
-                        GuestWriteSite::GlobalWritebackIdentity,
-                        address,
-                        byte_count,
-                        &current_bytes[start..cursor],
-                    );
-                    continue;
                 }
-                trace_discarded_stale_global_writeback(
-                    address,
-                    cursor - start,
-                    "during completion",
-                    range_identity,
-                    current,
-                );
-                return Ok(GlobalWritebackOutcome::DiscardedStale);
+                if matches!(mode, GlobalWritePublishMode::ProducerIdentity) {
+                    trace_discarded_stale_global_writeback(
+                        address,
+                        cursor - start,
+                        "producer identity unavailable",
+                        range_identity,
+                        current,
+                    );
+                    return Ok(GlobalWritebackOutcome::DiscardedStale);
+                }
+                return Err(format!(
+                    "writable global buffer backing write failed address={address:#x} bytes={} identity={range_identity:?}",
+                    cursor - start
+                ));
             }
-            if matches!(mode, GlobalWritePublishMode::ProducerIdentity) {
-                trace_discarded_stale_global_writeback(
-                    address,
-                    cursor - start,
-                    "producer identity unavailable",
-                    range_identity,
-                    current,
-                );
-                return Ok(GlobalWritebackOutcome::DiscardedStale);
-            }
-            return Err(format!(
-                "writable global buffer backing write failed address={address:#x} bytes={} identity={range_identity:?}",
-                cursor - start
-            ));
         }
     }
     Ok(GlobalWritebackOutcome::Applied)
@@ -2529,6 +2576,19 @@ fn write_changed_global_ranges_direct(
             cursor += 1;
         }
         if start == cursor {
+            continue;
+        }
+        // SAFETY: Production holds the mapping's CpuWriteWatch registry lock across this read and
+        // copy. Unit tests keep their local destination allocation alive for the whole call.
+        let guest_now = unsafe {
+            std::slice::from_raw_parts((destination as *const u8).add(start), cursor - start)
+        };
+        if guest_now != &original_bytes[start..cursor] {
+            trace_kept_guest_bytes_over_writeback(
+                writeback.guest_address.wrapping_add(start as u64),
+                cursor - start,
+                "anonymous",
+            );
             continue;
         }
         // SAFETY: Production holds the mapping's CpuWriteWatch registry lock across this copy.

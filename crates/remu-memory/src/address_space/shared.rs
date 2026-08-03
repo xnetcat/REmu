@@ -683,6 +683,123 @@ pub fn write_guest_shared_backing_at_identity(
     backing.write_all_at(identity.backing_offset, source)
 }
 
+/// Outcome of a baseline-guarded backing publication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GuardedBackingWrite {
+    /// The backing bytes still matched the capture-time baseline and the source was published.
+    Applied,
+    /// The guest wrote inside the range after the baseline was captured; nothing was written.
+    GuestModified,
+    /// The range could not be resolved: identity moved, backing gone, or coverage lost.
+    Unavailable,
+}
+
+/// Publishes `source` only while the backing bytes still equal `baseline`.
+///
+/// The backing holds the truth for every alias, so a byte that no longer matches the
+/// capture-time baseline was authored by the guest (or an ordered command-processor effect)
+/// after the capture. Overwriting it would revert a store the owner has already relied on —
+/// the recorded MallocBinned3 0x40-poison corruption. The caller holds the registry lock, so
+/// the comparison and the write cannot interleave with a remap.
+fn guarded_backing_write(
+    backing: &GuestPhysicalBacking,
+    offset: u64,
+    baseline: &[u8],
+    source: &[u8],
+) -> GuardedBackingWrite {
+    debug_assert_eq!(baseline.len(), source.len());
+    let mut current = vec![0_u8; baseline.len()];
+    if !backing.read_exact_at(offset, &mut current) {
+        return GuardedBackingWrite::Unavailable;
+    }
+    if current != baseline {
+        return GuardedBackingWrite::GuestModified;
+    }
+    if backing.write_all_at(offset, source) {
+        GuardedBackingWrite::Applied
+    } else {
+        GuardedBackingWrite::Unavailable
+    }
+}
+
+/// Baseline-guarded form of [`write_guest_shared_backing_if_identity`].
+pub fn write_guest_shared_backing_if_identity_and_baseline(
+    address: u64,
+    expected: GuestSharedMappingIdentity,
+    baseline: &[u8],
+    source: &[u8],
+) -> GuardedBackingWrite {
+    let Ok(byte_count) = u64::try_from(source.len()) else {
+        return GuardedBackingWrite::Unavailable;
+    };
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
+    else {
+        return GuardedBackingWrite::Unavailable;
+    };
+    if backing.id() != expected.backing_id || offset != expected.backing_offset {
+        return GuardedBackingWrite::Unavailable;
+    }
+    guarded_backing_write(&backing, offset, baseline, source)
+}
+
+/// Baseline-guarded form of [`write_guest_shared_backing_at_identity`].
+///
+/// The same two licence bounds apply — a physically keyed backing and full live-mapping
+/// coverage — and on top of them the capture-time baseline must still match, so a recycled
+/// allocation the guest has since written is left exactly as the guest left it.
+pub fn write_guest_shared_backing_at_identity_with_baseline(
+    identity: GuestSharedMappingIdentity,
+    baseline: &[u8],
+    source: &[u8],
+) -> GuardedBackingWrite {
+    let Ok(byte_count) = u64::try_from(source.len()) else {
+        return GuardedBackingWrite::Unavailable;
+    };
+    if byte_count == 0 {
+        return GuardedBackingWrite::Unavailable;
+    }
+    let Some(end) = identity.backing_offset.checked_add(byte_count) else {
+        return GuardedBackingWrite::Unavailable;
+    };
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(backing) = mappings
+        .values()
+        .find(|record| record.backing.id() == identity.backing_id)
+        .map(|record| record.backing.clone())
+    else {
+        trace_refused_identity_write(
+            &mappings,
+            identity,
+            byte_count,
+            "backing has no live mapping",
+        );
+        return GuardedBackingWrite::Unavailable;
+    };
+    if backing.is_virtually_keyed() {
+        trace_refused_identity_write(&mappings, identity, byte_count, "virtually keyed backing");
+        return GuardedBackingWrite::Unavailable;
+    }
+    if end > backing.size() {
+        trace_refused_identity_write(&mappings, identity, byte_count, "range exceeds backing");
+        return GuardedBackingWrite::Unavailable;
+    }
+    if !identity_range_is_live(&mappings, identity.backing_id, identity.backing_offset, end) {
+        trace_refused_identity_write(
+            &mappings,
+            identity,
+            byte_count,
+            "no live mapping covers the range",
+        );
+        return GuardedBackingWrite::Unavailable;
+    }
+    guarded_backing_write(&backing, identity.backing_offset, baseline, source)
+}
+
 /// Reports whether live records cover every byte of a physical interval in one backing.
 fn identity_range_is_live(
     mappings: &BTreeMap<u64, SharedMappingRecord>,

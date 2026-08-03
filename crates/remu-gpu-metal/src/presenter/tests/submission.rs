@@ -1352,6 +1352,224 @@ fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
 }
 
 #[test]
+fn exact_writeback_skips_runs_the_guest_wrote_after_capture() {
+    // The MallocBinned3 recycling shape: the guest hands a direct-memory range to its allocator
+    // while a captured writeback is still draining, then stores live heap structures there. The
+    // publication must leave every changed run the guest has since written exactly as the guest
+    // left it — a run is skipped whole, because byte-wise merging could recompose half a guest
+    // pointer out of stale GPU bytes.
+    let mut address_space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base.checked_add(2 * GUEST_PAGE_SIZE).unwrap()),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let binding_address = producer_alias.get() + 64;
+    let binding_byte_count = 16_usize;
+    // SAFETY: the producer alias remains mapped read/write for the staged upload.
+    unsafe {
+        std::ptr::write_bytes(binding_address as *mut u8, 0x11, binding_byte_count);
+    }
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: binding_address,
+        instruction_pcs: Default::default(),
+        byte_count: binding_byte_count,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("writable alias uses staged storage");
+    let evaluation = evaluation_with_global(binding);
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("exact staged writeback is captured");
+    assert_eq!(pending.len(), 1);
+
+    // The guest recycles the first half of the range after the capture...
+    let observer_binding = observer_alias.get() + 64;
+    // SAFETY: the observer alias remains mapped and shares the physical backing.
+    unsafe {
+        std::ptr::write_bytes(observer_binding as *mut u8, 0x77, 8);
+    }
+    // ...while the GPU writes the whole range.
+    // SAFETY: the exact shared buffer is binding_byte_count bytes long and retained by `uploaded`.
+    unsafe {
+        std::ptr::write_bytes(
+            uploaded.buffer.contents().cast::<u8>(),
+            0x5a,
+            binding_byte_count,
+        );
+    }
+    write_back_pending_globals(&pending).expect("guarded writeback completes");
+
+    // SAFETY: the observer alias remains mapped for the assertions.
+    unsafe {
+        for offset in 0..8_u64 {
+            assert_eq!(
+                ((observer_binding + offset) as *const u8).read(),
+                0x77,
+                "a guest store after capture owns its bytes"
+            );
+        }
+        for offset in 8..16_u64 {
+            assert_eq!(
+                ((observer_binding + offset) as *const u8).read(),
+                0x11,
+                "a guest-modified changed run is skipped whole, not byte-merged"
+            );
+        }
+    }
+}
+
+#[test]
+fn remapped_writeback_skips_guest_recycled_physical_pages() {
+    // Same as remapped_exact_writable_writeback_publishes_to_producer_physical_pages, except the
+    // guest also stores to the producer physical pages after the capture. Publishing by producer
+    // identity must then yield to the guest bytes instead of splatting stale GPU output over a
+    // live allocation — the recorded 0x40-poison crash mechanism.
+    let mut address_space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let binding_address = producer_alias.get() + 64;
+    let binding_byte_count = 16_usize;
+    // SAFETY: the producer alias remains mapped read/write for the staged upload.
+    unsafe {
+        std::ptr::write_bytes(binding_address as *mut u8, 0x11, binding_byte_count);
+    }
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+    let binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: binding_address,
+        instruction_pcs: Default::default(),
+        byte_count: binding_byte_count,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let uploaded = presenter
+        .upload_global_buffer(&device, &binding)
+        .expect("writable upload stages exact storage");
+    let producer_identity = uploaded
+        .physical_identity
+        .expect("staged writable upload captures producer identity");
+
+    address_space
+        .unmap(producer_alias, GUEST_PAGE_SIZE)
+        .unwrap();
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(producer_alias),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+    assert_ne!(
+        guest_shared_backing_identity(binding_address, u64::try_from(binding_byte_count).unwrap()),
+        Some(producer_identity)
+    );
+
+    let evaluation = evaluation_with_global(binding);
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&uploaded), &evaluation, &mut pending)
+        .expect("exact staged writeback is captured");
+
+    // The guest allocator recycles the producer physical pages and stores live data there.
+    let observer_binding = observer_alias.get() + 64;
+    // SAFETY: the observer alias still maps the original producer physical page.
+    unsafe {
+        std::ptr::write_bytes(observer_binding as *mut u8, 0x77, 8);
+    }
+    // SAFETY: the exact shared buffer is binding_byte_count bytes long and retained by `uploaded`.
+    unsafe {
+        std::ptr::write_bytes(
+            uploaded.buffer.contents().cast::<u8>(),
+            0x5a,
+            binding_byte_count,
+        );
+    }
+    write_back_pending_globals(&pending).expect("guarded identity writeback completes");
+
+    // SAFETY: the observer alias remains mapped for the assertions.
+    unsafe {
+        for offset in 0..8_u64 {
+            assert_eq!(
+                ((observer_binding + offset) as *const u8).read(),
+                0x77,
+                "guest stores onto recycled producer pages survive the identity publish"
+            );
+        }
+        for offset in 8..16_u64 {
+            assert_eq!(
+                ((observer_binding + offset) as *const u8).read(),
+                0x11,
+                "a guest-modified changed run is skipped whole in identity mode too"
+            );
+        }
+    }
+}
+
+#[test]
 fn queued_zero_copy_writer_stages_writable_alias_across_shifted_aliases_and_eviction() {
     let mut address_space = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).unwrap();
     let base = address_space.base();
@@ -2441,6 +2659,39 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
 
 #[test]
 fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
+    // Byte 0: the CPU wrote 7 after capture and the GPU left it alone — preserved.
+    // Bytes 1 and 3: the GPU changed them and the CPU never touched them — published.
+    // Byte 2: neither side changed it — untouched.
+    let device = Device::system_default().expect("Metal device");
+    let buffer = device.new_buffer_with_data(
+        [1_u8, 9, 3, 8].as_ptr().cast(),
+        4,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let mut destination = [7_u8, 2, 3, 4];
+    let guest_address =
+        u64::try_from(destination.as_mut_ptr() as usize).expect("host pointer fits u64");
+
+    write_back_pending_globals(&[PendingGlobalWriteback {
+        buffer,
+        offset: 0,
+        guest_address,
+        byte_count: destination.len(),
+        mapping_identity: None,
+        write_watch: None,
+        original_bytes: vec![1, 2, 3, 4],
+        original_version: None,
+    }])
+    .expect("changed global bytes write back");
+
+    assert_eq!(destination, [7, 9, 3, 8]);
+}
+
+#[test]
+fn global_writeback_yields_changed_runs_to_newer_cpu_stores() {
+    // The continuity guard: a run the GPU changed is published only while the guest bytes still
+    // match the capture-time baseline. A guest store after capture — heap recycling — owns its
+    // bytes, and the whole run is skipped rather than byte-merged.
     let device = Device::system_default().expect("Metal device");
     let buffer = device.new_buffer_with_data(
         [1_u8, 9, 3, 8].as_ptr().cast(),
@@ -2461,9 +2712,9 @@ fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
         original_bytes: vec![1, 2, 3, 4],
         original_version: None,
     }])
-    .expect("changed global bytes write back");
+    .expect("guarded writeback completes");
 
-    assert_eq!(destination, [7, 9, 7, 8]);
+    assert_eq!(destination, [7, 7, 7, 7]);
 }
 
 #[test]
