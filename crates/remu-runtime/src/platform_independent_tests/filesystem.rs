@@ -60,10 +60,13 @@ fn resolves_duplicate_console_path_separators() {
 #[test]
 fn resolves_persistent_download_mount_without_allowing_escape() {
     let temporary = TemporaryTestDirectory::new("download0-mount");
-    let state = ProbeDispatchState {
+    let mut state = ProbeDispatchState {
         save_root: temporary.path.clone(),
         ..ProbeDispatchState::default()
     };
+    state
+        .vfs
+        .rebuild_static_mounts(Path::new("/game"), &temporary.path);
     let root = temporary.path.join("download0");
     std::fs::create_dir_all(&root).unwrap();
 
@@ -218,28 +221,44 @@ fn matches_save_data_wildcards_case_insensitively() {
 #[test]
 fn temporary_app_content_mount_is_not_a_save_data_slot() {
     let temporary = TemporaryTestDirectory::new("savedata-temp-mount");
-    let state = ProbeDispatchState {
+    let mut state = ProbeDispatchState {
         save_root: temporary.path.clone(),
         ..ProbeDispatchState::default()
     };
+    state
+        .vfs
+        .rebuild_static_mounts(Path::new("/game"), &temporary.path);
     let mut mount_point = [0_u8; 16];
 
     assert_eq!(
         crate::app_content_temporary_data_mount(
             [0, mount_point.as_mut_ptr().addr() as u64, 0, 0, 0, 0],
-            &state,
+            &mut state,
         ),
         0
     );
     assert_eq!(&mount_point[..7], b"/temp0\0");
     assert!(temporary.path.join("temp0").is_dir());
+    assert_eq!(
+        resolve_probe_guest_path(&state, "/temp0/scratch.bin"),
+        Some((temporary.path.join("temp0/scratch.bin"), true)),
+        "/temp0 must resolve through the VfsMount table after TemporaryDataMount2"
+    );
     // `/download0` shares the flat save root, so a search must not report it as a save slot.
     std::fs::create_dir_all(temporary.path.join("download0")).unwrap();
+    std::fs::create_dir_all(crate::vfs::save_data_slots_root(&temporary.path)).unwrap();
+    assert_eq!(
+        crate::enumerate_save_data_entries(&crate::vfs::save_data_slots_root(&temporary.path), "")
+            .unwrap()
+            .len(),
+        0
+    );
     assert_eq!(
         crate::enumerate_save_data_entries(&temporary.path, "")
             .unwrap()
             .len(),
-        0
+        0,
+        "flat save_root enumeration must still skip download0/temp0"
     );
 }
 
@@ -307,7 +326,7 @@ fn deletes_only_unmounted_save_data_slots() {
         save_data_initialized: true,
         ..ProbeDispatchState::default()
     };
-    let slot = state.save_root.join("SAVEDATA00");
+    let slot = crate::vfs::save_data_slots_root(&state.save_root).join("SAVEDATA00");
     std::fs::create_dir_all(&slot).unwrap();
     std::fs::write(slot.join("save.bin"), b"data").unwrap();
 
@@ -435,7 +454,8 @@ fn persists_and_searches_transactional_save_data() {
         0
     );
 
-    let committed_param = state.save_root.join("SAVEDATA00/sce_sys/param.bin");
+    let committed_param = crate::vfs::save_data_slots_root(&state.save_root)
+        .join("SAVEDATA00/sce_sys/param.bin");
     assert_ne!(
         &std::fs::read(&committed_param).unwrap()[..14],
         b"Save Metadata\0"
@@ -458,7 +478,10 @@ fn persists_and_searches_transactional_save_data() {
         b"Save Metadata\0"
     );
     assert_eq!(
-        std::fs::read(state.save_root.join("SAVEDATA00/sce_sys/icon0.png")).unwrap(),
+        std::fs::read(
+            crate::vfs::save_data_slots_root(&state.save_root).join("SAVEDATA00/sce_sys/icon0.png")
+        )
+        .unwrap(),
         icon_bytes
     );
 
@@ -525,7 +548,8 @@ fn persists_and_searches_transactional_save_data() {
         ),
         0
     );
-    let committed_by_umount = state.save_root.join("SAVEDATA00/committed-by-umount.bin");
+    let committed_by_umount = crate::vfs::save_data_slots_root(&state.save_root)
+        .join("SAVEDATA00/committed-by-umount.bin");
     let staging_file = resolve_probe_guest_path(&state, "/savedata0/committed-by-umount.bin")
         .unwrap()
         .0;

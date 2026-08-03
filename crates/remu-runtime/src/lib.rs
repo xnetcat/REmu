@@ -46,11 +46,13 @@ mod pthread;
 mod random;
 mod rtld_atexit;
 mod save_data;
+mod savedata_journal;
 mod sha_ni;
 mod shader_cache;
 mod shader_eval;
 mod tls;
 mod unwind;
+mod vfs;
 mod video_out;
 mod videodec2;
 
@@ -510,6 +512,8 @@ struct ProbeDispatchState {
     pending_agc_user_interrupts: VecDeque<u64>,
     agc_completion_telemetry: AgcCompletionTelemetry,
     save_root: PathBuf,
+    /// Guest mount table for `/app0`, `/download0`, `/temp0`, and (later) save slots (G2).
+    vfs: vfs::VfsState,
     save_data_initialized: bool,
     save_mounts: BTreeMap<String, SaveDataMount>,
     next_save_transaction_resource: u32,
@@ -1039,20 +1043,20 @@ enum SplashState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SaveDataMount {
-    path: PathBuf,
-    committed_path: PathBuf,
-    dir_name: String,
-    user_id: i32,
-    resource: u32,
-    read_only: bool,
+pub(crate) struct SaveDataMount {
+    pub(crate) path: PathBuf,
+    pub(crate) committed_path: PathBuf,
+    pub(crate) dir_name: String,
+    pub(crate) user_id: i32,
+    pub(crate) resource: u32,
+    pub(crate) read_only: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SaveDataTransaction {
-    mount_point: String,
-    committed_path: PathBuf,
-    staging_path: PathBuf,
+pub(crate) struct SaveDataTransaction {
+    pub(crate) mount_point: String,
+    pub(crate) committed_path: PathBuf,
+    pub(crate) staging_path: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -2138,6 +2142,17 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
             state.save_root.display()
         );
     }
+    if let Err(error) = vfs::migrate_legacy_save_slots(&state.save_root) {
+        eprintln!(
+            "[REMu][VFS] legacy save-slot migration failed under {}: {error}",
+            state.save_root.display()
+        );
+    }
+    state.vfs.clear();
+    let save_root_for_vfs = state.save_root.clone();
+    state
+        .vfs
+        .rebuild_static_mounts(game_root, &save_root_for_vfs);
     state.save_data_initialized = false;
     state.save_mounts.clear();
     state.next_save_transaction_resource = 1;
@@ -6661,21 +6676,31 @@ fn unix_days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 }
 
 /// Registers the writable per-title temporary data directory.
-fn app_content_temporary_data_mount(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+///
+/// SDK: `sceAppContentTemporaryDataMount2` writes an
+/// `SceAppContentMountPoint` of at most `SCE_APP_CONTENT_MOUNTPOINT_DATA_MAXSIZE` (16) bytes
+/// (`sdk/target/include/app_content.h:215`, `:255-259`, `:328-334`). REmu reports `/temp0` and
+/// registers it on the VfsMount table so subsequent open/stat resolve through Scratch policy.
+fn app_content_temporary_data_mount(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let output = arguments[1];
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let mount = state.save_root.join("temp0");
+    let mount = state.vfs.register_temp0(&state.save_root);
     if let Err(error) = std::fs::create_dir_all(&mount) {
         eprintln!(
             "[REMu][VFS] temporary data mount failed {:?}: {error}",
             mount.display()
         );
+        let _ = state.vfs.unregister("/temp0");
         return sce_kernel_io_error(&error);
     }
     // The console reports the guest-visible mount point, not a host path.
     write_guest_bytes(output, b"/temp0\0");
+    eprintln!(
+        "[REMu][VFS] temporary data mounted guest=/temp0 host={:?}",
+        mount.display()
+    );
     0
 }
 

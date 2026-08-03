@@ -466,7 +466,7 @@ mod path_normalization_tests {
     }
 }
 
-fn resolve_normalized_app_path_with_presence(
+pub(crate) fn resolve_normalized_app_path_with_presence(
     game_root: &Path,
     normalized: &str,
 ) -> Option<ImmutableAppPathResolution> {
@@ -561,34 +561,13 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
             known_absent: false,
         });
     }
-    // Application paths dominate packaged-title startup and asset streaming. Route them before
-    // constructing writable-root paths or scanning save mounts, and pass the already-normalized
-    // spelling through so the immutable resolver does not allocate and normalize it a second
-    // time. Save-data mounts are created only as `/savedata0` through `/savedata15`, so they can
-    // never shadow this namespace.
-    if normalized == "/app0" || normalized.starts_with("/app0/") {
-        return resolve_normalized_app_path_with_presence(&state.game_root, &normalized).map(
-            |resolved| ResolvedProbeGuestPath {
-                path: resolved.path,
-                writable: false,
-                known_absent: resolved.known_absent,
-            },
-        );
-    }
-    if normalized == "/download0" {
-        return Some(ResolvedProbeGuestPath {
-            path: state.save_root.join("download0"),
-            writable: true,
-            known_absent: false,
-        });
-    }
-    if let Some(relative) = normalized.strip_prefix("/download0/") {
-        let download_root = state.save_root.join("download0");
-        return resolve_path_beneath(&download_root, relative).map(|path| ResolvedProbeGuestPath {
-            path,
-            writable: true,
-            known_absent: false,
-        });
+    // Static namespaces (`/app0`, `/download0`, `/temp0`) live in the VfsMount table (G2).
+    // Save-data mounts stay on `save_mounts` because Prepare retargets their host root and
+    // writability depends on the transaction resource — folding that into VfsMount is a later seam.
+    if let Some(mount) = state.vfs.find_mount(&normalized)
+        && !matches!(mount.policy.kind, crate::vfs::VfsMountKind::SaveData)
+    {
+        return crate::vfs::resolve_via_vfs_mount(mount, &normalized);
     }
     for (mount_point, mounted) in &state.save_mounts {
         let writable = save_data_mount_is_writable(mounted, state);

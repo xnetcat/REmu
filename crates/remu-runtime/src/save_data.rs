@@ -77,20 +77,35 @@ pub(crate) struct SaveDataSearchEntry {
 }
 
 pub(crate) fn save_data_initialize(state: &mut ProbeDispatchState) -> u64 {
-    match std::fs::create_dir_all(&state.save_root) {
-        Ok(()) => {
-            state.save_data_initialized = true;
-            eprintln!(
-                "[REMu][SAVEDATA] initialized root={:?}",
-                state.save_root.display()
-            );
-            0
-        }
+    if let Err(error) = crate::vfs::migrate_legacy_save_slots(&state.save_root) {
+        eprintln!(
+            "[REMu][SAVEDATA] legacy slot migration failed root={:?}: {error}",
+            state.save_root.display()
+        );
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    let slots_root = crate::vfs::save_data_slots_root(&state.save_root);
+    match std::fs::create_dir_all(&slots_root) {
+        Ok(()) => {}
         Err(error) => {
             eprintln!("[REMu][SAVEDATA] initialize failed: {error}");
-            sce_kernel_error(SAVE_DATA_ERROR_INTERNAL)
+            return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
         }
     }
+    if let Err(error) = crate::savedata_journal::recover_save_data_root(&state.save_root) {
+        eprintln!(
+            "[REMu][SAVEDATA] recovery scan failed root={:?}: {error}",
+            state.save_root.display()
+        );
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
+    state.save_data_initialized = true;
+    eprintln!(
+        "[REMu][SAVEDATA] initialized root={:?} slots={:?}",
+        state.save_root.display(),
+        slots_root.display()
+    );
+    0
 }
 
 pub(crate) fn save_data_terminate(state: &mut ProbeDispatchState) -> u64 {
@@ -106,6 +121,17 @@ pub(crate) fn save_data_terminate(state: &mut ProbeDispatchState) -> u64 {
         }
     }
     state.save_mounts.clear();
+    state
+        .vfs
+        .mounts()
+        .iter()
+        .filter(|mount| matches!(mount.policy.kind, crate::vfs::VfsMountKind::SaveData))
+        .map(|mount| mount.guest_prefix.clone())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .for_each(|prefix| {
+            let _ = state.vfs.unregister(&prefix);
+        });
     state.save_transactions.clear();
     state.prepared_save_resources.clear();
     state.save_transaction_resources.clear();
@@ -146,7 +172,7 @@ pub(crate) fn save_data_dir_name_search(arguments: [u64; 6], state: &ProbeDispat
         pattern
     };
     let title_root = if title_id_address == 0 {
-        state.save_root.clone()
+        crate::vfs::save_data_slots_root(&state.save_root)
     } else {
         let Some(title_id) = read_guest_fixed_ascii(title_id_address, 10) else {
             return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
@@ -154,11 +180,13 @@ pub(crate) fn save_data_dir_name_search(arguments: [u64; 6], state: &ProbeDispat
         if title_id.is_empty() {
             return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
         }
-        state
-            .save_root
-            .parent()
-            .unwrap_or(&state.save_root)
-            .join(sanitize_save_segment(&title_id))
+        crate::vfs::save_data_slots_root(
+            &state
+                .save_root
+                .parent()
+                .unwrap_or(&state.save_root)
+                .join(sanitize_save_segment(&title_id)),
+        )
     };
 
     let mut entries = match enumerate_save_data_entries(&title_root, &pattern) {
@@ -330,7 +358,8 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
         );
     }
 
-    let slot = state.save_root.join(sanitize_save_segment(&dir_name));
+    let slot = crate::vfs::save_data_slots_root(&state.save_root)
+        .join(sanitize_save_segment(&dir_name));
     let existed = slot.is_dir();
     let create = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE != 0;
     let create_if_missing = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE_IF_MISSING != 0;
@@ -402,6 +431,14 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
                 && mount_mode & SAVE_DATA_MOUNT_MODE_READ_WRITE == 0,
         },
     );
+    if let Err(reason) = state
+        .vfs
+        .register_save_data_mount(&mount_point, slot.clone())
+    {
+        eprintln!("[REMu][SAVEDATA] vfs registration refused: {reason}");
+        state.save_mounts.remove(&mount_point);
+        return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
+    }
     eprintln!(
         "[REMu][SAVEDATA] mount3 user={user_id} dir={dir_name:?} blocks={blocks:#x} system_blocks={system_blocks:#x} mount_mode={mount_mode:#x} resource={resource} mode={mode:#x} mount={mount_point:?} host={:?}",
         slot.display()
@@ -442,6 +479,7 @@ pub(crate) fn save_data_umount2(arguments: [u64; 6], state: &mut ProbeDispatchSt
         }
     }
     state.save_mounts.remove(&mount_point);
+    let _ = state.vfs.unregister(&mount_point);
     eprintln!("[REMu][SAVEDATA] unmounted {mount_point:?} mode={mode:#x}");
     0
 }
@@ -464,7 +502,7 @@ pub(crate) fn save_data_delete(arguments: [u64; 6], state: &mut ProbeDispatchSta
         return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
     }
     let title_root = if title_id_address == 0 {
-        state.save_root.clone()
+        crate::vfs::save_data_slots_root(&state.save_root)
     } else {
         let Some(title_id) = read_guest_fixed_ascii(title_id_address, 10) else {
             return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
@@ -472,11 +510,13 @@ pub(crate) fn save_data_delete(arguments: [u64; 6], state: &mut ProbeDispatchSta
         if title_id.is_empty() {
             return sce_kernel_error(SAVE_DATA_ERROR_PARAMETER);
         }
-        state
-            .save_root
-            .parent()
-            .unwrap_or(&state.save_root)
-            .join(sanitize_save_segment(&title_id))
+        crate::vfs::save_data_slots_root(
+            &state
+                .save_root
+                .parent()
+                .unwrap_or(&state.save_root)
+                .join(sanitize_save_segment(&title_id)),
+        )
     };
     let slot = title_root.join(sanitize_save_segment(&dir_name));
     if state
@@ -545,7 +585,8 @@ pub(crate) fn save_data_prepare(arguments: [u64; 6], state: &mut ProbeDispatchSt
     if staging_path.exists() {
         return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
     }
-    if let Err(error) = copy_save_data_tree(&committed_path, &staging_path) {
+    if let Err(error) = crate::savedata_journal::clone_or_copy_tree(&committed_path, &staging_path)
+    {
         eprintln!(
             "[REMu][SAVEDATA] prepare failed resource={resource} staging={:?}: {error}",
             staging_path.display()
@@ -557,6 +598,9 @@ pub(crate) fn save_data_prepare(arguments: [u64; 6], state: &mut ProbeDispatchSt
         .get_mut(&mount_point)
         .expect("validated save mount remains live under dispatcher lock");
     mounted.path.clone_from(&staging_path);
+    state
+        .vfs
+        .set_save_data_host_root(&mount_point, staging_path.clone());
     state.prepared_save_resources.insert(resource);
     state.save_transactions.insert(
         resource,
@@ -695,7 +739,9 @@ fn commit_save_data_resource(resource: u32, state: &mut ProbeDispatchState) -> u
     let Some(transaction) = state.save_transactions.get(&resource).cloned() else {
         return sce_kernel_error(SAVE_DATA_ERROR_BUSY);
     };
-    if let Err(error) = commit_save_data_transaction(&transaction) {
+    if let Err(error) =
+        crate::savedata_journal::commit_save_data_transaction_journaled(&transaction)
+    {
         eprintln!("[REMu][SAVEDATA] commit failed resource={resource}: {error}");
         return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
     }
@@ -708,6 +754,9 @@ fn commit_save_data_resource(resource: u32, state: &mut ProbeDispatchState) -> u
         return sce_kernel_error(SAVE_DATA_ERROR_NOT_MOUNTED);
     };
     mounted.path.clone_from(&transaction.committed_path);
+    state
+        .vfs
+        .set_save_data_host_root(&transaction.mount_point, transaction.committed_path.clone());
     eprintln!("[REMu][SAVEDATA] committed resource={resource}");
     0
 }
@@ -750,6 +799,7 @@ pub(crate) fn enumerate_save_data_entries(
         if name.to_ascii_lowercase().starts_with("sce_")
             || name.eq_ignore_ascii_case("temp0")
             || name.eq_ignore_ascii_case("download0")
+            || name.eq_ignore_ascii_case("savedata")
             || (!pattern.is_empty() && !save_data_pattern_matches(&name, pattern))
         {
             continue;
@@ -998,73 +1048,4 @@ fn write_host_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     file.write_all(bytes)?;
     file.sync_all()
-}
-
-fn copy_save_data_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
-    std::fs::create_dir(destination)?;
-    let mut pending = vec![(source.to_owned(), destination.to_owned())];
-    while let Some((source_directory, destination_directory)) = pending.pop() {
-        for entry in std::fs::read_dir(source_directory)? {
-            let entry = entry?;
-            let source_path = entry.path();
-            let destination_path = destination_directory.join(entry.file_name());
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                std::fs::create_dir(&destination_path)?;
-                pending.push((source_path, destination_path));
-            } else if file_type.is_file() {
-                std::fs::copy(source_path, destination_path)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn sync_save_data_tree(root: &Path) -> std::io::Result<()> {
-    let mut directories = vec![root.to_owned()];
-    let mut index = 0;
-    while index < directories.len() {
-        for entry in std::fs::read_dir(&directories[index])? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                directories.push(entry.path());
-            } else if file_type.is_file() {
-                std::fs::File::open(entry.path())?.sync_all()?;
-            }
-        }
-        index += 1;
-    }
-    for directory in directories.into_iter().rev() {
-        std::fs::File::open(directory)?.sync_all()?;
-    }
-    Ok(())
-}
-
-fn commit_save_data_transaction(transaction: &SaveDataTransaction) -> std::io::Result<()> {
-    sync_save_data_tree(&transaction.staging_path)?;
-    let file_name = transaction
-        .committed_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("save");
-    let backup_path = transaction.committed_path.with_file_name(format!(
-        "sce_commit_backup_{}_{}_{}",
-        std::process::id(),
-        file_name,
-        transaction
-            .staging_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("transaction")
-    ));
-    std::fs::rename(&transaction.committed_path, &backup_path)?;
-    if let Err(error) = std::fs::rename(&transaction.staging_path, &transaction.committed_path) {
-        let _ = std::fs::rename(&backup_path, &transaction.committed_path);
-        return Err(error);
-    }
-    if let Some(parent) = transaction.committed_path.parent() {
-        std::fs::File::open(parent)?.sync_all()?;
-    }
-    std::fs::remove_dir_all(backup_path)
 }
