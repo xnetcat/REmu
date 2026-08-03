@@ -214,8 +214,16 @@ That is this file's own warning about fabricated success arriving in practice. A
 and reporting completion is a claim that audio was decoded, and an engine that verifies its own
 pipeline catches the claim. Serving the batch ABI as a lifetime shell is therefore not the route:
 Ajm needs a real decoder — the title's audio is ATRAC9 and AAC — or the batch entry points should
-go back to being loudly unimplemented so the failure stays a stall rather than an abort. That
-decision is open, and the shell should not be treated as progress until it is made.
+go back to being loudly unimplemented so the failure stays a stall rather than an abort.
+
+That decision was made and implemented (2026-08-03): the shell is deleted and an `AjmEngine`
+serves the batch ABI from parsed job structures against the SDK's layout, with a worker pool,
+blocking waits, real statistics, and one real decoder (LPCM passthrough) proving the decode
+shape end to end. A batch referencing a codec without a host decoder fails whole, loudly, with
+the SDK's malformed-batch error and the failing codec type in the caller's error block —
+SCREAM stalling on a truthful failure is acceptable; SCREAM being lied to was not. Per-codec
+first-hit telemetry ranks which decoder to implement next; ATRAC9 and AAC (plan P1/P2) remain
+the known blockers for this title's audio.
 
 Import failures are now reported unconditionally rather than behind `REMU_TRACE_IMPORT_ERRORS=1`.
 A failed import is the most useful line in a bring-up log, and gating it meant the runs that needed
@@ -226,10 +234,12 @@ which is its blocker.
 
 The title still submits no draws.
 
-Note for whoever picks this up: `scripts/audit-import-coverage.py` under-reports. It walks modules
-from `lib.rs` and does not recognise every dispatch shape, so it lists NIDs as unserved that
-demonstrably run — the whole fiber family, for instance. Its "unserved" count is an upper bound
-with a measurement artifact in it, not a work list.
+The auditor under-report is fixed (2026-08-03): `scripts/audit-import-coverage.py` walks every
+dispatch chain (including `dispatch_stateless_import`, which serves the fiber family and platform
+services), resolves module directories, and no longer truncates a module scan at a bare
+`#[cfg(test)]` helper. `generate-nid-names.py` additionally reads the SDK stubs' `.scenid`
+sections, the only oracle for pinned NIDs. A live audit of Poppy Playtime now reports 1750
+callable imports with 203 unserved — a true work list, not an upper bound.
 
 The fiber implementation is x86-64 only, because it saves and restores x86-64 register state. On
 any other host the NIDs fall through to the unimplemented path rather than to a stub, so its tests
@@ -252,6 +262,18 @@ Frame rate is also not stable across successful runs of one binary: 59.9, 61.9, 
 and display state. Neither frame rate nor draw rate can therefore be used to detect a
 performance regression. There is no CPU-throughput benchmark in the tree, which is the gap
 to close before any performance claim can be made.
+
+The same class has a half-rate sibling (2026-08-03, 19-run census): a launch sticks for its
+whole run at either 60.0 FPS/899 draws/s or ~30 FPS/450 draws/s with present latency ~30 ms,
+decided at startup. It reproduces at `bf50225` before any of that day's changes, and late in
+the session the machine entered a state where every revision — including that baseline —
+ran at 30 (AC power, no thermal pressure, no Low Power Mode, load under 5). In the slow mode
+the guest paces on equeue flip completions at exactly half rate from the first window and all
+counters halve together, pointing at the flip-completion/presentation cadence rather than any
+compute path. Two candidate cures were tried and refuted while the machine state drifted
+(once-per-vblank present pacing from a CVDisplayLink; completing translated flips at snapshot
+retirement); both are parked unverified until a run on a display state that lets the bf50225
+control reach 60 again. Plan E1 owns this class.
 
 ### Write-watch arming assumes plain read/write data pages
 
