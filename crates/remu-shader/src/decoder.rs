@@ -221,7 +221,24 @@ fn create_instruction(
                 kind: OperandKind::EncodedConstant,
                 value: word & 0xffff,
             });
-            destinations.push(Operand::scalar((word >> 16) & 0x7f));
+            if opcode.is("SVersion") {
+                // A pure toolchain hint: the SDST field carries no register operand.
+            } else if opcode.is("SSetregB32") {
+                // The SDST field is the value READ into the hardware register.
+                sources.push(Operand::scalar((word >> 16) & 0x7f));
+            } else if opcode.is("SSetregImm32B32") {
+                if let Some(literal) = literal {
+                    sources.push(literal_operand(literal));
+                }
+            } else if matches!(
+                opcode.known_name(),
+                Some("SWaitcntVscnt" | "SWaitcntVmcnt" | "SWaitcntExpcnt" | "SWaitcntLgkmcnt")
+            ) {
+                // The SDST field supplies an additional wait count and is read, not written.
+                sources.push(Operand::source((word >> 16) & 0x7f, None));
+            } else {
+                destinations.push(Operand::scalar((word >> 16) & 0x7f));
+            }
         }
         ShaderEncoding::Smrd => {
             let scalar_base = ((word >> 9) & 0x3f) * 2;

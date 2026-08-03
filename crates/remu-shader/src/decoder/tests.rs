@@ -1294,3 +1294,192 @@ fn decodes_the_full_gfx10_image_sample_gather_lattice() {
         );
     }
 }
+
+#[test]
+fn decodes_benign_sopp_hint_opcodes_as_known_non_branches() {
+    // SOPP hints adjust hardware wait/mode/priority state only. Every one of them previously
+    // failed the whole shader with UnknownOpcode; a single S_DENORM_MODE killed the draw.
+    let words = [
+        0xbf83_0000, // s_wakeup
+        0xbf8d_0000, // s_sethalt 0
+        0xbf8e_0001, // s_sleep 1
+        0xbf8f_0003, // s_setprio 3
+        0xbf93_0000, // s_icache_inv
+        0xbf94_0000, // s_incperflevel 0
+        0xbf95_0000, // s_decperflevel 0
+        0xbfa2_0000, // s_wait_idle
+        0xbfa4_0003, // s_round_mode 3
+        0xbfa5_000f, // s_denorm_mode 15
+        0xbfa8_0000, // s_ttracedata_imm 0
+        0xbf81_0000, // s_endpgm
+    ];
+    let program = decode_program(0x1000, &words).expect("benign SOPP hints decode");
+    let names = [
+        "SWakeup",
+        "SSethalt",
+        "SSleep",
+        "SSetprio",
+        "SIcacheInv",
+        "SIncperflevel",
+        "SDecperflevel",
+        "SWaitIdle",
+        "SRoundMode",
+        "SDenormMode",
+        "STtracedataImm",
+    ];
+    for (instruction, name) in program.instructions.iter().zip(names) {
+        assert_eq!(instruction.encoding, ShaderEncoding::Sopp);
+        assert!(
+            instruction.opcode.is(name),
+            "expected {name}, got {}",
+            instruction.opcode
+        );
+    }
+    assert_eq!(program.instructions[11].opcode, Opcode::END_PROGRAM);
+}
+
+#[test]
+fn sopp_end_program_variants_terminate_the_stream() {
+    for word in [0xbf9b_0000_u32, 0xbf9e_0000] {
+        // s_endpgm_saved / s_endpgm_ordered_ps_done end the wave exactly like s_endpgm. Decoding
+        // them as the terminator (the S_CODE_END precedent) stops the stream scan correctly.
+        let program = decode_program(0x1000, &[word, 0xdead_beef]).expect("end-program variant");
+        assert_eq!(program.instructions.len(), 1);
+        assert_eq!(program.instructions[0].opcode, Opcode::END_PROGRAM);
+    }
+}
+
+#[test]
+fn decodes_benign_sopk_hints_and_scalar_waitcnt_shapes() {
+    let program = decode_program(
+        0x1000,
+        &[
+            0xb080_1234, // s_version 0x1234
+            0xb105_0007, // s_cmovk_i32 s5, 7
+            0xb885_f801, // s_getreg_b32 s5, hwreg(...)
+            0xb905_f801, // s_setreg_b32 hwreg(...), s5
+            0xb985_f801, // s_setreg_imm32_b32 hwreg(...), 0x11223344
+            0x1122_3344,
+            0xbafd_0000, // s_waitcnt_vscnt null, 0
+            0xbb05_0001, // s_waitcnt_vmcnt s5, 1
+            0xbbfd_0002, // s_waitcnt_expcnt null, 2
+            0xbc05_0003, // s_waitcnt_lgkmcnt s5, 3
+            0xbf81_0000, // s_endpgm
+        ],
+    )
+    .expect("benign SOPK program");
+
+    let version = &program.instructions[0];
+    assert!(version.opcode.is("SVersion"));
+    assert!(version.destinations.is_empty(), "s_version writes no SGPR");
+
+    let cmovk = &program.instructions[1];
+    assert!(cmovk.opcode.is("SCmovkI32"));
+    assert_eq!(cmovk.destinations, [Operand::scalar(5)]);
+
+    let getreg = &program.instructions[2];
+    assert!(getreg.opcode.is("SGetregB32"));
+    assert_eq!(getreg.destinations, [Operand::scalar(5)]);
+
+    let setreg = &program.instructions[3];
+    assert!(setreg.opcode.is("SSetregB32"));
+    assert!(setreg.destinations.is_empty(), "s_setreg writes no SGPR");
+    assert_eq!(setreg.sources[1], Operand::scalar(5));
+
+    let setreg_imm = &program.instructions[4];
+    assert!(setreg_imm.opcode.is("SSetregImm32B32"));
+    assert_eq!(
+        setreg_imm.words.len(),
+        2,
+        "s_setreg_imm32_b32 carries a literal"
+    );
+    assert!(setreg_imm.destinations.is_empty());
+    assert_eq!(
+        setreg_imm.sources[1],
+        Operand {
+            kind: OperandKind::LiteralConstant,
+            value: 0x1122_3344,
+        }
+    );
+
+    for (index, name) in [
+        (5, "SWaitcntVscnt"),
+        (6, "SWaitcntVmcnt"),
+        (7, "SWaitcntExpcnt"),
+        (8, "SWaitcntLgkmcnt"),
+    ] {
+        let waitcnt = &program.instructions[index];
+        assert!(
+            waitcnt.opcode.is(name),
+            "expected {name}, got {}",
+            waitcnt.opcode
+        );
+        assert!(
+            waitcnt.destinations.is_empty(),
+            "{name} reads its SDST field"
+        );
+    }
+    // The register-relative wait count is a read of the SDST field, not a write.
+    assert_eq!(program.instructions[6].sources[1], Operand::scalar(5));
+}
+
+#[test]
+fn decodes_the_sop1_unary_and_relative_move_batch() {
+    // SOP1 word: 0xbe80_0000 | sdst<<16 | code<<8 | ssrc.
+    let cases: &[(u32, &str)] = &[
+        (0xbe85_0503, "SCmovB32"),            // s_cmov_b32 s5, s3
+        (0xbe84_0602, "SCmovB64"),            // s_cmov_b64 s[4:5], s[2:3]
+        (0xbe85_0903, "SWqmB32"),             // s_wqm_b32 s5, s3
+        (0xbe84_0c02, "SBrevB64"),            // s_brev_b64 s[4:5], s[2:3]
+        (0xbe85_0d03, "SBcnt0I32B32"),        // s_bcnt0_i32_b32 s5, s3
+        (0xbe85_0e02, "SBcnt0I32B64"),        // s_bcnt0_i32_b64 s5, s[2:3]
+        (0xbe85_1103, "SFF0I32B32"),          // s_ff0_i32_b32 s5, s3
+        (0xbe85_1202, "SFF0I32B64"),          // s_ff0_i32_b64 s5, s[2:3]
+        (0xbe85_1402, "SFF1I32B64"),          // s_ff1_i32_b64 s5, s[2:3]
+        (0xbe85_1503, "SFlbitI32B32"),        // s_flbit_i32_b32 s5, s3
+        (0xbe85_1602, "SFlbitI32B64"),        // s_flbit_i32_b64 s5, s[2:3]
+        (0xbe85_1703, "SFlbitI32"),           // s_flbit_i32 s5, s3
+        (0xbe85_1802, "SFlbitI32I64"),        // s_flbit_i32_i64 s5, s[2:3]
+        (0xbe85_1903, "SSextI32I8"),          // s_sext_i32_i8 s5, s3
+        (0xbe85_1a03, "SSextI32I16"),         // s_sext_i32_i16 s5, s3
+        (0xbe85_1b03, "SBitset0B32"),         // s_bitset0_b32 s5, s3
+        (0xbe84_1c03, "SBitset0B64"),         // s_bitset0_b64 s[4:5], s3
+        (0xbe84_1e03, "SBitset1B64"),         // s_bitset1_b64 s[4:5], s3
+        (0xbe85_2c03, "SQuadmaskB32"),        // s_quadmask_b32 s5, s3
+        (0xbe84_2d02, "SQuadmaskB64"),        // s_quadmask_b64 s[4:5], s[2:3]
+        (0xbe85_2e03, "SMovrelsB32"),         // s_movrels_b32 s5, s3
+        (0xbe84_2f02, "SMovrelsB64"),         // s_movrels_b64 s[4:5], s[2:3]
+        (0xbe85_3003, "SMovreldB32"),         // s_movreld_b32 s5, s3
+        (0xbe84_3102, "SMovreldB64"),         // s_movreld_b64 s[4:5], s[2:3]
+        (0xbe85_3403, "SAbsI32"),             // s_abs_i32 s5, s3
+        (0xbe84_3603, "SBitreplicateB64B32"), // s_bitreplicate_b64_b32 s[4:5], s3
+    ];
+    for &(word, name) in cases {
+        let program =
+            decode_program(0x1000, &[word, 0xbf81_0000]).expect("SOP1 batch instruction decodes");
+        let instruction = &program.instructions[0];
+        assert_eq!(instruction.encoding, ShaderEncoding::Sop1);
+        assert!(
+            instruction.opcode.is(name),
+            "word 0x{word:08X}: expected {name}, got {}",
+            instruction.opcode
+        );
+    }
+}
+
+#[test]
+fn decodes_s_call_and_scans_past_endpgm_to_its_forward_subroutine() {
+    // s_call_b64 s[10:11], +2 jumps over the endpgm to the subroutine; the decoder must keep
+    // scanning to the call target exactly as it does for forward branches.
+    let words = [
+        0xba0a_0001, // s_call_b64 s[10:11], +1 (target pc 8)
+        0xbf81_0000, // s_endpgm at pc 4
+        0xb005_002a, // s_movk_i32 s5, 42 at pc 8
+        0xbf81_0000, // s_endpgm
+    ];
+    let program = decode_program(0x1000, &words).expect("call target extends the scan");
+    assert_eq!(program.instructions.len(), 4);
+    assert!(program.instructions[0].opcode.is("SCallB64"));
+    assert_eq!(program.instructions[0].destinations, [Operand::scalar(10)]);
+    assert!(program.instructions[2].opcode.is("SMovkI32"));
+}

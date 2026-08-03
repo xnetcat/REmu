@@ -48,6 +48,35 @@ fn scalar_operand_width(instruction: &Instruction) -> u32 {
     }
 }
 
+/// Width of the scalar destination write, which differs from the source width for the 64-bit
+/// scans and counts: they read a register pair but write one 32-bit result. Killing the pair
+/// would under-approximate liveness for the neighboring register.
+fn scalar_destination_width(instruction: &Instruction) -> u32 {
+    if matches!(
+        instruction.opcode.known_name(),
+        Some(
+            "SBcnt0I32B64"
+                | "SBcnt1I32B64"
+                | "SFF0I32B64"
+                | "SFF1I32B64"
+                | "SFlbitI32B64"
+                | "SFlbitI32I64"
+        )
+    ) {
+        return 1;
+    }
+    scalar_operand_width(instruction)
+}
+
+/// The M0-relative moves touch a dynamically selected register; every scalar register must stay
+/// live around them so path dedup and recurrence detection never merge states they distinguish.
+fn scalar_instruction_touches_dynamic_register(instruction: &Instruction) -> bool {
+    matches!(
+        instruction.opcode.known_name(),
+        Some("SMovrelsB32" | "SMovrelsB64" | "SMovreldB32" | "SMovreldB64")
+    )
+}
+
 fn scalar_instruction_defines_condition(instruction: &Instruction) -> bool {
     if instruction.encoding == ShaderEncoding::Sopc
         || (instruction.encoding == ShaderEncoding::Sopk && instruction.opcode.starts_with("SCmpk"))
@@ -58,10 +87,14 @@ fn scalar_instruction_defines_condition(instruction: &Instruction) -> bool {
         instruction.opcode.known_name(),
         Some(
             "SNotB32"
-                | "SBrevB32"
+                | "SBcnt0I32B32"
                 | "SBcnt1I32B32"
-                | "SFF1I32B32"
+                | "SBcnt0I32B64"
                 | "SBcnt1I32B64"
+                | "SWqmB32"
+                | "SQuadmaskB32"
+                | "SQuadmaskB64"
+                | "SAbsI32"
                 | "SNotB64"
                 | "SWqmB64"
                 | "SLshlB64"
@@ -133,7 +166,15 @@ fn scalar_instruction_defines_condition(instruction: &Instruction) -> bool {
 fn scalar_instruction_reads_condition(instruction: &Instruction) -> bool {
     matches!(
         instruction.opcode.known_name(),
-        Some("SCselectB32" | "SCselectB64" | "SAddcU32" | "SSubbU32")
+        Some(
+            "SCselectB32"
+                | "SCselectB64"
+                | "SAddcU32"
+                | "SSubbU32"
+                | "SCmovB32"
+                | "SCmovB64"
+                | "SCmovkI32"
+        )
     ) || instruction
         .sources
         .iter()
@@ -143,7 +184,17 @@ fn scalar_instruction_reads_condition(instruction: &Instruction) -> bool {
 fn scalar_destination_is_also_source(instruction: &Instruction) -> bool {
     matches!(
         instruction.opcode.known_name(),
-        Some("SAddkI32" | "SMulkI32" | "SBitset1B32")
+        Some(
+            "SAddkI32"
+                | "SMulkI32"
+                | "SBitset0B32"
+                | "SBitset1B32"
+                | "SBitset0B64"
+                | "SBitset1B64"
+                | "SCmovkI32"
+                | "SCmovB32"
+                | "SCmovB64"
+        )
     )
 }
 
@@ -194,7 +245,7 @@ pub(crate) fn evaluation_scalar_liveness(
                     | "SCbranchExecnz"
             )
         );
-        if is_branch
+        if (is_branch || matches!(name, Some("SCallB64")))
             && let Some(target) = evaluation_branch_target(instruction)
             && let Ok(target_index) =
                 instructions.binary_search_by_key(&target, |candidate| candidate.pc)
@@ -237,8 +288,27 @@ pub(crate) fn evaluation_scalar_liveness(
             let result_live = destination_live || condition_live;
             let mut updated = live_out;
 
+            // A dynamically targeted transfer or register move invalidates every static liveness
+            // assumption at this point: the indirect return path or the M0-relative index can
+            // observe any register. Saturating the live set here is the sound over-approximation.
+            let unlinked_indirect_transfer =
+                matches!(instruction.opcode.known_name(), Some("SSwappcB64"))
+                    || (matches!(instruction.opcode.known_name(), Some("SSetpcB64"))
+                        && !linked_transfer_targets.contains_key(&instruction.pc));
+            if unlinked_indirect_transfer
+                || scalar_instruction_touches_dynamic_register(instruction)
+            {
+                scalar_live_insert_range(&mut updated.registers, 0, 256);
+                updated.scalar_condition = true;
+                if updated != live_in[index] {
+                    live_in[index] = updated;
+                    changed = true;
+                }
+                continue;
+            }
+
             if !compare_k {
-                let destination_width = scalar_operand_width(instruction);
+                let destination_width = scalar_destination_width(instruction);
                 for operand in &instruction.destinations {
                     if operand.kind == OperandKind::ScalarRegister {
                         scalar_live_remove_range(

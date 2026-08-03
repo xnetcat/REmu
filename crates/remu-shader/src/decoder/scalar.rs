@@ -12,14 +12,32 @@ pub(crate) fn decode_sop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let name = match code {
         0x03 => Some("SMovB32"),
         0x04 => Some("SMovB64"),
+        0x05 => Some("SCmovB32"),
+        0x06 => Some("SCmovB64"),
         0x07 => Some("SNotB32"),
         0x08 => Some("SNotB64"),
+        0x09 => Some("SWqmB32"),
         0x0a => Some("SWqmB64"),
         0x0b => Some("SBrevB32"),
+        0x0c => Some("SBrevB64"),
+        0x0d => Some("SBcnt0I32B32"),
+        0x0e => Some("SBcnt0I32B64"),
         0x0f => Some("SBcnt1I32B32"),
         0x10 => Some("SBcnt1I32B64"),
+        0x11 => Some("SFF0I32B32"),
+        0x12 => Some("SFF0I32B64"),
         0x13 => Some("SFF1I32B32"),
+        0x14 => Some("SFF1I32B64"),
+        0x15 => Some("SFlbitI32B32"),
+        0x16 => Some("SFlbitI32B64"),
+        0x17 => Some("SFlbitI32"),
+        0x18 => Some("SFlbitI32I64"),
+        0x19 => Some("SSextI32I8"),
+        0x1a => Some("SSextI32I16"),
+        0x1b => Some("SBitset0B32"),
+        0x1c => Some("SBitset0B64"),
         0x1d => Some("SBitset1B32"),
+        0x1e => Some("SBitset1B64"),
         0x1f => Some("SGetpcB64"),
         0x20 => Some("SSetpcB64"),
         0x21 => Some("SSwappcB64"),
@@ -31,6 +49,14 @@ pub(crate) fn decode_sop1(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x29 => Some("SNandSaveexecB64"),
         0x2a => Some("SNorSaveexecB64"),
         0x2b => Some("SXnorSaveexecB64"),
+        0x2c => Some("SQuadmaskB32"),
+        0x2d => Some("SQuadmaskB64"),
+        0x2e => Some("SMovrelsB32"),
+        0x2f => Some("SMovrelsB64"),
+        0x30 => Some("SMovreldB32"),
+        0x31 => Some("SMovreldB64"),
+        0x34 => Some("SAbsI32"),
+        0x36 => Some("SBitreplicateB64B32"),
         0x37 => Some("SAndn1SaveexecB64"),
         0x38 => Some("SOrn1SaveexecB64"),
         0x3c => Some("SAndSaveexecB32"),
@@ -182,14 +208,19 @@ pub(crate) fn decode_sopp(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x16 => Some("STtraceData"),
         // Mode-control ops. They set rounding/denormal/priority state that resource discovery
         // does not model, so decoding them keeps a shader that merely toggled a mode alive. SDK
-        // cross-check: s_round_mode / s_denorm_mode / s_sleep mnemonics in libSceShaderIsaP.dll;
-        // OP numbers continue the RDNA2 (GFX10) SOPP block already decoded above (0x20-0x23).
+        // cross-check: s_round_mode / s_denorm_mode / s_sleep / s_ttracedata_imm mnemonics in
+        // libSceShaderIsaP.dll; OP numbers continue the RDNA2 (GFX10) SOPP block already decoded
+        // above (0x20-0x23).
         0x22 => Some("SWaitIdle"),
         0x24 => Some("SRoundMode"),
         0x25 => Some("SDenormMode"),
-        // RDNA2 uses S_CODE_END to pad bytes beyond the executable shader. Treating it as the
-        // bounded stream terminator keeps the decoder from interpreting padding as instructions.
-        0x1f => {
+        0x28 => Some("STtracedataImm"),
+        // S_ENDPGM_SAVED (0x1b) and S_ENDPGM_ORDERED_PS_DONE (0x1e) end the wave exactly like
+        // S_ENDPGM (both mnemonics are in libSceShaderIsaP.dll); RDNA2 additionally uses
+        // S_CODE_END to pad bytes beyond the executable shader. Treating all three as the
+        // bounded stream terminator keeps the decoder from interpreting padding as instructions
+        // while preserving the architectural wave end.
+        0x1b | 0x1e | 0x1f => {
             return Ok(Frame {
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::END_PROGRAM,
@@ -208,6 +239,8 @@ pub(crate) fn decode_sopk(pc: u32, word: u32) -> Result<Frame, DecodeError> {
     let code = ((word >> 23) & 0x7f) - 0x60;
     let name = match code {
         0x00 => Some("SMovkI32"),
+        0x01 => Some("SVersion"),
+        0x02 => Some("SCmovkI32"),
         0x03 => Some("SCmpkEqI32"),
         0x04 => Some("SCmpkLgI32"),
         0x05 => Some("SCmpkGtI32"),
@@ -231,6 +264,14 @@ pub(crate) fn decode_sopk(pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x11 => Some("SGetregB32"),
         0x12 => Some("SSetregB32"),
         0x13 => Some("SSetregImm32B32"),
+        // S_CALL_B64 (20) links the return address and takes a static relative target; the
+        // scalar wait counts (21-24) only park the wave. RDNA2 SOPK numbering continues the
+        // block above; every mnemonic is present in libSceShaderIsaP.dll.
+        0x14 => Some("SCallB64"),
+        0x15 => Some("SWaitcntVscnt"),
+        0x16 => Some("SWaitcntVmcnt"),
+        0x17 => Some("SWaitcntExpcnt"),
+        0x18 => Some("SWaitcntLgkmcnt"),
         _ => None,
     };
     let dwords = 1 + usize::from(code == 0x13);
