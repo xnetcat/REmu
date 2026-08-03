@@ -1779,7 +1779,7 @@ struct SharedEventDirectDrawPlan {
 
 #[derive(Clone, Debug)]
 struct SharedEventComputeGlobalBindingPlan {
-    source: Buffer,
+    source: Option<Buffer>,
     source_offset: u64,
     physical_identity: GuestSharedMappingIdentity,
     byte_count: u64,

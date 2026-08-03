@@ -4901,6 +4901,15 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
     read_alias.write_back_to_guest = false;
     let mut evaluation = evaluation_with_global(writable);
     evaluation.global_memory_bindings.push(read_alias);
+    evaluation.global_memory_bindings.push(GlobalMemoryBinding {
+        scalar_address: 8,
+        base_address: guest_address + 128,
+        instruction_pcs: Default::default(),
+        byte_count: 32,
+        data: vec![0x5a; 32],
+        writable: false,
+        write_back_to_guest: false,
+    });
     let dispatch = ComputeDispatch {
         sequence: 2,
         source: ComputeDispatchSource::Direct,
@@ -4956,11 +4965,16 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
             Some(&plan),
         )
         .expect("planned retained versions upload");
-    assert_eq!(uploaded.len(), 2);
+    assert_eq!(uploaded.len(), 3);
     assert_ne!(uploaded[0].buffer.as_ptr(), retained.as_ptr());
     assert_eq!(uploaded[0].buffer.as_ptr(), uploaded[1].buffer.as_ptr());
+    assert_ne!(uploaded[0].buffer.as_ptr(), uploaded[2].buffer.as_ptr());
     assert!(uploaded[0].original_version.is_some());
     assert!(uploaded[1].original_version.is_some());
+    assert!(uploaded[2].original_version.is_none());
+    let packet_bytes =
+        unsafe { std::slice::from_raw_parts(uploaded[2].buffer.contents().cast::<u8>(), 32) };
+    assert_eq!(packet_bytes, &[0x5a; 32]);
 }
 
 #[test]

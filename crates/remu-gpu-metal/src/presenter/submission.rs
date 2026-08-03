@@ -1155,7 +1155,7 @@ impl MetalPresenter {
         };
         compute_program_shared_event_reject(dispatch, snapshot, evaluation).or_else(|| {
             (self
-                .shared_event_compute_global_binding_plan(evaluation)
+                .shared_event_compute_global_binding_plan(evaluation, &[])
                 .is_none())
             .then_some(SharedEventComputeReject::UnretainedGlobalVersion)
         })
@@ -1183,6 +1183,7 @@ impl MetalPresenter {
             return None;
         }
         let consumer = self.guest_queue_batches.get(&consumer_queue_id)?;
+        let mut dependency_write_footprint = Vec::new();
         for dependency in dependencies {
             let checkpoint = consumer
                 .resource_dependencies
@@ -1191,6 +1192,7 @@ impl MetalPresenter {
             if !checkpoint.footprint_complete {
                 return None;
             }
+            dependency_write_footprint.extend_from_slice(&checkpoint.pending_write_footprint);
             for &(address, _) in &evaluation.scalar_memory_reads {
                 let scalar = PhysicalFootprintRange::new(
                     SharedEventWriteKind::CopiedGlobal,
@@ -1208,7 +1210,10 @@ impl MetalPresenter {
             }
         }
         Some(SharedEventDirectComputePlan {
-            global_bindings: self.shared_event_compute_global_binding_plan(evaluation)?,
+            global_bindings: self.shared_event_compute_global_binding_plan(
+                evaluation,
+                &dependency_write_footprint,
+            )?,
         })
     }
 

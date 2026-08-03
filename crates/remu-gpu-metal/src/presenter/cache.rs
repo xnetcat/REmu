@@ -4,12 +4,12 @@
 use super::{
     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
     GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
-    NggSubgroupLimits, PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY,
-    SamplerArgumentCacheKey, SharedEventComputeGlobalBindingPlan, SharedEventDirectComputePlan,
-    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
-    canonical_sampler_bindings, create_sampler_argument_buffer, describe_guest_batch,
-    effective_global_memory_binding, guest_batch_writes_overlap, guest_physical_ranges_overlap,
-    metal_buffer_with_bytes, prepare_ngg_meshlets,
+    NggSubgroupLimits, PendingGlobalWriteback, PhysicalFootprintRange,
+    SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, SharedEventComputeGlobalBindingPlan,
+    SharedEventDirectComputePlan, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
+    UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
+    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
+    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -368,7 +368,7 @@ impl MetalPresenter {
         let mut group_destinations: Vec<Option<UploadedGlobalBuffer>> =
             vec![None; effective_bindings.len()];
         let mut uploaded = Vec::with_capacity(effective_bindings.len());
-        for binding_plan in &plan.global_bindings {
+        for (index, binding_plan) in plan.global_bindings.iter().enumerate() {
             if let Some(group) = binding_plan.writable_group {
                 if group >= effective_bindings.len() {
                     return Err("shared compute writable group is out of range".to_owned());
@@ -377,25 +377,39 @@ impl MetalPresenter {
                     destination.clone()
                 } else {
                     let owner = &plan.global_bindings[group];
-                    let destination = self.upload_writable_global_buffer_from_gpu_version(
-                        device,
-                        effective_bindings[group],
-                        owner.source.clone(),
-                        owner.source_offset,
-                        Some(owner.physical_identity),
-                    )?;
+                    let destination = if let Some(source) = &owner.source {
+                        self.upload_writable_global_buffer_from_gpu_version(
+                            device,
+                            effective_bindings[group],
+                            source.clone(),
+                            owner.source_offset,
+                            Some(owner.physical_identity),
+                        )?
+                    } else {
+                        let binding = effective_bindings[group];
+                        if binding.data.len() != binding.byte_count {
+                            return Err("shared compute packet snapshot is incomplete".to_owned());
+                        }
+                        self.new_exact_writable_global_buffer(device, binding, &binding.data)?
+                    };
                     group_destinations[group] = Some(destination.clone());
                     destination
                 };
                 uploaded.push(destination);
             } else {
-                uploaded.push(UploadedGlobalBuffer {
-                    buffer: binding_plan.source.clone(),
-                    offset: binding_plan.source_offset,
-                    guest_memory: false,
-                    physical_identity: Some(binding_plan.physical_identity),
-                    original_version: None,
-                });
+                if let Some(source) = &binding_plan.source {
+                    uploaded.push(UploadedGlobalBuffer {
+                        buffer: source.clone(),
+                        offset: binding_plan.source_offset,
+                        guest_memory: false,
+                        physical_identity: Some(binding_plan.physical_identity),
+                        original_version: None,
+                    });
+                } else {
+                    uploaded.push(
+                        self.upload_global_buffer_from_packet(device, effective_bindings[index])?,
+                    );
+                }
             }
         }
         Ok(uploaded)
@@ -945,6 +959,7 @@ impl MetalPresenter {
     pub(super) fn shared_event_compute_global_binding_plan(
         &self,
         evaluation: &ShaderEvaluation,
+        dependency_write_footprint: &[PhysicalFootprintRange],
     ) -> Option<Vec<SharedEventComputeGlobalBindingPlan>> {
         let effective_bindings = evaluation
             .global_memory_bindings
@@ -957,23 +972,42 @@ impl MetalPresenter {
                 return None;
             }
             let byte_count = u64::try_from(binding.byte_count).ok()?;
-            let QueuedGlobalReadSource::Buffer {
-                buffer,
-                offset,
-                guest_memory: false,
-                physical_identity: Some(physical_identity),
-            } = self.queued_global_read_source(binding).ok()?
-            else {
-                return None;
-            };
-            if offset
-                .checked_add(byte_count)
-                .is_none_or(|end| end > buffer.length())
-            {
-                return None;
-            }
+            let binding_identity = guest_shared_backing_identity(binding.base_address, byte_count)?;
+            let (source, offset, physical_identity) =
+                match self.queued_global_read_source(binding).ok()? {
+                    QueuedGlobalReadSource::Buffer {
+                        buffer,
+                        offset,
+                        guest_memory: false,
+                        physical_identity: Some(physical_identity),
+                    } => {
+                        if offset
+                            .checked_add(byte_count)
+                            .is_none_or(|end| end > buffer.length())
+                        {
+                            return None;
+                        }
+                        (Some(buffer), offset, physical_identity)
+                    }
+                    QueuedGlobalReadSource::None
+                        if binding.data.len() == binding.byte_count
+                            && !dependency_write_footprint.iter().any(|producer| {
+                                producer.mapping.backing_id == binding_identity.backing_id
+                                    && producer.mapping.backing_offset
+                                        < binding_identity.backing_offset.saturating_add(byte_count)
+                                    && binding_identity.backing_offset
+                                        < producer
+                                            .mapping
+                                            .backing_offset
+                                            .saturating_add(producer.byte_count)
+                            }) =>
+                    {
+                        (None, 0, binding_identity)
+                    }
+                    _ => return None,
+                };
             plans.push(SharedEventComputeGlobalBindingPlan {
-                source: buffer,
+                source,
                 source_offset: offset,
                 physical_identity,
                 byte_count,
@@ -997,7 +1031,11 @@ impl MetalPresenter {
                 }
                 let exact = left_start == right_start
                     && plans[left].byte_count == plans[right].byte_count
-                    && plans[left].source.as_ptr() == plans[right].source.as_ptr()
+                    && match (&plans[left].source, &plans[right].source) {
+                        (Some(left), Some(right)) => left.as_ptr() == right.as_ptr(),
+                        (None, None) => true,
+                        _ => false,
+                    }
                     && plans[left].source_offset == plans[right].source_offset;
                 if !exact {
                     return None;
