@@ -25,7 +25,10 @@ pub use write_watch::notify_guest_memory_written;
 #[cfg(target_os = "macos")]
 pub use write_watch::notify_guest_memory_written_excluding;
 #[cfg(target_os = "macos")]
-pub use write_watch::{CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement};
+pub use write_watch::{
+    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement, GuestReadMaterializer,
+    set_read_watch_materializer,
+};
 
 /// Non-macOS builds have no unified-memory write-watch backend to notify.
 #[cfg(not(target_os = "macos"))]
@@ -728,6 +731,9 @@ const KERN_SUCCESS: i32 = 0;
 #[cfg(target_os = "macos")]
 const VM_FLAGS_FIXED: i32 = 0;
 
+// SAFETY (declaration): these are the libSystem Mach VM entry points with their documented ABI;
+// each call site upholds the per-call preconditions (live task, owned address range, sizes fitting
+// the platform types) noted at that site.
 #[cfg(target_os = "macos")]
 #[link(name = "System")]
 unsafe extern "C" {
@@ -790,6 +796,8 @@ impl SystemInfo {
     }
 }
 
+// SAFETY (declaration): these are the kernel32 VM entry points with their documented ABI; each
+// call site upholds the per-call preconditions noted at that site.
 #[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {

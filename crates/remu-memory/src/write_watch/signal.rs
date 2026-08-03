@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::io;
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::diagnostic::{
     DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace, format_fault_registers,
@@ -18,6 +18,46 @@ use super::page::{align_down, host_page_size_infallible};
 use super::snapshot::{ACTIVE_HANDLERS, WATCH_SNAPSHOT};
 
 static RECOVERED_DISARMED_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Fills a guest page with a producer's (GPU) bytes so a faulting guest read observes them.
+///
+/// It is invoked directly from the SIGSEGV/SIGBUS handler with the page made temporarily writable,
+/// and therefore **must be async-signal-safe**: no heap allocation, no lock any non-handler code
+/// can hold, and no re-entry into the watch registry — only a bounded copy into
+/// `[page_address, page_address + page_size)`. Returning `false` leaves the fault unhandled and
+/// forwards it, so the failure is loud rather than a silent wrong-bytes read.
+///
+/// This is the D5 integration seam: the gpu-metal consumer registers a materializer that copies
+/// the resident texture's bytes (from a host-visible staging buffer it already owns) into the page.
+pub type GuestReadMaterializer = unsafe extern "C" fn(page_address: u64, page_size: u64) -> bool;
+
+/// The process-global read-watch materializer, stored as a raw function-pointer address (0 = none).
+static READ_MATERIALIZER: AtomicUsize = AtomicUsize::new(0);
+
+/// Registers the read-watch materializer, returning the previously registered one if any.
+pub(super) fn set_read_watch_materializer(
+    materializer: GuestReadMaterializer,
+) -> Option<GuestReadMaterializer> {
+    let previous = READ_MATERIALIZER.swap(materializer as usize, Ordering::AcqRel);
+    // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestReadMaterializer`.
+    (previous != 0)
+        .then(|| unsafe { std::mem::transmute::<usize, GuestReadMaterializer>(previous) })
+}
+
+/// Returns the currently registered read-watch materializer, if any.
+pub(super) fn read_watch_materializer() -> Option<GuestReadMaterializer> {
+    let raw = READ_MATERIALIZER.load(Ordering::Acquire);
+    // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestReadMaterializer`.
+    (raw != 0).then(|| unsafe { std::mem::transmute::<usize, GuestReadMaterializer>(raw) })
+}
+
+/// Whether a delivered fault was a read, a write, or could not be classified from the context.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FaultAccess {
+    Read,
+    Write,
+    Unknown,
+}
 
 static HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
@@ -36,6 +76,10 @@ impl PreviousAction {
         self.0.get().cast::<libc::sigaction>()
     }
 
+    /// # Safety
+    ///
+    /// The slot must have been initialized by a successful `install_fault_handlers_once`, which is
+    /// the sole writer and runs exactly once before any handler can read it.
     unsafe fn get(&self) -> &libc::sigaction {
         // SAFETY: successful handler installation initializes both previous-action slots.
         unsafe { &*self.as_mut_ptr() }
@@ -57,6 +101,10 @@ pub(super) fn install_fault_handlers() -> io::Result<()> {
     result.map_err(io::Error::from_raw_os_error)
 }
 
+/// # Safety
+///
+/// Must run exactly once (enforced by the `HANDLER_RESULT` `OnceLock` in `install_fault_handlers`)
+/// so the previous-action slots are written before any delivered signal can read them.
 unsafe fn install_fault_handlers_once() -> Result<(), i32> {
     // SAFETY: a zeroed sigaction is a valid base before its mask, callback and flags are set.
     let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
@@ -122,7 +170,9 @@ extern "C" fn write_fault_signal_handler(
             )
         }
     };
-    let handled = try_handle_write_fault(fault_address, || {
+    // SAFETY: SA_SIGINFO supplies a live ucontext_t (or null) for the duration of this callback.
+    let access = unsafe { fault_access(context) };
+    let handled = try_handle_write_fault(fault_address, access, || {
         // SAFETY: SA_SIGINFO supplies a live ucontext_t for the duration of this callback.
         let (program_counter, registers) = unsafe { fault_machine_state(context) };
         (
@@ -150,7 +200,11 @@ extern "C" fn write_fault_signal_handler(
 
 type FaultState = (FaultReport, Option<[FaultRegister; REGISTER_COUNT]>);
 
-fn try_handle_write_fault(fault_address: u64, state: impl Fn() -> FaultState) -> bool {
+fn try_handle_write_fault(
+    fault_address: u64,
+    access: FaultAccess,
+    state: impl Fn() -> FaultState,
+) -> bool {
     if fault_address == 0 {
         write_fault_diagnostic(state(), FaultReason::NullAddress);
         return false;
@@ -187,6 +241,26 @@ fn try_handle_write_fault(fault_address: u64, state: impl Fn() -> FaultState) ->
         write_fault_diagnostic(state(), FaultReason::LengthConversion);
         return false;
     };
+
+    // D5 read-watch: a guest READ (or an access we cannot classify as a write) of an armed, not
+    // yet materialized read-watch page must materialize the producer's bytes before the read
+    // resumes. A definite WRITE falls through: the guest overwrites the stale bytes, so it only
+    // needs the ordinary make-writable-and-dirty path (and its owners are marked materialized so a
+    // later read never overwrites those guest bytes).
+    if access != FaultAccess::Write
+        && has_page
+        && snapshot.owners(page_address).any(|owner| {
+            // SAFETY: the snapshot pins the range allocation referenced by its owner.
+            let range = unsafe { &*owner.range };
+            let page = &range.pages[owner.page_index];
+            range.read_watch
+                && page.armed.load(Ordering::Acquire)
+                && !page.materialized.load(Ordering::Acquire)
+        })
+    {
+        return materialize_read_watch_page(snapshot, page_address, address, length, &state);
+    }
+
     // SAFETY: all page owners registered this live mapping. This is the exact protected host page.
     if unsafe {
         libc::mprotect(
@@ -221,6 +295,11 @@ fn try_handle_write_fault(fault_address: u64, state: impl Fn() -> FaultState) ->
         if watched_page.armed.swap(false, Ordering::AcqRel) {
             range.generation.fetch_add(1, Ordering::AcqRel);
         }
+        // A guest write to a read-watch page overwrites the stale GPU bytes, so it is materialized
+        // by definition; never copy the producer's bytes over what the guest just wrote.
+        if range.read_watch {
+            watched_page.materialized.store(true, Ordering::Release);
+        }
         watched_page.dirty.store(true, Ordering::Release);
         range.dirty.store(true, Ordering::Release);
     }
@@ -237,6 +316,67 @@ fn try_handle_write_fault(fault_address: u64, state: impl Fn() -> FaultState) ->
             fault_address,
             report.program_counter,
         );
+    }
+    true
+}
+
+/// Materializes a read-watch page from the registered producer, then leaves it readable.
+///
+/// The page is made temporarily writable so the materializer can fill it, then dropped to
+/// read-only so a later guest write still faults and is tracked. The read-watch owners are marked
+/// materialized so the copy happens exactly once per armed window. Any failure — no materializer,
+/// a failing producer, or an `mprotect` error — is reported and the fault is forwarded rather than
+/// resumed over wrong bytes.
+fn materialize_read_watch_page(
+    snapshot: &super::snapshot::WatchSnapshot,
+    page_address: u64,
+    address: usize,
+    length: usize,
+    state: &impl Fn() -> FaultState,
+) -> bool {
+    let Some(materializer) = read_watch_materializer() else {
+        // A read-watch cannot be armed without a materializer, so this is unreachable in practice;
+        // forward rather than fabricate a materialized page.
+        write_fault_diagnostic(state(), FaultReason::MaterializeFailed);
+        return false;
+    };
+    // SAFETY: every owner registered this live mapping; this is the exact protected host page.
+    if unsafe {
+        libc::mprotect(
+            address as *mut c_void,
+            length,
+            libc::PROT_READ | libc::PROT_WRITE,
+        )
+    } != 0
+    {
+        write_fault_diagnostic(state(), FaultReason::ProtectFailed);
+        return false;
+    }
+    // SAFETY: the page is now writable and spans `[page_address, page_address + length)`; the
+    // materializer's async-signal-safety is its registration contract.
+    if !unsafe { materializer(page_address, length as u64) } {
+        write_fault_diagnostic(state(), FaultReason::MaterializeFailed);
+        return false;
+    }
+    // Leave the page readable but not writable: the read may resume now, and a subsequent guest
+    // write faults again and is handled on the ordinary write path.
+    // SAFETY: same live protected host page as above.
+    if unsafe { libc::mprotect(address as *mut c_void, length, libc::PROT_READ) } != 0 {
+        write_fault_diagnostic(state(), FaultReason::ProtectFailed);
+        return false;
+    }
+    for owner in snapshot.owners(page_address) {
+        // SAFETY: the active snapshot pins the range, and page_index was produced from that range.
+        let range = unsafe { &*owner.range };
+        if range.read_watch {
+            let page = &range.pages[owner.page_index];
+            page.materialized.store(true, Ordering::Release);
+            // Disarm the page: it is now readable, so it will not fault again until the consumer
+            // rearms. Only a rearm (which re-arms this page) re-applies no-access and re-stales it.
+            // A materializing read is not a guest write, so it neither bumps the generation nor
+            // dirties the watch.
+            page.armed.store(false, Ordering::Release);
+        }
     }
     true
 }
@@ -341,6 +481,24 @@ unsafe fn fault_machine_state(
     )
 }
 
+/// Classifies a delivered fault as a read or a write from the machine context's exception state.
+///
+/// # Safety
+///
+/// `context` must be the `ucontext_t` pointer an `SA_SIGINFO` handler received, or null.
+unsafe fn fault_access(context: *mut c_void) -> FaultAccess {
+    if context.is_null() {
+        return FaultAccess::Unknown;
+    }
+    // SAFETY: the caller guarantees this is the live signal ucontext_t.
+    let machine_context = unsafe { (*context.cast::<UserContext>()).machine_context };
+    if machine_context.is_null() {
+        return FaultAccess::Unknown;
+    }
+    // SAFETY: the kernel initializes the machine context for every SIGSEGV/SIGBUS delivery.
+    unsafe { &*machine_context }.access()
+}
+
 /// Darwin's `__darwin_ucontext`, truncated after the machine-context pointer this handler needs.
 #[repr(C)]
 struct UserContext {
@@ -405,6 +563,36 @@ const REGISTER_COUNT: usize = 32;
 impl MachineContext {
     const fn program_counter(&self) -> u64 {
         self.instruction_pointer
+    }
+
+    /// Whether the fault was a store, a load, or could not be classified.
+    ///
+    /// x86-64 encodes the direction in bit 1 of the page-fault error code; AArch64 encodes it in
+    /// the `WnR` bit (6) of a data-abort syndrome. A syndrome that is not a data abort — or any
+    /// state the direction cannot be read from — is `Unknown`, which the read-watch path treats
+    /// conservatively as a read (materialize) so it never skips a materialization it owed.
+    #[cfg(target_arch = "x86_64")]
+    const fn access(&self) -> FaultAccess {
+        if self._error & 0x2 != 0 {
+            FaultAccess::Write
+        } else {
+            FaultAccess::Read
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    const fn access(&self) -> FaultAccess {
+        // ESR_EL1.EC == 0b100100 (lower EL) or 0b100101 (same EL) is a data abort; WnR is ISS bit 6.
+        let exception_class = (self._syndrome >> 26) & 0x3f;
+        if exception_class == 0b10_0100 || exception_class == 0b10_0101 {
+            if self._syndrome & (1 << 6) != 0 {
+                FaultAccess::Write
+            } else {
+                FaultAccess::Read
+            }
+        } else {
+            FaultAccess::Unknown
+        }
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -477,6 +665,11 @@ fn write_signal_diagnostic_bytes(message: &[u8]) {
     }
 }
 
+/// # Safety
+///
+/// Callable only from the installed signal handler, forwarding the exact `signal`, `information`
+/// and `context` the kernel delivered; the previous-action slots it reads were initialized by
+/// `install_fault_handlers_once` before the handler became reachable.
 unsafe fn chain_previous_action(
     signal: libc::c_int,
     information: *mut libc::siginfo_t,

@@ -2,9 +2,9 @@
 
 //! Process-global registry mapping live shared guest ranges back to their physical backing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock};
 
 use super::{GuestPhysicalBacking, GuestSharedBackingView, align_up, host_page_size, host_size};
 
@@ -78,10 +78,98 @@ impl GuestSharedBackingRange {
     }
 }
 
-static SHARED_MAPPINGS: OnceLock<Mutex<BTreeMap<u64, SharedMappingRecord>>> = OnceLock::new();
+/// The live shared-mapping records, indexed both by guest address and by physical backing.
+///
+/// The `by_address` map is the source of truth and supports the ordered lookups resolution needs
+/// (`range(..=address)`, `get(&cursor)`). `by_backing` is a secondary index: commit-heavy titles
+/// register hundreds of records against one direct-memory object, and every resolution scan filters
+/// by backing id. Scanning the whole address map for one backing was `O(all live records)` per
+/// watch; `by_backing` bounds those scans to the records that actually name the backing (audit N2).
+///
+/// The two indices are kept consistent by routing every mutation through [`Self::insert`] and
+/// [`Self::remove`]; `Deref` exposes only the immutable `by_address` map so no caller can insert or
+/// remove behind the index's back.
+#[derive(Default)]
+struct SharedRegistry {
+    by_address: BTreeMap<u64, SharedMappingRecord>,
+    by_backing: BTreeMap<u64, BTreeSet<u64>>,
+}
 
-fn shared_mappings() -> &'static Mutex<BTreeMap<u64, SharedMappingRecord>> {
-    SHARED_MAPPINGS.get_or_init(|| Mutex::new(BTreeMap::new()))
+impl std::ops::Deref for SharedRegistry {
+    type Target = BTreeMap<u64, SharedMappingRecord>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.by_address
+    }
+}
+
+impl SharedRegistry {
+    fn insert(&mut self, address: u64, record: SharedMappingRecord) {
+        let backing_id = record.backing.id();
+        if let Some(previous) = self.by_address.insert(address, record)
+            && previous.backing.id() != backing_id
+        {
+            self.forget_backing_address(previous.backing.id(), address);
+        }
+        self.by_backing
+            .entry(backing_id)
+            .or_default()
+            .insert(address);
+    }
+
+    fn remove(&mut self, address: u64) -> Option<SharedMappingRecord> {
+        let record = self.by_address.remove(&address)?;
+        self.forget_backing_address(record.backing.id(), address);
+        Some(record)
+    }
+
+    fn forget_backing_address(&mut self, backing_id: u64, address: u64) {
+        if let Some(addresses) = self.by_backing.get_mut(&backing_id) {
+            addresses.remove(&address);
+            if addresses.is_empty() {
+                self.by_backing.remove(&backing_id);
+            }
+        }
+    }
+
+    /// Live records naming `backing_id`, yielded `(mapping_start, record)` in address order.
+    ///
+    /// This is the secondary-index equivalent of `self.iter().filter(|(_, r)| r.backing.id() ==
+    /// backing_id)`; the `by_backing` set holds exactly those addresses, so the filter is gone.
+    fn backing_records(
+        &self,
+        backing_id: u64,
+    ) -> impl Iterator<Item = (u64, &SharedMappingRecord)> {
+        self.by_backing
+            .get(&backing_id)
+            .into_iter()
+            .flatten()
+            .filter_map(move |&address| {
+                self.by_address
+                    .get(&address)
+                    .map(|record| (address, record))
+            })
+    }
+
+    /// A backing clone for any live record naming `backing_id`, or `None` if none is mapped.
+    fn any_backing(&self, backing_id: u64) -> Option<GuestPhysicalBacking> {
+        self.backing_records(backing_id)
+            .next()
+            .map(|(_, record)| record.backing.clone())
+    }
+
+    #[cfg(test)]
+    fn backing_record_count(&self, backing_id: u64) -> usize {
+        self.by_backing
+            .get(&backing_id)
+            .map_or(0, std::collections::BTreeSet::len)
+    }
+}
+
+static SHARED_MAPPINGS: OnceLock<RwLock<SharedRegistry>> = OnceLock::new();
+
+fn shared_mappings() -> &'static RwLock<SharedRegistry> {
+    SHARED_MAPPINGS.get_or_init(|| RwLock::new(SharedRegistry::default()))
 }
 
 static SHARED_MAPPING_MUTATION: OnceLock<Mutex<()>> = OnceLock::new();
@@ -133,12 +221,12 @@ pub(super) fn existing_shared_backing_alias_segments(
     let Some(backing_end) = backing_offset.checked_add(byte_count) else {
         return Vec::new();
     };
-    let mut aliases = shared_mappings()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .filter(|(_, record)| record.backing.id() == backing.id())
-        .filter_map(|(&mapping_start, record)| {
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut aliases = mappings
+        .backing_records(backing.id())
+        .filter_map(|(mapping_start, record)| {
             let mapping_length = record.end.checked_sub(mapping_start)?;
             let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
             let intersection_start = record.backing_offset.max(backing_offset);
@@ -155,7 +243,7 @@ pub(super) fn existing_shared_backing_alias_segments(
 }
 
 fn resolve_shared_backing_range(
-    mappings: &BTreeMap<u64, SharedMappingRecord>,
+    mappings: &SharedRegistry,
     address: u64,
     byte_count: u64,
 ) -> Option<(GuestPhysicalBacking, u64, u64)> {
@@ -180,9 +268,8 @@ fn resolve_shared_backing_range(
     let mut physical_cursor = physical_start;
     while physical_cursor < physical_end {
         let covered_end = mappings
-            .iter()
-            .filter(|(_, record)| record.backing.id() == backing_id)
-            .filter_map(|(&start, record)| {
+            .backing_records(backing_id)
+            .filter_map(|(start, record)| {
                 let mapping_length = record.end.checked_sub(start)?;
                 let backing_end = record.backing_offset.checked_add(mapping_length)?;
                 (record.backing_offset <= physical_cursor && physical_cursor < backing_end)
@@ -212,7 +299,7 @@ pub fn guest_shared_mapping_identity(
     }
     let end = address.checked_add(byte_count)?;
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (&start, first) = mappings.range(..=address).next_back()?;
     if address >= first.end {
@@ -250,7 +337,7 @@ pub fn guest_shared_backing_identity(
     byte_count: u64,
 ) -> Option<GuestSharedMappingIdentity> {
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     resolve_shared_backing_range(&mappings, address, byte_count).map(
         |(backing, physical_start, _)| GuestSharedMappingIdentity {
@@ -271,7 +358,7 @@ pub fn guest_shared_backing_range(
     byte_count: u64,
 ) -> Option<GuestSharedBackingRange> {
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backing, physical_start, physical_end) =
         resolve_shared_backing_range(&mappings, address, byte_count)?;
@@ -316,7 +403,7 @@ pub fn guest_shared_backing_segments(
     byte_count: u64,
 ) -> Option<Vec<GuestSharedBackingSegment>> {
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backing, physical_start, physical_end) =
         resolve_shared_backing_range(&mappings, address, byte_count)?;
@@ -326,9 +413,8 @@ pub fn guest_shared_backing_segments(
     let mut segments = Vec::new();
     while physical_cursor < physical_end {
         let candidate = mappings
-            .iter()
-            .filter(|(_, record)| record.backing.id() == backing_id)
-            .filter_map(|(&start, record)| {
+            .backing_records(backing_id)
+            .filter_map(|(start, record)| {
                 let length = record.end.checked_sub(start)?;
                 let backing_end = record.backing_offset.checked_add(length)?;
                 (record.backing_offset <= physical_cursor && physical_cursor < backing_end)
@@ -364,15 +450,14 @@ pub fn guest_shared_backing_alias_segments(
     byte_count: u64,
 ) -> Option<Vec<GuestSharedBackingSegment>> {
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (backing, physical_start, physical_end) =
         resolve_shared_backing_range(&mappings, address, byte_count)?;
     let backing_id = backing.id();
     let mut aliases = mappings
-        .iter()
-        .filter(|(_, record)| record.backing.id() == backing_id)
-        .filter_map(|(&mapping_start, record)| {
+        .backing_records(backing_id)
+        .filter_map(|(mapping_start, record)| {
             let mapping_length = record.end.checked_sub(mapping_start)?;
             let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
             let intersection_start = record.backing_offset.max(physical_start);
@@ -404,7 +489,7 @@ pub(crate) fn guest_write_alias_segments(
         return Vec::new();
     }
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let written_shared_intervals = mappings
         .range(..end)
@@ -428,21 +513,18 @@ pub(crate) fn guest_write_alias_segments(
         byte_count,
     }];
     for (backing_id, physical_start, physical_end) in written_shared_intervals {
-        aliases.extend(
-            mappings
-                .iter()
-                .filter(|(_, record)| record.backing.id() == backing_id)
-                .filter_map(|(&mapping_start, record)| {
-                    let mapping_length = record.end.checked_sub(mapping_start)?;
-                    let mapping_physical_end = record.backing_offset.checked_add(mapping_length)?;
-                    let intersection_start = record.backing_offset.max(physical_start);
-                    let intersection_end = mapping_physical_end.min(physical_end);
-                    (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
-                        address: mapping_start + (intersection_start - record.backing_offset),
-                        byte_count: intersection_end - intersection_start,
-                    })
-                }),
-        );
+        aliases.extend(mappings.backing_records(backing_id).filter_map(
+            |(mapping_start, record)| {
+                let mapping_length = record.end.checked_sub(mapping_start)?;
+                let mapping_physical_end = record.backing_offset.checked_add(mapping_length)?;
+                let intersection_start = record.backing_offset.max(physical_start);
+                let intersection_end = mapping_physical_end.min(physical_end);
+                (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
+                    address: mapping_start + (intersection_start - record.backing_offset),
+                    byte_count: intersection_end - intersection_start,
+                })
+            },
+        ));
     }
     aliases.sort_unstable_by_key(|segment| (segment.address, segment.byte_count));
     aliases.dedup();
@@ -465,7 +547,7 @@ pub fn guest_shared_backing_ranges_overlap(
         return false;
     }
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((left_backing, left_physical_start, left_physical_end)) =
         resolve_shared_backing_range(&mappings, left, left_byte_count)
@@ -488,9 +570,8 @@ pub fn guest_shared_backing_ranges_overlap(
         return false;
     };
     mappings
-        .iter()
-        .filter(|(_, record)| record.backing.id() == left_backing.id())
-        .any(|(&mapping_start, record)| {
+        .backing_records(left_backing.id())
+        .any(|(mapping_start, record)| {
             let Some(mapping_length) = record.end.checked_sub(mapping_start) else {
                 return false;
             };
@@ -526,7 +607,7 @@ pub fn read_guest_shared_backing(address: u64, destination: &mut [u8]) -> bool {
     };
     let Some((backing, offset, _)) = ({
         let mappings = shared_mappings()
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         resolve_shared_backing_range(&mappings, address, byte_count)
     }) else {
@@ -550,7 +631,7 @@ pub fn write_guest_shared_backing_scattered(
 ) -> bool {
     let Some((backing, base_offset, _)) = ({
         let mappings = shared_mappings()
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         resolve_shared_backing_range(&mappings, address, byte_count)
     }) else {
@@ -583,7 +664,7 @@ pub fn write_guest_shared_backing(address: u64, source: &[u8]) -> bool {
     };
     let Some((backing, offset, _)) = ({
         let mappings = shared_mappings()
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         resolve_shared_backing_range(&mappings, address, byte_count)
     }) else {
@@ -605,7 +686,7 @@ pub fn write_guest_shared_backing_if_identity(
         return false;
     };
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
     else {
@@ -648,13 +729,9 @@ pub fn write_guest_shared_backing_at_identity(
         return false;
     };
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(backing) = mappings
-        .values()
-        .find(|record| record.backing.id() == identity.backing_id)
-        .map(|record| record.backing.clone())
-    else {
+    let Some(backing) = mappings.any_backing(identity.backing_id) else {
         trace_refused_identity_write(
             &mappings,
             identity,
@@ -733,7 +810,7 @@ pub fn write_guest_shared_backing_if_identity_and_baseline(
         return GuardedBackingWrite::Unavailable;
     };
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
     else {
@@ -765,13 +842,9 @@ pub fn write_guest_shared_backing_at_identity_with_baseline(
         return GuardedBackingWrite::Unavailable;
     };
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(backing) = mappings
-        .values()
-        .find(|record| record.backing.id() == identity.backing_id)
-        .map(|record| record.backing.clone())
-    else {
+    let Some(backing) = mappings.any_backing(identity.backing_id) else {
         trace_refused_identity_write(
             &mappings,
             identity,
@@ -843,7 +916,7 @@ impl GuestRangeLease {
     pub fn acquire(address: u64, byte_count: u64) -> Option<Self> {
         let epoch = guest_shared_mapping_epoch();
         let mappings = shared_mappings()
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (backing, offset, _) = resolve_shared_backing_range(&mappings, address, byte_count)?;
         let identity = GuestSharedMappingIdentity {
@@ -870,12 +943,9 @@ impl GuestRangeLease {
     pub fn adopt(address: u64, byte_count: u64, identity: GuestSharedMappingIdentity) -> Self {
         let backing = {
             let mappings = shared_mappings()
-                .lock()
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            mappings
-                .values()
-                .find(|record| record.backing.id() == identity.backing_id)
-                .map(|record| record.backing.clone())
+            mappings.any_backing(identity.backing_id)
         };
         Self {
             address,
@@ -932,7 +1002,7 @@ impl GuestRangeLease {
             return LeasePublishOutcome::Revoked;
         };
         let mappings = shared_mappings()
-            .lock()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((backing, offset, _)) =
             resolve_shared_backing_range(&mappings, run_address, run_bytes)
@@ -946,11 +1016,7 @@ impl GuestRangeLease {
             };
         }
         // The VA moved. Publish through the producer-identity licence, under its two bounds.
-        let Some(backing) = mappings
-            .values()
-            .find(|record| record.backing.id() == self.identity.backing_id)
-            .map(|record| record.backing.clone())
-        else {
+        let Some(backing) = mappings.any_backing(self.identity.backing_id) else {
             trace_refused_identity_write(
                 &mappings,
                 self.identity,
@@ -1007,7 +1073,7 @@ impl GuestRangeLease {
 
 /// Reports whether live records cover every byte of a physical interval in one backing.
 fn identity_range_is_live(
-    mappings: &BTreeMap<u64, SharedMappingRecord>,
+    mappings: &SharedRegistry,
     backing_id: u64,
     start: u64,
     end: u64,
@@ -1015,9 +1081,8 @@ fn identity_range_is_live(
     let mut cursor = start;
     while cursor < end {
         let covered_end = mappings
-            .iter()
-            .filter(|(_, record)| record.backing.id() == backing_id)
-            .filter_map(|(&mapping_start, record)| {
+            .backing_records(backing_id)
+            .filter_map(|(mapping_start, record)| {
                 let mapping_length = record.end.checked_sub(mapping_start)?;
                 let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
                 (record.backing_offset <= cursor && cursor < mapping_backing_end)
@@ -1035,7 +1100,7 @@ fn identity_range_is_live(
 static REFUSED_IDENTITY_WRITES: AtomicU64 = AtomicU64::new(0);
 
 fn trace_refused_identity_write(
-    mappings: &BTreeMap<u64, SharedMappingRecord>,
+    mappings: &SharedRegistry,
     identity: GuestSharedMappingIdentity,
     byte_count: u64,
     reason: &str,
@@ -1045,9 +1110,8 @@ fn trace_refused_identity_write(
         return;
     }
     let alias = mappings
-        .iter()
-        .filter(|(_, record)| record.backing.id() == identity.backing_id)
-        .find_map(|(&mapping_start, record)| {
+        .backing_records(identity.backing_id)
+        .find_map(|(mapping_start, record)| {
             let mapping_length = record.end.checked_sub(mapping_start)?;
             let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
             (record.backing_offset <= identity.backing_offset
@@ -1062,7 +1126,7 @@ fn trace_refused_identity_write(
 }
 
 fn unregister_shared_mapping_range_locked(
-    mappings: &mut BTreeMap<u64, SharedMappingRecord>,
+    mappings: &mut SharedRegistry,
     address: u64,
     byte_count: u64,
 ) {
@@ -1075,7 +1139,7 @@ fn unregister_shared_mapping_range_locked(
         .map(|(&start, record)| (start, record.clone()))
         .collect::<Vec<_>>();
     for (start, record) in overlaps {
-        mappings.remove(&start);
+        mappings.remove(start);
         if start < address {
             mappings.insert(
                 start,
@@ -1100,7 +1164,7 @@ fn unregister_shared_mapping_range_locked(
 
 pub(super) fn unregister_shared_mapping_range(address: u64, byte_count: u64) {
     let mut mappings = shared_mappings()
-        .lock()
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     unregister_shared_mapping_range_locked(&mut mappings, address, byte_count);
 }
@@ -1119,7 +1183,7 @@ fn records_are_physically_contiguous(
             .is_some_and(|left_backing_end| left_backing_end == right.backing_offset)
 }
 
-fn coalesce_shared_mapping_record(mappings: &mut BTreeMap<u64, SharedMappingRecord>, address: u64) {
+fn coalesce_shared_mapping_record(mappings: &mut SharedRegistry, address: u64) {
     let mut merged_start = address;
     let Some(current) = mappings.get(&merged_start).cloned() else {
         return;
@@ -1128,8 +1192,8 @@ fn coalesce_shared_mapping_record(mappings: &mut BTreeMap<u64, SharedMappingReco
         && records_are_physically_contiguous(previous_start, previous, merged_start, &current)
     {
         let previous = previous.clone();
-        mappings.remove(&previous_start);
-        mappings.remove(&merged_start);
+        mappings.remove(previous_start);
+        mappings.remove(merged_start);
         mappings.insert(
             previous_start,
             SharedMappingRecord {
@@ -1148,8 +1212,8 @@ fn coalesce_shared_mapping_record(mappings: &mut BTreeMap<u64, SharedMappingReco
         if !records_are_physically_contiguous(merged_start, &current, current.end, &next) {
             break;
         }
-        mappings.remove(&merged_start);
-        mappings.remove(&current.end);
+        mappings.remove(merged_start);
+        mappings.remove(current.end);
         mappings.insert(
             merged_start,
             SharedMappingRecord {
@@ -1174,7 +1238,7 @@ pub(super) fn register_shared_mapping_range(
         return;
     };
     let mut mappings = shared_mappings()
-        .lock()
+        .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     unregister_shared_mapping_range_locked(&mut mappings, address, byte_count);
     mappings.insert(
@@ -1190,4 +1254,16 @@ pub(super) fn register_shared_mapping_range(
     // watches care only that adjacent addresses name adjacent bytes of one backing. Coalescing
     // here turns separately committed pages back into one watchable/copyable physical run.
     coalesce_shared_mapping_record(&mut mappings, address);
+}
+
+/// Number of `by_address` records naming `backing_id` (N1 coalescing / N2 index regression check).
+///
+/// Backing ids are allocated monotonically, so a test that creates its own backing observes only
+/// its own records here regardless of what other process-global tests are doing concurrently.
+#[cfg(test)]
+pub(super) fn shared_backing_record_count(backing_id: u64) -> usize {
+    shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .backing_record_count(backing_id)
 }

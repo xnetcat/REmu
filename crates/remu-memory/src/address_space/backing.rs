@@ -152,6 +152,143 @@ impl ReadMappingCache {
     }
 }
 
+/// One page-aligned writable window retained across writebacks to the same physical range.
+///
+/// It mirrors [`CachedReadMapping`] but maps read/write so publications reuse it. Being a
+/// `MAP_SHARED` window over the same object, its stores are coherent with every read mapping and
+/// guest alias of that object.
+#[derive(Debug)]
+struct CachedWriteMapping {
+    address: usize,
+    backing_offset: u64,
+    byte_count: usize,
+    last_use: u64,
+}
+
+impl CachedWriteMapping {
+    fn new(descriptor: i32, backing_offset: u64, byte_count: usize) -> Option<Self> {
+        let file_offset = libc::off_t::try_from(backing_offset).ok()?;
+        // SAFETY: the caller validated that this page-aligned file interval belongs to the live
+        // shared-memory object. The mapping remains owned by this value until Drop.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                byte_count,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                descriptor,
+                file_offset,
+            )
+        };
+        if mapping == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self {
+            address: mapping as usize,
+            backing_offset,
+            byte_count,
+            last_use: 0,
+        })
+    }
+
+    fn contains(&self, offset: u64, byte_count: usize) -> bool {
+        let Ok(byte_count) = u64::try_from(byte_count) else {
+            return false;
+        };
+        let Some(request_end) = offset.checked_add(byte_count) else {
+            return false;
+        };
+        let Some(mapping_end) = self
+            .backing_offset
+            .checked_add(u64::try_from(self.byte_count).unwrap_or(u64::MAX))
+        else {
+            return false;
+        };
+        self.backing_offset <= offset && request_end <= mapping_end
+    }
+
+    fn copy_from(&self, offset: u64, source: &[u8]) {
+        debug_assert!(self.contains(offset, source.len()));
+        let in_mapping_offset =
+            usize::try_from(offset - self.backing_offset).expect("contained offset fits usize");
+        // SAFETY: `contains` proves this writable mapping covers the requested physical range, and
+        // `source` provides an independently owned readable range of the same length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.as_ptr(),
+                (self.address as *mut u8).add(in_mapping_offset),
+                source.len(),
+            );
+        }
+    }
+}
+
+impl Drop for CachedWriteMapping {
+    fn drop(&mut self) {
+        // SAFETY: this value owns the complete mmap interval and releases it exactly once.
+        unsafe {
+            libc::munmap(self.address as *mut libc::c_void, self.byte_count);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct WriteMappingCache {
+    mappings: Vec<CachedWriteMapping>,
+    mapped_bytes: usize,
+    next_use: u64,
+    #[cfg(test)]
+    hits: u64,
+    #[cfg(test)]
+    misses: u64,
+}
+
+impl WriteMappingCache {
+    fn copy_if_present(&mut self, offset: u64, source: &[u8]) -> bool {
+        let Some(index) = self
+            .mappings
+            .iter()
+            .position(|mapping| mapping.contains(offset, source.len()))
+        else {
+            #[cfg(test)]
+            {
+                self.misses = self.misses.saturating_add(1);
+            }
+            return false;
+        };
+        self.next_use = self.next_use.wrapping_add(1);
+        self.mappings[index].last_use = self.next_use;
+        self.mappings[index].copy_from(offset, source);
+        #[cfg(test)]
+        {
+            self.hits = self.hits.saturating_add(1);
+        }
+        true
+    }
+
+    fn insert(&mut self, mut mapping: CachedWriteMapping) {
+        while !self.mappings.is_empty()
+            && (self.mappings.len() >= READ_MAPPING_CACHE_CAPACITY
+                || self.mapped_bytes.saturating_add(mapping.byte_count)
+                    > READ_MAPPING_CACHE_BYTE_CAPACITY)
+        {
+            let oldest = self
+                .mappings
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, mapping)| mapping.last_use)
+                .map(|(index, _)| index)
+                .expect("non-empty mapping cache has an oldest entry");
+            let removed = self.mappings.swap_remove(oldest);
+            self.mapped_bytes = self.mapped_bytes.saturating_sub(removed.byte_count);
+        }
+        self.next_use = self.next_use.wrapping_add(1);
+        mapping.last_use = self.next_use;
+        self.mapped_bytes = self.mapped_bytes.saturating_add(mapping.byte_count);
+        self.mappings.push(mapping);
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct BackingInner {
     pub(super) id: u64,
@@ -159,6 +296,7 @@ pub(super) struct BackingInner {
     virtually_keyed: bool,
     pub(super) descriptor: i32,
     read_mappings: Mutex<ReadMappingCache>,
+    write_mappings: Mutex<WriteMappingCache>,
 }
 
 impl Drop for BackingInner {
@@ -276,6 +414,7 @@ impl GuestPhysicalBacking {
                 virtually_keyed,
                 descriptor,
                 read_mappings: Mutex::new(ReadMappingCache::default()),
+                write_mappings: Mutex::new(WriteMappingCache::default()),
             }),
         })
     }
@@ -402,39 +541,52 @@ impl GuestPhysicalBacking {
         let in_mapping_offset = offset - aligned_offset;
         let Some(mapping_length) = in_mapping_offset
             .checked_add(u64::try_from(source.len()).unwrap_or(u64::MAX))
+            .and_then(|length| align_up(length, page_size).ok())
             .and_then(|length| host_size(length).ok())
         else {
             return false;
         };
-        let Ok(file_offset) = libc::off_t::try_from(aligned_offset) else {
+        // Aligning the window end past the object is legal for mmap only up to the file size;
+        // clamp so a final partial page still maps. `end <= size` and page-aligned object sizes
+        // make the clamp a no-op except for objects smaller than one page window.
+        let mapping_length = match usize::try_from(self.size() - aligned_offset) {
+            Ok(available) => mapping_length.min(available),
+            Err(_) => mapping_length,
+        };
+        if mapping_length <= READ_MAPPING_CACHE_BYTE_CAPACITY {
+            let mut cache = self
+                .inner
+                .write_mappings
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.copy_if_present(offset, source) {
+                return true;
+            }
+            let Some(mapping) =
+                CachedWriteMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+            else {
+                return false;
+            };
+            mapping.copy_from(offset, source);
+            cache.insert(mapping);
+            return true;
+        }
+        let Some(mapping) =
+            CachedWriteMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+        else {
             return false;
         };
-        // SAFETY: the aligned file range was validated against the live backing object.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                mapping_length,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                self.inner.descriptor,
-                file_offset,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            return false;
-        }
-        // SAFETY: `mapping` covers the requested offset and source length.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.as_ptr(),
-                mapping.cast::<u8>().add(
-                    usize::try_from(in_mapping_offset)
-                        .expect("validated mapping offset fits usize"),
-                ),
-                source.len(),
-            );
-            libc::munmap(mapping, mapping_length);
-        }
+        mapping.copy_from(offset, source);
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn write_mapping_cache_stats(&self) -> (usize, u64, u64) {
+        let cache = self
+            .inner
+            .write_mappings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (cache.mappings.len(), cache.hits, cache.misses)
     }
 }
