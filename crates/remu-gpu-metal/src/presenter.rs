@@ -181,9 +181,12 @@ use self::stats::{
     TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
-    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, TerminalPublicationPhase, TerminalPublicationStatistics,
-    TerminalPublicationTimer, format_terminal_publication_report, process_memory_statistics,
-    record_mode27_work_detail, record_texture_dirty_work_detail,
+    TEXTURE_SNAPSHOT_UNSTABLE_COUNT, SharedEventHostEffectLatencyPhase,
+    SharedEventHostEffectLatencyStatistics, SharedEventHostEffectPendingStatistics,
+    TerminalPublicationPhase,
+    TerminalPublicationStatistics, TerminalPublicationTimer,
+    format_shared_event_host_effect_latency_report, format_terminal_publication_report,
+    process_memory_statistics, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, take_mode27_work_details,
     take_texture_dirty_work_details, take_texture_snapshot_work_details,
 };
@@ -963,6 +966,44 @@ struct ShaderFunctionStageCache {
     completed: Condvar,
 }
 
+#[derive(Clone, Debug)]
+struct SharedEventHostEffectLatencyState {
+    phase: SharedEventHostEffectLatencyPhase,
+    phase_started_at: Instant,
+}
+
+impl SharedEventHostEffectLatencyState {
+    fn new(now: Instant) -> Self {
+        Self {
+            phase: SharedEventHostEffectLatencyPhase::ConsumerAck,
+            phase_started_at: now,
+        }
+    }
+
+    fn complete_phase(
+        &mut self,
+        now: Instant,
+        statistics: &mut SharedEventHostEffectLatencyStatistics,
+    ) {
+        statistics.record(
+            self.phase,
+            now.saturating_duration_since(self.phase_started_at),
+        );
+        self.phase = match self.phase {
+            SharedEventHostEffectLatencyPhase::ConsumerAck => {
+                SharedEventHostEffectLatencyPhase::ImmutablePrefix
+            }
+            SharedEventHostEffectLatencyPhase::ImmutablePrefix => {
+                SharedEventHostEffectLatencyPhase::HostTerminal
+            }
+            SharedEventHostEffectLatencyPhase::HostTerminal => {
+                SharedEventHostEffectLatencyPhase::HostTerminal
+            }
+        };
+        self.phase_started_at = now;
+    }
+}
+
 #[derive(Clone, Default)]
 struct ShaderFunctionCache {
     vertex: Arc<ShaderFunctionStageCache>,
@@ -989,11 +1030,13 @@ enum QueueBlockReason {
     /// publication wakes the exact overlapping wait after the label becomes guest-visible.
     GuestMemoryWaitPendingTerminal(GpuMemoryWait),
     /// Presenter-thread work must wait for both the consumer to cross its encoded wait and every
-    /// producer's terminal host-side publication.
+    /// producer's terminal host-side publication. `latency` observes the exact producer signal
+    /// between those gates but does not publish memory or relax readiness.
     GuestSharedEventHostEffect {
         consumer_queue_id: u64,
         consumer_ack: Option<SharedEventFence>,
         terminal_dependencies: Vec<SharedEventFence>,
+        latency: SharedEventHostEffectLatencyState,
     },
     FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
@@ -1511,6 +1554,7 @@ struct PresenterStatistics {
     shared_event_error_advances: u32,
     shared_event_fallbacks_no_exact_producer: u32,
     shared_event_fallbacks_timeline_overflow: u32,
+    shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics,
     terminal_publication: TerminalPublicationStatistics,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,

@@ -15,6 +15,124 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(usize)]
+pub(super) enum SharedEventHostEffectLatencyPhase {
+    ConsumerAck = 0,
+    ImmutablePrefix,
+    HostTerminal,
+}
+
+const SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT: usize =
+    SharedEventHostEffectLatencyPhase::HostTerminal as usize + 1;
+
+/// Presenter-local aggregate for one phase of a truthful SharedEvent host-effect gate.
+///
+/// The presenter is the sole writer, so these counters need no atomics. A sample is recorded only
+/// when a gate crosses a phase boundary; unresolved gates are reported separately as a bounded
+/// snapshot of the receiver's queue fronts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SharedEventHostEffectLatency {
+    pub(super) count: u64,
+    pub(super) total_ns: u64,
+    pub(super) maximum_ns: u64,
+}
+
+impl SharedEventHostEffectLatency {
+    fn record(&mut self, duration: Duration) {
+        let nanoseconds = u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX);
+        self.count = self.count.saturating_add(1);
+        self.total_ns = self.total_ns.saturating_add(nanoseconds);
+        self.maximum_ns = self.maximum_ns.max(nanoseconds);
+    }
+
+    pub(super) fn mean_ns(self) -> u64 {
+        self.total_ns.checked_div(self.count).unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SharedEventHostEffectLatencyStatistics {
+    phases: [SharedEventHostEffectLatency; SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT],
+}
+
+impl SharedEventHostEffectLatencyStatistics {
+    pub(super) fn record(
+        &mut self,
+        phase: SharedEventHostEffectLatencyPhase,
+        duration: Duration,
+    ) {
+        self.phases[phase as usize].record(duration);
+    }
+
+    pub(super) fn phase(
+        self,
+        phase: SharedEventHostEffectLatencyPhase,
+    ) -> SharedEventHostEffectLatency {
+        self.phases[phase as usize]
+    }
+
+    pub(super) fn take(&mut self) -> Self {
+        std::mem::take(self)
+    }
+}
+
+/// Point-in-time ages for host-effect gates which have not crossed their current phase.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct SharedEventHostEffectPendingStatistics {
+    phases: [SharedEventHostEffectLatency; SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT],
+}
+
+impl SharedEventHostEffectPendingStatistics {
+    pub(super) fn record(
+        &mut self,
+        phase: SharedEventHostEffectLatencyPhase,
+        age: Duration,
+    ) {
+        self.phases[phase as usize].record(age);
+    }
+
+    pub(super) fn phase(
+        self,
+        phase: SharedEventHostEffectLatencyPhase,
+    ) -> SharedEventHostEffectLatency {
+        self.phases[phase as usize]
+    }
+}
+
+pub(super) fn format_shared_event_host_effect_latency_report(
+    window_ms: u128,
+    completed: SharedEventHostEffectLatencyStatistics,
+    pending: SharedEventHostEffectPendingStatistics,
+) -> String {
+    let completed_phase = |phase| {
+        let latency = completed.phase(phase);
+        format!(
+            "{}/{}/{}/{}",
+            latency.count,
+            latency.total_ns,
+            latency.mean_ns(),
+            latency.maximum_ns,
+        )
+    };
+    let pending_phase = |phase| {
+        let latency = pending.phase(phase);
+        format!(
+            "{}/{}/{}",
+            latency.count, latency.total_ns, latency.maximum_ns,
+        )
+    };
+    format!(
+        "[REMu][PERF-SHARED-EVENT-LATENCY] window_ms={window_ms} completed=count/total_ns/mean_ns/max_ns ack={} ack-prefix={} prefix-terminal={} pending=count/total_age_ns/max_age_ns ack={} ack-prefix={} prefix-terminal={}",
+        completed_phase(SharedEventHostEffectLatencyPhase::ConsumerAck),
+        completed_phase(SharedEventHostEffectLatencyPhase::ImmutablePrefix),
+        completed_phase(SharedEventHostEffectLatencyPhase::HostTerminal),
+        pending_phase(SharedEventHostEffectLatencyPhase::ConsumerAck),
+        pending_phase(SharedEventHostEffectLatencyPhase::ImmutablePrefix),
+        pending_phase(SharedEventHostEffectLatencyPhase::HostTerminal),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ProcessMemoryStatistics {
     pub(super) resident_bytes: u64,
     pub(super) physical_footprint_bytes: u64,
@@ -549,6 +667,7 @@ impl PresenterStatistics {
             shared_event_error_advances: 0,
             shared_event_fallbacks_no_exact_producer: 0,
             shared_event_fallbacks_timeline_overflow: 0,
+            shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics::default(),
             terminal_publication: TerminalPublicationStatistics::default(),
             gpu_execution_time: Duration::ZERO,
             presentation_queue_latency: Duration::ZERO,
@@ -561,9 +680,11 @@ impl PresenterStatistics {
 #[cfg(test)]
 mod tests {
     use super::{
+        SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT, SharedEventHostEffectLatencyPhase,
+        SharedEventHostEffectLatencyStatistics, SharedEventHostEffectPendingStatistics,
         TERMINAL_PUBLICATION_TIMING_SAMPLES, TerminalPublicationPhase,
         TerminalPublicationStatistics, TerminalPublicationTimer,
-        format_terminal_publication_report,
+        format_shared_event_host_effect_latency_report, format_terminal_publication_report,
     };
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -618,6 +739,39 @@ mod tests {
         assert!(report[2].contains("globals=0/0/0/0"));
         assert!(report[3].contains("completion-wake=1/8/8/8"));
         assert!(report.iter().all(|line| line.len() < 256));
+    }
+
+    #[test]
+    fn shared_event_host_effect_latency_report_separates_completed_and_open_phases() {
+        assert_eq!(SHARED_EVENT_HOST_EFFECT_LATENCY_PHASE_COUNT, 3);
+        let mut completed = SharedEventHostEffectLatencyStatistics::default();
+        completed.record(
+            SharedEventHostEffectLatencyPhase::ConsumerAck,
+            Duration::from_nanos(20),
+        );
+        completed.record(
+            SharedEventHostEffectLatencyPhase::ConsumerAck,
+            Duration::from_nanos(40),
+        );
+        completed.record(
+            SharedEventHostEffectLatencyPhase::ImmutablePrefix,
+            Duration::from_nanos(7),
+        );
+        let mut pending = SharedEventHostEffectPendingStatistics::default();
+        pending.record(
+            SharedEventHostEffectLatencyPhase::HostTerminal,
+            Duration::from_nanos(90),
+        );
+
+        let report = format_shared_event_host_effect_latency_report(5_000, completed, pending);
+        assert!(report.starts_with(
+            "[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5000 completed=count/total_ns/mean_ns/max_ns"
+        ));
+        assert!(report.contains("ack=2/60/30/40"));
+        assert!(report.contains("ack-prefix=1/7/7/7"));
+        assert!(report.contains("prefix-terminal=0/0/0/0"));
+        assert!(report.contains("pending=count/total_age_ns/max_age_ns"));
+        assert!(report.ends_with("prefix-terminal=1/90/90"));
     }
 
     #[test]
