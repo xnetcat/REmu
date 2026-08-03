@@ -191,10 +191,6 @@ impl GpuWaitFenceMap {
         self.missing_once.insert(wait_id)
     }
 
-    pub(crate) fn fences(&self) -> impl Iterator<Item = SharedEventFence> + '_ {
-        self.by_wait.values().copied()
-    }
-
     #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
