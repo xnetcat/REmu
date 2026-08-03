@@ -1788,6 +1788,7 @@ impl MetalPresenter {
                     draw: draw.sequence,
                     export_shader: draw.export_shader_address,
                     pixel_shader: draw.pixel_shader_address,
+                    queue_id: self.active_guest_queue,
                 };
                 record_diagnostic_scanout_writer(target.texture.address, writer);
                 if trace_scanout_writers {

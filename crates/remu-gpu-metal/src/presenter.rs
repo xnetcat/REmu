@@ -687,6 +687,7 @@ struct DiagnosticScanoutWriter {
     draw: u64,
     export_shader: u64,
     pixel_shader: u64,
+    queue_id: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
