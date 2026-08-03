@@ -2131,7 +2131,7 @@ impl MetalPresenter {
         };
         let shader_compiler_workers = shader_compiler_worker_count();
         eprintln!(
-            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB",
+            "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB exact-shared-event-readiness=true",
             SAMPLED_TEXTURE_CACHE_CAPACITY,
             sampled_texture_cache_byte_capacity().map_or(0, |bytes| bytes / (1024 * 1024)),
             resident_texture_cache_byte_capacity().map_or(0, |bytes| bytes / (1024 * 1024)),

@@ -3,7 +3,7 @@
 //! The bounded, ordered guest GPU event channel and its process-global sink.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Condvar, Mutex, OnceLock};
 
@@ -61,6 +61,7 @@ struct PublicationGuard {
 static GPU_EVENT_SINK: OnceLock<(Mutex<EventSinkState>, Condvar)> = OnceLock::new();
 static GPU_PUBLICATION_COORDINATOR: OnceLock<(Mutex<PublicationCoordinator>, Condvar)> =
     OnceLock::new();
+static REPORTED_LINEAR_SUBMISSION_CHUNKING: AtomicBool = AtomicBool::new(false);
 
 struct ActiveEventSender {
     sender: SyncSender<GpuEvent>,
@@ -360,6 +361,15 @@ pub fn emit_event_with_admission(mut event: GpuEvent, admitted: impl FnOnce()) -
         GpuEvent::QueueSubmission { queue_id, events }
             if events.len() > GPU_EVENT_SUBMISSION_CHUNK_SIZE =>
         {
+            if !REPORTED_LINEAR_SUBMISSION_CHUNKING.load(Ordering::Relaxed)
+                && REPORTED_LINEAR_SUBMISSION_CHUNKING
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                eprintln!(
+                    "[REMu][GPU] linear submission chunking enabled chunk_size={GPU_EVENT_SUBMISSION_CHUNK_SIZE}"
+                );
+            }
             // Splitting the leading chunk from a `Vec` with `split_off` copies the complete
             // remaining tail on every iteration and leaves each published prefix retaining the
             // previous tail's capacity. Consume the source allocation once instead, then build
