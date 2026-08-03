@@ -380,7 +380,11 @@ if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
     echo "[REMu] headless Metal presenter enabled"
 fi
 set +e
-if [ "$capture_frames" = 1 ]; then
+# Ordered scanout-writer diagnostics also emit post-draw images through the presenter's capture
+# root. They do not enable periodic frame capture, but they still need the run-local directory;
+# otherwise the provenance trace succeeds while every requested pixel artifact is silently
+# skipped. Keep ordinary runs isolated from an inherited capture directory as before.
+if [ "$capture_frames" = 1 ] || [ -n "${REMU_DIAGNOSTIC_SCANOUT_WRITERS:-}" ]; then
     (
         cd "$launch_working_directory"
         "$script_dir/run-with-watchdog.sh" \
