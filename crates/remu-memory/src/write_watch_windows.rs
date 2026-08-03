@@ -159,6 +159,14 @@ fn install_exception_handler() -> io::Result<()> {
         .map_err(io::Error::from_raw_os_error)
 }
 
+pub(crate) fn prepare_guest_write_diagnostics() -> io::Result<()> {
+    if crate::guest_write_journal_enabled() {
+        install_exception_handler()?;
+        eprintln!("[REMu][JOURNAL] Windows access-violation diagnostics armed");
+    }
+    Ok(())
+}
+
 unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS) -> i32 {
     let Some(exception) = (unsafe { exception.as_ref() }) else {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -166,10 +174,41 @@ unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS
     let Some(record) = (unsafe { exception.ExceptionRecord.as_ref() }) else {
         return EXCEPTION_CONTINUE_SEARCH;
     };
-    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION
-        || record.NumberParameters < 2
-        || record.ExceptionInformation[0] != 1
-    {
+    if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if record.ExceptionInformation[0] != 1 {
+        if crate::guest_write_journal::guest_cpu_page_journal_armed()
+            && let Some(context) = unsafe { exception.ContextRecord.as_ref() }
+        {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let anchors = [
+                    context.Rax,
+                    context.Rbx,
+                    context.Rcx,
+                    context.Rdx,
+                    context.Rsi,
+                    context.Rdi,
+                    context.Rbp,
+                    context.Rsp,
+                    context.R8,
+                    context.R9,
+                    context.R10,
+                    context.R11,
+                    context.R12,
+                    context.R13,
+                    context.R14,
+                    context.R15,
+                ];
+                crate::report_unrecovered_signal(
+                    b"SEH_ACCESS_VIOLATION",
+                    context.Rip,
+                    record.ExceptionInformation[1] as u64,
+                    &anchors,
+                );
+            }
+        }
         return EXCEPTION_CONTINUE_SEARCH;
     }
     let fault_address = record.ExceptionInformation[1] as u64;
@@ -401,6 +440,9 @@ impl CpuWriteWatch {
                 "a CPU write watch requires a nonempty, non-overflowing mapped range",
             ));
         }
+        // Resolve and, when requested, allocate the diagnostic journal outside exception
+        // context before installing a handler that may need to report the very next access.
+        let _ = crate::guest_write_journal_enabled();
         install_exception_handler()?;
         let mut state = state()
             .lock()

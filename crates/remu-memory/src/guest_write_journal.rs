@@ -697,7 +697,31 @@ fn write_diagnostic(buffer: &DiagnosticBuffer) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn write_diagnostic(buffer: &DiagnosticBuffer) {
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+
+    // WriteFile does not allocate and is safe to call from this last-chance vectored exception
+    // path. Short writes are intentionally ignored, matching the Unix signal implementation.
+    let Ok(stderr) = (unsafe { GetStdHandle(STD_ERROR_HANDLE) }) else {
+        return;
+    };
+    if stderr.is_invalid() {
+        return;
+    }
+    let mut written = 0_u32;
+    unsafe {
+        let _ = WriteFile(
+            stderr,
+            Some(buffer.as_slice()),
+            Some(&raw mut written),
+            None,
+        );
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn write_diagnostic(_buffer: &DiagnosticBuffer) {}
 
 #[cfg(test)]

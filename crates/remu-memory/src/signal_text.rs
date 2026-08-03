@@ -71,7 +71,7 @@ impl DiagnosticBuffer {
         self.length = 0;
     }
 
-    #[cfg(any(test, unix))]
+    #[cfg(any(test, unix, windows))]
     pub(crate) fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.length]
     }

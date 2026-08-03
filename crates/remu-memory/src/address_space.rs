@@ -91,6 +91,15 @@ impl GuestAddressSpace {
 
     fn from_reservation(reservation: HostReservation) -> Result<Self, AddressSpaceError> {
         let end = checked_end(reservation.address(), reservation.size as u64)?;
+        #[cfg(windows)]
+        super::write_watch::prepare_guest_write_diagnostics().map_err(|source| {
+            AddressSpaceError::HostOperationFailed {
+                operation: "guest-write diagnostic handler installation",
+                address: reservation.address(),
+                end,
+                source,
+            }
+        })?;
         reservation.publish_bounds();
         Ok(Self {
             reservation,
