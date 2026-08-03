@@ -1146,12 +1146,9 @@ struct AgcGraphicsState {
     /// This is command-processor state, not shader-stage state: the shader-type bit in a PM4
     /// header selects how the packet is decoded, but does not create a second indirect base.
     indirect_args_address: u64,
-    /// Synthetic cumulative pixel count published by `PIXEL_PIPE_STAT_DUMP`.
-    ///
-    /// Gen5 exposes one cumulative counter per render backend. Keeping the sequence in the
-    /// graphics command-processor state makes successive start/end query dumps differ while the
-    /// high validity bit tells the guest that the ordered GPU write has retired.
-    pixel_pipe_stat_counter: u64,
+    // J1: synthetic `pixel_pipe_stat_counter` deleted. `PIXEL_PIPE_STAT_DUMP` now emits
+    // `GpuEvent::OcclusionQuery { destination }` for MTLVisibilityResultBuffer publication
+    // (sdk/target/include/agc/drawcommandbuffer.h:86,385-392).
     emitted_draws: u64,
     emitted_compute_dispatches: u64,
     traced_shader_pairs: BTreeSet<(u64, u64)>,

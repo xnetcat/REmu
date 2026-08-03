@@ -1346,12 +1346,21 @@ impl MetalPresenter {
                 } else {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
+                // B4: resolve store action via attachment::tbdr (memoryless only when draws/pass
+                // gate is proven; otherwise StoreAndMultisampleResolve — loud refusal in tbdr).
+                let memoryless = super::attachment::msaa_memoryless_decision(
+                    self.statistics.encoded_draws.saturating_add(1),
+                    self.statistics.encoded_render_passes.saturating_add(1),
+                    false,
+                );
+                let store = super::attachment::color_store_action(
+                    resolve_texture.is_some(),
+                    &memoryless,
+                );
                 if let Some(resolve_texture) = resolve_texture {
                     attachment.set_resolve_texture(Some(resolve_texture));
-                    attachment.set_store_action(MTLStoreAction::StoreAndMultisampleResolve);
-                } else {
-                    attachment.set_store_action(MTLStoreAction::Store);
                 }
+                attachment.set_store_action(store.metal());
             }
             if let (Some(_depth), Some(texture)) = (depth, depth_texture.as_ref()) {
                 let attachment = pass
@@ -1370,18 +1379,30 @@ impl MetalPresenter {
                 } else {
                     attachment.set_load_action(MTLLoadAction::Load);
                 }
+                // B4: consumer-derived depth store. Lookahead for "sampled later" is not yet
+                // proven in-pass, so UnknownKeepStore retains Store (loud seam in NOTES).
                 if let Some(resolve_texture) = depth_resolve_texture.as_ref() {
                     attachment.set_resolve_texture(Some(resolve_texture));
-                    attachment.set_store_action(MTLStoreAction::StoreAndMultisampleResolve);
-                } else {
-                    attachment.set_store_action(MTLStoreAction::Store);
                 }
+                let depth_store = super::attachment::depth_store_action(
+                    depth_resolve_texture.is_some(),
+                    super::attachment::DepthConsumerHint::UnknownKeepStore,
+                );
+                attachment.set_store_action(depth_store.metal());
             }
+            // J1: attach visibility result buffer so Counting mode can land sample counts.
+            let visibility = super::attachment::ensure_visibility_result_buffer(
+                &device,
+                &mut self.visibility_result_buffer,
+            );
+            super::attachment::attach_visibility_result_buffer(&pass, &visibility);
             Some(pass)
         } else {
             None
         };
         let ack_metal_encoding_started = ack_phase_timing.then(Instant::now);
+        // J1: mark counting armed before borrowing the open batch (see arm_visibility_counting below).
+        self.visibility_counting_armed = true;
         {
             let (batch, statistics) = self.active_open_guest_batch_and_statistics();
             let batch = batch.expect("guest command batch was opened above");
@@ -1438,6 +1459,10 @@ impl MetalPresenter {
                 .as_ref()
                 .expect("compatible guest render pass was opened above")
                 .encoder;
+            // J1: every translated draw contributes to the next PIXEL_PIPE_STAT_DUMP / OcclusionQuery.
+            // Flag is set before the batch borrow so OcclusionQuery can observe it without fighting
+            // the open-batch mutable borrow.
+            super::attachment::arm_visibility_counting(encoder);
             encoder.set_render_pipeline_state(&pipeline);
             encoder.set_front_facing_winding(raster.front_winding);
             encoder.set_cull_mode(
@@ -3134,10 +3159,15 @@ impl MetalPresenter {
         attachment.set_clear_color(clear_color);
         if let Some(resolve_texture) = resolve_texture.as_ref() {
             attachment.set_resolve_texture(Some(resolve_texture));
-            attachment.set_store_action(MTLStoreAction::StoreAndMultisampleResolve);
-        } else {
-            attachment.set_store_action(MTLStoreAction::Store);
         }
+        let memoryless = super::attachment::msaa_memoryless_decision(
+            self.statistics.encoded_draws.saturating_add(1),
+            self.statistics.encoded_render_passes.saturating_add(1),
+            false,
+        );
+        attachment.set_store_action(
+            super::attachment::color_store_action(resolve_texture.is_some(), &memoryless).metal(),
+        );
 
         let batch = self
             .active_open_guest_batch_mut()

@@ -36,6 +36,10 @@ const REGISTER_ARRAY_ENTRY_BYTES: u64 = 8;
 
 const MAX_EVENT_TYPE: u32 = 0x3f;
 /// The two occlusion-counter events carry a destination address; every other event type does not.
+///
+/// SDK: `EventType::kOcclusionCounterControl` (0x38) and `kOcclusionCounterDump` (0x39) in
+/// `sdk/target/include/agc/drawcommandbuffer.h:85-86`. Dump destinations feed
+/// `GpuEvent::OcclusionQuery` (J1) rather than a fabricated CPU counter.
 const ADDRESSED_EVENT_TYPE_GROUP: u32 = 0x38;
 
 const BRANCH_PACKET_BYTES: u64 = 56;

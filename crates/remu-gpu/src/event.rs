@@ -74,6 +74,17 @@ pub enum GpuEvent {
     MemoryCopy(GpuMemoryCopy),
     MemoryWrite(GpuMemoryWrite),
     MemoryRelease(GpuMemoryRelease),
+    /// A Gen5 `PIXEL_PIPE_STAT_DUMP` / `kOcclusionCounterDump` (event type 0x39).
+    ///
+    /// The destination is the qword-aligned base of a 16×16-byte render-backend counter block
+    /// (`sce::Agc::OcclusionQueryResults` / `Alignment::kOcclusionQueryResults` —
+    /// `sdk/target/include/agc/drawcommandbuffer.h:85-86,385-392` and
+    /// `sdk/target/include/agc/baselayer.h:67`). The Metal backend publishes real
+    /// `MTLVisibilityResultBuffer` sample counts (plus the high validity bit) into that block;
+    /// the runtime must not fabricate counter values.
+    OcclusionQuery {
+        destination: u64,
+    },
     /// A decoded wait which has not yet crossed the installed guest GPU event sink.
     ///
     /// [`crate::emit_event`] upgrades waits inside a `QueueSubmission` to
@@ -281,6 +292,16 @@ mod memory_copy_snapshot_tests {
         assert_eq!(gpu_memory_copy_snapshot_statistics().0, before);
     }
 }
+
+/// Gen5 occlusion / pixel-pipe dump result blocks contain sixteen 16-byte render-backend pairs.
+///
+/// SDK: `sce::Agc::OcclusionQueryResults::m_results[16]` (`drawcommandbuffer.h:392`) and
+/// `Alignment::kOcclusionQueryResults` (`baselayer.h:67`).
+pub const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 16;
+
+/// High bit set on every published occlusion / pixel-pipe counter qword once the GPU write has
+/// retired. Native titles (and Unreal's blocking render-query path) spin until this bit appears.
+pub const PIXEL_PIPE_STAT_VALID: u64 = 1 << 63;
 
 /// An ordered CPU-visible label write produced by a Gen5 end-of-pipe packet.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

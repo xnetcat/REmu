@@ -31,6 +31,7 @@ mod execute;
 mod format;
 mod host_ui;
 mod metal_bytes;
+mod attachment;
 mod present;
 mod readback;
 mod sampler;
@@ -2292,6 +2293,10 @@ struct MetalPresenter {
     direct_scanout_textures: HashMap<u64, DirectScanoutTexture>,
     scanout_snapshot_textures: HashMap<u64, ScanoutSnapshotTexture>,
     multisample_textures: HashMap<MultisampleTextureKey, MultisampleResidentTexture>,
+    /// J1: Shared `MTLVisibilityResultBuffer` for Counting-mode occlusion queries.
+    visibility_result_buffer: Option<Buffer>,
+    /// True after at least one draw armed Counting mode since the last OcclusionQuery publish.
+    visibility_counting_armed: bool,
     /// Logical HTILE clear state keyed by the byte address in DB_HTILE_DATA_BASE. Metal cannot
     /// consume guest HTILE directly, so the next attachment use materializes a pending state as
     /// a depth load clear.
@@ -2530,6 +2535,8 @@ impl MetalPresenter {
             direct_scanout_textures: HashMap::new(),
             scanout_snapshot_textures: HashMap::new(),
             multisample_textures: HashMap::new(),
+            visibility_result_buffer: None,
+            visibility_counting_armed: false,
             depth_metadata_clears: HashMap::new(),
             color_metadata_clears: HashMap::new(),
             next_depth_metadata_clear_sequence: 0,

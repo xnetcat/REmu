@@ -541,6 +541,15 @@ impl MetalPresenter {
                         }
                     }
                 }
+                GpuEvent::OcclusionQuery { destination } => {
+                    // J1: close the active pass so Counting-mode results land in the visibility
+                    // buffer, then publish VALID|count into the 16-pair guest block.
+                    if let Err(error) = self.publish_occlusion_query(source, destination) {
+                        eprintln!(
+                            "[REMu][METAL][J1] occlusion query publication failed destination={destination:#x}: {error}"
+                        );
+                    }
+                }
                 GpuEvent::MemoryWait(wait) => {
                     match self.execute_guest_memory_wait(source, None, wait) {
                         Ok(GuestMemoryWaitStatus::Satisfied) => {}
@@ -860,6 +869,7 @@ fn shared_event_host_effect_kind(event: &GpuEvent) -> usize {
         GpuEvent::MemoryCopy(_) | GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
             SHARED_HOST_KIND_DMA
         }
+        GpuEvent::OcclusionQuery { .. } => SHARED_HOST_KIND_DMA,
         GpuEvent::MemoryWait(_)
         | GpuEvent::RegisteredMemoryWait { .. }
         | GpuEvent::WaitFlipDone(_) => SHARED_HOST_KIND_WAIT,

@@ -59,13 +59,14 @@ pub(crate) struct AgcSubmissionPacket {
 }
 
 const INDIRECT_DRAW_REGISTER_UNMAPPED: u32 = 0x280;
-const PIXEL_PIPE_STAT_VALID: u64 = 1 << 63;
-const PIXEL_PIPE_STAT_STEP: u64 = 0x02ff_ffff;
 /// Gen5 result blocks contain sixteen 16-byte render-backend counter pairs.
 ///
 /// Native PS5 command streams clear the full 0x100-byte payload before issuing
-/// `PIXEL_PIPE_STAT_DUMP`; every even qword is a counter and every odd qword is padding.
-const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 16;
+/// `PIXEL_PIPE_STAT_DUMP` (`kOcclusionCounterDump`,
+/// `sdk/target/include/agc/drawcommandbuffer.h:86`); every even qword is a counter and every odd
+/// qword is padding. Publication of the validity bit + real sample counts is the Metal backend's
+/// job (`GpuEvent::OcclusionQuery`) — this module must not fabricate counter values.
+const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = remu_gpu::PIXEL_PIPE_STAT_COUNTER_PAIRS;
 
 fn emit_agc_memory_release(packet_address: u64, release: remu_gpu::GpuMemoryRelease) {
     if trace_guest_sync()
@@ -370,7 +371,11 @@ pub(crate) fn agc_handle_submission_packet(
                 emit_agc_gpu_event(remu_gpu::GpuEvent::PipelineBarrier(barrier));
             }
             Some(AgcEventWrite::PixelPipeStatDump { destination }) => {
-                let value = graphics.pixel_pipe_stat_counter | PIXEL_PIPE_STAT_VALID;
+                // J1: emit the occlusion dump destination for MTLVisibilityResultBuffer publication.
+                // Do not fabricate counter values here — the Metal backend owns the sample count
+                // and the high validity bit (`PIXEL_PIPE_STAT_VALID`).
+                // SDK: drawcommandbuffer.h:86 (kOcclusionCounterDump) + :385-392
+                // (OcclusionQueryResults).
                 static PIXEL_PIPE_STAT_TRACE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
                 let trace_sequence = trace_guest_sync()
                     .then(|| PIXEL_PIPE_STAT_TRACE_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1);
@@ -385,31 +390,10 @@ pub(crate) fn agc_handle_submission_packet(
                 }
                 if let Some(trace_sequence) = trace_query {
                     eprintln!(
-                        "[REMu][AGC][PIXEL-PIPE][EMIT] sequence={trace_sequence} packet={packet_address:#x} destination={destination:#x} value={value:#018x} pairs={PIXEL_PIPE_STAT_COUNTER_PAIRS}"
+                        "[REMu][AGC][PIXEL-PIPE][EMIT] sequence={trace_sequence} packet={packet_address:#x} destination={destination:#x} pairs={PIXEL_PIPE_STAT_COUNTER_PAIRS} (occlusion-query; no fabricated count)"
                     );
                 }
-                for pair in 0..PIXEL_PIPE_STAT_COUNTER_PAIRS {
-                    let release = remu_gpu::GpuMemoryRelease {
-                        address: destination + pair * 16,
-                        value: remu_gpu::GpuMemoryReleaseValue::Immediate64(value),
-                    };
-                    if let Some(trace_sequence) = trace_query {
-                        remu_gpu::record_pixel_pipe_stat_release_trace(
-                            release,
-                            remu_gpu::PixelPipeStatReleaseTrace {
-                                dump_sequence: u64::try_from(trace_sequence).unwrap_or(u64::MAX),
-                                pair_index: u8::try_from(pair).expect(
-                                    "pixel-pipe counter-pair count fits the diagnostic index",
-                                ),
-                            },
-                        );
-                    }
-                    emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryRelease(release));
-                }
-                graphics.pixel_pipe_stat_counter = graphics
-                    .pixel_pipe_stat_counter
-                    .wrapping_add(PIXEL_PIPE_STAT_STEP)
-                    & !PIXEL_PIPE_STAT_VALID;
+                emit_agc_gpu_event(remu_gpu::GpuEvent::OcclusionQuery { destination });
             }
             None => {}
         }

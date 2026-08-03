@@ -35,12 +35,14 @@ pub(crate) fn decode_agc_event_write(
             .map(AgcEventWrite::PipelineBarrier)
             .map(Some);
     }
-    // EVENT_TYPE=0x39 is PIXEL_PIPE_STAT_DUMP. AMD assigns it EVENT_INDEX=1 (the
+    // EVENT_TYPE=0x39 is PIXEL_PIPE_STAT_DUMP / sce::Agc::EventType::kOcclusionCounterDump
+    // (sdk/target/include/agc/drawcommandbuffer.h:86). AMD assigns it EVENT_INDEX=1 (the
     // ZPASS_DONE/PIXEL_PIPE_STAT group), and the two remaining packet dwords name the qword-aligned
     // occlusion-counter destination. The attached RDNA2 ISA manual covers shader instructions,
     // not PM4, but AMD's packet documentation and Linux's GFX10 `nvd.h` agree on this four-dword
     // form. The command processor must publish a validity bit for every render-backend counter:
-    // Unreal's blocking render-query path yields until those bits appear.
+    // Unreal's blocking render-query path yields until those bits appear. J1: decode only names the
+    // destination; `GpuEvent::OcclusionQuery` carries it to the Metal visibility-result publisher.
     if event_type == 0x39 {
         if event_index != 1 || length != 4 || control & !0x0000_0f3f != 0 {
             return Err(AgcSubmissionError::UnsupportedEventWrite {

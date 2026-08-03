@@ -32,7 +32,8 @@ pub use event::{
     GpuEvent, GpuFlipCompletion, GpuFlipWait, GpuMemoryAcquire, GpuMemoryCopy,
     GpuMemoryCopySnapshot, GpuMemoryCopySnapshotBudgetExceeded, GpuMemoryRelease,
     GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage,
-    GpuWaitId, gpu_memory_copy_snapshot_statistics,
+    GpuWaitId, PIXEL_PIPE_STAT_COUNTER_PAIRS, PIXEL_PIPE_STAT_VALID,
+    gpu_memory_copy_snapshot_statistics,
 };
 
 mod diagnostics;

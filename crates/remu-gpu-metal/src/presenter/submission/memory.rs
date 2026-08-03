@@ -891,6 +891,40 @@ impl MetalPresenter {
             self.record_submitted_gpu_waits_in_range(address, byte_count);
         }
     }
+
+    /// Publishes a Gen5 occlusion / pixel-pipe dump through MTLVisibilityResultBuffer counts.
+    ///
+    /// Closes the active render pass first so Counting-mode results are flushed into the Shared
+    /// visibility buffer, then writes `PIXEL_PIPE_STAT_VALID | count` into each of the sixteen
+    /// guest counter pairs via the ordinary MemoryRelease path (preserves wait wakeups / ordering).
+    pub(crate) fn publish_occlusion_query(
+        &mut self,
+        source: OrderedEventSource,
+        destination: u64,
+    ) -> Result<(), String> {
+        if destination == 0 || !destination.is_multiple_of(8) {
+            return Err(format!(
+                "occlusion query destination {destination:#x} is not a qword-aligned guest address"
+            ));
+        }
+        if let Some(batch) = self.active_open_guest_batch_mut() {
+            batch.close_active_pass_encoders();
+        }
+        let armed = self.visibility_counting_armed;
+        let buffer = self.visibility_result_buffer.clone();
+        let releases = super::super::attachment::occlusion_counter_releases(
+            buffer.as_ref(),
+            destination,
+            armed,
+        );
+        self.visibility_counting_armed = false;
+        for release in releases {
+            self.execute_guest_memory_release(source, release)?;
+            self.receiver
+                .retry_guest_memory_waits_overlapping(release.address, 8);
+        }
+        Ok(())
+    }
 }
 
 impl GuestMemoryWriteOperation {

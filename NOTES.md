@@ -145,3 +145,13 @@ Test-only (lower priority): `kernel_api/tests/filesystem.rs:309`, `agc_command_a
 - `cargo check --workspace --all-targets --target x86_64-apple-darwin`: **0 errors**; remu-runtime lib **4** / lib-test **3**; remu-memory **1** warning
 - No `cargo test` / game gates (owner-run)
 
+
+## Batch B5 — attachment/MSAA/occlusion + J1 — 2026-08-03
+
+- **branch:** `worktree-batch-b5-attachment` @ base `7ee8650`
+- **worktree:** `/Users/xnetcat/Documents/REmu/.worktrees/worktree-batch-b5-attachment`
+- **J1:** synthetic pixel-pipe counter deleted; `GpuEvent::OcclusionQuery` + MTLVisibilityResultBuffer
+- **B4-TBDR:** store-action policy + memoryless MSAA gate (loud refuse below 1.2 draws/pass)
+- **B1:** attachment zero-copy eligibility + loud refuse (bind deferred)
+- Full write-up: `~/Documents/REmu-research/implementation-notes/NOTES.md` (Batch B5 entry)
+- Checks: arm64 + x86_64 `cargo check --workspace --all-targets` → 0 errors; no test/gates
