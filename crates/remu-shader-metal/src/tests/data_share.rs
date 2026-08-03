@@ -331,12 +331,48 @@ fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
 }
 
 #[test]
-fn restores_ngg_packed_export_counts_after_empty_workaround_clobber() {
-    // Poppy glyph mesh packs `(verts<<16)|prims` into s4, then runs the GFX10 empty workaround
-    // keyed off `s2 == 0`. On remu, s2 still holds wave id 0 for the allocating wave, so the
-    // guest forces GS_ALLOC / V_CMPX counts to 1 and only vertex 0 exports (solid tofu quads).
-    // Lowering must snapshot the packed value at S_CMPK_LE and restore after S_MAX_U32 s*, 1, *.
-    let program = Program::new(
+fn empty_workaround_packed_export_sequence_refuses_without_proven_ngg_registers() {
+    // J3: the snapshot/restore peephole is deleted. Without Q5-proven NggRegisters the pattern
+    // must fail loudly rather than silently rewrite counts.
+    let program = empty_workaround_ngg_program();
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 192, 64, 192);
+    options.wave_lane_count = 64;
+    let error = compile_msl(&program, &empty_evaluation(), &options)
+        .expect_err("unproven empty-workaround must refuse");
+    assert!(
+        error.to_string().contains("proven NggRegisters"),
+        "loud refuse must name the Q5 proof requirement: {error}"
+    );
+}
+
+#[test]
+fn proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole() {
+    let program = empty_workaround_ngg_program();
+    let mut options = MetalCompileOptions::mesh_from_ngg_registers(
+        1,
+        16 * 1024,
+        192,
+        NggRegisters {
+            pgm_rsrc1: 0x8,
+            gs_max_vert_out: 64,
+            ge_ngg_subgrp_cntl: 64,
+        },
+    );
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("proven NggRegisters may lower the guest empty-workaround as-is");
+    assert!(
+        !shader.source.contains("remu_ngg_packed_export_counts"),
+        "J3 deleted the snapshot/restore peephole"
+    );
+    assert!(
+        !shader.source.contains("remu_ngg_export_counts_pending"),
+        "J3 deleted the snapshot/restore peephole"
+    );
+}
+
+fn empty_workaround_ngg_program() -> Program {
+    Program::new(
         0x1000,
         vec![
             Instruction {
@@ -412,75 +448,53 @@ fn restores_ngg_packed_export_counts_after_empty_workaround_clobber() {
                 control: None,
             },
         ],
-    );
-    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 192, 64, 192);
+    )
+}
+
+#[test]
+fn compacted_vertex_exp_gate_refuses_without_proven_ngg_registers() {
+    // Poppy Slate UI: EXP gated by `V_CMPX_GT_U32 s4, v18`. J3 deletes the staged-vertex
+    // peephole; without Q5-proven registers the pattern must fail loudly.
+    let program = compacted_vertex_exp_program();
+    let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
     options.wave_lane_count = 64;
-    let shader = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("NGG packed-count restore should lower");
+    let error = compile_msl(&program, &empty_evaluation(), &options)
+        .expect_err("unproven compacted-vertex EXP must refuse");
     assert!(
-        shader
-            .source
-            .contains("uint remu_ngg_packed_export_counts = 0u;"),
-        "packed export counts need function-scoped storage across CF blocks"
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_ngg_packed_export_counts = remu_s_4;"),
-        "S_CMPK_LE must snapshot packed (verts<<16)|prims before the empty workaround"
-    );
-    assert!(
-        shader
-            .source
-            .contains("uint remu_ngg_hi = (remu_ngg_packed_export_counts >> 16) & 0x7ffu;"),
-        "restore must read the high half of the pre-alloc SGPR"
-    );
-    assert!(
-        shader
-            .source
-            .contains("uint remu_ngg_lo = remu_ngg_packed_export_counts & 0x7ffu;"),
-        "restore must read the low half of the pre-alloc SGPR"
-    );
-    assert!(
-        shader
-            .source
-            .contains("uint remu_ngg_verts = remu_ngg_hi != 0u ? remu_ngg_hi : remu_ngg_lo;"),
-        "flat scan counts live in the low half; packed counts put verts in the high half"
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_ngg_verts = remu_mesh_input_vertex_count;"),
-        "meshlet vertex count is authoritative for passthrough NGG UI quads"
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_ngg_prims = remu_mesh_input_primitive_count;"),
-        "meshlet primitive count is authoritative for passthrough NGG UI quads"
-    );
-    assert!(
-        shader.source.contains("remu_s_0 = 0u;"),
-        "restore must clear the empty-workaround flag so prim indices are not forced to zero"
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_s_4 = remu_ngg_verts == 0u ? 1u : remu_ngg_verts;"),
-        "s4 must become the vertex count used by GS_ALLOC low bits and V_CMPX"
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_s_107 = remu_ngg_prims == 0u ? 1u : remu_ngg_prims;"),
-        "s107 must become the primitive count used by GS_ALLOC[22:12] and prim V_CMPX"
+        error.to_string().contains("proven NggRegisters"),
+        "loud refuse must name the Q5 proof requirement: {error}"
     );
 }
 
 #[test]
-fn stages_ngg_mesh_vertex_exports_by_compacted_vertex_vgpr() {
-    // Poppy Slate UI: EXP is gated by `V_CMPX_GT_U32 s4, v18` where v18 is the compacted
-    // vertex id. Publishing remu_out via remu_thread_index swaps UV/position across slots.
+fn proven_ngg_registers_lower_compacted_vertex_exp_without_staging_peephole() {
+    let program = compacted_vertex_exp_program();
+    let mut options = MetalCompileOptions::mesh_from_ngg_registers(
+        2,
+        16 * 1024,
+        64,
+        NggRegisters {
+            pgm_rsrc1: 0x8,
+            gs_max_vert_out: 64,
+            ge_ngg_subgrp_cntl: 64,
+        },
+    );
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("proven NggRegisters may lower compacted EXP as-is");
+    assert!(
+        !shader.source.contains("remu_mesh_staged_vertices"),
+        "J3 deleted the staged-vertex peephole"
+    );
+    assert!(
+        shader.source.contains(
+            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out)"
+        ),
+        "epilogue publishes remu_out by thread index without staging"
+    );
+}
+
+fn compacted_vertex_exp_program() -> Program {
     let export = |pc, target, sources| Instruction {
         pc,
         encoding: ShaderEncoding::Exp,
@@ -496,7 +510,7 @@ fn stages_ngg_mesh_vertex_exports_by_compacted_vertex_vgpr() {
             valid_mask: false,
         })),
     };
-    let program = Program::new(
+    Program::new(
         0x1000,
         vec![
             Instruction {
@@ -538,35 +552,7 @@ fn stages_ngg_mesh_vertex_exports_by_compacted_vertex_vgpr() {
                 control: None,
             },
         ],
-    );
-    let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
-    options.wave_lane_count = 64;
-    let shader = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("compacted NGG mesh vertex staging should lower");
-    assert!(
-        shader
-            .source
-            .contains("threadgroup RemuVsOut remu_mesh_staged_vertices[64]"),
-        "compacted exports need a threadgroup staging array"
-    );
-    assert!(
-        shader.source.contains(
-            "if (exec && remu_v_18 < 64u) remu_mesh_staged_vertices[remu_v_18] = remu_out;"
-        ),
-        "EXP must stage remu_out under the compacted vertex VGPR"
-    );
-    assert!(
-        shader.source.contains(
-            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index])"
-        ),
-        "epilogue must publish staged vertices by compacted index"
-    );
-    assert!(
-        !shader.source.contains(
-            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out)"
-        ),
-        "must not publish the exporting thread's private remu_out by thread index"
-    );
+    )
 }
 
 #[test]

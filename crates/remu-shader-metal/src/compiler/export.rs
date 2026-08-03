@@ -160,27 +160,7 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
-        self.stage_mesh_vertex_export();
         Ok(())
-    }
-
-    /// Publish the current `remu_out` under the guest compacted vertex id so Metal
-    /// `set_vertex(i, …)` receives the payload that EXP wrote for vertex `i`, not the
-    /// payload left in the arbitrary thread that happens to own `remu_thread_index == i`.
-    fn stage_mesh_vertex_export(&mut self) {
-        let Some(vgpr) = self.mesh_export_vertex_vgpr else {
-            return;
-        };
-        if self.options.stage != MetalShaderStage::Mesh {
-            return;
-        }
-        self.line(
-            3,
-            &format!(
-                "if (exec && v[{vgpr}] < {}u) remu_mesh_staged_vertices[v[{vgpr}]] = remu_out;",
-                self.options.mesh_max_vertex_count
-            ),
-        );
     }
 
     fn emit_vertex_misc_export(
@@ -209,16 +189,10 @@ impl Compiler<'_> {
             ),
             MetalShaderStage::Mesh => {
                 let max = self.options.mesh_max_vertex_count;
-                match self.mesh_export_vertex_vgpr {
-                    Some(vgpr) => (
-                        format!("remu_mesh_render_target_indices[v[{vgpr}]]"),
-                        format!(" && v[{vgpr}] < {max}u"),
-                    ),
-                    None => (
-                        "remu_mesh_render_target_indices[remu_thread_index]".to_owned(),
-                        format!(" && remu_thread_index < {max}u"),
-                    ),
-                }
+                (
+                    "remu_mesh_render_target_indices[remu_thread_index]".to_owned(),
+                    format!(" && remu_thread_index < {max}u"),
+                )
             }
             _ => return Ok(()),
         };
@@ -274,7 +248,6 @@ impl Compiler<'_> {
                 );
             }
         }
-        self.stage_mesh_vertex_export();
         Ok(())
     }
 

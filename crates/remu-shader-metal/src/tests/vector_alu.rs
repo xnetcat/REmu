@@ -73,16 +73,11 @@ fn lowers_relative_vector_moves_with_m0_and_the_allocated_register_limit() {
 }
 
 #[test]
-fn pixel_movrels_serialization_indexes_per_lane_without_killing_exec() {
-    // Guest wave-serializes divergent relative VGPR banks:
-    //   v_readfirstlane_b32 s4, v5
-    //   v_cmpx_eq_u32 s4, v5
-    //   s_mov_b32 m0, s4
-    //   v_movrels_b32 v2, v0
-    // On Metal fragments that must not permanently clear non-matching lanes.
+fn pixel_movrels_serialization_refuses_without_a_proven_metal_path() {
+    // J3: the EXEC-preserving serialization peephole is deleted. The idiom must fail loudly.
     let mut options = MetalCompileOptions::pixel(Vec::new(), 0, 0);
     options.allocated_vector_register_count = 8;
-    let shader = compile_msl(
+    let error = compile_msl(
         &Program::new(
             0x1000,
             vec![
@@ -127,24 +122,11 @@ fn pixel_movrels_serialization_indexes_per_lane_without_killing_exec() {
         &empty_evaluation(),
         &options,
     )
-    .expect("pixel movrels serialization should lower");
-
+    .expect_err("pixel movrels serialization must refuse");
     assert!(
-        shader.source.contains("switch (remu_v_5)"),
-        "expected per-lane index switch, got:\n{}",
-        shader.source
+        error.to_string().contains("V_MOVRELS serialization"),
+        "loud refuse must name the idiom: {error}"
     );
-    assert!(
-        !shader.source.contains("switch (remu_s_124)"),
-        "must not index MOVRELS by uniform M0 in the serialization idiom:\n{}",
-        shader.source
-    );
-    assert!(
-        !shader.source.contains("== (remu_v_5)"),
-        "V_CMPX must not kill EXEC for non-matching lanes:\n{}",
-        shader.source
-    );
-    assert!(shader.source.contains("if (exec) remu_v_2 ="));
 }
 
 #[test]

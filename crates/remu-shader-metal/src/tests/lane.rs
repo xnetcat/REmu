@@ -265,6 +265,7 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             lds_size_bytes: 2_048,
             wave_lane_count: 64,
             allocated_vector_register_count: 256,
+            ngg_registers_proven: false,
         },
     )
     .expect("wave64 readfirstlane should lower with threadgroup exchange");
@@ -385,40 +386,35 @@ fn lowers_readlane_and_writelane_independently_of_exec() {
     );
     assert!(read.source.contains("remu_s_8 = "));
 
-    let write = compile_vector_instruction(
-        Instruction {
-            pc: 0,
-            encoding: ShaderEncoding::Vop3,
-            opcode: Opcode::Known("VWritelaneB32"),
-            words: vec![0, 0],
-            sources: vec![Operand::scalar(2), Operand::scalar(4)],
-            destinations: vec![Operand::vector(8)],
-            control: None,
-        },
-        MetalShaderStage::Pixel,
-    );
+    // J3: pixel V_WRITELANE refuses — no proven Metal lane occupancy for wave-constant tables.
+    let write_error = compile_msl(
+        &Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VWritelaneB32"),
+                words: vec![0, 0],
+                sources: vec![Operand::scalar(2), Operand::scalar(4)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            }],
+        ),
+        &empty_evaluation(),
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect_err("pixel V_WRITELANE must refuse");
     assert!(
-        write.source.contains("uint remu_v_8_lanes[32] = {};"),
-        "pixel V_WRITELANE needs a private lane table"
+        write_error.to_string().contains("lane-file peephole")
+            || write_error.to_string().contains("V_WRITELANE"),
+        "loud refuse must name the lane-file peephole: {write_error}"
     );
-    assert!(
-        write
-            .source
-            .contains("remu_v_8_lanes[(remu_s_4) & 31u] = remu_s_2;"),
-        "every fragment must record the writelane even when its remu_lane is not the target"
-    );
-    assert!(
-        write
-            .source
-            .contains("if (remu_lane == ((remu_s_4) & 31u)) remu_v_8 = remu_s_2;")
-    );
-    assert!(!write.source.contains("if (exec) remu_v_8 ="));
 }
 
 #[test]
-fn pixel_readlane_uses_writelane_private_lane_file() {
-    // Poppy glyph PS packs SDF float constants with V_WRITELANE into v12 then V_READLANE.
-    // Metal fragment simdgroups do not occupy lanes 0..21, so simd_shuffle cannot see them.
+fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
+    // J3: the private lane-file peephole is deleted. Pixel V_WRITELANE/V_READLANE tables must
+    // fail loudly until Metal lane occupancy is proven.
     let program = Program::new(
         0x1000,
         vec![
@@ -442,7 +438,7 @@ fn pixel_readlane_uses_writelane_private_lane_file() {
             },
         ],
     );
-    let shader = compile_msl(
+    let error = compile_msl(
         &program,
         &empty_evaluation(),
         &MetalCompileOptions {
@@ -467,26 +463,14 @@ fn pixel_readlane_uses_writelane_private_lane_file() {
             lds_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: 256,
+            ngg_registers_proven: false,
         },
     )
-    .expect("pixel writelane/readlane pair should lower");
-    assert!(shader.source.contains("uint remu_v_12_lanes[32] = {};"));
+    .expect_err("pixel writelane table must refuse");
     assert!(
-        shader
-            .source
-            .contains("remu_v_12_lanes[(remu_s_4) & 31u] = remu_s_2;")
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_s_8 = remu_v_12_lanes[(remu_s_4) & 31u]")
-            || shader.source.contains("remu_v_12_lanes[(remu_s_4) & 31u];"),
-        "readlane must load the private table, not simd_shuffle: {}",
-        shader.source
-    );
-    assert!(
-        !shader.source.contains("simd_shuffle(remu_v_12"),
-        "simd_shuffle cannot see inactive fragment lanes for the SDF constant table"
+        error.to_string().contains("lane-file peephole")
+            || error.to_string().contains("V_WRITELANE"),
+        "loud refuse must name the lane-file peephole: {error}"
     );
 }
 

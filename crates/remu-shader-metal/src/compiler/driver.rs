@@ -182,12 +182,25 @@ impl<'a> Compiler<'a> {
             }
         }
         let control_flow = analyze_control_flow(program)?;
-        let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh)
-            .then(|| mesh_export_vertex_vgpr(program))
-            .flatten();
-        let mesh_ngg_packed_export_sgpr = (options.stage == MetalShaderStage::Mesh)
-            .then(|| mesh_ngg_packed_export_sgpr(program))
-            .flatten();
+        // J3: compacted-vertex EXP staging and the GFX10 empty-workaround snapshot/restore are
+        // deleted. Detecting either pattern without proven Q5 NggRegisters is a loud refuse —
+        // never a silent title-specific rewrite. With proven registers the guest sequence lowers
+        // as-is (GS_ALLOC_REQ still honours M0; EXP publishes by remu_thread_index). Remaining
+        // seams: s2 wave-id vs empty-check ABI, and compacted vertex-id → set_vertex mapping.
+        if options.stage == MetalShaderStage::Mesh && !options.ngg_registers_proven {
+            if mesh_ngg_packed_export_sgpr(program).is_some() {
+                return Err(MetalCompileError::InvalidInterface(
+                    "NGG GFX10 empty-workaround / packed export-count sequence requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing the title-specific snapshot/restore peephole"
+                        .into(),
+                ));
+            }
+            if mesh_export_vertex_vgpr(program).is_some() {
+                return Err(MetalCompileError::InvalidInterface(
+                    "NGG compacted-vertex EXP gate requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing the title-specific staged-vertex peephole"
+                        .into(),
+                ));
+            }
+        }
 
         Ok(Self {
             program,
@@ -201,10 +214,6 @@ impl<'a> Compiler<'a> {
             image_kinds,
             image_slots,
             control_flow,
-            mesh_export_vertex_vgpr,
-            mesh_ngg_packed_export_sgpr,
-            mesh_ngg_export_counts_pending: false,
-            pending_movrels_lane_index_vgpr: None,
         })
     }
 

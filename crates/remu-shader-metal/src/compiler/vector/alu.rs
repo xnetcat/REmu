@@ -77,21 +77,11 @@ impl Compiler<'_> {
                 // have consumed the current value.
                 self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
                 selected
-            } else if let Some(vgpr) =
-                source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
-            {
-                // Pixel/vertex: read the private wave-VGPR table filled by V_WRITELANE. Metal
-                // fragment simdgroups often have only a 2x2 quad of active lanes, so shuffling
-                // from lane 9+ would miss Poppy Slate's SDF constant table and solid-fill tofu.
-                let lane_mask = if self.options.wave_lane_count == 64 {
-                    63
-                } else {
-                    31
-                };
-                self.temp(
-                    "uint",
-                    &format!("remu_v_{vgpr}_lanes[({lane}) & {lane_mask}u]"),
-                )
+            } else if source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr)).is_some() {
+                return Err(
+                    "pixel/vertex V_READLANE of a V_WRITELANE wave-constant table has no proven Metal lane occupancy; refusing the private lane-file peephole"
+                        .into(),
+                );
             } else {
                 self.temp(
                     "uint",
@@ -100,23 +90,6 @@ impl Compiler<'_> {
             };
             // V_READLANE is a wave operation and is architecturally independent of EXEC.
             self.store_scalar(destination, &selected);
-            // Poppy glyph NGG: the lane-3 reduce into the packed export SGPR can be 0 when the
-            // per-wave LDS totals never load (wave-count mask edge). Without verts in the high
-            // half, the later `v18 < (s4>>16)` prim-rebuild gate is skipped and PLAY/SETTINGS
-            // keep culled indices. Fall back to the meshlet header before that compare runs.
-            if self.mesh_ngg_packed_export_sgpr == Some(destination) {
-                self.line(
-                    3,
-                    &format!("if (((s[{destination}] >> 16) & 0xFFFFu) == 0u && remu_mesh_input_vertex_count != 0u && remu_mesh_input_vertex_count < 256u) {{"),
-                );
-                self.line(
-                    4,
-                    &format!(
-                        "s[{destination}] = ((remu_mesh_input_vertex_count & 0xFFFFu) << 16) | (remu_mesh_input_primitive_count & 0xFFFFu);"
-                    ),
-                );
-                self.line(3, "}");
-            }
             return Ok(());
         }
         if name == "VReadfirstlaneB32" {
@@ -174,6 +147,16 @@ impl Compiler<'_> {
             let destination = destination_vector(instruction)?;
             let value = self.raw_source(instruction, 0)?;
             let lane = self.raw_source(instruction, 1)?;
+            // J3: the private graphics lane-file peephole (Poppy Slate SDF constants) is deleted.
+            // Metal fragment/vertex simdgroups do not prove architectural lane occupancy for
+            // V_WRITELANE tables, so this path refuses loudly rather than silently filling tofu
+            // via simd_shuffle or inventing a title-specific private table.
+            if !self.is_threadgroup_stage() {
+                return Err(
+                    "pixel/vertex V_WRITELANE wave-constant table has no proven Metal lane occupancy; refusing the private lane-file peephole"
+                        .into(),
+                );
+            }
             // V_WRITELANE also ignores EXEC: exactly the selected physical lane is replaced and
             // all other lanes retain the old VGPR value.
             let architectural_lane = if self.split_wave64() {
@@ -187,15 +170,6 @@ impl Compiler<'_> {
                 31
             };
             let lane_index = format!("({lane}) & {lane_mask}u");
-            if self.graphics_lane_file_vgpr(destination) {
-                // Every graphics invocation executes the same uniform writelane stream, so each
-                // thread can keep a complete private copy of the wave VGPR without needing the
-                // destination architectural lane to be occupied in the Metal simdgroup.
-                self.line(
-                    3,
-                    &format!("remu_v_{destination}_lanes[{lane_index}] = {value};"),
-                );
-            }
             self.line(
                 3,
                 &format!("if ({architectural_lane} == ({lane_index})) v[{destination}] = {value};"),
@@ -919,21 +893,17 @@ impl Compiler<'_> {
         } else {
             self.store_vector(destination, &value);
         }
-        self.pending_movrels_lane_index_vgpr = None;
         Ok(())
     }
 
-    /// Selector for `V_MOVREL*`: architectural M0 (`s[124]`), or the per-lane index VGPR when the
-    /// pixel-stage serialization idiom was recognized at the preceding `V_CMPX`.
+    /// Selector for `V_MOVREL*`: architectural M0 (`s[124]`).
     fn relative_vector_index_expression(&self) -> String {
-        self.pending_movrels_lane_index_vgpr
-            .map_or_else(|| "s[124]".to_owned(), |vgpr| format!("v[{vgpr}]"))
+        "s[124]".to_owned()
     }
 
     /// Detects `V_READFIRSTLANE vIdx → sTmp; V_CMPX_EQ sTmp, vIdx; S_MOV M0, sTmp; V_MOVRELS`.
     ///
-    /// Returns the per-lane index VGPR when the pixel shader uses that AMD wave-serialization
-    /// pattern so Metal can keep divergent fragment lanes alive.
+    /// Used only to refuse the pattern loudly (J3); the former EXEC-preserving peephole is gone.
     pub(crate) fn pixel_movrels_serialization_index_vgpr(&self, cmpx: &Instruction) -> Option<u32> {
         if self.options.stage != crate::MetalShaderStage::Pixel {
             return None;

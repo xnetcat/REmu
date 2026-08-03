@@ -227,6 +227,11 @@ pub struct MetalCompileOptions {
     /// scalarized per-register locals to retain a dynamic subscript, so lowering expands the
     /// selection only across this architectural allocation.
     pub allocated_vector_register_count: u32,
+    /// Set when [`MetalCompileOptions::mesh_from_ngg_registers`] built these options from real
+    /// guest NGG register dwords (workstream Q5). J3 peephole deletions require this proof before
+    /// they will lower NGG glyph sequences; without it those patterns fail loudly instead of
+    /// applying a title-specific heuristic.
+    pub ngg_registers_proven: bool,
 }
 
 impl MetalCompileOptions {
@@ -254,6 +259,7 @@ impl MetalCompileOptions {
             lds_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
+            ngg_registers_proven: false,
         }
     }
 
@@ -285,6 +291,7 @@ impl MetalCompileOptions {
             lds_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
+            ngg_registers_proven: false,
         }
     }
 
@@ -312,6 +319,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
+            ngg_registers_proven: false,
         }
     }
 
@@ -339,6 +347,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             wave_lane_count,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
+            ngg_registers_proven: false,
         }
     }
 
@@ -380,6 +389,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
+            ngg_registers_proven: false,
         }
     }
 
@@ -415,6 +425,7 @@ impl MetalCompileOptions {
             .clamp(1, VECTOR_REGISTER_COUNT);
         Self {
             allocated_vector_register_count,
+            ngg_registers_proven: true,
             ..Self::mesh(
                 required_vertex_output_count,
                 lds_size_bytes,

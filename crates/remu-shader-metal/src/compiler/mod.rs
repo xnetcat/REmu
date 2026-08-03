@@ -46,21 +46,6 @@ pub(crate) struct Compiler<'a> {
     image_kinds: Vec<ImageKind>,
     image_slots: ImageBindingSlotMap,
     control_flow: ControlFlowLowering,
-    /// VGPR holding the NGG allocated/compacted vertex id that gates EXP (e.g. `v18` in
-    /// `V_CMPX_GT_U32 s4, v18` before POS). When set, mesh exports stage `remu_out` into
-    /// `remu_mesh_staged_vertices[vN]` so the epilogue can `set_vertex` by compacted index
-    /// instead of `remu_thread_index` (Poppy Slate UI tofu).
-    mesh_export_vertex_vgpr: Option<u32>,
-    /// SGPR that holds the pre-GS_ALLOC packed export counts `(verts << 16) | prims` when the
-    /// mesh program uses the GFX10 empty-workaround sequence. Wave 0 still holds the merged wave
-    /// id in `s2`, so the guest `s2 == 0` check always forces counts to 1 and starves EXP; we
-    /// save the packed value at `S_CMPK_LE` and restore verts/prims after the following `S_MAX`.
-    mesh_ngg_packed_export_sgpr: Option<u32>,
-    mesh_ngg_export_counts_pending: bool,
-    /// Pixel-stage `V_READFIRSTLANE`/`V_CMPX`/`S_MOV M0`/`V_MOVRELS` serialization leaves the
-    /// per-lane index VGPR here so `V_MOVRELS` can index without relying on a uniform M0 after
-    /// `V_CMPX` has killed every non-matching fragment lane.
-    pending_movrels_lane_index_vgpr: Option<u32>,
 }
 
 impl Compiler<'_> {

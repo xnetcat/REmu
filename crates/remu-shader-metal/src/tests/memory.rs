@@ -471,10 +471,9 @@ fn range_checks_raw_dword_vectors_per_component() {
 }
 
 #[test]
-fn structured_buffer_oob_honors_expanded_metal_binding_span() {
-    // Poppy Playtime UI reloads V# from SMEM with guest NUM_RECORDS=4 while the presenter
-    // expands the Metal buffer to the instanced draw span. OOB_SELECT=0 must accept those
-    // extra records or every glyph instance past the guest count fetches zeroes (tofu).
+fn structured_buffer_oob_uses_guest_num_records_without_binding_span_expansion() {
+    // J3: the NUM_RECORDS expansion peephole is deleted. Guest NUM_RECORDS alone drives OOB;
+    // Q4 absolute-address pools are the real fix for instanced draws past the guest count.
     let stride = 16_u32;
     let guest_records = 4_u32;
     let draw_records = 256_u32;
@@ -540,14 +539,10 @@ fn structured_buffer_oob_honors_expanded_metal_binding_span() {
         });
 
     let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
-        .expect("expanded structured buffer load should lower");
+        .expect("structured buffer load should lower");
     assert!(
-        shader.source.contains("max(") && shader.source.contains("/ "),
-        "structured OOB must lift NUM_RECORDS from the expanded Metal binding length"
-    );
-    assert!(
-        shader.source.contains("<= 1u &&"),
-        "record lift must stay limited to OOB_SELECT 0/1"
+        !shader.source.contains("max(") || !shader.source.contains("/ remu_"),
+        "J3 deleted the NUM_RECORDS↔binding-span expansion peephole"
     );
 }
 
