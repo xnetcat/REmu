@@ -199,27 +199,54 @@ def parse_flat_stub_arms(dispatch_source: str, return_expression: str) -> set[st
     return result
 
 
+AREA_DISPATCH_CHAINS = (
+    "dispatch_extended_import",
+    "dispatch_stateless_import",
+    "dispatch_probe_import",
+    "import_dispatch",
+)
+
+
+def _nids_outside_tests(source: str) -> set[str]:
+    # Everything outside the test module, so a NID named only by a test is not counted.  Only a
+    # `#[cfg(test)] mod` opens a test region: a bare `#[cfg(test)]` on a helper function midway
+    # through a module must not truncate the dispatch arms that follow it.
+    tests = re.search(r"(?m)^#\[cfg\(test\)\]\n(?:pub(?:\([^)]*\))?\s+)?mod\s", source)
+    return quoted_nids(source[: tests.start()] if tests else source)
+
+
 def area_module_nids(runtime_path: Path) -> set[str]:
     """Returns the NIDs served by the per-area dispatch modules beside the main dispatcher.
 
-    Each area module owns one service family and exposes a `dispatch` the main dispatcher consults
-    after its own table misses, so a NID handled there is implemented just as fully as one handled
-    inline.  Modules are discovered by reading the dispatch chain rather than from a hard-coded
-    list, so adding an area to the runtime does not silently understate coverage here.
+    Each area module owns one service family and exposes a `dispatch` some dispatcher consults
+    after its own table misses, so a NID handled there is implemented just as fully as one
+    handled inline.  Modules are discovered by reading every dispatch chain rather than from a
+    hard-coded list — `dispatch_stateless_import` chains to `fiber`/`platform_services` just as
+    `dispatch_extended_import` chains to the AGC areas — so adding an area to the runtime or a
+    chain call to a dispatcher does not silently understate coverage here.  A module directory
+    beside the module file (`av.rs` + `av/*.rs`) is scanned too, excluding its test trees.
     """
-    try:
-        chain = sibling_function_slice(runtime_path, "dispatch_extended_import")
-    except ValueError:
-        return set()
     served: set[str] = set()
-    for module in re.findall(r"(\w+)::dispatch\(", chain):
-        module_path = runtime_path.with_name(f"{module}.rs")
-        if not module_path.is_file():
+    for dispatcher in AREA_DISPATCH_CHAINS:
+        try:
+            chain = sibling_function_slice(runtime_path, dispatcher)
+        except ValueError:
             continue
-        module_source = module_path.read_text(encoding="utf-8")
-        # Everything outside the test module, so a NID named only by a test is not counted.
-        tests = re.search(r"(?m)^#\[cfg\(test\)\]", module_source)
-        served |= quoted_nids(module_source[: tests.start()] if tests else module_source)
+        for module in re.findall(r"(\w+)::dispatch\(", chain):
+            candidates = (
+                runtime_path.with_name(f"{module}.rs"),
+                runtime_path.with_name(module) / "mod.rs",
+            )
+            module_path = next((path for path in candidates if path.is_file()), None)
+            if module_path is None:
+                continue
+            served |= _nids_outside_tests(module_path.read_text(encoding="utf-8"))
+            module_dir = runtime_path.with_name(module)
+            if module_dir.is_dir():
+                for sub_path in sorted(module_dir.rglob("*.rs")):
+                    if "tests" in sub_path.relative_to(module_dir).parts:
+                        continue
+                    served |= _nids_outside_tests(sub_path.read_text(encoding="utf-8"))
     return served
 
 

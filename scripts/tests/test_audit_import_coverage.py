@@ -63,6 +63,16 @@ import_resolution=host-direct nid=P330P3dFF68 weak=false symbol=P330P3dFF68#A#B
         self.assertEqual(runtime.statuses["vcmNN+AAXnY"], "hle-native-agc")
         self.assertNotEqual(runtime.statuses["8zTFvBIAIN8"], "named-only")
 
+    def test_stateless_dispatch_chain_modules_are_counted_as_served(self) -> None:
+        # The fiber family demonstrably runs (docs/status.md) but is dispatched from
+        # dispatch_stateless_import, a chain the auditor previously did not walk — its NIDs
+        # showed as unserved, making the audit an upper bound instead of a work list.
+        runtime = AUDIT.inspect_runtime_source(
+            Path(__file__).resolve().parents[2] / "crates/remu-runtime/src/lib.rs"
+        )
+        self.assertEqual(runtime.statuses.get("a0LLrZWac0M"), "hle-area-module")
+        self.assertEqual(runtime.statuses.get("BohYr-F7-is"), "hle-area-module")
+
     def test_parse_known_names_follows_nid_table_module(self) -> None:
         names = AUDIT.parse_known_names(
             Path(__file__).resolve().parents[2] / "crates/remu-runtime/src/lib.rs"

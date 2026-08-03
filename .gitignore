@@ -8,3 +8,4 @@
 .worktrees/
 /tmp
 /.tmp
+__pycache__/

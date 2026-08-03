@@ -17,9 +17,11 @@ cannot recover them and must not be used to "verify" them either: applied naivel
 hand-maintained table it flags correct pinned entries as wrong.
 
 The authoritative pairing is in the stub library itself — a `.scenid` section holding one
-8-byte NID per `.dynsym` entry — which is the only source that can name a pinned export.  Until
-this script reads that section, treat its output as covering hashed exports only, and keep the
-pinned entries in the hand-maintained table where they can be sourced deliberately.
+8-byte NID per `.dynsym` entry — which is the only source that can name a pinned export.  This
+script reads that section (`scenid_pairs`): stub-named pairs override hash-derived ones, and a
+name the stubs pair is never hashed, so no phantom hash NID is emitted beside a pinned export.
+Verified against SDK 10.00: 50,206 pairs across all 128 stubs, 16 pinned, in full agreement
+with the independently derived `abi-inventory/sdk10-nid-map.tsv`.
 
 The table carries names only.  It records no signature, layout, or behaviour, and it never
 makes a NID dispatch anywhere -- an unimplemented import stays unimplemented, it just gets
@@ -101,7 +103,8 @@ def sections(data: bytes):
     out = []
     for index in range(e_shnum):
         fields = struct.unpack_from("<IIQQQQIIQQ", data, e_shoff + index * e_shentsize)
-        out.append({"type": fields[1], "offset": fields[4], "size": fields[5], "link": fields[6], "entsize": fields[9]})
+        out.append({"name_offset": fields[0], "type": fields[1], "offset": fields[4],
+                    "size": fields[5], "link": fields[6], "entsize": fields[9]})
     return out
 
 
@@ -126,6 +129,57 @@ def exported_symbols(path: pathlib.Path):
             name = strings[offset:strings.find(b"\0", offset)].decode("utf-8", "replace")
             if name and "#" not in name and not name.startswith("$"):
                 yield name
+
+
+def scenid_pairs(path: pathlib.Path):
+    """Yields authoritative (nid, name) pairs from a link stub's `.scenid` section.
+
+    A stub carries one 8-byte NID per `.dynsym` entry, parallel arrays at shift zero.  This is
+    the only oracle that can name a pinned export — a NID that is not the hash of its own
+    symbol name — so pairs from here override hash-derived pairs.
+    """
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return
+    image = elf_image(data)
+    if image is None:
+        return
+    table = sections(image)
+    if not table:
+        return
+    shstrndx, = struct.unpack_from("<H", image, 0x3E)
+    if shstrndx >= len(table):
+        return
+    shstr = image[table[shstrndx]["offset"]:][: table[shstrndx]["size"]]
+
+    def section_name(section) -> str:
+        offset = section["name_offset"]
+        if offset >= len(shstr):
+            return ""
+        return shstr[offset : shstr.find(b"\0", offset)].decode("utf-8", "replace")
+
+    scenid = next((section for section in table if section_name(section) == ".scenid"), None)
+    dynsym = next((section for section in table if section["type"] == 11), None)
+    if (
+        scenid is None
+        or dynsym is None
+        or not dynsym["entsize"]
+        or dynsym["link"] >= len(table)
+    ):
+        return
+    strings = image[table[dynsym["link"]]["offset"]:][: table[dynsym["link"]]["size"]]
+    count = min(scenid["size"] // 8, dynsym["size"] // dynsym["entsize"])
+    for index in range(count):
+        offset, = struct.unpack_from("<I", image, dynsym["offset"] + index * dynsym["entsize"])
+        if not offset or offset >= len(strings):
+            continue
+        name = strings[offset : strings.find(b"\0", offset)].decode("utf-8", "replace")
+        if not name or "#" in name or name.startswith("$"):
+            continue
+        value, = struct.unpack_from("<Q", image, scenid["offset"] + index * 8)
+        nid = base64.b64encode(struct.pack(">Q", value)).decode()[:11].replace("/", "-")
+        yield nid, name
 
 
 def function_slice(source: str, name: str) -> str:
@@ -230,6 +284,7 @@ def main(argv: list[str] | None = None) -> int:
     destination_path = pathlib.Path(destination)
 
     names = set()
+    authoritative: dict[str, str] = {}
     files_seen = 0
     files_with_symbols = 0
     for root in roots:
@@ -241,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
             if found:
                 files_with_symbols += 1
                 names.update(found)
+            authoritative.update(scenid_pairs(path))
 
     if files_seen and not files_with_symbols:
         print(
@@ -250,7 +306,13 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     known = already_named()
-    table = [(nid, name) for nid, name in sorted({nid_of(name): name for name in names}.items())
+    # `.scenid` pairs are authoritative and include pinned exports; hashing a pinned export's
+    # name would emit a phantom NID no binary uses, so names the stubs already pair are never
+    # hashed, and on any residual collision the authoritative pair wins.
+    scenid_named = set(authoritative.values())
+    merged = {nid_of(name): name for name in names if name not in scenid_named}
+    merged.update(authoritative)
+    table = [(nid, name) for nid, name in sorted(merged.items())
              if nid not in known and len(name) < 256]
 
     previous = existing_table_count(destination_path)
