@@ -2,15 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use metal::{
+    foreign_types::ForeignTypeRef,
     CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
-    MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
+    MTLTextureUsage, RenderPassDescriptor, Texture, TextureDescriptor,
 };
 use remu_memory::CpuWriteWatchRetirement;
 use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
 use super::super::refresh_resident_texture_write_watch;
 use super::super::texture::{
     ResidentSpanIndex, ResidentTextureMap, SpanQueryOrder, ensure_resident_texture_in_map,
+    sampled_texture_supports_access,
 };
 use super::super::{
     OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
@@ -46,6 +48,36 @@ use super::{
     storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
     write_watched_guest_texture_linear,
 };
+
+fn upload_test_image_textures(
+    presenter: &mut MetalPresenter,
+    evaluation: &ShaderEvaluation,
+) -> Vec<Texture> {
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    upload_image_textures(
+        "test",
+        &device,
+        &queue,
+        evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
+    )
+    .expect("test image bindings upload")
+    .into_iter()
+    .map(|binding| binding.texture)
+    .collect()
+}
 
 #[test]
 fn accepts_large_rdna2_storage_ranges_when_descriptor_math_is_valid() {
@@ -1275,6 +1307,132 @@ fn sampled_texture_cache_key_ignores_shader_applied_component_selection() {
         super::sampled_texture_key(descriptor, false),
         super::sampled_texture_key(alternate, true)
     );
+}
+
+#[test]
+fn sampled_texture_usage_is_promoted_without_splitting_guest_image_identity() {
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let queue = device.new_command_queue();
+    let guest = GuestTextureDescriptor {
+        address: 0x10_0000,
+        width: 1,
+        height: 1,
+        pitch: 1,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let sampled = create_sampled_guest_texture(
+        &device,
+        &queue,
+        guest,
+        &[1, 2, 3, 4],
+        0,
+        1,
+        13,
+        1,
+        false,
+        false,
+    )
+    .expect("ordinary 2D-array sample texture");
+    assert_eq!(sampled.usage(), MTLTextureUsage::ShaderRead);
+    assert!(sampled_texture_supports_access(&sampled, false));
+    assert!(!sampled_texture_supports_access(&sampled, true));
+
+    let storage = create_sampled_guest_texture(
+        &device,
+        &queue,
+        guest,
+        &[1, 2, 3, 4],
+        0,
+        1,
+        13,
+        1,
+        false,
+        true,
+    )
+    .expect("writable 2D-array storage texture");
+    assert_eq!(
+        storage.usage(),
+        MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+    );
+    assert!(sampled_texture_supports_access(&storage, false));
+    assert!(sampled_texture_supports_access(&storage, true));
+}
+
+#[test]
+fn load_before_store_binds_one_read_write_array_texture() {
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 13 << 28;
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1, 2],
+        vector_data: 4,
+        scalar_resource: 12,
+        scalar_sampler: 0,
+        dimension: 5,
+        is_array: true,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let mut store = ImageBinding {
+        pc: 0x38,
+        opcode: Opcode::Known("ImageStore"),
+        control: control.clone(),
+        resource_descriptor: resource_descriptor.clone().into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    };
+    let load = ImageBinding {
+        pc: 0x30,
+        opcode: Opcode::Known("ImageLoad"),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    };
+    store.control.vector_data = 8;
+    let evaluation = |image_bindings| ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings,
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+
+    let (_transition_sender, transition_receiver) = std::sync::mpsc::channel();
+    let mut transition =
+        MetalPresenter::new(transition_receiver).expect("Metal presenter state");
+    let read_only = upload_test_image_textures(&mut transition, &evaluation(vec![load.clone()]));
+    assert_eq!(read_only.len(), 1);
+    assert!(!sampled_texture_supports_access(&read_only[0], true));
+    let promoted = upload_test_image_textures(&mut transition, &evaluation(vec![store.clone()]));
+    assert_eq!(promoted.len(), 1);
+    assert_ne!(read_only[0].as_ptr(), promoted[0].as_ptr());
+    assert!(sampled_texture_supports_access(&promoted[0], true));
+    let reused = upload_test_image_textures(&mut transition, &evaluation(vec![load.clone()]));
+    assert_eq!(reused.len(), 1);
+    assert_eq!(promoted[0].as_ptr(), reused[0].as_ptr());
+    assert_eq!(transition.fallback_texture_cache.len(), 1);
+
+    let (_combined_sender, combined_receiver) = std::sync::mpsc::channel();
+    let mut combined = MetalPresenter::new(combined_receiver).expect("Metal presenter state");
+    let uploaded = upload_test_image_textures(&mut combined, &evaluation(vec![load, store]));
+    assert_eq!(uploaded.len(), 2);
+    assert_eq!(uploaded[0].as_ptr(), uploaded[1].as_ptr());
+    assert_eq!(combined.fallback_texture_cache.len(), 1);
+    for texture in &uploaded {
+        assert_eq!(texture.texture_type(), MTLTextureType::D2Array);
+        assert!(sampled_texture_supports_access(texture, true));
+    }
 }
 
 #[test]
@@ -4359,8 +4517,10 @@ fn cube_sampled_textures_serve_face_atlas_coordinates_as_2d_array_layers() {
             linear.push(u8::try_from(face * 36 + texel + 1).expect("identity texel fits u8"));
         }
     }
-    let texture = create_sampled_guest_texture(&device, &queue, guest, &linear, 0, 1, 11, 6, false)
-        .expect("six-face cube uploads as a 2D array");
+    let texture = create_sampled_guest_texture(
+        &device, &queue, guest, &linear, 0, 1, 11, 6, false, false,
+    )
+    .expect("six-face cube uploads as a 2D array");
     assert_eq!(texture.texture_type(), MTLTextureType::D2Array);
     assert_eq!(texture.array_length(), 6);
 
