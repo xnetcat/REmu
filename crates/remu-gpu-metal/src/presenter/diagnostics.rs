@@ -611,28 +611,48 @@ pub(super) fn trace_scanout_writes() -> bool {
     })
 }
 
-fn parse_diagnostic_shader_addresses(value: &str) -> Vec<u64> {
-    value
+#[derive(Debug, Eq, PartialEq)]
+enum DiagnosticScanoutWriterFilter {
+    Disabled,
+    All,
+    Addresses(Vec<u64>),
+}
+
+fn parse_diagnostic_scanout_writer_filter(value: &str) -> DiagnosticScanoutWriterFilter {
+    if value.trim().eq_ignore_ascii_case("auto") {
+        return DiagnosticScanoutWriterFilter::All;
+    }
+    let addresses = value
         .split(',')
         .filter_map(|part| parse_diagnostic_hex_address(part.trim()))
-        .collect()
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        DiagnosticScanoutWriterFilter::Disabled
+    } else {
+        DiagnosticScanoutWriterFilter::Addresses(addresses)
+    }
 }
 
 /// Selects scanout writers for an ordered, per-draw source/capture trace.
 ///
 /// This diagnostic is deliberately narrower than `REMU_TRACE_SCANOUT_WRITES`: a title can issue
 /// dozens of UI writers per frame, and settling all of them would perturb the workload beyond
-/// recognition. The comma-separated filter contains pixel-shader addresses in hexadecimal.
+/// recognition. The filter is either `auto` for every known scanout writer after the minimum
+/// draw, or comma-separated pixel-shader addresses in hexadecimal.
 pub(super) fn diagnostic_scanout_writer_selected(pixel_shader_address: u64) -> bool {
-    static FILTER: OnceLock<Vec<u64>> = OnceLock::new();
-    FILTER
-        .get_or_init(|| {
+    static FILTER: OnceLock<DiagnosticScanoutWriterFilter> = OnceLock::new();
+    match FILTER.get_or_init(|| {
             std::env::var("REMU_DIAGNOSTIC_SCANOUT_WRITERS")
                 .ok()
-                .map(|value| parse_diagnostic_shader_addresses(&value))
-                .unwrap_or_default()
-        })
-        .contains(&pixel_shader_address)
+                .map(|value| parse_diagnostic_scanout_writer_filter(&value))
+                .unwrap_or(DiagnosticScanoutWriterFilter::Disabled)
+        }) {
+        DiagnosticScanoutWriterFilter::Disabled => false,
+        DiagnosticScanoutWriterFilter::All => true,
+        DiagnosticScanoutWriterFilter::Addresses(addresses) => {
+            addresses.contains(&pixel_shader_address)
+        }
+    }
 }
 
 /// Allocates a bounded trace slot for a selected scanout writer.
@@ -1765,8 +1785,26 @@ mod tests {
     #[test]
     fn scanout_writer_shader_filter_accepts_prefixed_and_plain_hex() {
         assert_eq!(
-            parse_diagnostic_shader_addresses("0x8059850000, 8051dc0000,invalid,,0X80d3b70000"),
-            vec![0x8059_850000, 0x8051_dc0000, 0x80d3_b70000]
+            parse_diagnostic_scanout_writer_filter(
+                "0x8059850000, 8051dc0000,invalid,,0X80d3b70000"
+            ),
+            DiagnosticScanoutWriterFilter::Addresses(vec![
+                0x8059_850000,
+                0x8051_dc0000,
+                0x80d3_b70000
+            ])
+        );
+    }
+
+    #[test]
+    fn scanout_writer_auto_filter_selects_runtime_discovered_writers() {
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter(" AUTO "),
+            DiagnosticScanoutWriterFilter::All
+        );
+        assert_eq!(
+            parse_diagnostic_scanout_writer_filter("invalid,,"),
+            DiagnosticScanoutWriterFilter::Disabled
         );
     }
 
