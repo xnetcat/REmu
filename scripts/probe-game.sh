@@ -36,17 +36,25 @@ fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
+# Plan H2: serialize cargo rebuilds across parallel sessions.
+# shellcheck source=lib/remu-build-lock.sh
+. "$script_dir/lib/remu-build-lock.sh"
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 # Runtime artifacts are diagnostics rather than project sources; keep them in the user's
 # temporary directory by default, matching run-game.sh.
 run_root=${REMU_RUN_ROOT:-"${TMPDIR:-/tmp}/remu-runs"}
 run_dir="$run_root/$run_id-probe"
-binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
+raw_binary="$repo_dir/target/x86_64-apple-darwin/release/remu"
+# probe-game launches the raw binary (no app bundle); still take the exclusive lock so a
+# concurrent run-game.sh cannot rewrite target/.../remu mid-link.
 mkdir -p "$run_dir"
 
-echo "[REMu] building the Rosetta probe"
-cargo build --manifest-path "$repo_dir/Cargo.toml" \
-    --release --target x86_64-apple-darwin -p remu-cli
+binary=$(remu_with_exclusive_build_lock \
+    "$script_dir/lib/prepare-rosetta-runner.sh" \
+    --repo-dir "$repo_dir" \
+    --raw-binary "$raw_binary" \
+    --app-bundle "$repo_dir/target/x86_64-apple-darwin/release/REMu.app" \
+    --headless)
 
 echo "[REMu] launching under LLDB; artifacts: $run_dir"
 set +e

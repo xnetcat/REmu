@@ -84,6 +84,9 @@ fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
+# Plan H2: serialize cargo rebuilds / shared REMu.app installs across parallel sessions.
+# shellcheck source=lib/remu-build-lock.sh
+. "$script_dir/lib/remu-build-lock.sh"
 # Offline libraries are retained across launches by default (plan F1): the runner discovers the
 # bundled toolchain itself, so no export is needed here. REMU_USE_BUNDLED_METAL_COMPILER=0 still
 # selects Apple's in-process source compiler for diagnosis, now through the runner's kill-switch.
@@ -270,23 +273,45 @@ if [ ! -d "$launch_working_directory" ]; then
     exit 66
 fi
 
+# Exclusive lock covers cargo + app-bundle install. SKIP_BUILD launches take a shared lock so
+# they wait for an in-progress rebuild, then run concurrently with each other. Pin
+# REMU_APP_BUNDLE to a private path (and REMU_SKIP_BUILD=1 after a verified build) for parallel
+# sessions that must not rewrite the shared default REMu.app — the shared lock still serializes
+# against writers rewriting target/.../remu.
 if [ "${REMU_SKIP_BUILD:-0}" != 1 ]; then
-    echo "[REMu] building the Rosetta release runner"
-    cargo build --manifest-path "$repo_dir/Cargo.toml" \
-        --release --target x86_64-apple-darwin -p remu-cli
-fi
-
-if [ ! -x "$raw_binary" ]; then
-    echo "error: Rosetta runner not found: $raw_binary" >&2
-    exit 69
-fi
-
-if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
-    binary=$raw_binary
+    if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
+        binary=$(remu_with_exclusive_build_lock \
+            "$script_dir/lib/prepare-rosetta-runner.sh" \
+            --repo-dir "$repo_dir" \
+            --raw-binary "$raw_binary" \
+            --app-bundle "$app_bundle" \
+            --headless)
+    else
+        binary=$(remu_with_exclusive_build_lock \
+            "$script_dir/lib/prepare-rosetta-runner.sh" \
+            --repo-dir "$repo_dir" \
+            --raw-binary "$raw_binary" \
+            --app-bundle "$app_bundle")
+    fi
 else
-    "$script_dir/build-macos-app.sh" "$raw_binary" "$app_bundle" >/dev/null
-    binary="$app_bundle/Contents/MacOS/remu"
+    if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
+        binary=$(remu_with_shared_build_lock \
+            "$script_dir/lib/prepare-rosetta-runner.sh" \
+            --repo-dir "$repo_dir" \
+            --raw-binary "$raw_binary" \
+            --app-bundle "$app_bundle" \
+            --skip-build \
+            --headless)
+    else
+        binary=$(remu_with_shared_build_lock \
+            "$script_dir/lib/prepare-rosetta-runner.sh" \
+            --repo-dir "$repo_dir" \
+            --raw-binary "$raw_binary" \
+            --app-bundle "$app_bundle" \
+            --skip-build)
+    fi
 fi
+
 
 # Interactive runs never inject controller input unless the caller explicitly supplies a schedule.
 # After its final scheduled pulse, the automation alternates Cross and Square once per second.

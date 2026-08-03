@@ -91,6 +91,9 @@ fi
 
 script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 repo_dir=$(dirname -- "$script_dir")
+# Plan H2: serialize cargo rebuilds / shared REMu.app installs across parallel sessions.
+# shellcheck source=lib/remu-build-lock.sh
+. "$script_dir/lib/remu-build-lock.sh"
 trace_script="$script_dir/lldb_taskgraph_trace.py"
 run_id=$(date -u +%Y%m%dT%H%M%SZ)
 run_root=${REMU_RUN_ROOT:-"${TMPDIR:-/tmp}/remu-runs"}
@@ -161,20 +164,37 @@ fi
 
 if [ "$attach_mode" -eq 0 ]; then
     if [ "${REMU_SKIP_BUILD:-0}" != 1 ]; then
-        echo "[REMu] building the Rosetta release runner"
-        cargo build --manifest-path "$repo_dir/Cargo.toml" \
-            --release --target x86_64-apple-darwin -p remu-cli
-    fi
-    if [ ! -x "$raw_binary" ]; then
-        echo "error: Rosetta runner not found: $raw_binary" >&2
-        exit 69
-    fi
-
-    if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
-        binary=$raw_binary
+        if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
+            binary=$(remu_with_exclusive_build_lock \
+                "$script_dir/lib/prepare-rosetta-runner.sh" \
+                --repo-dir "$repo_dir" \
+                --raw-binary "$raw_binary" \
+                --app-bundle "$app_bundle" \
+                --headless)
+        else
+            binary=$(remu_with_exclusive_build_lock \
+                "$script_dir/lib/prepare-rosetta-runner.sh" \
+                --repo-dir "$repo_dir" \
+                --raw-binary "$raw_binary" \
+                --app-bundle "$app_bundle")
+        fi
     else
-        "$script_dir/build-macos-app.sh" "$raw_binary" "$app_bundle" >/dev/null
-        binary="$app_bundle/Contents/MacOS/remu"
+        if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
+            binary=$(remu_with_shared_build_lock \
+                "$script_dir/lib/prepare-rosetta-runner.sh" \
+                --repo-dir "$repo_dir" \
+                --raw-binary "$raw_binary" \
+                --app-bundle "$app_bundle" \
+                --skip-build \
+                --headless)
+        else
+            binary=$(remu_with_shared_build_lock \
+                "$script_dir/lib/prepare-rosetta-runner.sh" \
+                --repo-dir "$repo_dir" \
+                --raw-binary "$raw_binary" \
+                --app-bundle "$app_bundle" \
+                --skip-build)
+        fi
     fi
 fi
 
