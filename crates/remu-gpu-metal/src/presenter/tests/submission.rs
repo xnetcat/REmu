@@ -28,11 +28,13 @@ use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::submission::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges, release_value_for_wait,
+    shared_event_host_effect_is_resolved,
 };
 use super::super::{
     CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
     PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SharedEventDrawReject, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
+    SharedEventDrawReject, SharedEventFence, SharedEventProducerId, SharedEventSignalCheckpoint,
+    SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -4886,6 +4888,83 @@ fn shared_event_direct_draw_outcome_counts_encoding_and_internal_drains_separate
         presenter.statistics.shared_event_draw_internal_drains, 1,
         "an admitted draw which explicitly settles Metal work is never interpreted as a saved gate"
     );
+}
+
+#[test]
+fn shared_event_host_effect_readiness_queries_only_exact_required_state() {
+    use std::cell::{Cell, RefCell};
+
+    let consumer = SharedEventProducerId::new(7);
+    let first_producer = SharedEventProducerId::new(41);
+    let second_producer = SharedEventProducerId::new(99);
+    let consumer_ack = SharedEventFence::new(consumer, 3);
+    let terminal_dependencies = [
+        SharedEventFence::new(first_producer, 5),
+        SharedEventFence::new(second_producer, 2),
+    ];
+
+    let outstanding_queries = Cell::new(0);
+    let shared_queries = RefCell::new(Vec::new());
+    let retired_queries = RefCell::new(Vec::new());
+    assert!(!shared_event_host_effect_is_resolved(
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| {
+            outstanding_queries.set(outstanding_queries.get() + 1);
+            false
+        },
+        |producer| {
+            shared_queries.borrow_mut().push(producer);
+            Some(2)
+        },
+        |producer| {
+            retired_queries.borrow_mut().push(producer);
+            Some(u64::MAX)
+        },
+    ));
+    assert_eq!(outstanding_queries.get(), 0);
+    assert_eq!(&*shared_queries.borrow(), &[consumer]);
+    assert!(
+        retired_queries.borrow().is_empty(),
+        "terminal publication is not queried before the consumer reaches its acknowledgement"
+    );
+
+    shared_queries.borrow_mut().clear();
+    assert!(shared_event_host_effect_is_resolved(
+        7,
+        Some(consumer_ack),
+        &terminal_dependencies,
+        |_| panic!("an acknowledgement must not fall back to queue-outstanding state"),
+        |producer| {
+            shared_queries.borrow_mut().push(producer);
+            (producer == consumer).then_some(3)
+        },
+        |producer| match producer {
+            producer if producer == first_producer => Some(5),
+            producer if producer == second_producer => Some(2),
+            _ => None,
+        },
+    ));
+    assert_eq!(
+        &*shared_queries.borrow(),
+        &[consumer],
+        "readiness polls only the exact acknowledgement timeline"
+    );
+
+    let no_ack_outstanding_queries = RefCell::new(Vec::new());
+    assert!(!shared_event_host_effect_is_resolved(
+        7,
+        None,
+        &terminal_dependencies,
+        |queue_id| {
+            no_ack_outstanding_queries.borrow_mut().push(queue_id);
+            true
+        },
+        |_| panic!("a missing acknowledgement must use consumer batch state"),
+        |_| panic!("terminal publication must short-circuit behind outstanding consumer work"),
+    ));
+    assert_eq!(&*no_ack_outstanding_queries.borrow(), &[7]);
 }
 
 #[test]

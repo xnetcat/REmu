@@ -79,36 +79,13 @@ impl MetalPresenter {
             // callback immediately releases its queue-local gate instead of remaining falsely
             // "active" until the next AppKit callback.
             self.receive_shader_compilations();
-            let shared_event_values = self
-                .guest_queue_batches
-                .iter()
-                .map(|(&queue_id, state)| {
-                    (
-                        super::SharedEventProducerId::new(queue_id),
-                        state.shared_event_timeline.event().signaled_value(),
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-            let guest_queue_outstanding = self
-                .guest_queue_batches
-                .iter()
-                .map(|(&queue_id, state)| {
-                    (
-                        queue_id,
-                        state.open_batch.is_some() || !state.committed_batches.is_empty(),
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
-            let host_retired_values = self
-                .guest_queue_batches
-                .iter()
-                .map(|(&queue_id, state)| {
-                    (
-                        super::SharedEventProducerId::new(queue_id),
-                        state.host_retired_fence_value,
-                    )
-                })
-                .collect::<std::collections::HashMap<_, _>>();
+            // Read only the exact queue/fences named by a blocked host effect. Building three
+            // complete queue snapshots here made every dequeued GPU event allocate and poll every
+            // Metal SharedEvent, even when no SharedEvent host block existed. Queue state cannot
+            // mutate while `try_recv` runs on the presenter thread; native event values are
+            // monotonic, so each direct lookup preserves the same threshold proof without the
+            // command-stream-frequency full-map scan.
+            let guest_queue_batches = &self.guest_queue_batches;
             let (source, event) = match self.receiver.try_recv(|reason| match reason {
                 QueueBlockReason::GraphicsPipeline(key) => {
                     self.compiled_shader_pairs.contains_key(key)
@@ -124,27 +101,26 @@ impl MetalPresenter {
                     consumer_queue_id,
                     consumer_ack,
                     terminal_dependencies,
-                } => {
-                    let consumer_reached_wait = consumer_ack.as_ref().map_or_else(
-                        || {
-                            !guest_queue_outstanding
-                                .get(consumer_queue_id)
-                                .copied()
-                                .unwrap_or(false)
-                        },
-                        |fence| {
-                            shared_event_values
-                                .get(&fence.producer())
-                                .is_some_and(|value| *value >= fence.value())
-                        },
-                    );
-                    consumer_reached_wait
-                        && terminal_dependencies.iter().all(|fence| {
-                            host_retired_values
-                                .get(&fence.producer())
-                                .is_some_and(|value| *value >= fence.value())
+                } => shared_event_host_effect_is_resolved(
+                    *consumer_queue_id,
+                    *consumer_ack,
+                    terminal_dependencies,
+                    |queue_id| {
+                        guest_queue_batches.get(&queue_id).is_some_and(|state| {
+                            state.open_batch.is_some() || !state.committed_batches.is_empty()
                         })
-                }
+                    },
+                    |producer| {
+                        guest_queue_batches
+                            .get(&producer.queue_id())
+                            .map(|state| state.shared_event_timeline.event().signaled_value())
+                    },
+                    |producer| {
+                        guest_queue_batches
+                            .get(&producer.queue_id())
+                            .map(|state| state.host_retired_fence_value)
+                    },
+                ),
                 QueueBlockReason::FlipSafetyWait(wait) => {
                     wait.required_flip_sequence.is_none_or(|sequence| {
                         sequence <= self.safe_flip_sequence_prefix
@@ -916,6 +892,24 @@ impl MetalPresenter {
                     .any(|checkpoint| checkpoint.fence == fence)
             })
     }
+}
+
+pub(crate) fn shared_event_host_effect_is_resolved(
+    consumer_queue_id: u64,
+    consumer_ack: Option<super::SharedEventFence>,
+    terminal_dependencies: &[super::SharedEventFence],
+    mut queue_has_outstanding_batches: impl FnMut(u64) -> bool,
+    mut shared_event_value: impl FnMut(super::SharedEventProducerId) -> Option<u64>,
+    mut host_retired_value: impl FnMut(super::SharedEventProducerId) -> Option<u64>,
+) -> bool {
+    let consumer_reached_wait = consumer_ack.map_or_else(
+        || !queue_has_outstanding_batches(consumer_queue_id),
+        |fence| shared_event_value(fence.producer()).is_some_and(|value| value >= fence.value()),
+    );
+    consumer_reached_wait
+        && terminal_dependencies.iter().all(|fence| {
+            host_retired_value(fence.producer()).is_some_and(|value| value >= fence.value())
+        })
 }
 
 fn compute_program_has_only_covered_readonly_buffers(
