@@ -200,6 +200,90 @@ pub(crate) fn collect_unwind_fdes_at(
     Ok(fdes)
 }
 
+/// Function start addresses from `.eh_frame_hdr` (FDE `initial_location` column).
+///
+/// These are the primary seed set for `fs:` seeded linear decode (F3): the linker already walks
+/// this table for unwind registration, and each entry names a real function entry the guest can
+/// reach.
+pub(crate) fn collect_eh_frame_function_starts(
+    memory: &GuestImage,
+    image_base: GuestAddress,
+    executable: &LoadedExecutable,
+) -> Result<Vec<GuestAddress>, LinkError> {
+    let Some(header) = executable
+        .info
+        .elf
+        .as_ref()
+        .and_then(|elf| {
+            elf.program_headers
+                .iter()
+                .find(|header| header.program_type == PT_GNU_EH_FRAME)
+        })
+        .filter(|header| header.file_size >= 4)
+    else {
+        return Ok(Vec::new());
+    };
+    let header_size = usize::try_from(header.file_size)
+        .map_err(|_| LinkError::MalformedEhFrame(".eh_frame_hdr is too large"))?;
+    let header_address =
+        runtime_address_at(memory, image_base, header.virtual_address, header_size)?;
+    let mut header_bytes = vec![0_u8; header_size];
+    memory.read(header_address, &mut header_bytes)?;
+    if header_bytes[0] != 1 {
+        return Err(LinkError::MalformedEhFrame(
+            "unsupported .eh_frame_hdr version",
+        ));
+    }
+    let mut cursor = 4;
+    let _frame_address = decode_eh_pointer(
+        memory,
+        &header_bytes,
+        &mut cursor,
+        header_bytes[1],
+        header_address,
+    )?;
+    let expected_fdes = if header_bytes[2] == DW_EH_PE_OMIT {
+        0
+    } else {
+        usize::try_from(decode_eh_pointer(
+            memory,
+            &header_bytes,
+            &mut cursor,
+            header_bytes[2],
+            header_address,
+        )?)
+        .map_err(|_| LinkError::MalformedEhFrame("FDE count is too large"))?
+    };
+    let table_encoding = header_bytes[3];
+    if expected_fdes != 0 && table_encoding == DW_EH_PE_OMIT {
+        return Err(LinkError::MalformedEhFrame(
+            "nonempty .eh_frame_hdr omits its search table",
+        ));
+    }
+    let mut starts = Vec::with_capacity(expected_fdes);
+    let mut unique = BTreeSet::new();
+    for _ in 0..expected_fdes {
+        let initial_location = decode_eh_pointer(
+            memory,
+            &header_bytes,
+            &mut cursor,
+            table_encoding,
+            header_address,
+        )?;
+        let _fde = decode_eh_pointer(
+            memory,
+            &header_bytes,
+            &mut cursor,
+            table_encoding,
+            header_address,
+        )?;
+        if unique.insert(initial_location) {
+            starts.push(GuestAddress::new(initial_location));
+        }
+    }
+    Ok(starts)
+}
+
 pub(crate) fn guest_unwind_module(
     memory: &GuestImage,
     name: &str,

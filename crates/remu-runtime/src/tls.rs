@@ -4,6 +4,12 @@ use remu_loader::LoadedExecutable;
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::link::fs_decode::{
+    collect_fs_decode_seed_addresses, report_fs_load_boundary_mismatches, seed_offsets_in_region,
+    seeded_fs_load_sites,
+};
+use crate::link::collect_initializer_array;
+use crate::unwind::collect_eh_frame_function_starts;
 use crate::{
     GuestTls, LinkError, MACOS_GUEST_PAGE_ALIGNMENT, PT_TLS, add_address,
     current_guest_thread_pointer, runtime_address_at, subtract_address, write_u64,
@@ -165,7 +171,8 @@ pub(crate) fn install_tls_support(
     seed_tls_thread_control(memory, thread_pointer, &module_blocks)?;
 
     write_tls_helpers(memory, helper_base)?;
-    let patched_loads = patch_tls_loads(memory, helper_base)?;
+    let decode_seeds = collect_tls_fs_decode_seeds(memory, images)?;
+    let patched_loads = patch_tls_loads_with_seeds(memory, helper_base, &decode_seeds)?;
     let patched_stores = if let Some(store_helper_base) = store_helper_base {
         write_tls_store_helpers(memory, store_helper_base, &tls_stores)?;
         patch_tls_immediate_stores(memory, store_helper_base, &tls_stores)?
@@ -642,7 +649,52 @@ fn emit_pop_register(slot: &mut [u8], cursor: &mut usize, register: u8) {
     }
 }
 
-fn patch_tls_loads(memory: &mut GuestImage, helper_base: GuestAddress) -> Result<usize, LinkError> {
+fn collect_tls_fs_decode_seeds(
+    memory: &GuestImage,
+    images: &[TlsImageInput<'_>],
+) -> Result<Vec<GuestAddress>, LinkError> {
+    let mut seeds = BTreeSet::new();
+    for image in images {
+        let fde_starts = collect_eh_frame_function_starts(memory, image.base, image.executable)?;
+        for seed in collect_fs_decode_seed_addresses(image.base, image.executable, &fde_starts) {
+            seeds.insert(seed);
+        }
+        // DT_INIT_ARRAY entries are live code pointers once the image is mapped.
+        if let Some(dynamic) = image
+            .executable
+            .info
+            .elf
+            .as_ref()
+            .and_then(|elf| elf.dynamic.as_ref())
+        {
+            for initializer in collect_initializer_array(
+                memory,
+                image.base,
+                dynamic.init_array_address,
+                dynamic.init_array_size,
+                "DT_INIT_ARRAY",
+            )? {
+                seeds.insert(initializer);
+            }
+            for initializer in collect_initializer_array(
+                memory,
+                image.base,
+                dynamic.preinit_array_address,
+                dynamic.preinit_array_size,
+                "DT_PREINIT_ARRAY",
+            )? {
+                seeds.insert(initializer);
+            }
+        }
+    }
+    Ok(seeds.into_iter().collect())
+}
+
+fn patch_tls_loads_with_seeds(
+    memory: &mut GuestImage,
+    helper_base: GuestAddress,
+    seeds: &[GuestAddress],
+) -> Result<usize, LinkError> {
     let executable_regions = memory
         .regions()
         .iter()
@@ -650,38 +702,35 @@ fn patch_tls_loads(memory: &mut GuestImage, helper_base: GuestAddress) -> Result
         .copied()
         .collect::<Vec<_>>();
     let mut patches = Vec::new();
+    let mut mismatch_total = 0_usize;
     for region in executable_regions {
         let length =
             usize::try_from(region.file_size).map_err(|_| LinkError::ExecutableRegionTooLarge)?;
         let mut bytes = vec![0_u8; length];
         memory.read(region.start, &mut bytes)?;
-        for offset in 0..=bytes.len() - 9 {
-            let source = &bytes[offset..];
-            if source[0] != 0x64 || !(0x48..=0x4f).contains(&source[1]) {
-                continue;
-            }
-            let rex = source[1];
-            if rex & 0x08 == 0 || source[2] != 0x8b {
-                continue;
-            }
-            let mod_rm = source[3];
-            if mod_rm >> 6 != 0 || mod_rm & 7 != 4 || source[4] != 0x25 {
-                continue;
-            }
-            if source[5..9] != [0, 0, 0, 0] {
-                continue;
-            }
-            let destination = ((mod_rm >> 3) & 7) | ((rex & 4) << 1);
-            // Replacing an RSP destination would invalidate the call's return frame.
-            if destination == 4 {
-                continue;
-            }
-            let address = add_address(
-                region.start,
-                u64::try_from(offset).map_err(|_| LinkError::AddressOverflow)?,
-            )?;
-            patches.push((address, destination));
+        let region_seeds = seed_offsets_in_region(seeds, region.start, length);
+        let report = report_fs_load_boundary_mismatches(
+            "execute-region",
+            region.start.get(),
+            &bytes,
+            &region_seeds,
+        );
+        mismatch_total = mismatch_total.saturating_add(report.boundary_mismatches);
+        let (_boundaries, loads) = seeded_fs_load_sites(&bytes, &region_seeds);
+        for site in loads {
+            patches.push((
+                add_address(
+                    region.start,
+                    u64::try_from(site.offset).map_err(|_| LinkError::AddressOverflow)?,
+                )?,
+                site.destination,
+            ));
         }
+    }
+    if mismatch_total != 0 {
+        eprintln!(
+            "[REMu][TLS][FS] boundary-mismatch total={mismatch_total} — byte-scan hits rejected; only seeded-decode sites are rewritten"
+        );
     }
 
     for (address, destination) in &patches {

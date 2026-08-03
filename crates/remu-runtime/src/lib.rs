@@ -36,6 +36,7 @@ mod kernel_api;
 mod kernel_memory;
 mod link;
 mod memory;
+mod module_lifecycle;
 mod nid_names;
 mod nid_table;
 mod np;
@@ -2059,6 +2060,22 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.module_tls_destructor_refs.clear();
     state.application_heap_api_address = 0;
     state.bundled_modules.clone_from(&image.bundled_modules);
+    module_lifecycle::reset_guest_module_registry(image.bundled_modules.iter().map(|module| {
+        module_lifecycle::GuestModule {
+            name: module.name.clone(),
+            handle: module.handle,
+            exports_by_nid: module.exports_by_nid.clone(),
+            initializers: module.initializers.clone(),
+            // Boot-started modules already ran constructors via module_initializers; everything
+            // else stays Relocated until sceKernelLoadStartModule finishes constructors (F4).
+            phase: if module.started {
+                module_lifecycle::GuestModulePhase::Started
+            } else {
+                module_lifecycle::GuestModulePhase::Relocated
+            },
+            refcount: 0,
+        }
+    }));
     state.unwind_modules.clone_from(&image.unwind_modules);
     state.installed_exception_handlers.clear();
     ajm_engine::reset_for_new_process();
@@ -3979,52 +3996,42 @@ fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&requested_path);
+    // Lifecycle claims live outside ProbeDispatchState so constructors never run while a second
+    // thread can dlsym a half-constructed module (F4 / SDK `_kernel.h:79-85`).
+    if let Some(claim) =
+        module_lifecycle::begin_load_start_module(&requested_path, requested_name)
+    {
+        let start_result =
+            invoke_guest_module_initializers(&claim.initializers, arguments[1], arguments[2]);
+        let succeeded = start_result >= 0;
+        module_lifecycle::finish_load_start_module(claim.handle, succeeded);
+        if arguments[5] != 0 {
+            write_guest_u32(arguments[5], start_result.cast_unsigned());
+        }
+        eprintln!(
+            "[REMu][MODULE] load-start {requested_path} -> handle {} ({}) result={start_result:#x}",
+            claim.handle, claim.name,
+        );
+        return u64::from(claim.handle);
+    }
     let dispatch = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = lock_probe_dispatch_for_write(dispatch);
-    let bundled_index = state.bundled_modules.iter().position(|module| {
-        module.name.eq_ignore_ascii_case(&requested_path)
-            || Path::new(&module.name)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.eq_ignore_ascii_case(requested_name))
-    });
-    let Some(bundled_index) = bundled_index else {
-        // No object of this name is mapped in the process. If the name is a system library REmu
-        // serves through HLE, its exports are already resolved by the import dispatcher, so the
-        // load succeeds against a synthetic handle rather than failing NOT_FOUND. Anything else is
-        // genuinely absent.
-        if let Some(handle) = load_start_hle_system_module(&mut state, &requested_path) {
-            if arguments[5] != 0 {
-                write_guest_u32(arguments[5], 0);
-            }
-            return u64::from(handle);
-        }
-        let error = sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    // No object of this name is mapped in the process. If the name is a system library REmu
+    // serves through HLE, its exports are already resolved by the import dispatcher, so the
+    // load succeeds against a synthetic handle rather than failing NOT_FOUND. Anything else is
+    // genuinely absent.
+    if let Some(handle) = load_start_hle_system_module(&mut state, &requested_path) {
         if arguments[5] != 0 {
-            write_guest_u32(arguments[5], low_u32(error));
+            write_guest_u32(arguments[5], 0);
         }
-        eprintln!("[REMu][MODULE] load-start could not find {requested_path}");
-        return error;
-    };
-    let module = &mut state.bundled_modules[bundled_index];
-    let handle = module.handle;
-    let module_name = module.name.clone();
-    let initializers = if module.started {
-        Vec::new()
-    } else {
-        module.started = true;
-        module.initializers.clone()
-    };
-    drop(state);
-    let start_result = invoke_guest_module_initializers(&initializers, arguments[1], arguments[2]);
-    if arguments[5] != 0 {
-        write_guest_u32(arguments[5], start_result.cast_unsigned());
+        return u64::from(handle);
     }
-    eprintln!(
-        "[REMu][MODULE] load-start {requested_path} -> handle {} ({}) result={start_result:#x}",
-        handle, module_name,
-    );
-    u64::from(handle)
+    let error = sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    if arguments[5] != 0 {
+        write_guest_u32(arguments[5], low_u32(error));
+    }
+    eprintln!("[REMu][MODULE] load-start could not find {requested_path}");
+    error
 }
 
 /// The first synthetic handle handed to an HLE system module.
@@ -4110,13 +4117,18 @@ fn kernel_dlsym(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     };
     let handle = low_u32(arguments[0]);
     let nid = sce_symbol_nid(&symbol);
-    let guest_target = state
-        .bundled_modules
-        .iter()
-        .find(|module| module.handle == handle)
-        .and_then(|module| module.exports_by_nid.get(&nid))
-        .copied()
-        .unwrap_or_default();
+    // Prefer the lifecycle registry so dlsym waits out Starting and never reads exports from a
+    // half-constructed module (F4). Fall back to the dispatch snapshot for handles that never
+    // entered the registry (tests / pre-reset probes).
+    let guest_target = module_lifecycle::resolve_started_export(handle, &nid).unwrap_or_else(|| {
+        state
+            .bundled_modules
+            .iter()
+            .find(|module| module.handle == handle && module.started)
+            .and_then(|module| module.exports_by_nid.get(&nid))
+            .copied()
+            .unwrap_or_default()
+    });
     let target = if hle_target != 0 {
         hle_target
     } else {

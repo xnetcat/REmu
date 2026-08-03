@@ -238,7 +238,7 @@ pub(super) fn append_object_initializers(
     Ok(())
 }
 
-pub(super) fn collect_initializer_array(
+pub(crate) fn collect_initializer_array(
     memory: &GuestImage,
     image_base: GuestAddress,
     address: u64,
