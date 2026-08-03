@@ -5,29 +5,24 @@ use super::*;
 
 #[test]
 fn a_synchronized_output_bounds_its_port_array_before_it_touches_a_port() {
-    let mut state = ProbeDispatchState::default();
     let mut entries = [0_u8; 32];
     entries[..4].copy_from_slice(&0x7fff_u32.to_le_bytes());
     entries[16..20].copy_from_slice(&0x7ffe_u32.to_le_bytes());
     assert_eq!(
-        dispatch("w3PdaSTSwGE", args(&[0, 1]), &mut state),
-        Some(audio_out_error(audio::AudioOutError::InvalidPointer))
+        audio_out_outputs(args(&[0, 1])),
+        audio_out_error(audio::AudioOutError::InvalidPointer)
     );
     assert_eq!(
-        dispatch("w3PdaSTSwGE", args(&[address(&entries), 0]), &mut state),
-        Some(error(AUDIO_OUT_ERROR_INVALID_ARG))
+        audio_out_outputs(args(&[address(&entries), 0])),
+        error(AUDIO_OUT_ERROR_INVALID_ARG)
     );
     assert_eq!(
-        dispatch(
-            "w3PdaSTSwGE",
-            args(&[address(&entries), AUDIO_OUT_OUTPUTS_MAX + 1]),
-            &mut state
-        ),
-        Some(error(AUDIO_OUT_ERROR_INVALID_ARG))
+        audio_out_outputs(args(&[address(&entries), AUDIO_OUT_OUTPUTS_MAX + 1])),
+        error(AUDIO_OUT_ERROR_INVALID_ARG)
     );
     assert_eq!(
-        dispatch("w3PdaSTSwGE", args(&[address(&entries), 2]), &mut state),
-        Some(audio_out_error(audio::AudioOutError::InvalidPort))
+        audio_out_outputs(args(&[address(&entries), 2])),
+        audio_out_error(audio::AudioOutError::InvalidPort)
     );
 }
 

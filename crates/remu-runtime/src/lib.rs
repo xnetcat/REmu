@@ -3252,6 +3252,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             | "aII9h5nli9U"
             | "XHl38ZNknbs"
             | "v8iOE+j8a5o"
+            | "w3PdaSTSwGE"
     ) {
         remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Audio);
         return ProbeImportReturn::integer(dispatch_audio_out_import(nid, call_args));
@@ -3262,6 +3263,13 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         // the per-frame read path must not queue behind command-buffer translation, which owns no
         // pad state and can take tens of milliseconds under shader-heavy workloads.
         return ProbeImportReturn::integer(result);
+    }
+    if nid == "j6RaAUlaLv0" {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Video);
+        // A vblank wait sleeps for up to a whole frame. Serving it before the dispatch lock
+        // keeps graphics submission and flip publication from queueing behind that sleep; the
+        // handler takes its own brief read lock for the port check (plan C5).
+        return ProbeImportReturn::integer(av::video_out_wait_vblank(call_args));
     }
     // Most hot imports return above without consuming stack arguments. Reading them lazily avoids
     // six guest-memory loads on every timer, synchronization, numeric, audio, and pad call while
@@ -3528,6 +3536,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
 }
 
 fn dispatch_audio_out_import(nid: &str, arguments: [u64; 6]) -> u64 {
+    if nid == "w3PdaSTSwGE" {
+        // The multi-port output blocks until every port is ready; it runs before the dispatch
+        // lock so that ready-wait cannot stall stateful imports (plan C5).
+        return av::audio_out_outputs(arguments);
+    }
     if matches!(
         nid,
         "g2tViFIohHE"

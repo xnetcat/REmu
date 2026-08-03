@@ -71,6 +71,8 @@ pub enum DispatchImportFamily {
     Loader,
     /// Ordered APR/AMPR operations.
     Ampr,
+    /// Display waits served before the process dispatch lock (vblank sleeps).
+    Video,
     /// Imports served while holding the process-wide dispatch-state lock.
     Stateful,
 }

@@ -321,9 +321,23 @@ pub(super) fn video_out_get_flip_status(arguments: [u64; 6], state: &ProbeDispat
 }
 
 /// Blocks the caller until the display's next vertical blank.
-pub(super) fn video_out_wait_vblank(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
-    if !video_out_port_is_open(arguments[0], state) {
-        return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+///
+/// Dispatched before the process-wide dispatch lock (plan C5): the port check takes a brief
+/// read lock, and the vblank sleep itself holds nothing another import needs — graphics
+/// submission, flip publication, and every stateful import used to queue behind this sleep for
+/// up to a full frame.
+pub(crate) fn video_out_wait_vblank(arguments: [u64; 6]) -> u64 {
+    crate::assert_wait_is_off_the_dispatch_lock("sceVideoOutWaitVblank");
+    {
+        let Some(dispatch) = crate::PROBE_DISPATCH.get() else {
+            return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+        };
+        let state = dispatch
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !video_out_port_is_open(arguments[0], &state) {
+            return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
+        }
     }
     let (_, since_vblank_microseconds) = video_out_vblank_position();
     std::thread::sleep(Duration::from_micros(

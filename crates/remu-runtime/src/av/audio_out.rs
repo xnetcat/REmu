@@ -49,7 +49,7 @@ pub(super) fn audio_out_port_is_open(state: &audio::AudioOutState, handle: i32) 
 ///
 /// Like the single-port output this blocks until the ports are ready for their next buffer, and
 /// waits once for the longest of them rather than serially.
-pub(super) fn audio_out_outputs(arguments: [u64; 6]) -> u64 {
+pub(crate) fn audio_out_outputs(arguments: [u64; 6]) -> u64 {
     let (params, count) = (arguments[0], arguments[1]);
     if params == 0 {
         return audio_out_error(audio::AudioOutError::InvalidPointer);
@@ -86,6 +86,9 @@ pub(super) fn audio_out_outputs(arguments: [u64; 6]) -> u64 {
     }
     drop(state);
     if !delay.is_zero() {
+        // Dispatched before the process-wide dispatch lock (plan C5): the ready-wait is a
+        // sleep, and holding the write lock across it would stall every stateful import.
+        crate::assert_wait_is_off_the_dispatch_lock("sceAudioOutOutputs");
         std::thread::sleep(delay);
     }
     0

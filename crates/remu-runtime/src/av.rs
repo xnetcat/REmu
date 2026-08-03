@@ -29,7 +29,9 @@ use self::audio_out::{
     AUDIO_OUT_ERROR_INVALID_ARG, AUDIO_OUT_ERROR_INVALID_MIXLEVEL, AUDIO_OUT_MIXLEVEL_MAXIMUM,
     AUDIO_OUT_OUTPUTS_MAX,
 };
-use self::audio_out::{audio_out_outputs, audio_out_set_mix_level_pad_spk};
+use self::audio_out::audio_out_set_mix_level_pad_spk;
+// Dispatched before the process-wide dispatch lock (plan C5).
+pub(crate) use self::audio_out::audio_out_outputs;
 use self::mp3::ajm_dec_mp3_parse_frame;
 #[cfg(test)]
 use self::mp3::{MP3_OFL_TYPE_LAME, MP3_PARSE_FRAME_SIZE};
@@ -83,8 +85,10 @@ use self::video_out::{
     video_out_adjust_color, video_out_close, video_out_get_event_id, video_out_get_flip_status,
     video_out_get_vblank_status, video_out_initialize_output_options,
     video_out_is_output_supported, video_out_submit_change_buffer_attribute2,
-    video_out_unregister_buffers, video_out_vrr_unpeg_from_fixed_rate, video_out_wait_vblank,
+    video_out_unregister_buffers, video_out_vrr_unpeg_from_fixed_rate,
 };
+// Dispatched before the process-wide dispatch lock (plan C5).
+pub(crate) use self::video_out::video_out_wait_vblank;
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.
 pub(crate) fn dispatch(
@@ -116,7 +120,8 @@ fn dispatch_video_out(
         "HuViW4HnrOw" => video_out_submit_change_buffer_attribute2(arguments, state),
         "1FZBKy8HeNU" => video_out_get_vblank_status(arguments, state),
         "SbU3dwp80lQ" => video_out_get_flip_status(arguments, state),
-        "j6RaAUlaLv0" => video_out_wait_vblank(arguments, state),
+        // sceVideoOutWaitVblank ("j6RaAUlaLv0") is dispatched before the process-wide dispatch
+        // lock (plan C5); its sleep must never run under this dispatcher's write lock.
         "U2JJtSqNKZI" => video_out_get_event_id(arguments[0]),
         "+I4K03i3EL0" => video_out_initialize_output_options(arguments[0]),
         "Nv8c-Kb+DUM" => video_out_is_output_supported(arguments, state),
@@ -160,7 +165,8 @@ fn dispatch_ajm(nid: &str, arguments: [u64; 6], state: &ProbeDispatchState) -> O
 /// Handles the audio-output entry points this module owns.
 fn dispatch_audio_out(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
-        "w3PdaSTSwGE" => audio_out_outputs(arguments),
+        // sceAudioOutOutputs ("w3PdaSTSwGE") is dispatched before the process-wide dispatch
+        // lock (plan C5); its ready-wait sleep must never run under the write lock.
         "wVwPU50pS1c" => audio_out_set_mix_level_pad_spk(arguments),
         _ => return None,
     })

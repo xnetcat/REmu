@@ -22,19 +22,61 @@ fn closing_the_display_port_releases_its_buffers_and_refuses_a_second_close() {
 #[test]
 fn a_display_call_on_a_handle_no_port_owns_is_rejected() {
     let mut state = open_display();
-    for nid in [
-        "uquVH4-Du78",
-        "N5KDtkIjjJ4",
-        "1FZBKy8HeNU",
-        "j6RaAUlaLv0",
-        "T4ucGB8CsnM",
-    ] {
+    for nid in ["uquVH4-Du78", "N5KDtkIjjJ4", "1FZBKy8HeNU", "T4ucGB8CsnM"] {
         assert_eq!(
             dispatch(nid, args(&[2, 0]), &mut state),
             Some(error(VIDEO_OUT_ERROR_INVALID_HANDLE)),
             "{nid} accepted a handle no port owns"
         );
     }
+}
+
+/// Sets the process display port's open flag, returning the previous value for restoration.
+fn set_process_display_open(open: bool) -> bool {
+    let dispatch_lock = crate::PROBE_DISPATCH
+        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let mut state = crate::lock_probe_dispatch_for_write(dispatch_lock);
+    std::mem::replace(&mut state.video_out.is_open, open)
+}
+
+#[test]
+fn wait_vblank_validates_its_port_briefly_and_sleeps_off_the_dispatch_lock() {
+    // Dispatched before the process-wide dispatch lock (plan C5): the port check takes a short
+    // read lock and the vblank sleep holds nothing another import needs.
+    let was_open = set_process_display_open(false);
+    assert_eq!(
+        video_out_wait_vblank(args(&[2])),
+        error(VIDEO_OUT_ERROR_INVALID_HANDLE)
+    );
+    set_process_display_open(true);
+    let started = std::time::Instant::now();
+    assert_eq!(video_out_wait_vblank(args(&[VIDEO_OUT_HANDLE])), SUCCESS);
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(250),
+        "a vblank wait must resolve within a frame, not a scheduler pathology"
+    );
+    set_process_display_open(was_open);
+}
+
+#[test]
+fn wait_vblank_refuses_to_run_under_the_dispatch_write_lock() {
+    let dispatch_lock = crate::PROBE_DISPATCH
+        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let guard = crate::lock_probe_dispatch_for_write(dispatch_lock);
+    // Catch the refusal inside the guard's lifetime: letting the panic unwind out of the test
+    // would drop the guard on a panicking thread and poison the process-wide lock for every
+    // later test in this binary.
+    let refusal = std::panic::catch_unwind(|| video_out_wait_vblank(args(&[VIDEO_OUT_HANDLE])))
+        .expect_err("a vblank wait under the dispatch write lock must refuse");
+    drop(guard);
+    let message = refusal
+        .downcast_ref::<String>()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        message.contains("process-wide dispatch write lock"),
+        "unexpected refusal: {message}"
+    );
 }
 
 #[test]
@@ -146,10 +188,10 @@ fn the_vblank_status_reports_a_free_running_counter_in_its_documented_layout() {
         "flags, phase and padding must be zero"
     );
 
-    assert_eq!(
-        dispatch("j6RaAUlaLv0", args(&[VIDEO_OUT_HANDLE]), &mut state),
-        Some(SUCCESS)
-    );
+    // The wait is dispatched before the process lock and checks the process display port.
+    let was_open = set_process_display_open(true);
+    assert_eq!(video_out_wait_vblank(args(&[VIDEO_OUT_HANDLE])), SUCCESS);
+    set_process_display_open(was_open);
     assert_eq!(
         dispatch(
             "1FZBKy8HeNU",

@@ -241,7 +241,7 @@ impl MetalPresenter {
                 }
             };
             eprintln!(
-                "[REMu][PERF-DISPATCH] window_ms={dispatch_window_ms} calls={} direct={} leaf={} sync={} audio={} pad={} stateless={} fd={} equeue={} loader={} ampr={} stateful={} | lock-wait count={} total_ns={} mean_ns={} max_ns={} buckets={:?} | lock-hold count={} total_ns={} mean_ns={} max_ns={} buckets={:?} | gpu-publication count={} total_ns={} mean_ns={} max_ns={} buckets={:?} bucket_upper_ns={:?}",
+                "[REMu][PERF-DISPATCH] window_ms={dispatch_window_ms} calls={} direct={} leaf={} sync={} audio={} pad={} stateless={} fd={} equeue={} loader={} ampr={} video={} stateful={} | lock-wait count={} total_ns={} mean_ns={} max_ns={} buckets={:?} | lock-hold count={} total_ns={} mean_ns={} max_ns={} buckets={:?} | gpu-publication count={} total_ns={} mean_ns={} max_ns={} buckets={:?} bucket_upper_ns={:?}",
                 dispatch.total_import_calls(),
                 calls(ImportFamily::Direct),
                 calls(ImportFamily::Leaf),
@@ -253,6 +253,7 @@ impl MetalPresenter {
                 calls(ImportFamily::Equeue),
                 calls(ImportFamily::Loader),
                 calls(ImportFamily::Ampr),
+                calls(ImportFamily::Video),
                 calls(ImportFamily::Stateful),
                 dispatch.dispatch_lock_acquire_wait.count,
                 dispatch.dispatch_lock_acquire_wait.total_ns,
