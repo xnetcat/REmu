@@ -15,6 +15,7 @@ use super::{
     NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
     PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
     ResidencyState, ResidentTextureActivityStamp, SharedEventWriteKind, SpanQueryOrder, StaleSource,
+    SharedEventDrawTextureOverride,
     append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
@@ -122,6 +123,7 @@ impl MetalPresenter {
         &mut self,
         draw: &IndexedDraw,
         key: &GraphicsPipelineKey,
+        shared_event_texture_overrides: &[SharedEventDrawTextureOverride],
     ) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let started = Instant::now();
@@ -595,6 +597,9 @@ impl MetalPresenter {
                 })
             {
                 if let Ok(descriptor) = decode_image_descriptor(&binding.resource_descriptor)
+                    && !shared_event_texture_overrides
+                        .iter()
+                        .any(|retained| retained.matches(descriptor))
                     && self
                         .resident_guest_textures
                         .get(&descriptor.guest)
@@ -675,7 +680,10 @@ impl MetalPresenter {
                 }
             }
         }
-        self.synchronize_sampled_aliases(&[export_evaluation, pixel_evaluation])?;
+        self.synchronize_sampled_aliases(
+            &[export_evaluation, pixel_evaluation],
+            shared_event_texture_overrides,
+        )?;
 
         self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[export_evaluation, pixel_evaluation])?;
@@ -698,6 +706,7 @@ impl MetalPresenter {
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
             activity_stamp,
+            shared_event_texture_overrides,
         )?;
         let pixel_textures = upload_image_textures(
             "pixel",
@@ -712,6 +721,7 @@ impl MetalPresenter {
             &mut self.fallback_texture_cache,
             &mut self.next_sampled_texture_use,
             activity_stamp,
+            shared_event_texture_overrides,
         )?;
         let diagnostic_scanout_target = targets
             .iter()

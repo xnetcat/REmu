@@ -22,8 +22,8 @@ use super::{
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use crate::presenter::{
-    PhysicalFootprintRange, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
-    SharedEventUnresolvedWriteRange, SharedEventWriteKind,
+    PhysicalFootprintRange, SharedEventGlobalBufferVersion, SharedEventResidentTextureVersion,
+    SharedEventSignalCheckpoint, SharedEventUnresolvedWriteRange, SharedEventWriteKind,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -81,6 +81,7 @@ impl SharedEventSignalCheckpoint {
             guest_write_range_count: batch.guest_write_ranges.len(),
             memory_write_count: batch.memory_writes.len(),
             global_versions: Vec::new(),
+            resident_texture_versions: Vec::new(),
             unresolved_write_ranges: Vec::new(),
             pending_write_footprint: Vec::new(),
             footprint_complete: true,
@@ -112,6 +113,16 @@ impl SharedEventSignalCheckpoint {
         self.footprint_complete &= batch.resident_write_footprint_complete;
         for &range in &batch.resident_write_footprint {
             append_unique_physical_footprint(&mut self.pending_write_footprint, range);
+        }
+        for version in &batch.resident_texture_versions {
+            if let Some(existing) = self.resident_texture_versions.iter_mut().find(|existing| {
+                existing.span.backing() == version.span.backing()
+                    && existing.span.len() == version.span.len()
+            }) {
+                *existing = version.clone();
+            } else {
+                self.resident_texture_versions.push(version.clone());
+            }
         }
         for writeback in &batch.global_writebacks[..global_writeback_count] {
             let Ok(byte_count) = u64::try_from(writeback.byte_count) else {
@@ -239,6 +250,20 @@ fn append_unique_physical_footprint(
 }
 
 impl GuestCommandBatch {
+    pub(crate) fn record_resident_texture_version(
+        &mut self,
+        version: SharedEventResidentTextureVersion,
+    ) {
+        if let Some(existing) = self.resident_texture_versions.iter_mut().find(|existing| {
+            existing.span.backing() == version.span.backing()
+                && existing.span.len() == version.span.len()
+        }) {
+            *existing = version;
+        } else {
+            self.resident_texture_versions.push(version);
+        }
+    }
+
     pub(crate) fn record_resident_write_footprint(
         &mut self,
         kind: SharedEventWriteKind,
@@ -1557,6 +1582,7 @@ fn new_guest_command_batch(
         guest_write_ranges: Vec::new(),
         memory_writes: Vec::new(),
         resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
         resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,

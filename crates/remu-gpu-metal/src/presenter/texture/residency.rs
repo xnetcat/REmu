@@ -4,8 +4,8 @@
 use super::super::completion::commit_and_settle;
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::{
-    FlushPolicy, GuestBatchFlushReason, SharedEventWriteKind, WritebackTrigger,
-    compile_metal_compute_library,
+    FlushPolicy, GuestBatchFlushReason, SharedEventResidentTextureVersion, SharedEventWriteKind,
+    WritebackTrigger, compile_metal_compute_library,
 };
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
@@ -2516,6 +2516,7 @@ impl MetalPresenter {
             RESIDENT_WRITE_ATTRIBUTION_MISSES.fetch_add(1, Ordering::Relaxed);
         }
         let mut footprint_span = None;
+        let mut texture_version = None;
         if let Some(writer) = resident_descriptor {
             let (written, writer_span) = {
                 let resident = self
@@ -2557,6 +2558,20 @@ impl MetalPresenter {
                 );
                 resident.content_version = version;
                 resident.note_gpu_write();
+                if let Some(writer_span) = writer_span {
+                    texture_version = Some(SharedEventResidentTextureVersion {
+                        texture: resident.texture.clone(),
+                        descriptor: resident.descriptor,
+                        texture_type: resident.texture_type,
+                        layer_count: resident.layer_count,
+                        mip_level_count: resident.mip_level_count,
+                        content_version: resident.content_version,
+                        gpu_write_watch_generations: resident
+                            .gpu_write_watch_generations
+                            .clone(),
+                        span: writer_span,
+                    });
+                }
             }
             if let Some(writer_span) = writer_span {
                 self.subtract_resident_authority(
@@ -2576,6 +2591,9 @@ impl MetalPresenter {
                 SharedEventWriteKind::ResidentDestination,
                 footprint_span,
             );
+            if let Some(texture_version) = texture_version {
+                batch.record_resident_texture_version(texture_version);
+            }
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, span);
     }

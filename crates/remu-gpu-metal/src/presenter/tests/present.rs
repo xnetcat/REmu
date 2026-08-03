@@ -977,6 +977,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
             guest_write_ranges: Vec::new(),
             memory_writes: Vec::new(),
             resident_write_footprint: Vec::new(),
+            resident_texture_versions: Vec::new(),
             resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,

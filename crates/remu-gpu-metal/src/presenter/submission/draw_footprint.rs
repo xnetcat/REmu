@@ -3,24 +3,26 @@
 
 //! Consumer-footprint classification for direct draws behind exact `SharedEvent` waits.
 //!
-//! Physical disjointness remains the default proof. The one overlapping class admitted here is a
-//! read-only global range backed by the immutable copied-buffer version retained in the exact
-//! producer checkpoint. The consumer command buffer has already encoded that checkpoint's Metal
-//! wait, so the version crosses queues without guest-RAM observation or host retirement.
+//! Physical disjointness remains the default proof. Overlapping read-only globals can consume an
+//! immutable copied-buffer version, and same-queue sampled images can consume an exact retained
+//! Metal texture version. The consumer command buffer has already encoded the checkpoint's wait,
+//! so neither path observes guest RAM or requires host retirement.
 
 use super::super::{CB_COLOR_CONTROL, ColorOperationMode, ResourceSpan};
 use super::super::{
     DEFAULT_CB_COLOR_CONTROL, GuestQueueBatchState, MetalPresenter, PhysicalFootprintRange,
-    SharedEventFence, SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind,
+    SharedEventDirectDrawPlan, SharedEventDrawTextureOverride, SharedEventFence,
+    SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind,
     color_operation_is_raster_noop, decode_color_operation_mode,
     decode_depth_target_without_diagnostics, decode_image_descriptor_without_diagnostics,
     decode_render_targets, draw_diagnostics_are_host_effectful, effective_global_memory_binding,
-    image_resource_descriptor_is_null, register_value, resident_texture_raw_byte_count,
-    sampled_texture_raw_range,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    register_value, resident_texture_raw_byte_count, sampled_texture_raw_range,
 };
+use metal::foreign_types::ForeignType;
 use remu_gpu::{IndexedDraw, ShaderSnapshot};
 use remu_memory::GuestSharedMappingIdentity;
-use remu_shader::{InstructionControl, ShaderEncoding, ShaderEvaluation};
+use remu_shader::{InstructionControl, ShaderEncoding, ShaderEvaluation, image_is_comparison};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,11 +79,12 @@ enum DrawFootprintKind {
     GlobalRead,
     GlobalWrite,
     ScalarEvaluationRead,
-    Image,
+    ImageRead,
+    ImageWrite,
 }
 
 impl DrawFootprintKind {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     const fn index(self) -> usize {
         self as usize
@@ -94,7 +97,8 @@ impl DrawFootprintKind {
             Self::GlobalRead => "global-read",
             Self::GlobalWrite => "global-write",
             Self::ScalarEvaluationRead => "scalar-eval",
-            Self::Image => "image",
+            Self::ImageRead => "image-read",
+            Self::ImageWrite => "image-write",
         }
     }
 }
@@ -105,6 +109,7 @@ struct DrawFootprintRange {
     guest_address: u64,
     byte_count: u64,
     mapping: GuestSharedMappingIdentity,
+    image: Option<super::super::DecodedImageDescriptor>,
 }
 
 impl DrawFootprintRange {
@@ -127,6 +132,7 @@ impl DrawFootprintRange {
             guest_address,
             byte_count,
             mapping,
+            image: None,
         })
     }
 
@@ -157,6 +163,7 @@ struct DirectDrawFootprint {
 enum DirectDrawAdmission {
     Disjoint,
     VersionedGlobal,
+    ResidentImage,
 }
 
 impl DirectDrawAdmission {
@@ -164,6 +171,7 @@ impl DirectDrawAdmission {
         match self {
             Self::Disjoint => "disjoint",
             Self::VersionedGlobal => "versioned-global",
+            Self::ResidentImage => "resident-image",
         }
     }
 }
@@ -183,6 +191,7 @@ impl DirectDrawFootprint {
             if let Some(previous) = coalesced.last_mut()
                 && previous.kind == range.kind
                 && previous.kind != DrawFootprintKind::GlobalRead
+                && previous.kind != DrawFootprintKind::ImageRead
                 && previous.mapping.backing_id == range.mapping.backing_id
             {
                 let previous_end = previous
@@ -222,6 +231,18 @@ fn append_range(
     byte_count: u64,
 ) -> Result<(), SharedEventDrawReject> {
     ranges.push(DrawFootprintRange::new(kind, guest_address, byte_count)?);
+    Ok(())
+}
+
+fn append_image_range(
+    ranges: &mut Vec<DrawFootprintRange>,
+    kind: DrawFootprintKind,
+    descriptor: super::super::DecodedImageDescriptor,
+    byte_count: u64,
+) -> Result<(), SharedEventDrawReject> {
+    let mut range = DrawFootprintRange::new(kind, descriptor.guest.address, byte_count)?;
+    range.image = Some(descriptor);
+    ranges.push(range);
     Ok(())
 }
 
@@ -328,10 +349,17 @@ fn append_evaluation_ranges(
             .map_err(|_| SharedEventDrawReject::Unresolved)?;
         let (_, byte_count) =
             sampled_texture_raw_range(descriptor).map_err(|_| SharedEventDrawReject::Unresolved)?;
-        append_range(
+        let read_only_sample = !is_storage_image_opcode(binding.opcode)
+            && !is_writable_image_opcode(binding.opcode)
+            && !image_is_comparison(binding.opcode);
+        append_image_range(
             ranges,
-            DrawFootprintKind::Image,
-            descriptor.guest.address,
+            if read_only_sample {
+                DrawFootprintKind::ImageRead
+            } else {
+                DrawFootprintKind::ImageWrite
+            },
+            descriptor,
             u64::try_from(byte_count).map_err(|_| SharedEventDrawReject::Unresolved)?,
         )?;
     }
@@ -442,13 +470,60 @@ fn overlap_rejection(kind: SharedEventWriteKind) -> SharedEventDrawReject {
     }
 }
 
+fn retained_resident_version_is_current(
+    residents: &super::super::ResidentTextureMap,
+    version: &super::super::SharedEventResidentTextureVersion,
+) -> bool {
+    let Some(resident) = residents.get(&version.descriptor) else {
+        return false;
+    };
+    if resident.texture.as_ptr() != version.texture.as_ptr()
+        || resident.content_version != version.content_version
+        || resident.texture_type != version.texture_type
+        || resident.layer_count != version.layer_count
+        || resident.mip_level_count != version.mip_level_count
+        || resident.span != Some(version.span)
+        || !resident.gpu_written()
+        || !resident.serves_reads()
+        || resident.gpu_write_watch_generations != version.gpu_write_watch_generations
+    {
+        return false;
+    }
+
+    // CPU fault delivery, mapping retirement, and content-validation publication use independent
+    // atomics/locks. Read the complete token twice. Equality gives the admission a concrete
+    // linearization point; a CPU write after it cannot redirect the retained Metal binding used
+    // by this draw, while any write/reprotect already in progress rejects here.
+    let stable_clean_token = || {
+        if resident.write_watch.retirement().is_some()
+            || !resident.write_watch.precise_tracking()
+            || resident.write_watch.is_dirty()
+            || !resident.write_watch.dirty_page_ranges().is_empty()
+            || resident.write_watch.content_validation_pending()
+        {
+            return None;
+        }
+        Some(resident.write_watch.generations())
+    };
+    let Some(first) = stable_clean_token() else {
+        return false;
+    };
+    let Some(second) = stable_clean_token() else {
+        return false;
+    };
+    first == second && second == version.gpu_write_watch_generations
+}
+
 fn direct_draw_dependencies_are_gpu_orderable(
+    consumer_queue_id: u64,
     dependencies: &[SharedEventFence],
     checkpoints: &HashMap<SharedEventProducerId, SharedEventSignalCheckpoint>,
     footprint: &DirectDrawFootprint,
     immutable_global_available: impl Fn(u64, u64) -> bool,
-) -> Result<DirectDrawAdmission, SharedEventDrawReject> {
+    resident_version_is_current: impl Fn(&super::super::SharedEventResidentTextureVersion) -> bool,
+) -> Result<(DirectDrawAdmission, Vec<SharedEventDrawTextureOverride>), SharedEventDrawReject> {
     let mut admission = DirectDrawAdmission::Disjoint;
+    let mut texture_overrides = Vec::<SharedEventDrawTextureOverride>::new();
     let mut dependencies = dependencies.to_vec();
     dependencies.sort_unstable_by_key(|fence| (fence.producer().queue_id(), fence.value()));
     for fence in dependencies {
@@ -472,11 +547,51 @@ fn direct_draw_dependencies_are_gpu_orderable(
                     admission = DirectDrawAdmission::VersionedGlobal;
                     continue;
                 }
+                if producer.kind == SharedEventWriteKind::ResidentDestination
+                    && consumer.kind == DrawFootprintKind::ImageRead
+                    && fence.producer().queue_id() == consumer_queue_id
+                    && let Some(sampled) = consumer.image
+                    && let Some(version) = checkpoint
+                        .resident_texture_versions
+                        .iter()
+                        .filter(|version| {
+                            version.span.backing() == Some(producer.mapping)
+                                && version.span.len() == producer.byte_count
+                                && version.descriptor == sampled.guest
+                                && version.texture_type == sampled.texture_type
+                                && version.layer_count == sampled.layer_count
+                                && version.mip_level_count == sampled.mip_level_count.max(1)
+                                && sampled.base_mip_level == 0
+                                && consumer.mapping == producer.mapping
+                                && consumer.byte_count == producer.byte_count
+                        })
+                        .max_by_key(|version| version.content_version)
+                    && resident_version_is_current(version)
+                {
+                    let retained = SharedEventDrawTextureOverride {
+                        sampled,
+                        texture: version.texture.clone(),
+                    };
+                    if let Some(existing) = texture_overrides.iter_mut().find(|existing| {
+                        existing.sampled.guest == sampled.guest
+                            && existing.sampled.destination_select == sampled.destination_select
+                            && existing.sampled.base_mip_level == sampled.base_mip_level
+                            && existing.sampled.mip_level_count == sampled.mip_level_count
+                            && existing.sampled.texture_type == sampled.texture_type
+                            && existing.sampled.layer_count == sampled.layer_count
+                    }) {
+                        *existing = retained;
+                    } else {
+                        texture_overrides.push(retained);
+                    }
+                    admission = DirectDrawAdmission::ResidentImage;
+                    continue;
+                }
                 return Err(overlap_rejection(producer.kind));
             }
         }
     }
-    Ok(admission)
+    Ok((admission, texture_overrides))
 }
 
 fn first_physical_overlap(
@@ -508,7 +623,8 @@ fn describe_consumer_bytes(footprint: &DirectDrawFootprint) -> String {
         DrawFootprintKind::GlobalRead,
         DrawFootprintKind::GlobalWrite,
         DrawFootprintKind::ScalarEvaluationRead,
-        DrawFootprintKind::Image,
+        DrawFootprintKind::ImageRead,
+        DrawFootprintKind::ImageWrite,
     ]
     .into_iter()
     .map(|kind| format!("{}:{}", kind.label(), bytes[kind.index()]))
@@ -558,7 +674,7 @@ impl MetalPresenter {
         consumer_queue_id: u64,
         dependencies: &[SharedEventFence],
         draw: &IndexedDraw,
-    ) -> bool {
+    ) -> Option<SharedEventDirectDrawPlan> {
         self.statistics.shared_event_draw_attempts =
             self.statistics.shared_event_draw_attempts.saturating_add(1);
         let footprint = direct_draw_footprint(draw, draw_diagnostics_are_host_effectful());
@@ -570,6 +686,7 @@ impl MetalPresenter {
                 .ok_or(SharedEventDrawReject::IncompleteProducer)
                 .and_then(|state| {
                     direct_draw_dependencies_are_gpu_orderable(
+                        consumer_queue_id,
                         dependencies,
                         &state.resource_dependencies,
                         footprint,
@@ -580,21 +697,33 @@ impl MetalPresenter {
                                 byte_count,
                             )
                         },
+                        |version| {
+                            retained_resident_version_is_current(
+                                &self.resident_guest_textures,
+                                version,
+                            )
+                        },
                     )
                 }),
         };
         match decision {
-            Ok(DirectDrawAdmission::Disjoint) => {
+            Ok((DirectDrawAdmission::Disjoint, _)) => {
                 self.statistics.shared_event_draw_disjoint_candidates = self
                     .statistics
                     .shared_event_draw_disjoint_candidates
                     .saturating_add(1);
             }
-            Ok(DirectDrawAdmission::VersionedGlobal) => {
+            Ok((DirectDrawAdmission::VersionedGlobal, _)) => {
                 self.statistics
                     .shared_event_draw_versioned_global_candidates = self
                     .statistics
                     .shared_event_draw_versioned_global_candidates
+                    .saturating_add(1);
+            }
+            Ok((DirectDrawAdmission::ResidentImage, _)) => {
+                self.statistics.shared_event_draw_resident_image_candidates = self
+                    .statistics
+                    .shared_event_draw_resident_image_candidates
                     .saturating_add(1);
             }
             Err(reject) => {
@@ -639,20 +768,24 @@ impl MetalPresenter {
                     draw.sequence,
                     decision
                         .as_ref()
-                        .map_or_else(|reject| reject.label(), |admission| admission.label()),
+                        .map_or_else(|reject| reject.label(), |(admission, _)| admission.label()),
                     footprint
                         .as_ref()
                         .map_or(0, DirectDrawFootprint::byte_count),
                 );
             }
         }
-        decision.is_ok()
+        decision
+            .ok()
+            .map(|(_, texture_overrides)| SharedEventDirectDrawPlan { texture_overrides })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metal::foreign_types::ForeignType;
+    use metal::{Device, MTLStorageMode, MTLTextureType, MTLTextureUsage, TextureDescriptor};
     use remu_gpu::{GpuRegister, ShaderSnapshot};
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1042,7 +1175,8 @@ mod tests {
             DrawFootprintKind::GlobalRead,
             DrawFootprintKind::GlobalWrite,
             DrawFootprintKind::ScalarEvaluationRead,
-            DrawFootprintKind::Image,
+            DrawFootprintKind::ImageRead,
+            DrawFootprintKind::ImageWrite,
         ] {
             assert!(
                 footprint.ranges.iter().any(|range| range.kind == kind),
@@ -1081,8 +1215,7 @@ mod tests {
         );
 
         let first = DrawFootprintRange::new(DrawFootprintKind::GlobalRead, base, 64).unwrap();
-        let second =
-            DrawFootprintRange::new(DrawFootprintKind::GlobalRead, base + 64, 64).unwrap();
+        let second = DrawFootprintRange::new(DrawFootprintKind::GlobalRead, base + 64, 64).unwrap();
         let exact = DirectDrawFootprint::from_ranges(vec![first, second]);
         assert_eq!(
             exact.ranges.len(),
@@ -1358,6 +1491,7 @@ mod tests {
             guest_write_range_count: 0,
             memory_write_count: 0,
             global_versions: Vec::new(),
+            resident_texture_versions: Vec::new(),
             unresolved_write_ranges: Vec::new(),
             pending_write_footprint: vec![producer],
             footprint_complete: true,
@@ -1365,11 +1499,14 @@ mod tests {
         let mut checkpoints = HashMap::from([(producer_id, checkpoint.clone())]);
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &checkpoints,
                 &consumer,
                 |_, _| false,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Err(SharedEventDrawReject::OverlapResident)
         );
 
@@ -1377,11 +1514,14 @@ mod tests {
             SharedEventFence::new(producer_id, 8);
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &checkpoints,
                 &consumer,
                 |_, _| false,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Err(SharedEventDrawReject::IncompleteProducer)
         );
         checkpoints.get_mut(&producer_id).expect("checkpoint").fence = fence;
@@ -1391,11 +1531,14 @@ mod tests {
             .footprint_complete = false;
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &checkpoints,
                 &consumer,
                 |_, _| false,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Err(SharedEventDrawReject::IncompleteProducer)
         );
 
@@ -1407,6 +1550,7 @@ mod tests {
                 backing_id: producer.mapping.backing_id + 1,
                 backing_offset: producer.mapping.backing_offset,
             },
+            image: None,
         }]);
         let exact_checkpoint = SharedEventSignalCheckpoint {
             footprint_complete: true,
@@ -1415,11 +1559,14 @@ mod tests {
         let rebound_checkpoints = HashMap::from([(producer_id, exact_checkpoint)]);
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &rebound_checkpoints,
                 &rebound_consumer,
                 |_, _| false,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Ok(DirectDrawAdmission::Disjoint),
             "identical virtual addresses rebound to different captured backings are disjoint"
         );
@@ -1447,6 +1594,7 @@ mod tests {
             guest_write_range_count: 0,
             memory_write_count: 0,
             global_versions: Vec::new(),
+            resident_texture_versions: Vec::new(),
             unresolved_write_ranges: Vec::new(),
             pending_write_footprint: vec![producer],
             footprint_complete: true,
@@ -1455,20 +1603,26 @@ mod tests {
 
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &checkpoints,
                 &consumer,
                 |candidate, byte_count| candidate == address + 64 && byte_count == 64,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Ok(DirectDrawAdmission::VersionedGlobal)
         );
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &checkpoints,
                 &consumer,
                 |_, _| false,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Err(SharedEventDrawReject::OverlapCopiedGlobal)
         );
 
@@ -1478,13 +1632,245 @@ mod tests {
         ]);
         assert_eq!(
             direct_draw_dependencies_are_gpu_orderable(
+                41,
                 &[fence],
                 &checkpoints,
                 &writable,
                 |_, _| true,
-            ),
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
             Err(SharedEventDrawReject::OverlapCopiedGlobal),
             "a writable consumer needs a new ordered copy and cannot alias the retained version"
+        );
+    }
+
+    #[test]
+    fn same_queue_resident_image_retains_exact_texture_across_mapping_replacement() {
+        let mut space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original");
+        let replacement_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement");
+        let mapped = space
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &original_backing,
+                0,
+            )
+            .expect("original mapping");
+        let address = mapped.get();
+        let sampled =
+            decode_image_descriptor_without_diagnostics(&image_descriptor(address, 32, 32))
+                .expect("sample descriptor");
+        let (_, byte_count) = sampled_texture_raw_range(sampled).expect("sample range");
+        let byte_count = u64::try_from(byte_count).expect("sample bytes fit u64");
+        let span = ResourceSpan::new(address, byte_count);
+        let producer = PhysicalFootprintRange::new(
+            SharedEventWriteKind::ResidentDestination,
+            address,
+            byte_count,
+            span.backing(),
+        )
+        .expect("resident producer footprint");
+        let mut consumer =
+            DrawFootprintRange::new(DrawFootprintKind::ImageRead, address, byte_count)
+                .expect("sample consumer footprint");
+        consumer.image = Some(sampled);
+        let footprint = DirectDrawFootprint::from_ranges(vec![consumer]);
+
+        let device = Device::system_default().expect("Metal device");
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(sampled.guest.pixel_format);
+        metal_descriptor.set_width(u64::from(sampled.guest.width));
+        metal_descriptor.set_height(u64::from(sampled.guest.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&metal_descriptor);
+        let texture_pointer = texture.as_ptr();
+        let producer_id = SharedEventProducerId::new(9);
+        let fence = SharedEventFence::new(producer_id, 3);
+        let checkpoint = SharedEventSignalCheckpoint {
+            fence,
+            global_writeback_count: 0,
+            guest_write_range_count: 0,
+            memory_write_count: 0,
+            global_versions: Vec::new(),
+            resident_texture_versions: vec![
+                super::super::super::SharedEventResidentTextureVersion {
+                    texture,
+                    descriptor: sampled.guest,
+                    texture_type: sampled.texture_type,
+                    layer_count: sampled.layer_count,
+                    mip_level_count: sampled.mip_level_count,
+                    content_version: 17,
+                    gpu_write_watch_generations: Vec::new(),
+                    span,
+                },
+            ],
+            unresolved_write_ranges: Vec::new(),
+            pending_write_footprint: vec![producer],
+            footprint_complete: true,
+        };
+        let checkpoints = HashMap::from([(producer_id, checkpoint)]);
+        let (admission, overrides) = direct_draw_dependencies_are_gpu_orderable(
+            9,
+            &[fence],
+            &checkpoints,
+            &footprint,
+            |_, _| false,
+            |_| true,
+        )
+        .expect("same queue exact resident version is GPU-orderable");
+        assert_eq!(admission, DirectDrawAdmission::ResidentImage);
+        assert_eq!(overrides.len(), 1);
+
+        space
+            .unmap(mapped, GUEST_PAGE_SIZE)
+            .expect("unmap original");
+        space
+            .map_shared(
+                GuestMapPlacement::Fixed(mapped),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &replacement_backing,
+                0,
+            )
+            .expect("replacement mapping");
+        assert_eq!(overrides[0].texture.as_ptr(), texture_pointer);
+        assert_eq!(overrides[0].sampled, sampled);
+        assert_eq!(
+            direct_draw_dependencies_are_gpu_orderable(
+                10,
+                &[fence],
+                &checkpoints,
+                &footprint,
+                |_, _| false,
+                |_| true,
+            )
+            .map(|(admission, _)| admission),
+            Err(SharedEventDrawReject::OverlapResident),
+            "cross-queue resident images require general immutable ownership"
+        );
+    }
+
+    fn current_resident_version(
+        presenter: &MetalPresenter,
+        descriptor: super::super::super::GuestTextureDescriptor,
+    ) -> super::super::super::SharedEventResidentTextureVersion {
+        let resident = presenter
+            .resident_guest_textures
+            .get(&descriptor)
+            .expect("resident texture exists");
+        super::super::super::SharedEventResidentTextureVersion {
+            texture: resident.texture.clone(),
+            descriptor: resident.descriptor,
+            texture_type: resident.texture_type,
+            layer_count: resident.layer_count,
+            mip_level_count: resident.mip_level_count,
+            content_version: resident.content_version,
+            gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
+            span: resident.span.expect("resident has physical span"),
+        }
+    }
+
+    #[test]
+    fn resident_version_preflight_rejects_later_gpu_cpu_and_reprotect_changes() {
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+        let primary = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("primary mapping");
+        let descriptor = super::super::super::GuestTextureDescriptor {
+            address: primary.get(),
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode: 0,
+            pixel_format: metal::MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        presenter
+            .ensure_resident_texture(&device, descriptor)
+            .expect("resident texture");
+        presenter.mark_resident_texture_written(descriptor);
+        let first = current_resident_version(&presenter, descriptor);
+        assert!(retained_resident_version_is_current(
+            &presenter.resident_guest_textures,
+            &first,
+        ));
+
+        presenter.mark_resident_texture_written(descriptor);
+        assert!(
+            !retained_resident_version_is_current(&presenter.resident_guest_textures, &first),
+            "a later encode can destructively update the same Metal object"
+        );
+        let second = current_resident_version(&presenter, descriptor);
+        assert!(retained_resident_version_is_current(
+            &presenter.resident_guest_textures,
+            &second,
+        ));
+        memory
+            .write(primary, &[0x5a; 32])
+            .expect("same-backing CPU write");
+        assert!(
+            !retained_resident_version_is_current(&presenter.resident_guest_textures, &second),
+            "same-backing CPU dirtiness obsoletes admission"
+        );
+
+        let second_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("second backing");
+        let second_primary = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &second_backing,
+                0,
+            )
+            .expect("second primary mapping");
+        let second_descriptor = super::super::super::GuestTextureDescriptor {
+            address: second_primary.get(),
+            ..descriptor
+        };
+        presenter
+            .ensure_resident_texture(&device, second_descriptor)
+            .expect("second resident texture");
+        presenter.mark_resident_texture_written(second_descriptor);
+        let before_reprotect = current_resident_version(&presenter, second_descriptor);
+        assert!(retained_resident_version_is_current(
+            &presenter.resident_guest_textures,
+            &before_reprotect,
+        ));
+        memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &second_backing,
+                0,
+            )
+            .expect("late coherent alias");
+        assert!(
+            !retained_resident_version_is_current(
+                &presenter.resident_guest_textures,
+                &before_reprotect,
+            ),
+            "same-physical-backing watch reprotection rejects the old token"
         );
     }
 }
