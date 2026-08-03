@@ -7,15 +7,15 @@ use metal::{
     MTLStoreAction, MTLTextureType, MTLTextureUsage, RenderPassDescriptor, TextureDescriptor,
 };
 use remu_gpu::{
-    ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
-    GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw, ShaderSnapshot,
-    gpu_event_channel,
+    gpu_event_channel, ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch,
+    GpuEvent, GpuFlipWait, GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease,
+    GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage,
+    IndexedDraw, ShaderSnapshot,
 };
 
 use remu_memory::{
-    CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-    GuestProtection, guest_shared_backing_identity, guest_shared_backing_range,
+    guest_shared_backing_identity, guest_shared_backing_range, CpuWriteWatch, GuestAddressSpace,
+    GuestMapPlacement, GuestPhysicalBacking, GuestProtection, GUEST_PAGE_SIZE,
 };
 use remu_shader::{
     GlobalMemoryBinding, GlobalMemoryControl, Instruction, InstructionControl, Opcode, Program,
@@ -31,20 +31,20 @@ use super::super::submission::{
     shared_event_host_effect_is_resolved,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
-    PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SharedEventDrawReject, SharedEventFence, SharedEventProducerId, SharedEventSignalCheckpoint,
-    SharedEventWriteKind, UploadedGlobalBuffer,
+    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, GlobalUploadChunk,
+    PendingGuestWriteRange, PhysicalFootprintRange, SharedEventDrawReject, SharedEventFence,
+    SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
+    SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
 };
 use super::{
-    ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
+    apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write, read_texture_linear,
+    write_back_pending_globals, ComputePipelineKey, FlushPolicy, GuestBatchFlushReason,
     GuestCommandBatch, GuestMemoryWaitKey, GuestMemoryWaitRecovery, GuestMemoryWaitStatus,
     GuestMemoryWaitTracker, GuestMemoryWriteOperation, GuestRenderPassKey, GuestTextureDescriptor,
-    MAX_COMMITTED_GUEST_BATCHES, MetalPresenter, OpenGuestRenderPass, OrderedEventPoll,
-    OrderedEventSource, OrderedGpuEventReceiver, PendingFlip, PendingGlobalWriteback,
-    PendingGuestMemoryWrite, PipelineCompileCandidate, ProgramIdentity, QueueBlockReason,
-    ResourceSpan, apply_pending_guest_memory_writes, indexed_draw, pin_guest_memory_write,
-    read_texture_linear, write_back_pending_globals,
+    MetalPresenter, OpenGuestRenderPass, OrderedEventPoll, OrderedEventSource,
+    OrderedGpuEventReceiver, PendingFlip, PendingGlobalWriteback, PendingGuestMemoryWrite,
+    PipelineCompileCandidate, ProgramIdentity, QueueBlockReason, ResourceSpan,
+    GLOBAL_UPLOAD_ALIGNMENT, MAX_COMMITTED_GUEST_BATCHES,
 };
 
 fn enable_per_queue_batches(presenter: &mut MetalPresenter) {
@@ -1897,13 +1897,13 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
-            memory_writes: vec![
-                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            memory_writes: vec![pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+                GpuMemoryRelease {
                     address: completion_address,
                     value: GpuMemoryReleaseValue::Immediate32(9),
-                }))
-                .expect("pin completion label mapping"),
-            ],
+                },
+            ))
+            .expect("pin completion label mapping")],
             resident_write_footprint: Vec::new(),
             resident_write_footprint_complete: true,
             render_pass: None,
@@ -2087,7 +2087,7 @@ fn opportunistic_flush_defers_at_the_in_flight_batch_budget() {
 }
 
 #[test]
-fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
+fn render_scalar_uploads_are_nonempty_aligned_and_do_not_alias() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
     let mut batch = GuestCommandBatch {
@@ -2107,15 +2107,46 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
     };
+    assert!(batch
+        .upload_render_scalar_words(&device, &[])
+        .expect("empty scalar metadata")
+        .is_none());
+    assert!(
+        batch.global_upload_chunks.is_empty(),
+        "empty scalar metadata must not manufacture a Metal resource"
+    );
+    let first_words = [0x1122_3344_u32, 0xaabb_ccdd];
+    let second_words = [0x0102_0304_u32];
     let (first_buffer, first_offset) = batch
-        .upload_global_bytes(&device, &[1, 2, 3])
-        .expect("first upload");
+        .upload_render_scalar_words(&device, &first_words)
+        .expect("first upload")
+        .expect("nonempty upload binds");
     let (second_buffer, second_offset) = batch
-        .upload_global_bytes(&device, &[9, 8, 7, 6])
-        .expect("second upload");
+        .upload_render_scalar_words(&device, &second_words)
+        .expect("second upload")
+        .expect("nonempty upload binds");
     assert_eq!(first_buffer.contents(), second_buffer.contents());
     assert_eq!(first_offset, 0);
     assert_eq!(second_offset, GLOBAL_UPLOAD_ALIGNMENT as u64);
+    assert_ne!(
+        first_offset, second_offset,
+        "draw metadata slices cannot alias"
+    );
+
+    let first_bytes = unsafe {
+        std::slice::from_raw_parts(
+            first_buffer
+                .contents()
+                .cast::<u8>()
+                .add(first_offset as usize),
+            std::mem::size_of_val(&first_words),
+        )
+    };
+    let expected_first = first_words
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(first_bytes, expected_first);
 
     let mut destination = [0_u8; 4];
     let guest_address =
@@ -2130,7 +2161,62 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
         original_bytes: vec![0; destination.len()],
     }])
     .expect("sliced global writeback");
-    assert_eq!(destination, [9, 8, 7, 6]);
+    assert_eq!(destination, second_words[0].to_ne_bytes());
+}
+
+#[test]
+fn global_upload_arena_remains_owned_until_terminal_batch_retirement() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let retained = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
+    command_buffer.commit();
+    presenter
+        .committed_guest_batches
+        .push_back(GuestCommandBatch {
+            queue_id: None,
+            command_buffer,
+            work: Vec::new(),
+            committed_at: Some(Instant::now()),
+            global_upload_chunks: vec![GlobalUploadChunk {
+                buffer: retained,
+                used: GLOBAL_UPLOAD_ALIGNMENT,
+            }],
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: Vec::new(),
+            resident_write_footprint: Vec::new(),
+            resident_write_footprint_complete: true,
+            render_pass: None,
+            compute_encoder: None,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
+            completion_sequences: Vec::new(),
+        });
+    assert_eq!(
+        presenter
+            .committed_guest_batches
+            .front()
+            .expect("submitted batch remains queued")
+            .global_upload_chunks
+            .len(),
+        1,
+        "the committed batch must retain its scalar arena before terminal settlement"
+    );
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("batch reaches a terminal Metal state");
+    assert!(
+        presenter.committed_guest_batches.is_empty(),
+        "terminal settlement is the scalar arena's retirement boundary"
+    );
 }
 
 #[test]
@@ -2278,13 +2364,13 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             global_upload_chunks: Vec::new(),
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
-            memory_writes: vec![
-                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+            memory_writes: vec![pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+                GpuMemoryRelease {
                     address: completion_address,
                     value: GpuMemoryReleaseValue::Immediate32(9),
-                }))
-                .expect("pin later completion label"),
-            ],
+                },
+            ))
+            .expect("pin later completion label")],
             resident_write_footprint: Vec::new(),
             resident_write_footprint_complete: true,
             render_pass: None,
@@ -4208,14 +4294,12 @@ fn per_queue_empty_boundary_ignores_foreign_outstanding_batches() {
         [0x4100],
         "an empty q41 completes immediately despite outstanding q0 work"
     );
-    assert!(
-        presenter.guest_queue_batches[&0]
-            .open_batch
-            .as_ref()
-            .expect("q0 remains open")
-            .completion_sequences
-            .is_empty()
-    );
+    assert!(presenter.guest_queue_batches[&0]
+        .open_batch
+        .as_ref()
+        .expect("q0 remains open")
+        .completion_sequences
+        .is_empty());
     presenter
         .wait_for_guest_command_batches()
         .expect("test queue drains");
@@ -4590,8 +4674,7 @@ fn disjoint_direct_draw_admission_is_default_disabled() {
     );
     assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
     assert_eq!(
-        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW],
-        1,
+        presenter.statistics.shared_event_host_block_kinds[SHARED_HOST_KIND_DRAW], 1,
         "default-OFF must preserve the existing draw host gate"
     );
     assert_eq!(
@@ -4659,7 +4742,8 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
     assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
     assert_eq!(
-        presenter.statistics.shared_event_draw_disjoint_candidates, 1
+        presenter.statistics.shared_event_draw_disjoint_candidates,
+        1
     );
     assert_eq!(presenter.statistics.shared_event_host_blocks, 0);
     assert_eq!(
@@ -4680,7 +4764,10 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
         .next()
         .expect("consumer retains one exact producer checkpoint");
     assert_eq!(producer.queue_id(), 41);
-    assert_eq!(consumer.host_dependencies.get(&producer), Some(&checkpoint.fence.value()));
+    assert_eq!(
+        consumer.host_dependencies.get(&producer),
+        Some(&checkpoint.fence.value())
+    );
     assert!(checkpoint.footprint_complete);
     assert_eq!(
         consumer
@@ -4691,7 +4778,11 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
         None,
         "admission must not manufacture a consumer host acknowledgement"
     );
-    assert_eq!(read_test_label(label), 0, "GPU signal is not host retirement");
+    assert_eq!(
+        read_test_label(label),
+        0,
+        "GPU signal is not host retirement"
+    );
 
     presenter.set_active_guest_queue(Some(0));
     presenter
@@ -4760,11 +4851,11 @@ fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
     assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
     assert_eq!(
-        presenter.statistics.shared_event_draw_disjoint_candidates, 0
+        presenter.statistics.shared_event_draw_disjoint_candidates,
+        0
     );
     assert_eq!(
-        presenter.statistics.shared_event_draw_rejections
-            [SharedEventDrawReject::Overlap.index()],
+        presenter.statistics.shared_event_draw_rejections[SharedEventDrawReject::Overlap.index()],
         1
     );
     assert_eq!(presenter.statistics.shared_event_gpu_ordered_draws, 0);
@@ -4830,7 +4921,9 @@ fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
-        events: vec![GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth)))],
+        events: vec![GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(
+            depth
+        )))],
     }));
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
     assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
@@ -5111,7 +5204,10 @@ fn shared_event_checkpoint_includes_earlier_unretired_queue_writes() {
     presenter
         .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
         .expect("earlier producer batch commits");
-    assert_eq!(presenter.guest_queue_batches[&41].committed_batches.len(), 1);
+    assert_eq!(
+        presenter.guest_queue_batches[&41].committed_batches.len(),
+        1
+    );
 
     open_per_queue_batch(&mut presenter, 41);
     let state = presenter
@@ -5141,8 +5237,8 @@ fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
     let device = presenter.device.as_ref().expect("Metal device").clone();
     let (_address_space, address) = mapped_test_label();
     let buffer = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
-    let copied_identity = guest_shared_backing_identity(address, 32)
-        .expect("copied global physical identity");
+    let copied_identity =
+        guest_shared_backing_identity(address, 32).expect("copied global physical identity");
     let zero_copy_identity = guest_shared_backing_identity(address + 64, 32)
         .expect("zero-copy global physical identity");
 
@@ -5274,10 +5370,7 @@ fn unresolved_or_ambiguous_signal_writes_make_the_checkpoint_unsafe() {
         .open_batch
         .as_mut()
         .expect("producer batch is open")
-        .record_resident_write_footprint(
-            SharedEventWriteKind::InternalResidentDestination,
-            None,
-        );
+        .record_resident_write_footprint(SharedEventWriteKind::InternalResidentDestination, None);
     let fence = state
         .shared_event_timeline
         .allocate_fence()
@@ -5317,7 +5410,10 @@ fn unresolved_or_ambiguous_signal_writes_make_the_checkpoint_unsafe() {
         .expect("second footprint mapping");
     let ambiguous_span = ResourceSpan::new(base.get() + GUEST_PAGE_SIZE as u64 - 16, 32);
     assert!(ambiguous_span.backing().is_none());
-    let batch = state.open_batch.as_mut().expect("producer batch remains open");
+    let batch = state
+        .open_batch
+        .as_mut()
+        .expect("producer batch remains open");
     batch.resident_write_footprint.clear();
     batch.resident_write_footprint_complete = true;
     batch.record_resident_write_footprint(

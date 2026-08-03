@@ -3,11 +3,12 @@
 
 //! Signal-safe evidence for Metal scalar-buffer binding faults.
 
+use metal::foreign_types::ForeignTypeRef;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-const REPRESENTATION_INLINE_BYTES: u64 = 1;
 const REPRESENTATION_RETAINED_BUFFER: u64 = 2;
+const REPRESENTATION_SKIPPED_EMPTY: u64 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FragmentScalarBindingRecord {
@@ -128,7 +129,7 @@ pub(super) fn install_fragment_scalar_binding_fault_diagnostic() {
     }
     if remu_memory::register_host_fault_diagnostic(write_last_fragment_scalar_binding) {
         ENABLED.store(true, Ordering::Release);
-        eprintln!("[REMu][METAL-BINDING-FAULT] enabled marker=fragment-scalar-binding-v1");
+        eprintln!("[REMu][METAL-BINDING-FAULT] enabled marker=fragment-scalar-binding-v2");
     } else {
         eprintln!(
             "[REMu][METAL-BINDING-FAULT] unavailable: another host-fault callback is installed"
@@ -137,13 +138,15 @@ pub(super) fn install_fragment_scalar_binding_fault_diagnostic() {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn record_fragment_scalar_inline_binding(
+pub(super) fn record_fragment_scalar_retained_buffer_binding(
     event_sequence: u64,
     export_shader: u64,
     pixel_shader: u64,
     binding_index: u64,
     byte_count: u64,
     render_pass_reused: bool,
+    buffer: &metal::BufferRef,
+    offset: u64,
 ) {
     if !ENABLED.load(Ordering::Acquire) {
         return;
@@ -155,7 +158,32 @@ pub(super) fn record_fragment_scalar_inline_binding(
         binding_index,
         byte_count,
         render_pass_reused: u64::from(render_pass_reused),
-        representation: REPRESENTATION_INLINE_BYTES,
+        representation: REPRESENTATION_RETAINED_BUFFER,
+        retained_resource: u64::try_from(buffer.as_ptr() as usize)
+            .expect("Metal resource pointer fits u64"),
+        retained_offset: offset,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn record_fragment_scalar_empty_binding(
+    event_sequence: u64,
+    export_shader: u64,
+    pixel_shader: u64,
+    binding_index: u64,
+    render_pass_reused: bool,
+) {
+    if !ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    LAST_FRAGMENT_SCALAR_BINDING.publish(FragmentScalarBindingRecord {
+        event_sequence,
+        export_shader,
+        pixel_shader,
+        binding_index,
+        byte_count: 0,
+        render_pass_reused: u64::from(render_pass_reused),
+        representation: REPRESENTATION_SKIPPED_EMPTY,
         retained_resource: 0,
         retained_offset: 0,
     });
@@ -195,10 +223,10 @@ fn format_fragment_scalar_binding(record: FragmentScalarBindingRecord, line: &mu
         b"new"
     });
     line.push_bytes(b" representation=");
-    line.push_bytes(if record.representation == REPRESENTATION_RETAINED_BUFFER {
-        b"retained-buffer"
-    } else {
-        b"inline-bytes"
+    line.push_bytes(match record.representation {
+        REPRESENTATION_RETAINED_BUFFER => b"retained-buffer",
+        REPRESENTATION_SKIPPED_EMPTY => b"skipped-empty",
+        _ => b"unknown",
     });
     line.push_bytes(b" resource=");
     line.push_hexadecimal(record.retained_resource);
@@ -264,9 +292,8 @@ impl DiagnosticLine {
 #[cfg(test)]
 mod tests {
     use super::{
-        DiagnosticLine, FragmentScalarBindingRecord, LastFragmentScalarBinding,
-        REPRESENTATION_INLINE_BYTES, REPRESENTATION_RETAINED_BUFFER,
-        format_fragment_scalar_binding,
+        format_fragment_scalar_binding, DiagnosticLine, FragmentScalarBindingRecord,
+        LastFragmentScalarBinding, REPRESENTATION_RETAINED_BUFFER, REPRESENTATION_SKIPPED_EMPTY,
     };
 
     fn record(sequence: u64, representation: u64) -> FragmentScalarBindingRecord {
@@ -287,7 +314,7 @@ mod tests {
     fn publishes_only_complete_fixed_slot_records() {
         let state = LastFragmentScalarBinding::new();
         assert_eq!(state.snapshot(), None);
-        state.publish(record(41, REPRESENTATION_INLINE_BYTES));
+        state.publish(record(41, REPRESENTATION_SKIPPED_EMPTY));
         state.publish(record(42, REPRESENTATION_RETAINED_BUFFER));
         assert_eq!(
             state.snapshot(),
@@ -305,5 +332,20 @@ mod tests {
               stage=fragment index=0 bytes=416 render_pass=reused representation=retained-buffer \
               resource=0x7f7cd0018000 offset=0x180\n"
         );
+    }
+
+    #[test]
+    fn formats_an_empty_binding_as_skipped_without_a_resource() {
+        let mut empty = record(43, REPRESENTATION_SKIPPED_EMPTY);
+        empty.byte_count = 0;
+        empty.retained_resource = 0;
+        empty.retained_offset = 0;
+        let mut line = DiagnosticLine::new();
+        format_fragment_scalar_binding(empty, &mut line);
+        assert!(line
+            .as_slice()
+            .windows(b"representation=skipped-empty".len())
+            .any(|window| { window == b"representation=skipped-empty" }));
+        assert!(line.as_slice().ends_with(b"resource=0x0 offset=0x0\n"));
     }
 }

@@ -2,22 +2,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::{
-    COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
-    wait_until_settled_within,
+    command_buffer_failure_message, settle_timeout_message, wait_until_settled_within,
+    COMMAND_BUFFER_SETTLE_TIMEOUT,
 };
 use super::super::shared_event::{
-    SharedEventBatchTerminalState, SharedEventFence, SharedEventProducerId,
-    terminal_shared_event_advance,
+    terminal_shared_event_advance, SharedEventBatchTerminalState, SharedEventFence,
+    SharedEventProducerId,
 };
 use super::super::{
     FlushPolicy, GuestQueueBatchState, PresenterStatistics, TerminalPublicationPhase,
     TerminalPublicationTimer,
 };
 use super::{
-    GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
-    GuestBatchFlushReason, GuestBatchWork, GuestCommandBatch, MetalPresenter, OrderedEventSource,
-    PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
-    guest_physical_ranges_overlap, guest_ranges_overlap,
+    guest_physical_ranges_overlap, guest_ranges_overlap, GlobalUploadChunk, GuestBatchFlushReason,
+    GuestBatchWork, GuestCommandBatch, MetalPresenter, OrderedEventSource, PendingGlobalWriteback,
+    PendingGuestWriteRange, UploadedGlobalBuffer, GLOBAL_UPLOAD_ALIGNMENT,
+    GLOBAL_UPLOAD_CHUNK_BYTE_COUNT,
 };
 use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
 use crate::presenter::{
@@ -32,9 +32,9 @@ use metal::{
 };
 use objc::{msg_send, sel, sel_impl};
 use remu_memory::{
-    CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_backing_identity,
-    read_guest_shared_backing, write_guest_shared_backing_at_identity,
-    write_guest_shared_backing_if_identity,
+    guest_shared_backing_identity, read_guest_shared_backing,
+    write_guest_shared_backing_at_identity, write_guest_shared_backing_if_identity, CpuWriteWatch,
+    GuestSharedMappingIdentity, GuestWriteSite,
 };
 use remu_shader::ShaderEvaluation;
 use std::io::ErrorKind;
@@ -146,11 +146,12 @@ impl SharedEventSignalCheckpoint {
             );
         }
         for range in &batch.guest_write_ranges[..guest_write_range_count] {
-            self.unresolved_write_ranges.push(SharedEventUnresolvedWriteRange {
-                guest_address: range.address,
-                byte_count: range.byte_count,
-                mapping_identity: Some(range.physical_identity),
-            });
+            self.unresolved_write_ranges
+                .push(SharedEventUnresolvedWriteRange {
+                    guest_address: range.address,
+                    byte_count: range.byte_count,
+                    mapping_identity: Some(range.physical_identity),
+                });
             self.capture_physical_range(
                 SharedEventWriteKind::ZeroCopyGlobal,
                 range.address,
@@ -160,11 +161,12 @@ impl SharedEventSignalCheckpoint {
         }
         for write in &batch.memory_writes[..memory_write_count] {
             let (guest_address, byte_count) = write.range();
-            self.unresolved_write_ranges.push(SharedEventUnresolvedWriteRange {
-                guest_address,
-                byte_count,
-                mapping_identity: write.mapping_identity,
-            });
+            self.unresolved_write_ranges
+                .push(SharedEventUnresolvedWriteRange {
+                    guest_address,
+                    byte_count,
+                    mapping_identity: write.mapping_identity,
+                });
             self.capture_physical_range(
                 SharedEventWriteKind::TerminalGuestWrite,
                 guest_address,
@@ -246,12 +248,9 @@ impl GuestCommandBatch {
             self.resident_write_footprint_complete = false;
             return;
         };
-        let Some(range) = PhysicalFootprintRange::new(
-            kind,
-            span.address(),
-            span.len(),
-            span.backing(),
-        ) else {
+        let Some(range) =
+            PhysicalFootprintRange::new(kind, span.address(), span.len(), span.backing())
+        else {
             self.resident_write_footprint_complete = false;
             return;
         };
@@ -656,16 +655,15 @@ impl MetalPresenter {
                         .committed_batches
                         .pop_front()
                         .expect("terminal front exists");
-                    let mut timer = TerminalPublicationTimer::start_if(
-                        self.terminal_publication_timing,
-                    );
+                    let mut timer =
+                        TerminalPublicationTimer::start_if(self.terminal_publication_timing);
                     let terminal_status = batch.command_buffer.status();
                     timer.mark(
                         &mut self.statistics.terminal_publication,
                         TerminalPublicationPhase::MetalTerminal,
                     );
-                    let execution_error = (terminal_status == MTLCommandBufferStatus::Error)
-                        .then(|| {
+                    let execution_error =
+                        (terminal_status == MTLCommandBufferStatus::Error).then(|| {
                             command_buffer_failure_message(
                                 &format!(
                                     "Metal guest command batch queue={} [{}]",
@@ -679,8 +677,7 @@ impl MetalPresenter {
                         &mut self.statistics.terminal_publication,
                         TerminalPublicationPhase::TerminalMetadata,
                     );
-                    let result =
-                        self.complete_terminal_guest_batch(&batch, execution_error, timer);
+                    let result = self.complete_terminal_guest_batch(&batch, execution_error, timer);
                     if let Err(error) = result {
                         eprintln!(
                             "[REMu][METAL] queue {queue_id} guest batch finalization failed: {error}"
@@ -700,9 +697,8 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
-                    let mut timer = TerminalPublicationTimer::start_if(
-                        self.terminal_publication_timing,
-                    );
+                    let mut timer =
+                        TerminalPublicationTimer::start_if(self.terminal_publication_timing);
                     let terminal_status = (cfg!(debug_assertions)
                         || self.terminal_publication_timing)
                         .then(|| batch.command_buffer.status());
@@ -727,9 +723,8 @@ impl MetalPresenter {
                         .committed_guest_batches
                         .pop_front()
                         .expect("front batch exists");
-                    let mut timer = TerminalPublicationTimer::start_if(
-                        self.terminal_publication_timing,
-                    );
+                    let mut timer =
+                        TerminalPublicationTimer::start_if(self.terminal_publication_timing);
                     let terminal_status = (cfg!(debug_assertions)
                         || self.terminal_publication_timing)
                         .then(|| batch.command_buffer.status());
@@ -1137,8 +1132,7 @@ impl MetalPresenter {
         let Some(batch) = self.committed_guest_batches.pop_front() else {
             return FrontBatchSettlement::Empty;
         };
-        let mut timer =
-            TerminalPublicationTimer::start_if(self.terminal_publication_timing);
+        let mut timer = TerminalPublicationTimer::start_if(self.terminal_publication_timing);
         let execution_error = match settle_guest_batch_by(&batch, deadline) {
             GuestBatchSettlement::Completed => None,
             GuestBatchSettlement::Failed(error) => Some(error),
@@ -1171,8 +1165,7 @@ impl MetalPresenter {
         else {
             return FrontBatchSettlement::Empty;
         };
-        let mut timer =
-            TerminalPublicationTimer::start_if(self.terminal_publication_timing);
+        let mut timer = TerminalPublicationTimer::start_if(self.terminal_publication_timing);
         let execution_error = match settle_guest_batch_by(&batch, deadline) {
             GuestBatchSettlement::Completed => None,
             GuestBatchSettlement::Failed(error) => Some(error),
@@ -1234,9 +1227,8 @@ impl MetalPresenter {
         &mut self,
         timeout: Duration,
     ) -> Result<(), String> {
-        self.guest_batch_cpu_synchronization_epoch = self
-            .guest_batch_cpu_synchronization_epoch
-            .saturating_add(1);
+        self.guest_batch_cpu_synchronization_epoch =
+            self.guest_batch_cpu_synchronization_epoch.saturating_add(1);
         if self.per_queue_guest_batches {
             return self.wait_for_guest_queue_command_batches_within(timeout);
         }
@@ -1444,7 +1436,7 @@ pub(crate) fn describe_guest_batch(work: &[GuestBatchWork]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{GuestBatchWork, describe_guest_batch};
+    use super::{describe_guest_batch, GuestBatchWork};
 
     #[test]
     fn batch_diagnostics_retain_indirect_geometry_and_dispatcher_cost() {
@@ -1559,6 +1551,31 @@ impl GuestCommandBatch {
             buffer,
             u64::try_from(offset).map_err(|_| "global upload offset does not fit Metal")?,
         ))
+    }
+
+    /// Retains render-stage scalar metadata in this batch's upload arena.
+    ///
+    /// Metal's inline-byte render bindings are represented internally as buffer resources. On a
+    /// restarted render pass the Metal driver can replay a missing inline resource and
+    /// dereference it while rebuilding the fragment resource list. A real buffer keeps the
+    /// resource identity stable, while ownership by `GuestCommandBatch` keeps its storage live
+    /// until the command buffer reaches a terminal state. Empty metadata is deliberately left
+    /// unbound: the translated shader has no scalar words to read, and manufacturing a zero-byte
+    /// resource would recreate the driver's semantically empty binding edge case.
+    pub(crate) fn upload_render_scalar_words(
+        &mut self,
+        device: &Device,
+        words: &[u32],
+    ) -> Result<Option<(Buffer, u64)>, String> {
+        if words.is_empty() {
+            return Ok(None);
+        }
+        let byte_count = std::mem::size_of_val(words);
+        // SAFETY: `words` is a contiguous live slice, and a `[u8]` permits every alignment and
+        // bit pattern. REmu's Metal shaders consume these native `uint` words on the same
+        // little-endian host that produced them.
+        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), byte_count) };
+        self.upload_global_bytes(device, bytes).map(Some)
     }
 
     /// Copies one live guest-physical range directly into this batch's shared upload arena.
