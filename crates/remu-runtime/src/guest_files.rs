@@ -7,6 +7,7 @@
 //! is resolved through a cache that remembers the one host name a console path maps to. The
 //! descriptor table and the `stat` layouts below are what the guest sees once a path resolves.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::io::{Read, Seek, Write};
@@ -433,11 +434,42 @@ pub(crate) fn resolve_immutable_app_path_with_presence(
     })
 }
 
-fn resolve_guest_path_with_presence(
+fn normalized_guest_path(guest_path: &str) -> Cow<'_, str> {
+    if guest_path.as_bytes().contains(&b'\\') {
+        Cow::Owned(guest_path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(guest_path)
+    }
+}
+
+#[cfg(test)]
+mod path_normalization_tests {
+    use std::borrow::Cow;
+
+    use super::normalized_guest_path;
+
+    #[test]
+    fn forward_slash_guest_paths_keep_borrowed_storage() {
+        let path = "/app0/majesty/content/paks/majesty-ps5.pak";
+        let normalized = normalized_guest_path(path);
+
+        assert_eq!(normalized, path);
+        assert!(matches!(normalized, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn backslash_guest_paths_are_normalized_once() {
+        let normalized = normalized_guest_path(r"\app0\majesty\content\paks");
+
+        assert_eq!(normalized, "/app0/majesty/content/paks");
+        assert!(matches!(normalized, Cow::Owned(_)));
+    }
+}
+
+fn resolve_normalized_app_path_with_presence(
     game_root: &Path,
-    guest_path: &str,
+    normalized: &str,
 ) -> Option<ImmutableAppPathResolution> {
-    let normalized = guest_path.replace('\\', "/");
     let relative = if let Some(path) = normalized.strip_prefix("/app0/") {
         path
     } else if normalized == "/app0" {
@@ -447,7 +479,7 @@ fn resolve_guest_path_with_presence(
     } else if normalized.starts_with('/') {
         return None;
     } else {
-        normalized.as_str()
+        normalized
     };
     // `/app0` is immutable for the lifetime of a title. Unreal repeatedly probes the same
     // optional configuration and localization paths, and resolving each miss used to repeat an
@@ -471,6 +503,14 @@ fn resolve_guest_path_with_presence(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     cache.insert_resolution(game_root, relative, resolved.clone());
     Some(resolved)
+}
+
+fn resolve_guest_path_with_presence(
+    game_root: &Path,
+    guest_path: &str,
+) -> Option<ImmutableAppPathResolution> {
+    let normalized = normalized_guest_path(guest_path);
+    resolve_normalized_app_path_with_presence(game_root, &normalized)
 }
 
 pub(crate) fn resolve_guest_path(game_root: &Path, guest_path: &str) -> Option<PathBuf> {
@@ -513,7 +553,7 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
     state: &ProbeDispatchState,
     guest_path: &str,
 ) -> Option<ResolvedProbeGuestPath> {
-    let normalized = guest_path.replace('\\', "/");
+    let normalized = normalized_guest_path(guest_path);
     if let Some(overlaid) = overlay_guest_path(&normalized) {
         return Some(ResolvedProbeGuestPath {
             path: overlaid,
@@ -521,15 +561,29 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
             known_absent: false,
         });
     }
-    let download_root = state.save_root.join("download0");
+    // Application paths dominate packaged-title startup and asset streaming. Route them before
+    // constructing writable-root paths or scanning save mounts, and pass the already-normalized
+    // spelling through so the immutable resolver does not allocate and normalize it a second
+    // time. Save-data mounts are created only as `/savedata0` through `/savedata15`, so they can
+    // never shadow this namespace.
+    if normalized == "/app0" || normalized.starts_with("/app0/") {
+        return resolve_normalized_app_path_with_presence(&state.game_root, &normalized).map(
+            |resolved| ResolvedProbeGuestPath {
+                path: resolved.path,
+                writable: false,
+                known_absent: resolved.known_absent,
+            },
+        );
+    }
     if normalized == "/download0" {
         return Some(ResolvedProbeGuestPath {
-            path: download_root,
+            path: state.save_root.join("download0"),
             writable: true,
             known_absent: false,
         });
     }
     if let Some(relative) = normalized.strip_prefix("/download0/") {
+        let download_root = state.save_root.join("download0");
         return resolve_path_beneath(&download_root, relative).map(|path| ResolvedProbeGuestPath {
             path,
             writable: true,
@@ -545,7 +599,10 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
                 known_absent: false,
             });
         }
-        if let Some(relative) = normalized.strip_prefix(&format!("{mount_point}/")) {
+        if let Some(relative) = normalized
+            .strip_prefix(mount_point)
+            .and_then(|relative| relative.strip_prefix('/'))
+        {
             return resolve_path_beneath(&mounted.path, relative).map(|path| {
                 ResolvedProbeGuestPath {
                     path,
@@ -555,7 +612,7 @@ pub(crate) fn resolve_probe_guest_path_with_presence(
             });
         }
     }
-    resolve_guest_path_with_presence(&state.game_root, &normalized).map(|resolved| {
+    resolve_normalized_app_path_with_presence(&state.game_root, &normalized).map(|resolved| {
         ResolvedProbeGuestPath {
             path: resolved.path,
             writable: false,
