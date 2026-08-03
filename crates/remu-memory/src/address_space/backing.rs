@@ -5,6 +5,8 @@
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::io;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +23,47 @@ use super::{
 };
 
 static NEXT_BACKING_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticBackingWriteWatch {
+    backing_id: u64,
+    offset: u64,
+    byte_count: u64,
+}
+
+#[cfg(windows)]
+fn diagnostic_backing_write_watch() -> &'static Mutex<Option<DiagnosticBackingWriteWatch>> {
+    static WATCH: OnceLock<Mutex<Option<DiagnosticBackingWriteWatch>>> = OnceLock::new();
+    WATCH.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(windows)]
+fn trace_diagnostic_backing_write(backing_id: u64, offset: u64, source: &[u8]) {
+    let watch = *diagnostic_backing_write_watch()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(watch) = watch else {
+        return;
+    };
+    let Some(end) = offset.checked_add(source.len() as u64) else {
+        return;
+    };
+    let watch_end = watch.offset + watch.byte_count;
+    if backing_id != watch.backing_id || offset >= watch_end || watch.offset >= end {
+        return;
+    }
+    let mut prefix = [0_u8; 8];
+    let copied = prefix.len().min(source.len());
+    prefix[..copied].copy_from_slice(&source[..copied]);
+    eprintln!(
+        "[REMu][JOURNAL][BACKING-WRITE] backing={backing_id} offset={offset:#x} bytes={:#x} payload={:#x} thread={:?}\n{}",
+        source.len(),
+        u64::from_le_bytes(prefix),
+        std::thread::current().name(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
 
 const READ_MAPPING_CACHE_CAPACITY: usize = 256;
 const READ_MAPPING_CACHE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
@@ -534,6 +577,22 @@ impl GuestPhysicalBacking {
     }
 
     #[cfg(windows)]
+    pub(super) fn install_write_diagnostic(&self, offset: u64, byte_count: u64) {
+        *diagnostic_backing_write_watch()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(DiagnosticBackingWriteWatch {
+                backing_id: self.id(),
+                offset,
+                byte_count,
+            });
+        eprintln!(
+            "[REMu][JOURNAL] watching backing={} offset={offset:#x} length={byte_count:#x}",
+            self.id(),
+        );
+    }
+
+    #[cfg(windows)]
     pub(super) fn windows_handle(&self) -> HANDLE {
         self.inner.windows_handle()
     }
@@ -616,6 +675,8 @@ impl GuestPhysicalBacking {
         if end > self.size() {
             return false;
         }
+        #[cfg(windows)]
+        trace_diagnostic_backing_write(self.id(), offset, source);
         let Ok(page_size) = host_page_size() else {
             return false;
         };

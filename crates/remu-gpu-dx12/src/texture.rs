@@ -204,6 +204,22 @@ impl DecodedTexture {
     }
 
     pub(super) fn raw_byte_count(self) -> Result<usize, String> {
+        if self.texture_type == 10 && matches!(self.tile_mode, 5 | 9) {
+            let block_bytes =
+                tiled_block_bytes(self.tile_mode).expect("mode 5/9 has a fixed tiled block size");
+            let (block_width, block_height, block_depth) =
+                tiled_3d_block_dimensions(block_bytes, self.bytes_per_element as usize)
+                    .ok_or("unsupported tiled 3D texture element size")?;
+            return self
+                .pitch_elements()
+                .div_ceil(block_width)
+                .checked_mul((self.height as usize).div_ceil(block_height))
+                .and_then(|blocks| {
+                    blocks.checked_mul((self.layer_count as usize).div_ceil(block_depth))
+                })
+                .and_then(|blocks| blocks.checked_mul(block_bytes))
+                .ok_or_else(|| "tiled 3D texture size overflows".to_owned());
+        }
         self.raw_layer_byte_count()?
             .checked_mul(self.layer_count as usize)
             .ok_or_else(|| "layered texture size overflows".to_owned())
@@ -326,18 +342,32 @@ pub(super) fn decode_texture(binding: &ImageBinding) -> Result<DecodedTexture, S
     })
 }
 
-pub(super) fn read_texture_linear(descriptor: DecodedTexture) -> Result<Vec<u8>, String> {
-    let mut linear = vec![0_u8; descriptor.linear_byte_count()?];
+fn snapshot_texture_raw(descriptor: DecodedTexture, byte_count: usize) -> Vec<u8> {
+    let mut raw = vec![0_u8; byte_count];
     if descriptor.address == 0 {
-        return Ok(linear);
+        return raw;
     }
-    let layer_raw_bytes = descriptor.raw_layer_byte_count()?;
-    let mut raw = vec![0_u8; descriptor.raw_byte_count()?];
     // SAFETY: evaluated image descriptors name mapped guest allocations retained through event
     // retirement. Descriptor validation above bounds the host allocation.
     unsafe {
         std::ptr::copy_nonoverlapping(descriptor.address as *const u8, raw.as_mut_ptr(), raw.len());
     }
+    raw
+}
+
+fn decode_texture_linear_from_raw(
+    descriptor: DecodedTexture,
+    raw: &[u8],
+) -> Result<Vec<u8>, String> {
+    if raw.len() != descriptor.raw_byte_count()? {
+        return Err("texture raw snapshot byte count mismatch".to_owned());
+    }
+    let mut linear = vec![0_u8; descriptor.linear_byte_count()?];
+    if descriptor.texture_type == 10 && matches!(descriptor.tile_mode, 5 | 9) {
+        detile_standard_volume(descriptor, raw, &mut linear)?;
+        return Ok(linear);
+    }
+    let layer_raw_bytes = descriptor.raw_layer_byte_count()?;
     let layer_linear_bytes = descriptor.linear_byte_count()? / descriptor.layer_count as usize;
     for layer in 0..descriptor.layer_count as usize {
         detile_layer(
@@ -350,9 +380,18 @@ pub(super) fn read_texture_linear(descriptor: DecodedTexture) -> Result<Vec<u8>,
     Ok(linear)
 }
 
-pub(super) fn read_texture_mip_chain(descriptor: DecodedTexture) -> Result<Vec<Vec<u8>>, String> {
+pub(super) fn read_texture_linear(descriptor: DecodedTexture) -> Result<Vec<u8>, String> {
+    let raw = snapshot_texture_raw(descriptor, descriptor.raw_byte_count()?);
+    decode_texture_linear_from_raw(descriptor, &raw)
+}
+
+pub(super) fn read_texture_mip_chain_with_raw(
+    descriptor: DecodedTexture,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
     if descriptor.mip_level_count == 1 {
-        return read_texture_linear(descriptor).map(|level| vec![level]);
+        let raw = snapshot_texture_raw(descriptor, descriptor.raw_byte_count()?);
+        let linear = decode_texture_linear_from_raw(descriptor, &raw)?;
+        return Ok((vec![linear], raw));
     }
     if descriptor.texture_type != 9 || descriptor.layer_count != 1 {
         return Err(format!(
@@ -361,13 +400,8 @@ pub(super) fn read_texture_mip_chain(descriptor: DecodedTexture) -> Result<Vec<V
         ));
     }
     let layout = mip_chain_layout(descriptor)?;
-    let mut raw = vec![0_u8; layout.byte_count];
-    // SAFETY: descriptor evaluation retains the complete guest mip allocation until submission
-    // retirement, and the exact GFX10 layout calculation bounds this copy.
-    unsafe {
-        std::ptr::copy_nonoverlapping(descriptor.address as *const u8, raw.as_mut_ptr(), raw.len());
-    }
-    layout
+    let raw = snapshot_texture_raw(descriptor, layout.byte_count);
+    let levels = layout
         .levels
         .iter()
         .copied()
@@ -383,7 +417,8 @@ pub(super) fn read_texture_mip_chain(descriptor: DecodedTexture) -> Result<Vec<V
             copy_mip_level_to_linear(&layout, level, &raw, &mut linear)?;
             Ok(linear)
         })
-        .collect()
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok((levels, raw))
 }
 
 #[cfg(test)]
@@ -410,11 +445,6 @@ pub(super) fn write_texture_mip_chain(
         copy_linear_to_mip_level(&layout, level, linear, &mut raw)
             .map_err(|error| format!("could not encode guest mip level {level_index}: {error}"))?;
     }
-    // SAFETY: the evaluated writable descriptor retains the exact mip allocation through
-    // submission retirement and the layout calculation bounds the complete copy.
-    unsafe {
-        std::ptr::copy_nonoverlapping(raw.as_ptr(), descriptor.address as *mut u8, raw.len());
-    }
     remu_memory::record_guest_write(
         remu_memory::GuestWriteSite::TextureWritebackRange,
         descriptor.address,
@@ -422,6 +452,11 @@ pub(super) fn write_texture_mip_chain(
         &raw,
         remu_gpu::gpu_completed_submission_sequence(),
     );
+    // SAFETY: the evaluated writable descriptor retains the exact mip allocation through
+    // submission retirement and the layout calculation bounds the complete copy.
+    unsafe {
+        std::ptr::copy_nonoverlapping(raw.as_ptr(), descriptor.address as *mut u8, raw.len());
+    }
     Ok(())
 }
 
@@ -716,25 +751,33 @@ fn copy_linear_to_mip_level(
     Ok(())
 }
 
-pub(super) fn write_texture_linear(
+pub(super) fn encode_texture_linear_from_baseline(
     descriptor: DecodedTexture,
     linear: &[u8],
-) -> Result<(), String> {
-    if descriptor.address == 0 {
-        return Ok(());
-    }
+) -> Result<Vec<u8>, String> {
+    let baseline = snapshot_texture_raw(descriptor, descriptor.raw_byte_count()?);
+    encode_texture_linear_over(descriptor, linear, &baseline)
+}
+
+pub(super) fn encode_texture_linear_over(
+    descriptor: DecodedTexture,
+    linear: &[u8],
+    baseline: &[u8],
+) -> Result<Vec<u8>, String> {
     if linear.len() != descriptor.linear_byte_count()? {
         return Err("texture writeback linear byte count mismatch".to_owned());
     }
     let layer_raw_bytes = descriptor.raw_layer_byte_count()?;
-    let mut raw = vec![0_u8; descriptor.raw_byte_count()?];
+    if baseline.len() != descriptor.raw_byte_count()? {
+        return Err("texture writeback baseline byte count mismatch".to_owned());
+    }
     // A guest image owns only the texels named by width/height. Pitch padding and unused tiled
     // block slots can belong to another tenant in a pooled allocation (including allocator
-    // metadata). Preserve those bytes instead of zero-filling and publishing the full footprint.
-    // SAFETY: the evaluated descriptor retains the complete validated raw mapping through this
-    // synchronous publication.
-    unsafe {
-        std::ptr::copy_nonoverlapping(descriptor.address as *const u8, raw.as_mut_ptr(), raw.len());
+    // metadata), so begin with the capture-time bytes rather than zero-filling the footprint.
+    let mut raw = baseline.to_vec();
+    if descriptor.texture_type == 10 && matches!(descriptor.tile_mode, 5 | 9) {
+        retile_standard_volume(descriptor, linear, &mut raw)?;
+        return Ok(raw);
     }
     let layer_linear_bytes = linear.len() / descriptor.layer_count as usize;
     for layer in 0..descriptor.layer_count as usize {
@@ -745,6 +788,43 @@ pub(super) fn write_texture_linear(
             &mut raw[layer * layer_raw_bytes..(layer + 1) * layer_raw_bytes],
         )?;
     }
+    Ok(raw)
+}
+
+pub(super) fn write_texture_linear(
+    descriptor: DecodedTexture,
+    linear: &[u8],
+) -> Result<(), String> {
+    if descriptor.address == 0 {
+        return Ok(());
+    }
+    let raw = encode_texture_linear_from_baseline(descriptor, linear)?;
+    static TRACE_WRITEBACKS: OnceLock<bool> = OnceLock::new();
+    if *TRACE_WRITEBACKS.get_or_init(|| {
+        std::env::var_os("REMU_TRACE_D3D12_WRITEBACKS").is_some_and(|value| value == "1")
+    }) {
+        eprintln!(
+            "[REMu][D3D12-WRITEBACK] address={:#x} raw_bytes={:#x} width={} height={} pitch={} tile={} format={:?} bytes_per_element={} layers={} mips={} writable={}",
+            descriptor.address,
+            raw.len(),
+            descriptor.width,
+            descriptor.height,
+            descriptor.pitch,
+            descriptor.tile_mode,
+            descriptor.format,
+            descriptor.bytes_per_element,
+            descriptor.layer_count,
+            descriptor.mip_level_count,
+            descriptor.writable,
+        );
+    }
+    remu_memory::record_guest_write(
+        remu_memory::GuestWriteSite::TextureWritebackRange,
+        descriptor.address,
+        raw.len() as u64,
+        &raw,
+        remu_gpu::gpu_completed_submission_sequence(),
+    );
     // SAFETY: the writable evaluated descriptor owns the complete validated raw range.
     unsafe {
         std::ptr::copy_nonoverlapping(raw.as_ptr(), descriptor.address as *mut u8, raw.len());
@@ -867,6 +947,121 @@ fn copy_linear_to_mode27_bgra(
                             .add(destination)
                             .cast::<u32>()
                             .write_unaligned(pixel);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn detile_standard_volume(
+    descriptor: DecodedTexture,
+    raw: &[u8],
+    linear: &mut [u8],
+) -> Result<(), String> {
+    let [width, height] = descriptor.element_extent();
+    let depth = descriptor.layer_count as usize;
+    let bytes = descriptor.bytes_per_element as usize;
+    let block_bytes =
+        tiled_block_bytes(descriptor.tile_mode).ok_or("unsupported tiled 3D texture mode")?;
+    let (block_width, block_height, block_depth) = tiled_3d_block_dimensions(block_bytes, bytes)
+        .ok_or("unsupported tiled 3D texture element size")?;
+    let blocks_per_row = descriptor.pitch_elements().div_ceil(block_width);
+    let block_rows = height.div_ceil(block_height);
+    if raw.len() != descriptor.raw_byte_count()?
+        || linear.len() != descriptor.linear_byte_count()?
+    {
+        return Err("tiled 3D texture raw/linear byte count mismatch".to_owned());
+    }
+    for block_z in 0..depth.div_ceil(block_depth) {
+        for block_y in 0..block_rows {
+            for block_x in 0..width.div_ceil(block_width) {
+                let block =
+                    ((block_z * block_rows + block_y) * blocks_per_row + block_x) * block_bytes;
+                let slices = (depth - block_z * block_depth).min(block_depth);
+                let rows = (height - block_y * block_height).min(block_height);
+                let columns = (width - block_x * block_width).min(block_width);
+                for local_z in 0..slices {
+                    for local_y in 0..rows {
+                        for local_x in 0..columns {
+                            let source = block
+                                + standard_3d_offset_sized(
+                                    local_x,
+                                    local_y,
+                                    local_z,
+                                    bytes,
+                                    block_bytes.trailing_zeros() as usize,
+                                );
+                            let destination = (((block_z * block_depth + local_z) * height
+                                + block_y * block_height
+                                + local_y)
+                                * width
+                                + block_x * block_width
+                                + local_x)
+                                * bytes;
+                            linear[destination..destination + bytes].copy_from_slice(
+                                raw.get(source..source + bytes)
+                                    .ok_or("tiled 3D texel exceeds backing")?,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retile_standard_volume(
+    descriptor: DecodedTexture,
+    linear: &[u8],
+    raw: &mut [u8],
+) -> Result<(), String> {
+    let [width, height] = descriptor.element_extent();
+    let depth = descriptor.layer_count as usize;
+    let bytes = descriptor.bytes_per_element as usize;
+    let block_bytes =
+        tiled_block_bytes(descriptor.tile_mode).ok_or("unsupported tiled 3D texture mode")?;
+    let (block_width, block_height, block_depth) = tiled_3d_block_dimensions(block_bytes, bytes)
+        .ok_or("unsupported tiled 3D texture element size")?;
+    let blocks_per_row = descriptor.pitch_elements().div_ceil(block_width);
+    let block_rows = height.div_ceil(block_height);
+    if raw.len() != descriptor.raw_byte_count()?
+        || linear.len() != descriptor.linear_byte_count()?
+    {
+        return Err("tiled 3D texture raw/linear byte count mismatch".to_owned());
+    }
+    for block_z in 0..depth.div_ceil(block_depth) {
+        for block_y in 0..block_rows {
+            for block_x in 0..width.div_ceil(block_width) {
+                let block =
+                    ((block_z * block_rows + block_y) * blocks_per_row + block_x) * block_bytes;
+                let slices = (depth - block_z * block_depth).min(block_depth);
+                let rows = (height - block_y * block_height).min(block_height);
+                let columns = (width - block_x * block_width).min(block_width);
+                for local_z in 0..slices {
+                    for local_y in 0..rows {
+                        for local_x in 0..columns {
+                            let source = (((block_z * block_depth + local_z) * height
+                                + block_y * block_height
+                                + local_y)
+                                * width
+                                + block_x * block_width
+                                + local_x)
+                                * bytes;
+                            let destination = block
+                                + standard_3d_offset_sized(
+                                    local_x,
+                                    local_y,
+                                    local_z,
+                                    bytes,
+                                    block_bytes.trailing_zeros() as usize,
+                                );
+                            raw.get_mut(destination..destination + bytes)
+                                .ok_or("tiled 3D texel exceeds backing")?
+                                .copy_from_slice(&linear[source..source + bytes]);
+                        }
                     }
                 }
             }
@@ -1006,6 +1201,26 @@ fn tiled_block_dimensions(block_bytes: usize, bytes: usize) -> Option<(usize, us
     let bits = (block_bytes / bytes).trailing_zeros() as usize;
     let width_bits = bits.div_ceil(2);
     Some((1 << width_bits, 1 << (bits - width_bits)))
+}
+
+fn tiled_3d_block_dimensions(block_bytes: usize, bytes: usize) -> Option<(usize, usize, usize)> {
+    let log = usize::try_from(bytes.checked_next_power_of_two()?.trailing_zeros()).ok()?;
+    if bytes != 1 << log || log >= 5 {
+        return None;
+    }
+    match block_bytes {
+        4_096 => Some([(16, 16, 16), (8, 16, 16), (8, 16, 8), (8, 8, 8), (4, 8, 8)][log]),
+        65_536 => Some(
+            [
+                (64, 32, 32),
+                (32, 32, 32),
+                (32, 32, 16),
+                (32, 16, 16),
+                (16, 16, 16),
+            ][log],
+        ),
+        _ => None,
+    }
 }
 
 fn block_offsets(
@@ -1161,6 +1376,108 @@ fn standard_offset_sized(x: usize, y: usize, bytes: usize, bits: usize) -> usize
             bit(x, 5),
         ],
         _ => unreachable!(),
+    };
+    order
+        .into_iter()
+        .take(bits)
+        .enumerate()
+        .fold(0, |result, (index, value)| result | (value << index))
+}
+
+fn standard_3d_offset_sized(x: usize, y: usize, z: usize, bytes: usize, bits: usize) -> usize {
+    let bit = |value: usize, index: usize| (value >> index) & 1;
+    let order = match bytes.trailing_zeros() {
+        0 => [
+            bit(x, 0),
+            bit(x, 1),
+            bit(z, 0),
+            bit(y, 0),
+            bit(z, 1),
+            bit(y, 1),
+            bit(x, 2),
+            bit(z, 2),
+            bit(y, 2),
+            bit(x, 3),
+            bit(z, 3),
+            bit(y, 3),
+            bit(x, 4),
+            bit(z, 4),
+            bit(y, 4),
+            bit(x, 5),
+        ],
+        1 => [
+            0,
+            bit(x, 0),
+            bit(z, 0),
+            bit(y, 0),
+            bit(z, 1),
+            bit(y, 1),
+            bit(x, 1),
+            bit(z, 2),
+            bit(y, 2),
+            bit(x, 2),
+            bit(z, 3),
+            bit(y, 3),
+            bit(x, 3),
+            bit(z, 4),
+            bit(y, 4),
+            bit(x, 4),
+        ],
+        2 => [
+            0,
+            0,
+            bit(x, 0),
+            bit(y, 0),
+            bit(z, 0),
+            bit(y, 1),
+            bit(x, 1),
+            bit(z, 1),
+            bit(y, 2),
+            bit(x, 2),
+            bit(z, 2),
+            bit(y, 3),
+            bit(x, 3),
+            bit(z, 3),
+            bit(y, 4),
+            bit(x, 4),
+        ],
+        3 => [
+            0,
+            0,
+            0,
+            bit(x, 0),
+            bit(z, 0),
+            bit(y, 0),
+            bit(x, 1),
+            bit(z, 1),
+            bit(y, 1),
+            bit(x, 2),
+            bit(z, 2),
+            bit(y, 2),
+            bit(x, 3),
+            bit(z, 3),
+            bit(y, 3),
+            bit(x, 4),
+        ],
+        4 => [
+            0,
+            0,
+            0,
+            0,
+            bit(z, 0),
+            bit(y, 0),
+            bit(x, 0),
+            bit(z, 1),
+            bit(y, 1),
+            bit(x, 1),
+            bit(z, 2),
+            bit(y, 2),
+            bit(x, 2),
+            bit(z, 3),
+            bit(y, 3),
+            bit(x, 3),
+        ],
+        _ => unreachable!("tiled 3D elements are validated to at most 16 bytes"),
     };
     order
         .into_iter()
@@ -1367,12 +1684,52 @@ pub(super) fn decode_dxgi_format(
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodedTexture, copy_linear_to_mip_level, copy_mip_level_to_linear, detile_layer,
-        mip_chain_layout, mode24_offset, retile_layer,
+        DecodedTexture, copy_linear_to_mip_level, copy_mip_level_to_linear,
+        decode_texture_linear_from_raw, detile_layer, encode_texture_linear_over, mip_chain_layout,
+        mode24_offset, retile_layer, standard_3d_offset_sized,
     };
     use windows::Win32::Graphics::Dxgi::Common::{
-        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_FLOAT,
     };
+
+    #[test]
+    fn mode5_volume_uses_thick_4k_blocks_and_round_trips() {
+        let descriptor = DecodedTexture {
+            address: 0,
+            width: 16,
+            height: 16,
+            pitch: 16,
+            tile_mode: 5,
+            format: DXGI_FORMAT_R16_UINT,
+            bytes_per_element: 2,
+            block_extent: [1, 1],
+            texture_type: 10,
+            layer_count: 16,
+            mip_level_count: 1,
+            writable: true,
+        };
+        // ADDR_SW_4KB_S is a thick 8x16x16 block at 16 bits per texel. This volume therefore
+        // occupies two adjacent 4 KiB blocks, not sixteen independently padded 2D slices.
+        assert_eq!(descriptor.raw_byte_count().unwrap(), 8_192);
+        assert_eq!(standard_3d_offset_sized(1, 0, 0, 2, 12), 2);
+        assert_eq!(standard_3d_offset_sized(0, 0, 1, 2, 12), 4);
+        assert_eq!(standard_3d_offset_sized(0, 1, 0, 2, 12), 8);
+        assert_eq!(standard_3d_offset_sized(0, 0, 8, 2, 12), 1_024);
+        assert_eq!(standard_3d_offset_sized(0, 8, 0, 2, 12), 2_048);
+
+        let linear = (0..descriptor.linear_byte_count().unwrap())
+            .map(|index| (index.wrapping_mul(37) & 0xff) as u8)
+            .collect::<Vec<_>>();
+        let raw = encode_texture_linear_over(
+            descriptor,
+            &linear,
+            &vec![0xa5; descriptor.raw_byte_count().unwrap()],
+        )
+        .expect("encode a thick mode-5 volume");
+        let actual =
+            decode_texture_linear_from_raw(descriptor, &raw).expect("decode a thick mode-5 volume");
+        assert_eq!(actual, linear);
+    }
 
     #[test]
     fn mode27_round_trips_a_pitched_color_surface() {

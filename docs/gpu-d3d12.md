@@ -17,19 +17,19 @@ Implemented and physically validated on the development host:
   adapter's static dedicated-memory figure.
 - Shader Model 6.7+ HLSL generation and DXC compilation for translated vertex, pixel, and compute
   shaders, with bounded shader and pipeline-state caches.
-- Buffer SRV/UAV/CBV resources, sampled and writable 2D textures, samplers, render-target upload and
-  writeback, multiple render targets, blending, raster state, viewports, scissors, depth, and
-  stencil.
+- Buffer SRV/UAV/CBV resources, sampled and writable 2D textures, single-mip standard-swizzled 3D
+  textures, samplers, render-target upload and writeback, multiple render targets, blending,
+  raster state, viewports, scissors, depth, and stencil.
 - Native two-plane D32/S8 upload/readback footprints, including independent front/back stencil
   references and masks through the D3D12 pipeline-state stream and command-list 8 interfaces.
 - 2x/4x/8x color and depth sample-count decoding with adapter quality queries; normalized/float
   color resolves, explicit sample-zero signed/unsigned integer resolves, D16/D32 MIN/MAX depth
   resolves, and plane-aware D32/S8 depth/stencil resolves. Single-sample guest contents are
   broadcast into MSAA attachments before rendering so load semantics are preserved.
-- GFX10 tiled texture conversion for the observed mode-24 and mode-27 surfaces and complete mode-5
-  and mode-27 2D mip chains, including packed mip tails. Mode-27 parity tables are cached and the
-  four-byte scanout path uses bounded unaligned pixel copies instead of rebuilding offsets per
-  64 KiB block.
+- GFX10 tiled texture conversion for the observed mode-24 and mode-27 surfaces, complete mode-5
+  and mode-27 2D mip chains including packed mip tails, and thick mode-5/mode-9 3D blocks. Mode-27
+  parity tables are cached and the four-byte scanout path uses bounded unaligned pixel copies
+  instead of rebuilding offsets per 64 KiB block.
 - Persistent single-sample render targets keyed by guest address and descriptor, with Windows VEH
   write watches for CPU/host invalidation. Coherent targets skip redundant 4K uploads and retain
   their already-linear output for DXGI presentation while still writing guest-visible bytes back.
@@ -52,8 +52,8 @@ Implemented and physically validated on the development host:
   sets such as `TEXCOORD0` plus `TEXCOORD2` no longer retain an unused vertex `TEXCOORD1` that
   causes DXIL stage-link register mismatches on D3D12.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
-  primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The current D3D12 crate has 38 passing tests on the
-  GTX 1050.
+  primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
+  current D3D12 crate has 42 passing tests on the GTX 1050.
 
 This is a playable vertical slice for one tested title, not yet a broad playability claim. The major remaining work is listed below: guest FMASK/DCC
 metadata and persistent multisample/depth-resource identity; NGG/mesh fallback for devices without mesh
@@ -140,6 +140,14 @@ minimized and restored the active game window, and continued to submission 584 b
 timeout. The process stayed alive during both transitions and the audio callback remained active
 with zero underrun frames.
 
+Poppy Playtime exposed a distinct single-mip 3D-layout defect. Its 16x16x16 R16 mode-5 UAV is two
+thick 4 KiB blocks (8 KiB total); treating depth slices as sixteen independently padded 2D images
+incorrectly produced a 64 KiB footprint and overwrote adjacent MallocBinned3 free-list nodes. The
+corrected GFX10 S3 address equations survived a 75-second DRED-enabled run, advanced from the old
+deterministic access violation at submission 16 to submission 595, kept the GPU worker active, and
+left WASAPI active. This is a crash/progress regression result, not yet a Poppy playability claim:
+only one VideoOut flip was observed during that bounded run.
+
 ## Crate and data-flow boundaries
 
 The existing split remains the right one:
@@ -197,8 +205,19 @@ The Windows design therefore needs explicit ownership:
   or release requires readback.
 - `GuestRangeLease` identity checks must guard delayed uploads/readbacks so a recycled virtual
   address never publishes into a new mapping.
+- Writable textures retain the exact raw upload snapshot. Completion retiles into that baseline
+  and publishes only baseline-matching chunks; newer guest bytes win, retired mappings discard the
+  completion, and one-megabyte coalescing avoids turning random image changes into millions of
+  backing writes.
 - Direct and flexible memory aliases must resolve to one physical identity even when several guest
   virtual ranges name it.
+
+GFX10 standard-swizzled 3D resources are thick, not arrays of padded 2D slices. For mode 5
+(`ADDR_SW_4KB_S`), the 4 KiB block dimensions for 1/2/4/8/16-byte elements are respectively
+16x16x16, 8x16x16, 8x16x8, 8x8x8, and 4x8x8. Mode 9 uses the corresponding 64 KiB S3 dimensions
+and the same low address equation extended through bits 12--15. The implementation derives the
+in-block X/Y/Z bit order from AMD AddrLib's GFX10 S3 pattern tables and calculates the outer block
+grid from pitch, height, and depth. Thin 3D modes continue to use their documented slice/XOR path.
 
 Committed resources are acceptable for the vertical slice. Placed-resource heap suballocation and
 aliasing barriers follow after correctness. Residency must use live `QueryVideoMemoryInfo` budgets;
@@ -261,8 +280,9 @@ disposable hardware, because deliberately triggering a TDR on a working desktop 
 4. Extend the persistent single-sample color cache to depth/MSAA/shader resources and replace
    synchronous per-draw fences with upload/readback rings, fence retirement, physical-alias
    invalidation, residency budgets, and submission batching.
-5. Complete mipped array/3D/UAV support, layered depth targets, DCC/FMASK metadata, and remaining
-   stencil logical/op-value emulation.
+5. Complete mipped array and mipped-3D UAV support beyond the implemented single-mip mode-5/mode-9
+   volume path, layered depth targets, DCC/FMASK metadata, and remaining stencil logical/op-value
+   emulation.
 6. Validate the implemented debug-layer/DRED path under intentional device removal, add GNU/MSVC
    CI and packaging, run long window/audio/input lifecycle tests, and expand game probes.
 
@@ -284,6 +304,8 @@ dumps are available; it does not replace them.
 - [D3D12 index-buffer strip-cut values](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_index_buffer_strip_cut_value)
 - [DirectX triangle-fan and dynamic strip-cut specification](https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html)
 - [Mesa GFX10.3 register descriptions](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/a11d1bd247df18057ecb9945e01bf39ff85d8d9d/src/amd/registers/gfx103.json)
+- [AMD AddrLib GFX10 swizzle pattern tables](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h)
+- [AMD AddrLib GFX10 resource and thick-block rules](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/imported/addrlib/src/gfx10/gfx10addrlib.h)
 - [`ID3D12Device::GetCopyableFootprints`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getcopyablefootprints)
 - [`ID3D12GraphicsCommandList::CopyTextureRegion`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-copytextureregion)
 - [`ID3D12GraphicsCommandList::ResolveSubresource`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12graphicscommandlist-resolvesubresource)

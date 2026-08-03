@@ -1,10 +1,16 @@
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
 #[cfg(any(target_os = "macos", windows))]
 use std::sync::atomic::Ordering;
 #[cfg(any(target_os = "macos", windows))]
 use std::sync::{Arc, RwLock};
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 
 #[cfg(any(target_os = "macos", windows))]
 use remu_core::GuestAddress;
+#[cfg(windows)]
+use remu_memory::CpuWriteWatch;
 #[cfg(any(target_os = "macos", windows))]
 use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestMapPlacement};
 
@@ -42,6 +48,323 @@ fn refresh_kernel_memory_readable_ranges(memory: &kernel_memory::KernelMemory) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Arc::from(memory.readable_ranges().into_boxed_slice());
     KERNEL_MEMORY_READABLE_RANGES_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticDirectRange {
+    start: u64,
+    byte_count: u64,
+}
+
+#[cfg(windows)]
+fn parse_diagnostic_number(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hexadecimal| u64::from_str_radix(hexadecimal, 16).ok(),
+        )
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_range() -> Option<DiagnosticDirectRange> {
+    static RANGE: OnceLock<Option<DiagnosticDirectRange>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let value = std::env::var("REMU_WATCH_DIRECT_RANGE").ok()?;
+        let (start, byte_count) = value
+            .split_once(':')
+            .map_or((value.as_str(), "0x10000"), |(start, length)| {
+                (start, length)
+            });
+        let start = parse_diagnostic_number(start)?;
+        let byte_count = parse_diagnostic_number(byte_count)?;
+        (byte_count != 0 && start.checked_add(byte_count).is_some())
+            .then_some(DiagnosticDirectRange { start, byte_count })
+    })
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_thread() -> Option<&'static str> {
+    static THREAD: OnceLock<Option<String>> = OnceLock::new();
+    THREAD
+        .get_or_init(|| {
+            std::env::var("REMU_WATCH_DIRECT_THREAD")
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_value_offset() -> Option<u64> {
+    static OFFSET: OnceLock<Option<u64>> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::env::var("REMU_WATCH_DIRECT_VALUE_OFFSET")
+            .ok()
+            .and_then(|value| parse_diagnostic_number(&value))
+    })
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_precise() -> bool {
+    static PRECISE: OnceLock<bool> = OnceLock::new();
+    *PRECISE.get_or_init(|| {
+        std::env::var_os("REMU_WATCH_DIRECT_PRECISE").is_some_and(|value| value == "1")
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct DiagnosticDirectWatch {
+    watch: CpuWriteWatch,
+    value_address: Option<u64>,
+    last_value: Option<u64>,
+    pointee_watch: Option<CpuWriteWatch>,
+    pointee_address: Option<u64>,
+    pointee_last_value: Option<u64>,
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_watches() -> &'static Mutex<Vec<DiagnosticDirectWatch>> {
+    static WATCHES: OnceLock<Mutex<Vec<DiagnosticDirectWatch>>> = OnceLock::new();
+    WATCHES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(windows)]
+fn watch_diagnostic_direct_mapping(direct_start: u64, mapped: u64, byte_count: u64) {
+    static THREAD_WATCH_CLAIMED: AtomicBool = AtomicBool::new(false);
+    let Some(direct_end) = direct_start.checked_add(byte_count) else {
+        return;
+    };
+    let current_thread = crate::current_guest_thread_name();
+    let thread_match = diagnostic_direct_thread().is_some_and(|name| {
+        // Keep the opt-in watch bounded: allocator metadata mappings are 64 KiB, while render
+        // targets can span hundreds of MiB and are unsuitable for import-boundary reprotection.
+        current_thread == name && byte_count <= 0x1_0000
+    });
+    let range_overlap = diagnostic_direct_range().and_then(|target| {
+        let target_end = target.start + target.byte_count;
+        let start = direct_start.max(target.start);
+        let end = direct_end.min(target_end);
+        (start < end).then_some((start, end))
+    });
+    let (overlap_start, overlap_end) = if thread_match {
+        if THREAD_WATCH_CLAIMED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        (direct_start, direct_end)
+    } else if let Some(overlap) = range_overlap {
+        overlap
+    } else {
+        return;
+    };
+    let Some(address) = mapped.checked_add(overlap_start - direct_start) else {
+        return;
+    };
+    let watch_byte_count = overlap_end - overlap_start;
+    // SAFETY: this runs immediately after map_direct_with_options created the shared guest
+    // mapping. Address-space replacement retires the watch before invalidating that mapping.
+    let result = if diagnostic_direct_precise() {
+        unsafe { CpuWriteWatch::new_precise(address, watch_byte_count) }
+    } else {
+        unsafe { CpuWriteWatch::new(address, watch_byte_count) }
+    };
+    match result {
+        Ok(watch) => {
+            if diagnostic_direct_precise()
+                && !remu_memory::watch_guest_shared_backing_writes(address, watch_byte_count)
+            {
+                eprintln!(
+                    "[REMu][JOURNAL] could not resolve physical backing for precise watch address={address:#x} length={watch_byte_count:#x}"
+                );
+            }
+            let value_address = diagnostic_direct_value_offset().and_then(|offset| {
+                (offset.checked_add(8)? <= watch_byte_count).then(|| address + offset)
+            });
+            let last_value = value_address.map(|value_address| {
+                // SAFETY: the diagnostic offset was checked against the retained live watch.
+                unsafe { std::ptr::read_unaligned(value_address as *const u64) }
+            });
+            if let Some(value_address) = value_address {
+                let _ = watch.set_diagnostic_sample(value_address);
+            }
+            eprintln!(
+                "[REMu][JOURNAL] watching direct={overlap_start:#x} address={address:#x} length={watch_byte_count:#x} thread={current_thread:?} value_address={value_address:#x?} initial={last_value:#x?}"
+            );
+            diagnostic_direct_watches()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(DiagnosticDirectWatch {
+                    watch,
+                    value_address,
+                    last_value,
+                    pointee_watch: None,
+                    pointee_address: None,
+                    pointee_last_value: None,
+                });
+        }
+        Err(error) => {
+            if thread_match {
+                THREAD_WATCH_CLAIMED.store(false, Ordering::Release);
+            }
+            eprintln!(
+                "[REMu][JOURNAL] could not watch direct={overlap_start:#x} address={address:#x} length={watch_byte_count:#x}: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct DiagnosticDirectWriteRearm {
+    dispatch_index: u64,
+    return_address: u64,
+}
+
+#[cfg(windows)]
+impl Drop for DiagnosticDirectWriteRearm {
+    fn drop(&mut self) {
+        if diagnostic_direct_range().is_none() && diagnostic_direct_thread().is_none() {
+            return;
+        }
+        diagnostic_direct_watches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain_mut(|diagnostic| {
+                if let (Some(watch), Some(address)) =
+                    (&diagnostic.pointee_watch, diagnostic.pointee_address)
+                {
+                    if crate::process_guest_range_is_readable(address, 8) {
+                        // SAFETY: the retained watch pins this qword's mapping.
+                        let value = unsafe { std::ptr::read_unaligned(address as *const u64) };
+                        if diagnostic.pointee_last_value != Some(value) {
+                            let precise_change = watch.take_diagnostic_sample_change();
+                            if value != 0 && !crate::process_guest_range_is_readable(value, 1) {
+                                let (previous, changed, fault, program_counter, registers) = precise_change
+                                    .unwrap_or((
+                                    diagnostic.pointee_last_value.unwrap_or_default(),
+                                    value,
+                                    0,
+                                    0,
+                                    [0; 6],
+                                    ));
+                                eprintln!(
+                                    "[REMu][JOURNAL][POINTEE-CORRUPTION] address={address:#x} previous={:#x?} value={value:#x} changed_previous={previous:#x} changed_value={changed:#x} write_fault={fault:#x} write_pc={program_counter:#x} rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} caller={:#x} dispatch={} return={:#x} thread={:?}",
+                                    diagnostic.pointee_last_value,
+                                    registers[0],
+                                    registers[1],
+                                    registers[2],
+                                    registers[3],
+                                    registers[4],
+                                    registers[5],
+                                    self.dispatch_index,
+                                    self.return_address,
+                                    crate::current_guest_thread_name(),
+                                );
+                            }
+                            diagnostic.pointee_last_value = Some(value);
+                        }
+                        if watch.rearm().is_err() {
+                            diagnostic.pointee_watch = None;
+                            diagnostic.pointee_address = None;
+                            diagnostic.pointee_last_value = None;
+                        }
+                    } else {
+                        diagnostic.pointee_watch = None;
+                        diagnostic.pointee_address = None;
+                        diagnostic.pointee_last_value = None;
+                    }
+                }
+                if let Some(value_address) = diagnostic.value_address {
+                    // SAFETY: CpuWriteWatch retains this exact mapping until retirement. This is
+                    // diagnostic sampling at an import boundary, after the guest store returned.
+                    let value = unsafe { std::ptr::read_unaligned(value_address as *const u64) };
+                    if diagnostic.last_value != Some(value) {
+                        let precise_change = diagnostic.watch.take_diagnostic_sample_change();
+                        if value != 0 && !crate::process_guest_range_is_readable(value, 1) {
+                            let (changed_previous, changed_value, fault, program_counter, registers) =
+                                precise_change.unwrap_or_else(|| {
+                                    let (fault, program_counter) = diagnostic
+                                        .watch
+                                        .last_guest_write()
+                                        .unwrap_or_default();
+                                    (
+                                        diagnostic.last_value.unwrap_or_default(),
+                                        value,
+                                        fault,
+                                        program_counter,
+                                        [0; 6],
+                                    )
+                                });
+                            eprintln!(
+                                "[REMu][JOURNAL][CORRUPTION] address={value_address:#x} previous={:#x?} value={value:#x} changed_previous={changed_previous:#x} changed_value={changed_value:#x} write_fault={fault:#x} write_pc={program_counter:#x} rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} caller={:#x} dispatch={} return={:#x} thread={:?}",
+                                diagnostic.last_value,
+                                registers[0],
+                                registers[1],
+                                registers[2],
+                                registers[3],
+                                registers[4],
+                                registers[5],
+                                self.dispatch_index,
+                                self.return_address,
+                                crate::current_guest_thread_name(),
+                            );
+                        }
+                        diagnostic.last_value = Some(value);
+                    }
+                    if value >= 0x10_000
+                        && crate::process_guest_range_is_readable(value, 8)
+                        && diagnostic.pointee_address != Some(value)
+                    {
+                        // SAFETY: readability was validated and the diagnostic watch itself pins
+                        // the mapping until replacement retirement.
+                        match unsafe { CpuWriteWatch::new_precise(value, 8) } {
+                            Ok(watch) => {
+                                let _ = watch.set_diagnostic_sample(value);
+                                let _ = watch.rearm();
+                                // SAFETY: the newly retained watch covers the qword.
+                                let initial =
+                                    unsafe { std::ptr::read_unaligned(value as *const u64) };
+                                diagnostic.pointee_watch = Some(watch);
+                                diagnostic.pointee_address = Some(value);
+                                diagnostic.pointee_last_value = Some(initial);
+                                eprintln!(
+                                    "[REMu][JOURNAL] watching free-list node address={value:#x} initial={initial:#x}"
+                                );
+                            }
+                            Err(error) => eprintln!(
+                                "[REMu][JOURNAL] could not watch free-list node address={value:#x}: {error}"
+                            ),
+                        }
+                    }
+                }
+                match diagnostic.watch.rearm() {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        eprintln!(
+                            "[REMu][JOURNAL] could not rearm direct-memory write watch address={:#x} length={:#x}: {error}",
+                            diagnostic.watch.range().0,
+                            diagnostic.watch.range().1,
+                        );
+                        true
+                    }
+                }
+            });
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn diagnostic_direct_write_rearm(
+    dispatch_index: u64,
+    return_address: u64,
+) -> DiagnosticDirectWriteRearm {
+    DiagnosticDirectWriteRearm {
+        dispatch_index,
+        return_address,
+    }
 }
 
 #[cfg(any(target_os = "macos", windows))]
@@ -385,6 +708,8 @@ fn map_direct_memory_core(
             return kernel_memory_error(&error);
         }
     };
+    #[cfg(windows)]
+    watch_diagnostic_direct_mapping(direct_start, mapped.get(), length);
     refresh_kernel_memory_readable_ranges(memory);
     write_guest_u64(output, mapped.get());
     if trace_guest_vm() {

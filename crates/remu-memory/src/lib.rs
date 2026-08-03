@@ -52,9 +52,10 @@ pub use address_space::{
     LeasePublishOutcome, RequestedAddress, guest_shared_backing_alias_segments,
     guest_shared_backing_identity, guest_shared_backing_range, guest_shared_backing_ranges_overlap,
     guest_shared_backing_segments, guest_shared_mapping_epoch, guest_shared_mapping_identity,
-    read_guest_shared_backing, write_guest_shared_backing, write_guest_shared_backing_at_identity,
-    write_guest_shared_backing_at_identity_with_baseline, write_guest_shared_backing_if_identity,
-    write_guest_shared_backing_if_identity_and_baseline, write_guest_shared_backing_scattered,
+    read_guest_shared_backing, watch_guest_shared_backing_writes, write_guest_shared_backing,
+    write_guest_shared_backing_at_identity, write_guest_shared_backing_at_identity_with_baseline,
+    write_guest_shared_backing_if_identity, write_guest_shared_backing_if_identity_and_baseline,
+    write_guest_shared_backing_scattered,
 };
 
 /// Validated `GuestPtr` / `GuestSlice` access layer (plan M1). Depends on the shared-mapping

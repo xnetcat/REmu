@@ -8,12 +8,13 @@
 //! page's writable protection, and resumes the guest instruction. This mirrors the Darwin
 //! protection-fault backend while retaining Windows page attributes and coherent alias behavior.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use windows::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+use windows::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
 use windows::Win32::System::Diagnostics::Debug::{
     AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
     EXCEPTION_POINTERS,
@@ -25,6 +26,7 @@ use windows::Win32::System::Memory::{
 };
 
 const HOST_PAGE_SIZE: u64 = 4096;
+const EXCEPTION_SINGLE_STEP_CODE: NTSTATUS = NTSTATUS(0x8000_0004_u32.cast_signed());
 const WATCH_ACTIVE: u8 = 0;
 const WATCH_REPROTECTING: u8 = 1;
 const WATCH_REPROTECTED: u8 = 2;
@@ -39,6 +41,21 @@ struct WatchedRange {
     dirty_pages: Mutex<BTreeSet<u64>>,
     generation: AtomicU64,
     retirement: AtomicU8,
+    last_write_fault: AtomicU64,
+    last_write_pc: AtomicU64,
+    sample_address: AtomicU64,
+    sample_value: AtomicU64,
+    sample_previous: AtomicU64,
+    sample_changed_value: AtomicU64,
+    sample_change_fault: AtomicU64,
+    sample_change_pc: AtomicU64,
+    sample_change_rax: AtomicU64,
+    sample_change_rcx: AtomicU64,
+    sample_change_rdx: AtomicU64,
+    sample_change_r8: AtomicU64,
+    sample_change_r9: AtomicU64,
+    sample_change_caller: AtomicU64,
+    precise: bool,
 }
 
 #[derive(Debug)]
@@ -59,6 +76,21 @@ struct WatchState {
 fn state() -> &'static Mutex<WatchState> {
     static STATE: OnceLock<Mutex<WatchState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(WatchState::default()))
+}
+
+thread_local! {
+    /// A precise diagnostic watch temporarily opens one page for exactly one instruction. The
+    /// trap flag raises `EXCEPTION_SINGLE_STEP` on this same host thread, where the page is closed
+    /// again before the next guest instruction executes.
+    static PRECISE_REARM_PAGE: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_FAULT: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_PC: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_RAX: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_RCX: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_RDX: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_R8: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_R9: Cell<u64> = const { Cell::new(0) };
+    static PRECISE_WRITE_CALLER: Cell<u64> = const { Cell::new(0) };
 }
 
 fn align_down(value: u64) -> u64 {
@@ -174,6 +206,71 @@ unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS
     let Some(record) = (unsafe { exception.ExceptionRecord.as_ref() }) else {
         return EXCEPTION_CONTINUE_SEARCH;
     };
+    if record.ExceptionCode == EXCEPTION_SINGLE_STEP_CODE {
+        let page_address = PRECISE_REARM_PAGE.replace(0);
+        let fault_address = PRECISE_WRITE_FAULT.replace(0);
+        let program_counter = PRECISE_WRITE_PC.replace(0);
+        let rax = PRECISE_WRITE_RAX.replace(0);
+        let rcx = PRECISE_WRITE_RCX.replace(0);
+        let rdx = PRECISE_WRITE_RDX.replace(0);
+        let r8 = PRECISE_WRITE_R8.replace(0);
+        let r9 = PRECISE_WRITE_R9.replace(0);
+        let caller = PRECISE_WRITE_CALLER.replace(0);
+        if page_address == 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        if let Some(context) = unsafe { exception.ContextRecord.as_mut() } {
+            #[cfg(target_arch = "x86_64")]
+            {
+                context.EFlags &= !0x100;
+            }
+        }
+        let mut state = state()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(page) = state.pages.get(&page_address) else {
+            return EXCEPTION_CONTINUE_EXECUTION;
+        };
+        for watcher_id in &page.watchers {
+            let Some(range) = state.ranges.get(watcher_id) else {
+                continue;
+            };
+            let sample_address = range.sample_address.load(Ordering::Acquire);
+            if !range.precise
+                || sample_address < page_address
+                || sample_address.saturating_add(8) > page_address + HOST_PAGE_SIZE
+            {
+                continue;
+            }
+            // SAFETY: this precise watch retains the page, which stays readable until the
+            // protection transition below. The trapped instruction has just completed.
+            let value = unsafe { std::ptr::read_unaligned(sample_address as *const u64) };
+            let previous = range.sample_value.swap(value, Ordering::AcqRel);
+            if previous != value {
+                range.sample_previous.store(previous, Ordering::Release);
+                range.sample_changed_value.store(value, Ordering::Release);
+                range
+                    .sample_change_fault
+                    .store(fault_address, Ordering::Release);
+                range
+                    .sample_change_pc
+                    .store(program_counter, Ordering::Release);
+                range.sample_change_rax.store(rax, Ordering::Release);
+                range.sample_change_rcx.store(rcx, Ordering::Release);
+                range.sample_change_rdx.store(rdx, Ordering::Release);
+                range.sample_change_r8.store(r8, Ordering::Release);
+                range.sample_change_r9.store(r9, Ordering::Release);
+                range.sample_change_caller.store(caller, Ordering::Release);
+            }
+        }
+        if page.open
+            && set_page_protection(page_address, page.readonly_protection).is_ok()
+            && let Some(page) = state.pages.get_mut(&page_address)
+        {
+            page.open = false;
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2 {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -213,18 +310,18 @@ unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS
     }
     let fault_address = record.ExceptionInformation[1] as u64;
     let page_address = align_down(fault_address);
+    let program_counter = unsafe { exception.ContextRecord.as_ref() }.map_or(0, |context| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.Rip
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = context;
+            0
+        }
+    });
     if crate::guest_write_journal::guest_cpu_page_journal_armed() {
-        let program_counter = unsafe { exception.ContextRecord.as_ref() }.map_or(0, |context| {
-            #[cfg(target_arch = "x86_64")]
-            {
-                context.Rip
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                let _ = context;
-                0
-            }
-        });
         let _ = crate::guest_write_journal::record_guest_cpu_page_open(
             page_address,
             HOST_PAGE_SIZE,
@@ -240,6 +337,7 @@ unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS
     };
     let watcher_ids = page.watchers.iter().copied().collect::<Vec<_>>();
     let writable_protection = page.writable_protection;
+    let mut precise = false;
     for watcher_id in watcher_ids {
         let Some(range) = state.ranges.get(&watcher_id) else {
             continue;
@@ -249,6 +347,13 @@ unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS
         }
         range.dirty.store(true, Ordering::Release);
         range.generation.fetch_add(1, Ordering::AcqRel);
+        range
+            .last_write_fault
+            .store(fault_address, Ordering::Release);
+        range
+            .last_write_pc
+            .store(program_counter, Ordering::Release);
+        precise |= range.precise;
         range
             .dirty_pages
             .lock()
@@ -260,6 +365,26 @@ unsafe extern "system" fn write_fault_handler(exception: *mut EXCEPTION_POINTERS
     }
     if let Some(page) = state.pages.get_mut(&page_address) {
         page.open = true;
+    }
+    if precise {
+        PRECISE_REARM_PAGE.set(page_address);
+        PRECISE_WRITE_FAULT.set(fault_address);
+        PRECISE_WRITE_PC.set(program_counter);
+        if let Some(context) = unsafe { exception.ContextRecord.as_mut() } {
+            #[cfg(target_arch = "x86_64")]
+            {
+                PRECISE_WRITE_RAX.set(context.Rax);
+                PRECISE_WRITE_RCX.set(context.Rcx);
+                PRECISE_WRITE_RDX.set(context.Rdx);
+                PRECISE_WRITE_R8.set(context.R8);
+                PRECISE_WRITE_R9.set(context.R9);
+                // SAFETY: RSP names the current host call stack and memmove's return address is
+                // the first qword at the faulting leaf routine's stack pointer.
+                PRECISE_WRITE_CALLER
+                    .set(unsafe { std::ptr::read_unaligned(context.Rsp as *const u64) });
+                context.EFlags |= 0x100;
+            }
+        }
     }
     EXCEPTION_CONTINUE_EXECUTION
 }
@@ -318,6 +443,34 @@ fn open_pages(state: &mut WatchState, address: u64, byte_count: u64) -> io::Resu
         set_range_protection(start, end - start, protection)?;
         for (_, page) in state.pages.range_mut(start..end) {
             page.open = true;
+        }
+    }
+    Ok(())
+}
+
+fn close_precise_pages(state: &mut WatchState, address: u64, byte_count: u64) -> io::Result<()> {
+    let Some(pages) = page_addresses(address, byte_count) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "precise page range overflows",
+        ));
+    };
+    for page_address in pages {
+        let Some(page) = state.pages.get(&page_address) else {
+            continue;
+        };
+        let close = page.open
+            && page.watchers.iter().any(|watcher_id| {
+                state.ranges.get(watcher_id).is_some_and(|range| {
+                    range.precise && range.retirement.load(Ordering::Acquire) == WATCH_ACTIVE
+                })
+            });
+        let protection = page.readonly_protection;
+        if close {
+            set_page_protection(page_address, protection)?;
+            if let Some(page) = state.pages.get_mut(&page_address) {
+                page.open = false;
+            }
         }
     }
     Ok(())
@@ -385,6 +538,16 @@ pub fn notify_guest_memory_written_excluding(
             let intersection_start = range.address.max(alias.address);
             let intersection_end =
                 (range.address + range.byte_count).min(alias.address + alias.byte_count);
+            if range.precise {
+                eprintln!(
+                    "[REMu][JOURNAL][PRECISE-NOTIFY] requested={address:#x}+{byte_count:#x} alias={:#x}+{:#x} watched={:#x}+{:#x} thread={:?}",
+                    alias.address,
+                    alias.byte_count,
+                    range.address,
+                    range.byte_count,
+                    std::thread::current().name(),
+                );
+            }
             mark_range_dirty(
                 range,
                 intersection_start,
@@ -434,6 +597,21 @@ impl CpuWriteWatch {
     ///
     /// The range must remain a live readable and writable mapping until the watch is retired.
     pub unsafe fn new(address: u64, byte_count: u64) -> io::Result<Self> {
+        unsafe { Self::new_with_precision(address, byte_count, false) }
+    }
+
+    /// Creates an instruction-precise diagnostic watch. Each trapped write is single-stepped and
+    /// the affected page is immediately protected again. This is intentionally too expensive for
+    /// normal GPU synchronization and should only be used for a tightly bounded debug range.
+    ///
+    /// # Safety
+    ///
+    /// The range must remain a live readable and writable mapping until the watch is retired.
+    pub unsafe fn new_precise(address: u64, byte_count: u64) -> io::Result<Self> {
+        unsafe { Self::new_with_precision(address, byte_count, true) }
+    }
+
+    unsafe fn new_with_precision(address: u64, byte_count: u64, precise: bool) -> io::Result<Self> {
         if address == 0 || byte_count == 0 || address.checked_add(byte_count).is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -459,6 +637,21 @@ impl CpuWriteWatch {
             dirty_pages: Mutex::new(BTreeSet::new()),
             generation: AtomicU64::new(0),
             retirement: AtomicU8::new(WATCH_ACTIVE),
+            last_write_fault: AtomicU64::new(0),
+            last_write_pc: AtomicU64::new(0),
+            sample_address: AtomicU64::new(0),
+            sample_value: AtomicU64::new(0),
+            sample_previous: AtomicU64::new(0),
+            sample_changed_value: AtomicU64::new(0),
+            sample_change_fault: AtomicU64::new(0),
+            sample_change_pc: AtomicU64::new(0),
+            sample_change_rax: AtomicU64::new(0),
+            sample_change_rcx: AtomicU64::new(0),
+            sample_change_rdx: AtomicU64::new(0),
+            sample_change_r8: AtomicU64::new(0),
+            sample_change_r9: AtomicU64::new(0),
+            sample_change_caller: AtomicU64::new(0),
+            precise,
         });
         state.ranges.insert(range.id, Arc::clone(&range));
         let setup = (|| {
@@ -573,6 +766,8 @@ impl CpuWriteWatch {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.range.last_write_fault.store(0, Ordering::Release);
+        self.range.last_write_pc.store(0, Ordering::Release);
         let range_start = align_down(self.range.address);
         let range_end = align_up(self.range.address + self.range.byte_count)
             .expect("live CPU write-watch page range remains valid");
@@ -603,6 +798,56 @@ impl CpuWriteWatch {
         Ok(())
     }
 
+    /// Returns the first guest store recorded since this watch was last rearmed.
+    #[must_use]
+    pub fn last_guest_write(&self) -> Option<(u64, u64)> {
+        let program_counter = self.range.last_write_pc.load(Ordering::Acquire);
+        let fault = self.range.last_write_fault.load(Ordering::Acquire);
+        (program_counter != 0).then_some((fault, program_counter))
+    }
+
+    /// Configures one qword whose instruction-level changes are retained until diagnostics take
+    /// them. The qword must fall completely inside this precise watch.
+    #[must_use]
+    pub fn set_diagnostic_sample(&self, address: u64) -> bool {
+        if !self.range.precise
+            || address < self.range.address
+            || address
+                .checked_add(8)
+                .is_none_or(|end| end > self.range.address + self.range.byte_count)
+        {
+            return false;
+        }
+        // SAFETY: the retained live watch contains the validated qword.
+        let value = unsafe { std::ptr::read_unaligned(address as *const u64) };
+        self.range.sample_value.store(value, Ordering::Release);
+        self.range.sample_address.store(address, Ordering::Release);
+        true
+    }
+
+    /// Takes the newest sampled-qword change completed by a trapped guest instruction.
+    #[must_use]
+    pub fn take_diagnostic_sample_change(&self) -> Option<(u64, u64, u64, u64, [u64; 6])> {
+        let program_counter = self.range.sample_change_pc.swap(0, Ordering::AcqRel);
+        if program_counter == 0 {
+            return None;
+        }
+        Some((
+            self.range.sample_previous.load(Ordering::Acquire),
+            self.range.sample_changed_value.load(Ordering::Acquire),
+            self.range.sample_change_fault.load(Ordering::Acquire),
+            program_counter,
+            [
+                self.range.sample_change_rax.load(Ordering::Acquire),
+                self.range.sample_change_rcx.load(Ordering::Acquire),
+                self.range.sample_change_rdx.load(Ordering::Acquire),
+                self.range.sample_change_r8.load(Ordering::Acquire),
+                self.range.sample_change_r9.load(Ordering::Acquire),
+                self.range.sample_change_caller.load(Ordering::Acquire),
+            ],
+        ))
+    }
+
     pub fn with_live_mapping<T>(&self, operation: impl FnOnce() -> T) -> io::Result<T> {
         let mut state = state()
             .lock()
@@ -614,7 +859,9 @@ impl CpuWriteWatch {
             ));
         }
         open_pages(&mut state, self.range.address, self.range.byte_count)?;
-        Ok(operation())
+        let result = operation();
+        close_precise_pages(&mut state, self.range.address, self.range.byte_count)?;
+        Ok(result)
     }
 
     #[must_use]

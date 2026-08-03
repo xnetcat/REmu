@@ -1686,6 +1686,17 @@ fn execute_memory_copy(copy: &GpuMemoryCopy) -> Result<(), String> {
         read_process_memory(copy.source_address, &mut bytes)?;
         bytes
     };
+    remu_memory::record_guest_write(
+        if copy.source_selection == 2 {
+            remu_memory::GuestWriteSite::DmaFill
+        } else {
+            remu_memory::GuestWriteSite::DmaCopy
+        },
+        copy.destination_address,
+        copy.byte_count,
+        &bytes,
+        remu_gpu::gpu_completed_submission_sequence(),
+    );
     write_process_memory(copy.destination_address, &bytes)?;
     notify_wait_producers(copy.destination_address, copy.byte_count);
     Ok(())
@@ -1700,6 +1711,13 @@ fn execute_memory_write(write: &GpuMemoryWrite) -> Result<(), String> {
         for value in &write.values {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
+        remu_memory::record_guest_write(
+            remu_memory::GuestWriteSite::WriteData,
+            write.address,
+            bytes.len() as u64,
+            &bytes,
+            remu_gpu::gpu_completed_submission_sequence(),
+        );
         write_process_memory(write.address, &bytes)?;
         notify_wait_producers(
             write.address,
@@ -1707,7 +1725,15 @@ fn execute_memory_write(write: &GpuMemoryWrite) -> Result<(), String> {
         );
     } else {
         for value in &write.values {
-            write_process_memory(write.address, &value.to_le_bytes())?;
+            let bytes = value.to_le_bytes();
+            remu_memory::record_guest_write(
+                remu_memory::GuestWriteSite::WriteData,
+                write.address,
+                bytes.len() as u64,
+                &bytes,
+                remu_gpu::gpu_completed_submission_sequence(),
+            );
+            write_process_memory(write.address, &bytes)?;
         }
         if !write.values.is_empty() {
             notify_wait_producers(write.address, 4);
@@ -1725,14 +1751,30 @@ fn execute_memory_release(release: GpuMemoryRelease) -> Result<(), String> {
             if !release.address.is_multiple_of(4) {
                 return Err("32-bit release destination is unaligned".to_owned());
             }
-            write_process_memory(release.address, &value.to_le_bytes())?;
+            let bytes = value.to_le_bytes();
+            remu_memory::record_guest_write(
+                remu_memory::GuestWriteSite::ReleaseMem,
+                release.address,
+                bytes.len() as u64,
+                &bytes,
+                remu_gpu::gpu_completed_submission_sequence(),
+            );
+            write_process_memory(release.address, &bytes)?;
             remu_gpu::record_gpu_wait_producer(release.address, false, u64::from(value));
         }
         GpuMemoryReleaseValue::Immediate64(value) => {
             if !release.address.is_multiple_of(8) {
                 return Err("64-bit release destination is unaligned".to_owned());
             }
-            write_process_memory(release.address, &value.to_le_bytes())?;
+            let bytes = value.to_le_bytes();
+            remu_memory::record_guest_write(
+                remu_memory::GuestWriteSite::ReleaseMem,
+                release.address,
+                bytes.len() as u64,
+                &bytes,
+                remu_gpu::gpu_completed_submission_sequence(),
+            );
+            write_process_memory(release.address, &bytes)?;
             remu_gpu::record_gpu_wait_producer(release.address, true, value);
         }
         GpuMemoryReleaseValue::Timestamp => {
@@ -1740,7 +1782,15 @@ fn execute_memory_release(release: GpuMemoryRelease) -> Result<(), String> {
                 return Err("timestamp release destination is unaligned".to_owned());
             }
             let timestamp = gpu_timestamp();
-            write_process_memory(release.address, &timestamp.to_le_bytes())?;
+            let bytes = timestamp.to_le_bytes();
+            remu_memory::record_guest_write(
+                remu_memory::GuestWriteSite::ReleaseMem,
+                release.address,
+                bytes.len() as u64,
+                &bytes,
+                remu_gpu::gpu_completed_submission_sequence(),
+            );
+            write_process_memory(release.address, &bytes)?;
             remu_gpu::record_gpu_wait_producer(release.address, true, timestamp);
         }
     }

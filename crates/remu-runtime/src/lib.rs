@@ -3264,6 +3264,9 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             float: low_xmm_f64(frame.xmm_arguments[7]),
         };
     }
+    #[cfg(windows)]
+    let _diagnostic_direct_write_rearm =
+        memory::diagnostic_direct_write_rearm(frame.dispatch_index, frame.guest_return_address);
     deliver_pending_guest_exception_at_import(frame);
     let call_args = frame.integer_arguments;
     let float_argument0 = low_xmm_f64(frame.xmm_arguments[0]);

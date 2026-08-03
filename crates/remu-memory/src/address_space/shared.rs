@@ -347,6 +347,24 @@ pub fn guest_shared_backing_identity(
     )
 }
 
+/// Installs a Windows-only diagnostic on the physical backing behind a live guest range.
+///
+/// This follows writes made through temporary backing views, which intentionally bypass virtual
+/// address page protection and therefore cannot be attributed by `CpuWriteWatch` alone.
+#[cfg(windows)]
+#[must_use]
+pub fn watch_guest_shared_backing_writes(address: u64, byte_count: u64) -> bool {
+    let mappings = shared_mappings()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
+    else {
+        return false;
+    };
+    backing.install_write_diagnostic(offset, byte_count);
+    true
+}
+
 /// Resolves an exact live guest range to a lazily mapped, page-aligned backing view.
 ///
 /// Unlike a no-copy view over the guest VA, this remains contiguous when consecutive physical
