@@ -33,8 +33,8 @@ use super::super::submission::{
 use super::super::{
     CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
     PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SharedEventDrawReject, SharedEventFence, SharedEventProducerId, SharedEventSignalCheckpoint,
-    SharedEventWriteKind, UploadedGlobalBuffer,
+    SameQueueDmaFillReject, SharedEventDrawReject, SharedEventFence, SharedEventProducerId,
+    SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
 use super::{
     ComputePipelineKey, FlushPolicy, GLOBAL_UPLOAD_ALIGNMENT, GuestBatchFlushReason,
@@ -1824,6 +1824,7 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         }),
         mapping_identity: None,
         write_watch: None,
+        publishes_guest_memory_authority: false,
     };
     let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
         address: completion_address,
@@ -4279,6 +4280,7 @@ fn per_queue_required_drain_has_one_deadline_and_continues_after_terminal_error(
         }),
         mapping_identity: None,
         write_watch: None,
+        publishes_guest_memory_authority: false,
     };
     let (_label_space, completion_address) = mapped_test_label();
     let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
@@ -5768,6 +5770,329 @@ fn invalidating_acquire_rejects_dirty_and_gpu_generation_mismatch() {
         ),
         SharedEventEventDisposition::HostEffect,
         "a dirty watched resource must run the normal acquire after terminal evidence"
+    );
+}
+
+fn immediate_dma_fill(destination_address: u64, value: u32) -> GpuMemoryCopy {
+    GpuMemoryCopy {
+        source_address: u64::from(value),
+        destination_address,
+        byte_count: 4,
+        source_selection: 2,
+        destination_selection: 3,
+        source_snapshot: None,
+    }
+}
+
+#[test]
+fn same_queue_immediate_fill_attaches_and_publishes_only_at_terminal_retirement() {
+    let (sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_destination_space, destination) = mapped_test_label();
+    // SAFETY: the retained test address space owns this aligned writable dword.
+    unsafe { std::ptr::write_volatile(destination as *mut u32, 0x1234_5678) };
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let fill = immediate_dma_fill(destination, 0);
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryCopy(fill.clone())],
+        })
+        .expect("same-queue immediate fill submission");
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(presenter.statistics.shared_event_dma_fill_attempts, 1);
+    assert_eq!(presenter.statistics.shared_event_gpu_ordered_dma_fills, 1);
+    assert_eq!(
+        presenter.statistics.shared_event_host_block_kinds[super::super::SHARED_HOST_KIND_DMA],
+        0,
+    );
+    assert!(!presenter.receiver.blocked_queues.contains_key(&0));
+    assert_eq!(
+        read_test_label(destination),
+        0x1234_5678,
+        "zero fill is still in flight"
+    );
+    let state = &presenter.guest_queue_batches[&0];
+    assert_eq!(state.host_dependencies[&dependency.producer()], dependency.value());
+    let open = state.open_batch.as_ref().expect("same-q batch remains open");
+    assert!(matches!(
+        open.memory_writes.as_slice(),
+        [PendingGuestMemoryWrite {
+            operation: GuestMemoryWriteOperation::Fill {
+                address,
+                value: 0,
+                dword_count: 1,
+            },
+            mapping_identity: Some(_),
+            publishes_guest_memory_authority: true,
+            ..
+        }] if *address == destination
+    ));
+
+    // A cache/metadata consumer can appear after admission. The transition still belongs to
+    // terminal publication, not event dequeue.
+    presenter.color_metadata_clears.insert(destination, 0);
+    ensure_watched_test_resident(&mut presenter, destination);
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == destination)
+        .expect("late resident key");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter.ensure_direct_scanout_texture(&device, descriptor);
+    assert_eq!(presenter.color_metadata_clears[&destination], 0);
+    assert!(
+        !presenter.resident_guest_textures[&descriptor]
+            .write_watch
+            .is_dirty(),
+        "event dequeue cannot dirty the late cache"
+    );
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("same-q fill batch commits");
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("same-q fill batch retires");
+    assert_eq!(read_test_label(destination), 0);
+    assert_eq!(
+        presenter.color_metadata_clears[&destination],
+        u32::MAX,
+        "metadata authority changes only after the fill is published"
+    );
+    assert!(
+        presenter.resident_guest_textures[&descriptor]
+            .write_watch
+            .is_dirty(),
+        "terminal publication dirties every persistent cache alias"
+    );
+    assert!(
+        !presenter.direct_scanout_textures.contains_key(&destination),
+        "terminal publication retires private cache aliases without write watches"
+    );
+}
+
+#[test]
+fn same_queue_immediate_fill_rejects_every_unproven_shape() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let (_destination_space, destination) = mapped_test_label();
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let exact = [dependency];
+    let assert_reject = |presenter: &mut MetalPresenter,
+                         queue_id: u64,
+                         dependencies: &[SharedEventFence],
+                         copy: &GpuMemoryCopy,
+                         reason: SameQueueDmaFillReject| {
+        let before = presenter.statistics.shared_event_dma_fill_rejections[reason.index()];
+        assert!(
+            presenter
+                .prepare_same_queue_immediate_fill(queue_id, dependencies, copy)
+                .is_none()
+        );
+        assert_eq!(
+            presenter.statistics.shared_event_dma_fill_rejections[reason.index()],
+            before + 1,
+            "expected rejection {reason:?}"
+        );
+    };
+
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.source_selection = 3;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::NonImmediateSource,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.destination_selection = 0;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::DestinationSelector,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.source_snapshot = Some(
+        remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::<[u8]>::from([0; 4]))
+            .expect("snapshot budget"),
+    );
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::SourceSnapshot,
+    );
+    let mut copy = immediate_dma_fill(destination, 0);
+    copy.byte_count = 2;
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &copy,
+        SameQueueDmaFillReject::InvalidRange,
+    );
+    let cross_queue = [SharedEventFence::new(SharedEventProducerId::new(41), 1)];
+    assert_reject(
+        &mut presenter,
+        0,
+        &cross_queue,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::CrossQueue,
+    );
+    let incomplete = [SharedEventFence::new(SharedEventProducerId::new(0), 2)];
+    assert_reject(
+        &mut presenter,
+        0,
+        &incomplete,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::IncompleteDependency,
+    );
+    assert_reject(
+        &mut presenter,
+        0,
+        &[],
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::IncompleteDependency,
+    );
+
+    let mut anonymous_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("anonymous address space");
+    let anonymous = anonymous_space
+        .map_anonymous(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .expect("anonymous destination");
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(anonymous.get(), 0),
+        SameQueueDmaFillReject::MissingIdentity,
+    );
+
+    presenter.color_metadata_clears.insert(destination, 0);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::MetadataOverlap,
+    );
+    presenter.color_metadata_clears.remove(&destination);
+    let descriptor = GuestTextureDescriptor {
+        address: destination,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter.ensure_direct_scanout_texture(&device, descriptor);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::CacheOverlap,
+    );
+    presenter.direct_scanout_textures.clear();
+    ensure_watched_test_resident(&mut presenter, destination);
+    assert_reject(
+        &mut presenter,
+        0,
+        &exact,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::CacheOverlap,
+    );
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut no_batch = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut no_batch);
+    let missing_batch = [SharedEventFence::new(SharedEventProducerId::new(7), 1)];
+    assert_reject(
+        &mut no_batch,
+        7,
+        &missing_batch,
+        &immediate_dma_fill(destination, 0),
+        SameQueueDmaFillReject::MissingOpenBatch,
+    );
+}
+
+#[test]
+fn same_queue_immediate_fill_refuses_replaced_destination_without_cache_transition() {
+    let mut address_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest destination space");
+    let original_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original destination backing");
+    let destination = address_space
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original destination mapping");
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let dependency = install_empty_shared_event_dependency(&mut presenter, 0, 0);
+    let fill = immediate_dma_fill(destination.get(), 0xdead_beef);
+    let prepared = presenter
+        .prepare_same_queue_immediate_fill(0, &[dependency], &fill)
+        .expect("original exact mapping admits the fill");
+    presenter
+        .queue_prepared_same_queue_immediate_fill(0, &fill, prepared)
+        .expect("fill attaches to original queue batch");
+
+    address_space
+        .unmap(destination, GUEST_PAGE_SIZE)
+        .expect("unmap original destination");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement destination backing");
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(destination),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement destination mapping");
+    ensure_watched_test_resident(&mut presenter, destination.get());
+    let descriptor = *presenter
+        .resident_guest_textures
+        .keys()
+        .find(|descriptor| descriptor.address == destination.get())
+        .expect("replacement resident key");
+
+    presenter.set_active_guest_queue(Some(0));
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::EventLoop)
+        .expect("stale fill batch commits");
+    let error = presenter
+        .wait_for_guest_command_batches()
+        .expect_err("stale exact identity must refuse publication");
+    assert!(error.contains("mapping changed before completion"), "{error}");
+    assert_eq!(read_test_label(destination.get()), 0);
+    assert!(
+        presenter.resident_guest_textures[&descriptor].is_live(),
+        "a refused write cannot publish guest-memory cache authority"
     );
 }
 
