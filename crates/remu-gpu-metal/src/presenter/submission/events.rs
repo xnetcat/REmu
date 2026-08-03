@@ -13,6 +13,7 @@ use super::{
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, GpuWaitId};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 fn dependency_ingress_budget() -> usize {
     if remu_gpu::gpu_work_items_pending() > GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD {
@@ -122,8 +123,19 @@ impl OrderedGpuEventReceiver {
             host_block: None,
             next_ingress_sequence: 0,
             disconnected: false,
+            event_queue_timing: false,
+            last_event_ingested_at: None,
+            last_event_queue_wait: Duration::ZERO,
             producer_labels: HashMap::new(),
         }
+    }
+
+    pub(crate) fn set_event_queue_timing(&mut self, enabled: bool) {
+        self.event_queue_timing = enabled;
+    }
+
+    pub(crate) fn last_event_queue_wait(&self) -> Duration {
+        self.last_event_queue_wait
     }
 
     fn index_queued_event_producers(&mut self, event: &GpuEvent) {
@@ -175,6 +187,7 @@ impl OrderedGpuEventReceiver {
             };
             let ingress_sequence = self.next_ingress_sequence;
             self.next_ingress_sequence = self.next_ingress_sequence.saturating_add(1);
+            let ingested_at = self.event_queue_timing.then(Instant::now);
             match event {
                 GpuEvent::QueueSubmission { queue_id, events } => {
                     remu_gpu::record_startup_milestone(
@@ -192,12 +205,14 @@ impl OrderedGpuEventReceiver {
                     self.submissions.entry(queue_id).or_default().push_back(
                         ScheduledGpuSubmission {
                             ingress_sequence,
+                            ingested_at,
                             events: events.into(),
                         },
                     );
                 }
                 event => self.host_events.push_back(ScheduledHostEvent {
                     ingress_sequence,
+                    ingested_at,
                     event,
                 }),
             }
@@ -365,6 +380,10 @@ impl OrderedGpuEventReceiver {
                 .host_events
                 .pop_front()
                 .expect("host event exists after readiness check");
+            self.last_event_ingested_at = host.ingested_at;
+            self.last_event_queue_wait = host.ingested_at.map_or(Duration::ZERO, |at| {
+                Instant::now().saturating_duration_since(at)
+            });
             return OrderedEventPoll::Event {
                 source: OrderedEventSource::Host {
                     ingress_sequence: host.ingress_sequence,
@@ -433,7 +452,12 @@ impl OrderedGpuEventReceiver {
         {
             queue.pop_front();
         }
+        let ingested_at = queue.front()?.ingested_at;
         let event = queue.front_mut()?.events.pop_front()?;
+        self.last_event_ingested_at = ingested_at;
+        self.last_event_queue_wait = ingested_at.map_or(Duration::ZERO, |at| {
+            Instant::now().saturating_duration_since(at)
+        });
         self.unindex_queued_event_producers(&event);
         Some(event)
     }
@@ -471,6 +495,7 @@ impl OrderedGpuEventReceiver {
             OrderedEventSource::Host { ingress_sequence } => {
                 self.host_events.push_front(ScheduledHostEvent {
                     ingress_sequence,
+                    ingested_at: self.last_event_ingested_at,
                     event,
                 });
                 self.host_block = Some(reason);

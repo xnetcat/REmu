@@ -10,8 +10,9 @@ use super::super::shared_event::{
     terminal_shared_event_advance,
 };
 use super::super::{
-    FlushPolicy, GuestQueueBatchState, PresenterStatistics, TerminalPublicationPhase,
-    TerminalPublicationTimer,
+    FlushPolicy, GuestQueueBatchState, PendingSharedEventAckTrace, PresenterStatistics,
+    SharedEventAckNativeHostTimes, SharedEventAckTerminalTimes, SharedEventAckTrace,
+    TerminalPublicationPhase, TerminalPublicationTimer,
 };
 use super::{
     GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT, GlobalUploadChunk,
@@ -39,6 +40,7 @@ use remu_memory::{
 use remu_shader::ShaderEvaluation;
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 static DISCARDED_STALE_GLOBAL_WRITEBACKS: AtomicUsize = AtomicUsize::new(0);
@@ -260,6 +262,138 @@ impl GuestCommandBatch {
 }
 
 impl MetalPresenter {
+    pub(crate) fn shared_event_ack_phase_timing_enabled(&self) -> bool {
+        self.shared_event_ack_phase_timing
+    }
+
+    pub(crate) fn record_shared_event_ack_batch_cpu_phases(
+        &mut self,
+        translation: Duration,
+        metal_encoding: Duration,
+        compute: bool,
+    ) {
+        if !self.shared_event_ack_phase_timing {
+            return;
+        }
+        let Some(queue_id) = self.active_guest_queue else {
+            return;
+        };
+        let phases = self.shared_event_ack_batch_cpu.entry(queue_id).or_default();
+        phases.translation = phases.translation.saturating_add(translation);
+        phases.metal_encoding = phases.metal_encoding.saturating_add(metal_encoding);
+        if compute {
+            phases.computes = phases.computes.saturating_add(1);
+        } else {
+            phases.draws = phases.draws.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn prepare_shared_event_ack_phase_trace(
+        &mut self,
+        fence: Option<SharedEventFence>,
+        event_queue: Duration,
+        host_preflight: Duration,
+        ack_encoding: Duration,
+    ) {
+        if !self.shared_event_ack_phase_timing
+            || self.shared_event_ack_phase_samples_remaining == 0
+            || self.shared_event_ack_traces.len() + self.pending_shared_event_ack_traces.len()
+                >= 64
+        {
+            return;
+        }
+        let (Some(queue_id), Some(fence)) = (self.active_guest_queue, fence) else {
+            return;
+        };
+        self.shared_event_ack_phase_samples_remaining -= 1;
+        self.pending_shared_event_ack_traces.insert(
+            queue_id,
+            PendingSharedEventAckTrace {
+                fence,
+                event_queue,
+                host_preflight,
+                ack_encoding,
+            },
+        );
+    }
+
+    pub(crate) fn record_shared_event_ack_observed(
+        &mut self,
+        fence: SharedEventFence,
+        observed_at: Instant,
+    ) {
+        let Some(&command_buffer_key) = self.shared_event_ack_trace_buffers_by_fence.get(&fence)
+        else {
+            return;
+        };
+        if let Some(trace) = self.shared_event_ack_traces.get_mut(&command_buffer_key) {
+            trace.ack_observed_at = Some(observed_at);
+        }
+        self.finish_shared_event_ack_trace(command_buffer_key);
+    }
+
+    fn record_shared_event_ack_terminal(&mut self, command_buffer: &CommandBuffer) {
+        let command_buffer_key = command_buffer.as_ptr() as usize;
+        let Some(trace) = self.shared_event_ack_traces.get_mut(&command_buffer_key) else {
+            return;
+        };
+        trace.terminal = Some(completed_command_buffer_ack_timeline(command_buffer));
+        self.finish_shared_event_ack_trace(command_buffer_key);
+    }
+
+    fn finish_shared_event_ack_trace(&mut self, command_buffer_key: usize) {
+        let ready = self
+            .shared_event_ack_traces
+            .get(&command_buffer_key)
+            .is_some_and(|trace| trace.terminal.is_some() && trace.ack_observed_at.is_some());
+        if !ready {
+            return;
+        }
+        let trace = self
+            .shared_event_ack_traces
+            .remove(&command_buffer_key)
+            .expect("ready acknowledgement trace exists");
+        self.shared_event_ack_trace_buffers_by_fence
+            .remove(&trace.fence);
+        let terminal = trace.terminal.expect("ready trace has terminal timing");
+        let native_host = trace
+            .native_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let statistics = &mut self.statistics.shared_event_ack_phases;
+        statistics.samples = statistics.samples.saturating_add(1);
+        statistics.draws = statistics.draws.saturating_add(trace.cpu.draws);
+        statistics.computes = statistics.computes.saturating_add(trace.cpu.computes);
+        statistics.event_queue.record(trace.event_queue);
+        statistics.cpu_translation.record(trace.cpu.translation);
+        statistics.metal_encoding.record(trace.cpu.metal_encoding);
+        statistics.ack_encoding.record(trace.ack_encoding);
+        statistics.commit_call.record(trace.commit_call);
+        if let Some(scheduled_at) = native_host.scheduled_at {
+            statistics
+                .commit_to_scheduled
+                .record(scheduled_at.saturating_duration_since(trace.committed_at));
+            if let Some(completed_at) = native_host.completed_at {
+                statistics
+                    .scheduled_to_completed
+                    .record(completed_at.saturating_duration_since(scheduled_at));
+            }
+        }
+        statistics
+            .kernel_to_gpu_start
+            .record(terminal.kernel_to_gpu_start);
+        statistics.gpu_execution.record(terminal.gpu_execution);
+        statistics
+            .gpu_to_kernel_end
+            .record(terminal.gpu_to_kernel_end);
+        statistics.commit_to_ack.record(
+            trace
+                .ack_observed_at
+                .expect("ready trace has acknowledgement observation")
+                .saturating_duration_since(trace.committed_at),
+        );
+    }
+
     pub(crate) fn encode_active_guest_queue_host_ack(
         &mut self,
     ) -> Result<Option<super::super::SharedEventFence>, String> {
@@ -848,6 +982,7 @@ impl MetalPresenter {
         execution_error: Option<String>,
         mut timer: TerminalPublicationTimer,
     ) -> Result<(), String> {
+        self.record_shared_event_ack_terminal(&batch.command_buffer);
         let result = self.finish_terminal_guest_batch(batch, execution_error, &mut timer);
         self.statistics.gpu_execution_time +=
             completed_command_buffer_gpu_duration(&batch.command_buffer);
@@ -1045,6 +1180,16 @@ impl MetalPresenter {
         let Some(mut batch) = state.open_batch.take() else {
             return settlement;
         };
+        let mut acknowledgement_cpu = self
+            .shared_event_ack_batch_cpu
+            .remove(&queue_id)
+            .unwrap_or_default();
+        let acknowledgement_trace = self.pending_shared_event_ack_traces.remove(&queue_id);
+        if let Some(trace) = &acknowledgement_trace {
+            acknowledgement_cpu.translation = acknowledgement_cpu
+                .translation
+                .saturating_add(trace.host_preflight);
+        }
         batch.end_compute_pass();
         if batch.end_render_pass() {
             self.statistics.render_pass_ends_for_batch_flush = self
@@ -1053,11 +1198,39 @@ impl MetalPresenter {
                 .saturating_add(1);
         }
         state.transient_global_buffer_cache.clear();
-        batch.committed_at = Some(Instant::now());
+        let committed_at = Instant::now();
+        batch.committed_at = Some(committed_at);
         if let Some(waker) = completion_waker {
             attach_guest_batch_completion_waker(&batch.command_buffer, waker);
         }
+        let native_host = acknowledgement_trace
+            .as_ref()
+            .map(|_| Arc::new(Mutex::new(SharedEventAckNativeHostTimes::default())));
+        if let Some(native_host) = native_host.as_ref() {
+            attach_shared_event_ack_phase_handlers(&batch.command_buffer, Arc::clone(native_host));
+        }
+        let commit_started = Instant::now();
         batch.command_buffer.commit();
+        let commit_call = Instant::now().saturating_duration_since(commit_started);
+        if let (Some(trace), Some(native_host)) = (acknowledgement_trace, native_host) {
+            let command_buffer_key = batch.command_buffer.as_ptr() as usize;
+            self.shared_event_ack_trace_buffers_by_fence
+                .insert(trace.fence, command_buffer_key);
+            self.shared_event_ack_traces.insert(
+                command_buffer_key,
+                SharedEventAckTrace {
+                    fence: trace.fence,
+                    committed_at,
+                    event_queue: trace.event_queue,
+                    cpu: acknowledgement_cpu,
+                    ack_encoding: trace.ack_encoding,
+                    commit_call,
+                    native_host,
+                    terminal: None,
+                    ack_observed_at: None,
+                },
+            );
+        }
         state.committed_batches.push_back(batch);
         self.record_guest_batch_flush(reason);
         settlement
@@ -1344,6 +1517,30 @@ fn attach_guest_batch_completion_waker(
     })
     .copy();
     command_buffer.add_completed_handler(&handler);
+}
+
+fn attach_shared_event_ack_phase_handlers(
+    command_buffer: &CommandBuffer,
+    native_host: Arc<Mutex<SharedEventAckNativeHostTimes>>,
+) {
+    let scheduled_times: Arc<Mutex<SharedEventAckNativeHostTimes>> = Arc::clone(&native_host);
+    let scheduled = ConcreteBlock::new(move |_| {
+        scheduled_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .scheduled_at = Some(Instant::now());
+    })
+    .copy();
+    command_buffer.add_scheduled_handler(&scheduled);
+
+    let completed = ConcreteBlock::new(move |_| {
+        native_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .completed_at = Some(Instant::now());
+    })
+    .copy();
+    command_buffer.add_completed_handler(&completed);
 }
 
 fn new_guest_command_batch(
@@ -1727,6 +1924,31 @@ pub(crate) fn completed_command_buffer_gpu_duration(command_buffer: &CommandBuff
         return Duration::ZERO;
     }
     Duration::from_secs_f64(end - start)
+}
+
+fn completed_command_buffer_ack_timeline(
+    command_buffer: &CommandBuffer,
+) -> SharedEventAckTerminalTimes {
+    let (kernel_start, kernel_end, gpu_start, gpu_end): (f64, f64, f64, f64) = unsafe {
+        (
+            msg_send![command_buffer.as_ref(), kernelStartTime],
+            msg_send![command_buffer.as_ref(), kernelEndTime],
+            msg_send![command_buffer.as_ref(), GPUStartTime],
+            msg_send![command_buffer.as_ref(), GPUEndTime],
+        )
+    };
+    let delta = |start: f64, end: f64| {
+        if start.is_finite() && end.is_finite() && start > 0.0 && end >= start {
+            Duration::from_secs_f64(end - start)
+        } else {
+            Duration::ZERO
+        }
+    };
+    SharedEventAckTerminalTimes {
+        kernel_to_gpu_start: delta(kernel_start, gpu_start),
+        gpu_execution: delta(gpu_start, gpu_end),
+        gpu_to_kernel_end: delta(gpu_end, kernel_end),
+    }
 }
 
 pub(crate) fn collect_pending_global_writebacks(

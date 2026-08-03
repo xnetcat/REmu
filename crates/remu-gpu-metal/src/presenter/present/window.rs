@@ -13,7 +13,8 @@ use super::super::{
     SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
     SHARED_HOST_KIND_WAIT, SharedEventDrawReject, WRITEBACK_TRIGGERS,
-    format_shared_event_host_effect_latency_report, format_terminal_publication_report,
+    format_shared_event_ack_phase_report, format_shared_event_host_effect_latency_report,
+    format_terminal_publication_report,
 };
 use super::{
     EVENT_POLL_INTERVAL, FlushPolicy, GuestBatchFlushReason, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
@@ -270,8 +271,7 @@ impl MetalPresenter {
                 dispatch.gpu_publication_wait.buckets,
                 remu_gpu::DISPATCH_LATENCY_BUCKET_UPPER_NS,
             );
-            for line in
-                remu_gpu::format_gpu_publication_phase_report(dispatch_window_ms, &dispatch)
+            for line in remu_gpu::format_gpu_publication_phase_report(dispatch_window_ms, &dispatch)
             {
                 eprintln!("{line}");
             }
@@ -302,6 +302,15 @@ impl MetalPresenter {
                 ) {
                     eprintln!("{line}");
                 }
+            }
+            if self.shared_event_ack_phase_timing {
+                for line in format_shared_event_ack_phase_report(
+                    dispatch_window_ms,
+                    self.statistics.shared_event_ack_phases.take(),
+                ) {
+                    eprintln!("{line}");
+                }
+                self.shared_event_ack_phase_samples_remaining = 64;
             }
             eprintln!(
                 "[REMu][PERF-CAUSES] RP-end compute={:.0}/s key={:.0}/s color-op={:.0}/s flush={:.0}/s | CB tick={:.0}/s memory={:.0}/s wait={:.0}/s shared-host={:.0}/s flip={:.0}/s capacity={:.0}/s pfp={:.0}/s sync={:.0}/s",
