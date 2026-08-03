@@ -226,12 +226,21 @@ impl Compiler<'_> {
     ) -> Result<(), String> {
         // GFX10 DIM describes the address operand layout, while the descriptor selects the actual
         // Metal resource view. Unreal can execute DIM=2/5 instructions through a single-layer 2D
-        // descriptor; consume the extra address only when that descriptor really is a 3D view.
+        // descriptor; consume the extra address only when that descriptor really is a 3D or 2D
+        // array view.
         let image_kind = self.image_kinds[binding_index];
-        let is_3d = image_kind.texture_type == 10;
+        let metal_dim = metal_image_dimension(image_kind);
+        let is_3d = metal_dim == 2;
+        let is_2d_array = metal_dim == 3;
         if !matches!(image.dimension, 0 | 1 | 2 | 4 | 5) {
             return Err(format!(
                 "storage image dimension {} requires a non-2D Metal texture type",
+                image.dimension
+            ));
+        }
+        if is_2d_array && !matches!(image.dimension, 2 | 5) {
+            return Err(format!(
+                "2D-array storage image requires a 3-component address, got dimension {}",
                 image.dimension
             ));
         }
@@ -243,7 +252,7 @@ impl Compiler<'_> {
         };
         let x = self.temp("int", &format!("as_type<int>({raw_x})"));
         let y = self.temp("int", &format!("as_type<int>({raw_y})"));
-        let z = is_3d.then(|| {
+        let z_or_layer = (is_3d || is_2d_array).then(|| {
             let raw_z = self.image_uint_address(image, 2);
             self.temp("int", &format!("as_type<int>({raw_z})"))
         });
@@ -264,18 +273,37 @@ impl Compiler<'_> {
             });
             input += 1;
         }
-        let z_bounds = z.as_ref().map_or_else(String::new, |z| {
-            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.get_depth()")
+        let z_bounds = z_or_layer.as_ref().map_or_else(String::new, |z| {
+            let extent = if is_2d_array {
+                "get_array_size"
+            } else {
+                "get_depth"
+            };
+            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
         });
-        let coordinates = z.as_ref().map_or_else(
-            || format!("uint2((uint){x}, (uint){y})"),
-            |z| format!("uint3((uint){x}, (uint){y}, (uint){z})"),
-        );
+        let coordinates = if is_3d {
+            format!(
+                "uint3((uint){x}, (uint){y}, (uint){})",
+                z_or_layer.as_ref().expect("3D image has a depth address")
+            )
+        } else {
+            format!("uint2((uint){x}, (uint){y})")
+        };
+        let layer_argument = if is_2d_array {
+            format!(
+                ", (uint){}",
+                z_or_layer
+                    .as_ref()
+                    .expect("2D-array image has a layer address")
+            )
+        } else {
+            String::new()
+        };
         self.line(3, &format!("if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {{"));
         self.line(
             4,
             &format!(
-                "tex{binding_index}.write(vec<{kind}, 4>({}, {}, {}, {}), {coordinates});",
+                "tex{binding_index}.write(vec<{kind}, 4>({}, {}, {}, {}), {coordinates}{layer_argument});",
                 logical_components[0],
                 logical_components[1],
                 logical_components[2],
@@ -293,10 +321,18 @@ impl Compiler<'_> {
         binding_index: usize,
     ) -> Result<(), String> {
         let image_kind = self.image_kinds[binding_index];
-        let is_3d = image_kind.texture_type == 10;
+        let metal_dim = metal_image_dimension(image_kind);
+        let is_3d = metal_dim == 2;
+        let is_2d_array = metal_dim == 3;
         if !matches!(image.dimension, 0 | 1 | 2 | 4 | 5) {
             return Err(format!(
                 "storage image dimension {} requires a non-2D Metal texture type",
+                image.dimension
+            ));
+        }
+        if is_2d_array && !matches!(image.dimension, 2 | 5) {
+            return Err(format!(
+                "2D-array storage image requires a 3-component address, got dimension {}",
                 image.dimension
             ));
         }
@@ -308,17 +344,36 @@ impl Compiler<'_> {
         };
         let x = self.temp("int", &format!("as_type<int>({raw_x})"));
         let y = self.temp("int", &format!("as_type<int>({raw_y})"));
-        let z = is_3d.then(|| {
+        let z_or_layer = (is_3d || is_2d_array).then(|| {
             let raw_z = self.image_uint_address(image, 2);
             self.temp("int", &format!("as_type<int>({raw_z})"))
         });
-        let z_bounds = z.as_ref().map_or_else(String::new, |z| {
-            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.get_depth()")
+        let z_bounds = z_or_layer.as_ref().map_or_else(String::new, |z| {
+            let extent = if is_2d_array {
+                "get_array_size"
+            } else {
+                "get_depth"
+            };
+            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
         });
-        let coordinates = z.as_ref().map_or_else(
-            || format!("uint2((uint){x}, (uint){y})"),
-            |z| format!("uint3((uint){x}, (uint){y}, (uint){z})"),
-        );
+        let coordinates = if is_3d {
+            format!(
+                "uint3((uint){x}, (uint){y}, (uint){})",
+                z_or_layer.as_ref().expect("3D image has a depth address")
+            )
+        } else {
+            format!("uint2((uint){x}, (uint){y})")
+        };
+        let layer_argument = if is_2d_array {
+            format!(
+                ", (uint){}",
+                z_or_layer
+                    .as_ref()
+                    .expect("2D-array image has a layer address")
+            )
+        } else {
+            String::new()
+        };
         let kind = self.image_kinds[binding_index].component;
         let zero = if kind == "float" { "0.0f" } else { "0" };
         let loaded = self.temp(
@@ -328,7 +383,7 @@ impl Compiler<'_> {
         self.line(
             3,
             &format!(
-                "if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {loaded} = tex{binding_index}.read({coordinates});"
+                "if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {loaded} = tex{binding_index}.read({coordinates}{layer_argument});"
             ),
         );
         let destination_select = self.image_destination_select(image);
