@@ -13,12 +13,13 @@ use super::{
     ResourceSpan, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
     SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent,
-    SharedEventHostEffectLatencyPhase, SharedEventHostEffectLatencyState,
-    SharedEventHostEffectPendingStatistics, SharedEventWriteKind, UploadedGlobalBuffer,
-    WriteWatchRefresh, compute_pipeline_key, diagnostic_skip_export_shader,
-    diagnostic_skip_pixel_shader, graphics_pipeline_key, guest_physical_ranges_overlap,
-    guest_ranges_overlap, guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
-    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    SharedEventDirectComputePlan, SharedEventHostEffectLatencyPhase,
+    SharedEventHostEffectLatencyState, SharedEventHostEffectPendingStatistics,
+    SharedEventWriteKind, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
+    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, graphics_pipeline_key,
+    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
+    noop_placeholder_cover_draw, pixel_scalars, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, register_value, retire_sampled_textures_matching,
     trace_resident_texture_removal, trace_video_target_compute_consumer,
     trace_video_target_draw_consumer,
@@ -26,6 +27,7 @@ use super::{
 use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
+use remu_memory::guest_shared_backing_identity;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -42,7 +44,9 @@ pub(crate) use self::batch::{
     collect_shared_event_global_versions, completed_command_buffer_gpu_duration,
     describe_guest_batch, guest_batch_writes_overlap, merge_guest_batch_result,
 };
-pub(crate) use self::draw_footprint::{SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject};
+pub(crate) use self::draw_footprint::{
+    SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject, program_memory_is_completely_covered,
+};
 pub(crate) use self::memory::{SAME_QUEUE_DMA_FILL_REJECT_COUNT, SameQueueDmaFillReject};
 #[cfg(test)]
 pub(crate) use self::memory::{
@@ -199,6 +203,7 @@ impl MetalPresenter {
             let mut shared_event_gpu_ordered_compute = false;
             let mut shared_event_gpu_ordered_registered_wait = false;
             let mut shared_event_gpu_ordered_draw = false;
+            let mut shared_event_direct_compute_plan = None;
             let mut shared_event_direct_draw_plan = None;
             let mut prepared_same_queue_dma_fill = None;
             if let OrderedEventSource::GuestQueue(queue_id) = source {
@@ -207,6 +212,13 @@ impl MetalPresenter {
                     None
                 } else if let GpuEvent::IndexedDraw(draw) = &event {
                     self.observe_shared_event_direct_draw_preflight(queue_id, &dependencies, draw)
+                } else {
+                    None
+                };
+                shared_event_direct_compute_plan = if dependencies.is_empty() {
+                    None
+                } else if let GpuEvent::ComputeDispatch(dispatch) = &event {
+                    self.prepare_shared_event_direct_compute_plan(queue_id, &dependencies, dispatch)
                 } else {
                     None
                 };
@@ -222,6 +234,7 @@ impl MetalPresenter {
                 };
                 let disposition = if dependencies.is_empty()
                     || direct_draw_gpu_orderable
+                    || shared_event_direct_compute_plan.is_some()
                     || same_queue_dma_fill.is_some()
                 {
                     SharedEventEventDisposition::GpuOrderable
@@ -297,9 +310,7 @@ impl MetalPresenter {
                     );
                     continue;
                 }
-                if !dependencies.is_empty() && matches!(&event, GpuEvent::ComputeDispatch(_)) {
-                    shared_event_gpu_ordered_compute = true;
-                }
+                shared_event_gpu_ordered_compute = shared_event_direct_compute_plan.is_some();
                 if !dependencies.is_empty()
                     && matches!(&event, GpuEvent::RegisteredMemoryWait { .. })
                 {
@@ -614,7 +625,10 @@ impl MetalPresenter {
                             continue;
                         }
                     }
-                    match self.execute_compute_dispatch(&dispatch) {
+                    match self.execute_compute_dispatch(
+                        &dispatch,
+                        shared_event_direct_compute_plan.as_ref(),
+                    ) {
                         Ok(()) => {
                             self.statistics.encoded_compute_dispatches =
                                 self.statistics.encoded_compute_dispatches.saturating_add(1);
@@ -1076,9 +1090,9 @@ impl MetalPresenter {
             GpuEvent::RegisteredMemoryWait { id, .. } => {
                 self.registered_wait_has_exact_shared_event_checkpoint(source, *id)
             }
-            GpuEvent::ComputeDispatch(dispatch) => {
-                self.shared_event_compute_reject(dispatch).is_none()
-            }
+            // Compute admission owns retained Metal buffer versions and is dependency-specific,
+            // so it is decided by `prepare_shared_event_direct_compute_plan` in the event loop.
+            GpuEvent::ComputeDispatch(_) => false,
             GpuEvent::MemoryWrite(_) | GpuEvent::MemoryRelease(_) => {
                 self.active_open_guest_batch().is_some()
                     || !self.active_committed_guest_batches().is_empty()
@@ -1140,8 +1154,61 @@ impl MetalPresenter {
             None => return Some(SharedEventComputeReject::MissingShaderEvaluation),
         };
         compute_program_shared_event_reject(dispatch, snapshot, evaluation).or_else(|| {
-            (!self.shared_event_dependencies_supply_compute_globals(evaluation))
-                .then_some(SharedEventComputeReject::UnretainedGlobalVersion)
+            (self
+                .shared_event_compute_global_binding_plan(evaluation)
+                .is_none())
+            .then_some(SharedEventComputeReject::UnretainedGlobalVersion)
+        })
+    }
+
+    pub(super) fn prepare_shared_event_direct_compute_plan(
+        &self,
+        consumer_queue_id: u64,
+        dependencies: &[super::SharedEventFence],
+        dispatch: &remu_gpu::ComputeDispatch,
+    ) -> Option<SharedEventDirectComputePlan> {
+        if !self.per_queue_guest_batches
+            || dependencies.is_empty()
+            || dependencies
+                .iter()
+                .any(|fence| fence.producer().queue_id() != consumer_queue_id)
+        {
+            return None;
+        }
+        let snapshot = dispatch.shader.as_ref()?;
+        let evaluation = dispatch.shader_evaluation.as_ref()?;
+        if compute_program_shared_event_reject(dispatch, snapshot, evaluation).is_some()
+            || !program_memory_is_completely_covered(snapshot, evaluation, false)
+        {
+            return None;
+        }
+        let consumer = self.guest_queue_batches.get(&consumer_queue_id)?;
+        for dependency in dependencies {
+            let checkpoint = consumer
+                .resource_dependencies
+                .get(&dependency.producer())
+                .filter(|checkpoint| checkpoint.fence == *dependency)?;
+            if !checkpoint.footprint_complete {
+                return None;
+            }
+            for &(address, _) in &evaluation.scalar_memory_reads {
+                let scalar = PhysicalFootprintRange::new(
+                    SharedEventWriteKind::CopiedGlobal,
+                    address,
+                    4,
+                    guest_shared_backing_identity(address, 4),
+                )?;
+                if checkpoint
+                    .pending_write_footprint
+                    .iter()
+                    .any(|&producer| scalar.overlaps(producer))
+                {
+                    return None;
+                }
+            }
+        }
+        Some(SharedEventDirectComputePlan {
+            global_bindings: self.shared_event_compute_global_binding_plan(evaluation)?,
         })
     }
 
@@ -1273,7 +1340,6 @@ pub(crate) enum SharedEventComputeReject {
     GlobalStore,
     GlobalAtomic,
     UncoveredGlobalInstruction,
-    WritableGlobalBinding,
     UnretainedGlobalVersion,
 }
 
@@ -1290,7 +1356,6 @@ impl SharedEventComputeReject {
             Self::GlobalStore => "global-store",
             Self::GlobalAtomic => "global-atomic",
             Self::UncoveredGlobalInstruction => "uncovered-global-instruction",
-            Self::WritableGlobalBinding => "writable-global-binding",
             Self::UnretainedGlobalVersion => "unretained-global-version",
         }
     }
@@ -1313,12 +1378,8 @@ fn compute_program_shared_event_reject(
     if !evaluation.image_bindings.is_empty() {
         return Some(SharedEventComputeReject::ImageBinding);
     }
-    if evaluation
-        .global_memory_bindings
-        .iter()
-        .any(|binding| binding.writable)
-    {
-        return Some(SharedEventComputeReject::WritableGlobalBinding);
+    if !program_memory_is_completely_covered(snapshot, evaluation, false) {
+        return Some(SharedEventComputeReject::UncoveredGlobalInstruction);
     }
 
     snapshot
@@ -1334,15 +1395,18 @@ fn compute_program_shared_event_reject(
                 | remu_shader::InstructionControl::BufferMemory(_)
                 | remu_shader::InstructionControl::ScalarMemory(_),
             ) => {
-                if instruction.opcode.contains("Store") {
-                    Some(SharedEventComputeReject::GlobalStore)
-                } else if instruction.opcode.contains("Atomic") {
-                    Some(SharedEventComputeReject::GlobalAtomic)
-                } else if !evaluation
+                let binding = evaluation
                     .global_memory_bindings
                     .iter()
-                    .any(|binding| binding.instruction_pcs.contains(&instruction.pc))
-                {
+                    .find(|binding| binding.instruction_pcs.contains(&instruction.pc));
+                let Some(binding) = binding else {
+                    return Some(SharedEventComputeReject::UncoveredGlobalInstruction);
+                };
+                if instruction.opcode.contains("Store") && !binding.writable {
+                    Some(SharedEventComputeReject::GlobalStore)
+                } else if instruction.opcode.contains("Atomic") && !binding.writable {
+                    Some(SharedEventComputeReject::GlobalAtomic)
+                } else if !binding.instruction_pcs.contains(&instruction.pc) {
                     Some(SharedEventComputeReject::UncoveredGlobalInstruction)
                 } else {
                     None

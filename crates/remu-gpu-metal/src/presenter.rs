@@ -1777,6 +1777,20 @@ struct SharedEventDirectDrawPlan {
     texture_overrides: Vec<SharedEventDrawTextureOverride>,
 }
 
+#[derive(Clone, Debug)]
+struct SharedEventComputeGlobalBindingPlan {
+    source: Buffer,
+    source_offset: u64,
+    physical_identity: GuestSharedMappingIdentity,
+    byte_count: u64,
+    writable_group: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct SharedEventDirectComputePlan {
+    global_bindings: Vec<SharedEventComputeGlobalBindingPlan>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct SharedEventUnresolvedWriteRange {
     guest_address: u64,

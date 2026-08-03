@@ -4761,10 +4761,12 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         shader_evaluation: Some(Arc::new(evaluation)),
         shader_registers: Vec::new(),
     };
-    assert!(presenter.event_is_shared_event_gpu_orderable(
-        OrderedEventSource::GuestQueue(0),
-        &GpuEvent::ComputeDispatch(Box::new(dispatch.clone())),
-    ));
+    assert!(
+        presenter
+            .prepare_shared_event_direct_compute_plan(0, &[fence], &dispatch)
+            .is_none(),
+        "the first writable slice deliberately keeps cross-queue compute conservative"
+    );
     let mut uncovered = dispatch.clone();
     uncovered.shader = Some(ShaderSnapshot {
         header_address: 0x5000,
@@ -4795,20 +4797,20 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         metadata: None,
     });
     assert!(
-        !presenter.event_is_shared_event_gpu_orderable(
-            OrderedEventSource::GuestQueue(0),
-            &GpuEvent::ComputeDispatch(Box::new(uncovered)),
-        ),
+        presenter
+            .prepare_shared_event_direct_compute_plan(0, &[fence], &uncovered)
+            .is_none(),
         "a memory instruction omitted by partial evaluation must remain behind the host gate"
     );
     let mut indirect = dispatch;
     indirect.source = ComputeDispatchSource::Indirect {
         dimensions_address: guest_address + 0x100,
     };
-    assert!(!presenter.event_is_shared_event_gpu_orderable(
-        OrderedEventSource::GuestQueue(0),
-        &GpuEvent::ComputeDispatch(Box::new(indirect)),
-    ));
+    assert!(
+        presenter
+            .prepare_shared_event_direct_compute_plan(0, &[fence], &indirect)
+            .is_none()
+    );
 
     presenter
         .guest_queue_batches
@@ -4828,6 +4830,137 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
         !presenter.shared_event_dependencies_supply_compute_globals(&unresolved),
         "zero-copy or CPU-published overlap must remain behind the host gate"
     );
+}
+
+#[test]
+fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliases() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let (_global_space, guest_address) = mapped_test_pages(1);
+    let byte_count = 64_usize;
+    let retained = device.new_buffer(
+        u64::try_from(byte_count).unwrap(),
+        MTLResourceOptions::StorageModeShared,
+    );
+
+    open_per_queue_batch(&mut presenter, 7);
+    presenter
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue exists")
+        .open_batch
+        .as_mut()
+        .expect("batch is open")
+        .global_writebacks
+        .push(PendingGlobalWriteback {
+            buffer: retained.clone(),
+            offset: 0,
+            guest_address,
+            byte_count,
+            mapping_identity: guest_shared_backing_identity(
+                guest_address,
+                u64::try_from(byte_count).unwrap(),
+            ),
+            write_watch: None,
+            original_bytes: vec![0; byte_count],
+            original_version: None,
+        });
+    let fence = presenter
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue exists")
+        .shared_event_timeline
+        .allocate_fence()
+        .expect("queue fence");
+    let checkpoint = SharedEventSignalCheckpoint::capture_queue_prefix(
+        presenter.guest_queue_batches.get(&7).expect("queue exists"),
+        fence,
+    );
+    presenter
+        .guest_queue_batches
+        .get_mut(&7)
+        .expect("queue exists")
+        .resource_dependencies
+        .insert(fence.producer(), checkpoint);
+
+    let writable = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: guest_address,
+        instruction_pcs: vec![4].into(),
+        byte_count,
+        data: vec![0x22; byte_count],
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let mut read_alias = writable.clone();
+    read_alias.scalar_address = 4;
+    read_alias.instruction_pcs = Default::default();
+    read_alias.writable = false;
+    read_alias.write_back_to_guest = false;
+    let mut evaluation = evaluation_with_global(writable);
+    evaluation.global_memory_bindings.push(read_alias);
+    let dispatch = ComputeDispatch {
+        sequence: 2,
+        source: ComputeDispatchSource::Direct,
+        launch: ComputeLaunch {
+            grid: ComputeGrid::Threadgroups([1, 1, 1]),
+            group_count: [1, 1, 1],
+            base_group: [0, 0, 0],
+            threads_per_group: [1, 1, 1],
+            wave_lane_count: 32,
+            lds_size_bytes: 0,
+            initiator: 1,
+        },
+        shader_address: 0x6000,
+        shader_prefix: [0; 4],
+        shader: Some(ShaderSnapshot {
+            header_address: 0x6000,
+            program: Arc::new(Program::new(
+                0x6000,
+                vec![Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Flat,
+                    opcode: Opcode::Known("GlobalStoreDword"),
+                    words: Vec::new(),
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                        dword_count: 1,
+                        vector_address: 0,
+                        vector_data: 0,
+                        vector_destination: 0,
+                        scalar_address: Some(0),
+                        offset_bytes: 0,
+                        dlc: false,
+                        lds: false,
+                        glc: false,
+                        slc: false,
+                    })),
+                }],
+            )),
+            supplemental_programs: Arc::from([]),
+            metadata: None,
+        }),
+        shader_evaluation: Some(Arc::new(evaluation)),
+        shader_registers: Vec::new(),
+    };
+    let plan = presenter
+        .prepare_shared_event_direct_compute_plan(7, &[fence], &dispatch)
+        .expect("same-queue exact writable compute is GPU-orderable");
+    let uploaded = presenter
+        .upload_compute_global_buffers(
+            &device,
+            dispatch.shader_evaluation.as_deref().unwrap(),
+            Some(&plan),
+        )
+        .expect("planned retained versions upload");
+    assert_eq!(uploaded.len(), 2);
+    assert_ne!(uploaded[0].buffer.as_ptr(), retained.as_ptr());
+    assert_eq!(uploaded[0].buffer.as_ptr(), uploaded[1].buffer.as_ptr());
+    assert!(uploaded[0].original_version.is_some());
+    assert!(uploaded[1].original_version.is_some());
 }
 
 #[test]

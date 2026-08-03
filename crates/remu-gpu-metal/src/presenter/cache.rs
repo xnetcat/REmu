@@ -5,10 +5,11 @@ use super::{
     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
     GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
     NggSubgroupLimits, PendingGlobalWriteback, SAMPLER_ARGUMENT_CACHE_CAPACITY,
-    SamplerArgumentCacheKey, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
-    UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
-    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
+    SamplerArgumentCacheKey, SharedEventComputeGlobalBindingPlan, SharedEventDirectComputePlan,
+    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
+    canonical_sampler_bindings, create_sampler_argument_buffer, describe_guest_batch,
+    effective_global_memory_binding, guest_batch_writes_overlap, guest_physical_ranges_overlap,
+    metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -345,6 +346,59 @@ impl MetalPresenter {
             .zip(sources)
             .map(|(binding, source)| self.upload_global_buffer_from_source(device, binding, source))
             .collect()
+    }
+
+    pub(super) fn upload_compute_global_buffers(
+        &mut self,
+        device: &Device,
+        evaluation: &ShaderEvaluation,
+        plan: Option<&SharedEventDirectComputePlan>,
+    ) -> Result<Vec<UploadedGlobalBuffer>, String> {
+        let Some(plan) = plan else {
+            return self.upload_global_buffers(device, evaluation);
+        };
+        if plan.global_bindings.len() != evaluation.global_memory_bindings.len() {
+            return Err("shared compute plan/global binding count mismatch".to_owned());
+        }
+        let effective_bindings = evaluation
+            .global_memory_bindings
+            .iter()
+            .map(|binding| effective_global_memory_binding(evaluation, binding))
+            .collect::<Vec<_>>();
+        let mut group_destinations: Vec<Option<UploadedGlobalBuffer>> =
+            vec![None; effective_bindings.len()];
+        let mut uploaded = Vec::with_capacity(effective_bindings.len());
+        for binding_plan in &plan.global_bindings {
+            if let Some(group) = binding_plan.writable_group {
+                if group >= effective_bindings.len() {
+                    return Err("shared compute writable group is out of range".to_owned());
+                }
+                let destination = if let Some(destination) = &group_destinations[group] {
+                    destination.clone()
+                } else {
+                    let owner = &plan.global_bindings[group];
+                    let destination = self.upload_writable_global_buffer_from_gpu_version(
+                        device,
+                        effective_bindings[group],
+                        owner.source.clone(),
+                        owner.source_offset,
+                        Some(owner.physical_identity),
+                    )?;
+                    group_destinations[group] = Some(destination.clone());
+                    destination
+                };
+                uploaded.push(destination);
+            } else {
+                uploaded.push(UploadedGlobalBuffer {
+                    buffer: binding_plan.source.clone(),
+                    offset: binding_plan.source_offset,
+                    guest_memory: false,
+                    physical_identity: Some(binding_plan.physical_identity),
+                    original_version: None,
+                });
+            }
+        }
+        Ok(uploaded)
     }
 
     #[cfg(test)]
@@ -845,6 +899,7 @@ impl MetalPresenter {
 
     /// A direct compute dispatch can cross a GPU wait only when every global input is an exact
     /// immutable version retained by that wait and no earlier local writer competes with it.
+    #[cfg(test)]
     pub(super) fn shared_event_dependencies_supply_compute_globals(
         &self,
         evaluation: &ShaderEvaluation,
@@ -885,6 +940,86 @@ impl MetalPresenter {
                 }
             )
         })
+    }
+
+    pub(super) fn shared_event_compute_global_binding_plan(
+        &self,
+        evaluation: &ShaderEvaluation,
+    ) -> Option<Vec<SharedEventComputeGlobalBindingPlan>> {
+        let effective_bindings = evaluation
+            .global_memory_bindings
+            .iter()
+            .map(|binding| effective_global_memory_binding(evaluation, binding))
+            .collect::<Vec<_>>();
+        let mut plans = Vec::with_capacity(effective_bindings.len());
+        for binding in &effective_bindings {
+            if binding.base_address == 0 || binding.byte_count == 0 {
+                return None;
+            }
+            let byte_count = u64::try_from(binding.byte_count).ok()?;
+            let QueuedGlobalReadSource::Buffer {
+                buffer,
+                offset,
+                guest_memory: false,
+                physical_identity: Some(physical_identity),
+            } = self.queued_global_read_source(binding).ok()?
+            else {
+                return None;
+            };
+            if offset
+                .checked_add(byte_count)
+                .is_none_or(|end| end > buffer.length())
+            {
+                return None;
+            }
+            plans.push(SharedEventComputeGlobalBindingPlan {
+                source: buffer,
+                source_offset: offset,
+                physical_identity,
+                byte_count,
+                writable_group: None,
+            });
+        }
+
+        for left in 0..plans.len() {
+            for right in (left + 1)..plans.len() {
+                if plans[left].physical_identity.backing_id
+                    != plans[right].physical_identity.backing_id
+                {
+                    continue;
+                }
+                let left_start = plans[left].physical_identity.backing_offset;
+                let right_start = plans[right].physical_identity.backing_offset;
+                let left_end = left_start.checked_add(plans[left].byte_count)?;
+                let right_end = right_start.checked_add(plans[right].byte_count)?;
+                if left_start >= right_end || right_start >= left_end {
+                    continue;
+                }
+                let exact = left_start == right_start
+                    && plans[left].byte_count == plans[right].byte_count
+                    && plans[left].source.as_ptr() == plans[right].source.as_ptr()
+                    && plans[left].source_offset == plans[right].source_offset;
+                if !exact {
+                    return None;
+                }
+            }
+        }
+        for index in 0..plans.len() {
+            let start = plans[index].physical_identity.backing_offset;
+            let byte_count = plans[index].byte_count;
+            plans[index].writable_group = plans
+                .iter()
+                .enumerate()
+                .find(|(candidate, plan)| {
+                    effective_bindings[*candidate].writable
+                        && plan.physical_identity.backing_id
+                            == plans[index].physical_identity.backing_id
+                        && plan.physical_identity.backing_offset == start
+                        && plan.byte_count == byte_count
+                })
+                .map(|(candidate, _)| candidate);
+        }
+        Some(plans)
     }
 
     pub(super) fn cached_index_buffer(

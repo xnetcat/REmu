@@ -246,7 +246,7 @@ fn append_image_range(
     Ok(())
 }
 
-fn program_memory_is_completely_covered(
+pub(crate) fn program_memory_is_completely_covered(
     snapshot: &ShaderSnapshot,
     evaluation: &ShaderEvaluation,
     allow_vertex_inputs: bool,

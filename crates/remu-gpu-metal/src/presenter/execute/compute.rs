@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::super::SharedEventDirectComputePlan;
 use super::WrittenRegion;
 use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
@@ -36,6 +37,7 @@ impl MetalPresenter {
     pub(crate) fn execute_compute_dispatch(
         &mut self,
         dispatch: &ComputeDispatch,
+        shared_event_plan: Option<&SharedEventDirectComputePlan>,
     ) -> Result<(), String> {
         self.retire_completed_guest_batches();
         let ack_phase_started = self
@@ -207,7 +209,7 @@ impl MetalPresenter {
 
         self.ensure_active_open_guest_batch()?;
         self.prepare_depth_array_textures(&device, &[evaluation])?;
-        let buffers = self.upload_global_buffers(&device, evaluation)?;
+        let buffers = self.upload_compute_global_buffers(&device, evaluation, shared_event_plan)?;
         // DISPATCH_INDIRECT arguments are read by the GPU at this point in queue order. The
         // runtime's packet-time dimensions are useful diagnostics, but can be stale when an
         // earlier shader generated the argument dwords. Forward the pending Metal writeback
