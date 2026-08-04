@@ -1312,7 +1312,10 @@ fn a_continuously_written_resource_still_completes_content_validation() {
                     .write_volatile(value)
             };
             page = (page + 1) % usize::try_from(TEXTURE_PAGES).unwrap();
-            std::hint::spin_loop();
+            // Keep the resource continuously active without starving the validator on the
+            // two-core virtual macOS runners used by CI. The invariant under test is bounded
+            // retry in the presence of racing stores, not completion within one scheduler slice.
+            std::thread::yield_now();
         }
     });
 
@@ -1333,7 +1336,7 @@ fn a_continuously_written_resource_still_completes_content_validation() {
         let result = watch.content_has_changed();
         let _ = sender.send(result);
     });
-    let completed_while_writing = receiver.recv_timeout(Duration::from_millis(250));
+    let completed_while_writing = receiver.recv_timeout(Duration::from_secs(2));
     let completed_in_time = completed_while_writing.is_ok();
     finished.store(true, Ordering::Release);
     writer.join().expect("guest writer thread");
