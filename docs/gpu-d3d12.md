@@ -217,6 +217,11 @@ formats and export masks, resolved sampled-resource views/component mappings, an
 and scissor. This is intended for correlating a corrupt scanout with the exact final writer without
 dumping shader or game data; it is opt-in because modern titles can produce many such records.
 
+`REMU_DIAGNOSTIC_SKIP_PROCEDURAL_RECTANGLES=1` skips draws classified as architectural
+procedural-rectangle covers. This is an A/B diagnostic only, not a compatibility option: skipping
+those draws intentionally removes valid guest rendering. It can establish whether a corrupt frame
+was introduced by the synthesized three-vertex cover or was already present in an earlier pass.
+
 The Poppy counter pipeline has since been isolated further: a one-group reset clears a five-dword
 counter buffer, a 23x13 classifier accumulates into it, and a five-lane expander produces indirect
 triplets. Packet-time buffer snapshots can predate those GPU writes even when the events themselves

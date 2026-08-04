@@ -1259,6 +1259,16 @@ impl Dx12GuestExecutor {
             register_value(&draw.context_registers, 0x207).unwrap_or_default();
         let uses_procedural_rectangle_stage =
             remu_gpu::uses_procedural_rectangle_stage(&export.program, draw);
+        if uses_procedural_rectangle_stage
+            && std::env::var_os("REMU_DIAGNOSTIC_SKIP_PROCEDURAL_RECTANGLES")
+                .is_some_and(|value| value == "1")
+        {
+            eprintln!(
+                "[REMu][D3D12][DIAGNOSTIC] skipped procedural rectangle draw={} es={:#x} ps={:#x}",
+                draw.sequence, draw.export_shader_address, draw.pixel_shader_address,
+            );
+            return Ok(());
+        }
         let uses_ngg_compute_fallback = remu_gpu::is_ngg_export_stage(&export.program)
             && remu_gpu::ngg_uses_general_lds(&export.program);
         let (vertex_evaluation, vertex_compiled, vertex_translation_cache_hit, ngg_execution) =

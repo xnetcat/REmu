@@ -49,6 +49,11 @@ sent Enter only to the focused `REMu | Direct3D 12` window.
     now uses a three-vertex synthesized cover (`procedural=1`) for both intermediate and 4K target
     writes. This is useful implementation evidence, but the warped intermediate image is not a
     usable menu or gameplay frame.
+17. [`19-skip-procedural-ab-diagnostic.png`](19-skip-procedural-ab-diagnostic.png) — an A/B run with
+    only architectural procedural-rectangle covers skipped. The striped cover disappears, but the
+    older cyan frame and incomplete pale geometry remain. This confirms that the synthesized cover
+    changes the final image as intended while the remaining defect originates in an earlier normal
+    indexed render pass.
 
 ## Current boundary
 
@@ -73,6 +78,8 @@ same backend-neutral stage classification, pixel-consumer coordinate analysis, a
 three-vertex cover used by Metal. The final scanout writers now report `procedural=1`, but the
 2848x1600 DCC-backed intermediate sampled by the 4K composite already contains the visible
 striped/warped corruption. The current investigation therefore moves one pass earlier to the
-resident render-target handoff and the shader that produces that intermediate. Generated
+resident render-target handoff and the shader that produces that intermediate. Skipping only the
+procedural covers returns to the earlier cyan and partial-geometry frame rather than producing a
+usable scene, independently confirming that boundary. Generated
 HLSL, shader IR, binding traces, and DRED logs remain in ignored `.remu/logs/` and `target/`
 directories because game-derived shader material must not be committed.
