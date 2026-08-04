@@ -27,6 +27,13 @@ sent Enter only to the focused `REMu | Direct3D 12` window.
    remains a graphics defect.
 10. [`12-general-loop-watchdog-run.png`](12-general-loop-watchdog-run.png) — common dialog during the
     generalized compute-HLSL watchdog validation.
+11. [`13-rebased-export-format-dialog.png`](13-rebased-export-format-dialog.png) — clean trophies and
+    keyboard dialog after rebasing on `main` and carrying the exact guest color-export format into
+    the D3D12 shader path. The black underlay is an improvement over the earlier corrupt teal frame,
+    but it is not evidence that the game scene rendered.
+12. [`14-rebased-export-format-post-dialog.png`](14-rebased-export-format-post-dialog.png) — sustained
+    post-dialog execution from the same rebased build. The cyan surface and incomplete pale shape
+    confirm that matching the export format did not by itself fix presentation correctness.
 
 ## Current boundary
 
@@ -38,6 +45,8 @@ indirect dimensions repeatedly resolve to 120 and 4,200 groups.
 
 The remaining visible defect is presentation/rendering correctness: after dismissing the common
 dialog, the title draws cyan surfaces and partial menu-shaped gradients without usable text or game
-content. Gameplay screenshots must wait until that separate graphics path is corrected. Generated
+content. The rebased exact-export-format run still reaches and cleanly renders the common dialog,
+then returns to the same cyan/incomplete boundary. Gameplay screenshots must wait until that
+separate graphics path is corrected. Generated
 HLSL, shader IR, binding traces, and DRED logs remain in ignored `.remu/logs/` and `target/`
 directories because game-derived shader material must not be committed.
