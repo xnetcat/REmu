@@ -222,37 +222,26 @@ pub(super) fn create_sampler_argument_buffer(
                 .iter()
                 .enumerate()
                 .map(|(slot, _)| {
-                    #[cfg(test)]
-                    eprintln!("[REMu][TEST][SAMPLER-ABI] descriptor begin slot={slot}");
                     let descriptor = ArgumentDescriptor::new();
                     descriptor
                         .set_index(u64::try_from(slot).expect("canonical sampler slot fits Metal"));
                     descriptor.set_data_type(MTLDataType::Sampler);
-                    descriptor.set_array_length(1);
-                    #[cfg(test)]
-                    eprintln!("[REMu][TEST][SAMPLER-ABI] descriptor ready slot={slot}");
+                    // Each canonical slot is one scalar sampler. Metal requires arrayLength to
+                    // remain zero for non-array argument descriptors.
                     descriptor
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-ABI] encoder begin");
     let argument_encoder = buffer_index
         .map(|_| device.new_argument_encoder(Array::from_slice(argument_descriptors.as_slice())));
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-ABI] encoder ready");
     let argument_buffer = argument_encoder.as_ref().map(|encoder| {
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] buffer begin");
         let buffer = device.new_buffer(
             encoder.encoded_length(),
             MTLResourceOptions::StorageModeShared,
         );
         buffer.set_label("REMu guest sampler argument buffer");
         encoder.set_argument_buffer(&buffer, 0);
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] buffer ready");
         buffer
     });
     let mut samplers = Vec::with_capacity(sampled_bindings.len());
@@ -298,19 +287,13 @@ pub(super) fn create_sampler_argument_buffer(
                 / 256.0,
         );
         descriptor.set_support_argument_buffers(argument_encoder.is_some());
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] sampler begin slot={slot}");
         let sampler = device.new_sampler(&descriptor);
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] sampler ready slot={slot}");
         if let Some(encoder) = argument_encoder.as_ref() {
             encoder.set_sampler_state(
                 u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
                 &sampler,
             );
         }
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] sampler encoded slot={slot}");
         samplers.push(sampler);
     }
     Ok((argument_buffer, samplers))
