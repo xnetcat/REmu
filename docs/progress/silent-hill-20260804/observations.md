@@ -1,5 +1,11 @@
 # Silent Hill bring-up — 2026-08-04
 
+> **Correction / current gate:** the ruined hallway/content-warning backdrop described below is a
+> pre-menu presentation and does not prove the actual title-menu 3D scene renders. The real New
+> Game / Continue / Settings menu is reached, but its intended scene background is entirely black.
+> Silent Hill cinematic/gameplay rendering and crash-free sustained play remain open. The durable
+> current handoff is `docs/notes/silent-hill-20260804-handoff/README.md`.
+
 ## Outcome
 
 `SILENT HILL: The Short Message` now boots through the REmu Rosetta app runner, renders its
@@ -135,8 +141,65 @@ Observed result:
 
 The preceding 240-second endurance run also ended only at its watchdog, emitted 46 telemetry
 windows, completed submission 2326 with a 3 ms progress age, and remained on the rendered
-brightness calibration page. Repeated Cross input alone does not leave that calibration control;
-manual directional/gamepad progression beyond it was not part of the stability verdict.
+brightness calibration page. This was later traced to the old automation alternating Cross and
+Square. Cross-only edge pulses do accept the brightness value and advance the title without manual
+input.
+
+### Ten-minute Cross-only progression run
+
+A later 600-second run used Cross-only release/press edges and reached rendered opening content
+beyond calibration. It loaded 474 graphics and 132 compute pipelines and stayed alive until the
+configured watchdog. The captured frame `screenshots/opening-room-content-warning.png` contains the
+ruined-room pre-menu backdrop, the crisis-support content warning, and the Continue prompt. It must
+not be counted as proof of the actual title-menu 3D scene.
+
+That run exposed four concrete remaining translation gaps which were fixed before the next run:
+
+- indirect NGG draws now build ordered meshlet records and dispatch arguments on the GPU from the
+  live indirect/index buffers;
+- comparison-sampled BC1 color resources and exact mode-5/mode-27 mip hierarchies now upload as
+  native Metal depth textures;
+- the complete 64-bit LDS pair family (`DS_WRITE2_B64`, `DS_WRITE2ST64_B64`, `DS_READ2_B64`, and
+  `DS_READ2ST64_B64`) now decodes and lowers with architectural element strides;
+- half-float `V_FMAMK_F16`/`V_FMAAK_F16` now consume their unconditional literal dword, preventing
+  the literal from being misdecoded as a following raw VOP2 instruction.
+
+### Latest title-menu progression
+
+The next 600-second Cross-only run remained alive until its external watchdog and reached the
+actual title menu. Automated Cross selected New Game and progressed through the content warning to
+the opening quote. At termination 475 graphics and 133 compute pipelines were ready, none had
+failed, no draw or compute was dropped, and no NID was unimplemented. This is the first preserved
+run proving autonomous progression from process launch through brightness calibration and into a
+new-game cinematic sequence.
+
+The diagnostic PPMs from this run contained partial horizontal/vertical regions and damaged text.
+The pattern did not resemble a font-atlas-only failure: it crossed the logo, background, and UI at
+shared scan lines. Inspection found that periodic readback was submitted on the host queue before
+the translated scanout's guest-queue SharedEvent fence. The drawable present already waits on that
+fence; diagnostic readback now encodes the same wait. A synchronized desktop capture will be used
+as the visual authority for the next run.
+
+### Post-change compatibility observations
+
+These are observations only. No title-specific compatibility work was done outside Silent Hill.
+Every launch enabled automatic dialog dismissal and Cross pulses.
+
+- Octopath Traveler II ran for 185 seconds until the external watchdog, rendered startup, setup,
+  dialogue, and 3D scenes at roughly 7–10 FPS, and did not crash. Two shader pairs were rejected at
+  `V_WRITELANE_B32`/`V_READLANE_B32` because their Metal lane occupancy is not yet proven. Evidence:
+  `screenshots/octopath-observation.png`.
+- Superliminal remained alive for 185 seconds and produced one clean rendered 3D hallway frame,
+  then stayed static with no further GPU submissions and a 0 FPS title. Evidence:
+  `screenshots/superliminal-observation.png`.
+- Demon's Souls aborted after 15 seconds in its own audio assertion because
+  `sceAcmBatchStartBuffers` is unimplemented; it produced no captured frame.
+- Dreaming Sarah logged missing packaged `shaders/*.vert` files and segfaulted before a frame.
+- Void Terrarium segfaulted during startup/import/thread initialization before a frame.
+- The Oregon Trail did not launch because the dump contains duplicate `libc.prx` module paths.
+
+Poppy was deliberately not relaunched during this matrix; its requested second bring-up remains
+behind the Silent Hill gameplay gate.
 
 The summary does list normal negative results from implemented APIs—for example absent host files,
 no connected controller state, and no pending user-service event. These are not unimplemented NIDs
@@ -144,11 +207,12 @@ and did not prevent the title from rendering or advancing through setup.
 
 ## Evidence
 
-### Excluded Poppy result
+### Deferred Poppy result
 
 - The one Poppy launch was not healthy: it remained on a black screen at 0 FPS.
-- That launch is not evidence of rendering, performance, or title compatibility and must not be
-  repeated. Poppy is excluded from the remaining validation work; Silent Hill is the title gate.
+- That launch is not evidence of rendering, performance, or title compatibility. Poppy remains
+  excluded until Silent Hill passes the title gate; it will be revisited afterward as a separate
+  compatibility target.
 
 - `screenshots/stable-120s-05.png`: rendered autosave screen
 - `screenshots/stable-120s-06.png`: fully composed content-warning scene
@@ -158,6 +222,14 @@ and did not prevent the title from rendering or advancing through setup.
 - `screenshots/stable-240s-05.png`: 240-second endurance-run brightness calibration
 - `screenshots/post-race-150s-*.png`: final latest-code rendered progression after the condition
   race fix
+- `screenshots/opening-room-content-warning.png`: Cross-only progression into the ruined-room
+  pre-menu presentation beyond brightness calibration; not title-menu 3D evidence
+- `screenshots/latest-title-menu.png`: latest run at the actual title menu (pre-fix asynchronous
+  diagnostic readback; retained as evidence of progression, not pixel fidelity)
+- `screenshots/latest-opening-quote.png`: latest run after selecting New Game (same pre-fix
+  diagnostic readback limitation)
+- `screenshots/octopath-observation.png`: isolated post-change Octopath observation
+- `screenshots/superliminal-observation.png`: synchronized isolated Superliminal observation
 - `screenshots/run1-*.png`: earlier bring-up progression, retained for comparison
 - `diagnostics/post-race-150s-summary.txt`: final latest-code harness result and ABI summary
 - `diagnostics/post-race-150s-telemetry.jsonl`: all telemetry windows from the final latest-code run
