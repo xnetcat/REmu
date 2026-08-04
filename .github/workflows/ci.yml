@@ -23,6 +23,10 @@ jobs:
     runs-on: macos-14
     env:
       CARGO_TERM_COLOR: always
+      # Preserve the Objective-C exception name/reason if a native Metal validation rejects an
+      # argument-buffer operation before Rust can report it.
+      OBJC_PRINT_EXCEPTIONS: YES
+      NSUnbufferedIO: YES
     steps:
       - uses: actions/checkout@v4
 

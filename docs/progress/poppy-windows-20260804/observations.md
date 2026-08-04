@@ -40,6 +40,15 @@ sent Enter only to the focused `REMu | Direct3D 12` window.
 14. [`16-present-correlation-post-dialog.png`](16-present-correlation-post-dialog.png) — the same run
     immediately after one controlled Enter press. Partial pale UI geometry is present, but no text,
     title-menu controls, or game scene are readable.
+15. [`17-procedural-rectangle-first-run.png`](17-procedural-rectangle-first-run.png) — the first
+    release run after sharing Metal's architectural procedural-rectangle classification with
+    D3D12. The host keyboard dialog is readable over a substantially changed guest frame, while
+    the striped and cyan underlay remains corrupt.
+16. [`18-procedural-rectangle-post-dialog.png`](18-procedural-rectangle-post-dialog.png) — the same
+    run after one focused Enter press. The D3D12 writer trace proves that the affected rectangle
+    now uses a three-vertex synthesized cover (`procedural=1`) for both intermediate and 4K target
+    writes. This is useful implementation evidence, but the warped intermediate image is not a
+    usable menu or gameplay frame.
 
 ## Current boundary
 
@@ -56,6 +65,14 @@ then returns to the same cyan/incomplete boundary. A later timing run confirmed 
 3840x2160 display buffers are actively redrawn and presented; this is not a stale DXGI back buffer.
 That run completed 69 flips and 707 GPU submissions in 120 seconds without device removal while the
 same evaluator-truncated compute shader continued to recur. Gameplay screenshots must wait until
-that separate graphics path is corrected. Generated
+that separate graphics path is corrected.
+
+The first procedural-rectangle DX12 validation completed 168 traced native-format target writes
+without device removal. It replaced the incorrect four-vertex rectangle-list expansion with the
+same backend-neutral stage classification, pixel-consumer coordinate analysis, and oversized
+three-vertex cover used by Metal. The final scanout writers now report `procedural=1`, but the
+2848x1600 DCC-backed intermediate sampled by the 4K composite already contains the visible
+striped/warped corruption. The current investigation therefore moves one pass earlier to the
+resident render-target handoff and the shader that produces that intermediate. Generated
 HLSL, shader IR, binding traces, and DRED logs remain in ignored `.remu/logs/` and `target/`
 directories because game-derived shader material must not be committed.
