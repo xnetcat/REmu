@@ -553,6 +553,7 @@ fn ampr_reset_and_destroy_wait_for_the_same_buffer_submission_order() {
 /// does not exist.
 #[test]
 fn ampr_completions_are_announced_by_submission_not_registration() {
+    crate::event_state::reset_event_state_for_tests();
     let mut state = ProbeDispatchState::default();
     let equeue = 0x4000;
     crate::event_state::with_event_state_mut(|e| {

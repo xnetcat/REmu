@@ -813,6 +813,7 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_every_listed_command_buffer() {
+        crate::event_state::reset_event_state_for_tests();
         let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_thread_local_event_sink(sender);
         let stream = command_stream();
@@ -856,6 +857,7 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_nothing_when_one_entry_is_invalid() {
+        crate::event_state::reset_event_state_for_tests();
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let addresses = [address, 0];

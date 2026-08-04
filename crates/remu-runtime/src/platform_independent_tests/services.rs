@@ -157,6 +157,9 @@ fn fresh_boot_does_not_skip_the_platform_notice_screen() {
 
 #[test]
 fn pad_get_handle_observes_the_primary_controller_lifecycle() {
+    crate::reset_pad_runtime();
+    crate::reset_hid_runtime();
+    remu_gpu::set_host_pad_vibration(remu_gpu::HostPadVibration::default());
     let mut state = ProbeDispatchState::default();
     let primary = [0x1000_0000, 0, 0, 0, 0, 0];
 
