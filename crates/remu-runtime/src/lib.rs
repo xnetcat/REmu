@@ -410,6 +410,7 @@ unsafe extern "C" {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
     fn ReadProcessMemory(
         process: *mut std::ffi::c_void,
         base_address: *const std::ffi::c_void,
@@ -2018,6 +2019,9 @@ fn run_av_player_controller() {
     // publishes without signalling still has its callback delivered.
     const IDLE_POLL: Duration = Duration::from_millis(250);
     let controller = av_player_controller();
+    if av_player::av_player_trace_enabled() {
+        eprintln!("[REMu][AVPLAYER] controller worker entered");
+    }
     loop {
         {
             let mut signal = controller
@@ -2045,6 +2049,12 @@ fn run_av_player_controller() {
             let mut state = lock_probe_dispatch_for_write(dispatch);
             take_av_player_controller_callbacks(&mut state)
         };
+        if !callbacks.is_empty() && av_player::av_player_trace_enabled() {
+            eprintln!(
+                "[REMu][AVPLAYER] controller dequeued {} callback(s)",
+                callbacks.len()
+            );
+        }
         for callback in callbacks {
             controller
                 .signal
@@ -9379,88 +9389,93 @@ fn report_diagnostic_stall_attribution() {
                 last_completed_flip,
             )
         });
-    let (_h, events) = event_state::lock_event_state_for_read();
-    let pending_graphics_range = events
-        .pending_agc_completions
-        .front()
-        .map(|&(sequence, _)| sequence)
-        .zip(
-            events
-                .pending_agc_completions
-                .back()
-                .map(|&(sequence, _)| sequence),
-        );
-    let pending_compute_range = events
-        .pending_agc_user_interrupts
-        .front()
-        .copied()
-        .zip(events.pending_agc_user_interrupts.back().copied());
-    let pending_graphics_notifications = events
-        .pending_events
-        .iter()
-        .map(|event| u64::from(event.agc_graphics_completions))
-        .sum::<u64>();
-    let pending_user_interrupts = events
-        .pending_events
-        .iter()
-        .map(|event| u64::from(event.agc_user_interrupts))
-        .sum::<u64>();
-    let graphics_registrations = events
-        .kernel_event_registrations
-        .keys()
-        .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
-        .count();
-    let user_interrupt_registrations = events
-        .kernel_event_registrations
-        .keys()
-        .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
-        .count();
-    if let Some((
-        completed_flips,
-        flip_event_registrations,
-        vblank_event_registrations,
-        last_completed_flip,
-    )) = video_progress
-    {
-        eprintln!(
-            "[REMu][STALL-VIDEO] completed_flips={} runtime_pending={} backend_pending={gpu_flips} flip_event_registrations={} vblank_event_registrations={} last_completed={last_completed_flip:?}",
+    if let Some((_h, events)) = event_state::try_lock_event_state_for_read() {
+        let pending_graphics_range = events
+            .pending_agc_completions
+            .front()
+            .map(|&(sequence, _)| sequence)
+            .zip(
+                events
+                    .pending_agc_completions
+                    .back()
+                    .map(|&(sequence, _)| sequence),
+            );
+        let pending_compute_range = events
+            .pending_agc_user_interrupts
+            .front()
+            .copied()
+            .zip(events.pending_agc_user_interrupts.back().copied());
+        let pending_graphics_notifications = events
+            .pending_events
+            .iter()
+            .map(|event| u64::from(event.agc_graphics_completions))
+            .sum::<u64>();
+        let pending_user_interrupts = events
+            .pending_events
+            .iter()
+            .map(|event| u64::from(event.agc_user_interrupts))
+            .sum::<u64>();
+        let graphics_registrations = events
+            .kernel_event_registrations
+            .keys()
+            .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
+            .count();
+        let user_interrupt_registrations = events
+            .kernel_event_registrations
+            .keys()
+            .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
+            .count();
+        if let Some((
             completed_flips,
-            events.pending_video_out_flips.len(),
             flip_event_registrations,
             vblank_event_registrations,
-        );
-    }
-    if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
-        eprintln!(
-            "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
-            submission_count,
-            backend_unclaimed.len(),
-            events.pending_agc_completions.len(),
-            events.pending_agc_user_interrupts.len(),
-            telemetry.refreshed_graphics,
-            telemetry.last_refreshed_graphics,
-            telemetry.refreshed_compute,
-            telemetry.last_refreshed_compute,
-            telemetry.queued_graphics_notifications,
-            telemetry.delivered_graphics_notifications,
-            telemetry.cancelled_graphics_notifications,
-            pending_graphics_notifications,
-            telemetry.queued_user_interrupts,
-            telemetry.delivered_user_interrupts,
-            telemetry.cancelled_user_interrupts,
-            pending_user_interrupts,
-            telemetry.missing_graphics_registration,
-            telemetry.missing_user_interrupt_registration,
-            telemetry.unmatched_backend_ids,
-            telemetry.last_unmatched_backend_id,
-        );
+            last_completed_flip,
+        )) = video_progress
+        {
+            eprintln!(
+                "[REMu][STALL-VIDEO] completed_flips={} runtime_pending={} backend_pending={gpu_flips} flip_event_registrations={} vblank_event_registrations={} last_completed={last_completed_flip:?}",
+                completed_flips,
+                events.pending_video_out_flips.len(),
+                flip_event_registrations,
+                vblank_event_registrations,
+            );
+        }
+        if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
+            eprintln!(
+                "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
+                submission_count,
+                backend_unclaimed.len(),
+                events.pending_agc_completions.len(),
+                events.pending_agc_user_interrupts.len(),
+                telemetry.refreshed_graphics,
+                telemetry.last_refreshed_graphics,
+                telemetry.refreshed_compute,
+                telemetry.last_refreshed_compute,
+                telemetry.queued_graphics_notifications,
+                telemetry.delivered_graphics_notifications,
+                telemetry.cancelled_graphics_notifications,
+                pending_graphics_notifications,
+                telemetry.queued_user_interrupts,
+                telemetry.delivered_user_interrupts,
+                telemetry.cancelled_user_interrupts,
+                pending_user_interrupts,
+                telemetry.missing_graphics_registration,
+                telemetry.missing_user_interrupt_registration,
+                telemetry.unmatched_backend_ids,
+                telemetry.last_unmatched_backend_id,
+            );
+        } else {
+            eprintln!(
+                "[REMu][STALL-AGC] runtime=unavailable-or-dispatch-busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
+                backend_unclaimed.len(),
+            );
+        }
     } else {
         eprintln!(
-            "[REMu][STALL-AGC] runtime=unavailable-or-dispatch-busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
+            "[REMu][STALL-AGC] event_state=busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
             backend_unclaimed.len(),
         );
     }
-    drop(events);
     guest_sync::report_condition_stall_attribution();
 
     let dispatch_state = PROBE_DISPATCH
@@ -9547,10 +9562,40 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
                 return;
             }
             eprintln!("[REMu] diagnostic time limit of {timeout_seconds}s reached");
+            std::thread::Builder::new()
+                .name("remu-timeout-hard-stop".to_owned())
+                .spawn(|| {
+                    // Diagnostics deliberately inspect live runtime state. Even their try-lock
+                    // paths may encounter an unforeseen OS or driver stall, so retain a hard,
+                    // bounded backstop after giving the report time to flush.
+                    std::thread::sleep(Duration::from_secs(2));
+                    hard_terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
+                })
+                .ok();
             report_diagnostic_stall_attribution();
             terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
         })
         .ok();
+}
+
+fn hard_terminate_probe(code: i32) -> ! {
+    #[cfg(windows)]
+    // SAFETY: the normal diagnostic termination path has already stalled. TerminateProcess is the
+    // Windows equivalent of `_exit` and does not unwind through live guest or driver frames.
+    unsafe {
+        let exit_code = u32::try_from(code).unwrap_or(u32::MAX);
+        let _ = TerminateProcess(GetCurrentProcess(), exit_code);
+        std::process::abort();
+    }
+
+    #[cfg(unix)]
+    // SAFETY: this is the final backstop for an isolated CLI probe whose reporting path wedged.
+    unsafe {
+        libc::_exit(code);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    std::process::exit(code)
 }
 
 fn terminate_probe(code: i32) -> ! {

@@ -6,7 +6,7 @@
 
 #![allow(dead_code)] // with_/reset helpers exercised in tests; production still uses lock_* directly.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use crate::dispatch_locks::{LockHierarchyGuard, LockLevel, held_lock_level};
 use crate::{KernelQueuedEvent, PendingVideoOutFlip};
@@ -63,6 +63,25 @@ pub(crate) fn lock_event_state_for_read() -> (
     (hierarchy, guard)
 }
 
+/// Non-blocking read used by watchdog diagnostics.
+///
+/// A timeout report runs precisely when another thread may be wedged while owning EventState. It
+/// must describe that lock as busy instead of turning the watchdog into another blocked thread.
+pub(crate) fn try_lock_event_state_for_read() -> Option<(
+    Option<LockHierarchyGuard>,
+    RwLockReadGuard<'static, EventState>,
+)> {
+    let hierarchy = match held_lock_level() {
+        Some(LockLevel::ProbeDispatch) | Some(LockLevel::AgcState) => None,
+        _ => Some(LockHierarchyGuard::enter(LockLevel::EventState)),
+    };
+    match cell().try_read() {
+        Ok(guard) => Some((hierarchy, guard)),
+        Err(TryLockError::Poisoned(error)) => Some((hierarchy, error.into_inner())),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 pub(crate) fn reset_event_state() {
     let mut state = cell()
         .write()
@@ -115,7 +134,9 @@ pub(crate) fn with_event_state<R>(f: impl FnOnce(&EventState) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_event_state_for_write, reset_event_state_for_tests};
+    use super::{
+        lock_event_state_for_write, reset_event_state_for_tests, try_lock_event_state_for_read,
+    };
     use crate::dispatch_locks::{LockHierarchyGuard, LockLevel};
 
     #[test]
@@ -144,5 +165,12 @@ mod tests {
         crate::event_state::with_event_state(|events| {
             assert!(events.kernel_equeues.contains(&3));
         });
+    }
+
+    #[test]
+    fn diagnostic_read_reports_a_busy_writer_without_blocking() {
+        reset_event_state_for_tests();
+        let (_hierarchy, _writer) = lock_event_state_for_write();
+        assert!(try_lock_event_state_for_read().is_none());
     }
 }

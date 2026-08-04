@@ -1546,7 +1546,7 @@ fn av_player_wall_clock_catch_up_enabled() -> bool {
     })
 }
 
-fn av_player_trace_enabled() -> bool {
+pub(crate) fn av_player_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| std::env::var_os("REMU_TRACE_AVPLAYER").is_some_and(|value| value == "1"))

@@ -22,6 +22,13 @@ while opening vertex-shader assets that are absent from the host `shaders` direc
 local title-package completeness blocker; the VFS reports the exact resolved host paths and no
 game files were modified. A complete copy is required for the next game-backed DX12 regression.
 
+A DRED-enabled Poppy Playtime Chapter 1 probe on the same date reaches its first VideoOut flip and
+completes 14 GPU submissions. At the current startup boundary the D3D12 queue is fully drained,
+audio has not opened, and the title has not created an AVPlayer. The diagnostic watchdog now uses
+non-blocking runtime-state snapshots plus a hard two-second termination backstop; a deliberately
+contended run emitted its partial lock attribution and exited itself with status 142. This makes
+longer title probes deterministic while the pre-media startup wait is narrowed down.
+
 The following table deliberately distinguishes foundations from runnable subsystems:
 
 | Subsystem | Implemented and validated | Remaining compatibility/performance work |
@@ -208,7 +215,7 @@ Completed locally on the development Windows host:
    render/depth/stencil, normalized/integer color MSAA, D32 and combined D32/S8 MSAA, and
    independent-stencil coverage. A physical test executes a GFX10 general-LDS NGG shader through
    the compute fallback and verifies raster output on the mesh-shader-tier-0 GTX 1050. The serial
-   runtime suite has 661 passing tests.
+   runtime suite has 662 passing tests.
 6. A bounded Dreaming Sarah release launch enters New Game, completes the opening fade, renders the
    first forest layout, moves right under live input, and keeps audio active without a D3D12
    failure, panic, or underrun.
@@ -226,6 +233,9 @@ Completed locally on the development Windows host:
     completed submission 1002, and kept the 48 kHz stereo WASAPI callback active with zero
     underrun frames. The bounded run reported no panic, access violation, backend error, shader
     evaluation failure, or D3D12 device removal.
+11. A DRED-enabled Poppy Playtime Chapter 1 release probe completed 14 submissions and one flip,
+    then produced non-blocking event/condition/player attribution and terminated at its configured
+    limit even while EventState and ProbeDispatch were contended.
 
 Still required before a broad Windows compatibility claim:
 
