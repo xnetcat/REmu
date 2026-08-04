@@ -211,6 +211,12 @@ only retained when `REMU_DUMP_HLSL_CS=all` or when that variable is the hexadeci
 address printed in the AGC log (with or without `0x`). These files contain translated diagnostic
 material and must not be committed when they originate from a proprietary game.
 
+`REMU_TRACE_D3D12_PRESENT_WRITERS=1` emits one compact record for every draw into a native-format
+presentation-sized target. Each record includes the guest sequence, shader addresses, target
+formats and export masks, resolved sampled-resource views/component mappings, and raster viewport
+and scissor. This is intended for correlating a corrupt scanout with the exact final writer without
+dumping shader or game data; it is opt-in because modern titles can produce many such records.
+
 The Poppy counter pipeline has since been isolated further: a one-group reset clears a five-dword
 counter buffer, a 23x13 classifier accumulates into it, and a five-lane expander produces indirect
 triplets. Packet-time buffer snapshots can predate those GPU writes even when the events themselves

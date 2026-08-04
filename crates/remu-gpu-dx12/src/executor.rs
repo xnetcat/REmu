@@ -1564,6 +1564,63 @@ impl Dx12GuestExecutor {
         }
         let scissor = decode_scissor(draw, primary_extent.0, primary_extent.1);
         let viewport = decode_viewport(draw, scissor);
+        if trace_d3d12_present_writers()
+            && decoded_targets.iter().any(|target| {
+                native_present_format_supported(target.descriptor.format)
+                    && target.descriptor.width >= 1_920
+                    && target.descriptor.height >= 1_080
+            })
+        {
+            let targets = decoded_targets
+                .iter()
+                .map(|target| {
+                    format!(
+                        "s{}:{:#x}/{}x{}:{:?}:mask={:#x}:export={:?}:dcc={}",
+                        target.guest_slot,
+                        target.descriptor.address,
+                        target.descriptor.width,
+                        target.descriptor.height,
+                        target.descriptor.format,
+                        target.write_mask,
+                        target.export_format,
+                        u8::from(target.dcc_enabled),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let textures = pixel_resources
+                .as_ref()
+                .map(|resources| {
+                    resources
+                        .textures
+                        .iter()
+                        .map(|texture| {
+                            format!(
+                                "{:#x}/{}x{}:{:?}->view={:?}:mapping={:#010x}:writable={}",
+                                texture.descriptor.address,
+                                texture.descriptor.width,
+                                texture.descriptor.height,
+                                texture.descriptor.format,
+                                texture.view_format,
+                                texture.component_mapping,
+                                u8::from(texture.descriptor.writable),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "[REMu][D3D12-PRESENT-WRITER] sequence={} es={:#x} ps={:#x} indexed={} elements={} instances={} primitive={:#x} targets={targets:?} textures={textures:?} viewport={:?} scissor={:?}",
+                draw.sequence,
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                u8::from(draw.indexed),
+                geometry.element_count,
+                draw.instance_count,
+                draw.primitive_type,
+                viewport,
+                scissor,
+            );
+        }
         let blend_factor = [0x105, 0x106, 0x107, 0x108].map(|offset| {
             register_value(&draw.context_registers, offset).map_or(0.0, f32::from_bits)
         });
@@ -7342,6 +7399,10 @@ fn create_texture_view(
 
 fn trace_d3d12_bindings() -> bool {
     std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
+}
+
+fn trace_d3d12_present_writers() -> bool {
+    std::env::var_os("REMU_TRACE_D3D12_PRESENT_WRITERS").is_some_and(|value| value == "1")
 }
 
 fn ensure_device_available(device: &ID3D12Device, context: &str) -> Result<(), String> {
