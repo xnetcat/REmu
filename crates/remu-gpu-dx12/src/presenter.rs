@@ -33,8 +33,7 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12GraphicsCommandList, ID3D12PipelineState, ID3D12Resource,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_UNSPECIFIED, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
@@ -62,7 +61,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 use crate::backend::{backend_error, backend_error_with_device, create_default_device};
 use crate::context::{create_buffer, wait_for_fence};
 use crate::diagnostics::name_object;
-use crate::executor::{Dx12GuestExecutor, Dx12PresentTarget};
+use crate::executor::{Dx12GuestExecutor, Dx12PresentTarget, native_present_format_supported};
 use crate::process_memory::{read_process_memory, write_process_memory};
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -388,10 +387,7 @@ impl Dx12Renderer {
 
     fn present_native(&mut self, target: &Dx12PresentTarget) -> Result<(), String> {
         let started = Instant::now();
-        if !matches!(
-            target.format,
-            DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM
-        ) {
+        if !native_present_format_supported(target.format) {
             return Err(format!(
                 "unsupported native swap-chain format {:?}",
                 target.format

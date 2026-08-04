@@ -92,10 +92,10 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM,
-    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_TYPELESS,
-    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_UNKNOWN,
-    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16_TYPELESS,
+    DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+    DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G8X24_TYPELESS,
+    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_SAMPLE_DESC,
 };
 use windows::core::{BOOL, Interface};
 
@@ -868,17 +868,20 @@ impl Dx12GuestExecutor {
             return Ok(None);
         };
         let descriptor = target.target.descriptor;
-        if !target.pending_writeback
-            || target.target.sample_count != 1
-            || descriptor.width != width
-            || descriptor.height != height
-            || descriptor.bytes_per_element != 4
-            || descriptor.block_extent != [1, 1]
-            || !matches!(
-                descriptor.format,
-                DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM
-            )
-        {
+        let eligible = target.pending_writeback
+            && target.target.sample_count == 1
+            && descriptor.width == width
+            && descriptor.height == height
+            && descriptor.bytes_per_element == 4
+            && descriptor.block_extent == [1, 1]
+            && native_present_format_supported(descriptor.format);
+        if !eligible {
+            if std::env::var_os("REMU_TRACE_D3D12_TIMING").is_some_and(|value| value == "1") {
+                eprintln!(
+                    "[REMu][D3D12-TIMING] direct_present_ineligible={address:#x} requested={}x{} pending={} samples={} target={descriptor:?}",
+                    width, height, target.pending_writeback, target.target.sample_count
+                );
+            }
             return Ok(None);
         }
         Ok(Some(Dx12PresentTarget {
@@ -1848,10 +1851,7 @@ impl Dx12GuestExecutor {
         let descriptor = target.target.descriptor;
         if descriptor.width != width
             || descriptor.height != height
-            || !matches!(
-                descriptor.format,
-                DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM
-            )
+            || !native_present_format_supported(descriptor.format)
             || descriptor.bytes_per_element != 4
             || descriptor.block_extent != [1, 1]
         {
@@ -1882,10 +1882,7 @@ impl Dx12GuestExecutor {
         };
         if descriptor.width != width
             || descriptor.height != height
-            || !matches!(
-                descriptor.format,
-                DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM
-            )
+            || !native_present_format_supported(descriptor.format)
             || descriptor.bytes_per_element != 4
             || descriptor.block_extent != [1, 1]
         {
@@ -2488,6 +2485,15 @@ impl Dx12GuestExecutor {
             .insert(key, pipeline.clone());
         Ok(pipeline)
     }
+}
+
+pub(super) fn native_present_format_supported(
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R10G10B10A2_UNORM
+    )
 }
 
 /// Persist guest shader IR and translated HLSL for targeted Windows bring-up investigations.
@@ -5607,8 +5613,29 @@ fn presentable_bgra(
             }
             Some(linear)
         }
+        DXGI_FORMAT_R10G10B10A2_UNORM => {
+            for pixel in linear.chunks_exact_mut(4) {
+                let packed = u32::from_le_bytes(pixel.try_into().expect("four-byte pixel"));
+                let red = packed & 0x3ff;
+                let green = (packed >> 10) & 0x3ff;
+                let blue = (packed >> 20) & 0x3ff;
+                let alpha = packed >> 30;
+                pixel.copy_from_slice(&[
+                    scale_unorm(blue, 0x3ff),
+                    scale_unorm(green, 0x3ff),
+                    scale_unorm(red, 0x3ff),
+                    scale_unorm(alpha, 0x3),
+                ]);
+            }
+            Some(linear)
+        }
         _ => None,
     }
+}
+
+fn scale_unorm(value: u32, maximum: u32) -> u8 {
+    u8::try_from((value * u32::from(u8::MAX) + maximum / 2) / maximum)
+        .expect("normalized channel fits u8")
 }
 
 fn write_back_render_target(target: &mut RenderTargetResource) -> Result<(), String> {
@@ -8203,10 +8230,11 @@ mod tests {
         DecodedRenderTarget, DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions,
         WritebackJournalSites, decode_render_target_format, decode_sampler, dispatch_group_count,
         expand_primitive_indices, guest_resource_ranges_overlap, indirect_draw_count_allows,
-        initial_render_target_clear, ngg_raster_vertex_shader, prepare_ngg_triangle_indices,
-        presentable_bgra, primitive_restart_index, regroup_restart_list_indices,
-        resolve_indirect_compute, resolve_indirect_compute_ordered, resolve_indirect_draw,
-        snapshot_ordered_global, synthetic_ngg_binding, write_changed_ranges_direct,
+        initial_render_target_clear, native_present_format_supported, ngg_raster_vertex_shader,
+        prepare_ngg_triangle_indices, presentable_bgra, primitive_restart_index,
+        regroup_restart_list_indices, resolve_indirect_compute, resolve_indirect_compute_ordered,
+        resolve_indirect_draw, snapshot_ordered_global, synthetic_ngg_binding,
+        write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -8282,6 +8310,23 @@ mod tests {
             GUEST_PAGE_SIZE,
             unrelated.get(),
             GUEST_PAGE_SIZE,
+        ));
+    }
+
+    #[test]
+    fn native_scanout_accepts_dxgi_flip_model_formats() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+        };
+
+        assert!(native_present_format_supported(DXGI_FORMAT_B8G8R8A8_UNORM));
+        assert!(native_present_format_supported(DXGI_FORMAT_R8G8B8A8_UNORM));
+        assert!(native_present_format_supported(
+            DXGI_FORMAT_R10G10B10A2_UNORM
+        ));
+        assert!(!native_present_format_supported(
+            DXGI_FORMAT_R16G16B16A16_FLOAT
         ));
     }
 
@@ -8386,6 +8431,18 @@ mod tests {
                 vec![1, 2, 3, 4, 10, 20, 30, 40],
             ),
             Some(vec![3, 2, 1, 4, 30, 20, 10, 40])
+        );
+    }
+
+    #[test]
+    fn converts_ten_bit_scanout_bytes_to_presenter_bgra() {
+        let packed = (3_u32 << 30) | (0x155 << 20) | (0x200 << 10) | 0x3ff;
+        assert_eq!(
+            presentable_bgra(
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R10G10B10A2_UNORM,
+                packed.to_le_bytes().to_vec(),
+            ),
+            Some(vec![85, 128, 255, 255])
         );
     }
 
