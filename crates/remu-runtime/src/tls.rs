@@ -45,6 +45,7 @@ const TLS_IMMEDIATE_STORE_SIZE: usize = 12;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TlsVectorStateSave {
     Xsave,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     Fxsave,
 }
 

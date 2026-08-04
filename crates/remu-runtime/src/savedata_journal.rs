@@ -31,7 +31,7 @@ use crate::SaveDataTransaction;
 pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        return File::open(directory)?.sync_all();
+        File::open(directory)?.sync_all()
     }
     #[cfg(windows)]
     {
