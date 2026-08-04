@@ -5,10 +5,7 @@ use super::{ComputePipelineKey, ProgramIdentity, image_component_class, register
 #[cfg(test)]
 use crate::presenter::decode::pixel_input_controls;
 use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
-use remu_shader::{
-    InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
-};
-use std::collections::BTreeSet;
+use remu_shader::{InstructionControl, Program, ShaderEvaluation, image_is_comparison};
 use std::sync::{Arc, OnceLock};
 
 /// Canonical empty pixel program used by depth/stencil-only draws.
@@ -379,65 +376,7 @@ pub(crate) fn rectangle_coordinate_parameter_mask(
     program: &Program,
     controls: &[u32; 32],
 ) -> Option<u32> {
-    let (sample_index, image) =
-        program
-            .instructions
-            .iter()
-            .enumerate()
-            .find_map(|(index, instruction)| {
-                (instruction.opcode.starts_with("ImageSample")
-                    || instruction.opcode.starts_with("ImageGather"))
-                .then_some(match instruction.control.as_ref() {
-                    Some(InstructionControl::Image(image)) => Some((index, image)),
-                    _ => None,
-                })
-                .flatten()
-            })?;
-
-    let mut live_vectors = image
-        .address_registers
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let mut mask = 0_u32;
-    for instruction in program.instructions[..sample_index].iter().rev() {
-        let writes_live_vector = instruction.destinations.iter().any(|destination| {
-            destination.kind == OperandKind::VectorRegister
-                && live_vectors.contains(&destination.value)
-        });
-        if !writes_live_vector {
-            continue;
-        }
-        for destination in &instruction.destinations {
-            if destination.kind == OperandKind::VectorRegister {
-                live_vectors.remove(&destination.value);
-            }
-        }
-
-        if let Some(InstructionControl::Interpolation(interpolation)) = instruction.control.as_ref()
-            && !instruction.opcode.starts_with("VInterpP1")
-            && interpolation.attribute < 32
-        {
-            let control = remu_shader_metal::PixelInputControl::from_register(
-                controls[interpolation.attribute as usize],
-            );
-            if !control.uses_default() {
-                mask |= 1_u32 << control.input_offset;
-            }
-            continue;
-        }
-        for source in &instruction.sources {
-            if source.kind == OperandKind::VectorRegister {
-                live_vectors.insert(source.value);
-            }
-        }
-    }
-    // A texture operation with no recoverable interpolation dependency is not evidence that the
-    // rectangle has no coordinate parameter. Returning `Some(0)` makes the synthesized stage
-    // fill every input with unit modulation, so the consumer samples one constant texel and a
-    // fullscreen composite can become uniformly black. Let the caller use its conservative
-    // parameter convention when the decoded address provenance is incomplete.
-    (mask != 0).then_some(mask)
+    remu_shader_metal::rectangle_coordinate_parameter_mask(program, controls)
 }
 
 pub(crate) fn missing_vertex_parameter_exports(
@@ -498,36 +437,7 @@ pub(crate) fn ngg_export_uses_general_lds(program: &Program) -> bool {
 /// quads, but they fetch per-vertex attributes from buffers — those must keep the mesh path so
 /// sprite bounds survive. Topology alone cannot distinguish the two.
 pub(crate) fn ngg_memoryless_cover_export_stage(program: &Program) -> bool {
-    if !ngg_mesh_export_stage(program) {
-        return false;
-    }
-    for instruction in &program.instructions {
-        if matches!(
-            instruction.control.as_ref(),
-            Some(
-                InstructionControl::Image(_)
-                    | InstructionControl::GlobalMemory(_)
-                    | InstructionControl::BufferMemory(_)
-                    | InstructionControl::DataShare(_),
-            )
-        ) {
-            return false;
-        }
-        if let Some(name) = instruction.opcode.known_name()
-            && (name.starts_with("Ds")
-                || name.starts_with("Image")
-                || name.starts_with("Buffer")
-                || name.starts_with("SBuffer")
-                || name.starts_with("Global")
-                // Flat scalar/constant traffic is common in UE fullscreen covers that still derive
-                // position from the vertex ID. Buffer/Image/Global fetches remain disqualifying so
-                // sprite quads that pull per-vertex attributes stay on the ordinary VS path.
-                || name.starts_with("Scratch"))
-        {
-            return false;
-        }
-    }
-    true
+    remu_gpu::is_memoryless_ngg_cover_stage(program)
 }
 
 /// Returns whether a direct native draw can be represented by the CPU-prepared NGG meshlet ABI.
@@ -585,69 +495,7 @@ pub(crate) fn ngg_mesh_stage_for_draw(
 /// LDS, image, interpolation, or PARAM-export work. More complex merged ES/GS programs are not
 /// accepted here and continue through the ordinary translator/rejection path.
 pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
-    let mut primitive_export = false;
-    let mut position_export = false;
-    let mut allocation_message = false;
-    let mut vertex_id_x = false;
-    let mut vertex_id_y = false;
-    let mut coordinate_conversions = 0_u32;
-    let mut coordinate_mads = 0_u32;
-
-    for instruction in &program.instructions {
-        match instruction.control.as_ref() {
-            Some(InstructionControl::Export(export)) => match export.target {
-                20 if export.enable_mask != 0 && export.done => primitive_export = true,
-                12 if export.enable_mask == 0x0f && export.done => position_export = true,
-                _ => return false,
-            },
-            Some(
-                InstructionControl::Image(_)
-                | InstructionControl::GlobalMemory(_)
-                | InstructionControl::BufferMemory(_)
-                | InstructionControl::Interpolation(_)
-                | InstructionControl::DataShare(_),
-            ) => return false,
-            _ => {}
-        }
-
-        match instruction.opcode.known_name() {
-            Some("SSendmsg")
-                if instruction
-                    .sources
-                    .first()
-                    .is_some_and(|source| source.value == 9) =>
-            {
-                allocation_message = true;
-            }
-            Some("VAndB32") => vertex_id_x = true,
-            Some("VLshrrevB32") => vertex_id_y = true,
-            Some("VCvtF32U32" | "VCvtF32I32") => {
-                coordinate_conversions = coordinate_conversions.saturating_add(1);
-            }
-            Some("VMadF32" | "VFmaF32" | "VLshlAddU32") => {
-                coordinate_mads = coordinate_mads.saturating_add(1);
-            }
-            Some(name)
-                if name.starts_with("Ds")
-                    || name.starts_with("Image")
-                    || name.starts_with("Buffer")
-                    || name.starts_with("Global")
-                    || name.starts_with("Flat") =>
-            {
-                return false;
-            }
-            None => return false,
-            _ => {}
-        }
-    }
-
-    primitive_export
-        && position_export
-        && allocation_message
-        && vertex_id_x
-        && vertex_id_y
-        && coordinate_conversions >= 2
-        && coordinate_mads >= 2
+    remu_gpu::is_procedural_rectangle_export_stage(program)
 }
 
 /// Poppy/UE memoryless NGG rectangle covers: GS_ALLOC + prim EXP, no memory/PARAM traffic.
@@ -656,61 +504,12 @@ pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
 /// padded/undecoded tails. Rejecting on `Opcode::known_name() == None` missed every Poppy cover
 /// and left INTERFACE-FILL zeroes on scanout (mid-band noise).
 pub(crate) fn truncated_memoryless_ngg_rectangle_cover(program: &Program) -> bool {
-    let mut allocation_message = false;
-    let mut primitive_export = false;
-    for instruction in &program.instructions {
-        match instruction.control.as_ref() {
-            Some(InstructionControl::Export(export)) => match export.target {
-                20 if export.enable_mask != 0 => primitive_export = true,
-                // Position may appear in longer UE covers; PARAMs mean a real attribute path.
-                12 => {}
-                32..=63 if export.enable_mask != 0 => return false,
-                _ => {}
-            },
-            Some(
-                InstructionControl::Image(_)
-                | InstructionControl::GlobalMemory(_)
-                | InstructionControl::BufferMemory(_)
-                | InstructionControl::Interpolation(_)
-                | InstructionControl::DataShare(_),
-            ) => return false,
-            _ => {}
-        }
-        match instruction.opcode.known_name() {
-            Some("SSendmsg")
-                if instruction
-                    .sources
-                    .first()
-                    .is_some_and(|source| source.value == 9) =>
-            {
-                allocation_message = true;
-            }
-            Some(name)
-                if name.starts_with("Ds")
-                    || name.starts_with("Image")
-                    || name.starts_with("Buffer")
-                    || name.starts_with("SBuffer")
-                    || name.starts_with("Global")
-                    || name.starts_with("Scratch") =>
-            {
-                return false;
-            }
-            // Padding / undecoded tails after the live cover prefix.
-            None => {}
-            _ => {}
-        }
-    }
-    allocation_message && primitive_export
+    remu_gpu::is_truncated_memoryless_ngg_rectangle_cover(program)
 }
 
 /// Returns whether this exact draw uses the synthesized procedural-rectangle vertex stage.
 pub(crate) fn procedural_rectangle_stage_for_draw(program: &Program, draw: &IndexedDraw) -> bool {
-    !draw.indexed
-        && draw.indirect_arguments_address.is_none()
-        && draw.index_count == 3
-        && matches!(draw.primitive_type, 7 | 0x11)
-        && (procedural_rectangle_export_stage(program)
-            || truncated_memoryless_ngg_rectangle_cover(program))
+    remu_gpu::uses_procedural_rectangle_stage(program, draw)
 }
 
 #[cfg(test)]

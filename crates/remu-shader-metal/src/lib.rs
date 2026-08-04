@@ -7,6 +7,7 @@
 //! semantics or compilation fails with the instruction PC and opcode; this crate never substitutes
 //! a placeholder color, drops an unknown memory access, or selects behavior by game identity.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 mod compiler;
@@ -19,10 +20,13 @@ pub(crate) use compiler::operand::format_u32;
 use compiler::vector::is_supported_dpp_control;
 #[cfg(test)]
 use remu_shader::{
-    ExportControl, ImageBinding, ImageControl, InstructionControl, Operand, OperandKind,
-    PixelExportFormat, PixelOutputKind, SdwaControl, ShaderEncoding,
+    ExportControl, ImageBinding, ImageControl, Operand, PixelExportFormat, PixelOutputKind,
+    SdwaControl, ShaderEncoding,
 };
-use remu_shader::{Opcode, PixelOutputBinding, Program, ShaderEvaluation, VertexInputBinding};
+use remu_shader::{
+    InstructionControl, Opcode, OperandKind, PixelOutputBinding, Program, ShaderEvaluation,
+    VertexInputBinding,
+};
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
 const VECTOR_REGISTER_COUNT: u32 = 256;
@@ -101,6 +105,71 @@ impl PixelInputControl {
     pub const fn uses_default(self) -> bool {
         self.use_default && !self.flat_shade
     }
+}
+
+/// Determines which physical rectangle parameters supply texture coordinates to a pixel shader.
+///
+/// The procedural rectangle export stage has no conventional parameter exports. Trace the first
+/// texture sample's address VGPRs back to their interpolation instructions so every native backend
+/// can synthesize the same architectural interface.
+#[must_use]
+pub fn rectangle_coordinate_parameter_mask(
+    program: &Program,
+    controls: &[u32; PIXEL_INPUT_CONTROL_COUNT],
+) -> Option<u32> {
+    let (sample_index, image) =
+        program
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instruction)| {
+                (instruction.opcode.starts_with("ImageSample")
+                    || instruction.opcode.starts_with("ImageGather"))
+                .then_some(match instruction.control.as_ref() {
+                    Some(InstructionControl::Image(image)) => Some((index, image)),
+                    _ => None,
+                })
+                .flatten()
+            })?;
+
+    let mut live_vectors = image
+        .address_registers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut mask = 0_u32;
+    for instruction in program.instructions[..sample_index].iter().rev() {
+        let writes_live_vector = instruction.destinations.iter().any(|destination| {
+            destination.kind == OperandKind::VectorRegister
+                && live_vectors.contains(&destination.value)
+        });
+        if !writes_live_vector {
+            continue;
+        }
+        for destination in &instruction.destinations {
+            if destination.kind == OperandKind::VectorRegister {
+                live_vectors.remove(&destination.value);
+            }
+        }
+
+        if let Some(InstructionControl::Interpolation(interpolation)) = instruction.control.as_ref()
+            && !instruction.opcode.starts_with("VInterpP1")
+            && interpolation.attribute < PIXEL_INPUT_CONTROL_COUNT as u32
+        {
+            let control =
+                PixelInputControl::from_register(controls[interpolation.attribute as usize]);
+            if !control.uses_default() {
+                mask |= 1_u32 << control.input_offset;
+            }
+            continue;
+        }
+        for source in &instruction.sources {
+            if source.kind == OperandKind::VectorRegister {
+                live_vectors.insert(source.value);
+            }
+        }
+    }
+    (mask != 0).then_some(mask)
 }
 
 #[must_use]
@@ -832,6 +901,77 @@ pub fn compile_procedural_rectangle_vertex(
         },
         vertex_inputs: Vec::new(),
         interpolated_attribute_count,
+        register_footprint: MetalRegisterFootprint {
+            scalar_values: 0,
+            vector_values: 0,
+            direct_control_flow: true,
+        },
+    }
+}
+
+/// Builds the Direct3D 12 equivalent of the procedural Gen5 rectangle export stage.
+///
+/// The generated semantic locations exactly match the paired translated pixel shader. An
+/// oversized triangle avoids native rectangle-list expansion and makes the result independent of
+/// guest culling/winding conventions; the presenter disables culling for this stage.
+#[must_use]
+pub fn compile_procedural_rectangle_hlsl(
+    interpolated_attribute_locations: &[u32],
+    coordinate_parameter_mask: u32,
+) -> HlslShader {
+    let mut source = String::from(
+        "#define REMU_ROOT_SIGNATURE \"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=7, b0, space=0, visibility=SHADER_VISIBILITY_VERTEX), RootConstants(num32BitConstants=7, b0, space=1, visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=7, b0, space=2, visibility=SHADER_VISIBILITY_ALL)\"\n\n\
+         struct RemuVsOut {\n\
+         \x20   float4 position : SV_Position;\n",
+    );
+    for &location in interpolated_attribute_locations {
+        let _ = writeln!(source, "    float4 param{location} : TEXCOORD{location};");
+    }
+    source.push_str(
+        "};\n\n\
+         [RootSignature(REMU_ROOT_SIGNATURE)]\n\
+         RemuVsOut remu_main(uint remu_vertex_id : SV_VertexID) {\n\
+         \x20   static const float2 remu_positions[3] = {\n\
+         \x20       float2(-1.0f, -1.0f),\n\
+         \x20       float2( 3.0f, -1.0f),\n\
+         \x20       float2(-1.0f,  3.0f),\n\
+         \x20   };\n\
+         \x20   static const float2 remu_uvs[3] = {\n\
+         \x20       float2(0.0f, 0.0f),\n\
+         \x20       float2(2.0f, 0.0f),\n\
+         \x20       float2(0.0f, 2.0f),\n\
+         \x20   };\n\
+         \x20   uint remu_index = min(remu_vertex_id, 2u);\n\
+         \x20   float2 remu_uv = remu_uvs[remu_index];\n\
+         \x20   RemuVsOut remu_out = (RemuVsOut)0;\n\
+         \x20   remu_out.position = float4(remu_positions[remu_index], 0.0f, 1.0f);\n",
+    );
+    for &location in interpolated_attribute_locations {
+        let value = if coordinate_parameter_mask & (1 << location) != 0 {
+            "float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f)"
+        } else {
+            "float4(1.0f, 1.0f, 1.0f, 1.0f)"
+        };
+        let _ = writeln!(source, "    remu_out.param{location} = {value};");
+    }
+    source.push_str("    return remu_out;\n}\n");
+
+    HlslShader {
+        source,
+        entry_point: "remu_main".to_owned(),
+        target_profile: "vs_6_6".to_owned(),
+        stage: MetalShaderStage::Vertex,
+        bindings: HlslBindingLayout {
+            root_constant_words: 7,
+            binding_table_words: 0,
+            global_buffer_count: 0,
+            texture_count: 0,
+            sampler_count: 0,
+            threadgroup_memory_bytes: 0,
+        },
+        vertex_inputs: Vec::new(),
+        interpolated_attribute_count: interpolated_attribute_locations.len() as u32,
+        interpolated_attribute_locations: interpolated_attribute_locations.to_vec(),
         register_footprint: MetalRegisterFootprint {
             scalar_values: 0,
             vector_values: 0,

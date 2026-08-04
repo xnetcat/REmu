@@ -84,7 +84,9 @@ pub use ngg::{
     GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL, NGG_MESHLET_WORDS_PER_GROUP,
     NggOutputPrimitiveType, NggSubgroupLimits, PreparedNggMeshlets, VGT_GS_INSTANCE_CNT,
     VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE, decode_ngg_subgroup_limits,
-    is_ngg_export_stage, ngg_uses_general_lds, ngg_uses_wave64_exec, prepare_ngg_meshlets,
+    is_memoryless_ngg_cover_stage, is_ngg_export_stage, is_procedural_rectangle_export_stage,
+    is_truncated_memoryless_ngg_rectangle_cover, ngg_uses_general_lds, ngg_uses_wave64_exec,
+    prepare_ngg_meshlets, uses_procedural_rectangle_stage,
 };
 
 mod dialog;

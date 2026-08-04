@@ -423,6 +423,27 @@ fn builds_procedural_rectangle_from_pixel_consumer_parameter_roles() {
     );
 }
 
+#[test]
+fn builds_hlsl_procedural_rectangle_with_sparse_pixel_semantics() {
+    let shader = compile_procedural_rectangle_hlsl(&[0, 3], 1 << 3);
+
+    assert_eq!(shader.stage, MetalShaderStage::Vertex);
+    assert_eq!(shader.target_profile, "vs_6_6");
+    assert_eq!(shader.interpolated_attribute_locations, [0, 3]);
+    assert!(shader.source.contains("float4 param0 : TEXCOORD0;"));
+    assert!(shader.source.contains("float4 param3 : TEXCOORD3;"));
+    assert!(
+        shader
+            .source
+            .contains("remu_out.param0 = float4(1.0f, 1.0f, 1.0f, 1.0f);")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_out.param3 = float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f);")
+    );
+}
+
 fn compile_pixel_system_input_shader(
     referenced_vgpr: u32,
     pixel_input_enable: u32,

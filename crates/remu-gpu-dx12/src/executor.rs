@@ -210,6 +210,7 @@ struct GraphicsPipelineKey {
     index_buffer_strip_cut: i32,
     sample_count: u32,
     raster_control: u32,
+    force_no_cull: bool,
     render_targets: Vec<(i32, u32, u32)>,
     blend_controls: Vec<u32>,
     depth: Option<(i32, u32, u32, u32, u32)>,
@@ -1206,6 +1207,9 @@ impl Dx12GuestExecutor {
                 decoded_depth.map(|depth| (depth.descriptor.width, depth.descriptor.height))
             })
             .expect("a color or depth target supplies the render extent");
+        let pixel_input_controls = std::array::from_fn(|index| {
+            register_value(&draw.context_registers, 0x191 + index as u32).unwrap_or(index as u32)
+        });
         let pixel_stage = match (&draw.pixel_shader, &draw.pixel_shader_evaluation) {
             (Some(pixel), Some(evaluation)) => {
                 let mut options = MetalCompileOptions::pixel(
@@ -1222,12 +1226,8 @@ impl Dx12GuestExecutor {
                     register_value(&draw.context_registers, 0x1b3).unwrap_or_default(),
                     register_value(&draw.context_registers, 0x1b4).unwrap_or_default(),
                 );
-                options.pixel_input_controls = std::array::from_fn(|index| {
-                    remu_shader_metal::PixelInputControl::from_register(
-                        register_value(&draw.context_registers, 0x191 + index as u32)
-                            .unwrap_or(index as u32),
-                    )
-                });
+                options.pixel_input_controls =
+                    pixel_input_controls.map(remu_shader_metal::PixelInputControl::from_register);
                 options.pixel_depth_export = decoded_depth.is_some()
                     && register_value(&draw.context_registers, 0x203)
                         .is_some_and(|control| control & 1 != 0);
@@ -1257,10 +1257,44 @@ impl Dx12GuestExecutor {
             .map_or(0, |stage| stage.0.interpolated_attribute_count);
         let vertex_output_control =
             register_value(&draw.context_registers, 0x207).unwrap_or_default();
+        let uses_procedural_rectangle_stage =
+            remu_gpu::uses_procedural_rectangle_stage(&export.program, draw);
         let uses_ngg_compute_fallback = remu_gpu::is_ngg_export_stage(&export.program)
             && remu_gpu::ngg_uses_general_lds(&export.program);
         let (vertex_evaluation, vertex_compiled, vertex_translation_cache_hit, ngg_execution) =
-            if uses_ngg_compute_fallback {
+            if uses_procedural_rectangle_stage {
+                let coordinate_parameter_mask = pixel_stage
+                    .as_ref()
+                    .and_then(|(hlsl, _, _, _)| {
+                        draw.pixel_shader.as_ref().and_then(|pixel| {
+                            remu_shader_metal::rectangle_coordinate_parameter_mask(
+                                &pixel.program,
+                                &pixel_input_controls,
+                            )
+                            .or_else(|| {
+                                (!hlsl.interpolated_attribute_locations.is_empty()).then(|| {
+                                    hlsl.interpolated_attribute_locations
+                                        .iter()
+                                        .fold(0_u32, |mask, location| mask | (1 << location))
+                                })
+                            })
+                        })
+                    })
+                    .unwrap_or_default();
+                let hlsl = remu_shader_metal::compile_procedural_rectangle_hlsl(
+                    &interpolated_locations,
+                    coordinate_parameter_mask,
+                );
+                let source_name = format!(
+                    "remu-procedural-rectangle-vs-{:x}.hlsl",
+                    draw.export_shader_address
+                );
+                if let Err(error) = dump_translated_shader(&export.program, &hlsl, &source_name) {
+                    eprintln!("[REMu][D3D12] could not dump {source_name}: {error}");
+                }
+                let compiled = self.compile_shader_cached(&hlsl, &source_name)?;
+                (export_evaluation.clone(), compiled, false, None)
+            } else if uses_ngg_compute_fallback {
                 let limits = remu_gpu::decode_ngg_subgroup_limits(&draw.context_registers)?
                     .ok_or("NGG export is missing subgroup sizing registers")?;
                 if limits
@@ -1406,17 +1440,21 @@ impl Dx12GuestExecutor {
                 .as_ref()
                 .map_or(0, |(_, _, _, cache_hit)| usize::from(*cache_hit));
         let translation_ready = timing_started.elapsed();
-        let regular_geometry = ngg_execution
-            .is_none()
-            .then(|| {
-                prepare_geometry(
-                    &self.device,
-                    &mut self.upload_arena,
-                    draw,
-                    self.triangle_fan_supported,
-                )
-            })
-            .transpose()?;
+        let regular_geometry = if uses_procedural_rectangle_stage {
+            Some(procedural_rectangle_geometry())
+        } else {
+            ngg_execution
+                .is_none()
+                .then(|| {
+                    prepare_geometry(
+                        &self.device,
+                        &mut self.upload_arena,
+                        draw,
+                        self.triangle_fan_supported,
+                    )
+                })
+                .transpose()?
+        };
         let regular_geometry_ready = timing_started.elapsed();
         let output_addresses = decoded_targets
             .iter()
@@ -1464,6 +1502,7 @@ impl Dx12GuestExecutor {
             geometry.topology_type,
             geometry.strip_cut,
             sample_count,
+            uses_procedural_rectangle_stage,
         )?;
         let pipeline_ready = timing_started.elapsed();
         let (descriptors, samplers, root_descriptors) = {
@@ -1609,7 +1648,7 @@ impl Dx12GuestExecutor {
                 })
                 .unwrap_or_default();
             eprintln!(
-                "[REMu][D3D12-PRESENT-WRITER] sequence={} es={:#x} ps={:#x} indexed={} elements={} instances={} primitive={:#x} targets={targets:?} textures={textures:?} viewport={:?} scissor={:?}",
+                "[REMu][D3D12-PRESENT-WRITER] sequence={} es={:#x} ps={:#x} indexed={} elements={} instances={} primitive={:#x} procedural={} targets={targets:?} textures={textures:?} viewport={:?} scissor={:?}",
                 draw.sequence,
                 draw.export_shader_address,
                 draw.pixel_shader_address,
@@ -1617,6 +1656,7 @@ impl Dx12GuestExecutor {
                 geometry.element_count,
                 draw.instance_count,
                 draw.primitive_type,
+                u8::from(uses_procedural_rectangle_stage),
                 viewport,
                 scissor,
             );
@@ -1624,7 +1664,8 @@ impl Dx12GuestExecutor {
         let blend_factor = [0x105, 0x106, 0x107, 0x108].map(|offset| {
             register_value(&draw.context_registers, offset).map_or(0.0, f32::from_bits)
         });
-        let discard_triangles = decode_raster_state(draw)?.discard_triangles
+        let discard_triangles = !uses_procedural_rectangle_stage
+            && decode_raster_state(draw)?.discard_triangles
             && geometry.topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         let rtvs = targets
             .iter()
@@ -2420,6 +2461,7 @@ impl Dx12GuestExecutor {
         topology: windows::Win32::Graphics::Direct3D12::D3D12_PRIMITIVE_TOPOLOGY_TYPE,
         strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
         sample_count: u32,
+        force_no_cull: bool,
     ) -> Result<ID3D12PipelineState, String> {
         let key = GraphicsPipelineKey {
             vertex: vertex.key.clone(),
@@ -2428,6 +2470,7 @@ impl Dx12GuestExecutor {
             index_buffer_strip_cut: strip_cut.0,
             sample_count,
             raster_control: register_value(&draw.context_registers, 0x205).unwrap_or_default(),
+            force_no_cull,
             render_targets: targets
                 .iter()
                 .map(|target| {
@@ -2473,6 +2516,7 @@ impl Dx12GuestExecutor {
             strip_cut,
             sample_count,
             self.independent_stencil_ref_mask,
+            force_no_cull,
         )
         .map_err(|error| {
             if let Err(dump_error) = dump_failed_graphics_pipeline(vertex, pixel) {
@@ -3632,6 +3676,18 @@ fn prepare_geometry(
     })
 }
 
+fn procedural_rectangle_geometry() -> PreparedGeometry {
+    PreparedGeometry {
+        topology: D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+        topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        index: None,
+        element_count: 3,
+        start_vertex: 0,
+        base_vertex: 0,
+        strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+    }
+}
+
 fn create_graphics_pipeline(
     device: &ID3D12Device,
     root: &ID3D12RootSignature,
@@ -3644,6 +3700,7 @@ fn create_graphics_pipeline(
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
     sample_count: u32,
     independent_stencil_ref_mask_supported: bool,
+    force_no_cull: bool,
 ) -> Result<ID3D12PipelineState, String> {
     if std::env::var_os("REMU_D3D12_DEBUG").is_some_and(|value| value == "1")
         && let Ok(info) = device.cast::<ID3D12InfoQueue>()
@@ -3661,7 +3718,7 @@ fn create_graphics_pipeline(
     let raster = decode_raster_state(draw)?;
     let rasterizer = D3D12_RASTERIZER_DESC {
         FillMode: raster.fill_mode,
-        CullMode: if raster.discard_triangles {
+        CullMode: if raster.discard_triangles || force_no_cull {
             D3D12_CULL_MODE_NONE
         } else {
             raster.cull_mode
@@ -8479,16 +8536,17 @@ mod tests {
     };
 
     use super::{
-        D3D12_MIP_LOD_BIAS_MAX, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
-        DecodedRenderTarget, DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions,
-        WritebackJournalSites, decode_render_target_format, decode_sampler, dispatch_group_count,
+        D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D12_MIP_LOD_BIAS_MAX,
+        DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DecodedRenderTarget,
+        DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites,
+        decode_render_target_format, decode_sampler, dispatch_group_count,
         expand_primitive_indices, guest_resource_ranges_overlap, indirect_draw_count_allows,
         initial_render_target_clear, native_present_format_supported, ngg_raster_vertex_shader,
         prepare_ngg_triangle_indices, presentable_bgra, primitive_restart_index,
-        regroup_restart_list_indices, resolve_indirect_compute, resolve_indirect_compute_ordered,
-        resolve_indirect_draw, snapshot_ordered_global, synthetic_ngg_binding,
-        texture_component_mapping, texture_format_component_remap, wave64_group_isolation,
-        write_changed_ranges_direct,
+        procedural_rectangle_geometry, regroup_restart_list_indices, resolve_indirect_compute,
+        resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
+        synthetic_ngg_binding, texture_component_mapping, texture_format_component_remap,
+        wave64_group_isolation, write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -9011,6 +9069,22 @@ mod tests {
         assert!(!dxil.is_empty());
         assert_eq!(shader.target_profile, "vs_6_6");
         assert!(shader.source.contains("TEXCOORD3"));
+    }
+
+    #[test]
+    fn generated_procedural_rectangle_vertex_shader_compiles_to_dxil() {
+        let shader = remu_shader_metal::compile_procedural_rectangle_hlsl(&[0, 3], 1 << 3);
+        let dxil = crate::guest_shader::compile_guest_shader(
+            &shader,
+            "remu-procedural-rectangle-test.hlsl",
+        )
+        .expect("compile generated procedural rectangle vertex shader");
+        let geometry = procedural_rectangle_geometry();
+
+        assert!(!dxil.is_empty());
+        assert_eq!(geometry.topology, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        assert_eq!(geometry.element_count, 3);
+        assert!(geometry.index.is_none());
     }
 
     #[test]

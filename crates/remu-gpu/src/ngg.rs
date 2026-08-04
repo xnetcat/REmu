@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use remu_shader::{InstructionControl, OperandKind, Program};
 
-use crate::GpuRegister;
+use crate::{GpuRegister, IndexedDraw};
 
 pub const GE_MAX_OUTPUT_PER_SUBGROUP: u32 = 0x1ff;
 pub const VGT_GS_ONCHIP_CNTL: u32 = 0x291;
@@ -163,6 +163,173 @@ pub fn is_ngg_export_stage(program: &Program) -> bool {
         }
     }
     allocation && primitive && position
+}
+
+/// Returns whether an NGG stage computes cover geometry without fetching guest resources.
+///
+/// This is backend-neutral architectural classification. Resource-fetching sprite and UI stages
+/// must retain their translated geometry even when they use the same topology as a fullscreen
+/// cover.
+#[must_use]
+pub fn is_memoryless_ngg_cover_stage(program: &Program) -> bool {
+    if !is_ngg_export_stage(program) {
+        return false;
+    }
+    for instruction in &program.instructions {
+        if matches!(
+            instruction.control.as_ref(),
+            Some(
+                InstructionControl::Image(_)
+                    | InstructionControl::GlobalMemory(_)
+                    | InstructionControl::BufferMemory(_)
+                    | InstructionControl::DataShare(_),
+            )
+        ) {
+            return false;
+        }
+        if let Some(name) = instruction.opcode.known_name()
+            && (name.starts_with("Ds")
+                || name.starts_with("Image")
+                || name.starts_with("Buffer")
+                || name.starts_with("SBuffer")
+                || name.starts_with("Global")
+                || name.starts_with("Scratch"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Recognizes the position-only architectural rectangle export stage.
+#[must_use]
+pub fn is_procedural_rectangle_export_stage(program: &Program) -> bool {
+    let mut primitive_export = false;
+    let mut position_export = false;
+    let mut allocation_message = false;
+    let mut vertex_id_x = false;
+    let mut vertex_id_y = false;
+    let mut coordinate_conversions = 0_u32;
+    let mut coordinate_mads = 0_u32;
+
+    for instruction in &program.instructions {
+        match instruction.control.as_ref() {
+            Some(InstructionControl::Export(export)) => match export.target {
+                20 if export.enable_mask != 0 && export.done => primitive_export = true,
+                12 if export.enable_mask == 0x0f && export.done => position_export = true,
+                _ => return false,
+            },
+            Some(
+                InstructionControl::Image(_)
+                | InstructionControl::GlobalMemory(_)
+                | InstructionControl::BufferMemory(_)
+                | InstructionControl::Interpolation(_)
+                | InstructionControl::DataShare(_),
+            ) => return false,
+            _ => {}
+        }
+
+        match instruction.opcode.known_name() {
+            Some("SSendmsg")
+                if instruction
+                    .sources
+                    .first()
+                    .is_some_and(|source| source.value == 9) =>
+            {
+                allocation_message = true;
+            }
+            Some("VAndB32") => vertex_id_x = true,
+            Some("VLshrrevB32") => vertex_id_y = true,
+            Some("VCvtF32U32" | "VCvtF32I32") => {
+                coordinate_conversions = coordinate_conversions.saturating_add(1);
+            }
+            Some("VMadF32" | "VFmaF32" | "VLshlAddU32") => {
+                coordinate_mads = coordinate_mads.saturating_add(1);
+            }
+            Some(name)
+                if name.starts_with("Ds")
+                    || name.starts_with("Image")
+                    || name.starts_with("Buffer")
+                    || name.starts_with("Global")
+                    || name.starts_with("Flat") =>
+            {
+                return false;
+            }
+            None => return false,
+            _ => {}
+        }
+    }
+
+    primitive_export
+        && position_export
+        && allocation_message
+        && vertex_id_x
+        && vertex_id_y
+        && coordinate_conversions >= 2
+        && coordinate_mads >= 2
+}
+
+/// Recognizes a truncated but otherwise memoryless NGG rectangle cover.
+///
+/// Some guest binaries retain only the live allocation/primitive-export prefix followed by
+/// padding that the decoder cannot identify. Parameter exports or resource traffic disqualify the
+/// program so ordinary geometry is never replaced by a fullscreen cover.
+#[must_use]
+pub fn is_truncated_memoryless_ngg_rectangle_cover(program: &Program) -> bool {
+    let mut allocation_message = false;
+    let mut primitive_export = false;
+    for instruction in &program.instructions {
+        match instruction.control.as_ref() {
+            Some(InstructionControl::Export(export)) => match export.target {
+                20 if export.enable_mask != 0 => primitive_export = true,
+                12 => {}
+                32..=63 if export.enable_mask != 0 => return false,
+                _ => {}
+            },
+            Some(
+                InstructionControl::Image(_)
+                | InstructionControl::GlobalMemory(_)
+                | InstructionControl::BufferMemory(_)
+                | InstructionControl::Interpolation(_)
+                | InstructionControl::DataShare(_),
+            ) => return false,
+            _ => {}
+        }
+        match instruction.opcode.known_name() {
+            Some("SSendmsg")
+                if instruction
+                    .sources
+                    .first()
+                    .is_some_and(|source| source.value == 9) =>
+            {
+                allocation_message = true;
+            }
+            Some(name)
+                if name.starts_with("Ds")
+                    || name.starts_with("Image")
+                    || name.starts_with("Buffer")
+                    || name.starts_with("SBuffer")
+                    || name.starts_with("Global")
+                    || name.starts_with("Scratch") =>
+            {
+                return false;
+            }
+            None => {}
+            _ => {}
+        }
+    }
+    allocation_message && primitive_export
+}
+
+/// Returns whether a direct draw requires a synthesized procedural rectangle vertex stage.
+#[must_use]
+pub fn uses_procedural_rectangle_stage(program: &Program, draw: &IndexedDraw) -> bool {
+    !draw.indexed
+        && draw.indirect_arguments_address.is_none()
+        && draw.index_count == 3
+        && matches!(draw.primitive_type, 7 | 0x11)
+        && (is_procedural_rectangle_export_stage(program)
+            || is_truncated_memoryless_ngg_rectangle_cover(program))
 }
 
 #[must_use]
