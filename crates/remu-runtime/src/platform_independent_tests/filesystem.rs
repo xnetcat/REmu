@@ -8,6 +8,7 @@ use std::sync::Mutex;
 use crate::guest_files::{DIRENT_TYPE_FILE, resolve_probe_guest_path_from_roots};
 use crate::{guest_kernel_close, guest_kernel_getdents, guest_kernel_open};
 
+#[cfg(target_os = "macos")]
 use super::{
     AMPR_INVALID_FILE_ID, AprResolveOutputs, ampr_resolve_file_paths, ampr_resolve_paths_core,
 };

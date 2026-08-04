@@ -69,9 +69,13 @@ Implemented and physically validated on the development host:
 - Pixel-shader interpolation metadata drives an exact vertex-output signature. Sparse semantic
   sets such as `TEXCOORD0` plus `TEXCOORD2` no longer retain an unused vertex `TEXCOORD1` that
   causes DXIL stage-link register mismatches on D3D12.
+- Each active render target carries its decoded `SPI_SHADER_COL_FORMAT` export format into shared
+  HLSL lowering. Zero formats suppress color writes, packed FP16/normalized/integer formats retain
+  their architectural interpretation, and invalid nibbles fail closed instead of being guessed
+  from the physical adapter or render-target format.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
   primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
-  current D3D12 crate has 61 passing tests on the GTX 1050, including a physical general-LDS NGG
+  current D3D12 crate has 65 passing tests on the GTX 1050, including a physical general-LDS NGG
   compute-to-raster test on this mesh-shader-tier-0 adapter.
 
 This is a playable vertical slice for one tested title and sustained boot/media execution for a
@@ -438,6 +442,7 @@ it to DX12 by semantic capability rather than by copying Metal APIs:
 | Main work | Shared or DX12 equivalent | Current state |
 | --- | --- | --- |
 | Structured shader CFG (`6f32225`) | Shared IR plus HLSL structured/direct lowering | Integrated and covered by the shared compiler tests |
+| Pixel export formats (current main) | Decode `SPI_SHADER_COL_FORMAT` per target and carry it into shared HLSL lowering | Integrated; zero, packed normalized/integer, and 32-bit exports use the same guest semantics as Metal |
 | Ordered internal-resident writes (`ccc7640`) | Guest-range leases and ordered global versions | Integrated |
 | Attachment occlusion queries (`d683bb5`) | D3D12 occlusion query heap and readback publication | Implemented |
 | GPU tiler and equation work (`6ed02f8`) | Shared equations plus a future D3D12 compute tiler | CPU conversion exists; GPU path remains |

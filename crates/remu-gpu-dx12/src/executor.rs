@@ -663,6 +663,7 @@ struct DecodedRenderTarget {
     guest_slot: u32,
     descriptor: DecodedTexture,
     output_kind: remu_shader::PixelOutputKind,
+    export_format: remu_shader::PixelExportFormat,
     write_mask: u32,
     sample_count: u32,
     dcc_enabled: bool,
@@ -1215,6 +1216,7 @@ impl Dx12GuestExecutor {
                             guest_slot: target.guest_slot,
                             host_location: host_location as u32,
                             kind: target.output_kind,
+                            export_format: target.export_format,
                         })
                         .collect(),
                     register_value(&draw.context_registers, 0x1b3).unwrap_or_default(),
@@ -1322,9 +1324,9 @@ impl Dx12GuestExecutor {
                                 remu_gpu::VGT_GS_MAX_VERT_OUT,
                             )
                             .unwrap_or_default(),
-                            ge_ngg_subgrp_cntl: register_value(
+                            ge_max_output_per_subgroup: register_value(
                                 &draw.context_registers,
-                                remu_gpu::GE_NGG_SUBGRP_CNTL,
+                                remu_gpu::GE_MAX_OUTPUT_PER_SUBGROUP,
                             )
                             .unwrap_or_default(),
                         },
@@ -4479,8 +4481,22 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
         None => return Ok(Vec::new()),
     };
     let exports = pixel.program.pixel_color_export_masks();
+    let shader_color_formats = register_value(&draw.context_registers, 0x1c5).unwrap_or_default();
+    let export_format_for_slot = |slot: u32| {
+        let nibble = (shader_color_formats >> slot.saturating_mul(4)) & 0xf;
+        remu_shader::PixelExportFormat::from_register_nibble(nibble).ok_or_else(|| {
+            format!(
+                "color target {slot} has invalid SPI_SHADER_COL_FORMAT nibble {nibble:#x} in {shader_color_formats:#010x}"
+            )
+        })
+    };
     if let Some(scanout) = draw.scanout_target {
-        let mask = (exports >> (scanout.export_slot * 4)) & scanout.write_mask & 0xf;
+        let export_format = export_format_for_slot(scanout.export_slot)?;
+        let mask = if export_format == remu_shader::PixelExportFormat::Zero {
+            0
+        } else {
+            (exports >> (scanout.export_slot * 4)) & scanout.write_mask & 0xf
+        };
         if mask == 0 {
             return Err("scanout target has no matching pixel export".to_owned());
         }
@@ -4506,6 +4522,7 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
                 writable: true,
             },
             output_kind: remu_shader::PixelOutputKind::Float,
+            export_format,
             write_mask: mask,
             sample_count: 1,
             dcc_enabled: false,
@@ -4569,6 +4586,7 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
             5 => remu_shader::PixelOutputKind::Sint,
             _ => remu_shader::PixelOutputKind::Float,
         };
+        let export_format = export_format_for_slot(slot)?;
         targets.push(DecodedRenderTarget {
             guest_slot: slot,
             descriptor: DecodedTexture {
@@ -4586,7 +4604,12 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
                 writable: true,
             },
             output_kind,
-            write_mask,
+            export_format,
+            write_mask: if export_format == remu_shader::PixelExportFormat::Zero {
+                0
+            } else {
+                write_mask
+            },
             sample_count,
             dcc_enabled,
         });
@@ -8416,6 +8439,7 @@ mod tests {
                 threads_per_group: [1; 3],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1,
             },
             shader_address: 0,
@@ -8593,6 +8617,7 @@ mod tests {
                 writable: true,
             },
             output_kind: remu_shader::PixelOutputKind::Float,
+            export_format: remu_shader::PixelExportFormat::Abgr32,
             write_mask: 0xf,
             sample_count: 1,
             dcc_enabled: false,
@@ -9160,6 +9185,7 @@ mod tests {
                 color_surface: None,
             }),
             context_registers: vec![
+                register(0x1c5, 9),
                 register(remu_gpu::GE_MAX_OUTPUT_PER_SUBGROUP, 3),
                 register(remu_gpu::VGT_GS_ONCHIP_CNTL, 3 | (1 << 11) | (1 << 22)),
                 register(remu_gpu::VGT_GS_OUT_PRIM_TYPE, 2),
@@ -9387,6 +9413,7 @@ mod tests {
                 threads_per_group: [64, 1, 1],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1,
             },
             shader_address: 0x9000,
@@ -9543,6 +9570,7 @@ mod tests {
                 threads_per_group: [5, 1, 1],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1,
             },
             shader_address: 0x9800,
@@ -9581,6 +9609,7 @@ mod tests {
                 threads_per_group: [8, 4, 2],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1 | (1 << 2) | (1 << 15),
             },
             shader_address: 0,
@@ -9711,6 +9740,7 @@ mod tests {
                 threads_per_group: [8, 4, 2],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1 | (1 << 2) | (1 << 15),
             },
             shader_address: 0,
@@ -9839,6 +9869,7 @@ mod tests {
                 threads_per_group: [64, 1, 1],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1,
             },
             shader_address: 0xa000,
@@ -10063,6 +10094,7 @@ mod tests {
                 threads_per_group: [64, 1, 1],
                 wave_lane_count: 32,
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 initiator: 1,
             },
             shader_address: 0xb000,
@@ -10339,7 +10371,10 @@ mod tests {
                 write_mask: 0xf,
                 color_surface: None,
             }),
-            context_registers: Vec::new(),
+            context_registers: vec![GpuRegister {
+                offset: 0x1c5,
+                value: 9,
+            }],
             shader_registers: Vec::new(),
             user_config_registers: Vec::new(),
         };
@@ -10359,6 +10394,10 @@ mod tests {
             .execute_draw(&draw)
             .expect("execute destination-source-alpha blend graphics draw");
         draw.context_registers.clear();
+        draw.context_registers.push(GpuRegister {
+            offset: 0x1c5,
+            value: 9,
+        });
         executor
             .execute_draw(&draw)
             .expect("restore unblended graphics draw after blend PSO validation");
@@ -10461,6 +10500,7 @@ mod tests {
         draw.primitive_type = 4;
         draw.context_registers = vec![
             register(0x08e, 0x0000_000f),
+            register(0x1c5, 9),
             register(0x318, (scanout_address >> 8) as u32),
             register(0x390, ((scanout_address >> 40) & 0xff) as u32),
             register(0x31c, (10 << 2) | (1 << 11)),
@@ -10476,6 +10516,7 @@ mod tests {
         allocation.fill(0);
         draw.context_registers = vec![
             register(0x08e, 0x0000_000f),
+            register(0x1c5, 9),
             register(0x318, (scanout_address >> 8) as u32),
             register(0x390, ((scanout_address >> 40) & 0xff) as u32),
             register(0x31c, (10 << 2) | (4 << 8)),

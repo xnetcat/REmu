@@ -137,8 +137,8 @@ pub(super) fn build_guest_compute_self_test() -> Result<GuestComputeSelfTest, Me
 mod tests {
     use remu_shader::{
         ExportControl, ImageBinding, ImageControl, Instruction, InstructionControl, Opcode,
-        Operand, PixelOutputBinding, PixelOutputKind, Program, ShaderEncoding, ShaderEvaluation,
-        decode_program,
+        Operand, PixelExportFormat, PixelOutputBinding, PixelOutputKind, Program, ShaderEncoding,
+        ShaderEvaluation, decode_program,
     };
     use remu_shader_metal::MetalCompileOptions;
 
@@ -279,6 +279,7 @@ mod tests {
                 guest_slot: 0,
                 host_location: 0,
                 kind: PixelOutputKind::Float,
+                export_format: PixelExportFormat::Abgr32,
             }],
             0,
             0,
@@ -438,6 +439,7 @@ mod tests {
                 guest_slot: 0,
                 host_location: 0,
                 kind: PixelOutputKind::Float,
+                export_format: PixelExportFormat::Abgr32,
             }],
             0,
             0,

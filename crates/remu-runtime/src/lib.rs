@@ -19,11 +19,6 @@ mod ajm_engine;
 mod ampr;
 mod ampr_api;
 mod audio;
-mod dispatch_locks;
-pub(crate) mod event_state;
-mod import_routes;
-mod nid_u64;
-mod path_roots;
 pub use audio::{HostAudioInfo, probe_host_audio};
 mod audio_out2;
 mod audio_out2_abi;
@@ -268,7 +263,7 @@ pub(crate) use guest_sync::{GUEST_SYNC, GuestSyncState};
 pub(crate) use guest_sync::{
     dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import,
 };
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "macos", target_arch = "x86_64")))]
 pub(crate) use guest_sync::{
     guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock, guest_rwlock_unlock,
 };

@@ -24,9 +24,8 @@ use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_ALREADY_EXISTS, SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NOT_DIRECTORY, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_PERMISSION_DENIED,
-    SCE_KERNEL_STAT_SIZE, low_i32, low_u32, read_guest_cstring, sce_kernel_error,
-    sce_kernel_io_error, signed_i32_return, trace_guest_vfs, trace_guest_vfs_miss,
-    write_guest_bytes, write_guest_u64,
+    SCE_KERNEL_STAT_SIZE, low_i32, read_guest_cstring, sce_kernel_error, sce_kernel_io_error,
+    signed_i32_return, trace_guest_vfs, trace_guest_vfs_miss, write_guest_bytes, write_guest_u64,
 };
 
 pub(crate) static KERNEL_FILES: OnceLock<Mutex<KernelFileState>> = OnceLock::new();
