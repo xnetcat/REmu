@@ -342,6 +342,37 @@ pub(super) fn decode_texture(binding: &ImageBinding) -> Result<DecodedTexture, S
     })
 }
 
+/// Decodes the GFX10 image SRD destination selectors (DWORD3 bits 11:0).
+///
+/// AMD assigns 0/1 to constant zero/one and 4..=7 to the resource's RGBA components. Null SRDs
+/// keep the backend's historical identity mapping; their synthetic zero-filled resource still
+/// returns zero for every channel.
+pub(super) fn decode_texture_component_selectors(
+    binding: &ImageBinding,
+) -> Result<[u32; 4], String> {
+    if binding.resource_descriptor.iter().all(|word| *word == 0) {
+        return Ok([4, 5, 6, 7]);
+    }
+    let word = binding.resource_descriptor.get(3).copied().ok_or_else(|| {
+        format!(
+            "image descriptor at PC {:#x} has fewer than four dwords",
+            binding.pc
+        )
+    })?;
+    let selectors = std::array::from_fn(|component| (word >> (component * 3)) & 7);
+    if let Some(selector) = selectors
+        .iter()
+        .copied()
+        .find(|selector| !matches!(selector, 0 | 1 | 4..=7))
+    {
+        return Err(format!(
+            "image descriptor at PC {:#x} uses reserved destination selector {selector}",
+            binding.pc
+        ));
+    }
+    Ok(selectors)
+}
+
 fn snapshot_texture_raw(descriptor: DecodedTexture, byte_count: usize) -> Vec<u8> {
     let mut raw = vec![0_u8; byte_count];
     if descriptor.address == 0 {
@@ -1685,12 +1716,56 @@ pub(super) fn decode_dxgi_format(
 mod tests {
     use super::{
         DecodedTexture, copy_linear_to_mip_level, copy_mip_level_to_linear,
-        decode_texture_linear_from_raw, detile_layer, encode_texture_linear_over, mip_chain_layout,
-        mode24_offset, retile_layer, standard_3d_offset_sized,
+        decode_texture_component_selectors, decode_texture_linear_from_raw, detile_layer,
+        encode_texture_linear_over, mip_chain_layout, mode24_offset, retile_layer,
+        standard_3d_offset_sized,
     };
+    use remu_shader::{ImageBinding, ImageControl, Opcode};
     use windows::Win32::Graphics::Dxgi::Common::{
         DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_FLOAT,
     };
+
+    fn image_binding_with_word3(word3: u32) -> ImageBinding {
+        ImageBinding {
+            pc: 0x40,
+            opcode: Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: Vec::new(),
+                vector_data: 0,
+                scalar_resource: 0,
+                scalar_sampler: 0,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: vec![1, 0, 0, word3].into(),
+            sampler_descriptor: Vec::new().into(),
+            mip_level: None,
+        }
+    }
+
+    #[test]
+    fn decodes_gfx10_image_destination_selectors() {
+        let identity = 4 | (5 << 3) | (6 << 6) | (7 << 9);
+        assert_eq!(
+            decode_texture_component_selectors(&image_binding_with_word3(identity)),
+            Ok([4, 5, 6, 7])
+        );
+        let constants_and_reverse = 0 | (1 << 3) | (7 << 6) | (4 << 9);
+        assert_eq!(
+            decode_texture_component_selectors(&image_binding_with_word3(constants_and_reverse)),
+            Ok([0, 1, 7, 4])
+        );
+        let error = decode_texture_component_selectors(&image_binding_with_word3(2))
+            .expect_err("reserved destination selector must fail closed");
+        assert!(error.contains("reserved destination selector 2"), "{error}");
+    }
 
     #[test]
     fn mode5_volume_uses_thick_4k_blocks_and_round_trips() {

@@ -72,7 +72,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
     D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED, D3D12_SAMPLER_DESC,
-    D3D12_SHADER_BYTECODE, D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_SHADER_BYTECODE, D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES,
+    D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_SHADER_RESOURCE_VIEW_DESC_0,
     D3D12_SHADER_VISIBILITY_ALL, D3D12_SRV_DIMENSION_BUFFER, D3D12_SRV_DIMENSION_TEXTURE2D,
     D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SRV_DIMENSION_TEXTURE2DMS,
     D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_DECR_SAT,
@@ -92,10 +93,11 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
-    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16_TYPELESS,
-    DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
-    DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G8X24_TYPELESS,
-    DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10A2_UNORM,
+    DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT,
+    DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+    DXGI_SAMPLE_DESC,
 };
 use windows::core::{BOOL, Interface};
 
@@ -109,8 +111,9 @@ use crate::process_memory::read_process_memory;
 #[cfg(test)]
 use crate::texture::write_texture_mip_chain;
 use crate::texture::{
-    DecodedTexture, decode_dxgi_format, decode_texture, encode_texture_linear_over,
-    read_texture_linear, read_texture_mip_chain_with_raw, write_texture_linear,
+    DecodedTexture, decode_dxgi_format, decode_texture, decode_texture_component_selectors,
+    encode_texture_linear_over, read_texture_linear, read_texture_mip_chain_with_raw,
+    write_texture_linear,
 };
 
 const MAXIMUM_GLOBAL_BUFFER_BYTES: usize = 512 * 1024 * 1024;
@@ -590,6 +593,8 @@ struct ComputeResources {
 #[derive(Clone)]
 struct TextureResource {
     descriptor: DecodedTexture,
+    view_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    component_mapping: u32,
     gpu: ID3D12Resource,
     upload: ID3D12Resource,
     readback: Option<ID3D12Resource>,
@@ -4021,6 +4026,11 @@ fn create_stage_resources(
         .map(|binding| {
             let binding = binding.ok_or("non-dense canonical texture slots")?;
             let descriptor = decode_texture(binding)?;
+            let component_selectors = if descriptor.writable {
+                [4, 5, 6, 7]
+            } else {
+                decode_texture_component_selectors(binding)?
+            };
             if !excluded_target_addresses.contains(&descriptor.address)
                 && let Some(target) = resident_targets
                     .get(&descriptor.address)
@@ -4032,9 +4042,16 @@ fn create_stage_resources(
                         descriptor.address, descriptor.width, descriptor.height
                     );
                 }
-                Ok(create_resident_render_target_texture(target, descriptor))
+                create_resident_render_target_texture(target, descriptor, component_selectors)
             } else {
-                create_or_reuse_sampled_texture(device, descriptor, sampled_texture_cache)
+                let mut resource =
+                    create_or_reuse_sampled_texture(device, descriptor, sampled_texture_cache)?;
+                resource.component_mapping = texture_component_mapping(
+                    descriptor.format,
+                    resource.view_format,
+                    component_selectors,
+                )?;
+                Ok(resource)
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -5250,12 +5267,55 @@ fn render_target_can_alias_texture(target: &RenderTargetResource, texture: Decod
         && texture.height == render.height
         && texture.pitch == render.pitch
         && texture.tile_mode == render.tile_mode
-        && texture.format == render.format
+        && texture_format_component_remap(texture.format, render.format).is_some()
         && texture.bytes_per_element == render.bytes_per_element
         && texture.block_extent == render.block_extent
         && texture.texture_type == render.texture_type
         && texture.layer_count == render.layer_count
         && texture.mip_level_count == render.mip_level_count
+}
+
+/// Returns the texture's logical RGBA components as indices in the typed D3D12 resource view.
+///
+/// DXGI's RGBA8 and BGRA8 formats have identical element size and numeric behavior but belong to
+/// different typed format families. A resident render target therefore keeps its exact format,
+/// while the SRV component mapping reverses R/B when the guest image descriptor names the other
+/// channel order. Formats with different numeric or sRGB behavior remain incompatible.
+fn texture_format_component_remap(
+    logical_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    view_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> Option<[u32; 4]> {
+    if logical_format == view_format {
+        return Some([0, 1, 2, 3]);
+    }
+    match (logical_format, view_format) {
+        (DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM)
+        | (DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM)
+        | (DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+        | (DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) => Some([2, 1, 0, 3]),
+        _ => None,
+    }
+}
+
+fn texture_component_mapping(
+    logical_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    view_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    selectors: [u32; 4],
+) -> Result<u32, String> {
+    let remap = texture_format_component_remap(logical_format, view_format).ok_or_else(|| {
+        format!("texture format {logical_format:?} cannot use resident D3D12 view {view_format:?}")
+    })?;
+    let mut encoded = D3D12_SHADER_COMPONENT_MAPPING_ALWAYS_SET_BIT_AVOIDING_ZEROMEM_MISTAKES;
+    for (component, selector) in selectors.into_iter().enumerate() {
+        let source = match selector {
+            0 => 4,
+            1 => 5,
+            4..=7 => remap[(selector - 4) as usize],
+            _ => return Err(format!("reserved texture destination selector {selector}")),
+        };
+        encoded |= source << (component * 3);
+    }
+    Ok(encoded)
 }
 
 fn evaluation_requires_render_target_publication(
@@ -5419,9 +5479,17 @@ fn compute_requires_render_target_publication(
 fn create_resident_render_target_texture(
     target: &RenderTargetResource,
     descriptor: DecodedTexture,
-) -> TextureResource {
-    TextureResource {
+    component_selectors: [u32; 4],
+) -> Result<TextureResource, String> {
+    let view_format = target.target.descriptor.format;
+    Ok(TextureResource {
         descriptor,
+        view_format,
+        component_mapping: texture_component_mapping(
+            descriptor.format,
+            view_format,
+            component_selectors,
+        )?,
         gpu: target.gpu.clone(),
         upload: target.upload.clone(),
         readback: None,
@@ -5431,7 +5499,7 @@ fn create_resident_render_target_texture(
         packed_byte_count: target.slice_pitch,
         source: TextureResourceSource::ResidentRenderTarget,
         writeback: None,
-    }
+    })
 }
 
 fn refresh_render_target_upload(target: &RenderTargetResource) -> Result<(), String> {
@@ -5457,6 +5525,8 @@ fn record_render_target_upload(
     let upload_target = target.resolve.as_ref().unwrap_or(&target.gpu);
     let proxy = TextureResource {
         descriptor: target.target.descriptor,
+        view_format: target.target.descriptor.format,
+        component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu: upload_target.clone(),
         upload: target.upload.clone(),
         readback: None,
@@ -5549,6 +5619,8 @@ fn record_render_target_readback(
     };
     let proxy = TextureResource {
         descriptor: target.target.descriptor,
+        view_format: target.target.descriptor.format,
+        component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu: copy_source.clone(),
         upload: target.upload.clone(),
         readback: None,
@@ -6916,6 +6988,8 @@ fn create_texture_resource(
     };
     Ok(TextureResource {
         descriptor,
+        view_format: descriptor.format,
+        component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu,
         upload: create_upload_buffer(device, &packed)?,
         readback: descriptor
@@ -7129,12 +7203,13 @@ fn create_texture_view(
             )
         };
         let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: descriptor.format,
+            Format: resource.view_format,
             ViewDimension: dimension,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Shader4ComponentMapping: resource.component_mapping,
             Anonymous: anonymous,
         };
-        // SAFETY: the SRV dimension and format match the immutable resource.
+        // SAFETY: the SRV keeps the resource's typed format and maps guest destination selectors
+        // (including channel-order aliases) onto the shader's RGBA result.
         unsafe { device.CreateShaderResourceView(&resource.gpu, Some(&raw const view), handle) };
     }
     if trace_d3d12_bindings() {
@@ -8234,7 +8309,7 @@ mod tests {
         prepare_ngg_triangle_indices, presentable_bgra, primitive_restart_index,
         regroup_restart_list_indices, resolve_indirect_compute, resolve_indirect_compute_ordered,
         resolve_indirect_draw, snapshot_ordered_global, synthetic_ngg_binding,
-        write_changed_ranges_direct,
+        texture_component_mapping, texture_format_component_remap, write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -8328,6 +8403,49 @@ mod tests {
         assert!(!native_present_format_supported(
             DXGI_FORMAT_R16G16B16A16_FLOAT
         ));
+    }
+
+    #[test]
+    fn maps_guest_rgba_selectors_through_a_typed_bgra_view() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+        };
+
+        assert_eq!(
+            texture_format_component_remap(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM),
+            Some([2, 1, 0, 3])
+        );
+        assert_eq!(
+            texture_component_mapping(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                [4, 5, 6, 7]
+            ),
+            Ok(4_096 | 2 | (1 << 3) | (3 << 9))
+        );
+        assert_eq!(
+            texture_component_mapping(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM,
+                [6, 5, 4, 1]
+            ),
+            Ok(4_096 | (1 << 3) | (2 << 6) | (5 << 9))
+        );
+        assert!(
+            texture_format_component_remap(
+                DXGI_FORMAT_R8G8B8A8_UNORM,
+                DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+            )
+            .is_none()
+        );
+        assert_eq!(
+            texture_format_component_remap(
+                DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+                DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+            ),
+            Some([2, 1, 0, 3])
+        );
     }
 
     #[test]
