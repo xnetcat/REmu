@@ -384,6 +384,13 @@ impl Compiler<'_> {
                         MetalCompileError::InvalidInterface("NGG vertex record is too large".into())
                     })?;
                 source.push_str("    uint remu_lane = WaveGetLaneIndex();\n");
+                if self.split_wave64() {
+                    source.push_str(
+                        "    uint remu_wave_index = remu_thread_index >> 6u;\n\
+                         \x20   uint remu_wave_half = (remu_thread_index >> 5u) & 1u;\n\
+                         \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n",
+                    );
+                }
                 let _ = writeln!(
                     source,
                     "    uint3 remu_group_size = uint3({}u, 1u, 1u);\n    RemuVsOut remu_out = (RemuVsOut)0;\n    remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n    uint remu_meshlet_base = remu_group_id.x * 514u;\n    uint remu_output_group = remu_group_id.y * remu_draw[3] + remu_group_id.x;\n    uint remu_mesh_counts = remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 0u) * 4u, 0xffffffffu);\n    uint remu_mesh_primitive_base = remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 1u) * 4u, 0xffffffffu);\n    uint remu_mesh_input_vertex_count_encoded = remu_mesh_counts & 0xffu;\n    uint remu_mesh_input_primitive_count_encoded = (remu_mesh_counts >> 8u) & 0xffu;\n    uint remu_mesh_input_vertex_count = remu_mesh_input_vertex_count_encoded == 0u ? 256u : remu_mesh_input_vertex_count_encoded;\n    uint remu_mesh_input_primitive_count = remu_mesh_input_primitive_count_encoded == 0u ? 256u : remu_mesh_input_primitive_count_encoded;\n    uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 258u + remu_thread_index) * 4u, 0xffffffffu) : 0x80000000u;\n    if (remu_thread_index == 0u) {{\n        remu_mesh_output_vertex_count = 0u;\n        remu_mesh_output_primitive_count = 0u;\n        uint remu_sentinel_word = (remu_output_group * ({}u + 1u) + {}u) * {}u;\n        [unroll] for (uint remu_word = 0u; remu_word < {}u; ++remu_word) remu_store_u32(remu_mesh_vertices, (remu_sentinel_word + remu_word) * 4u, 0u);\n    }}\n    if (remu_thread_index < {}u) {{\n        uint remu_sentinel = remu_output_group * ({}u + 1u) + {}u;\n        remu_store_u32(remu_mesh_indices, (remu_output_group * {}u * 3u + remu_thread_index * 3u + 0u) * 4u, remu_sentinel);\n        remu_store_u32(remu_mesh_indices, (remu_output_group * {}u * 3u + remu_thread_index * 3u + 1u) * 4u, remu_sentinel);\n        remu_store_u32(remu_mesh_indices, (remu_output_group * {}u * 3u + remu_thread_index * 3u + 2u) * 4u, remu_sentinel);\n    }}\n    GroupMemoryBarrierWithGroupSync();",

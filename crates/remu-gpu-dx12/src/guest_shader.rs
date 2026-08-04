@@ -340,10 +340,16 @@ mod tests {
                 write_back_to_guest: false,
             })
             .collect();
-        let options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
+        let mut options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
+        options.wave_lane_count = 64;
         let shader = translate_guest_shader(&program, &evaluation, &options, [64, 1, 1])
             .expect("NGG stage should lower to a compute fallback");
         assert_eq!(shader.target_profile, "cs_6_6");
+        assert!(
+            shader
+                .source
+                .contains("uint remu_wave_half = (remu_thread_index >> 5u) & 1u;")
+        );
         let dxil = compile_guest_shader(&shader, "remu_guest_ngg_fallback_test.hlsl")
             .expect("generated NGG compute fallback should compile");
         assert!(dxil.len() > 128);

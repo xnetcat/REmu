@@ -352,6 +352,33 @@ fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
             .contains("((remu_thread_index >> 5u) & 0xfu) << 24u"),
         "SIMD32 halves must not leak into the guest-visible merged wave info"
     );
+
+    let mut hlsl_evaluation = empty_evaluation();
+    hlsl_evaluation.global_memory_bindings = (0..4)
+        .map(|index| remu_shader::GlobalMemoryBinding {
+            scalar_address: 0xffff_ff00 + index,
+            base_address: 0,
+            instruction_pcs: Default::default(),
+            byte_count: 4096,
+            data: vec![0; 4096],
+            writable: index >= 2,
+            write_back_to_guest: false,
+        })
+        .collect();
+    let hlsl = compile_hlsl(&program, &hlsl_evaluation, &options, [128, 1, 1])
+        .expect("wave64 NGG compute fallback lowering");
+    assert!(
+        hlsl.source
+            .contains("uint remu_wave_index = remu_thread_index >> 6u;")
+    );
+    assert!(
+        hlsl.source
+            .contains("uint remu_wave_half = (remu_thread_index >> 5u) & 1u;")
+    );
+    assert!(
+        hlsl.source
+            .contains("uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);")
+    );
 }
 
 #[test]
