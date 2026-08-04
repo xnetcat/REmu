@@ -18,7 +18,7 @@ use remu_gpu::{
     PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, PIXEL_PIPE_STAT_COUNTER_PAIRS,
     PIXEL_PIPE_STAT_VALID,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, INFINITE, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
     D3D12_FENCE_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER,
@@ -296,7 +296,7 @@ impl Dx12Renderer {
         validate_frame(frame)?;
         self.ensure_swap_chain(frame.width, frame.height, DXGI_FORMAT_B8G8R8A8_UNORM)?;
         // DXGI requires waiting before every rendered frame, including the first one.
-        if unsafe { WaitForSingleObject(self.frame_latency.0, INFINITE) } != WAIT_OBJECT_0 {
+        if unsafe { WaitForSingleObject(self.frame_latency.0, u32::MAX) } != WAIT_OBJECT_0 {
             return Err("failed waiting for DXGI frame latency".to_owned());
         }
 
