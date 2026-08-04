@@ -477,17 +477,22 @@ impl Compiler<'_> {
             32
         };
         for vgpr in self.graphics_lane_file_vgprs() {
+            let _ = writeln!(source, "    uint remu_v_{vgpr}_lanes[{lane_file_width}];");
             let _ = writeln!(
                 source,
-                "    uint remu_v_{vgpr}_lanes[{lane_file_width}] = {{0}};"
+                "    [unroll] for (uint remu_v_{vgpr}_init = 0u; remu_v_{vgpr}_init < {lane_file_width}u; ++remu_v_{vgpr}_init) remu_v_{vgpr}_lanes[remu_v_{vgpr}_init] = 0u;"
             );
         }
         let slots = self.graphics_addtid_write_slot_count();
         if slots != 0 {
-            let _ = writeln!(source, "    uint remu_addtid_address[{slots}] = {{0}};");
-            let _ = writeln!(source, "    uint remu_addtid_value[{slots}] = {{0}};");
-            let _ = writeln!(source, "    uint remu_addtid_sequence[{slots}] = {{0}};");
-            let _ = writeln!(source, "    bool remu_addtid_valid[{slots}] = {{false}};");
+            let _ = writeln!(source, "    uint remu_addtid_address[{slots}];");
+            let _ = writeln!(source, "    uint remu_addtid_value[{slots}];");
+            let _ = writeln!(source, "    uint remu_addtid_sequence[{slots}];");
+            let _ = writeln!(source, "    bool remu_addtid_valid[{slots}];");
+            let _ = writeln!(
+                source,
+                "    [unroll] for (uint remu_addtid_init = 0u; remu_addtid_init < {slots}u; ++remu_addtid_init) {{ remu_addtid_address[remu_addtid_init] = 0u; remu_addtid_value[remu_addtid_init] = 0u; remu_addtid_sequence[remu_addtid_init] = 0u; remu_addtid_valid[remu_addtid_init] = false; }}"
+            );
             source.push_str("    uint remu_addtid_clock = 0u;\n");
         }
     }

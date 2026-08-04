@@ -83,11 +83,11 @@ use windows::Win32::Graphics::Direct3D12::{
     ID3D12InfoQueue, ID3D12PipelineState, ID3D12Resource, ID3D12RootSignature,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R8G8B8A8_UNORM,
-    DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT,
-    DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT,
-    DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
-    DXGI_SAMPLE_DESC,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+    DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM,
+    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_TYPELESS,
+    DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_UNKNOWN,
+    DXGI_FORMAT_X32_TYPELESS_G8X24_UINT, DXGI_SAMPLE_DESC,
 };
 use windows::core::{BOOL, Interface};
 
@@ -636,6 +636,7 @@ struct DecodedRenderTarget {
     output_kind: remu_shader::PixelOutputKind,
     write_mask: u32,
     sample_count: u32,
+    dcc_enabled: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -661,6 +662,7 @@ struct RenderTargetResource {
     write_watch: remu_memory::CpuWriteWatch,
     presentable_linear: Option<Vec<u8>>,
     upload_required: bool,
+    initial_clear: Option<[f32; 4]>,
     pending_writeback: bool,
 }
 
@@ -1248,11 +1250,11 @@ impl Dx12GuestExecutor {
                 {
                     resource.target = target;
                     let cpu_dirty = resource.write_watch.consume_dirty();
-                    if resource.pending_writeback && cpu_dirty {
+                    if cpu_dirty && (resource.pending_writeback || target.dcc_enabled) {
                         // The guest has taken ownership of this allocation after the native draw
                         // completed. Discard the now-obsolete resident image and recreate it from
-                        // the CPU-authored bytes in COPY_DEST state; trying to merge two complete
-                        // color surfaces would preserve neither ordering nor contents.
+                        // the CPU-authored bytes. DCC changes cannot be decoded as ordinary tiled
+                        // pixels, so those are conservatively rematerialized by the same path.
                         create_render_target_resource(&self.device, target)?
                     } else {
                         resource.upload_required = cpu_dirty;
@@ -1301,7 +1303,7 @@ impl Dx12GuestExecutor {
         if let Some(resources) = &pixel_resources {
             record_stage_uploads(&commands, resources);
         }
-        for target in &targets {
+        for target in &mut targets {
             record_render_target_upload(&commands, target);
         }
         if let Some(depth) = &depth {
@@ -3777,6 +3779,7 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
             output_kind: remu_shader::PixelOutputKind::Float,
             write_mask: mask,
             sample_count: 1,
+            dcc_enabled: false,
         }]);
     }
     let target_mask = register_value(&draw.context_registers, 0x08e).unwrap_or_default();
@@ -3808,18 +3811,20 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
             ));
         }
         let sample_count = 1_u32 << sample_log2;
-        if info & ((1 << 14) | (1 << 28)) != 0 {
-            return Err("FMASK/DCC guest render targets require metadata decompression".to_owned());
+        let fast_clear_enabled = info & (1 << 13) != 0;
+        let fmask_compression_enabled = info & (1 << 14) != 0;
+        let dcc_enabled = info & (1 << 28) != 0;
+        if fast_clear_enabled || fmask_compression_enabled {
+            return Err(format!(
+                "color target {slot} requires fast-clear/FMASK metadata handling info={info:#010x} fast_clear={fast_clear_enabled} fmask={fmask_compression_enabled} dcc={dcc_enabled} samples={sample_count}"
+            ));
         }
         let data_format = (info >> 2) & 0x1f;
         let number_format = (info >> 8) & 7;
         let component_swap = (info >> 11) & 3;
-        let (mut format, bytes, block_extent) = decode_dxgi_format(data_format, number_format)?;
-        if data_format == 10 && component_swap == 1 && number_format == 0 {
-            format = DXGI_FORMAT_B8G8R8A8_UNORM;
-        } else if component_swap != 0 {
-            return Err(format!("unsupported color component swap {component_swap}"));
-        }
+        let (format, bytes, block_extent) =
+            decode_render_target_format(data_format, number_format, component_swap)
+                .map_err(|error| format!("color target {slot} {error}"))?;
         let tile_mode = (attrib3 >> 14) & 0x1f;
         if !matches!(tile_mode, 0 | 27) {
             return Err(format!("unsupported color-target tile mode {tile_mode}"));
@@ -3854,9 +3859,38 @@ fn decode_render_targets(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>,
             output_kind,
             write_mask,
             sample_count,
+            dcc_enabled,
         });
     }
     Ok(targets)
+}
+
+fn decode_render_target_format(
+    data_format: u32,
+    number_format: u32,
+    component_swap: u32,
+) -> Result<
+    (
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+        u32,
+        [u32; 2],
+    ),
+    String,
+> {
+    let (mut format, bytes, block_extent) = decode_dxgi_format(data_format, number_format)?;
+    match (data_format, number_format, component_swap) {
+        (10, 0, 1) => format = DXGI_FORMAT_B8G8R8A8_UNORM,
+        (10, 6, 1) => format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+        // Gen5 commonly uses ALT on RGBA16_FLOAT attachments. DXGI has no BGRA16_FLOAT
+        // format, and the guest shader export is already in logical component order.
+        (12, 7, 1) | (_, _, 0) => {}
+        _ => {
+            return Err(format!(
+                "has unsupported component swap {component_swap} for data format {data_format} number format {number_format}"
+            ));
+        }
+    }
+    Ok((format, bytes, block_extent))
 }
 
 fn decode_depth_target(draw: &IndexedDraw) -> Result<Option<DecodedDepthTarget>, String> {
@@ -4388,16 +4422,28 @@ fn create_render_target_resource(
     } else {
         None
     };
-    let linear = read_texture_linear(descriptor)?;
     let row_bytes = descriptor.width as usize * descriptor.bytes_per_element as usize;
     let row_pitch = align_up(row_bytes, 256)?;
     let slice_pitch = row_pitch
         .checked_mul(descriptor.height as usize)
         .ok_or("render-target footprint overflows")?;
     let mut packed = vec![0_u8; slice_pitch];
-    for row in 0..descriptor.height as usize {
-        packed[row * row_pitch..row * row_pitch + row_bytes]
-            .copy_from_slice(&linear[row * row_bytes..(row + 1) * row_bytes]);
+    let initial_clear = initial_render_target_clear(target);
+    if initial_clear.is_none() {
+        let linear = read_texture_linear(descriptor)?;
+        for row in 0..descriptor.height as usize {
+            packed[row * row_pitch..row * row_pitch + row_bytes]
+                .copy_from_slice(&linear[row * row_bytes..(row + 1) * row_bytes]);
+        }
+    } else {
+        static MATERIALIZED_DCC_TARGETS: AtomicUsize = AtomicUsize::new(0);
+        let sequence = MATERIALIZED_DCC_TARGETS.fetch_add(1, Ordering::Relaxed) + 1;
+        if sequence <= 16 || sequence.is_power_of_two() {
+            eprintln!(
+                "[REMu][D3D12] materializing DCC color target {} at {:#x} as uncompressed native storage sequence={sequence}",
+                target.guest_slot, descriptor.address
+            );
+        }
     }
     let rtv_description = D3D12_DESCRIPTOR_HEAP_DESC {
         Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
@@ -4518,9 +4564,18 @@ fn create_render_target_resource(
         slice_pitch,
         write_watch,
         presentable_linear: None,
-        upload_required: true,
+        upload_required: initial_clear.is_none(),
+        initial_clear,
         pending_writeback: false,
     })
+}
+
+fn initial_render_target_clear(target: DecodedRenderTarget) -> Option<[f32; 4]> {
+    // DCC backing bytes cannot be decoded as the uncompressed image represented by a D3D12
+    // render target. Preserve an existing resident resource elsewhere; on first materialization,
+    // discard the compressed contents deterministically instead of interpreting metadata as
+    // pixels. This matches the conservative cross-platform policy used by the Metal backend.
+    target.dcc_enabled.then_some([0.0, 0.0, 0.0, 1.0])
 }
 
 fn render_target_resource_compatible(
@@ -4754,7 +4809,7 @@ fn refresh_render_target_upload(target: &RenderTargetResource) -> Result<(), Str
 
 fn record_render_target_upload(
     commands: &ID3D12GraphicsCommandList,
-    target: &RenderTargetResource,
+    target: &mut RenderTargetResource,
 ) {
     if target.pending_writeback {
         debug_assert!(!target.upload_required);
@@ -4795,6 +4850,12 @@ fn record_render_target_upload(
             D3D12_RESOURCE_STATE_RENDER_TARGET
         },
     );
+    if let Some(clear) = target.initial_clear.take() {
+        let rtv = unsafe { target.rtv_heap.GetCPUDescriptorHandleForHeapStart() };
+        // SAFETY: the target has just transitioned to render-target state and the descriptor
+        // belongs to this resource. A full clear is the defined first-use DCC materialization.
+        unsafe { commands.ClearRenderTargetView(rtv, &clear, None) };
+    }
 }
 
 fn record_render_target_readback(
@@ -7484,8 +7545,10 @@ mod tests {
     };
 
     use super::{
-        D3D12_MIP_LOD_BIAS_MAX, Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites,
-        decode_sampler, dispatch_group_count, expand_primitive_indices, indirect_draw_count_allows,
+        D3D12_MIP_LOD_BIAS_MAX, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
+        DecodedRenderTarget, DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions,
+        WritebackJournalSites, decode_render_target_format, decode_sampler, dispatch_group_count,
+        expand_primitive_indices, indirect_draw_count_allows, initial_render_target_clear,
         presentable_bgra, primitive_restart_index, regroup_restart_list_indices,
         resolve_indirect_compute, resolve_indirect_compute_ordered, resolve_indirect_draw,
         snapshot_ordered_global, write_changed_ranges_direct,
@@ -7543,6 +7606,50 @@ mod tests {
         assert_eq!(sampler.MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
         assert_eq!(sampler.MinLOD, min_lod_raw as f32 / 256.0);
         assert_eq!(sampler.MaxLOD, sampler.MinLOD);
+    }
+
+    #[test]
+    fn dcc_first_use_discards_compressed_bytes_with_a_deterministic_clear() {
+        let mut target = DecodedRenderTarget {
+            guest_slot: 0,
+            descriptor: DecodedTexture {
+                address: 0x10_000,
+                width: 64,
+                height: 64,
+                pitch: 64,
+                tile_mode: 27,
+                format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                bytes_per_element: 4,
+                block_extent: [1, 1],
+                texture_type: 9,
+                layer_count: 1,
+                mip_level_count: 1,
+                writable: true,
+            },
+            output_kind: remu_shader::PixelOutputKind::Float,
+            write_mask: 0xf,
+            sample_count: 1,
+            dcc_enabled: false,
+        };
+        assert_eq!(initial_render_target_clear(target), None);
+
+        target.dcc_enabled = true;
+        assert_eq!(
+            initial_render_target_clear(target),
+            Some([0.0, 0.0, 0.0, 1.0])
+        );
+    }
+
+    #[test]
+    fn decodes_gen5_alt_render_target_formats_used_by_poppy() {
+        let (bgra_srgb, bytes, _) = decode_render_target_format(10, 6, 1)
+            .expect("ALT RGBA8_SRGB should select the DXGI BGRA view");
+        assert_eq!(bgra_srgb, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+        assert_eq!(bytes, 4);
+
+        let (_, bytes, _) = decode_render_target_format(12, 7, 1)
+            .expect("ALT RGBA16_FLOAT keeps logical shader export order");
+        assert_eq!(bytes, 8);
     }
 
     #[test]

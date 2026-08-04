@@ -136,8 +136,8 @@ pub(super) fn build_guest_compute_self_test() -> Result<GuestComputeSelfTest, Me
 #[cfg(test)]
 mod tests {
     use remu_shader::{
-        ImageBinding, ImageControl, Instruction, InstructionControl, Opcode, Operand,
-        PixelOutputBinding, PixelOutputKind, Program, ShaderEncoding, ShaderEvaluation,
+        ExportControl, ImageBinding, ImageControl, Instruction, InstructionControl, Opcode,
+        Operand, PixelOutputBinding, PixelOutputKind, Program, ShaderEncoding, ShaderEvaluation,
         decode_program,
     };
     use remu_shader_metal::MetalCompileOptions;
@@ -255,6 +255,64 @@ mod tests {
         let pixel_dxil = compile_guest_shader(&pixel, "remu_guest_pixel_test.hlsl")
             .expect("generated pixel HLSL should compile");
         assert!(pixel_dxil.len() > 128);
+    }
+
+    #[test]
+    fn pixel_private_lane_file_initialization_compiles_to_dxil() {
+        let program = Program::new(
+            0x3800,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vop3,
+                    opcode: Opcode::Known("VWritelaneB32"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::scalar(2), Operand::scalar(4)],
+                    destinations: vec![Operand::vector(12)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Vop3,
+                    opcode: Opcode::Known("VReadlaneB32"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::vector(12), Operand::scalar(4)],
+                    destinations: vec![Operand::scalar(8)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 16,
+                    encoding: ShaderEncoding::Exp,
+                    opcode: Opcode::EXPORT,
+                    words: vec![0, 0],
+                    sources: (0..4).map(Operand::vector).collect(),
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::Export(ExportControl {
+                        target: 0,
+                        enable_mask: 0xf,
+                        compressed: false,
+                        done: true,
+                        valid_mask: true,
+                    })),
+                },
+            ],
+        );
+        let options = MetalCompileOptions::pixel(
+            vec![PixelOutputBinding {
+                guest_slot: 0,
+                host_location: 0,
+                kind: PixelOutputKind::Float,
+            }],
+            0,
+            0,
+        );
+        let shader = translate_guest_shader(&program, &empty_evaluation([]), &options, [1, 1, 1])
+            .expect("pixel lane-file program should lower");
+        assert!(shader.source.contains("uint remu_v_12_lanes[32];"));
+        assert!(shader.source.contains("remu_v_12_init < 32u"));
+        let dxil = compile_guest_shader(&shader, "remu_guest_pixel_lane_file_test.hlsl")
+            .expect("pixel lane-file HLSL should compile");
+        assert!(dxil.len() > 128);
     }
 
     #[test]

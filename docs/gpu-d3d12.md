@@ -53,10 +53,10 @@ Implemented and physically validated on the development host:
   causes DXIL stage-link register mismatches on D3D12.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
   primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
-  current D3D12 crate has 47 passing tests on the GTX 1050.
+  current D3D12 crate has 50 passing tests on the GTX 1050.
 
-This is a playable vertical slice for one tested title, not yet a broad playability claim. The major remaining work is listed below: guest FMASK/DCC
-metadata and persistent multisample/depth-resource identity; NGG/mesh fallback for devices without mesh
+This is a playable vertical slice for one tested title, not yet a broad playability claim. The major remaining work is listed below: guest FMASK and full DCC
+metadata coherence plus persistent multisample/depth-resource identity; NGG/mesh fallback for devices without mesh
 shaders; patch/rectangle/triangle-with-flags edge semantics; mipped arrays/3D and writable-mip UAVs;
 cross-draw submission batching and resource retirement; DRED/debug-layer capture; and
 broader title validation.
@@ -182,8 +182,9 @@ That forwarding produces the intended counter `0x2428` and indirect triplet `[0x
 instead of the recycled `0x18003fff` sentinel. A physical GTX 1050 regression recreates the exact
 five-thread formatted-buffer expansion into a 65,532-byte UAV and verifies all five triplets.
 Poppy then reaches compute 196 with the correct 9,256-group X dimension. It is not playable yet:
-the next blocking graphics feature is guest FMASK/DCC metadata handling, and current per-draw/
-dispatch fencing still makes this workload much too slow for interactive use. Per-format
+the next blocking graphics feature is an NGG export using LDS/barriers on a device with no mesh
+shader tier, and current per-draw/dispatch fencing still makes this workload much too slow for
+interactive use. Per-format
 `D3D12_FEATURE_DATA_FORMAT_SUPPORT` checks confirm that this adapter advertises the required typed
 UAV store support.
 
@@ -197,6 +198,17 @@ descriptor. With this translation, the GTX 1050 submitted compute 196 as `[9256,
 compute 197, remained available, and continued processing until the bounded 50-second test ended.
 Trace-mode descriptor creation also checks removal immediately after every texture and sampler view
 so future void-API failures are attributed to the exact descriptor.
+
+The following graphics capture proved that Poppy's formerly rejected targets are single-sample DCC
+(`fast_clear=0`, `fmask=0`, `dcc=1`), not FMASK. The DX12 path now follows the same conservative
+policy as Metal: compressed first-use bytes are never reinterpreted as pixels; a deterministic clear
+materializes uncompressed native storage, which is then retained across draws. CPU ownership changes
+force rematerialization. This is enough for the observed DCC-only RGBA16F target, while actual FMASK
+and fast-clear metadata remain explicit work rather than silent corruption. The same capture added
+Gen5 ALT mappings for BGRA8 sRGB and RGBA16F render targets. It also exposed an HLSL-only bug in the
+pixel private-lane tables: DXC rejects a one-element initializer for a 32-element local array. The
+generator now explicitly initializes every lane and ADDTID spill record, with a physical DXIL
+regression for Poppy's `V_WRITELANE`/`V_READLANE` pattern.
 
 Device removal is terminal. The presenter emits one bounded DRED report and exits immediately;
 it no longer consumes queued work, reports cascaded failures, or retires fake submissions/flips.
@@ -331,8 +343,9 @@ disposable hardware, because deliberately triggering a TDR on a working desktop 
 
 1. Extend the completed ordered single/multi indirect draw/dispatch and primitive normalization
    paths to patch, triangle-with-flags, and rectangle-specific edge semantics.
-2. Move the completed transient color/depth/stencil MSAA paths into persistent resources and add
-   guest FMASK/DCC metadata decompression plus explicit guest resolve-packet semantics.
+2. Move the completed transient color/depth/stencil MSAA paths into persistent resources and extend
+   conservative DCC materialization to full guest FMASK/DCC metadata coherence plus explicit guest
+   resolve-packet semantics.
 3. Add a non-mesh-shader NGG fallback for the GTX 1050 (`mesh_shader_tier=0`) and validate it
    against the existing shared compiler corpus.
 4. Extend the persistent single-sample color cache to depth/MSAA/shader resources and replace
