@@ -8,6 +8,16 @@ use super::*;
 use crate::ComputeSystemRegisters;
 
 #[test]
+fn structural_rescue_revisits_states_seen_during_exact_evaluation() {
+    let mut visited = VisitedPaths::new();
+
+    assert!(visited.insert((0x40, 0x1234, false)));
+    assert!(!visited.insert((0x40, 0x1234, false)));
+    assert!(visited.insert((0x40, 0x1234, true)));
+    assert!(!visited.insert((0x40, 0x1234, true)));
+}
+
+#[test]
 fn preserves_initial_image_descriptors_for_statically_inactive_blocks() {
     let image = ImageControl {
         dmask: 0xf,
@@ -233,6 +243,7 @@ fn detects_a_non_unit_scalar_recurrence_in_constant_space() {
         exec_mask: RDNA_WAVE_MASK,
         scalar_condition: false,
         supplemental: false,
+        structural_rescue: false,
         backward_branch_visits: SmallVec::new(),
         backward_branch_recurrences: SmallVec::new(),
     };
@@ -372,6 +383,226 @@ fn compute_resource_discovery_degrades_to_a_finite_loop_hint_at_its_step_limit()
     )
     .expect("compute discovery should defer termination to the HLSL watchdog");
 
+    assert_eq!(
+        evaluation
+            .compute_system_registers
+            .expect("compute loop hints")
+            .maximum_evaluated_scalar_loop_iterations,
+        u32::MAX
+    );
+}
+
+#[test]
+fn compute_structural_pass_recovers_descriptors_from_an_inactive_scc_arm() {
+    let mut skip_inactive_arm = instruction(
+        4,
+        ShaderEncoding::Sopp,
+        "SCbranchScc1",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    skip_inactive_arm.words[0] = 6; // pc 4 + 4 + 6*4 = pc 32
+    let scalar_load = |pc, destination, count, offset| {
+        instruction(
+            pc,
+            ShaderEncoding::Smem,
+            if count == 8 {
+                "SLoadDwordx8"
+            } else {
+                "SLoadDwordx4"
+            },
+            vec![Operand::scalar(0)],
+            (destination..destination + count)
+                .map(Operand::scalar)
+                .collect(),
+            Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                destination_count: count,
+                immediate_offset_bytes: offset,
+                dynamic_offset_register: None,
+            })),
+        )
+    };
+    let image = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1],
+        vector_data: 4,
+        scalar_resource: 16,
+        scalar_sampler: 28,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let mut user_data = vec![0_u32; 21];
+    user_data[0] = 0x2000;
+    user_data[20] = 1;
+    let mut shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sopk,
+                "SCmpkEqI32",
+                vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 1,
+                }],
+                vec![Operand::scalar(20)],
+                None,
+            ),
+            skip_inactive_arm,
+            scalar_load(8, 16, 8, 0),
+            scalar_load(16, 28, 4, 32),
+            instruction(
+                24,
+                ShaderEncoding::Mimg,
+                "ImageSampleLz",
+                Vec::new(),
+                Vec::new(),
+                Some(InstructionControl::Image(image)),
+            ),
+            end(32),
+        ],
+        user_data,
+    );
+    shader.compute_system_registers = Some(ComputeSystemRegisters::default());
+    let mut memory = TestMemory::default();
+    let descriptors = (1_u32..=12).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    memory.write(0x2000, &descriptors);
+
+    let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+        .expect("structural pass should enter the inactive SCC arm");
+
+    assert_eq!(evaluation.image_bindings.len(), 1);
+    assert_eq!(
+        evaluation.image_bindings[0].resource_descriptor.as_slice(),
+        (1..=8).collect::<Vec<_>>().as_slice()
+    );
+    assert_eq!(
+        evaluation.image_bindings[0].sampler_descriptor.as_slice(),
+        (9..=12).collect::<Vec<_>>().as_slice()
+    );
+}
+
+#[test]
+fn compute_step_limit_rescue_executes_descriptor_loads_after_a_long_scalar_loop() {
+    let mut exit = instruction(
+        4,
+        ShaderEncoding::Sopp,
+        "SCbranchScc0",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    exit.words[0] = 3; // pc 4 + 4 + 3*4 = pc 20
+    let mut back_edge = instruction(
+        12,
+        ShaderEncoding::Sopp,
+        "SBranch",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    back_edge.words[0] = u32::from((-4_i16).cast_unsigned());
+    let scalar_load = |pc, destination, count, offset| {
+        instruction(
+            pc,
+            ShaderEncoding::Smem,
+            if count == 8 {
+                "SLoadDwordx8"
+            } else {
+                "SLoadDwordx4"
+            },
+            vec![Operand::scalar(0)],
+            (destination..destination + count)
+                .map(Operand::scalar)
+                .collect(),
+            Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                destination_count: count,
+                immediate_offset_bytes: offset,
+                dynamic_offset_register: None,
+            })),
+        )
+    };
+    let image = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1],
+        vector_data: 4,
+        scalar_resource: 16,
+        scalar_sampler: 28,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let mut user_data = vec![0_u32; 22];
+    user_data[0] = 0x2000;
+    user_data[21] = 100;
+    let mut shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sopc,
+                "SCmpLtU32",
+                vec![Operand::scalar(20), Operand::scalar(21)],
+                Vec::new(),
+                None,
+            ),
+            exit,
+            instruction(
+                8,
+                ShaderEncoding::Sop2,
+                "SAddU32",
+                vec![
+                    Operand::scalar(20),
+                    Operand {
+                        kind: OperandKind::LiteralConstant,
+                        value: 1,
+                    },
+                ],
+                vec![Operand::scalar(20)],
+                None,
+            ),
+            back_edge,
+            scalar_load(20, 16, 8, 0),
+            scalar_load(28, 28, 4, 32),
+            instruction(
+                36,
+                ShaderEncoding::Mimg,
+                "ImageSampleLz",
+                Vec::new(),
+                Vec::new(),
+                Some(InstructionControl::Image(image)),
+            ),
+            end(44),
+        ],
+        user_data,
+    );
+    shader.compute_system_registers = Some(ComputeSystemRegisters::default());
+    let mut memory = TestMemory::default();
+    let descriptors = (1_u32..=12).flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    memory.write(0x2000, &descriptors);
+
+    let evaluation = evaluate_shader_within(&memory, &shader, EvaluationOptions::default(), 6)
+        .expect("compute rescue should walk descriptor loads after the scalar loop");
+
+    assert_eq!(evaluation.image_bindings.len(), 1);
+    assert_eq!(
+        evaluation.image_bindings[0].resource_descriptor.as_slice(),
+        (1..=8).collect::<Vec<_>>().as_slice()
+    );
+    assert_eq!(
+        evaluation.image_bindings[0].sampler_descriptor.as_slice(),
+        (9..=12).collect::<Vec<_>>().as_slice()
+    );
     assert_eq!(
         evaluation
             .compute_system_registers
