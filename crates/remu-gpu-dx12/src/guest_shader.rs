@@ -224,6 +224,15 @@ mod tests {
             vec![
                 Instruction {
                     pc: 0,
+                    encoding: ShaderEncoding::Vopc,
+                    opcode: Opcode::Known("VCmpEqU32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(1), Operand::vector(2)],
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
                     encoding: ShaderEncoding::Vop1,
                     opcode: Opcode::Known("VReadfirstlaneB32"),
                     words: vec![0],
@@ -232,7 +241,7 @@ mod tests {
                     control: None,
                 },
                 Instruction {
-                    pc: 4,
+                    pc: 8,
                     encoding: ShaderEncoding::Sopp,
                     opcode: Opcode::END_PROGRAM,
                     words: vec![0xbf81_0000],
@@ -250,6 +259,16 @@ mod tests {
 
         assert!(translated.source.contains("[WaveSize(32)]"));
         assert!(translated.source.contains("[numthreads(64, 1, 1)]"));
+        assert!(
+            translated
+                .source
+                .contains("groupshared uint remu_wave64_ballot_words[32]")
+        );
+        assert!(
+            translated
+                .source
+                .contains("remu_wave64_ballot(t0, remu_wave_index, remu_wave_half)")
+        );
         let dxil = compile_guest_shader(&translated, "remu_guest_wave64_isolation_test.hlsl")
             .expect("isolated split-wave HLSL should compile to DXIL");
         assert!(dxil.len() > 128, "DXIL container should not be empty");

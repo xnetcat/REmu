@@ -183,6 +183,41 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
 }
 
 #[test]
+fn isolated_hlsl_wave64_compares_share_both_ballot_halves() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vopc,
+            opcode: Opcode::Known("VCmpEqU32"),
+            words: vec![0],
+            sources: vec![Operand::vector(1), Operand::vector(2)],
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let mut options = MetalCompileOptions::compute_wave(0, 64);
+    options.hlsl_wave64_group_isolation_axis = Some(0);
+    let shader = compile_hlsl(&program, &empty_evaluation(), &options, [16, 16, 1])
+        .expect("isolated wave64 compare should lower");
+
+    assert!(
+        shader
+            .source
+            .contains("groupshared uint remu_wave64_ballot_words[32]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint2 remu_wave64_ballot(bool condition")
+    );
+    assert!(shader.source.contains("remu_s_106 = remu_wave64_ballot(t"));
+    assert!(shader.source.contains("remu_wave_index, remu_wave_half).x"));
+    assert!(shader.source.contains("remu_wave_index, remu_wave_half).y"));
+    assert!(shader.source.contains("GroupMemoryBarrierWithGroupSync()"));
+}
+
+#[test]
 fn wave32_mesh_vcmp_into_s2_preserves_packed_s3_wave_fields() {
     let program = Program::new(
         0x1000,

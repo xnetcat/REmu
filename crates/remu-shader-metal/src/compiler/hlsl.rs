@@ -126,6 +126,7 @@ impl Compiler<'_> {
             );
         }
         if self.split_wave64() {
+            source.push_str("groupshared uint remu_wave64_ballot_words[32];\n");
             if self
                 .program
                 .instructions
@@ -149,7 +150,7 @@ impl Compiler<'_> {
             }
             source.push('\n');
         }
-        emit_hlsl_prelude(&mut source, lds_words.is_some());
+        emit_hlsl_prelude(&mut source, lds_words.is_some(), self.split_wave64());
         if self.options.stage == MetalShaderStage::Mesh {
             let _ = writeln!(
                 source,
@@ -887,7 +888,7 @@ fn translate_format_prelude(mut source: String) -> String {
     translate_common_source(source)
 }
 
-fn emit_hlsl_prelude(source: &mut String, uses_lds: bool) {
+fn emit_hlsl_prelude(source: &mut String, uses_lds: bool, split_wave64: bool) {
     source.push_str(
         r"uint remu_clz(uint value) {
     return value == 0u ? 32u : 31u - (uint)firstbithigh(value);
@@ -1125,6 +1126,20 @@ uint remu_atomic_dec(uint descriptor, uint offset, uint limit) {
 
 ",
     );
+    if split_wave64 {
+        source.push_str(
+            r"uint2 remu_wave64_ballot(bool condition, uint wave_index, uint wave_half) {
+    uint local = (uint)simd_ballot(condition);
+    uint slot = (wave_index << 1u) | wave_half;
+    if (WaveGetLaneIndex() == 0u) remu_wave64_ballot_words[slot] = local;
+    GroupMemoryBarrierWithGroupSync();
+    uint base = wave_index << 1u;
+    return uint2(remu_wave64_ballot_words[base], remu_wave64_ballot_words[base + 1u]);
+}
+
+",
+        );
+    }
     if uses_lds {
         source.push_str(
             r"uint remu_lds_load(uint index) {

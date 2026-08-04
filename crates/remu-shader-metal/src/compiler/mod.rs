@@ -249,6 +249,11 @@ impl Compiler<'_> {
     fn ballot_words(&self, condition: &str) -> (String, String) {
         let ballot = Self::ballot(condition);
         if self.split_wave64() {
+            if self.is_hlsl() && self.options.hlsl_wave64_group_isolation_axis.is_some() {
+                let synchronized =
+                    format!("remu_wave64_ballot({condition}, remu_wave_index, remu_wave_half)");
+                return (format!("{synchronized}.x"), format!("{synchronized}.y"));
+            }
             (
                 format!("remu_wave_half == 0u ? {ballot} : 0u"),
                 format!("remu_wave_half == 0u ? 0u : {ballot}"),
