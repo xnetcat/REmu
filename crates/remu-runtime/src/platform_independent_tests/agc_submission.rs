@@ -712,6 +712,12 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         video_out: targetless_scanout_test_video(address),
         ..ProbeDispatchState::default()
     };
+    let equeue = 0x44;
+    let user_data = 0x1234_5678;
+    state.video_out.flip_events.insert(equeue, user_data);
+    crate::event_state::with_event_state_mut(|events| {
+        events.kernel_equeues.insert(equeue);
+    });
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_thread_local_event_sink(sender);
 
@@ -753,6 +759,14 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         0
     );
     assert_eq!(state.video_out.completed_flip_count, 1);
+    crate::event_state::with_event_state(|events| {
+        assert!(events.pending_events.iter().any(|event| {
+            event.equeue == equeue
+                && event.ident == 6
+                && event.filter == -13
+                && event.user_data == user_data
+        }));
+    });
     assert!(receiver.try_recv().is_err());
     remu_gpu::clear_thread_local_event_sink();
 }

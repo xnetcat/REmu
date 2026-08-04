@@ -267,8 +267,8 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             );
         }
         for (equeue, user_data) in registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 6,
@@ -292,8 +292,8 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in vblank_registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 1,
