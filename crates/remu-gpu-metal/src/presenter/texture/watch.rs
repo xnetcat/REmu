@@ -305,8 +305,14 @@ impl MetalPresenter {
             // GPU-authored resident still owns the pixels (Octopath 0x80f27e0000 snapshots).
             // Prefer the resident's sparse content validation over the sampled watch dirty bit:
             // pitch-mismatched SRDs and component-reordered views share the same GPU image.
-            if let Some(resident_descriptor) =
-                gpu_written_resident_serving_sampled_key(&self.resident_guest_textures, key)
+            let sampled_span = self
+                .sampled_texture_cache
+                .get(&key)
+                .and_then(|cached| cached.overlap);
+            if let Some(resident_descriptor) = gpu_written_resident_serving_sampled_key(
+                &self.resident_guest_textures,
+                sampled_span,
+            )
                 && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
                 && !resident.write_watch.content_has_changed()?
             {

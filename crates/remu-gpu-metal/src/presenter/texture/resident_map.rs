@@ -69,12 +69,6 @@ impl ResidentTextureMap {
         self.textures.values()
     }
 
-    pub(crate) fn iter(
-        &self,
-    ) -> impl Iterator<Item = (&GuestTextureDescriptor, &ResidentGuestTexture)> {
-        self.textures.iter()
-    }
-
     /// Residency keys whose span overlaps `query` under the predicate's operand `order`.
     pub(crate) fn overlapping(
         &self,

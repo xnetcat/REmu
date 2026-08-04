@@ -5046,7 +5046,7 @@ fn persistent_target_removes_per_draw_full_surface_transfers() {
 
 #[test]
 fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resident() {
-    use super::super::texture::{gpu_written_resident_serving_sampled_key, sampled_texture_key};
+    use super::super::texture::gpu_written_resident_serving_sampled_key;
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -5077,18 +5077,6 @@ fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resid
         pitch: 128,
         ..rendered
     };
-    let key = sampled_texture_key(
-        DecodedImageDescriptor {
-            guest: sampled,
-            span: ResourceSpan::for_texture(sampled),
-            destination_select: 0,
-            base_mip_level: 0,
-            mip_level_count: 1,
-            texture_type: 9,
-            layer_count: 1,
-        },
-        false,
-    );
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
     let device = presenter.device.as_ref().expect("Metal device").clone();
@@ -5097,8 +5085,88 @@ fn gpu_written_resident_serving_sampled_key_prefers_the_newest_gpu_written_resid
         .expect("render resident");
     presenter.mark_resident_texture_written(rendered);
     assert_eq!(
-        gpu_written_resident_serving_sampled_key(&presenter.resident_guest_textures, key),
+        gpu_written_resident_serving_sampled_key(
+            &presenter.resident_guest_textures,
+            ResourceSpan::for_texture(sampled),
+        ),
         Some(rendered)
+    );
+}
+
+#[test]
+fn gpu_written_resident_lookup_uses_the_admitted_physical_span_after_va_rebinding() {
+    use super::super::texture::gpu_written_resident_serving_sampled_key;
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let texture_bytes = 4 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(12 * GUEST_PAGE_SIZE).expect("guest address space");
+    let original_backing = GuestPhysicalBacking::new(texture_bytes).expect("original backing");
+    let replacement_backing =
+        GuestPhysicalBacking::new(texture_bytes).expect("replacement backing");
+    let original = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            texture_bytes,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original mapping");
+    let alias = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            texture_bytes,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("alias mapping");
+    let rendered = GuestTextureDescriptor {
+        address: original.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let sampled = GuestTextureDescriptor {
+        address: alias.get(),
+        ..rendered
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, rendered)
+        .expect("render resident");
+    presenter.mark_resident_texture_written(rendered);
+
+    memory.unmap(original, texture_bytes).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(original),
+            texture_bytes,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement mapping");
+
+    assert_eq!(
+        gpu_written_resident_serving_sampled_key(
+            &presenter.resident_guest_textures,
+            ResourceSpan::for_texture(sampled),
+        ),
+        Some(rendered),
+        "lookup must use the resident's admission-time backing instead of re-resolving every VA",
     );
 }
 

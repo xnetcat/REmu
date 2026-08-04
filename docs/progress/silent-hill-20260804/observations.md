@@ -144,6 +144,12 @@ and did not prevent the title from rendering or advancing through setup.
 
 ## Evidence
 
+### Excluded Poppy result
+
+- The one Poppy launch was not healthy: it remained on a black screen at 0 FPS.
+- That launch is not evidence of rendering, performance, or title compatibility and must not be
+  repeated. Poppy is excluded from the remaining validation work; Silent Hill is the title gate.
+
 - `screenshots/stable-120s-05.png`: rendered autosave screen
 - `screenshots/stable-120s-06.png`: fully composed content-warning scene
 - `screenshots/stable-120s-07.png`: interactive Continue prompt

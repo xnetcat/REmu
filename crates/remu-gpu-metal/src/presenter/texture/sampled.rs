@@ -18,7 +18,7 @@ use super::{
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, sampled_alias_descriptor, texture_element_layout,
     trace_image_descriptors, trace_resident_texture_removal, trace_target_sampling,
-    trace_video_target_consumers,
+    trace_video_target_consumers, SpanQueryOrder,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -231,35 +231,24 @@ impl MetalPresenter {
     }
 }
 
-pub(crate) fn decoded_image_for_sampled_key(key: SampledTextureKey) -> DecodedImageDescriptor {
-    DecodedImageDescriptor {
-        guest: key.descriptor,
-        span: ResourceSpan::for_texture(key.descriptor),
-        destination_select: 0,
-        base_mip_level: key.base_mip_level,
-        mip_level_count: key.mip_level_count,
-        texture_type: key.texture_type,
-        layer_count: key.layer_count,
-    }
-}
-
 /// Returns the GPU-authored resident that can still serve a cached sampled texture after ACQUIRE.
 pub(crate) fn gpu_written_resident_serving_sampled_key(
     residents: &ResidentTextureMap,
-    key: SampledTextureKey,
+    sampled_span: Option<ResourceSpan>,
 ) -> Option<GuestTextureDescriptor> {
-    let sampled = decoded_image_for_sampled_key(key);
+    let sampled_span = sampled_span?;
+    // Every pitch-tolerant, colour-view, and depth-view eligibility rule ultimately requires the
+    // two descriptors to name the same byte storage, so each eligible resident is necessarily in
+    // this overlap set. Querying the admission-time interval index once avoids re-resolving both
+    // VAs through the process-global shared-mapping registry for every resident/sample pair.
     residents
-        .iter()
-        .filter(|(_, resident)| resident.gpu_written() && resident.serves_reads())
-        .filter(|(descriptor, resident)| {
-            let descriptor = **descriptor;
-            guest_texture_descriptors_overlap(descriptor, key.descriptor)
-                || guest_texture_descriptors_share_gpu_sample_storage(descriptor, key.descriptor)
-                || resident_depth_sample_is_eligible(resident, sampled)
-                || resident_color_view_sample_is_eligible(resident, sampled, key.comparison)
+        .overlapping(&sampled_span, SpanQueryOrder::ResidentFirst)
+        .into_iter()
+        .filter_map(|descriptor| {
+            let resident = residents.get(&descriptor)?;
+            (resident.gpu_written() && resident.serves_reads())
+                .then_some((descriptor, resident.content_version))
         })
-        .map(|(descriptor, resident)| (*descriptor, resident.content_version))
         .max_by_key(|(descriptor, version)| (*version, descriptor.address))
         .map(|(descriptor, _)| descriptor)
 }
