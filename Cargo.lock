@@ -1539,6 +1539,7 @@ name = "remu-gpu-dx12"
 version = "0.1.0"
 dependencies = [
  "hassle-rs",
+ "png",
  "remu-gpu",
  "remu-memory",
  "remu-shader",

@@ -215,6 +215,15 @@ only retained when `REMU_DUMP_HLSL_CS=all` or when that variable is the hexadeci
 address printed in the AGC log (with or without `0x`). These files contain translated diagnostic
 material and must not be committed when they originate from a proprietary game.
 
+Compute image diagnostics are opt-in and use transient readback resources rather than changing the
+resident-texture cache. `REMU_DUMP_D3D12_COMPUTE_OUTPUTS_DIR` writes PNG and metadata pairs for
+storage-image outputs; `REMU_DUMP_D3D12_TARGET_INPUTS_DIR` does the same for sampled inputs whether
+they originate in guest memory, a retained compute output, or a resident render target. The
+corresponding `_EXTENT`, `_ADDRESS`, and `_LIMIT` variables narrow captures. Diagnostic conversion
+covers the common normalized, packed-float, half-float, `R16_UNORM`, and `R32_FLOAT` color/depth
+formats. These captures can contain proprietary game imagery and belong only in ignored diagnostic
+directories unless an explicitly selected progress image is suitable for the repository.
+
 `REMU_TRACE_D3D12_PRESENT_WRITERS=1` emits one compact record for every draw into a native-format
 presentation-sized target. Each record includes the guest sequence, shader addresses, target
 formats and export masks, resolved sampled-resource views/component mappings, and raster viewport

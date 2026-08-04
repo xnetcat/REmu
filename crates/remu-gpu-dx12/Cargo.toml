@@ -13,6 +13,7 @@ thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 hassle-rs.workspace = true
+png.workspace = true
 remu-memory = { path = "../remu-memory" }
 sha1.workspace = true
 winit.workspace = true

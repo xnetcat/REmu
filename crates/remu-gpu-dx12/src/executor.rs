@@ -96,7 +96,8 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
     DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_R10G10B10A2_UNORM,
-    DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, DXGI_FORMAT_R32_FLOAT,
+    DXGI_FORMAT_R11G11B10_FLOAT, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_UNORM, DXGI_FORMAT_R32_FLOAT,
     DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_UINT,
     DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
     DXGI_SAMPLE_DESC,
@@ -1152,12 +1153,13 @@ impl Dx12GuestExecutor {
         // SAFETY: every referenced resource remains owned through the following fence wait.
         unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         self.wait()?;
+        dump_sampled_texture_inputs(dispatch.shader_address, &resources.textures)?;
         write_back_globals(
             evaluation,
             &resources.globals,
             &mut self.ordered_global_versions,
         )?;
-        write_back_textures(&resources.textures)?;
+        write_back_textures(Some(dispatch.shader_address), &resources.textures)?;
         cache_writable_texture_outputs(&resources.textures, &mut self.sampled_texture_cache);
         Ok(())
     }
@@ -2844,7 +2846,7 @@ fn write_back_stage(
     ordered_versions: &mut OrderedGlobalVersions,
 ) -> Result<(), String> {
     write_back_globals(evaluation, &resources.globals, ordered_versions)?;
-    write_back_textures(&resources.textures)
+    write_back_textures(None, &resources.textures)
 }
 
 fn decode_native_primitive_topology(
@@ -5850,7 +5852,7 @@ fn create_resident_render_target_texture(
         )?,
         gpu: target.gpu.clone(),
         upload: Some(target.upload.clone()),
-        readback: None,
+        readback: Some(target.readback.clone()),
         row_pitch: target.row_pitch,
         slice_pitch: target.slice_pitch,
         copy_footprints: Vec::new(),
@@ -7353,14 +7355,15 @@ fn create_texture_resource(
     } else {
         None
     };
+    let capture_readback =
+        sampled_input_capture_descriptor_requested(descriptor, descriptor.format);
     Ok(TextureResource {
         descriptor,
         view_format: descriptor.format,
         component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu,
         upload: Some(create_upload_buffer(device, &packed)?),
-        readback: descriptor
-            .writable
+        readback: (descriptor.writable || capture_readback)
             .then(|| create_readback_buffer(device, packed_byte_count))
             .transpose()?,
         row_pitch: u32::try_from(row_pitch).map_err(|_| "texture row pitch exceeds u32")?,
@@ -7438,11 +7441,13 @@ fn create_or_reuse_sampled_texture(
                     descriptor.address, descriptor.width, descriptor.height
                 );
             }
-            return Ok(cache
+            let mut resource = cache
                 .get(&descriptor)
                 .expect("reusable cache entry remains present")
                 .resource
-                .clone());
+                .clone();
+            attach_sampled_input_readback(device, &mut resource)?;
+            return Ok(resource);
         }
         cache.remove(&descriptor);
     }
@@ -7464,6 +7469,9 @@ fn create_or_reuse_sampled_texture(
         }
         let mut resident = resource.clone();
         resident.source = TextureResourceSource::ResidentSampledTexture;
+        // Diagnostic readbacks are per-dispatch scratch allocations. Retaining them in the cache
+        // would multiply large G-buffer allocations by the number of resident sampled textures.
+        resident.readback = None;
         cache.insert(
             descriptor,
             CachedSampledTexture {
@@ -7473,6 +7481,31 @@ fn create_or_reuse_sampled_texture(
         );
     }
     Ok(resource)
+}
+
+fn attach_sampled_input_readback(
+    device: &ID3D12Device,
+    resource: &mut TextureResource,
+) -> Result<(), String> {
+    if resource.readback.is_some() || !sampled_texture_input_capture_requested(resource) {
+        return Ok(());
+    }
+    if resource.row_pitch == 0 || resource.slice_pitch == 0 {
+        let row_bytes =
+            resource.descriptor.width as usize * resource.descriptor.bytes_per_element as usize;
+        let row_pitch = align_up(row_bytes, 256)?;
+        resource.row_pitch =
+            u32::try_from(row_pitch).map_err(|_| "diagnostic row pitch exceeds u32")?;
+        resource.slice_pitch = align_up(
+            row_pitch
+                .checked_mul(resource.descriptor.height as usize)
+                .ok_or("diagnostic texture size overflows")?,
+            512,
+        )?;
+    }
+    resource.packed_byte_count = resource.slice_pitch.max(4);
+    resource.readback = Some(create_readback_buffer(device, resource.packed_byte_count)?);
+    Ok(())
 }
 
 fn create_texture_view(
@@ -7813,8 +7846,51 @@ fn record_texture_uploads(commands: &ID3D12GraphicsCommandList, textures: &[Text
 fn record_texture_readbacks(commands: &ID3D12GraphicsCommandList, textures: &[TextureResource]) {
     for resource in textures
         .iter()
-        .filter(|resource| resource.source == TextureResourceSource::ResidentRenderTarget)
+        .filter(|resource| sampled_texture_input_capture_requested(resource))
     {
+        let sampled_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+            | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        record_transition(
+            commands,
+            &resource.gpu,
+            sampled_state,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        let readback = resource
+            .readback
+            .as_ref()
+            .expect("captured sampled texture retains its readback allocation");
+        record_texture_copy_footprint(
+            commands,
+            readback,
+            &resource.gpu,
+            TextureCopyFootprint {
+                offset: 0,
+                subresource: 0,
+                format: resource.view_format,
+                width: resource.descriptor.width,
+                height: resource.descriptor.height,
+                depth: 1,
+                row_pitch: resource.row_pitch,
+            },
+            true,
+        );
+        let restored_state = if resource.source == TextureResourceSource::ResidentRenderTarget {
+            D3D12_RESOURCE_STATE_RENDER_TARGET
+        } else {
+            sampled_state
+        };
+        record_transition(
+            commands,
+            &resource.gpu,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            restored_state,
+        );
+    }
+    for resource in textures.iter().filter(|resource| {
+        resource.source == TextureResourceSource::ResidentRenderTarget
+            && !sampled_texture_input_capture_requested(resource)
+    }) {
         record_transition(
             commands,
             &resource.gpu,
@@ -7850,6 +7926,292 @@ fn record_texture_readbacks(commands: &ID3D12GraphicsCommandList, textures: &[Te
                 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
         );
     }
+}
+
+fn sampled_texture_input_capture_requested(resource: &TextureResource) -> bool {
+    !resource.descriptor.writable
+        && sampled_input_capture_descriptor_requested(resource.descriptor, resource.view_format)
+}
+
+fn sampled_input_capture_descriptor_requested(
+    descriptor: DecodedTexture,
+    view_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> bool {
+    if std::env::var_os("REMU_DUMP_D3D12_TARGET_INPUTS_DIR").is_none()
+        || descriptor.writable
+        || descriptor.block_extent != [1, 1]
+        || descriptor.layer_count != 1
+        || descriptor.mip_level_count != 1
+    {
+        return false;
+    }
+    if let Ok(filter) = std::env::var("REMU_DUMP_D3D12_TARGET_INPUT_EXTENT") {
+        let Some((width, height)) = filter.split_once(['x', 'X']) else {
+            return false;
+        };
+        if width.parse::<u32>().ok() != Some(descriptor.width)
+            || height.parse::<u32>().ok() != Some(descriptor.height)
+        {
+            return false;
+        }
+    }
+    if let Ok(filter) = std::env::var("REMU_DUMP_D3D12_TARGET_INPUT_ADDRESS") {
+        let filter = filter.trim();
+        let address = filter
+            .strip_prefix("0x")
+            .or_else(|| filter.strip_prefix("0X"))
+            .map_or_else(|| filter.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+        if address.ok() != Some(descriptor.address) {
+            return false;
+        }
+    }
+    diagnostic_capture_supported(view_format)
+}
+
+fn diagnostic_capture_supported(
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+) -> bool {
+    matches!(
+        format,
+        DXGI_FORMAT_B8G8R8A8_UNORM
+            | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+            | DXGI_FORMAT_R8G8B8A8_UNORM
+            | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+            | DXGI_FORMAT_R10G10B10A2_UNORM
+            | DXGI_FORMAT_R11G11B10_FLOAT
+            | DXGI_FORMAT_R16_UNORM
+            | DXGI_FORMAT_R16G16B16A16_FLOAT
+            | DXGI_FORMAT_R16G16B16A16_UNORM
+            | DXGI_FORMAT_R32_FLOAT
+    )
+}
+
+fn dump_sampled_texture_inputs(
+    shader_address: u64,
+    textures: &[TextureResource],
+) -> Result<(), String> {
+    static CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    let Some(directory) = std::env::var_os("REMU_DUMP_D3D12_TARGET_INPUTS_DIR") else {
+        return Ok(());
+    };
+    let limit = std::env::var("REMU_DUMP_D3D12_TARGET_INPUT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32);
+    for resource in textures
+        .iter()
+        .filter(|resource| sampled_texture_input_capture_requested(resource))
+    {
+        let sequence = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        if sequence >= limit {
+            continue;
+        }
+        let readback = resource
+            .readback
+            .as_ref()
+            .expect("captured sampled texture retains its readback allocation");
+        let packed = read_readback(readback, resource.packed_byte_count)
+            .map_err(|error| error.to_string())?;
+        let descriptor = resource.descriptor;
+        let row_bytes = descriptor.width as usize * descriptor.bytes_per_element as usize;
+        let mut linear = vec![0_u8; row_bytes * descriptor.height as usize];
+        for row in 0..descriptor.height as usize {
+            let source = row * resource.row_pitch as usize;
+            let destination = row * row_bytes;
+            linear[destination..destination + row_bytes]
+                .copy_from_slice(&packed[source..source + row_bytes]);
+        }
+        let rgba = diagnostic_rgba8(resource.view_format, &linear)?;
+        let directory = Path::new(&directory);
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("create {}: {error}", directory.display()))?;
+        let stem = format!(
+            "{sequence:04}-cs-{shader_address:x}-input-{:x}-{}x{}-fmt{}",
+            descriptor.address, descriptor.width, descriptor.height, resource.view_format.0,
+        );
+        let png_path = directory.join(format!("{stem}.png"));
+        write_rgba_png(&png_path, descriptor.width, descriptor.height, &rgba)?;
+        let metadata_path = directory.join(format!("{stem}.txt"));
+        std::fs::write(
+            &metadata_path,
+            format!(
+                "shader_address={shader_address:#x}\ninput_address={:#x}\nsource={:?}\nwidth={}\nheight={}\nformat={:?}\nrow_pitch={}\n",
+                descriptor.address,
+                resource.source,
+                descriptor.width,
+                descriptor.height,
+                resource.view_format,
+                resource.row_pitch,
+            ),
+        )
+        .map_err(|error| format!("write {}: {error}", metadata_path.display()))?;
+        eprintln!(
+            "[REMu][D3D12-CAPTURE] sampled input {:#x} source={:?} -> {}",
+            descriptor.address,
+            resource.source,
+            png_path.display(),
+        );
+    }
+    Ok(())
+}
+
+fn diagnostic_rgba8(
+    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
+    linear: &[u8],
+) -> Result<Vec<u8>, String> {
+    match format {
+        DXGI_FORMAT_R8G8B8A8_UNORM | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Ok(linear.to_vec()),
+        DXGI_FORMAT_B8G8R8A8_UNORM | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Ok(linear
+            .chunks_exact(4)
+            .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]])
+            .collect()),
+        DXGI_FORMAT_R10G10B10A2_UNORM => Ok(linear
+            .chunks_exact(4)
+            .flat_map(|pixel| {
+                let packed = u32::from_le_bytes(pixel.try_into().expect("four-byte pixel"));
+                [
+                    scale_unorm(packed & 0x3ff, 0x3ff),
+                    scale_unorm((packed >> 10) & 0x3ff, 0x3ff),
+                    scale_unorm((packed >> 20) & 0x3ff, 0x3ff),
+                    scale_unorm(packed >> 30, 0x3),
+                ]
+            })
+            .collect()),
+        DXGI_FORMAT_R11G11B10_FLOAT => Ok(linear
+            .chunks_exact(4)
+            .flat_map(|pixel| {
+                let packed = u32::from_le_bytes(pixel.try_into().expect("four-byte pixel"));
+                [
+                    linear_float_to_srgb_unorm8(unsigned_float_to_f32(packed & 0x7ff, 6)),
+                    linear_float_to_srgb_unorm8(unsigned_float_to_f32((packed >> 11) & 0x7ff, 6)),
+                    linear_float_to_srgb_unorm8(unsigned_float_to_f32(packed >> 22, 5)),
+                    u8::MAX,
+                ]
+            })
+            .collect()),
+        DXGI_FORMAT_R16G16B16A16_FLOAT => Ok(linear
+            .chunks_exact(8)
+            .flat_map(|pixel| {
+                let channel = |offset| {
+                    half_float_to_f32(u16::from_le_bytes([pixel[offset], pixel[offset + 1]]))
+                };
+                [
+                    linear_float_to_srgb_unorm8(channel(0)),
+                    linear_float_to_srgb_unorm8(channel(2)),
+                    linear_float_to_srgb_unorm8(channel(4)),
+                    float_to_unorm8(channel(6)),
+                ]
+            })
+            .collect()),
+        DXGI_FORMAT_R16G16B16A16_UNORM => Ok(linear
+            .chunks_exact(8)
+            .flat_map(|pixel| {
+                let channel =
+                    |offset| u32::from(u16::from_le_bytes([pixel[offset], pixel[offset + 1]]));
+                [
+                    scale_unorm(channel(0), u32::from(u16::MAX)),
+                    scale_unorm(channel(2), u32::from(u16::MAX)),
+                    scale_unorm(channel(4), u32::from(u16::MAX)),
+                    scale_unorm(channel(6), u32::from(u16::MAX)),
+                ]
+            })
+            .collect()),
+        DXGI_FORMAT_R16_UNORM => Ok(linear
+            .chunks_exact(2)
+            .flat_map(|pixel| {
+                let value = scale_unorm(
+                    u32::from(u16::from_le_bytes([pixel[0], pixel[1]])),
+                    u32::from(u16::MAX),
+                );
+                [value, value, value, u8::MAX]
+            })
+            .collect()),
+        DXGI_FORMAT_R32_FLOAT => Ok(linear
+            .chunks_exact(4)
+            .flat_map(|pixel| {
+                let value = float_to_unorm8(f32::from_le_bytes(
+                    pixel.try_into().expect("four-byte float pixel"),
+                ));
+                [value, value, value, u8::MAX]
+            })
+            .collect()),
+        _ => Err(format!(
+            "D3D12 diagnostic capture does not support format {format:?}"
+        )),
+    }
+}
+
+fn write_rgba_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<(), String> {
+    let file = std::fs::File::create(path)
+        .map_err(|error| format!("create {}: {error}", path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|error| format!("write {} header: {error}", path.display()))?;
+    writer
+        .write_image_data(rgba)
+        .map_err(|error| format!("write {} pixels: {error}", path.display()))
+}
+
+fn unsigned_float_to_f32(bits: u32, mantissa_bits: u32) -> f32 {
+    debug_assert!(matches!(mantissa_bits, 5 | 6));
+    let mantissa_mask = (1_u32 << mantissa_bits) - 1;
+    let exponent = (bits >> mantissa_bits) & 0x1f;
+    let mantissa = bits & mantissa_mask;
+    let float_bits = match exponent {
+        0 if mantissa == 0 => 0,
+        0 => {
+            let leading_bit = 31 - mantissa.leading_zeros();
+            let float_exponent = 113 + leading_bit - mantissa_bits;
+            let float_mantissa = (mantissa ^ (1 << leading_bit)) << (23 - leading_bit);
+            (float_exponent << 23) | float_mantissa
+        }
+        0x1f => 0x7f80_0000 | (mantissa << (23 - mantissa_bits)),
+        _ => ((exponent + 112) << 23) | (mantissa << (23 - mantissa_bits)),
+    };
+    f32::from_bits(float_bits)
+}
+
+fn half_float_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits >> 15);
+    let exponent = u32::from((bits >> 10) & 0x1f);
+    let significand = u32::from(bits & 0x03ff);
+    let float_bits = match exponent {
+        0 if significand == 0 => sign << 31,
+        0 => {
+            let leading_zeros = significand.leading_zeros() - 21;
+            let normalized = (significand << leading_zeros) & 0x03ff;
+            let exponent = 113_u32.saturating_sub(leading_zeros);
+            (sign << 31) | (exponent << 23) | (normalized << 13)
+        }
+        0x1f => (sign << 31) | 0x7f80_0000 | (significand << 13),
+        _ => (sign << 31) | ((exponent + 112) << 23) | (significand << 13),
+    };
+    f32::from_bits(float_bits)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn float_to_unorm8(value: f32) -> u8 {
+    if value.is_nan() || value <= 0.0 {
+        0
+    } else if value >= 1.0 {
+        u8::MAX
+    } else {
+        (value * 255.0).round() as u8
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn linear_float_to_srgb_unorm8(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round() as u8
 }
 
 fn cache_writable_texture_outputs(
@@ -8020,7 +8382,10 @@ fn record_texture_copy(
     }
 }
 
-fn write_back_textures(textures: &[TextureResource]) -> Result<(), String> {
+fn write_back_textures(
+    compute_shader_address: Option<u64>,
+    textures: &[TextureResource],
+) -> Result<(), String> {
     for resource in textures
         .iter()
         .filter(|resource| resource.descriptor.writable)
@@ -8043,8 +8408,94 @@ fn write_back_textures(textures: &[TextureResource]) -> Result<(), String> {
                     .copy_from_slice(&packed[source..source + row_bytes]);
             }
         }
+        if let Some(shader_address) = compute_shader_address {
+            dump_compute_texture_output(shader_address, resource, &linear)?;
+        }
         publish_texture_linear(resource, &linear)?;
     }
+    Ok(())
+}
+
+fn compute_output_capture_requested(resource: &TextureResource) -> bool {
+    if std::env::var_os("REMU_DUMP_D3D12_COMPUTE_OUTPUTS_DIR").is_none()
+        || !resource.descriptor.writable
+        || resource.descriptor.layer_count != 1
+        || resource.descriptor.mip_level_count != 1
+    {
+        return false;
+    }
+    if let Ok(filter) = std::env::var("REMU_DUMP_D3D12_COMPUTE_OUTPUT_EXTENT") {
+        let Some((width, height)) = filter.split_once(['x', 'X']) else {
+            return false;
+        };
+        if width.parse::<u32>().ok() != Some(resource.descriptor.width)
+            || height.parse::<u32>().ok() != Some(resource.descriptor.height)
+        {
+            return false;
+        }
+    }
+    if let Ok(filter) = std::env::var("REMU_DUMP_D3D12_COMPUTE_OUTPUT_ADDRESS") {
+        let filter = filter.trim();
+        let address = filter
+            .strip_prefix("0x")
+            .or_else(|| filter.strip_prefix("0X"))
+            .map_or_else(|| filter.parse::<u64>(), |hex| u64::from_str_radix(hex, 16));
+        if address.ok() != Some(resource.descriptor.address) {
+            return false;
+        }
+    }
+    diagnostic_capture_supported(resource.descriptor.format)
+}
+
+fn dump_compute_texture_output(
+    shader_address: u64,
+    resource: &TextureResource,
+    linear: &[u8],
+) -> Result<(), String> {
+    static CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+    if !compute_output_capture_requested(resource) {
+        return Ok(());
+    }
+    let sequence = CAPTURE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let limit = std::env::var("REMU_DUMP_D3D12_COMPUTE_OUTPUT_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(32);
+    if sequence >= limit {
+        return Ok(());
+    }
+    let directory = std::env::var_os("REMU_DUMP_D3D12_COMPUTE_OUTPUTS_DIR")
+        .expect("compute-output capture request has a directory");
+    let directory = Path::new(&directory);
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    let descriptor = resource.descriptor;
+    let rgba = diagnostic_rgba8(descriptor.format, linear)?;
+    let stem = format!(
+        "{sequence:04}-cs-{shader_address:x}-output-{:x}-{}x{}-fmt{}",
+        descriptor.address, descriptor.width, descriptor.height, descriptor.format.0,
+    );
+    let png_path = directory.join(format!("{stem}.png"));
+    write_rgba_png(&png_path, descriptor.width, descriptor.height, &rgba)?;
+    let metadata_path = directory.join(format!("{stem}.txt"));
+    std::fs::write(
+        &metadata_path,
+        format!(
+            "shader_address={shader_address:#x}\noutput_address={:#x}\nwidth={}\nheight={}\nformat={:?}\ntile_mode={}\npitch={}\n",
+            descriptor.address,
+            descriptor.width,
+            descriptor.height,
+            descriptor.format,
+            descriptor.tile_mode,
+            descriptor.pitch,
+        ),
+    )
+    .map_err(|error| format!("write {}: {error}", metadata_path.display()))?;
+    eprintln!(
+        "[REMu][D3D12-CAPTURE] compute output {:#x} -> {}",
+        descriptor.address,
+        png_path.display(),
+    );
     Ok(())
 }
 
@@ -8880,7 +9331,7 @@ mod tests {
         D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, D3D12_MIP_LOD_BIAS_MAX,
         DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DecodedRenderTarget,
         DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites,
-        decode_render_target_format, decode_sampler, dispatch_group_count,
+        decode_render_target_format, decode_sampler, diagnostic_rgba8, dispatch_group_count,
         expand_primitive_indices, guest_resource_ranges_overlap,
         guest_resource_ranges_same_storage, indirect_draw_count_allows,
         initial_render_target_clear, native_present_format_supported, ngg_raster_vertex_shader,
@@ -9275,6 +9726,59 @@ mod tests {
                 packed.to_le_bytes().to_vec(),
             ),
             Some(vec![85, 128, 255, 255])
+        );
+    }
+
+    #[test]
+    fn converts_float_render_target_diagnostics_to_srgb() {
+        let rgba16 = [0x3c00_u16, 0x3800, 0, 0x3c00]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostic_rgba8(
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT,
+                &rgba16,
+            )
+            .expect("RGBA16F diagnostic conversion"),
+            [255, 188, 0, 255]
+        );
+
+        let red = 15_u32 << 6;
+        let green = (15_u32 << 6) << 11;
+        let blue = (15_u32 << 5) << 22;
+        assert_eq!(
+            diagnostic_rgba8(
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R11G11B10_FLOAT,
+                &(red | green | blue).to_le_bytes(),
+            )
+            .expect("R11G11B10F diagnostic conversion"),
+            [255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn converts_gbuffer_and_depth_diagnostics_to_rgba() {
+        let rgba16 = [0_u16, 0x8000, u16::MAX, 0x4000]
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostic_rgba8(
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UNORM,
+                &rgba16,
+            )
+            .expect("RGBA16 UNORM diagnostic conversion"),
+            [0, 128, 255, 64]
+        );
+
+        assert_eq!(
+            diagnostic_rgba8(
+                windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT,
+                &0.25_f32.to_le_bytes(),
+            )
+            .expect("R32 float diagnostic conversion"),
+            [64, 64, 64, 255]
         );
     }
 
