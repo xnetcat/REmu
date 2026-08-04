@@ -608,7 +608,7 @@ struct TextureResource {
     view_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     component_mapping: u32,
     gpu: ID3D12Resource,
-    upload: ID3D12Resource,
+    upload: Option<ID3D12Resource>,
     readback: Option<ID3D12Resource>,
     row_pitch: u32,
     slice_pitch: usize,
@@ -1158,6 +1158,7 @@ impl Dx12GuestExecutor {
             &mut self.ordered_global_versions,
         )?;
         write_back_textures(&resources.textures)?;
+        cache_writable_texture_outputs(&resources.textures, &mut self.sampled_texture_cache);
         Ok(())
     }
 
@@ -5848,7 +5849,7 @@ fn create_resident_render_target_texture(
             component_selectors,
         )?,
         gpu: target.gpu.clone(),
-        upload: target.upload.clone(),
+        upload: Some(target.upload.clone()),
         readback: None,
         row_pitch: target.row_pitch,
         slice_pitch: target.slice_pitch,
@@ -5885,7 +5886,7 @@ fn record_render_target_upload(
         view_format: target.target.descriptor.format,
         component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu: upload_target.clone(),
-        upload: target.upload.clone(),
+        upload: Some(target.upload.clone()),
         readback: None,
         row_pitch: target.row_pitch,
         slice_pitch: target.slice_pitch,
@@ -5979,7 +5980,7 @@ fn record_render_target_readback(
         view_format: target.target.descriptor.format,
         component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu: copy_source.clone(),
-        upload: target.upload.clone(),
+        upload: Some(target.upload.clone()),
         readback: None,
         row_pitch: target.row_pitch,
         slice_pitch: target.slice_pitch,
@@ -7357,7 +7358,7 @@ fn create_texture_resource(
         view_format: descriptor.format,
         component_mapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
         gpu,
-        upload: create_upload_buffer(device, &packed)?,
+        upload: Some(create_upload_buffer(device, &packed)?),
         readback: descriptor
             .writable
             .then(|| create_readback_buffer(device, packed_byte_count))
@@ -7771,10 +7772,14 @@ fn record_texture_uploads(commands: &ID3D12GraphicsCommandList, textures: &[Text
         let descriptor = resource.descriptor;
         match resource.source {
             TextureResourceSource::GuestUpload => {
+                let upload = resource
+                    .upload
+                    .as_ref()
+                    .expect("guest-upload texture retains its upload allocation");
                 for footprint in &resource.copy_footprints {
                     record_texture_copy_footprint(
                         commands,
-                        &resource.upload,
+                        upload,
                         &resource.gpu,
                         *footprint,
                         false,
@@ -7834,6 +7839,68 @@ fn record_texture_readbacks(commands: &ID3D12GraphicsCommandList, textures: &[Te
         for footprint in &resource.copy_footprints {
             record_texture_copy_footprint(commands, readback, &resource.gpu, *footprint, true);
         }
+        // Keep a completed UAV in a directly sampleable state. The resource can then be retained
+        // as the authoritative native output while the readback below still publishes identical
+        // tiled bytes for guest CPU visibility.
+        record_transition(
+            commands,
+            &resource.gpu,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+        );
+    }
+}
+
+fn cache_writable_texture_outputs(
+    textures: &[TextureResource],
+    cache: &mut HashMap<DecodedTexture, CachedSampledTexture>,
+) {
+    for resource in textures.iter().filter(|resource| {
+        resource.source == TextureResourceSource::GuestUpload
+            && resource.descriptor.writable
+            && resource.descriptor.address != 0
+    }) {
+        let Ok(raw_byte_count) = resource.descriptor.raw_byte_count() else {
+            continue;
+        };
+        let Ok(byte_count) = u64::try_from(raw_byte_count) else {
+            continue;
+        };
+        // SAFETY: the writable texture's publication guard proved that this exact mapping remains
+        // live through completion. The new watch is installed after publication, so it observes
+        // only later guest/CPU ownership changes and not the output that is being retained.
+        let Ok(write_watch) =
+            (unsafe { remu_memory::CpuWriteWatch::new(resource.descriptor.address, byte_count) })
+        else {
+            continue;
+        };
+        if cache.len() >= MAXIMUM_RESIDENT_SAMPLED_TEXTURES {
+            cache.clear();
+        }
+        let mut descriptor = resource.descriptor;
+        descriptor.writable = false;
+        let mut resident = resource.clone();
+        resident.descriptor = descriptor;
+        resident.source = TextureResourceSource::ResidentSampledTexture;
+        resident.upload = None;
+        resident.readback = None;
+        resident.copy_footprints.clear();
+        resident.packed_byte_count = 0;
+        resident.writeback = None;
+        if std::env::var_os("REMU_TRACE_D3D12_TIMING").is_some_and(|value| value == "1") {
+            eprintln!(
+                "[REMu][D3D12-TIMING] resident_compute_texture={:#x} extent={}x{} format={:?}",
+                descriptor.address, descriptor.width, descriptor.height, descriptor.format,
+            );
+        }
+        cache.insert(
+            descriptor,
+            CachedSampledTexture {
+                resource: resident,
+                write_watch,
+            },
+        );
     }
 }
 
@@ -10326,10 +10393,19 @@ mod tests {
     #[test]
     fn executes_guest_storage_image_store_and_retiles_guest_memory() {
         const WIDTH: usize = 64;
-        let mut allocation = vec![0_u8; WIDTH * 4 + 255];
-        let allocation_base = allocation.as_mut_ptr() as usize;
-        let aligned = (allocation_base + 255) & !255;
-        let address = aligned as u64;
+        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("texture backing");
+        let mapping = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("texture mapping");
+        let address = mapping.get();
         let unified = (0..0x200)
             .find(|value| remu_shader::decode_unified_format(*value) == Some((10, 4)))
             .expect("RGBA8_UINT unified format exists");
@@ -10437,15 +10513,29 @@ mod tests {
             shader_evaluation: Some(evaluation),
             shader_registers: Vec::new(),
         };
-        Dx12GuestExecutor::new()
-            .expect("create D3D12 guest executor")
+        let mut executor = Dx12GuestExecutor::new().expect("create D3D12 guest executor");
+        executor
             .execute_compute(&dispatch)
             .expect("execute guest storage-image dispatch");
-        // SAFETY: aligned points into `allocation` and the tested row is WIDTH*4 bytes.
-        let pixels = unsafe { std::slice::from_raw_parts(aligned as *const u8, WIDTH * 4) };
+        let mut pixels = vec![0_u8; WIDTH * 4];
+        memory
+            .read(mapping, &mut pixels)
+            .expect("read published texture pixels");
         for (index, pixel) in pixels.chunks_exact(4).enumerate() {
             assert_eq!(pixel, &[(100 + index) as u8, 0, 0, 0]);
         }
+        let (cached_descriptor, cached) = executor
+            .sampled_texture_cache
+            .iter()
+            .find(|(descriptor, _)| descriptor.address == address)
+            .expect("completed storage image remains resident for a sampled consumer");
+        assert!(!cached_descriptor.writable);
+        assert_eq!(
+            cached.resource.source,
+            super::TextureResourceSource::ResidentSampledTexture
+        );
+        assert!(cached.resource.upload.is_none());
+        assert!(cached.resource.readback.is_none());
     }
 
     #[test]
