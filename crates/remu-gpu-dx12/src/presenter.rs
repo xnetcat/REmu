@@ -861,7 +861,13 @@ impl Dx12Presenter {
                 }
             }
             GpuEvent::MemoryCopy(copy) => {
-                self.flush_render_targets("memory copy");
+                self.flush_render_targets_overlapping(
+                    "memory copy",
+                    &[
+                        (copy.source_address, copy.byte_count),
+                        (copy.destination_address, copy.byte_count),
+                    ],
+                );
                 match execute_memory_copy(&copy) {
                     Ok(()) => {
                         if let Some(executor) = self.guest_executor.as_mut() {
@@ -875,18 +881,21 @@ impl Dx12Presenter {
                 }
             }
             GpuEvent::MemoryWrite(write) => {
-                self.flush_render_targets("memory write");
+                let byte_count = if write.increment_address {
+                    u64::try_from(write.values.len())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(4)
+                } else if write.values.is_empty() {
+                    0
+                } else {
+                    4
+                };
+                self.flush_render_targets_overlapping(
+                    "memory write",
+                    &[(write.address, byte_count)],
+                );
                 match execute_memory_write(&write) {
                     Ok(()) => {
-                        let byte_count = if write.increment_address {
-                            u64::try_from(write.values.len())
-                                .unwrap_or(u64::MAX)
-                                .saturating_mul(4)
-                        } else if write.values.is_empty() {
-                            0
-                        } else {
-                            4
-                        };
                         if let Some(executor) = self.guest_executor.as_mut() {
                             executor.invalidate_ordered_global_range(write.address, byte_count);
                         }
@@ -895,12 +904,12 @@ impl Dx12Presenter {
                 }
             }
             GpuEvent::MemoryRelease(release) => {
-                self.flush_render_targets("memory release");
                 let byte_count = match release.value {
                     GpuMemoryReleaseValue::Immediate32(_) => 4,
                     GpuMemoryReleaseValue::Immediate64(_) | GpuMemoryReleaseValue::Timestamp => 8,
                 };
                 let address = release.address;
+                self.flush_render_targets_overlapping("memory release", &[(address, byte_count)]);
                 match execute_memory_release(release) {
                     Ok(()) => {
                         if let Some(executor) = self.guest_executor.as_mut() {
@@ -938,13 +947,19 @@ impl Dx12Presenter {
                 }
             }
             GpuEvent::MemoryWait(wait) => {
-                self.flush_render_targets("memory wait");
+                self.flush_render_targets_overlapping(
+                    "memory wait",
+                    &[(wait.address, if wait.is_64_bit { 8 } else { 4 })],
+                );
                 if !memory_wait_is_satisfied(wait) {
                     return EventOutcome::Blocked(GpuEvent::MemoryWait(wait));
                 }
             }
             GpuEvent::RegisteredMemoryWait { id, wait } => {
-                self.flush_render_targets("registered memory wait");
+                self.flush_render_targets_overlapping(
+                    "registered memory wait",
+                    &[(wait.address, if wait.is_64_bit { 8 } else { 4 })],
+                );
                 if remu_gpu::take_gpu_wait_latch(id).is_none() {
                     if !memory_wait_is_satisfied(wait) {
                         return EventOutcome::Blocked(GpuEvent::RegisteredMemoryWait { id, wait });
@@ -1013,21 +1028,24 @@ impl Dx12Presenter {
         EventOutcome::Processed
     }
 
-    fn flush_render_targets(&mut self, reason: &str) -> bool {
+    fn flush_render_targets_overlapping(&mut self, reason: &str, ranges: &[(u64, u64)]) -> bool {
         let Some(executor) = self.guest_executor.as_mut() else {
             return true;
         };
-        let pending = executor.pending_render_target_count();
-        if pending != 0
-            && std::env::var_os("REMU_TRACE_D3D12_TIMING").is_some_and(|value| value == "1")
-        {
-            eprintln!("[REMu][D3D12-TIMING] flush_reason={reason:?} pending={pending}");
-        }
-        if let Err(error) = executor.flush_all_render_targets() {
-            eprintln!("[REMu][D3D12] {reason} render-target flush failed: {error}");
-            false
-        } else {
-            true
+        match executor.flush_render_targets_overlapping(ranges) {
+            Ok(0) => true,
+            Ok(pending) => {
+                if std::env::var_os("REMU_TRACE_D3D12_TIMING").is_some_and(|value| value == "1") {
+                    eprintln!(
+                        "[REMu][D3D12-TIMING] flush_reason={reason:?} pending={pending} ranges={ranges:x?}"
+                    );
+                }
+                true
+            }
+            Err(error) => {
+                eprintln!("[REMu][D3D12] {reason} render-target flush failed: {error}");
+                false
+            }
         }
     }
 

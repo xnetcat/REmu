@@ -1984,11 +1984,56 @@ impl Dx12GuestExecutor {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn pending_render_target_count(&self) -> usize {
         self.render_target_cache
             .values()
             .filter(|target| target.pending_writeback)
             .count()
+    }
+
+    /// Publishes only GPU-owned targets whose storage intersects one of the guest ranges.
+    ///
+    /// Command-processor label writes and waits normally touch a handful of bytes outside color
+    /// allocations. Flushing every resident target for each such packet serialized the D3D12
+    /// queue and copied whole 4K surfaces back to RAM dozens of times per frame. Physical-alias
+    /// overlap is included so a label reached through another direct-memory VA remains ordered.
+    pub(super) fn flush_render_targets_overlapping(
+        &mut self,
+        ranges: &[(u64, u64)],
+    ) -> Result<usize, String> {
+        let pending = self
+            .render_target_cache
+            .iter()
+            .filter_map(|(&target_address, target)| {
+                if !target.pending_writeback {
+                    return None;
+                }
+                let target_byte_count = target
+                    .target
+                    .descriptor
+                    .raw_byte_count()
+                    .ok()
+                    .and_then(|byte_count| u64::try_from(byte_count).ok());
+                target_byte_count
+                    .is_none_or(|target_byte_count| {
+                        ranges.iter().any(|&(address, byte_count)| {
+                            guest_resource_ranges_overlap(
+                                target_address,
+                                target_byte_count,
+                                address,
+                                byte_count,
+                            )
+                        })
+                    })
+                    .then_some(target_address)
+            })
+            .collect::<Vec<_>>();
+        let count = pending.len();
+        for address in pending {
+            self.flush_render_target(address)?;
+        }
+        Ok(count)
     }
 
     /// Applies the cache-invalidation semantics of `ACQUIRE_MEM` without publishing GPU-owned
@@ -5170,6 +5215,25 @@ fn guest_ranges_overlap(
     left_address < right_end && right_address < left_end
 }
 
+fn guest_resource_ranges_overlap(
+    left_address: u64,
+    left_byte_count: u64,
+    right_address: u64,
+    right_byte_count: u64,
+) -> bool {
+    guest_ranges_overlap(
+        left_address,
+        left_byte_count,
+        right_address,
+        right_byte_count,
+    ) || remu_memory::guest_shared_backing_ranges_overlap(
+        left_address,
+        left_byte_count,
+        right_address,
+        right_byte_count,
+    )
+}
+
 fn render_target_can_alias_texture(target: &RenderTargetResource, texture: DecodedTexture) -> bool {
     let render = target.target.descriptor;
     target.pending_writeback
@@ -8124,6 +8188,10 @@ mod tests {
         ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuMemoryAcquire,
         GpuRegister, GpuScanoutTarget, IndexedDraw, ShaderSnapshot,
     };
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
     use remu_shader::{
         BufferMemoryControl, DataShareControl, ExportControl, GlobalMemoryBinding,
         GlobalMemoryControl, ImageBinding, ImageControl, Instruction, InstructionControl, Opcode,
@@ -8134,11 +8202,11 @@ mod tests {
         D3D12_MIP_LOD_BIAS_MAX, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM,
         DecodedRenderTarget, DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions,
         WritebackJournalSites, decode_render_target_format, decode_sampler, dispatch_group_count,
-        expand_primitive_indices, indirect_draw_count_allows, initial_render_target_clear,
-        ngg_raster_vertex_shader, prepare_ngg_triangle_indices, presentable_bgra,
-        primitive_restart_index, regroup_restart_list_indices, resolve_indirect_compute,
-        resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
-        synthetic_ngg_binding, write_changed_ranges_direct,
+        expand_primitive_indices, guest_resource_ranges_overlap, indirect_draw_count_allows,
+        initial_render_target_clear, ngg_raster_vertex_shader, prepare_ngg_triangle_indices,
+        presentable_bgra, primitive_restart_index, regroup_restart_list_indices,
+        resolve_indirect_compute, resolve_indirect_compute_ordered, resolve_indirect_draw,
+        snapshot_ordered_global, synthetic_ngg_binding, write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -8160,6 +8228,61 @@ mod tests {
             shader_evaluation: None,
             shader_registers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn publication_ranges_include_physical_aliases_without_flushing_unrelated_storage() {
+        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("physical backing");
+        let target = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("target mapping");
+        let alias = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("alias mapping");
+        let unrelated = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                GUEST_PAGE_SIZE,
+            )
+            .expect("unrelated physical mapping");
+
+        assert!(guest_resource_ranges_overlap(
+            target.get(),
+            GUEST_PAGE_SIZE,
+            target.get() + 64,
+            4,
+        ));
+        assert!(guest_resource_ranges_overlap(
+            target.get(),
+            GUEST_PAGE_SIZE,
+            alias.get() + 64,
+            4,
+        ));
+        assert!(!guest_resource_ranges_overlap(
+            target.get(),
+            GUEST_PAGE_SIZE,
+            unrelated.get(),
+            GUEST_PAGE_SIZE,
+        ));
     }
 
     #[test]
