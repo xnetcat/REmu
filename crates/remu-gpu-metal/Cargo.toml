@@ -20,5 +20,10 @@ remu-memory = { path = "../remu-memory" }
 sha1.workspace = true
 winit.workspace = true
 
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+# Keep Objective-C driver assertions inside the Rust test harness so CI reports the Metal
+# exception and the responsible test instead of aborting the complete test process.
+objc = { workspace = true, features = ["exception"] }
+
 [lints]
 workspace = true
