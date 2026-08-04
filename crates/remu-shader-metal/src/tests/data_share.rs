@@ -259,6 +259,30 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         shader.source.contains("remu_v_8 = remu_group_id.y"),
         "mesh instance ID must come from the second dispatch-grid dimension"
     );
+    let mut hlsl_evaluation = empty_evaluation();
+    hlsl_evaluation.global_memory_bindings = (0..4)
+        .map(|index| remu_shader::GlobalMemoryBinding {
+            scalar_address: 0xffff_ff00 + index,
+            base_address: 0,
+            instruction_pcs: Default::default(),
+            byte_count: 4096,
+            data: vec![0; 4096],
+            writable: index >= 2,
+            write_back_to_guest: false,
+        })
+        .collect();
+    let hlsl = compile_hlsl(
+        &program,
+        &hlsl_evaluation,
+        &MetalCompileOptions::mesh(2, 16 * 1024, 96, 96, 96),
+        [96, 1, 1],
+    )
+    .expect("NGG compute fallback lowering");
+    assert_eq!(hlsl.target_profile, "cs_6_6");
+    assert!(hlsl.source.contains("[numthreads(96, 1, 1)]"));
+    assert!(hlsl.source.contains("remu_ngg_set_index"));
+    assert!(hlsl.source.contains("remu_mesh_vertices"));
+    assert!(hlsl.source.contains("remu_mesh_indices"));
     #[cfg(target_os = "macos")]
     if let Some(compiler) = std::env::var_os("REMU_METAL_COMPILER") {
         let directory =

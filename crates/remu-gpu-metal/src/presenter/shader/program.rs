@@ -467,24 +467,7 @@ pub(crate) fn missing_vertex_parameter_exports(
 /// inputs without staging records through LDS. Lowering those stages as ordinary Metal vertices
 /// loses the merged-wave system values and can collapse every output position to zero.
 pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
-    let mut allocation_message = false;
-    let mut primitive_export = false;
-    let mut position_export = false;
-    for instruction in &program.instructions {
-        if instruction.opcode.is("SSendmsg")
-            && instruction
-                .sources
-                .first()
-                .is_some_and(|source| source.value == 9)
-        {
-            allocation_message = true;
-        }
-        if let Some(InstructionControl::Export(export)) = instruction.control.as_ref() {
-            primitive_export |= export.target == 20 && export.enable_mask != 0;
-            position_export |= export.target == 12 && export.enable_mask != 0;
-        }
-    }
-    allocation_message && primitive_export && position_export
+    remu_gpu::is_ngg_export_stage(program)
 }
 
 /// Returns whether an export program manipulates the architectural 64-bit EXEC pair.
@@ -495,19 +478,7 @@ pub(crate) fn ngg_mesh_export_stage(program: &Program) -> bool {
 /// `s3[27:24] * 64 + v_mbcnt`. The mesh lowering must synthesize the merged wave info with the
 /// matching granularity, so this classification selects its architectural lane count.
 pub(crate) fn ngg_export_uses_wave64_exec(program: &Program) -> bool {
-    const EXEC_LO: u32 = 126;
-    program.instructions.iter().any(|instruction| {
-        let Some(name) = instruction.opcode.known_name() else {
-            return false;
-        };
-        if !(name.ends_with("B64") || name.ends_with("U64") || name.ends_with("I64")) {
-            return false;
-        }
-        name.contains("Saveexec")
-            || instruction.destinations.first().is_some_and(|destination| {
-                destination.kind == OperandKind::ScalarRegister && destination.value == EXEC_LO
-            })
-    })
+    remu_gpu::ngg_uses_wave64_exec(program)
 }
 
 /// True when an NGG export stages geometry records through general LDS (not ADDTID spills).
@@ -517,13 +488,7 @@ pub(crate) fn ngg_export_uses_wave64_exec(program: &Program) -> bool {
 /// primitive connectivity, so non-procedural programs require the mesh ABI.
 #[cfg(test)]
 pub(crate) fn ngg_export_uses_general_lds(program: &Program) -> bool {
-    program.instructions.iter().any(|instruction| {
-        matches!(instruction.control, Some(InstructionControl::DataShare(_)))
-            && !matches!(
-                instruction.opcode.known_name(),
-                Some("DsSwizzleB32" | "DsWriteAddtidB32" | "DsReadAddtidB32")
-            )
-    })
+    remu_gpu::ngg_uses_general_lds(program)
 }
 
 /// True when an NGG export only computes cover geometry (no memory/image/LDS traffic).

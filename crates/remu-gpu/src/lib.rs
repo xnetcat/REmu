@@ -79,6 +79,14 @@ pub use resource::{
     GpuScanoutTarget, GraphicsApi, IndexedDraw, ShaderSnapshot,
 };
 
+mod ngg;
+pub use ngg::{
+    GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL, NGG_MESHLET_WORDS_PER_GROUP,
+    NggOutputPrimitiveType, NggSubgroupLimits, PreparedNggMeshlets, VGT_GS_INSTANCE_CNT,
+    VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE, decode_ngg_subgroup_limits,
+    is_ngg_export_stage, ngg_uses_general_lds, ngg_uses_wave64_exec, prepare_ngg_meshlets,
+};
+
 mod dialog;
 pub use dialog::{
     HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResult, HostDialogResultCode,

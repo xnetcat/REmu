@@ -55,7 +55,9 @@ impl Compiler<'_> {
             MetalShaderStage::Vertex => "vs",
             MetalShaderStage::Pixel => "ps",
             MetalShaderStage::Compute => "cs",
-            MetalShaderStage::Mesh => "ms",
+            // NGG is emitted as a compute prepass. The D3D12 backend rasterizes its generated
+            // vertex/index buffers through a small classic graphics pipeline on every tier.
+            MetalShaderStage::Mesh => "cs",
         };
         let target_version = if self.options.stage == MetalShaderStage::Pixel {
             "6_7"
@@ -117,6 +119,12 @@ impl Compiler<'_> {
         if let Some(words) = lds_words {
             let _ = writeln!(source, "groupshared uint remu_lds[{words}];\n");
         }
+        if self.options.stage == MetalShaderStage::Mesh {
+            source.push_str(
+                "groupshared uint remu_mesh_output_vertex_count;\n\
+                 groupshared uint remu_mesh_output_primitive_count;\n\n",
+            );
+        }
         if self.split_wave64() {
             if self
                 .program
@@ -142,6 +150,13 @@ impl Compiler<'_> {
             source.push('\n');
         }
         emit_hlsl_prelude(&mut source, lds_words.is_some());
+        if self.options.stage == MetalShaderStage::Mesh {
+            let _ = writeln!(
+                source,
+                "void remu_ngg_set_index(uint descriptor, uint group, uint slot, uint value) {{\n    uint global_index = group * {}u * 3u + slot;\n    uint global_vertex = group * ({}u + 1u) + value;\n    remu_store_u32(descriptor, global_index * 4u, global_vertex);\n}}\n",
+                self.options.mesh_max_primitive_count, self.options.mesh_max_vertex_count
+            );
+        }
         if self.program.instructions.iter().any(|instruction| {
             matches!(instruction.control, Some(InstructionControl::Vop3p(_)))
                 || instruction.opcode.is("VCvtPkrtzF16F32")
@@ -175,8 +190,7 @@ impl Compiler<'_> {
         let root_space = match self.options.stage {
             MetalShaderStage::Vertex => 0,
             MetalShaderStage::Pixel => 1,
-            MetalShaderStage::Compute => 2,
-            MetalShaderStage::Mesh => unreachable!(),
+            MetalShaderStage::Compute | MetalShaderStage::Mesh => 2,
         };
         let _ = writeln!(
             source,
@@ -205,7 +219,10 @@ impl Compiler<'_> {
                 "[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads({}, {}, {})]\nvoid remu_main(uint3 remu_local_id : SV_GroupThreadID, uint3 remu_native_group_id : SV_GroupID, uint3 remu_dispatch_id : SV_DispatchThreadID, uint remu_thread_index : SV_GroupIndex)",
                 threads_per_group[0], threads_per_group[1], threads_per_group[2]
             ),
-            MetalShaderStage::Mesh => unreachable!("mesh shaders are rejected by validation"),
+            MetalShaderStage::Mesh => format!(
+                "[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads({}, 1, 1)]\nvoid remu_main(uint3 remu_local_id : SV_GroupThreadID, uint3 remu_group_id : SV_GroupID, uint remu_thread_index : SV_GroupIndex)",
+                self.options.mesh_threadgroup_size
+            ),
         };
         let _ = writeln!(source, "{signature} {{");
         source.push_str(
@@ -217,6 +234,23 @@ impl Compiler<'_> {
                 source,
                 "    uint b{index} = remu_binding_table[{}u];",
                 index + 1
+            );
+        }
+        if self.options.stage == MetalShaderStage::Mesh {
+            let count = self.evaluation.global_memory_bindings.len();
+            if count < 4 {
+                return Err(MetalCompileError::InvalidInterface(
+                    "D3D12 NGG fallback requires meshlet, draw, vertex-output, and index-output bindings"
+                        .into(),
+                ));
+            }
+            let _ = writeln!(
+                source,
+                "    uint remu_meshlets = b{};\n    uint remu_draw_descriptor = b{};\n    uint remu_mesh_vertices = b{};\n    uint remu_mesh_indices = b{};\n    StructuredBuffer<uint> remu_draw = ResourceDescriptorHeap[remu_draw_descriptor];",
+                count - 4,
+                count - 3,
+                count - 2,
+                count - 1
             );
         }
         let texture_base = 1 + self.evaluation.global_memory_bindings.len();
@@ -332,7 +366,72 @@ impl Compiler<'_> {
                     );
                 }
             }
-            MetalShaderStage::Mesh => unreachable!(),
+            MetalShaderStage::Mesh => {
+                let vertex_capacity = self.options.mesh_max_vertex_count;
+                let primitive_capacity = self.options.mesh_max_primitive_count;
+                let record_words = 4_u32
+                    .checked_mul(
+                        1 + u32::try_from(self.vertex_outputs.len()).map_err(|_| {
+                            MetalCompileError::InvalidInterface(
+                                "too many NGG vertex outputs".into(),
+                            )
+                        })?,
+                    )
+                    .and_then(|words| {
+                        words.checked_add(u32::from(self.options.render_target_array_length > 1))
+                    })
+                    .ok_or_else(|| {
+                        MetalCompileError::InvalidInterface("NGG vertex record is too large".into())
+                    })?;
+                source.push_str("    uint remu_lane = WaveGetLaneIndex();\n");
+                let _ = writeln!(
+                    source,
+                    "    uint3 remu_group_size = uint3({}u, 1u, 1u);\n    RemuVsOut remu_out = (RemuVsOut)0;\n    remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n    uint remu_meshlet_base = remu_group_id.x * 514u;\n    uint remu_output_group = remu_group_id.y * remu_draw[3] + remu_group_id.x;\n    uint remu_mesh_counts = remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 0u) * 4u, 0xffffffffu);\n    uint remu_mesh_primitive_base = remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 1u) * 4u, 0xffffffffu);\n    uint remu_mesh_input_vertex_count_encoded = remu_mesh_counts & 0xffu;\n    uint remu_mesh_input_primitive_count_encoded = (remu_mesh_counts >> 8u) & 0xffu;\n    uint remu_mesh_input_vertex_count = remu_mesh_input_vertex_count_encoded == 0u ? 256u : remu_mesh_input_vertex_count_encoded;\n    uint remu_mesh_input_primitive_count = remu_mesh_input_primitive_count_encoded == 0u ? 256u : remu_mesh_input_primitive_count_encoded;\n    uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 258u + remu_thread_index) * 4u, 0xffffffffu) : 0x80000000u;\n    if (remu_thread_index == 0u) {{\n        remu_mesh_output_vertex_count = 0u;\n        remu_mesh_output_primitive_count = 0u;\n        uint remu_sentinel_word = (remu_output_group * ({}u + 1u) + {}u) * {}u;\n        [unroll] for (uint remu_word = 0u; remu_word < {}u; ++remu_word) remu_store_u32(remu_mesh_vertices, (remu_sentinel_word + remu_word) * 4u, 0u);\n    }}\n    if (remu_thread_index < {}u) {{\n        uint remu_sentinel = remu_output_group * ({}u + 1u) + {}u;\n        remu_store_u32(remu_mesh_indices, (remu_output_group * {}u * 3u + remu_thread_index * 3u + 0u) * 4u, remu_sentinel);\n        remu_store_u32(remu_mesh_indices, (remu_output_group * {}u * 3u + remu_thread_index * 3u + 1u) * 4u, remu_sentinel);\n        remu_store_u32(remu_mesh_indices, (remu_output_group * {}u * 3u + remu_thread_index * 3u + 2u) * 4u, remu_sentinel);\n    }}\n    GroupMemoryBarrierWithGroupSync();",
+                    self.options.mesh_threadgroup_size,
+                    vertex_capacity,
+                    vertex_capacity,
+                    record_words,
+                    record_words,
+                    primitive_capacity,
+                    vertex_capacity,
+                    vertex_capacity,
+                    primitive_capacity,
+                    primitive_capacity,
+                    primitive_capacity,
+                );
+                if self.options.render_target_array_length > 1 {
+                    let _ = writeln!(
+                        source,
+                        "    remu_out.render_target_array_index = min(remu_group_id.y, {}u);",
+                        self.options.render_target_array_length - 1
+                    );
+                }
+                let wave_shift = if self.split_wave64() { 6 } else { 5 };
+                let wave_round = (1_u32 << wave_shift) - 1;
+                let _ = writeln!(
+                    source,
+                    "    uint remu_mesh_wave_count = ({}u + {wave_round}u) >> {wave_shift}u;\n    s[3] = (remu_mesh_counts & 0x00ffffffu) | (((remu_thread_index >> {wave_shift}u) & 0xfu) << 24u) | ((remu_mesh_wave_count & 0xfu) << 28u);",
+                    self.options.mesh_threadgroup_size
+                );
+                if contains_register_reference(&self.body, 'v', 0) {
+                    source.push_str("    remu_v_0 = remu_mesh_primitive;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 1) {
+                    source
+                        .push_str("    remu_v_1 = remu_mesh_primitive_base + remu_thread_index;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 2) {
+                    source.push_str("    remu_v_2 = 0u;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 5) {
+                    source.push_str(
+                        "    remu_v_5 = remu_thread_index < remu_mesh_input_vertex_count ? remu_load_u32_ro(remu_meshlets, (remu_meshlet_base + 2u + remu_thread_index) * 4u, 0xffffffffu) + remu_draw[2] : 0u;\n",
+                    );
+                }
+                if contains_register_reference(&self.body, 'v', 8) {
+                    source.push_str("    remu_v_8 = remu_group_id.y + remu_draw[1];\n");
+                }
+            }
         }
 
         match self.control_flow {
@@ -398,7 +497,42 @@ impl Compiler<'_> {
                 }
             }
             MetalShaderStage::Compute => {}
-            MetalShaderStage::Mesh => unreachable!(),
+            MetalShaderStage::Mesh => {
+                let record_words = 4 * (1 + self.vertex_outputs.len())
+                    + usize::from(self.options.render_target_array_length > 1);
+                source.push_str("    GroupMemoryBarrierWithGroupSync();\n");
+                let _ = writeln!(
+                    source,
+                    "    uint remu_mesh_output_vertices = min(remu_mesh_output_vertex_count, {}u);\n    if (remu_thread_index < remu_mesh_output_vertices) {{\n        uint remu_vertex_word = (remu_output_group * ({}u + 1u) + remu_thread_index) * {}u;",
+                    self.options.mesh_max_vertex_count,
+                    self.options.mesh_max_vertex_count,
+                    record_words
+                );
+                for (component, field) in ["x", "y", "z", "w"].into_iter().enumerate() {
+                    let _ = writeln!(
+                        source,
+                        "        remu_store_u32(remu_mesh_vertices, (remu_vertex_word + {component}u) * 4u, asuint(remu_out.position.{field}));"
+                    );
+                }
+                let mut word = 4_usize;
+                for location in &self.vertex_outputs {
+                    for (component, field) in ["x", "y", "z", "w"].into_iter().enumerate() {
+                        let offset = word + component;
+                        let _ = writeln!(
+                            source,
+                            "        remu_store_u32(remu_mesh_vertices, (remu_vertex_word + {offset}u) * 4u, asuint(remu_out.param{location}.{field}));"
+                        );
+                    }
+                    word += 4;
+                }
+                if self.options.render_target_array_length > 1 {
+                    let _ = writeln!(
+                        source,
+                        "        remu_store_u32(remu_mesh_vertices, (remu_vertex_word + {word}u) * 4u, remu_out.render_target_array_index);"
+                    );
+                }
+                source.push_str("    }\n");
+            }
         }
         source.push_str("}\n");
         scalarize_register_state(&source)
@@ -471,7 +605,16 @@ impl Compiler<'_> {
                 }
             }
             MetalShaderStage::Compute => {}
-            MetalShaderStage::Mesh => unreachable!(),
+            MetalShaderStage::Mesh => {
+                source.push_str("struct RemuVsOut {\n    float4 position;\n");
+                for location in &self.vertex_outputs {
+                    let _ = writeln!(source, "    float4 param{location};");
+                }
+                if self.options.render_target_array_length > 1 {
+                    source.push_str("    uint render_target_array_index;\n");
+                }
+                source.push_str("};\n\n");
+            }
         }
     }
 
@@ -522,9 +665,21 @@ fn validate_hlsl_interface(
     threads_per_group: [u32; 3],
 ) -> Result<(), MetalCompileError> {
     if compiler.options.stage == MetalShaderStage::Mesh {
-        return Err(MetalCompileError::InvalidInterface(
-            "NGG mesh lowering requires the D3D12 compute/classic-graphics fallback".into(),
-        ));
+        let options = &compiler.options;
+        if options.mesh_threadgroup_size == 0
+            || options.mesh_threadgroup_size > 256
+            || options.mesh_max_vertex_count == 0
+            || options.mesh_max_vertex_count > 256
+            || options.mesh_max_primitive_count == 0
+            || options.mesh_max_primitive_count > 256
+        {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "NGG compute fallback has invalid threads/vertices/primitives {}/{}/{}",
+                options.mesh_threadgroup_size,
+                options.mesh_max_vertex_count,
+                options.mesh_max_primitive_count
+            )));
+        }
     }
     if compiler.options.stage == MetalShaderStage::Compute {
         let total = threads_per_group
@@ -608,6 +763,18 @@ fn translate_common_source(mut source: String) -> String {
 
 fn translate_hlsl_body(source: String) -> String {
     let mut source = translate_common_source(source);
+    source = source.replace(
+        "atomic_store_explicit(&remu_mesh_output_vertex_count, s[124] & 0x7ffu, memory_order_relaxed);",
+        "remu_mesh_output_vertex_count = s[124] & 0x7ffu;",
+    );
+    source = source.replace(
+        "atomic_store_explicit(&remu_mesh_output_primitive_count, (s[124] >> 12u) & 0x7ffu, memory_order_relaxed);",
+        "remu_mesh_output_primitive_count = (s[124] >> 12u) & 0x7ffu;",
+    );
+    source = source.replace(
+        "remu_mesh.set_index(",
+        "remu_ngg_set_index(remu_mesh_indices, remu_output_group, ",
+    );
     for (from, to) in [
         ("atomic_load_explicit(remu_lds + ", "remu_lds_load("),
         ("atomic_store_explicit(remu_lds + ", "remu_lds_store("),

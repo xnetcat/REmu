@@ -11,13 +11,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
-use remu_gpu::{ComputeDispatch, ComputeDispatchSource, ComputeGrid, IndexedDraw};
+use remu_gpu::{
+    ComputeDispatch, ComputeDispatchSource, ComputeGrid, IndexedDraw, NggOutputPrimitiveType,
+    NggSubgroupLimits, PreparedNggMeshlets,
+};
 use remu_memory::{
     CpuWriteWatch, GuestRangeLease, GuestSharedMappingIdentity, GuestWriteSite,
     LeasePublishOutcome, guest_shared_backing_identity,
 };
-use remu_shader::{Program, ShaderEvaluation};
-use remu_shader_metal::{HlslEvaluationKey, HlslShader, MetalCompileOptions};
+use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
+use remu_shader_metal::{
+    HlslBindingLayout, HlslEvaluationKey, HlslShader, MetalCompileOptions, MetalRegisterFootprint,
+    MetalShaderStage, NggRegisters,
+};
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_LINELIST, D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ,
@@ -49,19 +55,20 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_MESSAGE, D3D12_MIP_LOD_BIAS_MAX, D3D12_MIP_LOD_BIAS_MIN,
     D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_QUERY_HEAP_DESC,
-    D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION, D3D12_RASTERIZER_DESC,
-    D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOLVE_MODE_MAX,
-    D3D12_RESOLVE_MODE_MIN, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
-    D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
-    D3D12_RESOURCE_BARRIER_TYPE_TRANSITION, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+    D3D12_QUERY_TYPE_OCCLUSION, D3D12_RASTERIZER_DESC, D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT,
+    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOLVE_MODE_MAX, D3D12_RESOLVE_MODE_MIN,
+    D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+    D3D12_RESOURCE_BARRIER_FLAG_NONE, D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+    D3D12_RESOURCE_BARRIER_TYPE_UAV, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_BUFFER,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_DIMENSION_TEXTURE3D,
     D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
     D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE,
-    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
-    D3D12_RESOURCE_STATE_RESOLVE_DEST, D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
-    D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_ROOT_CONSTANTS,
+    D3D12_RESOURCE_STATE_GENERIC_READ, D3D12_RESOURCE_STATE_INDEX_BUFFER,
+    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RESOLVE_DEST,
+    D3D12_RESOURCE_STATE_RESOLVE_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    D3D12_RESOURCE_TRANSITION_BARRIER, D3D12_RESOURCE_UAV_BARRIER, D3D12_ROOT_CONSTANTS,
     D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
     D3D12_ROOT_SIGNATURE_DESC, D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED, D3D12_SAMPLER_DESC,
@@ -123,6 +130,7 @@ const TEXTURE_WRITEBACK_CHUNK_BYTES: usize = 1024 * 1024;
 const SHARED_DESCRIPTOR_CAPACITY: usize = 65_536;
 const SHARED_SAMPLER_CAPACITY: usize = 2_048;
 const SHARED_UPLOAD_CAPACITY: usize = 64 * 1024 * 1024;
+const NGG_LDS_BYTES: u32 = 16 * 1024;
 
 // D3D12 pipeline-state streams are alternating type/value records, each aligned like a pointer.
 // This is the Rust equivalent of Microsoft's `CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT` helper.
@@ -269,6 +277,7 @@ struct PendingDrawResources {
     _pixel_resources: Option<ComputeResources>,
     _geometry: PreparedGeometry,
     _pipeline: ID3D12PipelineState,
+    _ngg_pipeline: Option<ID3D12PipelineState>,
 }
 
 struct DescriptorArena {
@@ -730,6 +739,14 @@ struct PreparedGeometry {
     strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
 }
 
+struct PreparedNggExecution {
+    pipeline: ID3D12PipelineState,
+    meshlet_group_count: u32,
+    output_vertex_binding: usize,
+    output_index_binding: usize,
+    output_index_byte_count: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IndirectDrawArguments {
     element_count: u32,
@@ -796,8 +813,7 @@ impl Dx12GuestExecutor {
             .ok_or("ID3D12Device::CreateQueryHeap returned no occlusion heap")?;
         let occlusion_readback = create_readback_buffer(
             &device,
-            usize::try_from(OCCLUSION_QUERY_CAPACITY)
-                .expect("occlusion capacity fits usize")
+            usize::try_from(OCCLUSION_QUERY_CAPACITY).expect("occlusion capacity fits usize")
                 * size_of::<u64>(),
         )?;
         name_object(&occlusion_query_heap, "REMu guest occlusion query heap");
@@ -1202,53 +1218,179 @@ impl Dx12GuestExecutor {
             (None, None) => None,
             _ => return Err("draw has an incomplete pixel shader/evaluation pair".to_owned()),
         };
-        let mut vertex_options = MetalCompileOptions::vertex(
-            pixel_stage
-                .as_ref()
-                .map_or(0, |(shader, _, _, _)| shader.interpolated_attribute_count),
-        );
-        vertex_options.required_vertex_output_locations = pixel_stage
-            .as_ref()
-            .map(|(shader, _, _, _)| shader.interpolated_attribute_locations.clone());
-        vertex_options.vertex_output_control =
-            register_value(&draw.context_registers, 0x207).unwrap_or_default();
         let export_user_base = [0x08c, 0x0cc, 0x04c]
             .into_iter()
             .find(|base| register_value(&draw.shader_registers, base - 1).is_some())
             .unwrap_or(0x0cc);
-        vertex_options.allocated_vector_register_count =
-            graphics_allocated_vgprs(&draw.shader_registers, export_user_base);
-        let (_, vertex_compiled, vertex_translation_cache_hit) = self.translate_shader_cached(
-            &export.program,
-            export_evaluation,
-            &vertex_options,
-            [1, 1, 1],
-            &format!("remu-vs-{:x}.hlsl", draw.export_shader_address),
-        )?;
+        let interpolated_locations = pixel_stage.as_ref().map_or_else(Vec::new, |stage| {
+            stage.0.interpolated_attribute_locations.clone()
+        });
+        let required_vertex_output_count = pixel_stage
+            .as_ref()
+            .map_or(0, |stage| stage.0.interpolated_attribute_count);
+        let vertex_output_control =
+            register_value(&draw.context_registers, 0x207).unwrap_or_default();
+        let uses_ngg_compute_fallback = remu_gpu::is_ngg_export_stage(&export.program)
+            && remu_gpu::ngg_uses_general_lds(&export.program);
+        let (vertex_evaluation, vertex_compiled, vertex_translation_cache_hit, ngg_execution) =
+            if uses_ngg_compute_fallback {
+                let limits = remu_gpu::decode_ngg_subgroup_limits(&draw.context_registers)?
+                    .ok_or("NGG export is missing subgroup sizing registers")?;
+                if limits
+                    .output_primitive_type
+                    .is_some_and(|primitive| primitive != NggOutputPrimitiveType::TriangleStrip)
+                {
+                    return Err(format!(
+                        "NGG output primitive {:?} cannot use the D3D12 triangle fallback",
+                        limits.output_primitive_type
+                    ));
+                }
+                if limits.threadgroup_threads > 1_024 {
+                    return Err(format!(
+                        "NGG threadgroup {} exceeds D3D12's 1024-thread limit",
+                        limits.threadgroup_threads
+                    ));
+                }
+                if draw.instance_count > D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION {
+                    return Err(format!(
+                        "NGG instance count {} exceeds D3D12's {}-group Y limit",
+                        draw.instance_count, D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION
+                    ));
+                }
+                let triangle_indices = prepare_ngg_triangle_indices(draw)?;
+                let meshlets = remu_gpu::prepare_ngg_meshlets(&triangle_indices, limits);
+                if meshlets.group_count == 0 {
+                    return Ok(());
+                }
+                if meshlets.group_count > D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION {
+                    return Err(format!(
+                        "NGG meshlet count {} exceeds D3D12's {}-group X limit",
+                        meshlets.group_count, D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION
+                    ));
+                }
+                let layered = false;
+                let record_words = ngg_vertex_record_words(&interpolated_locations, layered);
+                let (
+                    prepared_evaluation,
+                    output_vertex_binding,
+                    output_index_binding,
+                    output_index_byte_count,
+                ) = prepare_ngg_evaluation(
+                    export_evaluation,
+                    &meshlets,
+                    draw,
+                    first_instance,
+                    limits,
+                    record_words,
+                )?;
+                let mut options = if let Some(pgm_rsrc1) =
+                    register_value(&draw.shader_registers, export_user_base.saturating_sub(2))
+                {
+                    MetalCompileOptions::mesh_from_ngg_registers(
+                        required_vertex_output_count,
+                        NGG_LDS_BYTES,
+                        limits.threadgroup_threads,
+                        NggRegisters {
+                            pgm_rsrc1,
+                            gs_max_vert_out: register_value(
+                                &draw.context_registers,
+                                remu_gpu::VGT_GS_MAX_VERT_OUT,
+                            )
+                            .unwrap_or_default(),
+                            ge_ngg_subgrp_cntl: register_value(
+                                &draw.context_registers,
+                                remu_gpu::GE_NGG_SUBGRP_CNTL,
+                            )
+                            .unwrap_or_default(),
+                        },
+                    )
+                } else {
+                    MetalCompileOptions::mesh(
+                        required_vertex_output_count,
+                        NGG_LDS_BYTES,
+                        limits.max_output_vertices_per_subgroup,
+                        limits.max_output_primitives_per_subgroup,
+                        limits.threadgroup_threads,
+                    )
+                };
+                options.required_vertex_output_locations = Some(interpolated_locations.clone());
+                options.vertex_output_control = vertex_output_control;
+                options.mesh_max_vertex_count = limits.max_output_vertices_per_subgroup;
+                options.mesh_max_primitive_count = limits.max_output_primitives_per_subgroup;
+                options.mesh_threadgroup_size = limits.threadgroup_threads;
+                if !options.ngg_registers_proven {
+                    options.allocated_vector_register_count =
+                        graphics_allocated_vgprs(&draw.shader_registers, export_user_base);
+                }
+                if remu_gpu::ngg_uses_wave64_exec(&export.program) {
+                    options.wave_lane_count = 64;
+                    options.allocated_vector_register_count =
+                        graphics_allocated_vgprs(&draw.shader_registers, export_user_base);
+                }
+                let (_, compute_compiled, cache_hit) = self.translate_shader_cached(
+                    &export.program,
+                    &prepared_evaluation,
+                    &options,
+                    [limits.threadgroup_threads, 1, 1],
+                    &format!("remu-ngg-cs-{:x}.hlsl", draw.export_shader_address),
+                )?;
+                let compute_pipeline = self.compute_pipeline_cached(&compute_compiled)?;
+                let raster_shader = ngg_raster_vertex_shader(
+                    &prepared_evaluation,
+                    &interpolated_locations,
+                    record_words,
+                    output_vertex_binding,
+                    layered,
+                );
+                let raster_compiled = self.compile_shader_cached(
+                    &raster_shader,
+                    &format!("remu-ngg-vs-{:x}.hlsl", draw.export_shader_address),
+                )?;
+                (
+                    prepared_evaluation,
+                    raster_compiled,
+                    cache_hit,
+                    Some(PreparedNggExecution {
+                        pipeline: compute_pipeline,
+                        meshlet_group_count: meshlets.group_count,
+                        output_vertex_binding,
+                        output_index_binding,
+                        output_index_byte_count,
+                    }),
+                )
+            } else {
+                let mut options = MetalCompileOptions::vertex(required_vertex_output_count);
+                options.required_vertex_output_locations = Some(interpolated_locations.clone());
+                options.vertex_output_control = vertex_output_control;
+                options.allocated_vector_register_count =
+                    graphics_allocated_vgprs(&draw.shader_registers, export_user_base);
+                let (_, compiled, cache_hit) = self.translate_shader_cached(
+                    &export.program,
+                    export_evaluation,
+                    &options,
+                    [1, 1, 1],
+                    &format!("remu-vs-{:x}.hlsl", draw.export_shader_address),
+                )?;
+                (export_evaluation.clone(), compiled, cache_hit, None)
+            };
         let pixel_compiled = pixel_stage.as_ref().map(|(_, _, compiled, _)| compiled);
         let shader_translation_cache_hits = usize::from(vertex_translation_cache_hit)
             + pixel_stage
                 .as_ref()
                 .map_or(0, |(_, _, _, cache_hit)| usize::from(*cache_hit));
         let translation_ready = timing_started.elapsed();
-        let geometry = prepare_geometry(
-            &self.device,
-            &mut self.upload_arena,
-            draw,
-            self.triangle_fan_supported,
-        )?;
-        let geometry_ready = timing_started.elapsed();
-        let pipeline = self.graphics_pipeline_cached(
-            &vertex_compiled,
-            pixel_compiled,
-            draw,
-            &decoded_targets,
-            decoded_depth,
-            geometry.topology_type,
-            geometry.strip_cut,
-            sample_count,
-        )?;
-        let pipeline_ready = timing_started.elapsed();
+        let regular_geometry = ngg_execution
+            .is_none()
+            .then(|| {
+                prepare_geometry(
+                    &self.device,
+                    &mut self.upload_arena,
+                    draw,
+                    self.triangle_fan_supported,
+                )
+            })
+            .transpose()?;
+        let regular_geometry_ready = timing_started.elapsed();
         let output_addresses = decoded_targets
             .iter()
             .map(|target| target.descriptor.address)
@@ -1256,7 +1398,7 @@ impl Dx12GuestExecutor {
         let mut vertex_resources = create_stage_resources(
             &self.device,
             &mut self.upload_arena,
-            export_evaluation,
+            &vertex_evaluation,
             Some((&draw.shader_registers, export_user_base, 8)),
             &self.render_target_cache,
             &mut self.sampled_texture_cache,
@@ -1280,6 +1422,23 @@ impl Dx12GuestExecutor {
             })
             .transpose()?;
         let pixel_resources_ready = timing_started.elapsed();
+        let geometry = match (&ngg_execution, regular_geometry) {
+            (Some(ngg), None) => prepare_ngg_geometry(&vertex_resources, ngg)?,
+            (None, Some(geometry)) => geometry,
+            _ => return Err("internal D3D12 NGG geometry selection mismatch".to_owned()),
+        };
+        let geometry_ready = timing_started.elapsed();
+        let pipeline = self.graphics_pipeline_cached(
+            &vertex_compiled,
+            pixel_compiled,
+            draw,
+            &decoded_targets,
+            decoded_depth,
+            geometry.topology_type,
+            geometry.strip_cut,
+            sample_count,
+        )?;
+        let pipeline_ready = timing_started.elapsed();
         let (descriptors, samplers, root_descriptors) = {
             let mut stages = vec![&mut vertex_resources];
             if let Some(resources) = &mut pixel_resources {
@@ -1398,6 +1557,38 @@ impl Dx12GuestExecutor {
         let pixel_constants = pixel_resources
             .as_ref()
             .map(|_| [root_descriptors[1], 0, 0, 0, 0, 0, 0]);
+        if let Some(ngg) = &ngg_execution {
+            let vertex_output = vertex_resources
+                .globals
+                .get(ngg.output_vertex_binding)
+                .ok_or("NGG output vertex binding is missing")?;
+            let index_output = vertex_resources
+                .globals
+                .get(ngg.output_index_binding)
+                .ok_or("NGG output index binding is missing")?;
+            let compute_constants = [root_descriptors[0], 0, 0, 0, 0, 0, 0];
+            // SAFETY: the translated NGG compute shader and generated buffers share this exact
+            // binding table. Dispatch dimensions were validated against the D3D12 limits above.
+            unsafe {
+                commands.SetDescriptorHeaps(&heaps);
+                commands.SetComputeRootSignature(&self.root);
+                commands.SetPipelineState(&ngg.pipeline);
+                commands.SetComputeRoot32BitConstants(
+                    2,
+                    compute_constants.len() as u32,
+                    compute_constants.as_ptr().cast(),
+                    0,
+                );
+                commands.Dispatch(ngg.meshlet_group_count, draw.instance_count, 1);
+            }
+            record_uav_barrier(&commands, &vertex_output.gpu);
+            record_transition(
+                &commands,
+                &index_output.gpu,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_INDEX_BUFFER,
+            );
+        }
         let occlusion_query_index = self.occlusion_query_count;
         // SAFETY: root constants select each stage's combined-heap table, and all fixed-function
         // state matches the PSO and live target.
@@ -1473,10 +1664,18 @@ impl Dx12GuestExecutor {
                 commands.IASetIndexBuffer(Some(view));
                 commands.DrawIndexedInstanced(
                     geometry.element_count,
-                    draw.instance_count,
+                    if ngg_execution.is_some() {
+                        1
+                    } else {
+                        draw.instance_count
+                    },
                     0,
                     geometry.base_vertex,
-                    first_instance,
+                    if ngg_execution.is_some() {
+                        0
+                    } else {
+                        first_instance
+                    },
                 );
             } else {
                 commands.DrawInstanced(
@@ -1543,7 +1742,7 @@ impl Dx12GuestExecutor {
             self.wait()?;
             let complete = timing_started.elapsed();
             write_back_stage(
-                export_evaluation,
+                &vertex_evaluation,
                 &vertex_resources,
                 &mut self.ordered_global_versions,
             )?;
@@ -1592,6 +1791,7 @@ impl Dx12GuestExecutor {
                 _pixel_resources: pixel_resources,
                 _geometry: geometry,
                 _pipeline: pipeline,
+                _ngg_pipeline: ngg_execution.map(|execution| execution.pipeline),
             });
         } else {
             self.command_pool.push((allocator, commands));
@@ -1614,16 +1814,19 @@ impl Dx12GuestExecutor {
                 u8::from(pixel_requires_writeback),
                 shader_translation_cache_hits,
                 translation_ready.as_micros(),
-                geometry_ready.saturating_sub(translation_ready).as_micros(),
+                regular_geometry_ready
+                    .saturating_sub(translation_ready)
+                    .saturating_add(geometry_ready.saturating_sub(pixel_resources_ready))
+                    .as_micros(),
                 pipeline_ready.saturating_sub(geometry_ready).as_micros(),
                 vertex_resources_ready
-                    .saturating_sub(pipeline_ready)
+                    .saturating_sub(regular_geometry_ready)
                     .as_micros(),
                 pixel_resources_ready
                     .saturating_sub(vertex_resources_ready)
                     .as_micros(),
                 heaps_ready
-                    .saturating_sub(pixel_resources_ready)
+                    .saturating_sub(pipeline_ready)
                     .as_micros(),
                 resources_ready.saturating_sub(heaps_ready).as_micros(),
                 pipeline_ready.as_micros(),
@@ -2328,26 +2531,30 @@ fn graphics_allocated_vgprs(registers: &[remu_gpu::GpuRegister], user_base: u32)
 
 fn record_stage_uploads(commands: &ID3D12GraphicsCommandList, resources: &ComputeResources) {
     for resource in &resources.globals {
-        let Some(upload) = &resource.upload else {
-            continue;
-        };
-        // SAFETY: both buffers cover the padded resource byte count.
-        unsafe {
-            commands.CopyBufferRegion(
+        if let Some(upload) = &resource.upload {
+            // SAFETY: both buffers cover the padded resource byte count.
+            unsafe {
+                commands.CopyBufferRegion(
+                    &resource.gpu,
+                    u64::try_from(resource.gpu_offset)
+                        .expect("bounded GPU buffer offset fits u64"),
+                    upload,
+                    u64::try_from(resource.upload_offset)
+                        .expect("bounded upload buffer offset fits u64"),
+                    resource.byte_count.max(4) as u64,
+                )
+            };
+        }
+        if resource.writable {
+            // Writable transient outputs have no initial bytes to copy, but default-heap buffers
+            // are still created in COPY_DEST and must enter UAV state before shader access.
+            record_transition(
+                commands,
                 &resource.gpu,
-                u64::try_from(resource.gpu_offset).expect("bounded GPU buffer offset fits u64"),
-                upload,
-                u64::try_from(resource.upload_offset)
-                    .expect("bounded upload buffer offset fits u64"),
-                resource.byte_count.max(4) as u64,
-            )
-        };
-        record_transition(
-            commands,
-            &resource.gpu,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-        );
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            );
+        }
     }
     record_texture_uploads(commands, &resources.textures);
 }
@@ -2870,6 +3077,234 @@ fn for_each_index_segment(indices: &[u32], restart: Option<u32>, mut visit: impl
     visit(&indices[first..]);
 }
 
+fn prepare_ngg_triangle_indices(draw: &IndexedDraw) -> Result<Vec<u32>, String> {
+    let source = logical_draw_indices(draw)?;
+    let restart = draw
+        .indexed
+        .then(|| primitive_restart_index(draw))
+        .flatten();
+    let capacity = match draw.primitive_type {
+        1 | 4 => source.len().saturating_mul(3),
+        6 => source.len().saturating_sub(2).saturating_mul(3),
+        primitive => {
+            return Err(format!(
+                "NGG compute fallback does not represent input topology {primitive:#x}"
+            ));
+        }
+    };
+    let mut triangles = Vec::new();
+    triangles
+        .try_reserve(capacity)
+        .map_err(|_| "NGG input triangle allocation failed")?;
+    for_each_index_segment(&source, restart, |segment| match draw.primitive_type {
+        // Point-list NGG stages use one source vertex per GS primitive and amplify it into the
+        // output topology. Repeating the index gives the fixed meshlet ABI a triangle record
+        // without inventing additional guest vertices.
+        1 => {
+            for &index in segment {
+                triangles.extend_from_slice(&[index, index, index]);
+            }
+        }
+        4 => {
+            for triangle in segment.chunks_exact(3) {
+                triangles.extend_from_slice(triangle);
+            }
+        }
+        6 => {
+            for (primitive, triangle) in segment.windows(3).enumerate() {
+                if primitive & 1 == 0 {
+                    triangles.extend_from_slice(triangle);
+                } else {
+                    triangles.extend_from_slice(&[triangle[1], triangle[0], triangle[2]]);
+                }
+            }
+        }
+        _ => unreachable!("topology was validated before visiting segments"),
+    });
+    Ok(triangles)
+}
+
+fn ngg_vertex_record_words(interpolated_locations: &[u32], layered: bool) -> usize {
+    4 * (1 + interpolated_locations.len()) + usize::from(layered)
+}
+
+fn synthetic_ngg_binding(
+    scalar_address: u32,
+    data: Vec<u8>,
+    byte_count: usize,
+    writable: bool,
+) -> GlobalMemoryBinding {
+    GlobalMemoryBinding {
+        scalar_address,
+        base_address: 0,
+        instruction_pcs: Vec::new().into(),
+        byte_count,
+        data,
+        writable,
+        write_back_to_guest: false,
+    }
+}
+
+fn prepare_ngg_evaluation(
+    evaluation: &ShaderEvaluation,
+    meshlets: &PreparedNggMeshlets,
+    draw: &IndexedDraw,
+    first_instance: u32,
+    limits: NggSubgroupLimits,
+    record_words: usize,
+) -> Result<(Arc<ShaderEvaluation>, usize, usize, usize), String> {
+    let instance_count = usize::try_from(draw.instance_count)
+        .map_err(|_| "NGG instance count exceeds host address space")?;
+    let total_groups = usize::try_from(meshlets.group_count)
+        .map_err(|_| "NGG meshlet count exceeds host address space")?
+        .checked_mul(instance_count)
+        .ok_or("NGG output group count overflows")?;
+    let output_vertex_records = total_groups
+        .checked_mul(limits.max_output_vertices_per_subgroup as usize + 1)
+        .ok_or("NGG output vertex count overflows")?;
+    let output_vertex_byte_count = output_vertex_records
+        .checked_mul(record_words)
+        .and_then(|words| words.checked_mul(size_of::<u32>()))
+        .ok_or("NGG output vertex buffer size overflows")?;
+    let output_index_byte_count = total_groups
+        .checked_mul(limits.max_output_primitives_per_subgroup as usize)
+        .and_then(|primitives| primitives.checked_mul(3))
+        .and_then(|indices| indices.checked_mul(size_of::<u32>()))
+        .ok_or("NGG output index buffer size overflows")?;
+    if output_vertex_byte_count > MAXIMUM_GLOBAL_BUFFER_BYTES
+        || output_index_byte_count > MAXIMUM_GLOBAL_BUFFER_BYTES
+    {
+        return Err(format!(
+            "NGG generated buffers exceed the {}-byte per-buffer safety limit (vertices={} indices={})",
+            MAXIMUM_GLOBAL_BUFFER_BYTES, output_vertex_byte_count, output_index_byte_count
+        ));
+    }
+
+    let mut prepared = evaluation.clone();
+    let first_binding = prepared.global_memory_bindings.len();
+    let meshlet_bytes = words_as_bytes(&meshlets.words);
+    let draw_words = [
+        0,
+        first_instance,
+        draw.base_vertex as u32,
+        meshlets.group_count,
+    ];
+    prepared.global_memory_bindings.extend([
+        synthetic_ngg_binding(
+            0xffff_ff00,
+            meshlet_bytes.clone(),
+            meshlet_bytes.len(),
+            false,
+        ),
+        synthetic_ngg_binding(
+            0xffff_ff04,
+            words_as_bytes(&draw_words),
+            draw_words.len() * size_of::<u32>(),
+            false,
+        ),
+        synthetic_ngg_binding(
+            0xffff_ff08,
+            Vec::new(),
+            output_vertex_byte_count,
+            true,
+        ),
+        synthetic_ngg_binding(
+            0xffff_ff0c,
+            Vec::new(),
+            output_index_byte_count,
+            true,
+        ),
+    ]);
+    Ok((
+        Arc::new(prepared),
+        first_binding + 2,
+        first_binding + 3,
+        output_index_byte_count,
+    ))
+}
+
+fn ngg_raster_vertex_shader(
+    evaluation: &ShaderEvaluation,
+    interpolated_locations: &[u32],
+    record_words: usize,
+    output_vertex_binding: usize,
+    layered: bool,
+) -> HlslShader {
+    use std::fmt::Write as _;
+
+    let mut source = String::from(
+        "#define REMU_ROOT_SIGNATURE \"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=7, b0, space=0, visibility=SHADER_VISIBILITY_VERTEX), RootConstants(num32BitConstants=7, b0, space=1, visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=7, b0, space=2, visibility=SHADER_VISIBILITY_ALL)\"\n\nstruct RemuVsOut {\n    float4 position : SV_Position;\n",
+    );
+    if layered {
+        source.push_str("    uint render_target_array_index : SV_RenderTargetArrayIndex;\n");
+    }
+    for location in interpolated_locations {
+        let _ = writeln!(source, "    float4 param{location} : TEXCOORD{location};");
+    }
+    source.push_str(
+        "};\n\ncbuffer RemuRootConstants : register(b0, space0) {\n    uint remu_binding_table_descriptor;\n    uint3 remu_dispatch_limit;\n    uint3 remu_dispatch_base_group;\n};\n\n[RootSignature(REMU_ROOT_SIGNATURE)]\nRemuVsOut remu_main(uint remu_vertex_id : SV_VertexID) {\n    StructuredBuffer<uint> remu_binding_table = ResourceDescriptorHeap[remu_binding_table_descriptor];\n",
+    );
+    let _ = writeln!(
+        source,
+        "    RWByteAddressBuffer remu_vertices = ResourceDescriptorHeap[remu_binding_table[{}u]];",
+        output_vertex_binding + 1
+    );
+    let _ = writeln!(
+        source,
+        "    uint remu_word = remu_vertex_id * {record_words}u;"
+    );
+    source.push_str(
+        "    RemuVsOut remu_out = (RemuVsOut)0;\n    remu_out.position = asfloat(uint4(remu_vertices.Load((remu_word + 0u) * 4u), remu_vertices.Load((remu_word + 1u) * 4u), remu_vertices.Load((remu_word + 2u) * 4u), remu_vertices.Load((remu_word + 3u) * 4u)));\n",
+    );
+    let mut word = 4_usize;
+    for location in interpolated_locations {
+        let _ = writeln!(
+            source,
+            "    remu_out.param{location} = asfloat(uint4(remu_vertices.Load((remu_word + {word}u) * 4u), remu_vertices.Load((remu_word + {}u) * 4u), remu_vertices.Load((remu_word + {}u) * 4u), remu_vertices.Load((remu_word + {}u) * 4u)));",
+            word + 1,
+            word + 2,
+            word + 3
+        );
+        word += 4;
+    }
+    if layered {
+        let _ = writeln!(
+            source,
+            "    remu_out.render_target_array_index = remu_vertices.Load((remu_word + {word}u) * 4u);"
+        );
+    }
+    source.push_str("    return remu_out;\n}\n");
+
+    let slots = evaluation.image_binding_slots();
+    HlslShader {
+        source,
+        entry_point: "remu_main".to_owned(),
+        target_profile: "vs_6_6".to_owned(),
+        stage: MetalShaderStage::Vertex,
+        bindings: HlslBindingLayout {
+            root_constant_words: 7,
+            binding_table_words: u32::try_from(
+                1 + evaluation.global_memory_bindings.len()
+                    + slots.texture_count as usize
+                    + slots.sampler_count as usize,
+            )
+            .unwrap_or(u32::MAX),
+            global_buffer_count: evaluation.global_memory_bindings.len() as u32,
+            texture_count: slots.texture_count,
+            sampler_count: slots.sampler_count,
+            threadgroup_memory_bytes: 0,
+        },
+        vertex_inputs: Vec::new(),
+        interpolated_attribute_count: interpolated_locations.len() as u32,
+        interpolated_attribute_locations: interpolated_locations.to_vec(),
+        register_footprint: MetalRegisterFootprint {
+            scalar_values: 0,
+            vector_values: 0,
+            direct_control_flow: true,
+        },
+    }
+}
+
 fn expand_primitive_indices(
     primitive: u32,
     indices: &[u32],
@@ -2968,6 +3403,38 @@ fn create_index_buffer(
         Format: DXGI_FORMAT_R32_UINT,
     };
     Ok(Some((buffer, view)))
+}
+
+fn prepare_ngg_geometry(
+    resources: &ComputeResources,
+    execution: &PreparedNggExecution,
+) -> Result<PreparedGeometry, String> {
+    let resource = resources
+        .globals
+        .get(execution.output_index_binding)
+        .ok_or("NGG output index binding is missing")?;
+    if !resource.writable || resource.byte_count != execution.output_index_byte_count {
+        return Err("NGG output index binding does not match its generated buffer".to_owned());
+    }
+    let size_in_bytes = u32::try_from(execution.output_index_byte_count)
+        .map_err(|_| "NGG output index buffer exceeds D3D12's 32-bit view size")?;
+    let element_count = size_in_bytes / size_of::<u32>() as u32;
+    Ok(PreparedGeometry {
+        topology: D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
+        topology_type: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+        index: Some((
+            resource.gpu.clone(),
+            D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: unsafe { resource.gpu.GetGPUVirtualAddress() },
+                SizeInBytes: size_in_bytes,
+                Format: DXGI_FORMAT_R32_UINT,
+            },
+        )),
+        element_count,
+        start_vertex: 0,
+        base_vertex: 0,
+        strip_cut: D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
+    })
 }
 
 fn prepare_geometry(
@@ -3461,6 +3928,12 @@ fn create_stage_resources(
     excluded_target_addresses: &[u64],
     ordered_versions: &OrderedGlobalVersions,
 ) -> Result<ComputeResources, String> {
+    let is_transient_output = |binding: &GlobalMemoryBinding| {
+        binding.writable
+            && !binding.write_back_to_guest
+            && binding.base_address == 0
+            && binding.data.is_empty()
+    };
     let mut scalar_words = evaluation.initial_scalar_registers.to_vec();
     if let Some((registers, user_base, scalar_base)) = live_scalars {
         let scalar_end = scalar_base.saturating_add(64).min(scalar_words.len());
@@ -3489,7 +3962,11 @@ fn create_stage_resources(
                 binding.base_address, binding.byte_count, MAXIMUM_GLOBAL_BUFFER_BYTES
             ));
         }
-        global_snapshots.push(snapshot_ordered_global(binding, ordered_versions)?);
+        global_snapshots.push(if is_transient_output(binding) {
+            Vec::new()
+        } else {
+            snapshot_ordered_global(binding, ordered_versions)?
+        });
     }
 
     let slots = evaluation.image_binding_slots();
@@ -3548,13 +4025,17 @@ fn create_stage_resources(
     )?;
     let mut global_offsets = Vec::with_capacity(global_snapshots.len());
     for binding in &evaluation.global_memory_bindings {
-        global_offsets.push(arena_size);
-        arena_size = align_up(
-            arena_size
-                .checked_add(binding.byte_count.max(4))
-                .ok_or("stage global upload range overflows")?,
-            D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT as usize,
-        )?;
+        if is_transient_output(binding) {
+            global_offsets.push(None);
+        } else {
+            global_offsets.push(Some(arena_size));
+            arena_size = align_up(
+                arena_size
+                    .checked_add(binding.byte_count.max(4))
+                    .ok_or("stage global upload range overflows")?,
+                D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT as usize,
+            )?;
+        }
     }
     let mut arena_bytes = vec![0_u8; arena_size.max(4)];
     arena_bytes[binding_table_offset..binding_table_offset + binding_table_bytes.len()]
@@ -3566,7 +4047,9 @@ fn create_stage_resources(
         .zip(&global_offsets)
         .zip(&evaluation.global_memory_bindings)
     {
-        arena_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        if let Some(offset) = offset {
+            arena_bytes[offset..offset + bytes.len()].copy_from_slice(bytes);
+        }
         debug_assert!(bytes.len() <= binding.byte_count.max(4));
     }
     let (stage_upload, arena_base) =
@@ -3583,9 +4066,14 @@ fn create_stage_resources(
     {
         let byte_count = binding.byte_count.max(4);
         let writable = binding.writable;
-        let absolute_offset = arena_base
-            .checked_add(offset)
-            .ok_or("stage upload offset overflows")?;
+        let absolute_offset = offset
+            .map(|offset| {
+                arena_base
+                    .checked_add(offset)
+                    .ok_or("stage upload offset overflows")
+            })
+            .transpose()?
+            .unwrap_or_default();
         let writeback_guard = if binding.write_back_to_guest && binding.byte_count != 0 {
             if binding.base_address < 0x10_000 {
                 return Err(format!(
@@ -3631,7 +4119,7 @@ fn create_stage_resources(
                 stage_upload.clone()
             },
             gpu_offset: if writable { 0 } else { absolute_offset },
-            upload: writable.then(|| stage_upload.clone()),
+            upload: (writable && offset.is_some()).then(|| stage_upload.clone()),
             upload_offset: absolute_offset,
             // A writable null/transient binding may intentionally have no guest destination.
             // Only bindings whose evaluated contract requests guest publication need a readback
@@ -7605,6 +8093,23 @@ fn record_transition(
     }
 }
 
+fn record_uav_barrier(commands: &ID3D12GraphicsCommandList, resource: &ID3D12Resource) {
+    let mut barrier = D3D12_RESOURCE_BARRIER {
+        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+        Anonymous: D3D12_RESOURCE_BARRIER_0 {
+            UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                pResource: ManuallyDrop::new(Some(resource.clone())),
+            }),
+        },
+    };
+    // SAFETY: UAV is the active union member and the resource remains live through execution.
+    unsafe {
+        commands.ResourceBarrier(std::slice::from_ref(&barrier));
+        ManuallyDrop::drop(&mut (*barrier.Anonymous.UAV).pResource);
+    }
+}
+
 fn words_as_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
@@ -7633,9 +8138,9 @@ mod tests {
         GpuRegister, GpuScanoutTarget, IndexedDraw, ShaderSnapshot,
     };
     use remu_shader::{
-        BufferMemoryControl, ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding,
-        ImageControl, Instruction, InstructionControl, Opcode, Operand, OperandKind, Program,
-        ShaderEncoding, ShaderEvaluation,
+        BufferMemoryControl, DataShareControl, ExportControl, GlobalMemoryBinding,
+        GlobalMemoryControl, ImageBinding, ImageControl, Instruction, InstructionControl, Opcode,
+        Operand, OperandKind, Program, ShaderEncoding, ShaderEvaluation,
     };
 
     use super::{
@@ -7643,9 +8148,10 @@ mod tests {
         DecodedRenderTarget, DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions,
         WritebackJournalSites, decode_render_target_format, decode_sampler, dispatch_group_count,
         expand_primitive_indices, indirect_draw_count_allows, initial_render_target_clear,
-        presentable_bgra, primitive_restart_index, regroup_restart_list_indices,
-        resolve_indirect_compute, resolve_indirect_compute_ordered, resolve_indirect_draw,
-        snapshot_ordered_global, write_changed_ranges_direct,
+        ngg_raster_vertex_shader, presentable_bgra, prepare_ngg_triangle_indices,
+        primitive_restart_index, regroup_restart_list_indices, resolve_indirect_compute,
+        resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
+        synthetic_ngg_binding, write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -7900,6 +8406,347 @@ mod tests {
             compute_system_registers: None,
             vertex_inputs: Vec::new(),
         })
+    }
+
+    fn indexed_draw_with_snapshot(primitive_type: u32, indices: &[u32]) -> IndexedDraw {
+        IndexedDraw {
+            sequence: 0,
+            indexed: true,
+            indirect_arguments_address: None,
+            indirect_count_address: None,
+            indirect_draw_index: 0,
+            instance_count: 1,
+            index_buffer_address: 0,
+            index_resource_address: 0,
+            index_buffer_count: indices.len() as u32,
+            index_size: 1,
+            index_offset: 0,
+            base_vertex: 0,
+            index_count: indices.len() as u32,
+            index_snapshot: Some(indices.to_vec().into()),
+            draw_flags: 0,
+            primitive_type,
+            export_shader_address: 0,
+            pixel_shader_address: 0,
+            export_shader_prefix: [0; 4],
+            pixel_shader_prefix: [0; 4],
+            export_shader: None,
+            pixel_shader: None,
+            export_shader_evaluation: None,
+            pixel_shader_evaluation: None,
+            color_target_address: 0,
+            scanout_target: None,
+            context_registers: Vec::new(),
+            shader_registers: Vec::new(),
+            user_config_registers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn ngg_input_expansion_preserves_strip_winding_and_restart_boundaries() {
+        let strip = indexed_draw_with_snapshot(6, &[10, 11, 12, 13]);
+        assert_eq!(
+            prepare_ngg_triangle_indices(&strip).expect("expand triangle strip"),
+            [10, 11, 12, 12, 11, 13]
+        );
+
+        let restart = 99;
+        let mut restarted =
+            indexed_draw_with_snapshot(6, &[0, 1, 2, 3, restart, 8, 9, 10]);
+        restarted.context_registers = vec![
+            GpuRegister {
+                offset: 0x103,
+                value: restart,
+            },
+            GpuRegister {
+                offset: 0x2a5,
+                value: 1,
+            },
+        ];
+        assert_eq!(
+            prepare_ngg_triangle_indices(&restarted).expect("expand restarted triangle strip"),
+            [0, 1, 2, 2, 1, 3, 8, 9, 10]
+        );
+    }
+
+    #[test]
+    fn generated_ngg_raster_vertex_shader_compiles_to_dxil() {
+        let mut evaluation = empty_evaluation_for_graphics().as_ref().clone();
+        evaluation.global_memory_bindings.extend([
+            synthetic_ngg_binding(0xffff_ff00, vec![0; 4], 4, false),
+            synthetic_ngg_binding(0xffff_ff04, vec![0; 4], 4, false),
+            synthetic_ngg_binding(0xffff_ff08, vec![0; 64], 64, true),
+            synthetic_ngg_binding(0xffff_ff0c, vec![0; 12], 12, true),
+        ]);
+        let shader = ngg_raster_vertex_shader(&evaluation, &[0, 3], 12, 2, false);
+        let dxil = crate::guest_shader::compile_guest_shader(&shader, "remu-ngg-raster-test.hlsl")
+            .expect("compile generated NGG raster vertex shader");
+        assert!(!dxil.is_empty());
+        assert_eq!(shader.target_profile, "vs_6_6");
+        assert!(shader.source.contains("TEXCOORD3"));
+    }
+
+    #[test]
+    fn executes_ngg_compute_fallback_and_rasterizes_generated_geometry() {
+        const WIDTH: u32 = 64;
+        const HEIGHT: u32 = 64;
+        let mut allocation = vec![0_u8; (WIDTH * HEIGHT * 4) as usize + 255];
+        let scanout_address = ((allocation.as_mut_ptr() as usize + 255) & !255_usize) as u64;
+        let encoded = |value| Operand {
+            kind: OperandKind::EncodedConstant,
+            value,
+        };
+        let mut instructions = vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![literal(3 | (1 << 12))],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: vec![0],
+                sources: vec![encoded(9)],
+                destinations: Vec::new(),
+                control: None,
+            },
+        ];
+        let mut pc = 8_u32;
+        let mut push_vop = |opcode, sources: Vec<Operand>, destination| {
+            instructions.push(Instruction {
+                pc,
+                encoding: ShaderEncoding::Vop2,
+                opcode: Opcode::Known(opcode),
+                words: vec![0],
+                sources,
+                destinations: vec![Operand::vector(destination)],
+                control: None,
+            });
+            pc += 4;
+        };
+        push_vop("VLshlrevB32", vec![literal(1), Operand::vector(5)], 20);
+        push_vop("VAndB32", vec![Operand::vector(20), literal(2)], 20);
+        push_vop("VCvtF32U32", vec![Operand::vector(20)], 20);
+        push_vop(
+            "VMulF32",
+            vec![Operand::vector(20), literal(2.0_f32.to_bits())],
+            20,
+        );
+        push_vop(
+            "VAddF32",
+            vec![Operand::vector(20), literal((-1.0_f32).to_bits())],
+            20,
+        );
+        push_vop("VAndB32", vec![Operand::vector(5), literal(2)], 21);
+        push_vop("VCvtF32U32", vec![Operand::vector(21)], 21);
+        push_vop(
+            "VMulF32",
+            vec![Operand::vector(21), literal((-2.0_f32).to_bits())],
+            21,
+        );
+        push_vop(
+            "VAddF32",
+            vec![Operand::vector(21), literal(1.0_f32.to_bits())],
+            21,
+        );
+        push_vop("VMovB32", vec![literal(0)], 22);
+        push_vop("VMovB32", vec![literal(1.0_f32.to_bits())], 23);
+        push_vop("VMovB32", vec![literal(0)], 9);
+        push_vop("VMovB32", vec![literal(0)], 10);
+        drop(push_vop);
+        instructions.push(Instruction {
+            pc,
+            encoding: ShaderEncoding::Ds,
+            opcode: Opcode::Known("DsWriteB32"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(9), Operand::vector(10)],
+            destinations: Vec::new(),
+            control: Some(InstructionControl::DataShare(DataShareControl {
+                offset0: 0,
+                offset1: 0,
+                gds: false,
+            })),
+        });
+        pc += 8;
+        instructions.push(Instruction {
+            pc,
+            encoding: ShaderEncoding::Exp,
+            opcode: Opcode::EXPORT,
+            words: vec![0, 0],
+            sources: vec![Operand::vector(0); 4],
+            destinations: Vec::new(),
+            control: Some(InstructionControl::Export(ExportControl {
+                target: 20,
+                enable_mask: 1,
+                compressed: false,
+                done: false,
+                valid_mask: false,
+            })),
+        });
+        pc += 8;
+        instructions.push(Instruction {
+            pc,
+            encoding: ShaderEncoding::Exp,
+            opcode: Opcode::EXPORT,
+            words: vec![0, 0],
+            sources: (20..24).map(Operand::vector).collect(),
+            destinations: Vec::new(),
+            control: Some(InstructionControl::Export(ExportControl {
+                target: 12,
+                enable_mask: 0xf,
+                compressed: false,
+                done: true,
+                valid_mask: false,
+            })),
+        });
+        pc += 8;
+        instructions.push(Instruction {
+            pc,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        });
+        let export = Arc::new(Program::new(0x2800, instructions));
+        let pixel = Arc::new(Program::new(
+            0x3800,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![literal(1.0_f32.to_bits())],
+                    destinations: vec![Operand::vector(0)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![literal(0)],
+                    destinations: vec![Operand::vector(1)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![literal(0)],
+                    destinations: vec![Operand::vector(2)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 12,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![literal(1.0_f32.to_bits())],
+                    destinations: vec![Operand::vector(3)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 16,
+                    encoding: ShaderEncoding::Exp,
+                    opcode: Opcode::EXPORT,
+                    words: vec![0, 0],
+                    sources: (0..4).map(Operand::vector).collect(),
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::Export(ExportControl {
+                        target: 0,
+                        enable_mask: 0xf,
+                        compressed: false,
+                        done: true,
+                        valid_mask: true,
+                    })),
+                },
+            ],
+        ));
+        let evaluation = empty_evaluation_for_graphics();
+        let register = |offset, value| GpuRegister { offset, value };
+        let draw = IndexedDraw {
+            sequence: 44,
+            indexed: false,
+            indirect_arguments_address: None,
+            indirect_count_address: None,
+            indirect_draw_index: 0,
+            instance_count: 1,
+            index_buffer_address: 0,
+            index_resource_address: 0,
+            index_buffer_count: 0,
+            index_size: 1,
+            index_offset: 0,
+            base_vertex: 0,
+            index_count: 3,
+            index_snapshot: None,
+            draw_flags: 0,
+            primitive_type: 4,
+            export_shader_address: 0x2800,
+            pixel_shader_address: 0x3800,
+            export_shader_prefix: [0; 4],
+            pixel_shader_prefix: [0; 4],
+            export_shader: Some(ShaderSnapshot {
+                header_address: 0x2800,
+                program: export,
+                supplemental_programs: Arc::from([]),
+                metadata: None,
+            }),
+            pixel_shader: Some(ShaderSnapshot {
+                header_address: 0x3800,
+                program: pixel,
+                supplemental_programs: Arc::from([]),
+                metadata: None,
+            }),
+            export_shader_evaluation: Some(evaluation.clone()),
+            pixel_shader_evaluation: Some(evaluation),
+            color_target_address: scanout_address,
+            scanout_target: Some(GpuScanoutTarget {
+                address: scanout_address,
+                width: WIDTH,
+                height: HEIGHT,
+                pitch: WIDTH,
+                pixel_format: 0,
+                tiling_mode: 1,
+                export_slot: 0,
+                write_mask: 0xf,
+                color_surface: None,
+            }),
+            context_registers: vec![
+                register(remu_gpu::GE_MAX_OUTPUT_PER_SUBGROUP, 3),
+                register(remu_gpu::VGT_GS_ONCHIP_CNTL, 3 | (1 << 11) | (1 << 22)),
+                register(remu_gpu::VGT_GS_OUT_PRIM_TYPE, 2),
+                register(remu_gpu::VGT_GS_MAX_VERT_OUT, 3),
+                register(remu_gpu::GE_NGG_SUBGRP_CNTL, 1),
+            ],
+            shader_registers: vec![register(0x0ca, 0), register(0x0cb, 1)],
+            user_config_registers: Vec::new(),
+        };
+
+        Dx12GuestExecutor::new()
+            .expect("create D3D12 guest executor")
+            .execute_draw(&draw)
+            .expect("execute NGG compute fallback draw");
+        // SAFETY: the aligned allocation covers the tightly packed scanout extent.
+        let pixels = unsafe {
+            std::slice::from_raw_parts(scanout_address as *const u8, (WIDTH * HEIGHT * 4) as usize)
+        };
+        let red_pixels = pixels
+            .chunks_exact(4)
+            .filter(|pixel| pixel[0] < 4 && pixel[1] < 4 && pixel[2] > 250 && pixel[3] > 250)
+            .count();
+        assert!(
+            red_pixels > 1_500,
+            "only {red_pixels} pixels were rasterized through the NGG fallback"
+        );
     }
 
     #[test]

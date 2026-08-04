@@ -2,7 +2,7 @@
 
 ## Current status and support baseline
 
-As of 2026-08-03, `remu-gpu-dx12` is an executable backend rather than a device probe. It selects a
+As of 2026-08-04, `remu-gpu-dx12` is an executable backend rather than a device probe. It selects a
 hardware DXGI adapter, creates the D3D12 device/queue/fence, translates the shared Gen5 shader IR to
 HLSL and DXIL, executes ordered compute and graphics events, copies results back to guest memory,
 and presents VideoOut buffers through a winit-owned Win32 window and a DXGI flip-model swap chain.
@@ -17,6 +17,11 @@ Implemented and physically validated on the development host:
   adapter's static dedicated-memory figure.
 - Shader Model 6.7+ HLSL generation and DXC compilation for translated vertex, pixel, and compute
   shaders, with bounded shader and pipeline-state caches.
+- Backend-neutral NGG classification and subgroup sizing, plus a capability-independent D3D12
+  compute fallback for general-LDS NGG exports. The path dispatches guest meshlets into transient
+  vertex/index UAVs, inserts the required UAV/index transitions, and rasterizes through a generated
+  passthrough vertex shader. It is the correctness path on every supported adapter, including
+  mesh-shader-tier-0 hardware; a native mesh path can remain an optional optimization.
 - Buffer SRV/UAV/CBV resources, sampled and writable 2D textures, single-mip standard-swizzled 3D
   textures, samplers, render-target upload and writeback, multiple render targets, blending,
   raster state, viewports, scissors, depth, and stencil.
@@ -56,13 +61,14 @@ Implemented and physically validated on the development host:
   causes DXIL stage-link register mismatches on D3D12.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
   primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
-  current D3D12 crate has 50 passing tests on the GTX 1050.
+  current D3D12 crate has 55 passing tests on the GTX 1050, including a physical general-LDS NGG
+  compute-to-raster test on this mesh-shader-tier-0 adapter.
 
-This is a playable vertical slice for one tested title, not yet a broad playability claim. The major remaining work is listed below: guest FMASK and full DCC
-metadata coherence plus persistent multisample/depth-resource identity; NGG/mesh fallback for devices without mesh
-shaders; patch/rectangle/triangle-with-flags edge semantics; mipped arrays/3D and writable-mip UAVs;
-cross-draw submission batching and resource retirement; DRED/debug-layer capture; and
-broader title validation.
+This is a playable vertical slice for one tested title, not yet a broad playability claim. The
+major remaining work is guest FMASK and full DCC metadata coherence plus persistent
+multisample/depth-resource identity; patch/rectangle/triangle-with-flags edge semantics; mipped
+arrays/3D and writable-mip UAVs; cross-draw submission batching and resource retirement;
+DRED/debug-layer capture; and broader title validation.
 
 The initial REmu baseline is:
 
@@ -74,9 +80,10 @@ The initial REmu baseline is:
 Feature level, wave capability, shader model, and resource-binding tier are queried independently.
 Optional features used to select exact or fallback paths include enhanced barriers, writable MSAA
 textures, independent front/back stencil reference and masks, triangle fan, dynamic strip-cut, and
-dynamic depth bias. Mesh-shader tier is also queried independently: tier 1-capable adapters may use
-a native mesh path once implemented, while tier-0 adapters require the classic/compute NGG
-fallback. This follows Microsoft's guidance to use
+dynamic depth bias. Mesh-shader tier is also queried independently, but correctness does not depend
+on it: the compute NGG path runs on both tier-0 and tier-1 adapters. A tier-1 native mesh path may
+be selected later only after it has equivalent coverage and preserves this fallback. This follows
+Microsoft's guidance to use
 `ID3D12Device::CheckFeatureSupport` rather than infer behavior from adapter names or DirectX
 marketing versions.
 
@@ -134,7 +141,9 @@ high-performance selection.
 
 The physical test suite exercises copy/readback, graphics, compute, translated guest shaders,
 triangle-fan support, independent stencil state, normalized/integer color MSAA, D32 MSAA, and
-combined D32/S8 MSAA on this adapter. A traced Dreaming Sarah run processed 10,725 physical draws
+combined D32/S8 MSAA on this adapter. It also executes a synthetic GFX10 general-LDS NGG shader,
+checks its transient geometry, and verifies red raster output through the generated passthrough
+stage on the mesh-shader-tier-0 GTX 1050. A traced Dreaming Sarah run processed 10,725 physical draws
 and 840 frames; its steady-state mean reached 535 microseconds per draw and median 413 microseconds.
 An untraced 20-second release run presented 998 frames and settled near 53--54 FPS after startup.
 New Game then entered `M0T0`, completed its intended white/title fade, rendered the forest and
@@ -192,10 +201,11 @@ entry, and 64 MiB total.
 That forwarding produces the intended counter `0x2428` and indirect triplet `[0x2428, 1, 1]`
 instead of the recycled `0x18003fff` sentinel. A physical GTX 1050 regression recreates the exact
 five-thread formatted-buffer expansion into a 65,532-byte UAV and verifies all five triplets.
-Poppy then reaches compute 196 with the correct 9,256-group X dimension. It is not playable yet:
-the next blocking graphics feature is an NGG export using LDS/barriers on a device with no mesh
-shader tier, and current per-draw/dispatch fencing still makes this workload much too slow for
-interactive use. Per-format
+Poppy then reaches compute 196 with the correct 9,256-group X dimension. Its next captured graphics
+feature was an NGG export using LDS/barriers. That class now has a backend-neutral subgroup decoder
+and a D3D12 compute-to-raster fallback which is physically validated on a device with no mesh-shader
+tier. A game-backed rerun is still required before claiming that the title advances through this
+point, and current per-draw/dispatch fencing remains too slow for interactive use. Per-format
 `D3D12_FEATURE_DATA_FORMAT_SUPPORT` checks confirm that this adapter advertises the required typed
 UAV store support.
 
@@ -369,7 +379,7 @@ it to DX12 by semantic capability rather than by copying Metal APIs:
 | GPU tiler and equation work (`6ed02f8`) | Shared equations plus a future D3D12 compute tiler | CPU conversion exists; GPU path remains |
 | Persistent shader caches (`dd62f2b`) | Compiler-keyed DXIL plus adapter/driver-keyed pipeline-library cache | Persistent DXIL implemented; pipeline-library disk cache remains |
 | Display-link timebase/pacing (`4f6537e`) | DXGI frame-latency waitable object and shared display timebase | Waitable-object pacing integrated; shared display-time telemetry remains |
-| NGG capacities and proof (`ca6c3a0`, `655d3d8`) | Capability-routed native mesh path plus classic/compute fallback | Shared register derivation is available; DX12 execution paths remain |
+| NGG capacities and proof (`ca6c3a0`, `655d3d8`) | Capability-routed native mesh path plus classic/compute fallback | Shared derivation and physically validated DX12 compute fallback are implemented; native mesh remains optional |
 | Sampled-resident lookup (`30bd087`) | Physical-identity-indexed DX12 texture lookup | Descriptor cache exists; identity index remains |
 
 This table is a porting checklist, not a claim that Metal implementation details should become the
@@ -381,9 +391,9 @@ resource transitions, queues, queries, DXIL, and DXGI pacing remain backend-spec
 2. Move the completed transient color/depth/stencil MSAA paths into persistent resources and extend
    conservative DCC materialization to full guest FMASK/DCC metadata coherence plus explicit guest
    resolve-packet semantics.
-3. Add a classic/compute NGG fallback for every `mesh_shader_tier=0` adapter, validate it on the
-   GTX 1050 and against the shared compiler corpus, then add a separately selected native mesh path
-   for adapters reporting mesh-shader tier 1 or newer.
+3. Validate the implemented compute NGG path against additional game captures, output primitive
+   modes, layered rendering, and multi-adapter wave sizes. A separately selected native mesh path
+   may be added for tier-1 adapters only as an optimization with equivalent fallback coverage.
 4. Extend the persistent single-sample color cache to depth/MSAA/shader resources and replace
    synchronous per-draw fences with upload/readback rings, fence retirement, physical-alias
    invalidation, residency budgets, and submission batching.

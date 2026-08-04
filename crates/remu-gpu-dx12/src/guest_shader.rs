@@ -258,6 +258,98 @@ mod tests {
     }
 
     #[test]
+    fn guest_ngg_stage_compiles_to_compute_fallback_dxil() {
+        let encoded = |value| Operand {
+            kind: remu_shader::OperandKind::EncodedConstant,
+            value,
+        };
+        let program = Program::new(
+            0x2800,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Sop1,
+                    opcode: Opcode::Known("SMovB32"),
+                    words: vec![0],
+                    sources: vec![Operand {
+                        kind: remu_shader::OperandKind::LiteralConstant,
+                        value: 3 | (1 << 12),
+                    }],
+                    destinations: vec![Operand::scalar(124)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::Known("SSendmsg"),
+                    words: vec![0],
+                    sources: vec![encoded(9)],
+                    destinations: Vec::new(),
+                    control: None,
+                },
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Exp,
+                    opcode: Opcode::Known("Exp"),
+                    words: vec![0, 0],
+                    sources: vec![Operand::vector(0); 4],
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::Export(ExportControl {
+                        target: 20,
+                        enable_mask: 1,
+                        compressed: false,
+                        done: false,
+                        valid_mask: false,
+                    })),
+                },
+                Instruction {
+                    pc: 16,
+                    encoding: ShaderEncoding::Exp,
+                    opcode: Opcode::Known("Exp"),
+                    words: vec![0, 0],
+                    sources: (4..8).map(Operand::vector).collect(),
+                    destinations: Vec::new(),
+                    control: Some(InstructionControl::Export(ExportControl {
+                        target: 12,
+                        enable_mask: 15,
+                        compressed: false,
+                        done: true,
+                        valid_mask: false,
+                    })),
+                },
+                Instruction {
+                    pc: 24,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let mut evaluation = empty_evaluation([]);
+        evaluation.global_memory_bindings = (0..4)
+            .map(|index| remu_shader::GlobalMemoryBinding {
+                scalar_address: 0xffff_ff00 + index,
+                base_address: 0,
+                instruction_pcs: Default::default(),
+                byte_count: 4096,
+                data: vec![0; 4096],
+                writable: index >= 2,
+                write_back_to_guest: false,
+            })
+            .collect();
+        let options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
+        let shader = translate_guest_shader(&program, &evaluation, &options, [64, 1, 1])
+            .expect("NGG stage should lower to a compute fallback");
+        assert_eq!(shader.target_profile, "cs_6_6");
+        let dxil = compile_guest_shader(&shader, "remu_guest_ngg_fallback_test.hlsl")
+            .expect("generated NGG compute fallback should compile");
+        assert!(dxil.len() > 128);
+    }
+
+    #[test]
     fn pixel_private_lane_file_initialization_compiles_to_dxil() {
         let program = Program::new(
             0x3800,
