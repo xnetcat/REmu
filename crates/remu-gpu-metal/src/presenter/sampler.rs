@@ -4,8 +4,11 @@
 use super::UploadedGlobalBuffer;
 use metal::{
     Buffer, Device, Function, MTLCompareFunction, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, SamplerDescriptor, SamplerState,
+    MTLSamplerMinMagFilter, MTLSamplerMipFilter, SamplerDescriptor, SamplerDescriptorRef,
+    SamplerState,
 };
+use objc::runtime::{BOOL, YES};
+use objc::{msg_send, sel, sel_impl};
 use remu_shader::{ImageBinding, ShaderEvaluation, image_is_comparison};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -154,6 +157,18 @@ pub(super) fn sampler_lod_bias(words: &[u32]) -> f32 {
     signed / 256.0
 }
 
+fn set_sampler_lod_bias_if_supported(descriptor: &SamplerDescriptorRef, bias: f32) {
+    // `lodBias` became a public MTLSamplerDescriptor property after the macOS 14 deployment
+    // target still used by CI and supported REmu hosts. Sending the setter unconditionally makes
+    // those systems raise an Objective-C `unrecognized selector` exception across Rust frames.
+    // Runtime selector discovery keeps the public property on newer systems and safely leaves the
+    // default zero bias on older Metal runtimes.
+    let supported: BOOL = unsafe { msg_send![descriptor, respondsToSelector: sel!(setLodBias:)] };
+    if supported == YES {
+        let _: () = unsafe { msg_send![descriptor, setLodBias: bias] };
+    }
+}
+
 pub(super) fn create_global_argument_buffer(
     device: &Device,
     function: &Function,
@@ -223,12 +238,9 @@ pub(super) fn create_sampler_argument_buffer(
         descriptor.set_address_mode_r(sampler_address_mode((words[0] >> 6) & 0x7));
         descriptor.set_max_anisotropy(u64::from(1_u32 << ((words[0] >> 9) & 0x7).min(4)));
         descriptor.set_normalized_coordinates(sampler_uses_normalized_coordinates(words));
-        // GFX10 stores a signed 14-bit fixed-point (8 fractional bits) sampler bias. Vulkan
-        // implementations such as SharpEmu pass this directly to the native sampler; modern
-        // Metal exposes the equivalent descriptor property as well.
-        unsafe {
-            descriptor.set_lod_bias(sampler_lod_bias(words));
-        }
+        // GFX10 stores a signed 14-bit fixed-point (8 fractional bits) sampler bias. Modern Metal
+        // exposes the equivalent descriptor property; older supported runtimes keep zero bias.
+        set_sampler_lod_bias_if_supported(&descriptor, sampler_lod_bias(words));
         descriptor.set_mag_filter(sampler_min_mag_filter((words[2] >> 20) & 0x3));
         descriptor.set_min_filter(sampler_min_mag_filter((words[2] >> 22) & 0x3));
         descriptor.set_mip_filter(sampler_mip_filter((words[2] >> 26) & 0x3));

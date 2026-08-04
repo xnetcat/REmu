@@ -29,7 +29,7 @@ cpal = "0.18"
 hassle-rs = "0.12"
 iced-x86 = "1.21"
 libc = "0.2"
-metal = { version = "0.33", features = ["private"] }
+metal = "0.33"
 objc = "0.2"
 png = "0.17.16"
 sha1 = "0.10"
