@@ -1613,13 +1613,17 @@ impl Dx12GuestExecutor {
         }
         let scissor = decode_scissor(draw, primary_extent.0, primary_extent.1);
         let viewport = decode_viewport(draw, scissor);
-        if trace_d3d12_present_writers()
-            && decoded_targets.iter().any(|target| {
-                native_present_format_supported(target.descriptor.format)
-                    && target.descriptor.width >= 1_920
-                    && target.descriptor.height >= 1_080
-            })
-        {
+        let has_large_target = decoded_targets
+            .iter()
+            .any(|target| target.descriptor.width >= 1_920 && target.descriptor.height >= 1_080);
+        let has_native_present_target = decoded_targets.iter().any(|target| {
+            native_present_format_supported(target.descriptor.format)
+                && target.descriptor.width >= 1_920
+                && target.descriptor.height >= 1_080
+        });
+        let traces_present_writer = (trace_d3d12_present_writers() && has_native_present_target)
+            || (trace_d3d12_present_bindings() && has_large_target);
+        if traces_present_writer {
             let targets = decoded_targets
                 .iter()
                 .map(|target| {
@@ -1658,18 +1662,62 @@ impl Dx12GuestExecutor {
                 })
                 .unwrap_or_default();
             eprintln!(
-                "[REMu][D3D12-PRESENT-WRITER] sequence={} es={:#x} ps={:#x} indexed={} elements={} instances={} primitive={:#x} procedural={} targets={targets:?} textures={textures:?} viewport={:?} scissor={:?}",
+                "[REMu][D3D12-PRESENT-WRITER] sequence={} es={:#x} ps={:#x} indexed={} elements={} instances={} first_instance={} index_offset={} base_vertex={} primitive={:#x} procedural={} targets={targets:?} textures={textures:?} viewport={:?} scissor={:?}",
                 draw.sequence,
                 draw.export_shader_address,
                 draw.pixel_shader_address,
                 u8::from(draw.indexed),
                 geometry.element_count,
                 draw.instance_count,
+                first_instance,
+                draw.index_offset,
+                draw.base_vertex,
                 draw.primitive_type,
                 u8::from(uses_procedural_rectangle_stage),
                 viewport,
                 scissor,
             );
+            if trace_d3d12_present_bindings() {
+                let indices = if uses_procedural_rectangle_stage {
+                    "synthetic(0x0,0x1,0x2)".to_owned()
+                } else if draw.index_count <= 64 {
+                    logical_draw_indices(draw)
+                        .map(|indices| {
+                            indices
+                                .iter()
+                                .take(16)
+                                .map(|index| format!("{index:#x}"))
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        })
+                        .unwrap_or_else(|error| format!("unavailable({error})"))
+                } else {
+                    format!("omitted(count={})", draw.index_count)
+                };
+                let (vertex_globals, vertex_inputs) = present_writer_stage_bindings(
+                    &vertex_evaluation,
+                    &draw.shader_registers,
+                    export_user_base,
+                    8,
+                    &self.ordered_global_versions,
+                );
+                let (pixel_globals, pixel_inputs) = pixel_stage.as_ref().map_or_else(
+                    || (Vec::new(), Vec::new()),
+                    |(_, evaluation, _, _)| {
+                        present_writer_stage_bindings(
+                            evaluation,
+                            &draw.shader_registers,
+                            0x00c,
+                            0,
+                            &self.ordered_global_versions,
+                        )
+                    },
+                );
+                eprintln!(
+                    "[REMu][D3D12-PRESENT-BINDINGS] sequence={} indices=[{}] vertex_globals={vertex_globals:?} vertex_inputs={vertex_inputs:?} pixel_globals={pixel_globals:?} pixel_inputs={pixel_inputs:?}",
+                    draw.sequence, indices,
+                );
+            }
         }
         let blend_factor = [0x105, 0x106, 0x107, 0x108].map(|offset| {
             register_value(&draw.context_registers, offset).map_or(0.0, f32::from_bits)
@@ -7470,6 +7518,98 @@ fn trace_d3d12_bindings() -> bool {
 
 fn trace_d3d12_present_writers() -> bool {
     std::env::var_os("REMU_TRACE_D3D12_PRESENT_WRITERS").is_some_and(|value| value == "1")
+}
+
+fn trace_d3d12_present_bindings() -> bool {
+    std::env::var_os("REMU_TRACE_D3D12_PRESENT_BINDINGS").is_some_and(|value| value == "1")
+}
+
+fn present_writer_stage_bindings(
+    evaluation: &ShaderEvaluation,
+    registers: &[remu_gpu::GpuRegister],
+    user_base: u32,
+    scalar_base: usize,
+    ordered_versions: &OrderedGlobalVersions,
+) -> (Vec<String>, Vec<String>) {
+    let globals = evaluation
+        .global_memory_bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            let descriptor = (0..4)
+                .map(|offset| {
+                    let scalar = binding.scalar_address.saturating_add(offset);
+                    usize::try_from(scalar)
+                        .ok()
+                        .and_then(|scalar| scalar.checked_sub(scalar_base))
+                        .and_then(|offset| {
+                            u32::try_from(offset)
+                                .ok()
+                                .and_then(|offset| register_value(registers, user_base + offset))
+                        })
+                        .or_else(|| {
+                            evaluation
+                                .initial_scalar_registers
+                                .get(scalar as usize)
+                                .copied()
+                        })
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(|words| preview_words(&words_as_bytes(&words)))
+                .unwrap_or_else(|| "unavailable".to_owned());
+            let head = present_writer_global_head(binding, ordered_versions)
+                .unwrap_or_else(|error| format!("unavailable({error})"));
+            format!(
+                "g{index}:s{}=[{descriptor}]:{:#x}/{}:{}{}:head=[{head}]",
+                binding.scalar_address,
+                binding.base_address,
+                binding.byte_count,
+                if binding.writable { "w" } else { "r" },
+                if binding.write_back_to_guest { "b" } else { "" },
+            )
+        })
+        .collect();
+    let vertex_inputs = evaluation
+        .vertex_inputs
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            format!(
+                "v{index}:pc={:#x}:loc={}:components={}:format={}/{}:{:#x}:stride={}:offset={}:head=[{}]",
+                binding.pc,
+                binding.location,
+                binding.component_count,
+                binding.data_format,
+                binding.number_format,
+                binding.base_address,
+                binding.stride,
+                binding.offset_bytes,
+                preview_words(&binding.data[..binding.data.len().min(64)]),
+            )
+        })
+        .collect();
+    (globals, vertex_inputs)
+}
+
+fn present_writer_global_head(
+    binding: &GlobalMemoryBinding,
+    ordered_versions: &OrderedGlobalVersions,
+) -> Result<String, String> {
+    let byte_count = binding.byte_count.min(64);
+    if byte_count == 0 {
+        return Ok(String::new());
+    }
+    let mut bytes = if binding.data.len() >= byte_count {
+        binding.data[..byte_count].to_vec()
+    } else {
+        let mut bytes = vec![0_u8; byte_count];
+        read_process_memory(binding.base_address, &mut bytes).map_err(|error| error.to_string())?;
+        bytes
+    };
+    if let Some(forwarded) = ordered_versions.forwarded_slice(binding.base_address, &bytes) {
+        bytes = forwarded;
+    }
+    Ok(preview_words(&bytes))
 }
 
 fn ensure_device_available(device: &ID3D12Device, context: &str) -> Result<(), String> {

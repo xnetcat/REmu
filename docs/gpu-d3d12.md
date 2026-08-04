@@ -217,6 +217,13 @@ formats and export masks, resolved sampled-resource views/component mappings, an
 and scissor. This is intended for correlating a corrupt scanout with the exact final writer without
 dumping shader or game data; it is opt-in because modern titles can produce many such records.
 
+`REMU_TRACE_D3D12_PRESENT_BINDINGS=1` adds the resolved index preview, signed base vertex, first
+instance, shader global descriptors and buffer heads, and evaluated vertex-input layouts for every
+render target at least 1920x1080, including non-presentable intermediate formats. Unlike the compact
+writer trace, this deliberately snapshots a small amount of live guest data and must remain in
+ignored diagnostic logs. It is intended for walking a corrupt final frame backward through its
+large intermediate passes and isolating vertex-fetch or ordered-resource defects.
+
 `REMU_DIAGNOSTIC_SKIP_PROCEDURAL_RECTANGLES=1` skips draws classified as architectural
 procedural-rectangle covers. This is an A/B diagnostic only, not a compatibility option: skipping
 those draws intentionally removes valid guest rendering. It can establish whether a corrupt frame
