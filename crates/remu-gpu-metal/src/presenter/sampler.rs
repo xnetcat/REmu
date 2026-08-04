@@ -212,8 +212,12 @@ pub(super) fn create_sampler_argument_buffer(
             Ok((None, Vec::new()))
         };
     }
+    #[cfg(test)]
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] creating argument encoder");
     let argument_encoder =
         buffer_index.map(|index| function.new_argument_encoder(u64::from(index)));
+    #[cfg(test)]
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] argument encoder created");
     let argument_buffer = argument_encoder.as_ref().map(|encoder| {
         let buffer = device.new_buffer(
             encoder.encoded_length(),
@@ -222,6 +226,8 @@ pub(super) fn create_sampler_argument_buffer(
         encoder.set_argument_buffer(&buffer, 0);
         buffer
     });
+    #[cfg(test)]
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] argument buffer created and bound");
     let mut samplers = Vec::with_capacity(sampled_bindings.len());
     for (slot, binding) in sampled_bindings.iter().enumerate() {
         if binding.sampler_descriptor.len() < 4 {
@@ -265,13 +271,19 @@ pub(super) fn create_sampler_argument_buffer(
                 / 256.0,
         );
         descriptor.set_support_argument_buffers(argument_encoder.is_some());
+        #[cfg(test)]
+        eprintln!("[REMu][TEST][SAMPLER-CACHE] creating sampler slot={slot}");
         let sampler = device.new_sampler(&descriptor);
+        #[cfg(test)]
+        eprintln!("[REMu][TEST][SAMPLER-CACHE] sampler created slot={slot}");
         if let Some(encoder) = argument_encoder.as_ref() {
             encoder.set_sampler_state(
                 u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
                 &sampler,
             );
         }
+        #[cfg(test)]
+        eprintln!("[REMu][TEST][SAMPLER-CACHE] sampler encoded slot={slot}");
         samplers.push(sampler);
     }
     Ok((argument_buffer, samplers))

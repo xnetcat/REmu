@@ -1379,6 +1379,7 @@ fn live_scalar_metadata_matches_sorted_register_snapshot_values() {
 fn reuses_immutable_sampler_argument_buffers() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] presenter initialized");
     let device = presenter
         .device
         .as_ref()
@@ -1401,9 +1402,11 @@ kernel void remu_sampler_cache_test(
     let library = device
         .new_library_with_source(source, &CompileOptions::new())
         .expect("sampler argument-buffer MSL compiles");
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] library compiled");
     let function = library
         .get_function("remu_sampler_cache_test", None)
         .expect("sampler cache function exists");
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] function loaded");
     let evaluation = ShaderEvaluation {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
@@ -1435,9 +1438,11 @@ kernel void remu_sampler_cache_test(
         vertex_inputs: Vec::new(),
     };
 
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] creating first cached arguments");
     let (first_buffer, first_samplers) = presenter
         .cached_sampler_argument_buffer(&device, &function, Some(0), &evaluation)
         .expect("first sampler argument buffer is created");
+    eprintln!("[REMu][TEST][SAMPLER-CACHE] first cached arguments created");
     let (second_buffer, second_samplers) = presenter
         .cached_sampler_argument_buffer(&device, &function, Some(0), &evaluation)
         .expect("identical sampler argument buffer is reused");
