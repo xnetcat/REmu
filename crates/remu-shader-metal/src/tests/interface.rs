@@ -343,14 +343,7 @@ fn emits_guest_misc_layer_as_mesh_primitive_output() {
         let source = directory.join("mesh.metal");
         let air = directory.join("mesh.air");
         std::fs::write(&source, &shader.source).expect("write generated layered mesh MSL");
-        let output = std::process::Command::new(compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(compiler.as_ref(), &source, &air);
         assert!(
             output.status.success(),
             "layered mesh MSL failed to compile:\n{}\n{}",

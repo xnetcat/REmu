@@ -451,14 +451,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
         let source = directory.join(format!("{stem}.metal"));
         let air = directory.join(format!("{stem}.air"));
         std::fs::write(&source, shader.source).expect("write generated MSL");
-        let output = Command::new(&compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(&compiler, &source, &air);
         assert!(
             output.status.success(),
             "{stage:?} VOP3P/conversion/lane MSL failed to compile:\n{}\n{}",

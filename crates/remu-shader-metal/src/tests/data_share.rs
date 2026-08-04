@@ -291,14 +291,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         let source = directory.join("mesh.metal");
         let air = directory.join("mesh.air");
         std::fs::write(&source, &shader.source).expect("write generated mesh MSL");
-        let output = std::process::Command::new(compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(compiler.as_ref(), &source, &air);
         assert!(
             output.status.success(),
             "mesh MSL failed to compile:\n{}\n{}",
@@ -977,14 +970,7 @@ fn generated_ds_msl_compiles_with_apple_metal_in_every_valid_stage() {
         let source = directory.join(format!("{stem}.metal"));
         let air = directory.join(format!("{stem}.air"));
         std::fs::write(&source, shader.source).expect("write generated DS MSL");
-        let output = Command::new(&compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(&compiler, &source, &air);
         assert!(
             output.status.success(),
             "{stem} DS MSL failed to compile:\n{}\n{}",

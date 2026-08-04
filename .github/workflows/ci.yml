@@ -41,7 +41,7 @@ jobs:
         run: softwareupdate --install-rosetta --agree-to-license || true
 
       - name: Install the offline Metal toolchain
-        # Three remu-shader-metal tests compile generated MSL with Apple's `metal` tool.
+        # remu-shader-metal tests compile generated MSL with Apple's `metal` tool.
         run: xcodebuild -downloadComponent MetalToolchain || true
 
       - uses: Swatinem/rust-cache@v2

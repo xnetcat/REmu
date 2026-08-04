@@ -40,6 +40,49 @@ fn empty_evaluation() -> ShaderEvaluation {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn compile_generated_msl_with_safe_math(
+    compiler: &std::path::Path,
+    source: &std::path::Path,
+    air: &std::path::Path,
+) -> std::process::Output {
+    fn run(
+        compiler: &std::path::Path,
+        math_option: &str,
+        source: &std::path::Path,
+        air: &std::path::Path,
+    ) -> std::process::Output {
+        std::process::Command::new(compiler)
+            .args(["-c", "-target", "air64-apple-macosx15.0"])
+            .arg(math_option)
+            .arg("-o")
+            .arg(air)
+            .arg(source)
+            .output()
+            .expect("run Apple Metal compiler")
+    }
+
+    let output = run(compiler, "-fmetal-math-mode=safe", source, air);
+    if output.status.success() {
+        return output;
+    }
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !diagnostics.contains("unknown argument: '-fmetal-math-mode=safe'")
+        && !diagnostics.contains("unknown argument: \"-fmetal-math-mode=safe\"")
+        && !diagnostics.contains("unsupported option '-fmetal-math-mode=safe'")
+        && !diagnostics.contains("unsupported option \"-fmetal-math-mode=safe\"")
+    {
+        return output;
+    }
+
+    let _ = std::fs::remove_file(air);
+    run(compiler, "-fno-fast-math", source, air)
+}
+
 #[test]
 fn hlsl_evaluation_key_excludes_live_resource_addresses_and_captured_data() {
     let uint_format = (0..0x200)
