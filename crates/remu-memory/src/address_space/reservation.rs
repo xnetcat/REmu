@@ -599,6 +599,7 @@ const VM_FLAGS_FIXED: i32 = 0;
 
 // SAFETY (declaration): the libSystem Mach VM entry points with their documented ABI; each call
 // site upholds the per-call preconditions (live task, owned range, representable sizes).
+#[cfg(target_os = "macos")]
 #[link(name = "System")]
 unsafe extern "C" {
     fn mach_task_self() -> u32;

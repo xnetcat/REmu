@@ -191,7 +191,8 @@ pub(crate) fn analyze_control_flow(
     // from an unproven tree (silently-wrong pixels risk).
     let cfg = build_control_flow_graph(program);
     let structured = cfg.structure();
-    if structured_cfg_is_fully_reducible(&structured)
+    if cfg.is_reducible()
+        && structured_cfg_is_fully_reducible(&structured)
         && structured_cfg_needs_structured_emission(&structured)
     {
         return Ok(ControlFlowLowering::Structured {

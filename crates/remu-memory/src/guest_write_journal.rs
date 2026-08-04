@@ -727,9 +727,10 @@ fn write_diagnostic(_buffer: &DiagnosticBuffer) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPACITY, ENABLED, ENABLED_YES, GuestWriteSite, JournalEntry, MIXED_PAYLOAD,
+        CAPACITY, ENABLED, ENABLED_YES, GuestWriteSite, JournalEntry, MIXED_PAYLOAD, NEXT_SEQUENCE,
         SAMPLED_PAYLOAD, address_looks_poisoned, payload_prefix, read_slot,
-        record_guest_cpu_page_open, record_guest_write_sequence, slots_for_recording, uniform_byte,
+        record_guest_cpu_page_open, record_guest_write, record_guest_write_sequence,
+        slots_for_recording, uniform_byte,
     };
     use std::sync::{Mutex, atomic::Ordering};
 

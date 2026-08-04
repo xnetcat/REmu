@@ -402,8 +402,8 @@ fn irreducible_control_flow_keeps_the_step_capped_dispatcher_as_loud_fallback() 
             Instruction {
                 pc: 0,
                 encoding: ShaderEncoding::Sopp,
-                opcode: Opcode::Known("SBranch"),
-                // Jump into the middle of the cycle (pc 8).
+                opcode: Opcode::Known("SCbranchScc1"),
+                // Either enter at pc 4 or jump into the middle of the cycle at pc 8.
                 words: vec![1],
                 sources: Vec::new(),
                 destinations: Vec::new(),
@@ -657,8 +657,8 @@ fn large_irreducible_dispatcher_programs_scale_the_step_limit_with_instruction_c
     instructions.push(Instruction {
         pc: 0,
         encoding: ShaderEncoding::Sopp,
-        opcode: Opcode::Known("SBranch"),
-        // Enter the cycle at pc 8 (skip the VMov at pc 4).
+        opcode: Opcode::Known("SCbranchScc1"),
+        // Enter the cycle at pc 4 or pc 8, giving it two distinct entry edges.
         words: vec![1],
         sources: Vec::new(),
         destinations: Vec::new(),
@@ -677,11 +677,14 @@ fn large_irreducible_dispatcher_programs_scale_the_step_limit_with_instruction_c
         });
     }
     // Backward branch to pc 4 — second entry into the cycle (irreducible with the SBranch above).
+    let branch_pc = u32::try_from(instructions.len() * 4).expect("pc fits");
+    let branch_displacement = i16::try_from((4_i64 - (i64::from(branch_pc) + 4)) / 4)
+        .expect("test branch displacement fits i16");
     instructions.push(Instruction {
-        pc: u32::try_from(instructions.len() * 4).expect("pc fits"),
+        pc: branch_pc,
         encoding: ShaderEncoding::Sopp,
         opcode: Opcode::Known("SCbranchScc1"),
-        words: vec![0xfffe],
+        words: vec![u32::from(branch_displacement.cast_unsigned())],
         sources: Vec::new(),
         destinations: Vec::new(),
         control: None,

@@ -30,7 +30,7 @@ pub(crate) use self::buffer::{
 };
 #[cfg(test)]
 pub(crate) use self::buffer::{
-    graphics_tracking_test_guard, mark_graphics_release_allocation, track_graphics_allocation,
+    graphics_tracking_test_guard, track_graphics_allocation,
 };
 use self::common::{
     cb_branch, cb_dispatch, cb_nop, cb_release_mem, cb_set_register_range, cb_set_sh_registers,

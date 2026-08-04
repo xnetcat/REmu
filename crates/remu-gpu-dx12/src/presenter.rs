@@ -15,7 +15,8 @@ use remu_gpu::{
     HostPadState, HostPadVibration, HostToastRequest, PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS,
     PAD_BUTTON_DOWN, PAD_BUTTON_L1, PAD_BUTTON_L2, PAD_BUTTON_L3, PAD_BUTTON_LEFT,
     PAD_BUTTON_OPTIONS, PAD_BUTTON_R1, PAD_BUTTON_R2, PAD_BUTTON_R3, PAD_BUTTON_RIGHT,
-    PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP,
+    PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, PIXEL_PIPE_STAT_COUNTER_PAIRS,
+    PIXEL_PIPE_STAT_VALID,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D12::{
@@ -882,6 +883,34 @@ impl Dx12Presenter {
                         }
                     }
                     Err(error) => eprintln!("[REMu][D3D12] RELEASE_MEM failed: {error}"),
+                }
+            }
+            GpuEvent::OcclusionQuery { destination } => {
+                let result = self
+                    .guest_executor
+                    .as_mut()
+                    .ok_or_else(|| "D3D12 guest executor is unavailable".to_owned())
+                    .and_then(Dx12GuestExecutor::take_occlusion_sample_count)
+                    .and_then(|sample_count| {
+                        let value = PIXEL_PIPE_STAT_VALID
+                            | (sample_count & !PIXEL_PIPE_STAT_VALID);
+                        for pair in 0..PIXEL_PIPE_STAT_COUNTER_PAIRS {
+                            let address = destination + pair * 16;
+                            execute_memory_release(GpuMemoryRelease {
+                                address,
+                                value: GpuMemoryReleaseValue::Immediate64(value),
+                            })?;
+                            if let Some(executor) = self.guest_executor.as_mut() {
+                                executor.invalidate_ordered_global_range(address, 8);
+                            }
+                        }
+                        Ok(())
+                    });
+                if let Err(error) = result {
+                    eprintln!(
+                        "[REMu][D3D12] occlusion query publication failed destination={destination:#x}: {error}"
+                    );
+                    self.report_device_removal();
                 }
             }
             GpuEvent::MemoryWait(wait) => {

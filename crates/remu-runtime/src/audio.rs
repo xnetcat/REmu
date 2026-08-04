@@ -556,7 +556,10 @@ fn route_ports_to_mixer(
     for (&handle, port) in ports {
         port.resampler = (port.frequency != sample_rate)
             .then(|| StreamingStereoResampler::new(port.frequency, sample_rate));
-        mixer.add_port(handle, maximum_queued_frames);
+        let queue = port
+            .queue
+            .get_or_insert_with(|| Arc::new(AudioQueue::with_capacity(maximum_queued_frames)));
+        mixer.add_port(handle, Arc::clone(queue));
     }
 }
 
@@ -1431,7 +1434,7 @@ mod tests {
         assert_eq!(resampler.destination_rate, 96_000);
         let mixer = mixer.lock().unwrap();
         assert!(mixer.queues.contains_key(&7));
-        assert!(mixer.queues[&7].frames.capacity() >= 96_000 * MAX_QUEUED_AUDIO_SECONDS);
+        assert!(mixer.queues[&7].ring.capacity() >= 96_000 * MAX_QUEUED_AUDIO_SECONDS);
     }
 
     #[test]

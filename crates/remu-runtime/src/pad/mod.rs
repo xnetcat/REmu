@@ -90,12 +90,13 @@ pub(crate) fn dispatch_pad_import(nid: &str, arguments: [u64; 6]) -> Option<u64>
         "rIZnR6eSpvk" => pad_reset_orientation(arguments),        // scePadResetOrientation
         "DscD1i9HX1w" => pad_handle_operation(arguments),         // scePadResetLightBar
         "r44mAxdSG+U" => pad_set_angular_velocity_deadband(arguments), // scePadSetAngularVelocityDeadbandState
-        "vDLMoJLde8I" => pad_set_tilt_correction(arguments), // scePadSetTiltCorrectionState
-        "KLmYx9ij2h0" => pad_set_angular_velocity_bias(arguments), // scePadSetAngularVelocityBiasCorrectionState
-        "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
-        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments), // scePadGetTriggerEffectState
-        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),  // scePadDeviceClassParseData
-        "hv1luiJrqQM" => pad_initialize(),                        // scePadInit
+        "vDLMoJLde8I" => pad_set_tilt_correction(arguments),          // scePadSetTiltCorrectionState
+        "KLmYx9ij2h0" => pad_set_angular_velocity_bias(arguments),    // scePadSetAngularVelocityBiasCorrectionState
+        "yFVnOdGxvZY" => pad_set_vibration(arguments),               // scePadSetVibration
+        "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
+        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments),     // scePadGetTriggerEffectState
+        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),       // scePadDeviceClassParseData
+        "hv1luiJrqQM" => pad_initialize(),                            // scePadInit
         _ => return None,
     })
 }
@@ -229,6 +230,7 @@ pub(crate) fn pad_close(arguments: [u64; 6]) -> u64 {
     state.last_history_timestamp = 0;
     drop(state);
     hid::note_pad_handle_closed();
+    remu_gpu::set_host_pad_vibration(remu_gpu::HostPadVibration::default());
     0
 }
 
@@ -346,6 +348,21 @@ pub(crate) fn pad_pointer_operation(arguments: [u64; 6]) -> u64 {
         eprintln!("[REMu][PAD] pointer operation: null parameter");
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    0
+}
+
+fn pad_set_vibration(arguments: [u64; 6]) -> u64 {
+    if let Err(error) = validate_pad_handle(arguments[0]) {
+        return error;
+    }
+    if !process_guest_range_is_readable(arguments[1], 2) {
+        eprintln!("[REMu][PAD] SetVibration: invalid vibration parameter");
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    remu_gpu::set_host_pad_vibration(remu_gpu::HostPadVibration {
+        large_motor: read_guest_u8(arguments[1]),
+        small_motor: read_guest_u8(arguments[1] + 1),
+    });
     0
 }
 

@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::mem::ManuallyDrop;
+use std::mem::{ManuallyDrop, size_of};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -49,7 +49,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_MESSAGE, D3D12_MIP_LOD_BIAS_MAX, D3D12_MIP_LOD_BIAS_MIN,
     D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_QUERY_HEAP_DESC,
+    D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_TYPE_OCCLUSION, D3D12_RASTERIZER_DESC,
     D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOLVE_MODE_MAX,
     D3D12_RESOLVE_MODE_MIN, D3D12_RESOURCE_BARRIER, D3D12_RESOURCE_BARRIER_0,
     D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -80,7 +81,7 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_UNORDERED_ACCESS_VIEW_DESC_0, D3D12_VIEWPORT, D3D12SerializeRootSignature,
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12DescriptorHeap,
     ID3D12Device, ID3D12Fence, ID3D12GraphicsCommandList, ID3D12GraphicsCommandList1,
-    ID3D12InfoQueue, ID3D12PipelineState, ID3D12Resource, ID3D12RootSignature,
+    ID3D12InfoQueue, ID3D12PipelineState, ID3D12QueryHeap, ID3D12Resource, ID3D12RootSignature,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
@@ -112,6 +113,7 @@ const MAXIMUM_GRAPHICS_PIPELINE_CACHE_ENTRIES: usize = 512;
 const MAXIMUM_COMPUTE_PIPELINE_CACHE_ENTRIES: usize = 256;
 const MAXIMUM_PERSISTENT_RENDER_TARGETS: usize = 8;
 const MAXIMUM_PENDING_DRAWS: usize = 128;
+const OCCLUSION_QUERY_CAPACITY: u32 = MAXIMUM_PENDING_DRAWS as u32;
 const MAXIMUM_RESIDENT_SAMPLED_TEXTURES: usize = 128;
 const MAXIMUM_ORDERED_GLOBAL_VERSION_BYTES: usize = 8 * 1024 * 1024;
 const MAXIMUM_ORDERED_GLOBAL_VERSIONS: usize = 128;
@@ -245,6 +247,10 @@ pub(super) struct Dx12GuestExecutor {
     upload_arena: UploadArena,
     command_pool: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
     pending_draw_resources: Vec<PendingDrawResources>,
+    occlusion_query_heap: ID3D12QueryHeap,
+    occlusion_readback: ID3D12Resource,
+    occlusion_query_count: u32,
+    occlusion_sample_count: u64,
 }
 
 pub(super) struct Dx12PresentTarget {
@@ -769,6 +775,33 @@ impl Dx12GuestExecutor {
         name_object(&root, "REmu guest root signature");
         let descriptor_arena = DescriptorArena::new(&device)?;
         let upload_arena = UploadArena::new(&device)?;
+        let occlusion_query_description = D3D12_QUERY_HEAP_DESC {
+            Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+            Count: OCCLUSION_QUERY_CAPACITY,
+            NodeMask: 0,
+        };
+        let mut occlusion_query_heap = None;
+        // SAFETY: the descriptor requests a baseline D3D12 occlusion-query heap and the output
+        // slot receives its owned COM reference.
+        unsafe {
+            device.CreateQueryHeap(
+                &raw const occlusion_query_description,
+                &raw mut occlusion_query_heap,
+            )
+        }
+        .map_err(|error| {
+            backend_error("ID3D12Device::CreateQueryHeap(occlusion)", &error).to_string()
+        })?;
+        let occlusion_query_heap = occlusion_query_heap
+            .ok_or("ID3D12Device::CreateQueryHeap returned no occlusion heap")?;
+        let occlusion_readback = create_readback_buffer(
+            &device,
+            usize::try_from(OCCLUSION_QUERY_CAPACITY)
+                .expect("occlusion capacity fits usize")
+                * size_of::<u64>(),
+        )?;
+        name_object(&occlusion_query_heap, "REMu guest occlusion query heap");
+        name_object(&occlusion_readback, "REMu guest occlusion query readback");
         Ok(Self {
             device,
             queue,
@@ -791,6 +824,10 @@ impl Dx12GuestExecutor {
             upload_arena,
             command_pool: Vec::new(),
             pending_draw_resources: Vec::new(),
+            occlusion_query_heap,
+            occlusion_readback,
+            occlusion_query_count: 0,
+            occlusion_sample_count: 0,
         })
     }
 
@@ -842,6 +879,17 @@ impl Dx12GuestExecutor {
         } else {
             self.wait()
         }
+    }
+
+    /// Completes every draw since the previous guest pixel-pipe dump and returns the native
+    /// D3D12 occlusion sample total. Query support is part of the D3D12 baseline, so this path is
+    /// adapter-independent and does not depend on vendor or device IDs.
+    pub(super) fn take_occlusion_sample_count(&mut self) -> Result<u64, String> {
+        self.complete_pending_gpu_work()?;
+        if self.occlusion_query_count != 0 {
+            self.wait()?;
+        }
+        Ok(std::mem::take(&mut self.occlusion_sample_count))
     }
 
     pub(super) fn execute_compute(&mut self, dispatch: &ComputeDispatch) -> Result<(), String> {
@@ -1075,7 +1123,9 @@ impl Dx12GuestExecutor {
         let timing_started = Instant::now();
         let trace_timing =
             std::env::var_os("REMU_TRACE_D3D12_TIMING").is_some_and(|value| value == "1");
-        if self.pending_draw_resources.len() >= MAXIMUM_PENDING_DRAWS {
+        if self.pending_draw_resources.len() >= MAXIMUM_PENDING_DRAWS
+            || self.occlusion_query_count >= OCCLUSION_QUERY_CAPACITY
+        {
             self.complete_pending_gpu_work()?;
         }
         if !indirect_draw_count_allows(draw)? {
@@ -1348,6 +1398,7 @@ impl Dx12GuestExecutor {
         let pixel_constants = pixel_resources
             .as_ref()
             .map(|_| [root_descriptors[1], 0, 0, 0, 0, 0, 0]);
+        let occlusion_query_index = self.occlusion_query_count;
         // SAFETY: root constants select each stage's combined-heap table, and all fixed-function
         // state matches the PSO and live target.
         unsafe {
@@ -1366,6 +1417,11 @@ impl Dx12GuestExecutor {
                 (!rtvs.is_empty()).then_some(rtvs.as_ptr()),
                 false,
                 dsv.as_ref().map(std::ptr::from_ref),
+            );
+            commands.BeginQuery(
+                &self.occlusion_query_heap,
+                D3D12_QUERY_TYPE_OCCLUSION,
+                occlusion_query_index,
             );
             if let (Some(depth), Some(dsv)) = (&depth, dsv) {
                 let mut clear_flags = windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS(0);
@@ -1430,6 +1486,19 @@ impl Dx12GuestExecutor {
                     first_instance,
                 );
             }
+            commands.EndQuery(
+                &self.occlusion_query_heap,
+                D3D12_QUERY_TYPE_OCCLUSION,
+                occlusion_query_index,
+            );
+            commands.ResolveQueryData(
+                &self.occlusion_query_heap,
+                D3D12_QUERY_TYPE_OCCLUSION,
+                occlusion_query_index,
+                1,
+                &self.occlusion_readback,
+                u64::from(occlusion_query_index) * size_of::<u64>() as u64,
+            );
         }
         record_stage_readbacks(&commands, &vertex_resources);
         if let Some(resources) = &pixel_resources {
@@ -1467,6 +1536,7 @@ impl Dx12GuestExecutor {
         })?;
         // SAFETY: all command resources live through the following wait.
         unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
+        self.occlusion_query_count = self.occlusion_query_count.saturating_add(1);
         let gpu_complete = if defer_gpu_completion {
             commands_ready
         } else {
@@ -1892,12 +1962,36 @@ impl Dx12GuestExecutor {
                 device_removed_report(&self.device)
             ));
         }
+        self.collect_occlusion_query_results()?;
         for resources in std::mem::take(&mut self.pending_draw_resources) {
             self.command_pool
                 .push((resources._allocator, resources._commands));
         }
         self.descriptor_arena.reset();
         self.upload_arena.reset();
+        Ok(())
+    }
+
+    fn collect_occlusion_query_results(&mut self) -> Result<(), String> {
+        let query_count = self.occlusion_query_count;
+        if query_count == 0 {
+            return Ok(());
+        }
+        let byte_count = usize::try_from(query_count)
+            .map_err(|_| "occlusion query count does not fit usize")?
+            .checked_mul(size_of::<u64>())
+            .ok_or("occlusion query readback size overflow")?;
+        let bytes = read_readback(&self.occlusion_readback, byte_count)
+            .map_err(|error| error.to_string())?;
+        for value in bytes.chunks_exact(size_of::<u64>()) {
+            let value: [u8; size_of::<u64>()] = value
+                .try_into()
+                .expect("chunks_exact yields one complete u64");
+            self.occlusion_sample_count = self
+                .occlusion_sample_count
+                .saturating_add(u64::from_le_bytes(value));
+        }
+        self.occlusion_query_count = 0;
         Ok(())
     }
 

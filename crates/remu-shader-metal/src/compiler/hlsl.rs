@@ -27,7 +27,10 @@ impl Compiler<'_> {
     ) -> Result<HlslShader, MetalCompileError> {
         validate_hlsl_interface(&self, threads_per_group)?;
         self.lower_body()?;
-        let direct_control_flow = matches!(self.control_flow, ControlFlowLowering::Direct(_));
+        let direct_control_flow = matches!(
+            self.control_flow,
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. }
+        );
         let (source, references) = self.emit_hlsl_module(threads_per_group)?;
         let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
             .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
@@ -340,7 +343,7 @@ impl Compiler<'_> {
                 source
                     .push_str("    uint pc = 0u;\n    bool active = true;\n    uint steps = 0u;\n");
             }
-            ControlFlowLowering::Direct(_) => {}
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. } => {}
         }
         self.emit_compute_system_registers(&mut source);
         for register in [crate::VCC_LO, crate::VCC_HI] {
@@ -372,7 +375,9 @@ impl Compiler<'_> {
 
         let body = translate_hlsl_body(self.body.clone());
         match self.control_flow {
-            ControlFlowLowering::Direct(_) => source.push_str(&body),
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. } => {
+                source.push_str(&body);
+            }
             ControlFlowLowering::Forward => source.push_str(&body),
             ControlFlowLowering::Dispatcher => {
                 let _ = writeln!(

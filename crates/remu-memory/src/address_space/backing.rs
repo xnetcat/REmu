@@ -284,32 +284,16 @@ impl ReadMappingCache {
 /// guest alias of that object.
 #[derive(Debug)]
 struct CachedWriteMapping {
-    address: usize,
+    host: HostBackingMapping,
     backing_offset: u64,
     byte_count: usize,
     last_use: u64,
 }
 
 impl CachedWriteMapping {
-    fn new(descriptor: i32, backing_offset: u64, byte_count: usize) -> Option<Self> {
-        let file_offset = libc::off_t::try_from(backing_offset).ok()?;
-        // SAFETY: the caller validated that this page-aligned file interval belongs to the live
-        // shared-memory object. The mapping remains owned by this value until Drop.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_count,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                descriptor,
-                file_offset,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            return None;
-        }
+    fn new(inner: &BackingInner, backing_offset: u64, byte_count: usize) -> Option<Self> {
         Some(Self {
-            address: mapping as usize,
+            host: HostBackingMapping::new(inner, backing_offset, byte_count)?,
             backing_offset,
             byte_count,
             last_use: 0,
@@ -341,18 +325,9 @@ impl CachedWriteMapping {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 source.as_ptr(),
-                (self.address as *mut u8).add(in_mapping_offset),
+                (self.host.address as *mut u8).add(in_mapping_offset),
                 source.len(),
             );
-        }
-    }
-}
-
-impl Drop for CachedWriteMapping {
-    fn drop(&mut self) {
-        // SAFETY: this value owns the complete mmap interval and releases it exactly once.
-        unsafe {
-            libc::munmap(self.address as *mut libc::c_void, self.byte_count);
         }
     }
 }
@@ -706,7 +681,7 @@ impl GuestPhysicalBacking {
                 return true;
             }
             let Some(mapping) =
-                CachedWriteMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+                CachedWriteMapping::new(&self.inner, aligned_offset, mapping_length)
             else {
                 return false;
             };
@@ -715,7 +690,7 @@ impl GuestPhysicalBacking {
             return true;
         }
         let Some(mapping) =
-            CachedWriteMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+            CachedWriteMapping::new(&self.inner, aligned_offset, mapping_length)
         else {
             return false;
         };

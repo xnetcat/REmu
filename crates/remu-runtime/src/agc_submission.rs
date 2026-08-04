@@ -60,8 +60,6 @@ pub(crate) struct AgcSubmissionPacket {
 
 const INDIRECT_DRAW_REGISTER_UNMAPPED: u32 = 0x280;
 const MAXIMUM_INDIRECT_DRAWS_PER_PACKET: u32 = 1_048_576;
-const PIXEL_PIPE_STAT_VALID: u64 = 1 << 63;
-const PIXEL_PIPE_STAT_STEP: u64 = 0x02ff_ffff;
 /// Gen5 result blocks contain sixteen 16-byte render-backend counter pairs.
 ///
 /// Native PS5 command streams clear the full 0x100-byte payload before issuing

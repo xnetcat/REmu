@@ -13,6 +13,7 @@ use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ProcessGuestMemory;
+use remu_shader::GuestMemoryReader;
 #[cfg(target_os = "macos")]
 use crate::cached_kernel_memory_readable_range_end;
 

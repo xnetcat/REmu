@@ -76,7 +76,9 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+#[cfg(target_os = "macos")]
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
@@ -190,7 +192,7 @@ pub(crate) use audio_out2_abi::{
     trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_audio_out2_pcm,
     write_audio_out2_context_param, write_audio_out2_port_state,
 };
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use av_player::av_player_nv12_layout;
 #[cfg(test)]
 pub(crate) use av_player::{
@@ -9372,7 +9374,6 @@ fn report_diagnostic_stall_attribution() {
             });
             (
                 state.video_out.completed_flip_count,
-                state.pending_video_out_flips.len(),
                 state.video_out.flip_events.len(),
                 state.video_out.vblank_events.len(),
                 last_completed_flip,
@@ -9416,7 +9417,6 @@ fn report_diagnostic_stall_attribution() {
         .count();
     if let Some((
         completed_flips,
-        runtime_pending,
         flip_event_registrations,
         vblank_event_registrations,
         last_completed_flip,
@@ -9425,7 +9425,7 @@ fn report_diagnostic_stall_attribution() {
         eprintln!(
             "[REMu][STALL-VIDEO] completed_flips={} runtime_pending={} backend_pending={gpu_flips} flip_event_registrations={} vblank_event_registrations={} last_completed={last_completed_flip:?}",
             completed_flips,
-            runtime_pending,
+            events.pending_video_out_flips.len(),
             flip_event_registrations,
             vblank_event_registrations,
         );

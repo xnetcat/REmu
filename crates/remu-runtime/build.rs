@@ -171,6 +171,9 @@ fn ensure_ffmpeg(target: &str) -> PathBuf {
 fn validate_ffmpeg_root(root: &Path, target: &str) {
     let required = [
         root.join("include/libavcodec/avcodec.h"),
+        root.join("include/libavutil/samplefmt.h"),
+        root.join("include/libavutil/pixfmt.h"),
+        root.join("include/libavutil/frame.h"),
         root.join("lib/libavformat.a"),
         root.join("lib/libavcodec.a"),
         root.join("lib/libavutil.a"),

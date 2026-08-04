@@ -261,7 +261,7 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                 pending.completion.buffer_index,
                 pending.completion.address,
                 pending.completion.flip_argument,
-                state.pending_video_out_flips.len(),
+                events.pending_video_out_flips.len(),
                 remu_gpu::gpu_flips_pending(),
                 registrations.len(),
             );

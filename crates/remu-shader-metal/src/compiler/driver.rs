@@ -244,7 +244,10 @@ impl<'a> Compiler<'a> {
     pub(crate) fn compile(mut self) -> Result<MetalShader, MetalCompileError> {
         self.lower_body()?;
 
-        let direct_control_flow = matches!(self.control_flow, ControlFlowLowering::Direct(_));
+        let direct_control_flow = matches!(
+            self.control_flow,
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. }
+        );
         let (source, register_references) = self.emit_module()?;
         let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
             .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
@@ -373,67 +376,7 @@ impl<'a> Compiler<'a> {
         if let Some(error) = combined_lowering_error(failures) {
             return Err(error);
         }
-
-        let direct_control_flow = matches!(
-            self.control_flow,
-            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. }
-        );
-        let (source, register_references) = self.emit_module()?;
-        let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
-            .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
-        let sampler_count = self.image_slots.sampler_count;
-        let global_argument_buffer_index = (global_buffer_count > 30).then_some(0);
-        let initial_scalar_buffer_index = if global_argument_buffer_index.is_some() {
-            1
-        } else {
-            global_buffer_count
-        };
-        let direct_sampler_bindings =
-            sampler_count != 0 && initial_scalar_buffer_index.saturating_add(1) > 30;
-        let threadgroup_memory_bytes = if self
-            .program
-            .instructions
-            .iter()
-            .any(is_lds_memory_instruction)
-        {
-            self.options.lds_size_bytes
-        } else {
-            0
-        };
-        Ok(MetalShader {
-            source,
-            entry_point: "remu_main".into(),
-            stage: self.options.stage,
-            bindings: MetalBindingLayout {
-                global_buffer_count,
-                global_argument_buffer_index,
-                initial_scalar_buffer_index,
-                sampler_argument_buffer_index: (sampler_count != 0 && !direct_sampler_bindings)
-                    .then_some(initial_scalar_buffer_index + 1),
-                texture_count: self.image_slots.texture_count,
-                sampler_count,
-                threadgroup_memory_bytes,
-            },
-            vertex_inputs: self.evaluation.vertex_inputs.clone(),
-            interpolated_attribute_count: self
-                .pixel_attributes
-                .iter()
-                .filter_map(|attribute| {
-                    let input = self.options.pixel_input_controls[*attribute as usize];
-                    (!input.uses_default()).then_some(u32::from(input.input_offset) + 1)
-                })
-                .max()
-                .unwrap_or(0),
-            register_footprint: MetalRegisterFootprint {
-                scalar_values: u32::try_from(register_references.scalar.len()).map_err(|_| {
-                    MetalCompileError::InvalidInterface("too many live scalar values".into())
-                })?,
-                vector_values: u32::try_from(register_references.vector.len()).map_err(|_| {
-                    MetalCompileError::InvalidInterface("too many live vector values".into())
-                })?,
-                direct_control_flow,
-            },
-        })
+        Ok(())
     }
 
     fn emit_instruction(

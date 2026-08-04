@@ -36,6 +36,9 @@ Implemented and physically validated on the development host:
 - Ordered compute, graphics, barriers, flip events, display registration, XInput polling, and DXGI
   presentation, including retained-frame restore across minimize, occlusion, suspension, and
   zero-sized resize transitions plus borderless F11/Alt+Enter fullscreen.
+- Native D3D12 occlusion queries around guest draws, resolved through a bounded query/readback
+  ring and published through the shared guest counter contract. This is baseline D3D12 behavior,
+  not an adapter-vendor extension.
 - Structural shader and pipeline variants cache translated state independently of live guest
   addresses. Shared shader-visible descriptor/sampler arenas, a persistently mapped 64 MiB upload
   arena, and fence-retired command allocator/list reuse remove per-draw heap and command-object
@@ -71,9 +74,17 @@ The initial REmu baseline is:
 Feature level, wave capability, shader model, and resource-binding tier are queried independently.
 Optional features used to select exact or fallback paths include enhanced barriers, writable MSAA
 textures, independent front/back stencil reference and masks, triangle fan, dynamic strip-cut, and
-dynamic depth bias. This follows Microsoft's guidance to use
+dynamic depth bias. Mesh-shader tier is also queried independently: tier 1-capable adapters may use
+a native mesh path once implemented, while tier-0 adapters require the classic/compute NGG
+fallback. This follows Microsoft's guidance to use
 `ID3D12Device::CheckFeatureSupport` rather than infer behavior from adapter names or DirectX
 marketing versions.
+
+No execution path is selected from adapter name, vendor ID, or device ID. Those values are retained
+only for diagnostics, cache identity, and an eventual explicit adapter selector. The GTX 1050
+results below are one physical validation point, not the supported-device definition; newer AMD,
+Intel, and NVIDIA adapters can use optional capabilities unavailable on that card without changing
+the baseline path for older hardware.
 
 DXGI adapters are enumerated with `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`, software adapters are
 skipped, and the first adapter satisfying the baseline is selected. Adapter selection must later
@@ -341,13 +352,34 @@ disposable hardware, because deliberately triggering a TDR on a working desktop 
 
 ## Remaining implementation sequence
 
+### Parity audit against post-divergence main
+
+The 2026-08-04 rebase audited the GPU/runtime work added to main after this branch diverged and maps
+it to DX12 by semantic capability rather than by copying Metal APIs:
+
+| Main work | Shared or DX12 equivalent | Current state |
+| --- | --- | --- |
+| Structured shader CFG (`6f32225`) | Shared IR plus HLSL structured/direct lowering | Integrated and covered by the shared compiler tests |
+| Ordered internal-resident writes (`ccc7640`) | Guest-range leases and ordered global versions | Integrated |
+| Attachment occlusion queries (`d683bb5`) | D3D12 occlusion query heap and readback publication | Implemented |
+| GPU tiler and equation work (`6ed02f8`) | Shared equations plus a future D3D12 compute tiler | CPU conversion exists; GPU path remains |
+| Persistent shader caches (`dd62f2b`) | Adapter/driver/capability-keyed DXIL and pipeline-library cache | In-memory caches exist; disk cache remains |
+| Display-link timebase/pacing (`4f6537e`) | DXGI frame-latency waitable object and shared display timebase | Present ordering exists; waitable-object pacing remains |
+| NGG capacities and proof (`ca6c3a0`, `655d3d8`) | Capability-routed native mesh path plus classic/compute fallback | Shared register derivation is available; DX12 execution paths remain |
+| Sampled-resident lookup (`30bd087`) | Physical-identity-indexed DX12 texture lookup | Descriptor cache exists; identity index remains |
+
+This table is a porting checklist, not a claim that Metal implementation details should become the
+cross-platform contract. Guest semantics and capability decisions belong in shared code; D3D12
+resource transitions, queues, queries, DXIL, and DXGI pacing remain backend-specific.
+
 1. Extend the completed ordered single/multi indirect draw/dispatch and primitive normalization
    paths to patch, triangle-with-flags, and rectangle-specific edge semantics.
 2. Move the completed transient color/depth/stencil MSAA paths into persistent resources and extend
    conservative DCC materialization to full guest FMASK/DCC metadata coherence plus explicit guest
    resolve-packet semantics.
-3. Add a non-mesh-shader NGG fallback for the GTX 1050 (`mesh_shader_tier=0`) and validate it
-   against the existing shared compiler corpus.
+3. Add a classic/compute NGG fallback for every `mesh_shader_tier=0` adapter, validate it on the
+   GTX 1050 and against the shared compiler corpus, then add a separately selected native mesh path
+   for adapters reporting mesh-shader tier 1 or newer.
 4. Extend the persistent single-sample color cache to depth/MSAA/shader resources and replace
    synchronous per-draw fences with upload/readback rings, fence retirement, physical-alias
    invalidation, residency budgets, and submission batching.

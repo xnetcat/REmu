@@ -355,7 +355,7 @@ pub fn guest_shared_backing_identity(
 #[must_use]
 pub fn watch_guest_shared_backing_writes(address: u64, byte_count: u64) -> bool {
     let mappings = shared_mappings()
-        .lock()
+        .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
     else {

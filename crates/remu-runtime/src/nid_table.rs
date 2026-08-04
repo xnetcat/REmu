@@ -9,6 +9,8 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "8G2LB+A3rzg" => "atexit",
         "tsvEmnenz48" => "__cxa_atexit",
         "H2e8t5ScQGc" => "__cxa_finalize",
+        "uMei1W9uyNo" => "exit",
+        "6Z83sYWFlA8" => "_exit",
         "rNhWz+lvOMU" => "_sceKernelSetThreadDtors",
         "pB-yGZ2nQ9o" => "_sceKernelSetThreadAtexitCount",
         "WhCc1w3EhSI" => "_sceKernelSetThreadAtexitReport",

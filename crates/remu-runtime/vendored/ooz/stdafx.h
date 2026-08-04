@@ -14,9 +14,11 @@
 #define _byteswap_uint64(x) __builtin_bswap64((uint64)(x))
 #define _BitScanForward(dst, x) (*(dst) = __builtin_ctz(x))
 #define _BitScanReverse(dst, x) (*(dst) = (__builtin_clz(x) ^ 31))
+#if !defined(_WIN32)
 static inline uint32_t _rotl(uint32_t x, int n) {
   return (((x) << (n)) | ((x) >> (32 - (n))));
 }
+#endif
 #define SIMDE_ENABLE_NATIVE_ALIASES
 #include <simde/x86/sse.h>
 #include <simde/x86/sse2.h>

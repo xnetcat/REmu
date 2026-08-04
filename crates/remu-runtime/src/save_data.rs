@@ -541,7 +541,7 @@ pub(crate) fn save_data_delete(arguments: [u64; 6], state: &mut ProbeDispatchSta
         );
         return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
     }
-    if let Err(error) = sync_save_data_directory(&title_root) {
+    if let Err(error) = crate::savedata_journal::sync_directory(&title_root) {
         eprintln!(
             "[REMu][SAVEDATA] delete directory sync failed path={:?}: {error}",
             title_root.display()
