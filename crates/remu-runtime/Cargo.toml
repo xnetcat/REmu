@@ -12,6 +12,7 @@ remu-core = { path = "../remu-core" }
 remu-gpu = { path = "../remu-gpu" }
 remu-loader = { path = "../remu-loader" }
 remu-memory = { path = "../remu-memory" }
+remu-platform = { path = "../remu-platform" }
 remu-shader = { path = "../remu-shader" }
 remu-shader-metal = { path = "../remu-shader-metal" }
 png.workspace = true

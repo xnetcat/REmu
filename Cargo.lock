@@ -1606,6 +1606,7 @@ dependencies = [
  "remu-gpu",
  "remu-loader",
  "remu-memory",
+ "remu-platform",
  "remu-shader",
  "remu-shader-metal",
  "sha1",
