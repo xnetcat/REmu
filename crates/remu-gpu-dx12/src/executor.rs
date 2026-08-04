@@ -1825,9 +1825,7 @@ impl Dx12GuestExecutor {
                 pixel_resources_ready
                     .saturating_sub(vertex_resources_ready)
                     .as_micros(),
-                heaps_ready
-                    .saturating_sub(pipeline_ready)
-                    .as_micros(),
+                heaps_ready.saturating_sub(pipeline_ready).as_micros(),
                 resources_ready.saturating_sub(heaps_ready).as_micros(),
                 pipeline_ready.as_micros(),
                 resources_ready.saturating_sub(pipeline_ready).as_micros(),
@@ -2536,8 +2534,7 @@ fn record_stage_uploads(commands: &ID3D12GraphicsCommandList, resources: &Comput
             unsafe {
                 commands.CopyBufferRegion(
                     &resource.gpu,
-                    u64::try_from(resource.gpu_offset)
-                        .expect("bounded GPU buffer offset fits u64"),
+                    u64::try_from(resource.gpu_offset).expect("bounded GPU buffer offset fits u64"),
                     upload,
                     u64::try_from(resource.upload_offset)
                         .expect("bounded upload buffer offset fits u64"),
@@ -3202,18 +3199,8 @@ fn prepare_ngg_evaluation(
             draw_words.len() * size_of::<u32>(),
             false,
         ),
-        synthetic_ngg_binding(
-            0xffff_ff08,
-            Vec::new(),
-            output_vertex_byte_count,
-            true,
-        ),
-        synthetic_ngg_binding(
-            0xffff_ff0c,
-            Vec::new(),
-            output_index_byte_count,
-            true,
-        ),
+        synthetic_ngg_binding(0xffff_ff08, Vec::new(), output_vertex_byte_count, true),
+        synthetic_ngg_binding(0xffff_ff0c, Vec::new(), output_index_byte_count, true),
     ]);
     Ok((
         Arc::new(prepared),
@@ -8148,7 +8135,7 @@ mod tests {
         DecodedRenderTarget, DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions,
         WritebackJournalSites, decode_render_target_format, decode_sampler, dispatch_group_count,
         expand_primitive_indices, indirect_draw_count_allows, initial_render_target_clear,
-        ngg_raster_vertex_shader, presentable_bgra, prepare_ngg_triangle_indices,
+        ngg_raster_vertex_shader, prepare_ngg_triangle_indices, presentable_bgra,
         primitive_restart_index, regroup_restart_list_indices, resolve_indirect_compute,
         resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
         synthetic_ngg_binding, write_changed_ranges_direct,
@@ -8451,8 +8438,7 @@ mod tests {
         );
 
         let restart = 99;
-        let mut restarted =
-            indexed_draw_with_snapshot(6, &[0, 1, 2, 3, restart, 8, 9, 10]);
+        let mut restarted = indexed_draw_with_snapshot(6, &[0, 1, 2, 3, restart, 8, 9, 10]);
         restarted.context_registers = vec![
             GpuRegister {
                 offset: 0x103,

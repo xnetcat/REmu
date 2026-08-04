@@ -38,10 +38,11 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory4, IDXGIOutput,
-    IDXGISwapChain3,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory4, IDXGIOutput, IDXGISwapChain3,
 };
+use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD, XINPUT_GAMEPAD_A, XINPUT_GAMEPAD_B, XINPUT_GAMEPAD_DPAD_DOWN,
     XINPUT_GAMEPAD_DPAD_LEFT, XINPUT_GAMEPAD_DPAD_RIGHT, XINPUT_GAMEPAD_DPAD_UP,
@@ -49,7 +50,6 @@ use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
     XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
 };
-use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -266,9 +266,8 @@ impl Dx12Renderer {
         unsafe { swap_chain.SetMaximumFrameLatency(1) }.map_err(|error| {
             backend_error("IDXGISwapChain2::SetMaximumFrameLatency", &error).to_string()
         })?;
-        let frame_latency = FrameLatencyHandle(unsafe {
-            swap_chain.GetFrameLatencyWaitableObject()
-        });
+        let frame_latency =
+            FrameLatencyHandle(unsafe { swap_chain.GetFrameLatencyWaitableObject() });
         if frame_latency.0.is_invalid() {
             return Err("DXGI returned no frame-latency waitable object".to_owned());
         }
@@ -918,8 +917,7 @@ impl Dx12Presenter {
                     .ok_or_else(|| "D3D12 guest executor is unavailable".to_owned())
                     .and_then(Dx12GuestExecutor::take_occlusion_sample_count)
                     .and_then(|sample_count| {
-                        let value = PIXEL_PIPE_STAT_VALID
-                            | (sample_count & !PIXEL_PIPE_STAT_VALID);
+                        let value = PIXEL_PIPE_STAT_VALID | (sample_count & !PIXEL_PIPE_STAT_VALID);
                         for pair in 0..PIXEL_PIPE_STAT_COUNTER_PAIRS {
                             let address = destination + pair * 16;
                             execute_memory_release(GpuMemoryRelease {
@@ -1510,7 +1508,9 @@ fn swap_chain_description(width: u32, height: u32) -> DXGI_SWAP_CHAIN_DESC1 {
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
-        Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0.cast_unsigned(),
+        Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+            .0
+            .cast_unsigned(),
         ..DXGI_SWAP_CHAIN_DESC1::default()
     }
 }

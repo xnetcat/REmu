@@ -689,8 +689,7 @@ impl GuestPhysicalBacking {
             cache.insert(mapping);
             return true;
         }
-        let Some(mapping) =
-            CachedWriteMapping::new(&self.inner, aligned_offset, mapping_length)
+        let Some(mapping) = CachedWriteMapping::new(&self.inner, aligned_offset, mapping_length)
         else {
             return false;
         };

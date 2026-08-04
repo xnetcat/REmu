@@ -11,14 +11,13 @@ use super::{
     AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
     AGC_IT_SET_SH_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO, AgcColorTargetState,
     AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry, AgcSubmitPacket,
-    AlignedComputeProgram, AlignedIndirectArguments, ProbeDispatchState,
-    VideoOutBufferAttributes, VideoOutState, agc_apply_set_base, agc_color_target_state,
-    agc_dcb_draw_index_auto, agc_dcb_set_index_buffer, agc_dcb_set_num_instances,
-    agc_decode_compute_dispatch, agc_driver_submit_acb, agc_pm4, compute_graphics_state,
-    draw_required_vertex_record_count, low_u32, read_guest_u64,
-    targetless_barrier_acquire_flip_commands, targetless_scanout_test_draw,
-    targetless_scanout_test_shader_state, targetless_scanout_test_video, write_guest_u32,
-    write_guest_u64,
+    AlignedComputeProgram, AlignedIndirectArguments, ProbeDispatchState, VideoOutBufferAttributes,
+    VideoOutState, agc_apply_set_base, agc_color_target_state, agc_dcb_draw_index_auto,
+    agc_dcb_set_index_buffer, agc_dcb_set_num_instances, agc_decode_compute_dispatch,
+    agc_driver_submit_acb, agc_pm4, compute_graphics_state, draw_required_vertex_record_count,
+    low_u32, read_guest_u64, targetless_barrier_acquire_flip_commands,
+    targetless_scanout_test_draw, targetless_scanout_test_shader_state,
+    targetless_scanout_test_video, write_guest_u32, write_guest_u64,
 };
 
 #[test]

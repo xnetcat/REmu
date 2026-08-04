@@ -29,9 +29,7 @@ pub(crate) use self::buffer::{
     track_graphics_command_allocation, track_graphics_submission,
 };
 #[cfg(test)]
-pub(crate) use self::buffer::{
-    graphics_tracking_test_guard, track_graphics_allocation,
-};
+pub(crate) use self::buffer::{graphics_tracking_test_guard, track_graphics_allocation};
 use self::common::{
     cb_branch, cb_dispatch, cb_nop, cb_release_mem, cb_set_register_range, cb_set_sh_registers,
     type_two_packet,

@@ -28,9 +28,7 @@ pub use write_watch::notify_guest_memory_written;
 #[cfg(any(target_os = "macos", windows))]
 pub use write_watch::notify_guest_memory_written_excluding;
 #[cfg(any(target_os = "macos", windows))]
-pub use write_watch::{
-    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement,
-};
+pub use write_watch::{CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement};
 #[cfg(target_os = "macos")]
 pub use write_watch::{GuestReadMaterializer, set_read_watch_materializer};
 

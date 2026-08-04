@@ -1202,7 +1202,10 @@ fn unregister_shared_mapping_range_locked(
         overlaps.push((start, record.clone()));
     }
     for (&start, record) in mappings.range(address..end) {
-        if overlaps.last().is_none_or(|(previous, _)| *previous != start) {
+        if overlaps
+            .last()
+            .is_none_or(|(previous, _)| *previous != start)
+        {
             overlaps.push((start, record.clone()));
         }
     }

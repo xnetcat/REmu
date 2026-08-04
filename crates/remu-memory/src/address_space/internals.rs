@@ -377,14 +377,20 @@ impl GuestAddressSpace {
         loop {
             let Some(next_key) = self
                 .vmas
-                .range((std::ops::Bound::Excluded(current_key), std::ops::Bound::Unbounded))
+                .range((
+                    std::ops::Bound::Excluded(current_key),
+                    std::ops::Bound::Unbounded,
+                ))
                 .next()
                 .map(|(&key, _)| key)
             else {
                 break;
             };
             let merge = {
-                let current = self.vmas.get(&current_key).expect("current VMA key is live");
+                let current = self
+                    .vmas
+                    .get(&current_key)
+                    .expect("current VMA key is live");
                 let next = self.vmas.get(&next_key).expect("next VMA key is live");
                 current.can_merge(next)
             };

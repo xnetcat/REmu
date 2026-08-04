@@ -19,6 +19,11 @@ mod ajm_engine;
 mod ampr;
 mod ampr_api;
 mod audio;
+mod dispatch_locks;
+pub(crate) mod event_state;
+mod import_routes;
+mod nid_u64;
+mod path_roots;
 pub use audio::{HostAudioInfo, probe_host_audio};
 mod audio_out2;
 mod audio_out2_abi;
@@ -74,11 +79,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
-#[cfg(target_os = "macos")]
-use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;

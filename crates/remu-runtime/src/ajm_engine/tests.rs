@@ -1342,13 +1342,15 @@ fn mp3_decodes_a_stream_and_matches_the_independent_ffmpeg_golden() {
     // The two decoders initialize their synthesis filterbanks differently. Exclude one
     // MPEG frame of startup transient after alignment and compare their steady-state PCM.
     let comparison_start = max_offset.min(n);
-    let mut differences: Vec<u32> = decoded
-        [decoded_offset + comparison_start..decoded_offset + n]
+    let mut differences: Vec<u32> = decoded[decoded_offset + comparison_start..decoded_offset + n]
         .iter()
         .zip(&reference[reference_offset + comparison_start..reference_offset + n])
         .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())
         .collect();
-    let mean_abs_diff = differences.iter().map(|value| u64::from(*value)).sum::<u64>()
+    let mean_abs_diff = differences
+        .iter()
+        .map(|value| u64::from(*value))
+        .sum::<u64>()
         / differences.len() as u64;
     differences.sort_unstable();
     let max_abs_diff = differences.last().copied().unwrap_or(0);

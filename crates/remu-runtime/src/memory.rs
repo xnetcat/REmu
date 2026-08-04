@@ -14,6 +14,8 @@ use remu_memory::CpuWriteWatch;
 #[cfg(any(target_os = "macos", windows))]
 use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestMapPlacement};
 
+#[cfg(target_os = "macos")]
+use crate::{KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION};
 #[cfg(any(target_os = "macos", windows))]
 use crate::{
     MACOS_GUEST_PAGE_ALIGNMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
@@ -21,8 +23,6 @@ use crate::{
     kernel_memory, low_i32, read_guest_u8, read_guest_u32, read_guest_u64, trace_guest_vm,
     write_guest_u8, write_guest_u32, write_guest_u64,
 };
-#[cfg(target_os = "macos")]
-use crate::{KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION};
 use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NAME_TOO_LONG,
     SCE_KERNEL_ERROR_NOT_FOUND, read_guest_cstring, sce_kernel_error,

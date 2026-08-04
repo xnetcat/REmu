@@ -90,13 +90,13 @@ pub(crate) fn dispatch_pad_import(nid: &str, arguments: [u64; 6]) -> Option<u64>
         "rIZnR6eSpvk" => pad_reset_orientation(arguments),        // scePadResetOrientation
         "DscD1i9HX1w" => pad_handle_operation(arguments),         // scePadResetLightBar
         "r44mAxdSG+U" => pad_set_angular_velocity_deadband(arguments), // scePadSetAngularVelocityDeadbandState
-        "vDLMoJLde8I" => pad_set_tilt_correction(arguments),          // scePadSetTiltCorrectionState
-        "KLmYx9ij2h0" => pad_set_angular_velocity_bias(arguments),    // scePadSetAngularVelocityBiasCorrectionState
-        "yFVnOdGxvZY" => pad_set_vibration(arguments),               // scePadSetVibration
+        "vDLMoJLde8I" => pad_set_tilt_correction(arguments), // scePadSetTiltCorrectionState
+        "KLmYx9ij2h0" => pad_set_angular_velocity_bias(arguments), // scePadSetAngularVelocityBiasCorrectionState
+        "yFVnOdGxvZY" => pad_set_vibration(arguments),             // scePadSetVibration
         "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
-        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments),     // scePadGetTriggerEffectState
-        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),       // scePadDeviceClassParseData
-        "hv1luiJrqQM" => pad_initialize(),                            // scePadInit
+        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments), // scePadGetTriggerEffectState
+        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),  // scePadDeviceClassParseData
+        "hv1luiJrqQM" => pad_initialize(),                        // scePadInit
         _ => return None,
     })
 }
