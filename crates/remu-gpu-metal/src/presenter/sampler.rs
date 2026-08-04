@@ -2,16 +2,52 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::UploadedGlobalBuffer;
+use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
-    ArgumentDescriptor, Array, Buffer, Device, Function, MTLCompareFunction, MTLDataType,
-    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-    SamplerDescriptor, SamplerDescriptorRef, SamplerState,
+    ArgumentEncoder, Buffer, Device, Function, MTLCompareFunction, MTLResourceOptions,
+    MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter, SamplerDescriptor,
+    SamplerDescriptorRef, SamplerState,
 };
 use objc::runtime::{BOOL, YES};
 use objc::{msg_send, sel, sel_impl};
 use remu_shader::{ImageBinding, ShaderEvaluation, image_is_comparison};
-use std::ffi::c_void;
+use std::ffi::{CStr, c_char, c_void};
 use std::sync::OnceLock;
+
+unsafe extern "C" {
+    fn remu_new_sampler_argument_encoder(
+        device: *mut c_void,
+        sampler_count: metal::NSUInteger,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> *mut metal::MTLArgumentEncoder;
+    fn remu_argument_encoder_encoded_length(
+        encoder: *mut c_void,
+        length: *mut metal::NSUInteger,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> bool;
+    fn remu_argument_encoder_set_argument_buffer(
+        encoder: *mut c_void,
+        buffer: *mut c_void,
+        offset: metal::NSUInteger,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> bool;
+    fn remu_new_sampler_state(
+        device: *mut c_void,
+        descriptor: *mut c_void,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> *mut metal::MTLSamplerState;
+    fn remu_argument_encoder_set_sampler_state(
+        encoder: *mut c_void,
+        sampler: *mut c_void,
+        index: metal::NSUInteger,
+        error: *mut c_char,
+        error_capacity: usize,
+    ) -> bool;
+}
 
 pub(super) const SAMPLER_ARGUMENT_CACHE_CAPACITY: usize = 1_024;
 
@@ -216,46 +252,20 @@ pub(super) fn create_sampler_argument_buffer(
     // Metal runtimes raise an Objective-C exception from makeArgumentEncoder(bufferIndex:) even
     // when the MSL argument-buffer declaration is valid, and that exception cannot safely cross
     // Rust frames.
-    let argument_descriptors = buffer_index
-        .map(|_| {
-            sampled_bindings
-                .iter()
-                .enumerate()
-                .map(|(slot, _)| {
-                    #[cfg(test)]
-                    eprintln!("[REMu][TEST][SAMPLER-ABI] descriptor-begin slot={slot}");
-                    let descriptor = ArgumentDescriptor::new();
-                    descriptor
-                        .set_index(u64::try_from(slot).expect("canonical sampler slot fits Metal"));
-                    descriptor.set_data_type(MTLDataType::Sampler);
-                    // Each canonical slot is one scalar sampler. Metal requires arrayLength to
-                    // remain zero for non-array argument descriptors.
-                    #[cfg(test)]
-                    eprintln!("[REMu][TEST][SAMPLER-ABI] descriptor-ready slot={slot}");
-                    descriptor
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-ABI] encoder-begin");
     let argument_encoder = buffer_index
-        .map(|_| device.new_argument_encoder(Array::from_slice(argument_descriptors.as_slice())));
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-ABI] encoder-ready");
-    let argument_buffer = argument_encoder.as_ref().map(|encoder| {
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] buffer-begin");
+        .map(|_| new_sampler_argument_encoder(device, sampled_bindings.len()))
+        .transpose()?;
+    let argument_buffer = if let Some(encoder) = argument_encoder.as_ref() {
         let buffer = device.new_buffer(
-            encoder.encoded_length(),
+            sampler_argument_encoder_length(encoder)?,
             MTLResourceOptions::StorageModeShared,
         );
         buffer.set_label("REMu guest sampler argument buffer");
-        encoder.set_argument_buffer(&buffer, 0);
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] buffer-ready");
-        buffer
-    });
+        set_sampler_argument_buffer(encoder, &buffer)?;
+        Some(buffer)
+    } else {
+        None
+    };
     let mut samplers = Vec::with_capacity(sampled_bindings.len());
     for (slot, binding) in sampled_bindings.iter().enumerate() {
         if binding.sampler_descriptor.len() < 4 {
@@ -299,20 +309,132 @@ pub(super) fn create_sampler_argument_buffer(
                 / 256.0,
         );
         descriptor.set_support_argument_buffers(argument_encoder.is_some());
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] sampler-begin slot={slot}");
-        let sampler = device.new_sampler(&descriptor);
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] sampler-ready slot={slot}");
+        let sampler = new_sampler_state(device, &descriptor)?;
         if let Some(encoder) = argument_encoder.as_ref() {
-            encoder.set_sampler_state(
-                u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
-                &sampler,
-            );
+            set_sampler_argument(encoder, &sampler, slot)?;
         }
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-ABI] sampler-encoded slot={slot}");
         samplers.push(sampler);
     }
     Ok((argument_buffer, samplers))
+}
+
+fn new_sampler_argument_encoder(
+    device: &Device,
+    sampler_count: usize,
+) -> Result<ArgumentEncoder, String> {
+    let sampler_count = metal::NSUInteger::try_from(sampler_count)
+        .map_err(|_| "sampler argument count does not fit Metal")?;
+    let mut error = [0_i8; 1_024];
+    // SAFETY: the Objective-C bridge retains a successful encoder for Rust ownership and catches
+    // NSException before it can cross a Rust frame. The device pointer remains live for the call,
+    // and the fixed error buffer is writable for its reported capacity.
+    let encoder = unsafe {
+        remu_new_sampler_argument_encoder(
+            device.as_ptr().cast(),
+            sampler_count,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if encoder.is_null() {
+        // SAFETY: the bridge always leaves this zero-initialized buffer NUL-terminated, including
+        // when no exception reason is available.
+        let detail = unsafe { CStr::from_ptr(error.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        return Err(if detail.is_empty() {
+            "Metal could not create the sampler argument encoder".to_owned()
+        } else {
+            format!("Metal sampler argument encoder creation failed: {detail}")
+        });
+    }
+    // SAFETY: `newArgumentEncoderWithArguments:` returns an owned (+1) Objective-C reference.
+    Ok(unsafe { ArgumentEncoder::from_ptr(encoder) })
+}
+
+fn sampler_argument_encoder_length(encoder: &ArgumentEncoder) -> Result<metal::NSUInteger, String> {
+    let mut length = 0;
+    let mut error = [0_i8; 1_024];
+    // SAFETY: all pointers remain valid for this synchronous Objective-C exception boundary.
+    let succeeded = unsafe {
+        remu_argument_encoder_encoded_length(
+            encoder.as_ptr().cast(),
+            &raw mut length,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    succeeded
+        .then_some(length)
+        .ok_or_else(|| metal_bridge_error("sampler argument encoder length", &error))
+}
+
+fn set_sampler_argument_buffer(encoder: &ArgumentEncoder, buffer: &Buffer) -> Result<(), String> {
+    let mut error = [0_i8; 1_024];
+    // SAFETY: all pointers remain valid for this synchronous Objective-C exception boundary.
+    let succeeded = unsafe {
+        remu_argument_encoder_set_argument_buffer(
+            encoder.as_ptr().cast(),
+            buffer.as_ptr().cast(),
+            0,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    succeeded
+        .then_some(())
+        .ok_or_else(|| metal_bridge_error("sampler argument-buffer binding", &error))
+}
+
+fn new_sampler_state(
+    device: &Device,
+    descriptor: &SamplerDescriptorRef,
+) -> Result<SamplerState, String> {
+    let mut error = [0_i8; 1_024];
+    // SAFETY: the bridge retains a successful sampler for Rust ownership and catches NSException.
+    let sampler = unsafe {
+        remu_new_sampler_state(
+            device.as_ptr().cast(),
+            descriptor.as_ptr().cast(),
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    if sampler.is_null() {
+        return Err(metal_bridge_error("sampler-state creation", &error));
+    }
+    // SAFETY: `newSamplerStateWithDescriptor:` returns an owned (+1) Objective-C reference.
+    Ok(unsafe { SamplerState::from_ptr(sampler) })
+}
+
+fn set_sampler_argument(
+    encoder: &ArgumentEncoder,
+    sampler: &SamplerState,
+    slot: usize,
+) -> Result<(), String> {
+    let index = metal::NSUInteger::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?;
+    let mut error = [0_i8; 1_024];
+    // SAFETY: all pointers remain valid for this synchronous Objective-C exception boundary.
+    let succeeded = unsafe {
+        remu_argument_encoder_set_sampler_state(
+            encoder.as_ptr().cast(),
+            sampler.as_ptr().cast(),
+            index,
+            error.as_mut_ptr(),
+            error.len(),
+        )
+    };
+    succeeded
+        .then_some(())
+        .ok_or_else(|| metal_bridge_error("sampler argument encoding", &error))
+}
+
+fn metal_bridge_error(context: &str, error: &[c_char]) -> String {
+    // SAFETY: bridge error buffers are zero-initialized and remain NUL-terminated.
+    let detail = unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy();
+    if detail.is_empty() {
+        format!("Metal {context} failed")
+    } else {
+        format!("Metal {context} failed: {detail}")
+    }
 }

@@ -494,6 +494,7 @@ pub(crate) fn ngg_mesh_stage_for_draw(
 /// 20, derives X/Y from the vertex ID, and exports position at target 12. It must have no memory,
 /// LDS, image, interpolation, or PARAM-export work. More complex merged ES/GS programs are not
 /// accepted here and continue through the ordinary translator/rejection path.
+#[cfg(test)]
 pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
     remu_gpu::is_procedural_rectangle_export_stage(program)
 }
@@ -503,6 +504,7 @@ pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
 /// Real binaries are often a short live prefix (sometimes without a position EXP) followed by
 /// padded/undecoded tails. Rejecting on `Opcode::known_name() == None` missed every Poppy cover
 /// and left INTERFACE-FILL zeroes on scanout (mid-band noise).
+#[cfg(test)]
 pub(crate) fn truncated_memoryless_ngg_rectangle_cover(program: &Program) -> bool {
     remu_gpu::is_truncated_memoryless_ngg_rectangle_cover(program)
 }

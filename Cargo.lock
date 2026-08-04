@@ -1554,6 +1554,7 @@ name = "remu-gpu-metal"
 version = "0.1.0"
 dependencies = [
  "block",
+ "cc",
  "core-graphics-types 0.2.0",
  "libc",
  "metal",

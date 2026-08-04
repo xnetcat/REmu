@@ -97,11 +97,11 @@ impl HostBackingMapping {
             if mapping == libc::MAP_FAILED {
                 return None;
             }
-            return Some(Self {
+            Some(Self {
                 mapping_address: mapping as usize,
                 mapping_byte_count: byte_count,
                 address: mapping as usize,
-            });
+            })
         }
 
         #[cfg(windows)]

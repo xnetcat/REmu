@@ -20,5 +20,8 @@ remu-memory = { path = "../remu-memory" }
 sha1.workspace = true
 winit.workspace = true
 
+[build-dependencies]
+cc.workspace = true
+
 [lints]
 workspace = true
