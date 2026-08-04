@@ -15,14 +15,21 @@ layout, rendered Sarah and the level, and accepted a live D-pad Right event thro
 the WASAPI callback reported zero underrun frames. This is a playable single-title vertical slice,
 not a broad compatibility claim.
 
+On 2026-08-04 the currently installed Dreaming Sarah copy was probed again with both `eboot.bin`
+and its read-only `.esbak` backup. Both enter guest code, initialize savedata, AGC, 3840x2160
+VideoOut, input, and the 48 kHz stereo WASAPI path, but stop before the first guest GPU submission
+while opening vertex-shader assets that are absent from the host `shaders` directory. This is a
+local title-package completeness blocker; the VFS reports the exact resolved host paths and no
+game files were modified. A complete copy is required for the next game-backed DX12 regression.
+
 The following table deliberately distinguishes foundations from runnable subsystems:
 
 | Subsystem | Implemented and validated | Remaining compatibility/performance work |
 | --- | --- | --- |
-| Build/runtime | Warning-free GNU release build; GNU/MSVC-aware CRT linkage and dependency discovery | GNU/MSVC CI, redistributable packaging, crash bundles |
+| Build/runtime | Warning-free GNU release build; GNU/MSVC-aware CRT linkage and dependency discovery; Windows FFmpeg bootstrap discovers Git Bash/pkgconf, accepts explicit overrides, and treats cached Windows paths case-insensitively | GNU/MSVC CI, redistributable packaging, crash bundles |
 | CPU | Native x86-64 guest entry, compiler-supported System V callbacks/imports, thread and fiber switching, TLS, guarded guest reads, and release game execution | Larger ABI/register stress corpus, structured crash recovery, unwind metadata audit |
 | Memory | Sparse placeholder aperture, reserve/commit/decommit, section-backed physical aliases, protection, mapping identity, leases, and VEH write watch with batched contiguous protection/query runs | Long-running alias/remap stress, budget telemetry, more hostile fault-order tests |
-| Graphics | Adapter probe with live local/non-local DXGI budgets, D3D12/DXC executor, compute/graphics, persistent coherent single-sample targets, cached tiled images/mips, MRT/depth/stencil, normalized/integer color and depth/stencil MSAA, ordered indirect multi-draw, shared descriptor/upload arenas, recycled command lists, event-based bounded fence waits, bounded DRED capture, DXGI window, and direct linear-frame presentation | Budget-aware cache trimming/residency, NGG fallback, FMASK/DCC and remaining topology/format semantics, depth/MSAA persistence, cross-draw submission batching, intentional device-removal capture validation |
+| Graphics | Adapter probe with live local/non-local DXGI budgets, D3D12/DXC executor, compute/graphics, capability-neutral general-LDS NGG compute-to-raster fallback, persistent coherent single-sample targets, cached tiled images/mips, MRT/depth/stencil, normalized/integer color and depth/stencil MSAA, ordered indirect multi-draw, shared descriptor/upload arenas, recycled command lists, event-based bounded fence waits, bounded DRED capture, DXGI window, and direct linear-frame presentation | Budget-aware cache trimming/residency, FMASK/DCC and remaining topology/format semantics, layered/extended NGG validation, depth/MSAA persistence, cross-draw submission batching, intentional device-removal capture validation |
 | Audio | CPAL/WASAPI production mixer; 48 kHz stereo endpoint, invalidated-stream reopening, guest-port rebinding/resampler retargeting, reroute reporting, and live game callback validated | Physical unplug/default-route-change stress, latency/drift telemetry, long-running A/V synchronization |
 | Window/input | winit Win32 event loop, DXGI surface, resize/close/focus flow, four-slot XInput hot-plug polling, dead zones/full-range axes/triggers, two-motor vibration, live keyboard-to-guest-pad press/release, neutral focus/suspend state, F11/Alt+Enter borderless fullscreen, and minimize/occlusion/suspend-safe presentation with retained-frame restore | Per-monitor display-change/sleep-resume and physical controller disconnect/reconnect stress; motion/touchpad and advanced DualSense output |
 | Filesystem/libc | Game VFS loading, cursor-preserving positional I/O, GNU/MSVC CRT selection, save-data commits, and CNG random bytes | Case/permission/path edge cases and directory-metadata durability |
@@ -189,18 +196,19 @@ Primary references:
 
 Completed locally on the development Windows host:
 
-1. Warning-free release CLI build and serial `cargo test --workspace` pass (935 tests on the
-   development Windows host).
+1. Warning-free release CLI build and workspace check pass on the development Windows host.
 2. `host-info`, `gpu-info`, `gpu-self-test`, `gpu-present-test`, `audio-info`, and `input-info`
    paths exist; the
    D3D12 and audio probes have run against physical hardware.
 3. Fixed-image and sparse/alias/write-watch memory suites pass.
 4. Runtime CPU, import, thread, TLS, fiber, filesystem, and libc suites pass.
-5. The D3D12 crate's 38 tests pass, including event-based asynchronous fence completion and
+5. The D3D12 crate's 55 tests pass, including event-based asynchronous fence completion and
    timeout, physical copy/readback, translated compute/graphics,
    ordered single/multi indirect arguments, tiled texture, mip-chain, primitive normalization,
    render/depth/stencil, normalized/integer color MSAA, D32 and combined D32/S8 MSAA, and
-   independent-stencil coverage. The serial runtime suite has 562 passing tests.
+   independent-stencil coverage. A physical test executes a GFX10 general-LDS NGG shader through
+   the compute fallback and verifies raster output on the mesh-shader-tier-0 GTX 1050. The serial
+   runtime suite has 661 passing tests.
 6. A bounded Dreaming Sarah release launch enters New Game, completes the opening fade, renders the
    first forest layout, moves right under live input, and keeps audio active without a D3D12
    failure, panic, or underrun.
@@ -225,8 +233,8 @@ Still required before a broad Windows compatibility claim:
 2. Install Windows Graphics Tools for a local SDK-layer pass and validate the completed DRED
    report path against an intentional device-removal diagnostic on disposable test hardware.
 3. Resize-in-flight/per-monitor-DPI/display-change/sleep-resume and controller hot-plug stress.
-4. NGG fallback, FMASK/DCC, remaining primitive/texture semantics, persistent depth/MSAA resources,
-   and asynchronous GPU batching.
+4. Additional NGG modes/title captures, FMASK/DCC, remaining primitive/texture semantics,
+   persistent depth/MSAA resources, and asynchronous GPU batching.
 5. Long-running A/V, memory remap, save-data, clean-shutdown, and multi-title interactive tests.
 
 The detailed graphics sequence lives in [gpu-d3d12.md](gpu-d3d12.md).

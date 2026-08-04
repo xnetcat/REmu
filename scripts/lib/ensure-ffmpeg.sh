@@ -103,7 +103,13 @@ required_install_is_complete() {
     for library in avformat avcodec avutil swscale swresample; do
         [ -f "$prefix/lib/lib$library.a" ] || return 1
         [ -f "$prefix/lib/pkgconfig/lib$library.pc" ] || return 1
-        grep -Fqx "prefix=$published_prefix" "$prefix/lib/pkgconfig/lib$library.pc" || return 1
+        if [ "$ffmpeg_target_os" = mingw32 ]; then
+            # Windows paths are case-insensitive. MSYS/cygpath may preserve a different spelling
+            # of an existing directory (for example REmu versus REMu) between Cargo processes.
+            grep -Fiqx "prefix=$published_prefix" "$prefix/lib/pkgconfig/lib$library.pc" || return 1
+        else
+            grep -Fqx "prefix=$published_prefix" "$prefix/lib/pkgconfig/lib$library.pc" || return 1
+        fi
     done
 }
 
