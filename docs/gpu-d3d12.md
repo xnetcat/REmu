@@ -53,7 +53,7 @@ Implemented and physically validated on the development host:
   causes DXIL stage-link register mismatches on D3D12.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
   primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
-  current D3D12 crate has 42 passing tests on the GTX 1050.
+  current D3D12 crate has 47 passing tests on the GTX 1050.
 
 This is a playable vertical slice for one tested title, not yet a broad playability claim. The major remaining work is listed below: guest FMASK/DCC
 metadata and persistent multisample/depth-resource identity; NGG/mesh fallback for devices without mesh
@@ -182,11 +182,21 @@ That forwarding produces the intended counter `0x2428` and indirect triplet `[0x
 instead of the recycled `0x18003fff` sentinel. A physical GTX 1050 regression recreates the exact
 five-thread formatted-buffer expansion into a 65,532-byte UAV and verifies all five triplets.
 Poppy then reaches compute 196 with the correct 9,256-group X dimension. It is not playable yet:
-the device is reproducibly removed while that dispatch prepares its large sampled/storage-texture
-set, before its command allocator/list is created or the dispatch is submitted. Per-format
+the next blocking graphics feature is guest FMASK/DCC metadata handling, and current per-draw/
+dispatch fencing still makes this workload much too slow for interactive use. Per-format
 `D3D12_FEATURE_DATA_FORMAT_SUPPORT` checks confirm that this adapter advertises the required typed
-UAV store support, so the active investigation is descriptor/resource-state construction rather
-than indirect arguments or a missing GTX 1050 format capability.
+UAV store support.
+
+The apparent resource-construction removal at compute 196 was isolated to the third void
+`ID3D12Device::CreateSampler` call. AMD's descriptor exposes independent U4.8 minimum/maximum LOD
+bounds and an S5.8 bias, while `D3D12_SAMPLER_DESC` requires `MaxLOD >= MinLOD` and limits bias to
+[-16, 15.99]. Poppy supplied both an inverted interval and a bias above that D3D12 range. The
+backend now clamps the bias and collapses an inverted interval at its minimum, the closest legal
+D3D12 representation that preserves the guest lower bound. A regression covers the exact invalid
+descriptor. With this translation, the GTX 1050 submitted compute 196 as `[9256, 1, 1]`, executed
+compute 197, remained available, and continued processing until the bounded 50-second test ended.
+Trace-mode descriptor creation also checks removal immediately after every texture and sampler view
+so future void-API failures are attributed to the exact descriptor.
 
 Device removal is terminal. The presenter emits one bounded DRED report and exits immediately;
 it no longer consumes queued work, reports cascaded failures, or retires fake submissions/flips.
@@ -344,6 +354,8 @@ dumps are available; it does not replace them.
 - [`ID3D12Device::CheckFeatureSupport`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-checkfeaturesupport)
 - [`D3D12_FEATURE_DATA_FORMAT_SUPPORT`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_feature_data_format_support)
 - [`D3D12_FORMAT_SUPPORT2`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_format_support2)
+- [`D3D12_SAMPLER_DESC`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_sampler_desc)
+- [Direct3D 12 constants, including the legal mip LOD bias range](https://learn.microsoft.com/en-us/windows/win32/direct3d12/constants)
 - [`IDXGIFactory6::EnumAdapterByGpuPreference`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_6/nf-dxgi1_6-idxgifactory6-enumadapterbygpupreference)
 - [`IDXGIAdapter3::QueryVideoMemoryInfo`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-queryvideomemoryinfo)
 - [D3D12 memory-management strategies](https://learn.microsoft.com/en-us/windows/win32/direct3d12/memory-management-strategies)
@@ -354,6 +366,7 @@ dumps are available; it does not replace them.
 - [D3D12 index-buffer strip-cut values](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_index_buffer_strip_cut_value)
 - [DirectX triangle-fan and dynamic strip-cut specification](https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html)
 - [Mesa GFX10.3 register descriptions](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/a11d1bd247df18057ecb9945e01bf39ff85d8d9d/src/amd/registers/gfx103.json)
+- [Mesa GFX10 resource-descriptor field definitions](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/refs/heads/stabilize-13982.70.B-chromeos-amd/src/amd/registers/gfx10-rsrc.json)
 - [AMD AddrLib GFX10 swizzle pattern tables](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h)
 - [AMD AddrLib GFX10 resource and thick-block rules](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/imported/addrlib/src/gfx10/gfx10addrlib.h)
 - [`ID3D12Device::GetCopyableFootprints`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getcopyablefootprints)

@@ -46,7 +46,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, D3D12_INDEX_BUFFER_VIEW, D3D12_LOGIC_OP_NOOP,
-    D3D12_MESSAGE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    D3D12_MESSAGE, D3D12_MIP_LOD_BIAS_MAX, D3D12_MIP_LOD_BIAS_MIN,
+    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
     D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOLVE_MODE_MAX,
@@ -903,8 +904,15 @@ impl Dx12GuestExecutor {
                 .image_bindings
                 .iter()
                 .map(|binding| {
+                    let sampler = if binding.sampler_descriptor.len() >= 4 {
+                        decode_sampler(binding)
+                            .map(|sampler| format!("{sampler:?}"))
+                            .unwrap_or_else(|error| format!("decode-error({error})"))
+                    } else {
+                        "none".to_owned()
+                    };
                     decode_texture(binding)
-                        .map(|texture| format!("{texture:?}"))
+                        .map(|texture| format!("{texture:?} sampler={sampler}"))
                         .unwrap_or_else(|error| format!("decode-error({error})"))
                 })
                 .collect::<Vec<_>>();
@@ -940,6 +948,7 @@ impl Dx12GuestExecutor {
             &format!("remu-cs-{:x}.hlsl", dispatch.shader_address),
         )?;
         let pipeline = self.compute_pipeline_cached(&compiled)?;
+        ensure_device_available(&self.device, "compute pipeline creation")?;
         let mut resources = create_stage_resources(
             &self.device,
             &mut self.upload_arena,
@@ -950,11 +959,13 @@ impl Dx12GuestExecutor {
             &[],
             &self.ordered_global_versions,
         )?;
+        ensure_device_available(&self.device, "compute resource creation")?;
         let (descriptors, samplers, root_descriptors) = combine_stage_heaps(
             &self.device,
             &mut self.descriptor_arena,
             &mut [&mut resources],
         )?;
+        ensure_device_available(&self.device, "compute descriptor creation")?;
 
         // SAFETY: allocator and command list types match this executor's direct queue.
         let allocator: ID3D12CommandAllocator = unsafe {
@@ -3706,14 +3717,20 @@ fn combine_stage_heaps(
         }
         for resource in &stage.textures {
             handle.ptr += descriptor_increment;
-            create_texture_view(device, resource, handle);
+            create_texture_view(device, resource, handle)?;
         }
         if sampler_count != 0 {
             let mut handle = sampler_start.expect("nonzero sampler total has a heap");
             handle.ptr += sampler_base * sampler_increment;
-            for sampler in &stage.samplers {
+            for (index, sampler) in stage.samplers.iter().enumerate() {
                 // SAFETY: each handle selects one initialized slot in the shader-visible heap.
                 unsafe { device.CreateSampler(sampler, handle) };
+                if trace_d3d12_bindings() {
+                    ensure_device_available(
+                        device,
+                        &format!("sampler descriptor {index} {sampler:?}"),
+                    )?;
+                }
                 handle.ptr += sampler_increment;
             }
         }
@@ -6300,7 +6317,7 @@ fn create_texture_view(
     device: &ID3D12Device,
     resource: &TextureResource,
     handle: windows::Win32::Graphics::Direct3D12::D3D12_CPU_DESCRIPTOR_HANDLE,
-) {
+) -> Result<(), String> {
     let descriptor = resource.descriptor;
     if descriptor.writable {
         let (dimension, anonymous) = if descriptor.texture_type == 10 {
@@ -6399,6 +6416,28 @@ fn create_texture_view(
         // SAFETY: the SRV dimension and format match the immutable resource.
         unsafe { device.CreateShaderResourceView(&resource.gpu, Some(&raw const view), handle) };
     }
+    if trace_d3d12_bindings() {
+        ensure_device_available(
+            device,
+            &format!("texture descriptor {:?}", resource.descriptor),
+        )?;
+    }
+    Ok(())
+}
+
+fn trace_d3d12_bindings() -> bool {
+    std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
+}
+
+fn ensure_device_available(device: &ID3D12Device, context: &str) -> Result<(), String> {
+    if unsafe { device.GetDeviceRemovedReason() }.is_ok() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{context} removed the D3D12 device: {}",
+            device_removed_report(device)
+        ))
+    }
 }
 
 fn decode_sampler(binding: &remu_shader::ImageBinding) -> Result<D3D12_SAMPLER_DESC, String> {
@@ -6441,7 +6480,20 @@ fn decode_sampler(binding: &remu_shader::ImageBinding) -> Result<D3D12_SAMPLER_D
         _ => windows::Win32::Graphics::Direct3D12::D3D12_COMPARISON_FUNC_ALWAYS,
     };
     let bias_raw = (words[2] & 0x3fff) as i32;
-    let bias = ((bias_raw ^ 0x2000) - 0x2000) as f32 / 256.0;
+    let guest_bias = ((bias_raw ^ 0x2000) - 0x2000) as f32 / 256.0;
+    let bias = guest_bias.clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX);
+    let min_lod = (words[1] & 0xfff) as f32 / 256.0;
+    let guest_max_lod = ((words[1] >> 12) & 0xfff) as f32 / 256.0;
+    // GCN exposes independent U4.8 bounds and an S5.8 bias. D3D12 accepts a narrower
+    // bias and requires MaxLOD >= MinLOD, so preserve the guest's lower bound while
+    // collapsing an inverted interval to the nearest representable D3D12 interval.
+    let max_lod = guest_max_lod.max(min_lod);
+    if trace_d3d12_bindings() && (bias != guest_bias || max_lod != guest_max_lod) {
+        eprintln!(
+            "d3d12: normalized sampler at PC {:#x}: bias {guest_bias} -> {bias}, LOD [{min_lod}, {guest_max_lod}] -> [{min_lod}, {max_lod}]",
+            binding.pc
+        );
+    }
     Ok(D3D12_SAMPLER_DESC {
         Filter: filter,
         AddressU: address(words[0] & 7),
@@ -6451,8 +6503,8 @@ fn decode_sampler(binding: &remu_shader::ImageBinding) -> Result<D3D12_SAMPLER_D
         MaxAnisotropy: 1_u32 << ((words[0] >> 9) & 7).min(4),
         ComparisonFunc: comparison,
         BorderColor: [0.0; 4],
-        MinLOD: (words[1] & 0xfff) as f32 / 256.0,
-        MaxLOD: ((words[1] >> 12) & 0xfff) as f32 / 256.0,
+        MinLOD: min_lod,
+        MaxLOD: max_lod,
     })
 }
 
@@ -7432,11 +7484,11 @@ mod tests {
     };
 
     use super::{
-        Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites, dispatch_group_count,
-        expand_primitive_indices, indirect_draw_count_allows, presentable_bgra,
-        primitive_restart_index, regroup_restart_list_indices, resolve_indirect_compute,
-        resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
-        write_changed_ranges_direct,
+        D3D12_MIP_LOD_BIAS_MAX, Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites,
+        decode_sampler, dispatch_group_count, expand_primitive_indices, indirect_draw_count_allows,
+        presentable_bgra, primitive_restart_index, regroup_restart_list_indices,
+        resolve_indirect_compute, resolve_indirect_compute_ordered, resolve_indirect_draw,
+        snapshot_ordered_global, write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -7458,6 +7510,39 @@ mod tests {
             shader_evaluation: None,
             shader_registers: Vec::new(),
         }
+    }
+
+    #[test]
+    fn normalizes_guest_sampler_to_the_d3d12_lod_domain() {
+        let min_lod_raw = 0x18d;
+        let max_lod_raw = 0x040;
+        let binding = ImageBinding {
+            pc: 0x1234,
+            opcode: Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 1,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 0,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: Vec::new().into(),
+            sampler_descriptor: vec![0, min_lod_raw | (max_lod_raw << 12), 0x1ba8, 0].into(),
+            mip_level: None,
+        };
+
+        let sampler = decode_sampler(&binding).expect("guest sampler should be transcodable");
+        assert_eq!(sampler.MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
+        assert_eq!(sampler.MinLOD, min_lod_raw as f32 / 256.0);
+        assert_eq!(sampler.MaxLOD, sampler.MinLOD);
     }
 
     #[test]
