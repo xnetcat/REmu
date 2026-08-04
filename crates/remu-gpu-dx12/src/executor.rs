@@ -3,7 +3,7 @@
 
 //! Ordered guest shader execution on a native Direct3D 12 queue.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::path::Path;
@@ -12,7 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use remu_gpu::{ComputeDispatch, ComputeDispatchSource, ComputeGrid, IndexedDraw};
-use remu_memory::{CpuWriteWatch, GuestRangeLease, GuestWriteSite, LeasePublishOutcome};
+use remu_memory::{
+    CpuWriteWatch, GuestRangeLease, GuestSharedMappingIdentity, GuestWriteSite,
+    LeasePublishOutcome, guest_shared_backing_identity,
+};
 use remu_shader::{Program, ShaderEvaluation};
 use remu_shader_metal::{HlslEvaluationKey, HlslShader, MetalCompileOptions};
 use windows::Win32::Foundation::RECT;
@@ -35,13 +38,15 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
     D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
     D3D12_DSV_DIMENSION_TEXTURE2D, D3D12_DSV_DIMENSION_TEXTURE2DMS, D3D12_DSV_FLAG_NONE,
-    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS,
-    D3D12_FENCE_FLAG_NONE, D3D12_FILL_MODE_SOLID, D3D12_GRAPHICS_PIPELINE_STATE_DESC,
-    D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK,
-    D3D12_HEAP_TYPE_UPLOAD, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
-    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED,
-    D3D12_INDEX_BUFFER_VIEW, D3D12_LOGIC_OP_NOOP, D3D12_MESSAGE,
-    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
+    D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_FENCE_FLAG_NONE,
+    D3D12_FILL_MODE_SOLID, D3D12_FORMAT_SUPPORT1_TEXTURE2D, D3D12_FORMAT_SUPPORT1_TEXTURE3D,
+    D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW, D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES,
+    D3D12_HEAP_TYPE_DEFAULT, D3D12_HEAP_TYPE_READBACK, D3D12_HEAP_TYPE_UPLOAD,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, D3D12_INDEX_BUFFER_VIEW, D3D12_LOGIC_OP_NOOP,
+    D3D12_MESSAGE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE, D3D12_RASTERIZER_DESC,
     D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT, D3D12_RENDER_TARGET_BLEND_DESC, D3D12_RESOLVE_MODE_MAX,
@@ -107,6 +112,9 @@ const MAXIMUM_COMPUTE_PIPELINE_CACHE_ENTRIES: usize = 256;
 const MAXIMUM_PERSISTENT_RENDER_TARGETS: usize = 8;
 const MAXIMUM_PENDING_DRAWS: usize = 128;
 const MAXIMUM_RESIDENT_SAMPLED_TEXTURES: usize = 128;
+const MAXIMUM_ORDERED_GLOBAL_VERSION_BYTES: usize = 8 * 1024 * 1024;
+const MAXIMUM_ORDERED_GLOBAL_VERSIONS: usize = 128;
+const MAXIMUM_ORDERED_GLOBAL_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 const D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION: u32 = 65_535;
 const TEXTURE_WRITEBACK_CHUNK_BYTES: usize = 1024 * 1024;
 const SHARED_DESCRIPTOR_CAPACITY: usize = 65_536;
@@ -231,6 +239,7 @@ pub(super) struct Dx12GuestExecutor {
         HashMap<IntegerMsaaResolvePipelineKey, ID3D12PipelineState>,
     render_target_cache: HashMap<u64, RenderTargetResource>,
     sampled_texture_cache: HashMap<DecodedTexture, CachedSampledTexture>,
+    ordered_global_versions: OrderedGlobalVersions,
     descriptor_arena: DescriptorArena,
     upload_arena: UploadArena,
     command_pool: Vec<(ID3D12CommandAllocator, ID3D12GraphicsCommandList)>,
@@ -357,6 +366,164 @@ struct GlobalResource {
     writable: bool,
     original_bytes: Vec<u8>,
     writeback_guard: Option<GlobalWritebackGuard>,
+}
+
+struct OrderedGlobalVersion {
+    address: u64,
+    identity: Option<GuestSharedMappingIdentity>,
+    original_bytes: Vec<u8>,
+    current_bytes: Vec<u8>,
+}
+
+#[derive(Default)]
+struct OrderedGlobalVersions {
+    entries: VecDeque<OrderedGlobalVersion>,
+    retained_bytes: usize,
+}
+
+impl OrderedGlobalVersions {
+    fn forwarded_slice(&self, address: u64, packet_bytes: &[u8]) -> Option<&[u8]> {
+        let byte_count = u64::try_from(packet_bytes.len()).ok()?;
+        let end = address.checked_add(byte_count)?;
+        let live_identity = guest_shared_backing_identity(address, byte_count);
+        self.entries.iter().rev().find_map(|version| {
+            let version_bytes = u64::try_from(version.current_bytes.len()).ok()?;
+            let version_end = version.address.checked_add(version_bytes)?;
+            if address < version.address || end > version_end {
+                return None;
+            }
+            let offset = usize::try_from(address - version.address).ok()?;
+            if let Some(identity) = version.identity {
+                let expected = GuestSharedMappingIdentity {
+                    backing_id: identity.backing_id,
+                    backing_offset: identity.backing_offset.checked_add(offset as u64)?,
+                };
+                if live_identity != Some(expected) {
+                    return None;
+                }
+            }
+            let range = offset..offset.checked_add(packet_bytes.len())?;
+            let original = version.original_bytes.get(range.clone())?;
+            let current = version.current_bytes.get(range)?;
+            (packet_bytes == original || packet_bytes == current).then_some(current)
+        })
+    }
+
+    fn record(
+        &mut self,
+        address: u64,
+        identity: Option<GuestSharedMappingIdentity>,
+        original_bytes: &[u8],
+        current_bytes: &[u8],
+    ) {
+        if original_bytes.len() != current_bytes.len()
+            || current_bytes.is_empty()
+            || current_bytes.len() > MAXIMUM_ORDERED_GLOBAL_VERSION_BYTES
+        {
+            return;
+        }
+        let Some(end) = address.checked_add(current_bytes.len() as u64) else {
+            return;
+        };
+        let new_backing_range = identity.and_then(|identity| {
+            identity
+                .backing_offset
+                .checked_add(current_bytes.len() as u64)
+                .map(|backing_end| (identity, backing_end))
+        });
+        let mut retained_bytes = self.retained_bytes;
+        self.entries.retain(|entry| {
+            let entry_end = entry
+                .address
+                .saturating_add(entry.current_bytes.len() as u64);
+            let virtual_overlap = address < entry_end && entry.address < end;
+            let physical_overlap = new_backing_range.is_some_and(|(new_identity, new_end)| {
+                entry.identity.is_some_and(|old_identity| {
+                    old_identity.backing_id == new_identity.backing_id
+                        && new_identity.backing_offset
+                            < old_identity
+                                .backing_offset
+                                .saturating_add(entry.current_bytes.len() as u64)
+                        && old_identity.backing_offset < new_end
+                })
+            });
+            let keep = !virtual_overlap && !physical_overlap;
+            if !keep {
+                retained_bytes = retained_bytes.saturating_sub(
+                    entry
+                        .original_bytes
+                        .len()
+                        .saturating_add(entry.current_bytes.len()),
+                );
+            }
+            keep
+        });
+        self.retained_bytes = retained_bytes;
+        let entry_bytes = original_bytes.len().saturating_add(current_bytes.len());
+        while self.entries.len() >= MAXIMUM_ORDERED_GLOBAL_VERSIONS
+            || self.retained_bytes.saturating_add(entry_bytes)
+                > MAXIMUM_ORDERED_GLOBAL_RETAINED_BYTES
+        {
+            let Some(evicted) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(
+                evicted
+                    .original_bytes
+                    .len()
+                    .saturating_add(evicted.current_bytes.len()),
+            );
+        }
+        self.entries.push_back(OrderedGlobalVersion {
+            address,
+            identity,
+            original_bytes: original_bytes.to_vec(),
+            current_bytes: current_bytes.to_vec(),
+        });
+        self.retained_bytes = self.retained_bytes.saturating_add(entry_bytes);
+    }
+
+    fn invalidate(&mut self, address: u64, byte_count: u64) {
+        if byte_count == 0 {
+            return;
+        }
+        let end = address.saturating_add(byte_count);
+        let backing_range =
+            guest_shared_backing_identity(address, byte_count).and_then(|identity| {
+                identity
+                    .backing_offset
+                    .checked_add(byte_count)
+                    .map(|backing_end| (identity, backing_end))
+            });
+        let mut retained_bytes = self.retained_bytes;
+        self.entries.retain(|entry| {
+            let entry_end = entry
+                .address
+                .saturating_add(entry.current_bytes.len() as u64);
+            let virtual_overlap = address < entry_end && entry.address < end;
+            let physical_overlap = backing_range.is_some_and(|(new_identity, new_end)| {
+                entry.identity.is_some_and(|old_identity| {
+                    old_identity.backing_id == new_identity.backing_id
+                        && new_identity.backing_offset
+                            < old_identity
+                                .backing_offset
+                                .saturating_add(entry.current_bytes.len() as u64)
+                        && old_identity.backing_offset < new_end
+                })
+            });
+            let keep = !virtual_overlap && !physical_overlap;
+            if !keep {
+                retained_bytes = retained_bytes.saturating_sub(
+                    entry
+                        .original_bytes
+                        .len()
+                        .saturating_add(entry.current_bytes.len()),
+                );
+            }
+            keep
+        });
+        self.retained_bytes = retained_bytes;
+    }
 }
 
 #[cfg_attr(test, allow(dead_code))]
@@ -616,6 +783,7 @@ impl Dx12GuestExecutor {
             integer_msaa_resolve_pipeline_cache: HashMap::new(),
             render_target_cache: HashMap::new(),
             sampled_texture_cache: HashMap::new(),
+            ordered_global_versions: OrderedGlobalVersions::default(),
             descriptor_arena,
             upload_arena,
             command_pool: Vec::new(),
@@ -674,7 +842,8 @@ impl Dx12GuestExecutor {
     }
 
     pub(super) fn execute_compute(&mut self, dispatch: &ComputeDispatch) -> Result<(), String> {
-        let resolved_dispatch = resolve_indirect_compute(dispatch)?;
+        let resolved_dispatch =
+            resolve_indirect_compute_ordered(dispatch, &self.ordered_global_versions)?;
         let dispatch = resolved_dispatch.as_ref().unwrap_or(dispatch);
         if dispatch.launch.is_empty() {
             return Ok(());
@@ -692,17 +861,36 @@ impl Dx12GuestExecutor {
                 .global_memory_bindings
                 .iter()
                 .map(|binding| {
+                    let descriptor = (0..4)
+                        .map(|index| {
+                            let scalar = binding.scalar_address.saturating_add(index);
+                            register_value(&dispatch.shader_registers, 0x240 + scalar).or_else(
+                                || {
+                                    evaluation
+                                        .initial_scalar_registers
+                                        .get(scalar as usize)
+                                        .copied()
+                                },
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .map(|words| preview_words(&words_as_bytes(&words)))
+                        .unwrap_or_else(|| "unavailable".to_owned());
                     let head = (binding.byte_count <= 64)
-                        .then(|| snapshot_global(binding).ok())
+                        .then(|| {
+                            snapshot_ordered_global(binding, &self.ordered_global_versions).ok()
+                        })
                         .flatten()
                         .map(|bytes| preview_words(&bytes))
                         .unwrap_or_default();
                     format!(
-                        "{:#x}/{}:{}{}{}",
+                        "{:#x}/{}:{}{}:s{}=[{}]{}",
                         binding.base_address,
                         binding.byte_count,
                         if binding.writable { "w" } else { "r" },
                         if binding.write_back_to_guest { "b" } else { "" },
+                        binding.scalar_address,
+                        descriptor,
                         if head.is_empty() {
                             String::new()
                         } else {
@@ -760,6 +948,7 @@ impl Dx12GuestExecutor {
             &self.render_target_cache,
             &mut self.sampled_texture_cache,
             &[],
+            &self.ordered_global_versions,
         )?;
         let (descriptors, samplers, root_descriptors) = combine_stage_heaps(
             &self.device,
@@ -847,7 +1036,11 @@ impl Dx12GuestExecutor {
         // SAFETY: every referenced resource remains owned through the following fence wait.
         unsafe { self.queue.ExecuteCommandLists(&[Some(list)]) };
         self.wait()?;
-        write_back_globals(evaluation, &resources.globals)?;
+        write_back_globals(
+            evaluation,
+            &resources.globals,
+            &mut self.ordered_global_versions,
+        )?;
         write_back_textures(&resources.textures)?;
         Ok(())
     }
@@ -1005,6 +1198,7 @@ impl Dx12GuestExecutor {
             &self.render_target_cache,
             &mut self.sampled_texture_cache,
             &output_addresses,
+            &self.ordered_global_versions,
         )?;
         let vertex_resources_ready = timing_started.elapsed();
         let mut pixel_resources = pixel_stage
@@ -1018,6 +1212,7 @@ impl Dx12GuestExecutor {
                     &self.render_target_cache,
                     &mut self.sampled_texture_cache,
                     &output_addresses,
+                    &self.ordered_global_versions,
                 )
             })
             .transpose()?;
@@ -1264,10 +1459,14 @@ impl Dx12GuestExecutor {
         } else {
             self.wait()?;
             let complete = timing_started.elapsed();
-            write_back_stage(export_evaluation, &vertex_resources)?;
+            write_back_stage(
+                export_evaluation,
+                &vertex_resources,
+                &mut self.ordered_global_versions,
+            )?;
             if let (Some((_, evaluation, _, _)), Some(resources)) = (&pixel_stage, &pixel_resources)
             {
-                write_back_stage(evaluation, resources)?;
+                write_back_stage(evaluation, resources, &mut self.ordered_global_versions)?;
             }
             complete
         };
@@ -1517,7 +1716,14 @@ impl Dx12GuestExecutor {
     /// they are next bound. Queue ordering and the per-command fence already order prior GPU
     /// work. Publication remains the responsibility of release/wait/submission/flip boundaries
     /// or an overlapping GPU consumer.
-    pub(super) fn synchronize_memory_acquire(&mut self, _acquire: remu_gpu::GpuMemoryAcquire) {}
+    pub(super) fn synchronize_memory_acquire(&mut self, acquire: remu_gpu::GpuMemoryAcquire) {
+        self.ordered_global_versions
+            .invalidate(acquire.base_address, acquire.size_bytes);
+    }
+
+    pub(super) fn invalidate_ordered_global_range(&mut self, address: u64, byte_count: u64) {
+        self.ordered_global_versions.invalidate(address, byte_count);
+    }
 
     pub(super) fn flush_for_draw_inputs(&mut self, draw: &IndexedDraw) -> Result<(), String> {
         let output_addresses = decode_render_targets(draw)?
@@ -1663,6 +1869,16 @@ impl Dx12GuestExecutor {
             backend_error("ID3D12CommandQueue::Signal(guest)", &error).to_string()
         })?;
         wait_for_fence(&self.fence, value).map_err(|error| error.to_string())?;
+        // A removed device can still leave a fence at the requested value when the failure is
+        // reported asynchronously after that command completed. Query the device immediately so
+        // the offending submission fails here instead of being misattributed to the next native
+        // object creation.
+        if unsafe { self.device.GetDeviceRemovedReason() }.is_err() {
+            return Err(format!(
+                "D3D12 device removed after guest fence {value}: {}",
+                device_removed_report(&self.device)
+            ));
+        }
         for resources in std::mem::take(&mut self.pending_draw_resources) {
             self.command_pool
                 .push((resources._allocator, resources._commands));
@@ -2067,8 +2283,9 @@ fn record_stage_readbacks(commands: &ID3D12GraphicsCommandList, resources: &Comp
 fn write_back_stage(
     evaluation: &ShaderEvaluation,
     resources: &ComputeResources,
+    ordered_versions: &mut OrderedGlobalVersions,
 ) -> Result<(), String> {
-    write_back_globals(evaluation, &resources.globals)?;
+    write_back_globals(evaluation, &resources.globals, ordered_versions)?;
     write_back_textures(&resources.textures)
 }
 
@@ -3040,14 +3257,34 @@ fn dispatch_group_count(dispatch: &ComputeDispatch) -> Result<[u32; 3], String> 
     Ok(groups)
 }
 
+#[cfg(test)]
 fn resolve_indirect_compute(dispatch: &ComputeDispatch) -> Result<Option<ComputeDispatch>, String> {
+    resolve_indirect_compute_ordered(dispatch, &OrderedGlobalVersions::default())
+}
+
+fn resolve_indirect_compute_ordered(
+    dispatch: &ComputeDispatch,
+    ordered_versions: &OrderedGlobalVersions,
+) -> Result<Option<ComputeDispatch>, String> {
     let ComputeDispatchSource::Indirect { dimensions_address } = dispatch.source else {
         return Ok(None);
     };
-    let mut bytes = [0_u8; 12];
-    read_process_memory(dimensions_address, &mut bytes).map_err(|error| {
-        format!("indirect compute dimensions at {dimensions_address:#x}: {error}")
-    })?;
+    let packet_dimensions = encoded_dispatch_dimensions(dispatch)?;
+    let mut bytes = packet_dimensions.map(u32::to_le_bytes).concat();
+    if let Some(forwarded) = ordered_versions.forwarded_slice(dimensions_address, &bytes) {
+        bytes.copy_from_slice(forwarded);
+        if std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1") {
+            eprintln!(
+                "[REMu][D3D12-BINDINGS] forwarded ordered indirect compute address={dimensions_address:#x} packet=[{}] gpu=[{}]",
+                preview_words(&packet_dimensions.map(u32::to_le_bytes).concat()),
+                preview_words(&bytes),
+            );
+        }
+    } else {
+        read_process_memory(dimensions_address, &mut bytes).map_err(|error| {
+            format!("indirect compute dimensions at {dimensions_address:#x}: {error}")
+        })?;
+    }
     let dimensions = std::array::from_fn(|axis| {
         let offset = axis * 4;
         u32::from_le_bytes(
@@ -3064,6 +3301,29 @@ fn resolve_indirect_compute(dispatch: &ComputeDispatch) -> Result<Option<Compute
     )
     .map_err(|error| format!("indirect compute dimensions at {dimensions_address:#x}: {error}"))?;
     Ok(Some(resolved))
+}
+
+fn encoded_dispatch_dimensions(dispatch: &ComputeDispatch) -> Result<[u32; 3], String> {
+    const DISPATCH_USE_THREAD_DIMENSIONS: u32 = 1 << 5;
+    let mut dimensions = [0_u32; 3];
+    for (axis, dimension) in dimensions.iter_mut().enumerate() {
+        let value = if dispatch.launch.initiator & DISPATCH_USE_THREAD_DIMENSIONS != 0 {
+            let ComputeGrid::Threads(threads) = dispatch.launch.grid else {
+                return Err("thread-dimension dispatch lost its exact thread grid".to_owned());
+            };
+            u64::from(dispatch.launch.base_group[axis])
+                .checked_mul(u64::from(dispatch.launch.threads_per_group[axis]))
+                .and_then(|start| start.checked_add(threads[axis]))
+                .ok_or("indirect compute packet dimensions overflow")?
+        } else {
+            u64::from(dispatch.launch.base_group[axis])
+                .checked_add(u64::from(dispatch.launch.group_count[axis]))
+                .ok_or("indirect compute packet dimensions overflow")?
+        };
+        *dimension =
+            u32::try_from(value).map_err(|_| "indirect compute packet dimension exceeds u32")?;
+    }
+    Ok(dimensions)
 }
 
 fn dispatch_root_constants(dispatch: &ComputeDispatch) -> [u32; 7] {
@@ -3092,6 +3352,7 @@ fn create_stage_resources(
     resident_targets: &HashMap<u64, RenderTargetResource>,
     sampled_texture_cache: &mut HashMap<DecodedTexture, CachedSampledTexture>,
     excluded_target_addresses: &[u64],
+    ordered_versions: &OrderedGlobalVersions,
 ) -> Result<ComputeResources, String> {
     let mut scalar_words = evaluation.initial_scalar_registers.to_vec();
     if let Some((registers, user_base, scalar_base)) = live_scalars {
@@ -3121,7 +3382,7 @@ fn create_stage_resources(
                 binding.base_address, binding.byte_count, MAXIMUM_GLOBAL_BUFFER_BYTES
             ));
         }
-        global_snapshots.push(snapshot_global(binding)?);
+        global_snapshots.push(snapshot_ordered_global(binding, ordered_versions)?);
     }
 
     let slots = evaluation.image_binding_slots();
@@ -5719,6 +5980,7 @@ fn create_texture_resource(
     } else {
         D3D12_RESOURCE_DIMENSION_TEXTURE2D
     };
+    validate_texture_format_support(device, descriptor, dimension)?;
     let depth_or_array =
         u16::try_from(descriptor.layer_count).map_err(|_| "texture layer count exceeds D3D12")?;
     let flags = if descriptor.writable {
@@ -5929,6 +6191,56 @@ fn create_texture_resource(
         source: TextureResourceSource::GuestUpload,
         writeback,
     })
+}
+
+fn validate_texture_format_support(
+    device: &ID3D12Device,
+    descriptor: DecodedTexture,
+    dimension: windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION,
+) -> Result<(), String> {
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: descriptor.format,
+        ..D3D12_FEATURE_DATA_FORMAT_SUPPORT::default()
+    };
+    let size = u32::try_from(std::mem::size_of::<D3D12_FEATURE_DATA_FORMAT_SUPPORT>())
+        .expect("D3D12 format-support structure fits u32");
+    // SAFETY: `support` is the exact writable structure required by FORMAT_SUPPORT.
+    unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast::<c_void>(),
+            size,
+        )
+    }
+    .map_err(|error| {
+        backend_error("ID3D12Device::CheckFeatureSupport(texture format)", &error).to_string()
+    })?;
+
+    let required_dimension = if dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        D3D12_FORMAT_SUPPORT1_TEXTURE3D
+    } else {
+        D3D12_FORMAT_SUPPORT1_TEXTURE2D
+    };
+    if !support.Support1.contains(required_dimension) {
+        return Err(format!(
+            "D3D12 format {:?} does not support the requested {:?} guest texture",
+            descriptor.format, dimension
+        ));
+    }
+    if descriptor.writable
+        && (!support
+            .Support1
+            .contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW)
+            || !support
+                .Support2
+                .contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE))
+    {
+        return Err(format!(
+            "D3D12 format {:?} lacks typed UAV store support (support1={:#x} support2={:#x})",
+            descriptor.format, support.Support1.0, support.Support2.0
+        ));
+    }
+    Ok(())
 }
 
 fn create_or_reuse_sampled_texture(
@@ -6458,9 +6770,53 @@ fn snapshot_global(binding: &remu_shader::GlobalMemoryBinding) -> Result<Vec<u8>
     })
 }
 
+fn snapshot_ordered_global(
+    binding: &remu_shader::GlobalMemoryBinding,
+    ordered_versions: &OrderedGlobalVersions,
+) -> Result<Vec<u8>, String> {
+    let packet_bytes = snapshot_global(binding)?;
+    let Some(forwarded) =
+        ordered_versions.forwarded_slice(binding.base_address, packet_bytes.as_slice())
+    else {
+        return Ok(packet_bytes);
+    };
+    if std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1") {
+        eprintln!(
+            "[REMu][D3D12-BINDINGS] forwarded ordered global address={:#x} bytes={} packet=[{}] gpu=[{}]",
+            binding.base_address,
+            binding.byte_count,
+            preview_words(&packet_bytes),
+            preview_words(forwarded),
+        );
+    }
+    Ok(forwarded.to_vec())
+}
+
+fn snapshot_live_global(binding: &remu_shader::GlobalMemoryBinding) -> Result<Vec<u8>, String> {
+    if binding.byte_count == 0 {
+        return Ok(Vec::new());
+    }
+    if binding.base_address < 0x10_000 {
+        return binding
+            .data
+            .get(..binding.byte_count)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| {
+                format!(
+                    "global binding has invalid guest address {:#x}",
+                    binding.base_address
+                )
+            });
+    }
+    let mut bytes = vec![0_u8; binding.byte_count];
+    read_process_memory(binding.base_address, &mut bytes)?;
+    Ok(bytes)
+}
+
 fn write_back_globals(
     evaluation: &ShaderEvaluation,
     resources: &[GlobalResource],
+    ordered_versions: &mut OrderedGlobalVersions,
 ) -> Result<(), String> {
     if evaluation.global_memory_bindings.len() != resources.len() {
         return Err("D3D12/global buffer binding count mismatch".to_owned());
@@ -6495,7 +6851,7 @@ fn write_back_globals(
         if binding.byte_count <= 64
             && std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
         {
-            let guest_bytes = snapshot_global(binding)?;
+            let guest_bytes = snapshot_live_global(binding)?;
             eprintln!(
                 "[REMu][D3D12-WRITEBACK] address={:#x} baseline=[{}] gpu=[{}] guest=[{}]",
                 binding.base_address,
@@ -6557,10 +6913,25 @@ fn write_back_globals(
                 0,
             )?,
         }
+        let identity = match guard {
+            GlobalWritebackGuard::Lease(lease) => Some(lease.identity()),
+            GlobalWritebackGuard::Anonymous(_) => guest_shared_backing_identity(
+                binding.base_address,
+                u64::try_from(binding.byte_count).unwrap_or(u64::MAX),
+            ),
+            #[cfg(test)]
+            GlobalWritebackGuard::Direct => None,
+        };
+        ordered_versions.record(
+            binding.base_address,
+            identity,
+            &resource.original_bytes,
+            current_bytes,
+        );
         if binding.byte_count <= 64
             && std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1")
         {
-            let guest_bytes = snapshot_global(binding)?;
+            let guest_bytes = snapshot_live_global(binding)?;
             eprintln!(
                 "[REMu][D3D12-WRITEBACK] address={:#x} published=[{}]",
                 binding.base_address,
@@ -7055,15 +7426,16 @@ mod tests {
         GpuRegister, GpuScanoutTarget, IndexedDraw, ShaderSnapshot,
     };
     use remu_shader::{
-        ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding, ImageControl,
-        Instruction, InstructionControl, Opcode, Operand, OperandKind, Program, ShaderEncoding,
-        ShaderEvaluation,
+        BufferMemoryControl, ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding,
+        ImageControl, Instruction, InstructionControl, Opcode, Operand, OperandKind, Program,
+        ShaderEncoding, ShaderEvaluation,
     };
 
     use super::{
-        Dx12GuestExecutor, WritebackJournalSites, dispatch_group_count, expand_primitive_indices,
-        indirect_draw_count_allows, presentable_bgra, primitive_restart_index,
-        regroup_restart_list_indices, resolve_indirect_compute, resolve_indirect_draw,
+        Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites, dispatch_group_count,
+        expand_primitive_indices, indirect_draw_count_allows, presentable_bgra,
+        primitive_restart_index, regroup_restart_list_indices, resolve_indirect_compute,
+        resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
         write_changed_ranges_direct,
     };
 
@@ -7466,6 +7838,163 @@ mod tests {
     }
 
     #[test]
+    fn executes_formatted_indirect_argument_expansion() {
+        let input = [0_u32, 0, 0, 0x2428, 0];
+        let mut output = vec![0_u32; 16_383];
+        let input_base = input.as_ptr() as u64;
+        let output_base = output.as_mut_ptr() as u64;
+        let buffer = |pc, opcode, vector_address, vector_data, scalar_resource| Instruction {
+            pc,
+            encoding: ShaderEncoding::Mubuf,
+            opcode: Opcode::Known(opcode),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(vector_address),
+                Operand::scalar(scalar_resource),
+                Operand::source(128, None),
+            ],
+            destinations: Vec::new(),
+            control: Some(InstructionControl::BufferMemory(BufferMemoryControl {
+                dword_count: 1,
+                vector_address,
+                vector_data,
+                scalar_resource,
+                instruction_format: None,
+                offset_bytes: 0,
+                index_enabled: true,
+                offset_enabled: false,
+                dlc: false,
+                lds: false,
+                glc: false,
+                slc: false,
+                tfe: false,
+            })),
+        };
+        let program = Arc::new(Program::new(
+            0x9800,
+            vec![
+                buffer(0, "BufferLoadDword", 0, 1, 0),
+                Instruction {
+                    pc: 8,
+                    encoding: ShaderEncoding::Vop2,
+                    opcode: Opcode::Known("VMulU32U24"),
+                    words: vec![0],
+                    sources: vec![literal(3), Operand::vector(0)],
+                    destinations: vec![Operand::vector(2)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 12,
+                    encoding: ShaderEncoding::Vop2,
+                    opcode: Opcode::Known("VAddI32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(2), literal(1)],
+                    destinations: vec![Operand::vector(3)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 16,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VMovB32"),
+                    words: vec![0],
+                    sources: vec![literal(1)],
+                    destinations: vec![Operand::vector(4)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 20,
+                    encoding: ShaderEncoding::Vop2,
+                    opcode: Opcode::Known("VAddI32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(2), literal(2)],
+                    destinations: vec![Operand::vector(0)],
+                    control: None,
+                },
+                buffer(24, "BufferStoreFormatX", 2, 1, 4),
+                buffer(32, "BufferStoreFormatX", 3, 4, 4),
+                buffer(40, "BufferStoreFormatX", 0, 4, 4),
+                Instruction {
+                    pc: 48,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        ));
+        let mut initial = vec![0_u32; 8];
+        initial[0] = input_base as u32;
+        initial[1] = ((input_base >> 32) as u32 & 0xffff) | (4 << 16);
+        initial[2] = input.len() as u32;
+        initial[4] = output_base as u32;
+        initial[5] = ((output_base >> 32) as u32 & 0xffff) | (4 << 16);
+        initial[6] = output.len() as u32;
+        // BUF_DATA_FORMAT_32 + BUF_NUM_FORMAT_UINT, with component X selecting VGPR data 0.
+        initial[7] = 4 | (20 << 12);
+        let evaluation = Arc::new(ShaderEvaluation {
+            initial_scalar_registers: initial.into_iter().collect(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: vec![
+                GlobalMemoryBinding {
+                    scalar_address: 0,
+                    base_address: input_base,
+                    instruction_pcs: [0].into_iter().collect(),
+                    byte_count: input.len() * 4,
+                    data: Vec::new(),
+                    writable: false,
+                    write_back_to_guest: false,
+                },
+                GlobalMemoryBinding {
+                    scalar_address: 4,
+                    base_address: output_base,
+                    instruction_pcs: [24, 32, 40].into_iter().collect(),
+                    byte_count: output.len() * 4,
+                    data: Vec::new(),
+                    writable: true,
+                    write_back_to_guest: true,
+                },
+            ],
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        });
+        let dispatch = ComputeDispatch {
+            sequence: 2,
+            source: ComputeDispatchSource::Direct,
+            launch: ComputeLaunch {
+                grid: ComputeGrid::Threadgroups([1, 1, 1]),
+                group_count: [1, 1, 1],
+                base_group: [0; 3],
+                threads_per_group: [5, 1, 1],
+                wave_lane_count: 32,
+                lds_size_bytes: 0,
+                initiator: 1,
+            },
+            shader_address: 0x9800,
+            shader_prefix: [0; 4],
+            shader: Some(ShaderSnapshot {
+                header_address: 0x9800,
+                program,
+                supplemental_programs: Arc::from([]),
+                metadata: None,
+            }),
+            shader_evaluation: Some(evaluation),
+            shader_registers: Vec::new(),
+        };
+        Dx12GuestExecutor::new()
+            .expect("create D3D12 guest executor")
+            .execute_compute(&dispatch)
+            .expect("execute formatted argument expansion");
+        assert_eq!(
+            &output[..15],
+            &[0, 1, 1, 0, 1, 1, 0, 1, 1, 0x2428, 1, 1, 0, 1, 1]
+        );
+    }
+
+    #[test]
     fn indirect_compute_uses_live_ordered_dimensions() {
         let dimensions = [7_u32, 5, 3];
         let dispatch = ComputeDispatch {
@@ -7508,6 +8037,94 @@ mod tests {
         assert_eq!(resolved.launch.group_count, dimensions);
         assert_eq!(resolved.launch.threads_per_group, [8, 4, 2]);
         assert_eq!(resolved.launch.wave_lane_count, 32);
+    }
+
+    #[test]
+    fn ordered_global_versions_forward_gpu_output_over_predating_packet_bytes() {
+        let mut live = [0_u32, 0x1800_3fff, 0, 0x1800_3fff, 0];
+        let address = live.as_mut_ptr() as u64;
+        let packet = vec![0_u8; live.len() * 4];
+        let produced_words = [0_u32, 0, 0, 0x2428, 0];
+        let produced = super::words_as_bytes(&produced_words);
+        let binding = GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: address,
+            instruction_pcs: Default::default(),
+            byte_count: packet.len(),
+            data: packet.clone(),
+            writable: false,
+            write_back_to_guest: false,
+        };
+        let mut versions = OrderedGlobalVersions::default();
+        versions.record(address, None, &packet, &produced);
+
+        assert_eq!(
+            snapshot_ordered_global(&binding, &versions).expect("forward ordered producer"),
+            produced
+        );
+
+        versions.invalidate(address + 4, 4);
+        assert_eq!(
+            snapshot_ordered_global(&binding, &versions).expect("observe invalidated packet bytes"),
+            packet
+        );
+
+        versions.record(address, None, &packet, &produced);
+
+        let mut future = binding;
+        future.data = super::words_as_bytes(&live);
+        assert_eq!(
+            snapshot_ordered_global(&future, &versions).expect("keep newer packet bytes"),
+            future.data
+        );
+    }
+
+    #[test]
+    fn indirect_compute_forwards_ordered_gpu_arguments() {
+        let mut live = [0x1800_3fff_u32, 1, 1];
+        let address = live.as_mut_ptr() as u64;
+        let packet = super::words_as_bytes(&live);
+        let produced = super::words_as_bytes(&[9_u32, 1, 1]);
+        let mut versions = OrderedGlobalVersions::default();
+        versions.record(address, None, &packet, &produced);
+        let dispatch = ComputeDispatch {
+            sequence: 1,
+            source: ComputeDispatchSource::Indirect {
+                dimensions_address: address,
+            },
+            launch: ComputeLaunch {
+                grid: ComputeGrid::Threadgroups(live),
+                group_count: live,
+                base_group: [0; 3],
+                threads_per_group: [8, 4, 2],
+                wave_lane_count: 32,
+                lds_size_bytes: 0,
+                initiator: 1 | (1 << 2) | (1 << 15),
+            },
+            shader_address: 0,
+            shader_prefix: [0; 4],
+            shader: None,
+            shader_evaluation: None,
+            shader_registers: vec![
+                GpuRegister {
+                    offset: 0x207,
+                    value: 8,
+                },
+                GpuRegister {
+                    offset: 0x208,
+                    value: 4,
+                },
+                GpuRegister {
+                    offset: 0x209,
+                    value: 2,
+                },
+            ],
+        };
+
+        let resolved = resolve_indirect_compute_ordered(&dispatch, &versions)
+            .expect("resolve ordered dimensions")
+            .expect("indirect dispatch resolves");
+        assert_eq!(resolved.launch.group_count, [9, 1, 1]);
     }
 
     #[test]

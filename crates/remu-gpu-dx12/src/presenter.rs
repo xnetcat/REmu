@@ -551,6 +551,10 @@ impl Dx12Presenter {
         };
         self.device_removal_reported = true;
         eprintln!("[REMu][D3D12][DEVICE-REMOVED] {report}");
+        // A removed D3D12 device is terminal. Continuing to consume guest work would emit a
+        // cascade of misleading native failures and, worse, retire flips and submissions that
+        // never executed. Exit the presenter after preserving the one-shot DRED report.
+        self.shutdown = true;
     }
 
     fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<(), String> {
@@ -617,7 +621,7 @@ impl Dx12Presenter {
                 let outcome = self.process_event(event);
                 remu_gpu::record_gpu_work_item_processed();
                 processed += 1;
-                if matches!(outcome, EventOutcome::Shutdown) {
+                if self.shutdown || matches!(outcome, EventOutcome::Shutdown) {
                     self.shutdown = true;
                     return;
                 }
@@ -641,7 +645,12 @@ impl Dx12Presenter {
                     .get_mut(&queue_id)
                     .and_then(VecDeque::pop_front)
                     .expect("an active queue has a front event");
-                match self.process_event(event) {
+                let outcome = self.process_event(event);
+                if self.shutdown {
+                    remu_gpu::record_gpu_work_item_processed();
+                    return;
+                }
+                match outcome {
                     EventOutcome::Blocked(event) => {
                         self.guest_queues
                             .get_mut(&queue_id)
@@ -827,20 +836,52 @@ impl Dx12Presenter {
             }
             GpuEvent::MemoryCopy(copy) => {
                 self.flush_render_targets("memory copy");
-                if let Err(error) = execute_memory_copy(&copy) {
-                    eprintln!("[REMu][D3D12] DMA_DATA failed: {error}");
+                match execute_memory_copy(&copy) {
+                    Ok(()) => {
+                        if let Some(executor) = self.guest_executor.as_mut() {
+                            executor.invalidate_ordered_global_range(
+                                copy.destination_address,
+                                copy.byte_count,
+                            );
+                        }
+                    }
+                    Err(error) => eprintln!("[REMu][D3D12] DMA_DATA failed: {error}"),
                 }
             }
             GpuEvent::MemoryWrite(write) => {
                 self.flush_render_targets("memory write");
-                if let Err(error) = execute_memory_write(&write) {
-                    eprintln!("[REMu][D3D12] WRITE_DATA failed: {error}");
+                match execute_memory_write(&write) {
+                    Ok(()) => {
+                        let byte_count = if write.increment_address {
+                            u64::try_from(write.values.len())
+                                .unwrap_or(u64::MAX)
+                                .saturating_mul(4)
+                        } else if write.values.is_empty() {
+                            0
+                        } else {
+                            4
+                        };
+                        if let Some(executor) = self.guest_executor.as_mut() {
+                            executor.invalidate_ordered_global_range(write.address, byte_count);
+                        }
+                    }
+                    Err(error) => eprintln!("[REMu][D3D12] WRITE_DATA failed: {error}"),
                 }
             }
             GpuEvent::MemoryRelease(release) => {
                 self.flush_render_targets("memory release");
-                if let Err(error) = execute_memory_release(release) {
-                    eprintln!("[REMu][D3D12] RELEASE_MEM failed: {error}");
+                let byte_count = match release.value {
+                    GpuMemoryReleaseValue::Immediate32(_) => 4,
+                    GpuMemoryReleaseValue::Immediate64(_) | GpuMemoryReleaseValue::Timestamp => 8,
+                };
+                let address = release.address;
+                match execute_memory_release(release) {
+                    Ok(()) => {
+                        if let Some(executor) = self.guest_executor.as_mut() {
+                            executor.invalidate_ordered_global_range(address, byte_count);
+                        }
+                    }
+                    Err(error) => eprintln!("[REMu][D3D12] RELEASE_MEM failed: {error}"),
                 }
             }
             GpuEvent::MemoryWait(wait) => {

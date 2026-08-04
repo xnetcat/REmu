@@ -170,11 +170,31 @@ material and must not be committed when they originate from a proprietary game.
 
 The Poppy counter pipeline has since been isolated further: a one-group reset clears a five-dword
 counter buffer, a 23x13 classifier accumulates into it, and a five-lane expander produces indirect
-triplets. Captured HLSL matches that flow and D3D12 readback observes valid reset/classifier output,
-but later ordered events can observe recycled guest bytes instead. A temporary Windows-only switch
-from identity leases to the live virtual address produced the same result, ruling out a stale mapped
-view as the sole cause. The remaining investigation is the event-completion/guest-reuse boundary;
-the oversized-dispatch rejection stays as a necessary device-safety check, not a compatibility fix.
+triplets. Packet-time buffer snapshots can predate those GPU writes even when the events themselves
+remain ordered. The D3D12 executor now retains a bounded queue of GPU-produced buffer versions,
+keys leased entries by physical mapping identity, and forwards a producer only when a consumer's
+packet bytes still match either the producer baseline or its current output. A genuinely newer CPU
+packet wins. Ordered acquire, DMA, `WRITE_DATA`, and `RELEASE_MEM` destinations invalidate
+overlapping virtual or aliased physical entries. The cache is limited to 128 entries, 8 MiB per
+entry, and 64 MiB total.
+
+That forwarding produces the intended counter `0x2428` and indirect triplet `[0x2428, 1, 1]`
+instead of the recycled `0x18003fff` sentinel. A physical GTX 1050 regression recreates the exact
+five-thread formatted-buffer expansion into a 65,532-byte UAV and verifies all five triplets.
+Poppy then reaches compute 196 with the correct 9,256-group X dimension. It is not playable yet:
+the device is reproducibly removed while that dispatch prepares its large sampled/storage-texture
+set, before its command allocator/list is created or the dispatch is submitted. Per-format
+`D3D12_FEATURE_DATA_FORMAT_SUPPORT` checks confirm that this adapter advertises the required typed
+UAV store support, so the active investigation is descriptor/resource-state construction rather
+than indirect arguments or a missing GTX 1050 format capability.
+
+Device removal is terminal. The presenter emits one bounded DRED report and exits immediately;
+it no longer consumes queued work, reports cascaded failures, or retires fake submissions/flips.
+Fence completion is followed by a removal-state query to reduce asynchronous misattribution.
+`REMU_TRACE_D3D12_BINDINGS=1` now includes the four live buffer-descriptor SGPRs, which proved that
+Poppy's expander uses the same 32-bit unsigned format covered by the physical regression. The SDK
+debug layer remains unavailable on this machine until the optional Windows Graphics Tools feature
+is installed, so DRED and fail-closed native checks remain the current diagnostic boundary.
 
 ## Crate and data-flow boundaries
 
@@ -322,6 +342,8 @@ dumps are available; it does not replace them.
 - [Direct3D 12 programming guide](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide)
 - [D3D12 hardware feature levels](https://learn.microsoft.com/en-us/windows/win32/direct3d12/hardware-feature-levels)
 - [`ID3D12Device::CheckFeatureSupport`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-checkfeaturesupport)
+- [`D3D12_FEATURE_DATA_FORMAT_SUPPORT`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_feature_data_format_support)
+- [`D3D12_FORMAT_SUPPORT2`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_format_support2)
 - [`IDXGIFactory6::EnumAdapterByGpuPreference`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_6/nf-dxgi1_6-idxgifactory6-enumadapterbygpupreference)
 - [`IDXGIAdapter3::QueryVideoMemoryInfo`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-queryvideomemoryinfo)
 - [D3D12 memory-management strategies](https://learn.microsoft.com/en-us/windows/win32/direct3d12/memory-management-strategies)
