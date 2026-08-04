@@ -3,9 +3,9 @@
 
 use super::UploadedGlobalBuffer;
 use metal::{
-    Buffer, Device, Function, MTLCompareFunction, MTLResourceOptions, MTLSamplerAddressMode,
-    MTLSamplerMinMagFilter, MTLSamplerMipFilter, SamplerDescriptor, SamplerDescriptorRef,
-    SamplerState,
+    ArgumentDescriptor, Array, Buffer, Device, Function, MTLCompareFunction, MTLDataType,
+    MTLResourceOptions, MTLSamplerAddressMode, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
+    SamplerDescriptor, SamplerDescriptorRef, SamplerState,
 };
 use objc::runtime::{BOOL, YES};
 use objc::{msg_send, sel, sel_impl};
@@ -200,7 +200,6 @@ pub(super) fn create_global_argument_buffer(
 
 pub(super) fn create_sampler_argument_buffer(
     device: &Device,
-    function: &Function,
     buffer_index: Option<u32>,
     evaluation: &ShaderEvaluation,
 ) -> Result<(Option<Buffer>, Vec<SamplerState>), String> {
@@ -212,22 +211,38 @@ pub(super) fn create_sampler_argument_buffer(
             Ok((None, Vec::new()))
         };
     }
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-CACHE] creating argument encoder");
-    let argument_encoder =
-        buffer_index.map(|index| function.new_argument_encoder(u64::from(index)));
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-CACHE] argument encoder created");
+    // The compiler emits one dense sampler argument for every canonical slot. Build the encoder
+    // from that backend-owned ABI instead of asking MTLFunction to reflect it. Some supported
+    // Metal runtimes raise an Objective-C exception from makeArgumentEncoder(bufferIndex:) even
+    // when the MSL argument-buffer declaration is valid, and that exception cannot safely cross
+    // Rust frames.
+    let argument_descriptors = buffer_index
+        .map(|_| {
+            sampled_bindings
+                .iter()
+                .enumerate()
+                .map(|(slot, _)| {
+                    let descriptor = ArgumentDescriptor::new();
+                    descriptor
+                        .set_index(u64::try_from(slot).expect("canonical sampler slot fits Metal"));
+                    descriptor.set_data_type(MTLDataType::Sampler);
+                    descriptor.set_array_length(1);
+                    descriptor
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let argument_encoder = buffer_index
+        .map(|_| device.new_argument_encoder(Array::from_slice(argument_descriptors.as_slice())));
     let argument_buffer = argument_encoder.as_ref().map(|encoder| {
         let buffer = device.new_buffer(
             encoder.encoded_length(),
             MTLResourceOptions::StorageModeShared,
         );
+        buffer.set_label("REMu guest sampler argument buffer");
         encoder.set_argument_buffer(&buffer, 0);
         buffer
     });
-    #[cfg(test)]
-    eprintln!("[REMu][TEST][SAMPLER-CACHE] argument buffer created and bound");
     let mut samplers = Vec::with_capacity(sampled_bindings.len());
     for (slot, binding) in sampled_bindings.iter().enumerate() {
         if binding.sampler_descriptor.len() < 4 {
@@ -271,19 +286,13 @@ pub(super) fn create_sampler_argument_buffer(
                 / 256.0,
         );
         descriptor.set_support_argument_buffers(argument_encoder.is_some());
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-CACHE] creating sampler slot={slot}");
         let sampler = device.new_sampler(&descriptor);
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-CACHE] sampler created slot={slot}");
         if let Some(encoder) = argument_encoder.as_ref() {
             encoder.set_sampler_state(
                 u64::try_from(slot).map_err(|_| "sampler slot does not fit Metal")?,
                 &sampler,
             );
         }
-        #[cfg(test)]
-        eprintln!("[REMu][TEST][SAMPLER-CACHE] sampler encoded slot={slot}");
         samplers.push(sampler);
     }
     Ok((argument_buffer, samplers))

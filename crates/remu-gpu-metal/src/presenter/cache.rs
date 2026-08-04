@@ -289,7 +289,7 @@ impl MetalPresenter {
         {
             return Ok((cached.buffer.clone(), cached.samplers.clone()));
         }
-        let created = create_sampler_argument_buffer(device, function, buffer_index, evaluation)?;
+        let created = create_sampler_argument_buffer(device, buffer_index, evaluation)?;
         if self.sampler_argument_cache.len() < SAMPLER_ARGUMENT_CACHE_CAPACITY
             && let Some(key) = key
         {
