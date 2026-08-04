@@ -22,12 +22,12 @@ while opening vertex-shader assets that are absent from the host `shaders` direc
 local title-package completeness blocker; the VFS reports the exact resolved host paths and no
 game files were modified. A complete copy is required for the next game-backed DX12 regression.
 
-A DRED-enabled Poppy Playtime Chapter 1 probe on the same date reaches its first VideoOut flip and
-completes 14 GPU submissions. At the current startup boundary the D3D12 queue is fully drained,
-audio has not opened, and the title has not created an AVPlayer. The diagnostic watchdog now uses
-non-blocking runtime-state snapshots plus a hard two-second termination backstop; a deliberately
-contended run emitted its partial lock attribution and exited itself with status 142. This makes
-longer title probes deterministic while the pre-media startup wait is narrowed down.
+Poppy Playtime Chapter 1 now advances through sustained VideoOut, AVPlayer, WASAPI, and D3D12
+execution. A 65-second release probe completed 244 guest flips, delivered 226 video frames while
+the decoder produced 230 frames of the 10.010-second opening movie, and submitted 2,938,176 audio
+output frames with zero underrun frames and no D3D12 device loss. The title has not reached its menu
+yet: guest media progress is still about 6.9 times slower than real time, so this is an end-to-end
+boot/media result rather than a playability claim.
 
 The following table deliberately distinguishes foundations from runnable subsystems:
 
@@ -36,7 +36,7 @@ The following table deliberately distinguishes foundations from runnable subsyst
 | Build/runtime | Warning-free GNU release build; GNU/MSVC-aware CRT linkage and dependency discovery; Windows FFmpeg bootstrap discovers Git Bash/pkgconf, accepts explicit overrides, and treats cached Windows paths case-insensitively | GNU/MSVC CI, redistributable packaging, crash bundles |
 | CPU | Native x86-64 guest entry, compiler-supported System V callbacks/imports, thread and fiber switching, TLS, guarded guest reads, and release game execution | Larger ABI/register stress corpus, structured crash recovery, unwind metadata audit |
 | Memory | Sparse placeholder aperture, reserve/commit/decommit, section-backed physical aliases, protection, mapping identity, leases, and VEH write watch with batched contiguous protection/query runs | Long-running alias/remap stress, budget telemetry, more hostile fault-order tests |
-| Graphics | Adapter probe with live local/non-local DXGI budgets, D3D12/DXC executor, compute/graphics, capability-neutral general-LDS NGG compute-to-raster fallback, persistent coherent single-sample targets, cached tiled images/mips, MRT/depth/stencil, normalized/integer color and depth/stencil MSAA, ordered indirect multi-draw, shared descriptor/upload arenas, recycled command lists, event-based bounded fence waits, bounded DRED capture, DXGI window, and direct linear-frame presentation | Budget-aware cache trimming/residency, FMASK/DCC and remaining topology/format semantics, layered/extended NGG validation, depth/MSAA persistence, cross-draw submission batching, intentional device-removal capture validation |
+| Graphics | Capability-routed adapter probe with live local/non-local DXGI budgets, D3D12/DXC executor, compute/graphics, capability-neutral general-LDS NGG compute-to-raster fallback, persistent coherent single-sample targets, physical-alias-aware range publication, typed SRV component mapping, cached tiled images/mips, MRT/depth/stencil, normalized/integer color and depth/stencil MSAA, ordered indirect multi-draw, shared descriptor/upload arenas, recycled command lists, event-based bounded fence waits, bounded DRED capture, DXGI window, and native BGRA8/RGBA8/R10G10B10A2 presentation | Budget-aware cache trimming/residency, FMASK/DCC and remaining topology/format semantics, layered/extended NGG validation, depth/MSAA persistence, cross-draw submission batching, intentional device-removal capture validation |
 | Audio | CPAL/WASAPI production mixer; 48 kHz stereo endpoint, invalidated-stream reopening, guest-port rebinding/resampler retargeting, reroute reporting, and live game callback validated | Physical unplug/default-route-change stress, latency/drift telemetry, long-running A/V synchronization |
 | Window/input | winit Win32 event loop, DXGI surface, resize/close/focus flow, four-slot XInput hot-plug polling, dead zones/full-range axes/triggers, two-motor vibration, live keyboard-to-guest-pad press/release, neutral focus/suspend state, F11/Alt+Enter borderless fullscreen, and minimize/occlusion/suspend-safe presentation with retained-frame restore | Per-monitor display-change/sleep-resume and physical controller disconnect/reconnect stress; motion/touchpad and advanced DualSense output |
 | Filesystem/libc | Game VFS loading, cursor-preserving positional I/O, GNU/MSVC CRT selection, save-data commits, and CNG random bytes | Case/permission/path edge cases and directory-metadata durability |
@@ -165,10 +165,11 @@ pad events; it must not receive `HWND`, messages, or swap-chain objects.
 F11 and Alt+Enter toggle a borderless fullscreen window on the current monitor. Minimize,
 occlusion, application suspension, and zero-sized resize events pause swap-chain presentation
 without pausing ordered guest GPU execution. The transition into a paused state retains the latest
-guest frame; restore or a nonzero resize presents it before normal flips resume. Suspension also
-publishes a neutral pad state and clears held keyboard/modifier state so focus transitions cannot
-leave guest buttons stuck. Per-monitor scale-factor changes request a redraw through the same
-retained-frame path.
+guest frame; later hidden flips retire without repeated full-resolution readback, and restore or a
+nonzero resize refreshes the newest submitted frame once before normal presentation resumes.
+Suspension also publishes a neutral pad state and clears held keyboard/modifier state so focus
+transitions cannot leave guest buttons stuck. Per-monitor scale-factor changes request a redraw
+through the same retained-frame path.
 
 XInput slots 0 through 3 are polled continuously. The first connected slot feeds standard face,
 D-pad, shoulder, stick-click, Options, trigger, and analog-stick state; slot connection,
@@ -209,7 +210,7 @@ Completed locally on the development Windows host:
    D3D12 and audio probes have run against physical hardware.
 3. Fixed-image and sparse/alias/write-watch memory suites pass.
 4. Runtime CPU, import, thread, TLS, fiber, filesystem, and libc suites pass.
-5. The D3D12 crate's 55 tests pass, including event-based asynchronous fence completion and
+5. The D3D12 crate's 61 tests pass, including event-based asynchronous fence completion and
    timeout, physical copy/readback, translated compute/graphics,
    ordered single/multi indirect arguments, tiled texture, mip-chain, primitive normalization,
    render/depth/stencil, normalized/integer color MSAA, D32 and combined D32/S8 MSAA, and
@@ -233,9 +234,10 @@ Completed locally on the development Windows host:
     completed submission 1002, and kept the 48 kHz stereo WASAPI callback active with zero
     underrun frames. The bounded run reported no panic, access violation, backend error, shader
     evaluation failure, or D3D12 device removal.
-11. A DRED-enabled Poppy Playtime Chapter 1 release probe completed 14 submissions and one flip,
-    then produced non-blocking event/condition/player attribution and terminated at its configured
-    limit even while EventState and ProbeDispatch were contended.
+11. A 65-second Poppy Playtime Chapter 1 release probe completed 244 flips, delivered 226 of 230
+    decoded opening-movie frames, kept the 48 kHz stereo output active for 2,938,176 frames with
+    zero underruns, and reported no D3D12 device loss. The menu/input path remains unvalidated
+    because current guest execution is still substantially slower than real time.
 
 Still required before a broad Windows compatibility claim:
 

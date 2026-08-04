@@ -38,9 +38,19 @@ Implemented and physically validated on the development host:
 - Persistent single-sample render targets keyed by guest address and descriptor, with Windows VEH
   write watches for CPU/host invalidation. Coherent targets skip redundant 4K uploads and retain
   their already-linear output for DXGI presentation while still writing guest-visible bytes back.
+  Guest-memory publication is range-scoped and follows both virtual ranges and their physical
+  aliases, so unrelated resident targets no longer stall or round-trip through guest memory.
+- Typed BGRA8 target storage can satisfy a logically RGBA8 sampled image by applying the guest
+  GFX10 destination selectors through `D3D12_SHADER_RESOURCE_VIEW_DESC::Shader4ComponentMapping`.
+  Component order is therefore descriptor state, not an adapter-specific byte-layout guess;
+  normalized and sRGB view semantics remain distinct and unsupported selector/format combinations
+  fail closed.
 - Ordered compute, graphics, barriers, flip events, display registration, XInput polling, and DXGI
-  presentation, including retained-frame restore across minimize, occlusion, suspension, and
-  zero-sized resize transitions plus borderless F11/Alt+Enter fullscreen.
+  presentation. Linear B8G8R8A8, R8G8B8A8, and R10G10B10A2 scanouts use native resources; the
+  ten-bit path is not quantized through BGRA8 before presentation. Minimize, occlusion, suspension,
+  and zero-sized resize transitions retain one frame, retire later flips without repeated 4K
+  readbacks, and refresh the newest submitted frame once on resume. Borderless F11/Alt+Enter
+  fullscreen uses the same lifecycle path.
 - Native D3D12 occlusion queries around guest draws, resolved through a bounded query/readback
   ring and published through the shared guest counter contract. This is baseline D3D12 behavior,
   not an adapter-vendor extension.
@@ -61,11 +71,12 @@ Implemented and physically validated on the development host:
   causes DXIL stage-link register mismatches on D3D12.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
   primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
-  current D3D12 crate has 55 passing tests on the GTX 1050, including a physical general-LDS NGG
+  current D3D12 crate has 61 passing tests on the GTX 1050, including a physical general-LDS NGG
   compute-to-raster test on this mesh-shader-tier-0 adapter.
 
-This is a playable vertical slice for one tested title, not yet a broad playability claim. The
-major remaining work is guest FMASK and full DCC metadata coherence plus persistent
+This is a playable vertical slice for one tested title and sustained boot/media execution for a
+second, not yet a broad playability claim. The major remaining work is guest FMASK and full DCC
+metadata coherence plus persistent
 multisample/depth-resource identity; patch/rectangle/triangle-with-flags edge semantics; mipped
 arrays/3D and writable-mip UAVs; cross-draw submission batching and resource retirement;
 DRED/debug-layer capture; and broader title validation.
@@ -92,6 +103,14 @@ only for diagnostics, cache identity, and an eventual explicit adapter selector.
 results below are one physical validation point, not the supported-device definition; newer AMD,
 Intel, and NVIDIA adapters can use optional capabilities unavailable on that card without changing
 the baseline path for older hardware.
+
+The capability record intentionally preserves features above the baseline even before every one
+has an optimized implementation. Native triangle fan is selected only when reported, while index
+expansion remains available; mesh-shader tier never removes the compute NGG fallback; MSAA quality
+and typed format operations are checked for the exact format/sample combination; and enhanced
+barriers remain an optional future fast path over the tested legacy barriers. Adding a path for a
+newer GPU must therefore be a capability-gated optimization with equivalent fallback tests, never
+a vendor/device allowlist or a replacement for the portable correctness path.
 
 DXGI adapters are enumerated with `DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE`, software adapters are
 skipped, and the first adapter satisfying the baseline is selected. Adapter selection must later
@@ -239,6 +258,21 @@ Poppy's expander uses the same 32-bit unsigned format covered by the physical re
 debug layer remains unavailable on this machine until the optional Windows Graphics Tools feature
 is installed, so DRED and fail-closed native checks remain the current diagnostic boundary.
 
+The latest Poppy validation advances materially beyond that earlier boundary. All four observed
+1920x1088 display surfaces now reuse their resident color targets even when the image descriptor
+names logical RGBA over typed BGRA storage; a live trace reported zero incompatible-image fallback
+and zero target-publication flushes. In comparable 12-second runs this change increased completed
+flips from 38 to 67. Native scanout presentation settles near 1--2 ms on the warm path, including
+packed ten-bit output.
+
+An uninstrumented 65-second release run completed 244 guest flips, delivered 226 video frames while
+the decoder produced 230 of the roughly 240-frame, 10.010-second opening movie, and submitted
+2,938,176 audio output frames with zero underrun frames. No D3D12 device loss occurred. This proves
+sustained CPU, memory, shader translation, D3D12 graphics/presentation, AVPlayer, and WASAPI
+execution in one title. It is not a Poppy playability claim yet: the run remained in the opening
+movie and guest progress was about 6.9 times slower than real time. Submission batching and the
+remaining per-draw synchronization/resource work are now the primary route to the menu.
+
 ## Crate and data-flow boundaries
 
 The existing split remains the right one:
@@ -271,13 +305,16 @@ The executable presenter creates:
 The event receiver is bounded. Pipeline compilation or a slow GPU applies backpressure
 instead of dropping ordered guest work or growing memory without limit. Window resize is deferred
 until all back buffers are idle; occlusion and minimize suspend presentation without losing guest
-queue progress. Tearing is used only when DXGI reports support and the user has not requested
+queue progress. The first pause transition snapshots the visible frame, hidden flips update the
+latest address and complete without pixel conversion/readback, and resume refreshes exactly once
+before rendering. Tearing is used only when DXGI reports support and the user has not requested
 VSync.
 
 The current executor persists coherent single-sample color targets, hands their linear output
-directly to presentation, and uses CPU write watches to invalidate them. Descriptor and upload
-arenas plus command objects are recycled after their fence completes. The executor still waits for
-a fence and performs guest-memory writeback after each draw or dispatch. The next performance
+directly to presentation in B8G8R8A8, R8G8B8A8, or R10G10B10A2 form, and uses CPU write watches to
+invalidate them. Descriptor and upload arenas plus command objects are recycled after their fence
+completes. The executor still waits for a fence after each draw or dispatch, but resident color
+targets remain GPU-owned until a range-overlapping guest publication point. The next performance
 architecture extends persistence to depth/MSAA/shader resources and batches command lists without
 weakening guest-visible acquire/release ordering.
 
@@ -294,6 +331,9 @@ The Windows design therefore needs explicit ownership:
 - CPU writes invalidate or incrementally upload affected guest ranges using the write-watch
   contract. GPU writes stay in the default resource until a guest-visible acquire, CPU read, alias,
   or release requires readback.
+- Memory copy, write, release, and wait publication scan only resources whose virtual or physical
+  alias range overlaps the operation. A command that touches one allocation cannot force every
+  resident render target back to the CPU.
 - `GuestRangeLease` identity checks must guard delayed uploads/readbacks so a recycled virtual
   address never publishes into a new mapping.
 - Writable textures retain the exact raw upload snapshot. Completion retiles into that baseline
@@ -302,6 +342,13 @@ The Windows design therefore needs explicit ownership:
   backing writes.
 - Direct and flexible memory aliases must resolve to one physical identity even when several guest
   virtual ranges name it.
+
+Image identity separates storage format from view format and component selection. A compatible
+typed target may be reused through another legal SRV view when the guest descriptor's destination
+selectors can be represented exactly by D3D12's four-component mapping. Selectors for constant 0,
+constant 1, R, G, B, and A are supported; invalid selectors and incompatible UNORM/sRGB families
+are rejected rather than approximated. This policy is defined by GFX10 descriptor semantics and
+D3D12 view capabilities, so it applies equally across conformant AMD, Intel, and NVIDIA adapters.
 
 GFX10 standard-swizzled 3D resources are thick, not arrays of padded 2D slices. For mode 5
 (`ADDR_SW_4KB_S`), the 4 KiB block dimensions for 1/2/4/8/16-byte elements are respectively
@@ -409,11 +456,15 @@ dumps are available; it does not replace them.
 ## Primary references
 
 - [Direct3D 12 programming guide](https://learn.microsoft.com/en-us/windows/win32/direct3d12/directx-12-programming-guide)
+- [Direct3D 12 swap chains and supported presentation formats](https://learn.microsoft.com/en-us/windows/win32/direct3d12/swap-chains)
+- [DXGI flip-model presentation guidance](https://learn.microsoft.com/en-us/windows/win32/direct3ddxgi/for-best-performance--use-dxgi-flip-model)
 - [D3D12 hardware feature levels](https://learn.microsoft.com/en-us/windows/win32/direct3d12/hardware-feature-levels)
 - [`ID3D12Device::CheckFeatureSupport`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-checkfeaturesupport)
 - [`D3D12_FEATURE_DATA_FORMAT_SUPPORT`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_feature_data_format_support)
 - [`D3D12_FORMAT_SUPPORT2`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_format_support2)
 - [`D3D12_SAMPLER_DESC`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_sampler_desc)
+- [`D3D12_SHADER_RESOURCE_VIEW_DESC`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_shader_resource_view_desc)
+- [D3D12 shader component mapping](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ne-d3d12-d3d12_shader_component_mapping)
 - [Direct3D 12 constants, including the legal mip LOD bias range](https://learn.microsoft.com/en-us/windows/win32/direct3d12/constants)
 - [`IDXGIFactory6::EnumAdapterByGpuPreference`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_6/nf-dxgi1_6-idxgifactory6-enumadapterbygpupreference)
 - [`IDXGIAdapter3::QueryVideoMemoryInfo`](https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_4/nf-dxgi1_4-idxgiadapter3-queryvideomemoryinfo)
@@ -426,6 +477,7 @@ dumps are available; it does not replace them.
 - [DirectX triangle-fan and dynamic strip-cut specification](https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html)
 - [Mesa GFX10.3 register descriptions](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/a11d1bd247df18057ecb9945e01bf39ff85d8d9d/src/amd/registers/gfx103.json)
 - [Mesa GFX10 resource-descriptor field definitions](https://chromium.googlesource.com/chromiumos/third_party/mesa/+/refs/heads/stabilize-13982.70.B-chromeos-amd/src/amd/registers/gfx10-rsrc.json)
+- [AMD GPUOpen RGD manual: image-resource descriptor fields](https://gpuopen.com/manuals/rgd_manual/help_manual/)
 - [AMD AddrLib GFX10 swizzle pattern tables](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/imported/addrlib/src/gfx10/gfx10SwizzlePattern.h)
 - [AMD AddrLib GFX10 resource and thick-block rules](https://github.com/GPUOpen-Drivers/pal/blob/dev/src/core/imported/addrlib/src/gfx10/gfx10addrlib.h)
 - [`ID3D12Device::GetCopyableFootprints`](https://learn.microsoft.com/en-us/windows/win32/api/d3d12/nf-d3d12-id3d12device-getcopyablefootprints)
