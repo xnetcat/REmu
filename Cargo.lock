@@ -1543,6 +1543,7 @@ dependencies = [
  "remu-memory",
  "remu-shader",
  "remu-shader-metal",
+ "sha1",
  "thiserror 2.0.19",
  "windows",
  "winit",

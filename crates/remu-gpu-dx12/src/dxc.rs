@@ -5,8 +5,11 @@
 use std::path::{Path, PathBuf};
 
 use hassle_rs::{Dxc, HassleError};
+use sha1::{Digest, Sha1};
 
 const DXCOMPILER_FILE: &str = "dxcompiler.dll";
+const DXIL_CACHE_SCHEMA: &[u8] = b"remu-dxil-cache-v1";
+const DXC_ARGUMENTS: &[&str] = &["-O3", "-Ges"];
 
 pub(super) fn compile_hlsl(
     source_name: &str,
@@ -15,6 +18,19 @@ pub(super) fn compile_hlsl(
     target_profile: &str,
 ) -> Result<Vec<u8>, String> {
     let (dxc, location) = load_dxc()?;
+    let cache_path = dxil_cache_path(
+        &location,
+        source,
+        entry_point,
+        target_profile,
+        DXC_ARGUMENTS,
+    );
+    if let Some(path) = &cache_path
+        && let Ok(dxil) = std::fs::read(path)
+        && valid_dxil_container(&dxil)
+    {
+        return Ok(dxil);
+    }
     let compiler = dxc.create_compiler().map_err(|error| {
         format!(
             "could not create DXC compiler from {}: {error}",
@@ -35,7 +51,7 @@ pub(super) fn compile_hlsl(
         source_name,
         entry_point,
         target_profile,
-        &["-O3", "-Ges"],
+        DXC_ARGUMENTS,
         None,
         &[],
     );
@@ -43,7 +59,13 @@ pub(super) fn compile_hlsl(
         Ok(result) => result
             .get_result()
             .map(|blob| blob.to_vec())
-            .map_err(|error| format!("DXC returned no DXIL object for {source_name}: {error}")),
+            .map_err(|error| format!("DXC returned no DXIL object for {source_name}: {error}"))
+            .map(|dxil| {
+                if let Some(path) = cache_path {
+                    persist_dxil(&path, &dxil);
+                }
+                dxil
+            }),
         Err((result, hresult)) => {
             let diagnostics = result
                 .get_error_buffer()
@@ -53,6 +75,68 @@ pub(super) fn compile_hlsl(
                 "DXC failed compiling {source_name} ({target_profile}, HRESULT {hresult:?}): {}",
                 diagnostics.trim()
             ))
+        }
+    }
+}
+
+fn dxil_cache_path(
+    compiler: &Path,
+    source: &str,
+    entry_point: &str,
+    target_profile: &str,
+    arguments: &[&str],
+) -> Option<PathBuf> {
+    if std::env::var_os("REMU_DISABLE_DXIL_CACHE").is_some() {
+        return None;
+    }
+    let root = std::env::var_os("REMU_DXIL_CACHE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .map(|root| {
+            if std::env::var_os("REMU_DXIL_CACHE_DIR").is_some() {
+                root
+            } else {
+                root.join("REmu").join("cache").join("dxil-v1")
+            }
+        })?;
+    let mut hash = Sha1::new();
+    hash.update(DXIL_CACHE_SCHEMA);
+    hash.update(source.as_bytes());
+    hash.update([0]);
+    hash.update(entry_point.as_bytes());
+    hash.update([0]);
+    hash.update(target_profile.as_bytes());
+    for argument in arguments {
+        hash.update([0]);
+        hash.update(argument.as_bytes());
+    }
+    if let Ok(metadata) = compiler.metadata() {
+        hash.update(metadata.len().to_le_bytes());
+        if let Ok(modified) = metadata.modified()
+            && let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            hash.update(duration.as_secs().to_le_bytes());
+            hash.update(duration.subsec_nanos().to_le_bytes());
+        }
+    }
+    Some(root.join(format!("{:x}.dxil", hash.finalize())))
+}
+
+fn valid_dxil_container(bytes: &[u8]) -> bool {
+    bytes.len() >= 32 && bytes.starts_with(b"DXBC")
+}
+
+fn persist_dxil(path: &Path, dxil: &[u8]) {
+    static NEXT_TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temporary_id = NEXT_TEMPORARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = path.with_extension(format!("{}-{temporary_id}.tmp", std::process::id()));
+    if std::fs::write(&temporary, dxil).is_ok() {
+        if std::fs::rename(&temporary, path).is_err() {
+            let _ = std::fs::remove_file(&temporary);
         }
     }
 }
@@ -139,7 +223,7 @@ fn format_load_error(path: &Path, error: HassleError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_candidate;
+    use super::{normalize_candidate, valid_dxil_container};
     use std::path::PathBuf;
 
     #[test]
@@ -155,5 +239,14 @@ mod tests {
     fn explicit_file_is_not_modified() {
         let file = PathBuf::from("somewhere/dxcompiler-custom.dll");
         assert_eq!(normalize_candidate(file.clone()), file);
+    }
+
+    #[test]
+    fn disk_cache_accepts_only_plausible_dxil_containers() {
+        let mut valid = vec![0_u8; 32];
+        valid[..4].copy_from_slice(b"DXBC");
+        assert!(valid_dxil_container(&valid));
+        assert!(!valid_dxil_container(b"DXBC"));
+        assert!(!valid_dxil_container(&[0_u8; 32]));
     }
 }
