@@ -18,7 +18,7 @@ use remu_gpu::{
     PAD_BUTTON_SQUARE, PAD_BUTTON_TRIANGLE, PAD_BUTTON_UP, PIXEL_PIPE_STAT_COUNTER_PAIRS,
     PIXEL_PIPE_STAT_VALID,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, INFINITE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC, D3D12_COMMAND_QUEUE_FLAG_NONE,
     D3D12_FENCE_FLAG_NONE, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_BARRIER,
@@ -38,7 +38,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIFactory4, IDXGIOutput,
     IDXGISwapChain3,
 };
@@ -49,6 +49,7 @@ use windows::Win32::UI::Input::XboxController::{
     XINPUT_GAMEPAD_RIGHT_THUMB, XINPUT_GAMEPAD_START, XINPUT_GAMEPAD_X, XINPUT_GAMEPAD_Y,
     XINPUT_STATE, XINPUT_VIBRATION, XInputGetState, XInputSetState,
 };
+use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::core::Interface;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -179,9 +180,19 @@ struct Dx12Renderer {
     commands: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     next_fence: u64,
+    frame_latency: FrameLatencyHandle,
     swap_chain: IDXGISwapChain3,
     buffer_size: (u32, u32),
     buffer_format: DXGI_FORMAT,
+}
+
+struct FrameLatencyHandle(HANDLE);
+
+impl Drop for FrameLatencyHandle {
+    fn drop(&mut self) {
+        // SAFETY: GetFrameLatencyWaitableObject transfers a live handle to the caller.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
 }
 
 impl Dx12Renderer {
@@ -251,6 +262,16 @@ impl Dx12Renderer {
         })?
         .cast::<IDXGISwapChain3>()
         .map_err(|error| backend_error("IDXGISwapChain1::cast", &error).to_string())?;
+        // SAFETY: the swap chain was created with the frame-latency waitable-object flag.
+        unsafe { swap_chain.SetMaximumFrameLatency(1) }.map_err(|error| {
+            backend_error("IDXGISwapChain2::SetMaximumFrameLatency", &error).to_string()
+        })?;
+        let frame_latency = FrameLatencyHandle(unsafe {
+            swap_chain.GetFrameLatencyWaitableObject()
+        });
+        if frame_latency.0.is_invalid() {
+            return Err("DXGI returned no frame-latency waitable object".to_owned());
+        }
         // SAFETY: this associates only the live presenter window with its factory.
         unsafe { factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) }.map_err(|error| {
             backend_error("IDXGIFactory::MakeWindowAssociation", &error).to_string()
@@ -264,6 +285,7 @@ impl Dx12Renderer {
             commands,
             fence,
             next_fence: 1,
+            frame_latency,
             swap_chain,
             buffer_size: (width, height),
             buffer_format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -273,6 +295,10 @@ impl Dx12Renderer {
     fn present(&mut self, frame: &HostFrame) -> Result<(), String> {
         validate_frame(frame)?;
         self.ensure_swap_chain(frame.width, frame.height, DXGI_FORMAT_B8G8R8A8_UNORM)?;
+        // DXGI requires waiting before every rendered frame, including the first one.
+        if unsafe { WaitForSingleObject(self.frame_latency.0, INFINITE) } != WAIT_OBJECT_0 {
+            return Err("failed waiting for DXGI frame latency".to_owned());
+        }
 
         let row_bytes = frame
             .width
@@ -437,7 +463,7 @@ impl Dx12Renderer {
                     width,
                     height,
                     format,
-                    DXGI_SWAP_CHAIN_FLAG(0),
+                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
                 )
             }
             .map_err(|error| backend_error("IDXGISwapChain::ResizeBuffers", &error).to_string())?;
@@ -1484,6 +1510,7 @@ fn swap_chain_description(width: u32, height: u32) -> DXGI_SWAP_CHAIN_DESC1 {
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_UNSPECIFIED,
+        Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0.cast_unsigned(),
         ..DXGI_SWAP_CHAIN_DESC1::default()
     }
 }

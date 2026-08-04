@@ -368,7 +368,7 @@ it to DX12 by semantic capability rather than by copying Metal APIs:
 | Attachment occlusion queries (`d683bb5`) | D3D12 occlusion query heap and readback publication | Implemented |
 | GPU tiler and equation work (`6ed02f8`) | Shared equations plus a future D3D12 compute tiler | CPU conversion exists; GPU path remains |
 | Persistent shader caches (`dd62f2b`) | Compiler-keyed DXIL plus adapter/driver-keyed pipeline-library cache | Persistent DXIL implemented; pipeline-library disk cache remains |
-| Display-link timebase/pacing (`4f6537e`) | DXGI frame-latency waitable object and shared display timebase | Present ordering exists; waitable-object pacing remains |
+| Display-link timebase/pacing (`4f6537e`) | DXGI frame-latency waitable object and shared display timebase | Waitable-object pacing integrated; shared display-time telemetry remains |
 | NGG capacities and proof (`ca6c3a0`, `655d3d8`) | Capability-routed native mesh path plus classic/compute fallback | Shared register derivation is available; DX12 execution paths remain |
 | Sampled-resident lookup (`30bd087`) | Physical-identity-indexed DX12 texture lookup | Descriptor cache exists; identity index remains |
 
