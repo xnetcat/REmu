@@ -67,8 +67,12 @@ fn exposes_a_stable_dinkumware_global_locale() {
     let locale = guest_global_locale(&mut state);
     let vtable = read_guest_u64(locale);
     let retain = read_guest_u64(vtable + 0x10);
-    // SAFETY: guest_global_locale installs this exact process-local C ABI function pointer.
-    let retain: extern "sysv64" fn(u64) -> u64 = unsafe {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type Retain = extern "sysv64" fn(u64) -> u64;
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    type Retain = extern "C" fn(u64) -> u64;
+    // SAFETY: guest_global_locale installs this exact process-local guest-ABI function pointer.
+    let retain: Retain = unsafe {
         std::mem::transmute(usize::try_from(retain).expect("function pointer fits usize"))
     };
 

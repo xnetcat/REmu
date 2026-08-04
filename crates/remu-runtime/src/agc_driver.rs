@@ -86,7 +86,10 @@ const MARKER_PROBE_BYTES: u64 = 64;
 /// Wavefront debugging is refused on a target whose PA Debug setting is off.
 const SHADER_DEBUGGING_NOT_AVAILABLE: u64 = 1;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
 
 /// Names registered for the workload stream identifiers Razor GPU can select between.
 static WORKLOAD_STREAMS: Mutex<BTreeMap<u32, String>> = Mutex::new(BTreeMap::new());

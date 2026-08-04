@@ -64,7 +64,10 @@ const REGISTER_ARRAY_WORST_CASE_BYTES: u64 = 12;
 /// A range packet holds an opcode dword and a first-offset dword ahead of its values.
 const REGISTER_RANGE_HEADER_BYTES: u64 = 8;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.
 pub(crate) fn dispatch(
@@ -628,23 +631,21 @@ mod tests {
 
     #[test]
     fn a_full_command_buffer_is_grown_through_the_guest_callback() {
-        unsafe extern "sysv64" fn grow(
-            command_buffer: u64,
-            requested: u32,
-            user_data: u64,
-        ) -> bool {
-            if requested != 4 {
-                return false;
+        guest_abi_function! {
+            unsafe fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
+                if requested != 4 {
+                    return false;
+                }
+                write_u64(
+                    command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET,
+                    read_u64(user_data),
+                );
+                write_u64(
+                    command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
+                    read_u64(user_data + 8),
+                );
+                true
             }
-            write_u64(
-                command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET,
-                read_u64(user_data),
-            );
-            write_u64(
-                command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
-                read_u64(user_data + 8),
-            );
-            true
         }
 
         let mut fixture = CommandFixture::new();

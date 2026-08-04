@@ -1331,16 +1331,18 @@ static BLOCKED_EVENT_ENTERED: std::sync::atomic::AtomicBool =
 static BLOCKED_EVENT_RELEASED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// A guest event handler that never returns until the test releases it.
-extern "sysv64" fn av_player_blocking_event_callback(
-    _object: u64,
-    _event: u64,
-    _source: u64,
-    _data: u64,
-) {
-    BLOCKED_EVENT_ENTERED.store(true, std::sync::atomic::Ordering::Release);
-    while !BLOCKED_EVENT_RELEASED.load(std::sync::atomic::Ordering::Acquire) {
-        std::thread::sleep(Duration::from_millis(1));
+guest_abi_function! {
+    /// A guest event handler that never returns until the test releases it.
+    fn av_player_blocking_event_callback(
+        _object: u64,
+        _event: u64,
+        _source: u64,
+        _data: u64,
+    ) {
+        BLOCKED_EVENT_ENTERED.store(true, std::sync::atomic::Ordering::Release);
+        while !BLOCKED_EVENT_RELEASED.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

@@ -189,22 +189,28 @@ static GUEST_EXCEPTION_TEST: Mutex<()> = Mutex::new(());
 static DELIVERED_EXCEPTION: AtomicU32 = AtomicU32::new(0);
 static ONCE_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "sysv64" fn once_test_callback() {
-    ONCE_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+guest_abi_function! {
+    unsafe fn once_test_callback() {
+        ONCE_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
-unsafe extern "sysv64" fn pthread_exit_boundary_test_entry(argument0: u64, argument1: u64) -> u64 {
-    super::guest_pthread_exit(argument0 + argument1);
+guest_abi_function! {
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn pthread_exit_boundary_test_entry(argument0: u64, argument1: u64) -> u64 {
+        super::guest_pthread_exit(argument0 + argument1);
+    }
 }
 
 static DELIVERED_EXCEPTION_RSP: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "sysv64" fn capture_guest_exception(exception: i32, context: *mut u8) {
-    DELIVERED_EXCEPTION.store(exception.cast_unsigned(), Ordering::SeqCst);
-    // SAFETY: the delivery test passes a complete 0x500-byte synthesized Orbis ucontext.
-    let rsp = unsafe { std::ptr::read_unaligned(context.add(0xf8).cast::<u64>()) };
-    DELIVERED_EXCEPTION_RSP.store(usize::try_from(rsp).unwrap(), Ordering::SeqCst);
+guest_abi_function! {
+    unsafe fn capture_guest_exception(exception: i32, context: *mut u8) {
+        DELIVERED_EXCEPTION.store(exception.cast_unsigned(), Ordering::SeqCst);
+        // SAFETY: the delivery test passes a complete 0x500-byte synthesized Orbis ucontext.
+        let rsp = unsafe { std::ptr::read_unaligned(context.add(0xf8).cast::<u64>()) };
+        DELIVERED_EXCEPTION_RSP.store(usize::try_from(rsp).unwrap(), Ordering::SeqCst);
+    }
 }
 
 fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
@@ -413,15 +419,17 @@ fn wait_for_guest_condition_waiters(condition: u64, expected: usize) {
     }
 }
 
-unsafe extern "sysv64" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
-    // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
-    let left = unsafe { std::ptr::read_unaligned(left.cast::<i32>()) };
-    // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
-    let right = unsafe { std::ptr::read_unaligned(right.cast::<i32>()) };
-    match left.cmp(&right) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
+guest_abi_function! {
+    unsafe fn compare_i32(left: *const u8, right: *const u8) -> i32 {
+        // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
+        let left = unsafe { std::ptr::read_unaligned(left.cast::<i32>()) };
+        // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
+        let right = unsafe { std::ptr::read_unaligned(right.cast::<i32>()) };
+        match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
     }
 }
 

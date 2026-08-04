@@ -1,6 +1,32 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+/// Defines a callback that guest x86-64 code may call directly.
+///
+/// Windows hosts must spell the guest ABI explicitly because their native C ABI is Win64. On
+/// every other supported build target the C ABI is the only portable declaration; non-x86 hosts
+/// compile these entry points for tooling and tests but never execute x86-64 guest code.
+macro_rules! guest_abi_function {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident($($argument:ident: $argument_type:ty),* $(,)?) $(-> $return_type:ty)? $body:block) => {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        $(#[$meta])*
+        $vis extern "sysv64" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        $(#[$meta])*
+        $vis extern "C" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+    };
+    ($(#[$meta:meta])* $vis:vis unsafe fn $name:ident($($argument:ident: $argument_type:ty),* $(,)?) $(-> $return_type:ty)? $body:block) => {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        $(#[$meta])*
+        $vis unsafe extern "sysv64" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        $(#[$meta])*
+        $vis unsafe extern "C" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+    };
+}
+
 mod agc_acb;
 mod agc_api;
 mod agc_command_abi;
@@ -267,7 +293,7 @@ pub(crate) use guest_sync::{
 pub(crate) use guest_sync::{
     guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock, guest_rwlock_unlock,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use hid::reset_hid_runtime;
 #[cfg(test)]
 pub(crate) use memory::BATCH_MAP_OPERATION_MAP_DIRECT;
@@ -300,7 +326,7 @@ pub(crate) use np_api::{
     np_universal_data_register_context, np_universal_data_terminate,
 };
 pub(crate) use pad::dispatch_pad_import;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use pad::reset_pad_runtime;
 #[cfg(test)]
 pub(crate) use pad::{
@@ -1580,8 +1606,10 @@ fn cached_import_telemetry() -> *const ImportTelemetry {
     })
 }
 
-extern "sysv64" fn current_guest_thread_pointer() -> u64 {
-    CURRENT_GUEST_THREAD_POINTER.get()
+guest_abi_function! {
+    fn current_guest_thread_pointer() -> u64 {
+        CURRENT_GUEST_THREAD_POINTER.get()
+    }
 }
 
 fn set_current_guest_thread_pointer(thread_pointer: u64) {
@@ -2241,6 +2269,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.json_runtime = JsonRuntimeState::default();
     state.av_player = AvPlayerRuntimeState::default();
     state.services = RuntimeServiceState::default();
+    #[cfg(any(test, target_arch = "x86_64"))]
     reset_pad_runtime();
     #[cfg(any(test, target_arch = "x86_64"))]
     reset_hid_runtime();
@@ -2915,7 +2944,10 @@ fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame) {
         "[REMu][KERNEL] delivering cooperative exception target={thread:#x} type={} handler={:#x} rip={:#x} rsp={:#x}",
         pending.exception, pending.handler, frame.guest_return_address, frame.guest_rsp,
     );
+    #[cfg(all(windows, target_arch = "x86_64"))]
     type GuestExceptionHandler = unsafe extern "sysv64" fn(i32, *mut u8);
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    type GuestExceptionHandler = unsafe extern "C" fn(i32, *mut u8);
     // SAFETY: The process installed this mapped executable guest handler for the requested signal.
     // Delivery runs at an import boundary on the target's own native thread, so its guest TLS and
     // stack identity remain intact while the handler observes the synthesized Orbis ucontext.
@@ -2930,10 +2962,11 @@ fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame) {
         .remove(&thread);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-unsafe extern "sysv64" fn import_dispatch_trampoline() {
-    core::arch::naked_asm!(
+guest_abi_function! {
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe fn import_dispatch_trampoline() {
+        core::arch::naked_asm!(
         "sub rsp, 0xe0",
         "mov [rsp + 0x00], rdi",
         "mov [rsp + 0x08], rsi",
@@ -2964,7 +2997,8 @@ unsafe extern "sysv64" fn import_dispatch_trampoline() {
         "add rsp, 8",
         "ret",
         dispatch = sym import_dispatch_entry,
-    );
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -2973,10 +3007,11 @@ const TEST_CAPTURE_DISPATCH_INDEX: u64 = i32::MAX as u64;
 #[cfg(all(test, target_arch = "x86_64"))]
 static TEST_CAPTURED_IMPORT_FRAME: Mutex<Option<ImportCallFrame>> = Mutex::new(None);
 
-#[cfg(all(test, target_arch = "x86_64"))]
-#[unsafe(naked)]
-unsafe extern "sysv64" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
-    core::arch::naked_asm!(
+guest_abi_function! {
+    #[cfg(all(test, target_arch = "x86_64"))]
+    #[unsafe(naked)]
+    unsafe fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
+        core::arch::naked_asm!(
         "mov r11, rdi",
         "push rbx",
         "mov rbx, 0x7172737475767778",
@@ -3006,7 +3041,8 @@ unsafe extern "sysv64" fn invoke_test_import_stub(_stub: u64) -> ProbeImportRetu
         "call r11",
         "pop rbx",
         "ret",
-    );
+        );
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -3141,7 +3177,13 @@ static IMPORT_CALL_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Guards the one-time process-wide condition summary printed with the first stall report.
 static STALL_SNAPSHOT_EMITTED: AtomicBool = AtomicBool::new(false);
 
-extern "sysv64" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
+guest_abi_function! {
+    fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
+        import_dispatch_entry_impl(frame)
+    }
+}
+
+fn import_dispatch_entry_impl(frame: *const ImportCallFrame) -> ProbeImportReturn {
     let _guest_import_trace = (!frame.is_null())
         // SAFETY: the import trampoline supplies one live frame for the complete dispatch.
         .then(|| GuestImportTraceGuard::enter(unsafe { &*frame }))
@@ -4519,20 +4561,28 @@ fn kernel_module_info_from_addr(arguments: [u64; 6], state: &ProbeDispatchState)
     0
 }
 
-extern "sysv64" fn scripting_get_mem(alignment: u64, size: u64) -> u64 {
-    guest_aligned_alloc(alignment, size)
+guest_abi_function! {
+    fn scripting_get_mem(alignment: u64, size: u64) -> u64 {
+        guest_aligned_alloc(alignment, size)
+    }
 }
 
-extern "sysv64" fn scripting_free_mem(pointer: u64) {
-    guest_free(pointer);
+guest_abi_function! {
+    fn scripting_free_mem(pointer: u64) {
+        guest_free(pointer);
+    }
 }
 
-extern "sysv64" fn scripting_realloc(pointer: u64, size: u64) -> u64 {
-    guest_realloc(pointer, size)
+guest_abi_function! {
+    fn scripting_realloc(pointer: u64, size: u64) -> u64 {
+        guest_realloc(pointer, size)
+    }
 }
 
-extern "sysv64" fn scripting_calloc(count: u64, size: u64) -> u64 {
-    guest_calloc(count, size)
+guest_abi_function! {
+    fn scripting_calloc(count: u64, size: u64) -> u64 {
+        guest_calloc(count, size)
+    }
 }
 
 fn kernel_install_exception_handler(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -6204,14 +6254,20 @@ fn take_exit_callbacks(
 fn invoke_guest_exit_callbacks(callbacks: Vec<GuestExitCallback>) {
     for callback in callbacks {
         if let Some(argument) = callback.argument {
+            #[cfg(all(windows, target_arch = "x86_64"))]
             type Destructor = unsafe extern "sysv64" fn(u64);
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            type Destructor = unsafe extern "C" fn(u64);
             // SAFETY: The guest registered a live Itanium destructor function and its opaque
             // argument. It remains executable until the corresponding module is finalized.
             let destructor: Destructor = unsafe { std::mem::transmute(callback.function) };
             // SAFETY: The registration defines the function and argument ABI above.
             unsafe { destructor(argument) };
         } else {
+            #[cfg(all(windows, target_arch = "x86_64"))]
             type Callback = unsafe extern "sysv64" fn();
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
+            type Callback = unsafe extern "C" fn();
             // SAFETY: C atexit registers a live no-argument callback in guest executable memory.
             let callback: Callback = unsafe { std::mem::transmute(callback.function) };
             // SAFETY: The registration defines the no-argument callback ABI above.
@@ -7726,8 +7782,10 @@ pub(crate) fn process_guest_range_has_read_access(address: u64, length: usize) -
     }
 }
 
-extern "sysv64" fn guest_locale_virtual_noop(locale: u64) -> u64 {
-    locale
+guest_abi_function! {
+    fn guest_locale_virtual_noop(locale: u64) -> u64 {
+        locale
+    }
 }
 
 fn guest_global_locale(state: &mut ProbeDispatchState) -> u64 {
@@ -8399,8 +8457,11 @@ fn guest_qsort(arguments: [u64; 6]) -> u64 {
     };
     // The guest comparator is native x86-64 code in this Rosetta process. Dropping the dispatcher
     // lock before entering this function permits a comparator that itself crosses an import stub.
-    let compare: unsafe extern "sysv64" fn(*const u8, *const u8) -> i32 =
-        unsafe { std::mem::transmute(comparator) };
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type Compare = unsafe extern "sysv64" fn(*const u8, *const u8) -> i32;
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    type Compare = unsafe extern "C" fn(*const u8, *const u8) -> i32;
+    let compare: Compare = unsafe { std::mem::transmute(comparator) };
     let mut key = vec![0_u8; size];
     for index in 1..count {
         // SAFETY: qsort's ABI guarantees a writable `count * size` byte range at `base`.
@@ -9070,11 +9131,13 @@ const fn probe_entry(
     Err(LinkError::ProbeRequiresX86_64)
 }
 
-#[cfg(target_arch = "x86_64")]
-extern "sysv64" fn guest_exit(code: i32) {
-    eprintln!("[REMu][PROBE] guest exit handler called with code {code}");
-    run_all_guest_exit_callbacks();
-    terminate_probe(code);
+guest_abi_function! {
+    #[cfg(target_arch = "x86_64")]
+    fn guest_exit(code: i32) {
+        eprintln!("[REMu][PROBE] guest exit handler called with code {code}");
+        run_all_guest_exit_callbacks();
+        terminate_probe(code);
+    }
 }
 
 /// Prints the shader opcode histogram accumulated by this run, one `[REMu][SHADER-OPCODES]` line
