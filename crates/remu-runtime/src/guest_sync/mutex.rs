@@ -18,11 +18,11 @@ use crate::{
     write_guest_u64,
 };
 
+use super::state::guest_mutex_object_index;
 use super::{
     GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
     guest_mutex_shards, guest_sync,
 };
-use super::state::guest_mutex_object_index;
 
 const GUEST_MUTEX_ENTRY_CACHE_SIZE: usize = 16;
 
@@ -197,9 +197,10 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
         existing.active.store(false, Ordering::Release);
         drop(mutex);
         if let Some(removed) = shard.remove(&address)
-            && removed.guest_object != 0 {
-                guest_free(removed.guest_object);
-            }
+            && removed.guest_object != 0
+        {
+            guest_free(removed.guest_object);
+        }
     }
     let entry = Arc::new(GuestMutexEntry {
         state: Mutex::new(GuestMutexState {

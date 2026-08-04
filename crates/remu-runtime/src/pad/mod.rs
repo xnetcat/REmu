@@ -78,24 +78,24 @@ pub(crate) fn reset_pad_runtime() {
 pub(crate) fn dispatch_pad_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     // NIDs from abi-inventory/sdk10-nid-map.tsv (libScePad).
     Some(match nid {
-        "xk0AcarP3V4" => pad_open(arguments),                         // scePadOpen
-        "u1GRHp+oWoY" => pad_get_handle(arguments),                   // scePadGetHandle
-        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments),      // scePadSetMotionSensorState
-        "gjP9-KQzoUk" => pad_get_controller_information(arguments),   // scePadGetControllerInformation
-        "6ncge5+l5Qs" => pad_close(arguments),                        // scePadClose
-        "AcslpN1jHR8" => pad_get_extended_information(arguments),     // scePadDeviceClassGetExtendedInformation
-        "YndgXqQVV7c" => pad_read_state(arguments),                   // scePadReadState
-        "q1cHNfGycLI" => pad_read(arguments),                         // scePadRead
-        "W2G-yoyMF5U" => pad_set_vibration_mode(arguments),           // scePadSetVibrationMode
-        "rIZnR6eSpvk" => pad_reset_orientation(arguments),            // scePadResetOrientation
-        "DscD1i9HX1w" => pad_handle_operation(arguments),             // scePadResetLightBar
+        "xk0AcarP3V4" => pad_open(arguments),       // scePadOpen
+        "u1GRHp+oWoY" => pad_get_handle(arguments), // scePadGetHandle
+        "clVvL4ZDntw" => pad_set_motion_sensor_state(arguments), // scePadSetMotionSensorState
+        "gjP9-KQzoUk" => pad_get_controller_information(arguments), // scePadGetControllerInformation
+        "6ncge5+l5Qs" => pad_close(arguments),                      // scePadClose
+        "AcslpN1jHR8" => pad_get_extended_information(arguments), // scePadDeviceClassGetExtendedInformation
+        "YndgXqQVV7c" => pad_read_state(arguments),               // scePadReadState
+        "q1cHNfGycLI" => pad_read(arguments),                     // scePadRead
+        "W2G-yoyMF5U" => pad_set_vibration_mode(arguments),       // scePadSetVibrationMode
+        "rIZnR6eSpvk" => pad_reset_orientation(arguments),        // scePadResetOrientation
+        "DscD1i9HX1w" => pad_handle_operation(arguments),         // scePadResetLightBar
         "r44mAxdSG+U" => pad_set_angular_velocity_deadband(arguments), // scePadSetAngularVelocityDeadbandState
-        "vDLMoJLde8I" => pad_set_tilt_correction(arguments),          // scePadSetTiltCorrectionState
-        "KLmYx9ij2h0" => pad_set_angular_velocity_bias(arguments),    // scePadSetAngularVelocityBiasCorrectionState
+        "vDLMoJLde8I" => pad_set_tilt_correction(arguments), // scePadSetTiltCorrectionState
+        "KLmYx9ij2h0" => pad_set_angular_velocity_bias(arguments), // scePadSetAngularVelocityBiasCorrectionState
         "yFVnOdGxvZY" | "2JgFB2n9oUM" | "RR4novUEENY" => pad_pointer_operation(arguments),
-        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments),     // scePadGetTriggerEffectState
-        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),       // scePadDeviceClassParseData
-        "hv1luiJrqQM" => pad_initialize(),                            // scePadInit
+        "znaWI0gpuo8" => pad_get_trigger_effect_state(arguments), // scePadGetTriggerEffectState
+        "IHPqcbc0zCA" => pad_device_class_parse_data(arguments),  // scePadDeviceClassParseData
+        "hv1luiJrqQM" => pad_initialize(),                        // scePadInit
         _ => return None,
     })
 }
@@ -104,7 +104,9 @@ fn require_user_logged_in() -> Result<(), u64> {
     if user_logged_in() {
         Ok(())
     } else {
-        eprintln!("[REMu][PAD] refused: user already logged out (SCE_HID_ERROR_ALREADY_LOGGED_OUT)");
+        eprintln!(
+            "[REMu][PAD] refused: user already logged out (SCE_HID_ERROR_ALREADY_LOGGED_OUT)"
+        );
         Err(sce_kernel_error(SCE_HID_ERROR_ALREADY_LOGGED_OUT))
     }
 }
@@ -525,23 +527,13 @@ pub(crate) fn pad_read(arguments: [u64; 6]) -> u64 {
 struct AutoCrossPulseState {
     next_scheduled_pulse: usize,
     active_until: Option<Instant>,
-    active_buttons: u32,
     next_repeated_pulse: Option<Instant>,
-    next_button_is_square: bool,
 }
 
 impl AutoCrossPulseState {
-    fn begin_pulse(&mut self, now: Instant, hold: Duration, allow_square: bool) -> u32 {
-        self.active_buttons = if allow_square && self.next_button_is_square {
-            remu_gpu::PAD_BUTTON_SQUARE
-        } else {
-            remu_gpu::PAD_BUTTON_CROSS
-        };
-        if allow_square {
-            self.next_button_is_square = !self.next_button_is_square;
-        }
+    fn begin_pulse(&mut self, now: Instant, hold: Duration) -> u32 {
         self.active_until = Some(now + hold);
-        self.active_buttons
+        remu_gpu::PAD_BUTTON_CROSS
     }
 
     fn buttons_at(
@@ -556,10 +548,9 @@ impl AutoCrossPulseState {
             .active_until
             .is_some_and(|active_until| now < active_until)
         {
-            return self.active_buttons;
+            return remu_gpu::PAD_BUTTON_CROSS;
         }
         self.active_until = None;
-        self.active_buttons = 0;
 
         let elapsed = now.saturating_duration_since(start);
         if times
@@ -569,13 +560,8 @@ impl AutoCrossPulseState {
             self.next_scheduled_pulse += 1;
             if self.next_scheduled_pulse == times.len() {
                 self.next_repeated_pulse = repeat.map(|period| now + period);
-                // First post-schedule pulse should be Square so Confirm and Restore Default
-                // keep alternating on separate edges.
-                self.next_button_is_square = true;
             }
-            // Explicit schedule pulses stay on Cross. Square is reserved for the post-schedule
-            // repeat phase so a Confirm path cannot be undone by Restore Default mid-menu.
-            return self.begin_pulse(now, hold, false);
+            return self.begin_pulse(now, hold);
         }
 
         if self.next_scheduled_pulse == times.len()
@@ -584,7 +570,7 @@ impl AutoCrossPulseState {
                 .is_some_and(|scheduled| now >= scheduled)
         {
             self.next_repeated_pulse = repeat.map(|period| now + period);
-            return self.begin_pulse(now, hold, true);
+            return self.begin_pulse(now, hold);
         }
         0
     }
@@ -926,7 +912,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_cross_alternates_cross_and_square_with_release_edges() {
+    fn auto_cross_repeats_cross_with_release_edges() {
         let start = Instant::now();
         let hold = Duration::from_millis(100);
         let repeat = Duration::from_millis(500);
@@ -981,7 +967,7 @@ mod tests {
                 hold,
                 Some(repeat),
             ),
-            remu_gpu::PAD_BUTTON_SQUARE
+            remu_gpu::PAD_BUTTON_CROSS
         );
         assert_eq!(
             state.buttons_at(

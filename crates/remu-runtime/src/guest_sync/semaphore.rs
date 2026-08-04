@@ -12,8 +12,8 @@ use crate::{
     write_guest_u32,
 };
 
-use super::state::{GuestSemaphoreEntry, GuestSemaphoreState};
 use super::guest_sync;
+use super::state::{GuestSemaphoreEntry, GuestSemaphoreState};
 
 /// Test/helper constructor for a per-object semaphore entry.
 #[cfg(test)]

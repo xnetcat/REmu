@@ -50,7 +50,8 @@ struct GuestModuleRegistryState {
     registry: GuestModuleRegistry,
 }
 
-static GUEST_MODULE_REGISTRY: OnceLock<(Mutex<GuestModuleRegistryState>, Condvar)> = OnceLock::new();
+static GUEST_MODULE_REGISTRY: OnceLock<(Mutex<GuestModuleRegistryState>, Condvar)> =
+    OnceLock::new();
 
 fn registry_pair() -> &'static (Mutex<GuestModuleRegistryState>, Condvar) {
     GUEST_MODULE_REGISTRY.get_or_init(|| {
@@ -146,15 +147,16 @@ pub(crate) fn finish_load_start_module(handle: u32, succeeded: bool) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(module) = state.registry.by_handle.get_mut(&handle)
-        && module.phase == GuestModulePhase::Starting {
-            module.phase = if succeeded {
-                GuestModulePhase::Started
-            } else {
-                // Constructors failed (`SCE_KERNEL_ERROR_ESTART`). Keep the module relocated so a
-                // later LoadStartModule can retry; exports stay invisible.
-                GuestModulePhase::Relocated
-            };
-        }
+        && module.phase == GuestModulePhase::Starting
+    {
+        module.phase = if succeeded {
+            GuestModulePhase::Started
+        } else {
+            // Constructors failed (`SCE_KERNEL_ERROR_ESTART`). Keep the module relocated so a
+            // later LoadStartModule can retry; exports stay invisible.
+            GuestModulePhase::Relocated
+        };
+    }
     condvar.notify_all();
 }
 
@@ -210,13 +212,9 @@ fn exports_visible_without_waiting(handle: u32, nid: &str) -> bool {
     let state = lock
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state
-        .registry
-        .by_handle
-        .get(&handle)
-        .is_some_and(|module| {
-            module.phase == GuestModulePhase::Started && module.exports_by_nid.contains_key(nid)
-        })
+    state.registry.by_handle.get(&handle).is_some_and(|module| {
+        module.phase == GuestModulePhase::Started && module.exports_by_nid.contains_key(nid)
+    })
 }
 
 pub(crate) struct LoadStartClaim {

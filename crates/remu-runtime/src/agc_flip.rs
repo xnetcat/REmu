@@ -201,15 +201,17 @@ pub(crate) fn queue_video_out_flip(
     };
     QUEUED_FLIPS.with(|queued| queued.set(queued.get().saturating_add(1)));
     let (_h, mut events) = crate::event_state::lock_event_state_for_write();
-    events.pending_video_out_flips.push_back(PendingVideoOutFlip {
-        completion: remu_gpu::GpuFlipCompletion {
-            address: display_address,
-            buffer_index,
-            flip_argument,
-        },
-        handle,
-        submit_process_time_counter: kernel_process_time(true),
-    });
+    events
+        .pending_video_out_flips
+        .push_back(PendingVideoOutFlip {
+            completion: remu_gpu::GpuFlipCompletion {
+                address: display_address,
+                buffer_index,
+                flip_argument,
+            },
+            handle,
+            submit_process_time_counter: kernel_process_time(true),
+        });
 }
 
 pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) {

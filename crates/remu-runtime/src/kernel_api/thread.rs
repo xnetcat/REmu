@@ -4,8 +4,8 @@
 use crate::{
     DEFAULT_THREAD_AFFINITY_MASK, DEFAULT_THREAD_PRIORITY, ProbeDispatchState,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND, current_guest_thread_handle,
-    pthread_attr_state, sce_kernel_error, signed_i32_return, update_pthread_attr,
-    write_guest_bytes, write_guest_u32, write_guest_u64,
+    pthread_attr_state, sce_kernel_error, signed_i32_return, trace_guest_affinity,
+    update_pthread_attr, write_guest_bytes, write_guest_u32, write_guest_u64,
 };
 
 use super::set_guest_errno;
@@ -119,8 +119,12 @@ pub(super) fn scheduler_priority_bound(policy: i32, bound: i32) -> u64 {
     }
 }
 
-/// The number of logical CPUs the PS5 exposes to a game process (cores 0-7).
-const PS5_LOGICAL_CPU_COUNT: u32 = 8;
+/// The number of logical CPUs the PS5 exposes to a native game process (cores 0-12).
+///
+/// SDK 10 `_kernel.h` defines `SCE_KERNEL_CPUMASK_13CPU` and
+/// `SCE_KERNEL_CPUMASK_NATIVE_ALL` as `0x1fff`. The older 6/7-CPU masks alongside them are
+/// explicitly deprecated and must not bound native placement.
+const PS5_LOGICAL_CPU_COUNT: u32 = 13;
 
 /// Distributes freshly placed threads across the cores their affinity permits.
 ///
@@ -155,9 +159,10 @@ pub(super) fn kernel_current_cpu(state: &mut ProbeDispatchState) -> u64 {
 /// Returns the emulated core REmu is running `handle` on, placing it if it has none yet.
 fn placed_core(state: &mut ProbeDispatchState, handle: u64, affinity_mask: u64) -> u32 {
     if let Some(&core) = state.thread_running_cpu.get(&handle)
-        && core_is_permitted(affinity_mask, core) {
-            return core;
-        }
+        && core_is_permitted(affinity_mask, core)
+    {
+        return core;
+    }
     let permitted: Vec<u32> = (0..PS5_LOGICAL_CPU_COUNT)
         .filter(|&core| core_is_permitted(affinity_mask, core))
         .collect();
@@ -168,6 +173,16 @@ fn placed_core(state: &mut ProbeDispatchState, handle: u64, affinity_mask: u64) 
     let placement = NEXT_CORE_PLACEMENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let core = permitted[placement as usize % permitted.len()];
     state.thread_running_cpu.insert(handle, core);
+    if trace_guest_affinity() {
+        eprintln!(
+            "[REMu][AFFINITY] place thread={handle:#x} name={:?} mask={affinity_mask:#x} core={core}",
+            state
+                .pthread_threads
+                .get(&handle)
+                .map(|thread| thread.name.as_str())
+                .unwrap_or("unknown"),
+        );
+    }
     core
 }
 
@@ -213,8 +228,8 @@ mod tests {
     #[test]
     fn an_affinity_permitting_no_console_core_reports_core_zero_without_a_placement() {
         let mut state = ProbeDispatchState::default();
-        // Bits set only outside the console's eight logical CPUs: no honest placement exists.
-        assert_eq!(placed_core(&mut state, THREAD, 0xff00), 0);
+        // Bits set only outside the console's thirteen logical CPUs: no honest placement exists.
+        assert_eq!(placed_core(&mut state, THREAD, 0xe000), 0);
         assert_eq!(placed_core(&mut state, THREAD, 0), 0);
         assert_eq!(state.thread_running_cpu.get(&THREAD), None);
     }
@@ -222,11 +237,19 @@ mod tests {
     #[test]
     fn every_placement_falls_inside_the_default_affinity_set() {
         let mut state = ProbeDispatchState::default();
-        // The default mask (0x7f) permits cores 0-6; round-robin placement must stay within it.
-        for index in 0..32 {
+        // SDK 10's native default mask (0x1fff) permits every logical CPU from 0 through 12.
+        for index in 0..52 {
             let core = placed_core(&mut state, THREAD + index, DEFAULT_THREAD_AFFINITY_MASK);
             assert!(core_is_permitted(DEFAULT_THREAD_AFFINITY_MASK, core));
-            assert!(core < 7);
+            assert!(core < PS5_LOGICAL_CPU_COUNT);
         }
+    }
+
+    #[test]
+    fn sdk_native_affinity_can_place_a_thread_on_the_thirteenth_cpu() {
+        let mut state = ProbeDispatchState::default();
+
+        assert_eq!(placed_core(&mut state, THREAD, 1 << 12), 12);
+        assert_eq!(state.thread_running_cpu.get(&THREAD), Some(&12));
     }
 }

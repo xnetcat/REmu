@@ -9,6 +9,23 @@ use super::{
 };
 
 #[test]
+fn hdr_tone_map_luminance_uses_sdk_float_fields() {
+    let mut state = ProbeDispatchState::default();
+    let mut output = [0_u32; 3];
+
+    assert_eq!(
+        dispatch_probe_import(
+            "mPpPxv5CZt4",
+            [output.as_mut_ptr().addr() as u64, 0, 0, 0, 0, 0],
+            [0; 6],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(output.map(f32::from_bits), [100.0, 100.0, 100.0]);
+}
+
+#[test]
 fn module_unwind_query_writes_the_gen5_metadata_layout() {
     let mut state = ProbeDispatchState::default();
     state.unwind_modules.push(crate::GuestUnwindModule {
@@ -260,7 +277,8 @@ fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
     );
     assert!(state.unimplemented_nids.is_empty());
 
-    // Without a presenter, Open auto-completes with cancel so UpdateStatus reaches FINISHED.
+    // Without a presenter, an SDK one-button NO_DATA notice is acknowledged so UpdateStatus
+    // reaches FINISHED without turning the only possible action into USER_CANCELED.
     remu_gpu::reset_host_dialog_state();
     let mut open_state = ProbeDispatchState::default();
     assert_eq!(
@@ -271,7 +289,12 @@ fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
         dispatch_probe_import("s9e3+YpRnzw", [0; 6], [0; 6], &mut open_state),
         0
     );
-    let mut parameters = [0_u8; 32];
+    let mut system_message = [0_u64; 6];
+    system_message[0] = 1; // SCE_SAVE_DATA_DIALOG_SYSMSG_TYPE_NODATA
+    let mut parameters = [0_u64; 19];
+    parameters[6] = (3_u64 << 32) | 0x98; // size @ +0x30, SYSTEM_MSG mode @ +0x34
+    parameters[11] = (&raw mut system_message).addr() as u64; // sysMsgParam @ +0x58
+    parameters[14] = 0x1122_3344_5566_7788; // userData @ +0x70
     assert_eq!(
         dispatch_probe_import(
             "4tPhsP6FpDI",
@@ -286,7 +309,7 @@ fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
         3,
         "auto-dismissed save dialog finishes on the first UpdateStatus poll"
     );
-    let mut result = [0_u32; 4];
+    let mut result = [0_u64; 9];
     assert_eq!(
         dispatch_probe_import(
             "yEiJ-qqr6Cg",
@@ -296,7 +319,9 @@ fn save_data_dialog_initialization_requires_and_owns_common_dialog_state() {
         ),
         0
     );
-    assert_eq!(result[1], 1, "auto-dismissed dialog reports user canceled");
+    assert_eq!(result[0], 3, "result reports SYSTEM_MSG mode and OK status");
+    assert_eq!(result[1], 1, "one-button notice reports the OK button");
+    assert_eq!(result[4], 0x1122_3344_5566_7788, "userData is echoed");
 
     let mut busy = ProbeDispatchState::default();
     assert_eq!(

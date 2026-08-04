@@ -9,11 +9,6 @@ mod agc_dispatch_state;
 mod agc_draw;
 mod agc_driver;
 mod agc_flip;
-mod dispatch_locks;
-pub(crate) mod event_state;
-mod import_routes;
-mod nid_u64;
-mod path_roots;
 #[allow(dead_code)]
 mod agc_frontend;
 mod agc_register_defaults;
@@ -31,13 +26,19 @@ mod av_player;
 mod av_player_libav;
 mod ces;
 mod dialog;
+mod dispatch_locks;
+pub(crate) mod event_state;
 mod guest_files;
 mod guest_libc;
+mod import_routes;
+mod nid_u64;
+mod path_roots;
 // The fiber ABI switches x86-64 register state, so it exists only on that architecture. On any
 // other host the NIDs fall through to the unimplemented path rather than to a stub that lies.
 #[cfg(target_arch = "x86_64")]
 mod fiber;
 mod guest_sync;
+mod hid;
 mod kernel_api;
 #[cfg(target_os = "macos")]
 mod kernel_memory;
@@ -48,7 +49,6 @@ mod nid_names;
 mod nid_table;
 mod np;
 mod np_api;
-mod hid;
 mod pad;
 mod playgo;
 mod pthread;
@@ -244,22 +244,24 @@ pub(crate) use guest_libc::{
 };
 #[cfg(test)]
 pub(crate) use guest_sync::{
-    EVENT_FLAG_WAIT_OR, GuestConditionState,
-    dispatch_guest_sync_import, guest_condition_destroy, guest_condition_init,
-    guest_condition_notify, guest_condition_wait, guest_condition_wait_with_interrupt,
-    guest_event_flag_entry, guest_event_flag_wait, guest_mutex_destroy, guest_mutex_entry,
-    guest_mutex_init, guest_pthread_once, guest_rwlock_destroy, guest_rwlock_init,
-    guest_semaphore_entry, guest_semaphore_wait, wake_all_guest_sync_for_exception,
+    EVENT_FLAG_WAIT_OR, GuestConditionState, dispatch_guest_sync_import, guest_condition_destroy,
+    guest_condition_init, guest_condition_notify, guest_condition_wait,
+    guest_condition_wait_with_interrupt, guest_event_flag_entry, guest_event_flag_wait,
+    guest_mutex_destroy, guest_mutex_entry, guest_mutex_init, guest_pthread_once,
+    guest_rwlock_destroy, guest_rwlock_init, guest_semaphore_entry, guest_semaphore_wait,
+    wake_all_guest_sync_for_exception,
 };
 #[cfg(target_arch = "x86_64")]
 pub(crate) use guest_sync::{GUEST_SYNC, GuestSyncState};
+pub(crate) use guest_sync::{
+    dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import,
+};
 #[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use guest_sync::{
     guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock, guest_rwlock_unlock,
 };
-pub(crate) use guest_sync::{
-    dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import,
-};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use hid::reset_hid_runtime;
 #[cfg(test)]
 pub(crate) use memory::BATCH_MAP_OPERATION_MAP_DIRECT;
 #[cfg(target_os = "macos")]
@@ -290,8 +292,7 @@ pub(crate) use np_api::{
     np_universal_data_object_set_string, np_universal_data_post_event,
     np_universal_data_register_context, np_universal_data_terminate,
 };
-#[cfg(target_arch = "x86_64")]
-pub(crate) use hid::reset_hid_runtime;
+pub(crate) use pad::dispatch_pad_import;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use pad::reset_pad_runtime;
 #[cfg(test)]
@@ -299,7 +300,6 @@ pub(crate) use pad::{
     SCE_PAD_ERROR_ALREADY_OPENED, SCE_PAD_ERROR_DEVICE_NO_HANDLE, SCE_PAD_ERROR_INVALID_HANDLE,
     SCE_PAD_ERROR_NOT_INITIALIZED,
 };
-pub(crate) use pad::dispatch_pad_import;
 pub(crate) use pad::{pad_get_handle, pad_open};
 pub(crate) use playgo::{
     play_go_accept_request, play_go_close, play_go_get_chunk_id, play_go_get_eta,
@@ -334,9 +334,9 @@ pub(crate) use save_data::{
 pub(crate) use save_data::{
     current_unix_seconds, read_guest_bytes, save_data_commit,
     save_data_create_transaction_resource, save_data_delete, save_data_delete_transaction_resource,
-    save_data_dir_name_search, save_data_initialize, save_data_mount3,
-    save_data_prepare, save_data_save_icon, save_data_set_param, save_data_terminate,
-    save_data_umount2, write_guest_bytes,
+    save_data_dir_name_search, save_data_initialize, save_data_mount3, save_data_prepare,
+    save_data_save_icon, save_data_set_param, save_data_terminate, save_data_umount2,
+    write_guest_bytes,
 };
 use sha1::{Digest, Sha1};
 pub(crate) use shader_cache::{
@@ -472,7 +472,8 @@ struct ProbeDispatchState {
     thread_atexit_count_callback: u64,
     thread_atexit_report_callback: u64,
     /// Per-guest-thread counts `_sceKernelRtldThreadAtexitIncrement` accumulates for CRT teardown.
-    #[allow(dead_code)] // Cleared on process reset; Increment/Decrement wiring still uses module_tls_destructor_refs.
+    #[allow(dead_code)]
+    // Cleared on process reset; Increment/Decrement wiring still uses module_tls_destructor_refs.
     thread_atexit_counts: BTreeMap<u64, u64>,
     thread_dtors_callback: u64,
     /// Pending `__cxa_thread_atexit` destructor references keyed by module base.
@@ -824,7 +825,8 @@ impl GuestMspace {
     }
 }
 
-const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x7f;
+/// Native PS5 process affinity from SDK 10 `_kernel.h`: thirteen logical CPUs.
+const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x1fff;
 const DEFAULT_THREAD_STACK_SIZE: u64 = 0x10_0000;
 const DEFAULT_THREAD_GUARD_SIZE: u64 = 0x1000;
 const DEFAULT_THREAD_PRIORITY: i32 = 700;
@@ -976,7 +978,11 @@ struct RuntimeServiceState {
     play_go_open: bool,
     save_data_dialog_status: i32,
     save_data_dialog_sequence: u64,
+    save_data_dialog_mode: u32,
     save_data_dialog_result_code: u32,
+    save_data_dialog_button: u32,
+    save_data_dialog_dir_name: u64,
+    save_data_dialog_user_data: u64,
     agc_states: BTreeMap<u64, u32>,
     game_update: InitializationState,
     np_entitlement_access: Option<(u64, u64)>,
@@ -1396,7 +1402,8 @@ fn guest_exception_is_pending(thread: u64) -> bool {
 #[derive(Debug)]
 struct ImportTelemetry {
     nids: Box<[String]>,
-    #[allow(dead_code)] // C1 dual representation; cascade→u64 hot-path consumers land with the rewrite.
+    #[allow(dead_code)]
+    // C1 dual representation; cascade→u64 hot-path consumers land with the rewrite.
     nids_u64: Box<[u64]>,
     routes: import_routes::ImportRouteTable,
     seen: Box<[AtomicBool]>,
@@ -2298,6 +2305,88 @@ fn trace_linked_guest_code(image: &LinkedImage) {
                     path.display()
                 ),
             }
+        }
+    }
+}
+
+/// Locates direct RIP-relative references to selected guest addresses in executable regions.
+///
+/// This is intentionally diagnostic-only: it lets a crash trace identify every constructor and
+/// consumer of a guest global without retaining or disassembling the whole linked image.
+#[cfg(target_arch = "x86_64")]
+fn trace_linked_guest_references(image: &LinkedImage) {
+    let Ok(specifications) = std::env::var("REMU_TRACE_GUEST_REFERENCES") else {
+        return;
+    };
+    let targets = specifications
+        .split(',')
+        .filter_map(parse_guest_code_number)
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return;
+    }
+    for &target in &targets {
+        let mut bytes = [0_u8; 16];
+        if image
+            .memory
+            .read(GuestAddress::new(target), &mut bytes)
+            .is_ok()
+        {
+            eprintln!(
+                "[REMu][GUEST-REFERENCE] data={target:#018x} bytes={:02x?}",
+                bytes
+            );
+        }
+    }
+    for region in image
+        .memory
+        .regions()
+        .iter()
+        .filter(|region| region.flags & GUEST_EXECUTE != 0)
+    {
+        let Ok(length) = usize::try_from(region.memory_size) else {
+            continue;
+        };
+        let mut bytes = vec![0_u8; length];
+        if image.memory.read(region.start, &mut bytes).is_err() {
+            continue;
+        }
+        for offset in 0..bytes.len().saturating_sub(7) {
+            let rex = bytes[offset];
+            let opcode = bytes[offset + 1];
+            let modrm = bytes[offset + 2];
+            if !(0x40..=0x4f).contains(&rex)
+                || !matches!(opcode, 0x8b | 0x89 | 0x8d)
+                || modrm & 0xc7 != 0x05
+            {
+                continue;
+            }
+            let displacement = i64::from(i32::from_le_bytes(
+                bytes[offset + 3..offset + 7]
+                    .try_into()
+                    .expect("four-byte slice"),
+            ));
+            let instruction = region.start.get() + u64::try_from(offset).unwrap_or(u64::MAX);
+            let referenced = instruction
+                .checked_add(7)
+                .and_then(|next| next.checked_add_signed(displacement));
+            let Some(target) = referenced.filter(|target| {
+                targets
+                    .iter()
+                    .any(|requested| target.abs_diff(*requested) <= 0x100)
+            }) else {
+                continue;
+            };
+            let sample_start = offset.saturating_sub(16);
+            let sample_end = (offset + 24).min(bytes.len());
+            let sample = bytes[sample_start..sample_end]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "[REMu][GUEST-REFERENCE] instruction={instruction:#018x} target={target:#018x} opcode={opcode:#04x} bytes={sample}"
+            );
         }
     }
 }
@@ -3452,7 +3541,7 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         if let Some(name) = thread_name.as_ref() {
             builder = builder.name(name.clone());
         }
-        if trace_guest_sync() {
+        if trace_guest_sync() || trace_guest_affinity() {
             let (inner_entry, inner_argument) =
                 if process_guest_range_is_readable(thread_argument, 2 * std::mem::size_of::<u64>())
                 {
@@ -3464,10 +3553,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                     (0, 0)
                 };
             eprintln!(
-                "[REMu][THREAD] create handle={handle} name={:?} entry={entry:#x} arg={thread_argument:#x} inner={inner_entry:#x}/{inner_argument:#x} detach={} stack={:#x} host_stack={host_stack_size:#x}",
+                "[REMu][THREAD] create handle={handle} name={:?} entry={entry:#x} arg={thread_argument:#x} inner={inner_entry:#x}/{inner_argument:#x} detach={} stack={:#x} host_stack={host_stack_size:#x} affinity={:#x}",
                 thread_name.as_deref().unwrap_or(""),
                 attributes.detach_state,
-                attributes.stack_size
+                attributes.stack_size,
+                attributes.affinity_mask,
             );
         }
         let trace_name = thread_name.clone();
@@ -4029,8 +4119,7 @@ fn kernel_load_start_module(arguments: [u64; 6]) -> u64 {
         .unwrap_or(&requested_path);
     // Lifecycle claims live outside ProbeDispatchState so constructors never run while a second
     // thread can dlsym a half-constructed module (F4 / SDK `_kernel.h:79-85`).
-    if let Some(claim) =
-        module_lifecycle::begin_load_start_module(&requested_path, requested_name)
+    if let Some(claim) = module_lifecycle::begin_load_start_module(&requested_path, requested_name)
     {
         let start_result =
             invoke_guest_module_initializers(&claim.initializers, arguments[1], arguments[2]);
@@ -4151,15 +4240,16 @@ fn kernel_dlsym(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     // Prefer the lifecycle registry so dlsym waits out Starting and never reads exports from a
     // half-constructed module (F4). Fall back to the dispatch snapshot for handles that never
     // entered the registry (tests / pre-reset probes).
-    let guest_target = module_lifecycle::resolve_started_export(handle, &nid).unwrap_or_else(|| {
-        state
-            .bundled_modules
-            .iter()
-            .find(|module| module.handle == handle && module.started)
-            .and_then(|module| module.exports_by_nid.get(&nid))
-            .copied()
-            .unwrap_or_default()
-    });
+    let guest_target =
+        module_lifecycle::resolve_started_export(handle, &nid).unwrap_or_else(|| {
+            state
+                .bundled_modules
+                .iter()
+                .find(|module| module.handle == handle && module.started)
+                .and_then(|module| module.exports_by_nid.get(&nid))
+                .copied()
+                .unwrap_or_default()
+        });
     let target = if hle_target != 0 {
         hle_target
     } else {
@@ -5064,7 +5154,13 @@ fn dispatch_probe_import(
         "rKBUtgRrtbk" => video_out_register_buffers2(arguments, state),
         "HXzjK9yI30k" => video_out_add_flip_event(arguments, state),
         "Xru92wHJRmg" => video_out_add_vblank_event(arguments, state),
-        "w0hLuNarQxY" => if low_i32(arguments[0]) == 1 { 0 } else { sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE) },
+        "w0hLuNarQxY" => {
+            if low_i32(arguments[0]) == 1 {
+                0
+            } else {
+                sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE)
+            }
+        }
         // libScePad output structures must always be initialized; successful no-ops would expose
         // stale guest stack contents as controller capabilities and button state.
         // Prefer dispatch_pad_import for new NIDs; these arms remain for the probe path.
@@ -5088,9 +5184,9 @@ fn dispatch_probe_import(
                 return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
             };
             guest_memset(output, 0, 12);
-            write_guest_u32(output, 100);
-            write_guest_u32(output + 4, 100);
-            write_guest_u32(output + 8, 100);
+            write_guest_u32(output, 100.0_f32.to_bits());
+            write_guest_u32(output + 4, 100.0_f32.to_bits());
+            write_guest_u32(output + 8, 100.0_f32.to_bits());
             0
         }
         // libSceSaveData uses durable host-side transactions while preserving the guest ABI.
@@ -7130,9 +7226,7 @@ fn begin_deferred_gpu_publication() {
             publication.is_none(),
             "nested GPU publication capture would lose event ordering"
         );
-        *publication = Some(DeferredGpuPublication {
-            events: Vec::new(),
-        });
+        *publication = Some(DeferredGpuPublication { events: Vec::new() });
     });
 }
 
@@ -7768,6 +7862,12 @@ fn trace_ampr_reads() -> bool {
 fn trace_guest_sync() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_SYNC").is_some_and(|value| value == "1"))
+}
+
+fn trace_guest_affinity() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var_os("REMU_TRACE_AFFINITY").is_some_and(|value| value == "1"))
 }
 
 fn sanitizer_new_replace_external() -> u64 {
@@ -8720,6 +8820,7 @@ fn probe_entry(
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");
     }
     trace_linked_guest_code(image);
+    trace_linked_guest_references(image);
     start_abi_gap_reporter();
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     resolve_pending_ifunc_relocations(image);

@@ -6,7 +6,7 @@ use crate::{
     PthreadAttrState, PthreadKeyState, PthreadMutexAttrObject, PthreadMutexAttrState,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TRY_AGAIN,
     current_guest_thread_handle, guest_calloc, guest_free, low_i32, low_u32, read_guest_cstring,
-    read_guest_u32, sce_kernel_error, write_guest_u32, write_guest_u64,
+    read_guest_u32, sce_kernel_error, trace_guest_affinity, write_guest_u32, write_guest_u64,
 };
 
 pub(crate) fn create_pthread_attr(
@@ -306,6 +306,18 @@ pub(crate) fn pthread_set_affinity(arguments: [u64; 6], state: &mut ProbeDispatc
         .entry(arguments[0])
         .or_default()
         .affinity_mask = arguments[1];
+    if trace_guest_affinity() {
+        eprintln!(
+            "[REMu][AFFINITY] set thread={:#x} name={:?} mask={:#x}",
+            arguments[0],
+            state
+                .pthread_threads
+                .get(&arguments[0])
+                .map(|thread| thread.name.as_str())
+                .unwrap_or("unknown"),
+            arguments[1],
+        );
+    }
     0
 }
 

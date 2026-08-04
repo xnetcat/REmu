@@ -545,7 +545,9 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                     1 => {
                         if attribute.value == 0
                             || attribute.value_size < std::mem::size_of::<f32>() as u64
-                            || !attribute.value_size.is_multiple_of(std::mem::size_of::<f32>() as u64)
+                            || !attribute
+                                .value_size
+                                .is_multiple_of(std::mem::size_of::<f32>() as u64)
                         {
                             return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
                         }

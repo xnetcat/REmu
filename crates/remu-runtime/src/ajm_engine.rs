@@ -83,6 +83,11 @@ const AJM_CODEC_DEC_CELP8: u32 = 3; // celp8_decoder.h:23
 const AJM_CODEC_ENC_CELP8: u32 = 4; // celp8_encoder.h:23
 const AJM_CODEC_DEC_CELP: u32 = 12; // celp_decoder.h:23
 const AJM_CODEC_ENC_CELP: u32 = 13; // celp_encoder.h:23
+/// Private platform codec observed in production PS5 middleware.  It is intentionally kept
+/// distinct from the public codec names: SDK 10's public AJM headers skip identifier 14, while
+/// Silent Hill registers and unregisters it during Wwise hardware initialization.  Registration
+/// is a module-lifecycle operation; a decode job still requires a real `host_codec` below.
+const AJM_CODEC_PRIVATE_14: u32 = 14;
 const AJM_CODEC_DEC_HEVAG: u32 = 22; // hevag_decoder.h:21
 pub(crate) const AJM_CODEC_DEC_LPCM: u32 = 23; // lpcm_decoder.h:30
 const AJM_CODEC_DEC_OPUS: u32 = 24; // opus_decoder.h:20
@@ -886,6 +891,7 @@ fn codec_type_is_defined(codec: u32) -> bool {
             | AJM_CODEC_ENC_CELP8
             | AJM_CODEC_DEC_CELP
             | AJM_CODEC_ENC_CELP
+            | AJM_CODEC_PRIVATE_14
             | AJM_CODEC_DEC_HEVAG
             | AJM_CODEC_DEC_LPCM
             | AJM_CODEC_DEC_OPUS
@@ -901,6 +907,7 @@ fn codec_display_name(codec: u32) -> &'static str {
         AJM_CODEC_ENC_CELP8 => "CELP8 encoder",
         AJM_CODEC_DEC_CELP => "CELP decoder",
         AJM_CODEC_ENC_CELP => "CELP encoder",
+        AJM_CODEC_PRIVATE_14 => "private platform codec 14",
         AJM_CODEC_DEC_HEVAG => "HE-VAG decoder",
         AJM_CODEC_DEC_LPCM => "LPCM decoder",
         AJM_CODEC_DEC_OPUS => "Opus decoder",
@@ -1237,7 +1244,8 @@ impl AjmCodec for M4aacCodec {
                 frames: 0,
             };
         };
-        let mut produced = Vec::with_capacity(samples.len() * usize::try_from(output_sample).unwrap_or(2));
+        let mut produced =
+            Vec::with_capacity(samples.len() * usize::try_from(output_sample).unwrap_or(2));
         for sample in samples {
             push_output_sample(&mut produced, sample, output_encoding);
         }
@@ -1295,7 +1303,8 @@ impl AjmCodec for Mp3Codec {
         } else {
             samples.len() as u64 / channels
         };
-        let mut produced = Vec::with_capacity(samples.len() * usize::try_from(output_sample).unwrap_or(2));
+        let mut produced =
+            Vec::with_capacity(samples.len() * usize::try_from(output_sample).unwrap_or(2));
         for sample in samples {
             push_output_sample(&mut produced, sample, output_encoding);
         }

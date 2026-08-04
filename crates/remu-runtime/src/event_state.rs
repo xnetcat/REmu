@@ -25,16 +25,17 @@ pub(crate) struct EventState {
 static EVENT_STATE: OnceLock<RwLock<EventState>> = OnceLock::new();
 
 fn cell() -> &'static RwLock<EventState> {
-    EVENT_STATE.get_or_init(|| RwLock::new(EventState {
-        next_equeue: 1,
-        ..EventState::default()
-    }))
+    EVENT_STATE.get_or_init(|| {
+        RwLock::new(EventState {
+            next_equeue: 1,
+            ..EventState::default()
+        })
+    })
 }
 
 /// Write lock for EventState. When ProbeDispatch is already held, nests without re-entering the
 /// hierarchy (producers under the dispatch lock still publish into EventState as sole store).
-pub(crate) fn lock_event_state_for_write()
--> (
+pub(crate) fn lock_event_state_for_write() -> (
     Option<LockHierarchyGuard>,
     RwLockWriteGuard<'static, EventState>,
 ) {
@@ -48,8 +49,7 @@ pub(crate) fn lock_event_state_for_write()
     (hierarchy, guard)
 }
 
-pub(crate) fn lock_event_state_for_read()
--> (
+pub(crate) fn lock_event_state_for_read() -> (
     Option<LockHierarchyGuard>,
     RwLockReadGuard<'static, EventState>,
 ) {
@@ -103,7 +103,6 @@ pub(crate) fn queue_kernel_event_into(events: &mut EventState, mut event: Kernel
     }
 }
 
-
 pub(crate) fn with_event_state_mut<R>(f: impl FnOnce(&mut EventState) -> R) -> R {
     let (_h, mut events) = lock_event_state_for_write();
     f(&mut events)
@@ -124,7 +123,9 @@ mod tests {
         reset_event_state_for_tests();
         let (_h, mut state) = lock_event_state_for_write();
         state.next_equeue = 7;
-        crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(7); });
+        crate::event_state::with_event_state_mut(|e| {
+            e.kernel_equeues.insert(7);
+        });
         assert!(state.kernel_equeues.contains(&7));
     }
 
@@ -133,7 +134,9 @@ mod tests {
         reset_event_state_for_tests();
         let _dispatch = LockHierarchyGuard::enter(LockLevel::ProbeDispatch);
         let (_h, state) = lock_event_state_for_write();
-        crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(3); });
+        crate::event_state::with_event_state_mut(|e| {
+            e.kernel_equeues.insert(3);
+        });
         assert!(state.kernel_equeues.contains(&3));
     }
 }

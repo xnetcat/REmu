@@ -397,8 +397,12 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
     crate::request_agc_submission_completion(&mut state, 0, Vec::new());
     crate::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
 
-    assert!(crate::event_state::with_event_state(|e| e.pending_agc_completions.is_empty()));
-    assert!(crate::event_state::with_event_state(|e| e.pending_agc_user_interrupts.is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_agc_completions
+        .is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_agc_user_interrupts
+        .is_empty()));
 
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_thread_local_event_sink(sender);
@@ -406,11 +410,19 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
     state.agc_submission_count = 42;
     crate::request_agc_compute_submission_completion(&mut state, 32, Vec::new());
     assert_eq!(
-        crate::event_state::with_event_state(|e| e.pending_agc_completions.iter().copied().collect::<Vec<_>>()),
+        crate::event_state::with_event_state(|e| e
+            .pending_agc_completions
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()),
         [(41, 0)]
     );
     assert_eq!(
-        crate::event_state::with_event_state(|e| e.pending_agc_user_interrupts.iter().copied().collect::<Vec<_>>()),
+        crate::event_state::with_event_state(|e| e
+            .pending_agc_user_interrupts
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()),
         [42]
     );
     assert!(matches!(
@@ -557,10 +569,15 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
         0xfeed_face
     );
     assert!(
-        crate::event_state::with_event_state(|e| e.pending_events.iter().all(|pending| pending.ident != 0x20)),
+        crate::event_state::with_event_state(|e| e
+            .pending_events
+            .iter()
+            .all(|pending| pending.ident != 0x20)),
         "graphics completion must not wake an unrelated compute queue"
     );
-    assert!(crate::event_state::with_event_state(|e| e.pending_agc_completions.is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_agc_completions
+        .is_empty()));
     assert_eq!(state.agc_completion_telemetry.refreshed_graphics, 2);
     assert_eq!(
         state.agc_completion_telemetry.queued_graphics_notifications,
@@ -583,7 +600,9 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
     let mut state = ProbeDispatchState::default();
-    crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.extend([1, 2]); });
+    crate::event_state::with_event_state_mut(|e| {
+        e.kernel_equeues.extend([1, 2]);
+    });
     assert_eq!(
         crate::kernel_register_event(
             &mut state,
@@ -604,15 +623,29 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
         ),
         0
     );
-    crate::event_state::with_event_state_mut(|e| { e.pending_agc_user_interrupts.push_back(sequence); });
+    crate::event_state::with_event_state_mut(|e| {
+        e.pending_agc_user_interrupts.push_back(sequence);
+    });
     remu_gpu::record_gpu_submission_completed(sequence);
 
     crate::refresh_completed_agc_submissions(&mut state);
 
-    assert!(crate::event_state::with_event_state(|e| e.pending_agc_completions.is_empty()));
-    assert!(crate::event_state::with_event_state(|e| e.pending_agc_user_interrupts.is_empty()));
-    assert_eq!(crate::event_state::with_event_state(|e| e.pending_events.len()), 1);
-    let user_event = crate::event_state::with_event_state(|e| e.pending_events.front().cloned().expect("AGC user interrupt"));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_agc_completions
+        .is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_agc_user_interrupts
+        .is_empty()));
+    assert_eq!(
+        crate::event_state::with_event_state(|e| e.pending_events.len()),
+        1
+    );
+    let user_event = crate::event_state::with_event_state(|e| {
+        e.pending_events
+            .front()
+            .cloned()
+            .expect("AGC user interrupt")
+    });
     assert_eq!(user_event.equeue, 1);
     assert_eq!(user_event.ident, 0x1800);
     assert_eq!(user_event.fflags, 1);
@@ -656,7 +689,9 @@ fn completion_ledger_identifies_a_backend_id_without_a_runtime_owner() {
         state.agc_completion_telemetry.last_unmatched_backend_id,
         Some(sequence)
     );
-    assert!(crate::event_state::with_event_state(|e| e.pending_events.is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_events
+        .is_empty()));
 }
 
 #[test]

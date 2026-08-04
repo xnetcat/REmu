@@ -13,10 +13,10 @@ use crate::{
     stall_report_interval, trace_guest_sync, write_guest_u32, write_guest_u64,
 };
 
+use super::guest_sync;
 use super::state::{
     EVENT_FLAG_SET_SEQUENCE, EVENT_FLAG_WAIT_SEQUENCE, GuestEventFlagEntry, GuestEventFlagState,
 };
-use super::guest_sync;
 
 pub(super) const EVENT_FLAG_WAIT_AND: u32 = 0x01;
 

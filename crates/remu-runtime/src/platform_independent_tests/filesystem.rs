@@ -5,6 +5,8 @@ use std::path::Path;
 
 use std::sync::Mutex;
 
+use crate::guest_files::resolve_probe_guest_path_from_roots;
+
 use super::{
     AMPR_INVALID_FILE_ID, AprResolveOutputs, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KERNEL_FILES,
     KernelDirectory, KernelFileState, ProbeDispatchState, SAVE_DATA_ERROR_BUSY,
@@ -405,6 +407,15 @@ fn persists_and_searches_transactional_save_data() {
             .1,
         "a transaction mount is not writable before Prepare"
     );
+    assert!(
+        !resolve_probe_guest_path_from_roots(
+            &crate::path_roots::load_path_roots(),
+            "/savedata0/save.bin"
+        )
+        .unwrap()
+        .1,
+        "the pre-lock path snapshot observes the mounted read-only transaction"
+    );
 
     let mut prepare = [0_u8; 0x28];
     prepare[..4].copy_from_slice(&resource.to_le_bytes());
@@ -420,6 +431,16 @@ fn persists_and_searches_transactional_save_data() {
             .unwrap()
             .1,
         "Prepare exposes the staging tree for writes"
+    );
+    let (published_staging_path, published_writable) = resolve_probe_guest_path_from_roots(
+        &crate::path_roots::load_path_roots(),
+        "/savedata0/save.bin",
+    )
+    .unwrap();
+    assert!(published_writable, "Prepare publishes the writable window");
+    assert!(
+        published_staging_path.starts_with(&state.save_root),
+        "the pre-lock snapshot resolves inside the transaction staging tree"
     );
 
     let mut param = [0_u8; SAVE_DATA_PARAM_SIZE];
@@ -453,8 +474,8 @@ fn persists_and_searches_transactional_save_data() {
         0
     );
 
-    let committed_param = crate::vfs::save_data_slots_root(&state.save_root)
-        .join("SAVEDATA00/sce_sys/param.bin");
+    let committed_param =
+        crate::vfs::save_data_slots_root(&state.save_root).join("SAVEDATA00/sce_sys/param.bin");
     assert_ne!(
         &std::fs::read(&committed_param).unwrap()[..14],
         b"Save Metadata\0"
@@ -470,6 +491,15 @@ fn persists_and_searches_transactional_save_data() {
             .unwrap()
             .1,
         "Commit closes the writable transaction window"
+    );
+    assert!(
+        !resolve_probe_guest_path_from_roots(
+            &crate::path_roots::load_path_roots(),
+            "/savedata0/save.bin"
+        )
+        .unwrap()
+        .1,
+        "Commit closes the published writable window"
     );
     assert_eq!(
         &std::fs::read(&committed_param).unwrap()[..14],
@@ -558,6 +588,14 @@ fn persists_and_searches_transactional_save_data() {
     );
     assert_eq!(std::fs::read(committed_by_umount).unwrap(), b"committed");
     assert!(!state.save_mounts.contains_key("/savedata0"));
+    assert!(
+        resolve_probe_guest_path_from_roots(
+            &crate::path_roots::load_path_roots(),
+            "/savedata0/committed-by-umount.bin"
+        )
+        .is_none(),
+        "Umount removes the mount from the pre-lock path snapshot"
+    );
     write_guest_u32(mount_address + 0x20, 1 << 2);
     assert_eq!(
         save_data_mount3([mount_address, result_address, 0, 0, 0, 0], &mut state),

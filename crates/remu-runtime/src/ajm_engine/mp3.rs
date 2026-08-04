@@ -127,7 +127,8 @@ impl Mp3Decoder {
                 // Reconstruct a plausible 32-bit header word for the sideband from the
                 // bytes minimp3 just accepted (big-endian sync word at the frame start).
                 if remain.len() >= 4 {
-                    self.last_header = u32::from_be_bytes([remain[0], remain[1], remain[2], remain[3]]);
+                    self.last_header =
+                        u32::from_be_bytes([remain[0], remain[1], remain[2], remain[3]]);
                     self.last_crc = if (remain[1] & 0x01) == 0 { 0 } else { 1 };
                     self.last_mode = (remain[3] >> 6) & 0x3;
                 }

@@ -714,7 +714,10 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
         remu_gpu::ComputeGrid::Threadgroups([3, 2, 1])
     );
     assert_eq!(dispatch.shader_address, program_address);
-    assert!(crate::agc_dispatch_state::with_agc(|agc| agc.graphics.shader_registers.is_empty()));
+    assert!(crate::agc_dispatch_state::with_agc(|agc| agc
+        .graphics
+        .shader_registers
+        .is_empty()));
     assert_eq!(
         crate::agc_dispatch_state::with_agc(|agc| {
             agc.compute_queues.get(&7).and_then(|queue| {
@@ -727,11 +730,19 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
         Some(low_u32(program_address >> 8))
     );
     assert_eq!(
-        crate::event_state::with_event_state(|e| e.pending_agc_completions.iter().copied().collect::<Vec<_>>()),
+        crate::event_state::with_event_state(|e| e
+            .pending_agc_completions
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()),
         vec![]
     );
     assert_eq!(
-        crate::event_state::with_event_state(|e| e.pending_agc_user_interrupts.iter().copied().collect::<Vec<_>>()),
+        crate::event_state::with_event_state(|e| e
+            .pending_agc_user_interrupts
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()),
         vec![1]
     );
 }

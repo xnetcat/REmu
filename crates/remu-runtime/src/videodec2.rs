@@ -12,7 +12,7 @@
 use crate::av_player_libav::LibavCodecSession;
 use crate::{
     ProbeDispatchState, process_guest_range_is_readable, read_guest_u32, read_guest_u64,
-    sce_kernel_error, write_guest_u32, write_guest_u64, write_guest_u8,
+    sce_kernel_error, write_guest_u8, write_guest_u32, write_guest_u64,
 };
 
 fn low_u8(value: u64) -> u8 {
@@ -277,10 +277,7 @@ fn decode(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let au = read_guest_u64(input + 0x08);
     let au_size = read_guest_u64(input + 0x10);
     let pts = read_guest_u64(input + 0x18) as i64;
-    if au == 0
-        || au_size == 0
-        || !process_guest_range_is_readable(au, au_size as usize)
-    {
+    if au == 0 || au_size == 0 || !process_guest_range_is_readable(au, au_size as usize) {
         return sce_kernel_error(VIDEODEC2_ERROR_ARGUMENT_POINTER);
     }
     let frame_ptr = read_guest_u64(frame_buffer + 0x08);
@@ -311,7 +308,15 @@ fn decode(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
                 return sce_kernel_error(VIDEODEC2_ERROR_FRAME_BUFFER_SIZE);
             }
             write_guest_u8(frame_buffer + 0x18, 1); // isAccepted
-            write_output_info(output, instance.codec_type, width, height, pitch, frame_ptr, need);
+            write_output_info(
+                output,
+                instance.codec_type,
+                width,
+                height,
+                pitch,
+                frame_ptr,
+                need,
+            );
             instance.next_handle_stamp = instance.next_handle_stamp.saturating_add(1);
             0
         }
@@ -384,7 +389,15 @@ fn flush(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
                 .saturating_mul(3)
                 / 2;
             write_guest_u8(frame_buffer + 0x18, 1);
-            write_output_info(output, instance.codec_type, width, height, pitch, frame_ptr, need);
+            write_output_info(
+                output,
+                instance.codec_type,
+                width,
+                height,
+                pitch,
+                frame_ptr,
+                need,
+            );
             0
         }
         Ok(None) | Err(()) => {

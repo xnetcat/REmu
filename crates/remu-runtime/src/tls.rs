@@ -5,11 +5,11 @@ use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::link::collect_initializer_array;
 use crate::link::fs_decode::{
     collect_fs_decode_seed_addresses, report_fs_load_boundary_mismatches, seed_offsets_in_region,
     seeded_fs_load_sites,
 };
-use crate::link::collect_initializer_array;
 use crate::unwind::collect_eh_frame_function_starts;
 use crate::{
     GuestTls, LinkError, MACOS_GUEST_PAGE_ALIGNMENT, PT_TLS, add_address,

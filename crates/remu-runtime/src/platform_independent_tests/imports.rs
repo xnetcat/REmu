@@ -314,10 +314,7 @@ fn pending_guest_exception_interrupts_event_flag_and_semaphore_waits() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .semaphores
-        .insert(
-            SEMAPHORE,
-            crate::guest_semaphore_entry(0, 1),
-        );
+        .insert(SEMAPHORE, crate::guest_semaphore_entry(0, 1));
     crate::guest_exception_delivery()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

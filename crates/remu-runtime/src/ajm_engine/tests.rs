@@ -247,6 +247,25 @@ fn instance_creation_validates_codec_type_and_registration_and_records_flags() {
 }
 
 #[test]
+fn private_codec_14_has_a_real_module_lifecycle_without_fabricating_decode_support() {
+    let engine = AjmEngine::new();
+    let context = create_context(&engine);
+    assert_eq!(
+        engine.module_register(args(&[u64::from(context), u64::from(AJM_CODEC_PRIVATE_14)])),
+        SUCCESS,
+        "production PS5 middleware registers private AJM codec 14"
+    );
+    assert!(
+        host_codec(AJM_CODEC_PRIVATE_14).is_none(),
+        "module registration must not invent a decoder implementation"
+    );
+    assert_eq!(
+        engine.module_unregister(args(&[u64::from(context), u64::from(AJM_CODEC_PRIVATE_14)])),
+        SUCCESS
+    );
+}
+
+#[test]
 fn batch_initialize_writes_only_the_five_qword_cursor() {
     let batch = [0x5a_u8; 0x708];
     let original_batch = batch;
@@ -1223,7 +1242,10 @@ fn m4aac_decodes_an_adts_stream_and_matches_the_independent_ffmpeg_golden() {
         "decoded PCM disagrees with the independent ffmpeg golden by {max_abs_diff} > 64"
     );
     let peak = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap();
-    assert!(peak > 1000, "decoded audio must not be silence (peak={peak})");
+    assert!(
+        peak > 1000,
+        "decoded audio must not be silence (peak={peak})"
+    );
 }
 
 // --- P6 MP3 -----------------------------------------------------------------------
@@ -1237,7 +1259,13 @@ fn mp3_decodes_a_stream_and_matches_the_independent_ffmpeg_golden() {
     let context = create_context(&engine);
     let instance = create_instance(&engine, context, AJM_CODEC_DEC_MP3, 2);
 
-    let mut output = vec![0_u8; MP3_GOLDEN.len().saturating_mul(2).max(MP3_GOLDEN.len() + 8192)];
+    let mut output = vec![
+        0_u8;
+        MP3_GOLDEN
+            .len()
+            .saturating_mul(2)
+            .max(MP3_GOLDEN.len() + 8192)
+    ];
     let mut initialize_result = [0xff_u8; 8];
     let mut decode_result = [0xff_u8; 32];
     let mut fixture = BatchFixture::new();
@@ -1302,7 +1330,10 @@ fn mp3_decodes_a_stream_and_matches_the_independent_ffmpeg_golden() {
         "decoded PCM disagrees with the independent ffmpeg golden by {max_abs_diff} > 96"
     );
     let peak = decoded.iter().map(|s| s.unsigned_abs()).max().unwrap();
-    assert!(peak > 1000, "decoded audio must not be silence (peak={peak})");
+    assert!(
+        peak > 1000,
+        "decoded audio must not be silence (peak={peak})"
+    );
 }
 
 // --- P3 Kraken/Oodle --------------------------------------------------------------
@@ -1324,10 +1355,7 @@ fn ampr_kraken_decode_stage_matches_the_two_phase_closure_signature() {
     use std::io::Write;
     // File framing = 8-byte LE uncompressed size + Kraken bitstream (ooz CLI convention).
     let mut path = std::env::temp_dir();
-    path.push(format!(
-        "remu-kraken-stage-{}.bin",
-        std::process::id()
-    ));
+    path.push(format!("remu-kraken-stage-{}.bin", std::process::id()));
     {
         let mut file = std::fs::File::create(&path).unwrap();
         let size = KRAKEN_PLAIN.len() as u64;

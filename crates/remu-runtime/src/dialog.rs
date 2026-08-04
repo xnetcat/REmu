@@ -6,7 +6,8 @@
 //! Opening a dialog publishes [`remu_gpu::GpuEvent::ShowHostDialog`] to the presenter, which
 //! composites a PS5-like panel over the guest scanout. Status stays `RUNNING` until the presenter
 //! records a result through [`remu_gpu::complete_host_dialog`]. Headless runs and
-//! `REMU_AUTO_DISMISS_DIALOGS` auto-complete with cancel so titles that poll never hang.
+//! `REMU_AUTO_DISMISS_DIALOGS` acknowledge one-button notices and conservatively decline actual
+//! choices so titles that poll never hang without changing a notice into a cancellation.
 
 use crate::{
     CommonDialogOwner, InitializationState, ProbeDispatchState, guest_output_pointer,
@@ -16,6 +17,7 @@ use crate::{
 use remu_gpu::{
     HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResultCode, HostToastRequest,
     begin_host_dialog, cancel_host_dialog, complete_host_dialog, host_dialog_result,
+    unattended_dialog_result,
 };
 
 const COMMON_DIALOG_STATUS_NONE: u32 = 0;
@@ -36,6 +38,25 @@ const MESSAGE_DIALOG_RESULT_USER_CANCELED: u32 = 1;
 /// `SceSaveDataDialogResult` layout: mode, result, buttonId, reserved...
 const SAVE_DATA_DIALOG_RESULT_OK: u32 = 0;
 const SAVE_DATA_DIALOG_RESULT_USER_CANCELED: u32 = 1;
+const SAVE_DATA_DIALOG_MODE_INVALID: u32 = 0;
+const SAVE_DATA_DIALOG_MODE_LIST: u32 = 1;
+const SAVE_DATA_DIALOG_MODE_USER_MSG: u32 = 2;
+const SAVE_DATA_DIALOG_MODE_SYSTEM_MSG: u32 = 3;
+const SAVE_DATA_DIALOG_MODE_ERROR_CODE: u32 = 4;
+const SAVE_DATA_DIALOG_MODE_PROGRESS_BAR: u32 = 5;
+const SAVE_DATA_DIALOG_MODE_WIZARD_LIST: u32 = 6;
+const SAVE_DATA_DIALOG_MODE_WIZARD_CONFIRM: u32 = 7;
+const SAVE_DATA_DIALOG_BUTTON_INVALID: u32 = 0;
+const SAVE_DATA_DIALOG_BUTTON_OK: u32 = 1;
+const SAVE_DATA_DIALOG_BUTTON_NO: u32 = 2;
+const SAVE_DATA_DIALOG_PARAM_MODE_OFFSET: u64 = 0x34;
+const SAVE_DATA_DIALOG_PARAM_DISPLAY_TYPE_OFFSET: u64 = 0x38;
+const SAVE_DATA_DIALOG_PARAM_ITEMS_OFFSET: u64 = 0x48;
+const SAVE_DATA_DIALOG_PARAM_USER_MESSAGE_OFFSET: u64 = 0x50;
+const SAVE_DATA_DIALOG_PARAM_SYSTEM_MESSAGE_OFFSET: u64 = 0x58;
+const SAVE_DATA_DIALOG_PARAM_ERROR_CODE_OFFSET: u64 = 0x60;
+const SAVE_DATA_DIALOG_PARAM_USER_DATA_OFFSET: u64 = 0x70;
+const SAVE_DATA_DIALOG_RESULT_SIZE: usize = 0x48;
 
 pub(crate) fn message_dialog_initialize(state: &mut ProbeDispatchState) -> u64 {
     if state.services.common_dialog != InitializationState::Initialized {
@@ -228,7 +249,11 @@ pub(crate) fn save_data_dialog_initialize(state: &mut ProbeDispatchState) -> u64
     state.services.save_data_dialog_status = COMMON_DIALOG_STATUS_INITIALIZED.cast_signed();
     state.services.common_dialog_owner = Some(CommonDialogOwner::SaveData);
     state.services.save_data_dialog_sequence = 0;
+    state.services.save_data_dialog_mode = SAVE_DATA_DIALOG_MODE_INVALID;
     state.services.save_data_dialog_result_code = SAVE_DATA_DIALOG_RESULT_USER_CANCELED;
+    state.services.save_data_dialog_button = SAVE_DATA_DIALOG_BUTTON_INVALID;
+    state.services.save_data_dialog_dir_name = 0;
+    state.services.save_data_dialog_user_data = 0;
     0
 }
 
@@ -251,16 +276,21 @@ pub(crate) fn save_data_dialog_open(parameters: u64, state: &mut ProbeDispatchSt
     if parameters == 0 {
         return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
     }
+    let request = decode_save_data_dialog_request(parameters);
     let sequence = begin_host_dialog();
     state.services.save_data_dialog_sequence = sequence;
+    state.services.save_data_dialog_mode = request.mode;
     state.services.save_data_dialog_result_code = SAVE_DATA_DIALOG_RESULT_USER_CANCELED;
+    state.services.save_data_dialog_button = SAVE_DATA_DIALOG_BUTTON_INVALID;
+    state.services.save_data_dialog_dir_name = request.dir_name;
+    state.services.save_data_dialog_user_data = request.user_data;
     state.services.save_data_dialog_status = COMMON_DIALOG_STATUS_RUNNING.cast_signed();
     publish_or_auto_dismiss(
         HostDialogRequest {
             kind: HostDialogKind::SaveData,
             title: "Saved Data".to_owned(),
-            message: "Continue without loading saved data?".to_owned(),
-            buttons: HostDialogButtons::OkCancel,
+            message: request.message,
+            buttons: request.buttons,
             sequence,
         },
         sequence,
@@ -300,14 +330,152 @@ pub(crate) fn save_data_dialog_get_result(output: u64, state: &ProbeDispatchStat
     if state.services.save_data_dialog_status == COMMON_DIALOG_STATUS_NONE.cast_signed() {
         return sce_kernel_error(COMMON_DIALOG_ERROR_NOT_INITIALIZED);
     }
-    let Some(output) = guest_output_pointer(output, 16) else {
+    let Some(output) = guest_output_pointer(output, SAVE_DATA_DIALOG_RESULT_SIZE) else {
         return sce_kernel_error(COMMON_DIALOG_ERROR_ARG_NULL);
     };
-    write_guest_u32(output, 0);
+    // SAFETY: `guest_output_pointer` validated the complete SDK `SceSaveDataDialogResult` span.
+    unsafe { std::ptr::write_bytes(output as *mut u8, 0, SAVE_DATA_DIALOG_RESULT_SIZE) };
+    write_guest_u32(output, state.services.save_data_dialog_mode);
     write_guest_u32(output + 4, state.services.save_data_dialog_result_code);
-    write_guest_u32(output + 8, 0);
-    write_guest_u32(output + 12, 0);
+    write_guest_u32(output + 8, state.services.save_data_dialog_button);
+    crate::write_guest_u64(output + 0x10, state.services.save_data_dialog_dir_name);
+    crate::write_guest_u64(output + 0x20, state.services.save_data_dialog_user_data);
     0
+}
+
+struct DecodedSaveDataDialogRequest {
+    mode: u32,
+    message: String,
+    buttons: HostDialogButtons,
+    dir_name: u64,
+    user_data: u64,
+}
+
+fn decode_save_data_dialog_request(parameters: u64) -> DecodedSaveDataDialogRequest {
+    let mode = read_guest_u32(parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_MODE_OFFSET));
+    let display_type =
+        read_guest_u32(parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_DISPLAY_TYPE_OFFSET));
+    let user_data =
+        read_guest_u64(parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_USER_DATA_OFFSET));
+    let mut dir_name = 0;
+    let (message, buttons) = match mode {
+        SAVE_DATA_DIALOG_MODE_LIST => {
+            let items =
+                read_guest_u64(parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_ITEMS_OFFSET));
+            if items != 0 && read_guest_u32(items + 0x18) != 0 {
+                dir_name = read_guest_u64(items + 0x10);
+            }
+            (
+                format!("Select saved data to {}.", save_data_action(display_type)),
+                HostDialogButtons::OkCancel,
+            )
+        }
+        SAVE_DATA_DIALOG_MODE_USER_MSG => {
+            let user = read_guest_u64(
+                parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_USER_MESSAGE_OFFSET),
+            );
+            if user == 0 {
+                ("Saved data message".to_owned(), HostDialogButtons::Ok)
+            } else {
+                let button_type = read_guest_u32(user);
+                let message = read_guest_cstring(read_guest_u64(user + 0x08))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "Saved data message".to_owned());
+                (message, save_data_buttons(button_type))
+            }
+        }
+        SAVE_DATA_DIALOG_MODE_SYSTEM_MSG => {
+            let system = read_guest_u64(
+                parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_SYSTEM_MESSAGE_OFFSET),
+            );
+            let message_type = (system != 0)
+                .then(|| read_guest_u32(system))
+                .unwrap_or_default();
+            save_data_system_message(message_type, display_type)
+        }
+        SAVE_DATA_DIALOG_MODE_ERROR_CODE => {
+            let error =
+                read_guest_u64(parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_ERROR_CODE_OFFSET));
+            let code = (error != 0)
+                .then(|| read_guest_u32(error))
+                .unwrap_or_default();
+            (
+                format!("Saved data error {code:#010x}"),
+                HostDialogButtons::Ok,
+            )
+        }
+        SAVE_DATA_DIALOG_MODE_PROGRESS_BAR => {
+            ("Processing saved data...".to_owned(), HostDialogButtons::Ok)
+        }
+        SAVE_DATA_DIALOG_MODE_WIZARD_LIST | SAVE_DATA_DIALOG_MODE_WIZARD_CONFIRM => (
+            "Confirm the saved data operation.".to_owned(),
+            HostDialogButtons::YesNo,
+        ),
+        _ => ("Saved data message".to_owned(), HostDialogButtons::Ok),
+    };
+    DecodedSaveDataDialogRequest {
+        mode,
+        message,
+        buttons,
+        dir_name,
+        user_data,
+    }
+}
+
+fn save_data_buttons(button_type: u32) -> HostDialogButtons {
+    match button_type {
+        1 => HostDialogButtons::YesNo,
+        3 => HostDialogButtons::OkCancel,
+        _ => HostDialogButtons::Ok,
+    }
+}
+
+fn save_data_action(display_type: u32) -> &'static str {
+    match display_type {
+        1 => "save",
+        2 => "load",
+        3 => "delete",
+        _ => "use",
+    }
+}
+
+fn save_data_system_message(message_type: u32, display_type: u32) -> (String, HostDialogButtons) {
+    match message_type {
+        1 => ("There is no saved data.".to_owned(), HostDialogButtons::Ok),
+        2 => (
+            format!(
+                "Do you want to {} this saved data?",
+                save_data_action(display_type)
+            ),
+            HostDialogButtons::YesNo,
+        ),
+        3 => (
+            "Do you want to overwrite this saved data?".to_owned(),
+            HostDialogButtons::YesNo,
+        ),
+        4 => (
+            "There is not enough free space.".to_owned(),
+            HostDialogButtons::Ok,
+        ),
+        5 => ("Processing saved data...".to_owned(), HostDialogButtons::Ok),
+        6 => (
+            "The saved data is corrupted.".to_owned(),
+            HostDialogButtons::Ok,
+        ),
+        7 => (
+            "The saved data operation finished.".to_owned(),
+            HostDialogButtons::Ok,
+        ),
+        8 => (
+            "There is not enough free space. You can continue without saving.".to_owned(),
+            HostDialogButtons::Ok,
+        ),
+        14 => (
+            "The total saved data size is too large.".to_owned(),
+            HostDialogButtons::Ok,
+        ),
+        _ => ("Saved data message".to_owned(), HostDialogButtons::Ok),
+    }
 }
 
 pub(crate) fn save_data_dialog_is_ready_to_display(state: &ProbeDispatchState) -> u64 {
@@ -468,11 +636,12 @@ pub(crate) fn ime_keyboard_open() -> u64 {
 }
 
 fn publish_or_auto_dismiss(request: HostDialogRequest, sequence: u64) {
+    let unattended_result = unattended_dialog_result(request.buttons);
     let published = publish_gpu_event(remu_gpu::GpuEvent::ShowHostDialog(request));
     if !published || headless_dialogs_auto_dismiss() {
         // No live presenter (unit tests) or an explicit headless opt-in: complete immediately so
         // titles that poll UpdateStatus still make progress.
-        complete_host_dialog(sequence, HostDialogResultCode::Cancel);
+        complete_host_dialog(sequence, unattended_result);
     }
 }
 
@@ -568,12 +737,18 @@ fn apply_message_dialog_result(state: &mut ProbeDispatchState, code: HostDialogR
 }
 
 fn apply_save_data_dialog_result(state: &mut ProbeDispatchState, code: HostDialogResultCode) {
-    state.services.save_data_dialog_result_code = match code {
-        HostDialogResultCode::Ok | HostDialogResultCode::Yes => SAVE_DATA_DIALOG_RESULT_OK,
-        HostDialogResultCode::Cancel | HostDialogResultCode::No | HostDialogResultCode::None => {
-            SAVE_DATA_DIALOG_RESULT_USER_CANCELED
+    let (result, button) = match code {
+        HostDialogResultCode::Ok | HostDialogResultCode::Yes => {
+            (SAVE_DATA_DIALOG_RESULT_OK, SAVE_DATA_DIALOG_BUTTON_OK)
         }
+        HostDialogResultCode::No => (SAVE_DATA_DIALOG_RESULT_OK, SAVE_DATA_DIALOG_BUTTON_NO),
+        HostDialogResultCode::Cancel | HostDialogResultCode::None => (
+            SAVE_DATA_DIALOG_RESULT_USER_CANCELED,
+            SAVE_DATA_DIALOG_BUTTON_INVALID,
+        ),
     };
+    state.services.save_data_dialog_result_code = result;
+    state.services.save_data_dialog_button = button;
 }
 
 fn apply_error_dialog_result(state: &mut ProbeDispatchState, code: HostDialogResultCode) {

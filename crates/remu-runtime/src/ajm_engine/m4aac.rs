@@ -58,7 +58,11 @@ pub(crate) struct M4aacDecoder {
 }
 
 impl M4aacDecoder {
-    pub(crate) fn new(config_number: u32, sampling_freq_index: u32, max_channels: u32) -> Option<Self> {
+    pub(crate) fn new(
+        config_number: u32,
+        sampling_freq_index: u32,
+        max_channels: u32,
+    ) -> Option<Self> {
         if config_number != M4AAC_CONFIG_ADTS
             && config_number != M4AAC_CONFIG_RAW
             && config_number != 3
@@ -73,7 +77,11 @@ impl M4aacDecoder {
         } else {
             sampling_freq_hz(sampling_freq_index)?
         };
-        let channels = if max_channels == 0 { 2 } else { max_channels.min(8) };
+        let channels = if max_channels == 0 {
+            2
+        } else {
+            max_channels.min(8)
+        };
         Some(Self {
             config_number,
             sampling_freq_index,
@@ -196,9 +204,8 @@ fn adts_frame_len(data: &[u8]) -> Option<usize> {
     if data.len() < 7 || data[0] != 0xff || (data[1] & 0xf0) != 0xf0 {
         return None;
     }
-    let len = (((data[3] & 0x03) as usize) << 11)
-        | ((data[4] as usize) << 3)
-        | ((data[5] as usize) >> 5);
+    let len =
+        (((data[3] & 0x03) as usize) << 11) | ((data[4] as usize) << 3) | ((data[5] as usize) >> 5);
     if len < 7 || len > data.len() {
         None
     } else {

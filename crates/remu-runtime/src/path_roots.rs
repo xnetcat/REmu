@@ -28,7 +28,10 @@ pub(crate) struct PathRoots {
 }
 
 impl PathRoots {
-    pub(crate) fn with_game_root(game_root: impl Into<PathBuf>, save_root: impl Into<PathBuf>) -> Self {
+    pub(crate) fn with_game_root(
+        game_root: impl Into<PathBuf>,
+        save_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             game_root: game_root.into(),
             save_root: save_root.into(),

@@ -36,8 +36,12 @@ fn a_user_event_registration_can_be_added_and_withdrawn_again() {
         dispatch("LJDwdSNTnDg", args(&[7, 42]), &mut state),
         Some(SUCCESS)
     );
-    assert!(crate::event_state::with_event_state(|e| e.kernel_event_registrations.is_empty()));
-    assert!(crate::event_state::with_event_state(|e| e.pending_events.is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .kernel_event_registrations
+        .is_empty()));
+    assert!(crate::event_state::with_event_state(|e| e
+        .pending_events
+        .is_empty()));
     assert_eq!(
         dispatch("LJDwdSNTnDg", args(&[7, 42]), &mut state),
         Some(KERNEL_NOT_FOUND)

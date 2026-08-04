@@ -156,7 +156,10 @@ fn create_shader_registers_the_authoritative_agc_code_extent() {
     );
     assert_eq!(shader_registers[1], low_u32(code_address >> 8));
     assert_eq!(shader_registers[3], low_u32(code_address >> 40));
-    assert!(crate::agc_dispatch_state::with_agc(|agc| agc.shader_registry.fused_continuations.is_empty()));
+    assert!(crate::agc_dispatch_state::with_agc(|agc| agc
+        .shader_registry
+        .fused_continuations
+        .is_empty()));
     assert!(crate::agc_dispatch_state::with_agc(|agc| {
         !agc.shader_registry.decode_failures.contains(&code_address)
     }));
@@ -325,8 +328,13 @@ fn fused_shader_preserves_header_data_and_high_register_flags() {
         }),
         Some(2)
     );
-    assert!(crate::agc_dispatch_state::with_agc_mut(|agc| crate::agc_shader_snapshot(&mut agc.shader_registry, code).is_none()));
-    assert!(crate::agc_dispatch_state::with_agc(|agc| agc.shader_registry.decode_failures.contains(&code)));
+    assert!(crate::agc_dispatch_state::with_agc_mut(|agc| {
+        crate::agc_shader_snapshot(&mut agc.shader_registry, code).is_none()
+    }));
+    assert!(crate::agc_dispatch_state::with_agc(|agc| agc
+        .shader_registry
+        .decode_failures
+        .contains(&code)));
 }
 
 #[test]

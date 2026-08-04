@@ -354,12 +354,18 @@ fn av_player_gen5_extended_stream_info_preserves_size_and_reports_frame_rate() {
 
 #[test]
 fn av_player_gen5_extended_frame_info_uses_right_and_bottom_crop_fields() {
-    let layout_small = crate::av_player::av_player_nv12_layout(378, 150, true)
-        .expect("extended 378x150 layout");
-    assert_eq!(layout_small.pitch, 512, "the extended ABI uses its explicit pitch");
+    let layout_small =
+        crate::av_player::av_player_nv12_layout(378, 150, true).expect("extended 378x150 layout");
+    assert_eq!(
+        layout_small.pitch, 512,
+        "the extended ABI uses its explicit pitch"
+    );
     assert_eq!(layout_small.storage_height, 150, "raw visible height");
     assert_eq!(layout_small.frame_bytes, 115_200);
-    assert_eq!(layout_small.chroma_offset, layout_small.pitch * layout_small.storage_height);
+    assert_eq!(
+        layout_small.chroma_offset,
+        layout_small.pitch * layout_small.storage_height
+    );
     let layout_hd = crate::av_player::av_player_nv12_layout(1_920, 1_080, true)
         .expect("extended 1920x1080 layout");
     assert_eq!(layout_hd.pitch, 2_048);
@@ -1358,7 +1364,7 @@ fn av_player_blocked_controller_callback_never_stalls_a_guest_import() {
             player.playing_since = Some(Instant::now());
             player.event_callback = av_player_blocking_event_callback as *const () as usize as u64;
             player.video_decoder = Some(crate::AvPlayerDecoder {
-                    frames: std::sync::Mutex::new(frames),
+                frames: std::sync::Mutex::new(frames),
                 cancelled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 worker: None,
                 progress: Some(std::sync::Arc::new(
@@ -1433,8 +1439,8 @@ fn av_player_close_purges_pending_callbacks_for_that_handle() {
 
 #[test]
 fn av_player_nv12_layout_is_a_single_owned_descriptor() {
-    let layout = crate::av_player::av_player_nv12_layout(378, 150, true)
-        .expect("valid extended layout");
+    let layout =
+        crate::av_player::av_player_nv12_layout(378, 150, true).expect("valid extended layout");
     assert_eq!(layout.visible_width, 378);
     assert_eq!(layout.visible_height, 150);
     assert_eq!(layout.pitch, 512);
@@ -1444,12 +1450,15 @@ fn av_player_nv12_layout_is_a_single_owned_descriptor() {
         layout.pitch * layout.storage_height,
         "chroma_offset is the single source of truth for the UV plane"
     );
-    assert_eq!(layout.frame_bytes, layout.chroma_offset + layout.pitch * 150usize.div_ceil(2));
+    assert_eq!(
+        layout.frame_bytes,
+        layout.chroma_offset + layout.pitch * 150usize.div_ceil(2)
+    );
     assert_eq!(layout.crop_right, 134);
     assert_eq!(layout.crop_bottom, 0);
 
-    let legacy = crate::av_player::av_player_nv12_layout(378, 150, false)
-        .expect("valid legacy layout");
+    let legacy =
+        crate::av_player::av_player_nv12_layout(378, 150, false).expect("valid legacy layout");
     assert_eq!(legacy.pitch, 384);
     assert_eq!(legacy.storage_height, 160);
     assert_eq!(legacy.chroma_offset, legacy.pitch * legacy.storage_height);

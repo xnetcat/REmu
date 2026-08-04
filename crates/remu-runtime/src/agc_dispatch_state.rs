@@ -26,7 +26,10 @@ fn cell() -> &'static RwLock<AgcState> {
 }
 
 /// Write lock for AgcState. Nests without hierarchy re-entry when ProbeDispatch is already held.
-pub(crate) fn lock_agc_for_write() -> (Option<LockHierarchyGuard>, RwLockWriteGuard<'static, AgcState>) {
+pub(crate) fn lock_agc_for_write() -> (
+    Option<LockHierarchyGuard>,
+    RwLockWriteGuard<'static, AgcState>,
+) {
     let hierarchy = match held_lock_level() {
         Some(LockLevel::ProbeDispatch) => None,
         _ => Some(LockHierarchyGuard::enter(LockLevel::AgcState)),
@@ -37,7 +40,10 @@ pub(crate) fn lock_agc_for_write() -> (Option<LockHierarchyGuard>, RwLockWriteGu
     (hierarchy, guard)
 }
 
-pub(crate) fn lock_agc_for_read() -> (Option<LockHierarchyGuard>, RwLockReadGuard<'static, AgcState>) {
+pub(crate) fn lock_agc_for_read() -> (
+    Option<LockHierarchyGuard>,
+    RwLockReadGuard<'static, AgcState>,
+) {
     let hierarchy = match held_lock_level() {
         Some(LockLevel::ProbeDispatch) => None,
         _ => Some(LockHierarchyGuard::enter(LockLevel::AgcState)),
@@ -89,7 +95,8 @@ mod tests {
         reset_agc_state();
         let _dispatch = LockHierarchyGuard::enter(LockLevel::ProbeDispatch);
         let (_h, mut agc) = lock_agc_for_write();
-        agc.compute_queues.insert(1, crate::AgcGraphicsState::default());
+        agc.compute_queues
+            .insert(1, crate::AgcGraphicsState::default());
         assert!(agc.compute_queues.contains_key(&1));
     }
 }

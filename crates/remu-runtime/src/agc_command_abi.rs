@@ -24,9 +24,9 @@ use self::buffer::{
 };
 pub(crate) use self::buffer::{
     consume_recorded_graphics_range, decline_reservation, graphics_continuation_was_consumed,
-    mark_graphics_release_for_command_buffer,
-    retire_pending_graphics_continuation, take_graphics_continuations_before,
-    take_recorded_graphics_prefix, track_graphics_command_allocation, track_graphics_submission,
+    mark_graphics_release_for_command_buffer, retire_pending_graphics_continuation,
+    take_graphics_continuations_before, take_recorded_graphics_prefix,
+    track_graphics_command_allocation, track_graphics_submission,
 };
 #[cfg(test)]
 pub(crate) use self::buffer::{graphics_tracking_test_guard, track_graphics_allocation};

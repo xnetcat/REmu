@@ -26,12 +26,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::os::raw::c_int;
 
 unsafe extern "C" {
-    fn ooz_kraken_decompress(
-        src: *const u8,
-        src_len: usize,
-        dst: *mut u8,
-        dst_len: usize,
-    ) -> c_int;
+    fn ooz_kraken_decompress(src: *const u8, src_len: usize, dst: *mut u8, dst_len: usize)
+    -> c_int;
 }
 
 /// Decompresses a Kraken/Oodle payload into `dst`. Returns the number of bytes written,
@@ -42,9 +38,8 @@ pub(crate) fn kraken_decompress(src: &[u8], dst: &mut [u8]) -> Option<usize> {
     }
     // SAFETY: `src`/`dst` are valid host buffers; ooz reads `src_len` and writes at most
     // `dst_len` (plus an internal SAFE_SPACE scratch it allocates itself).
-    let written = unsafe {
-        ooz_kraken_decompress(src.as_ptr(), src.len(), dst.as_mut_ptr(), dst.len())
-    };
+    let written =
+        unsafe { ooz_kraken_decompress(src.as_ptr(), src.len(), dst.as_mut_ptr(), dst.len()) };
     if written <= 0 {
         None
     } else {
@@ -70,13 +65,17 @@ pub fn ampr_kraken_decode_stage(
     capacity: usize,
 ) -> Result<usize, u64> {
     let Ok(want) = usize::try_from(size) else {
-        return Err(crate::sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        return Err(crate::sce_kernel_error(
+            crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        ));
     };
     if want == 0 {
         return Ok(0);
     }
     if want > capacity || destination == 0 {
-        return Err(crate::sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        return Err(crate::sce_kernel_error(
+            crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        ));
     }
 
     let mut file = file;
@@ -101,7 +100,10 @@ pub fn ampr_kraken_decode_stage(
     }
     let as_u64 = u64::from_le_bytes(header);
     let (hdrsize, unpacked) = if as_u64 >= 0x100_0000_0000 {
-        (4_usize, u64::from(u32::from_le_bytes(header[0..4].try_into().unwrap())))
+        (
+            4_usize,
+            u64::from(u32::from_le_bytes(header[0..4].try_into().unwrap())),
+        )
     } else {
         (8_usize, as_u64)
     };
@@ -111,12 +113,17 @@ pub fn ampr_kraken_decode_stage(
         eprintln!(
             "[REMu][OOZ] kraken decode refused unpacked={unpacked} want={want} capacity={capacity}"
         );
-        return Err(crate::sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        return Err(crate::sce_kernel_error(
+            crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        ));
     }
 
     // Compressed payload: read until EOF from the post-header offset. Bound by a generous
     // multiple of the uncompressed size so a hostile file cannot force unbounded alloc.
-    let max_compressed = want.saturating_mul(2).saturating_add(64 * 1024).max(want + 16);
+    let max_compressed = want
+        .saturating_mul(2)
+        .saturating_add(64 * 1024)
+        .max(want + 16);
     if file
         .seek(SeekFrom::Start(file_offset + hdrsize as u64))
         .is_err()
@@ -133,12 +140,19 @@ pub fn ampr_kraken_decode_stage(
 
     let mut plain = vec![0_u8; want];
     let Some(written) = kraken_decompress(&compressed, &mut plain) else {
-        eprintln!("[REMu][OOZ] kraken decompress failed want={want} compressed={}", compressed.len());
-        return Err(crate::sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        eprintln!(
+            "[REMu][OOZ] kraken decompress failed want={want} compressed={}",
+            compressed.len()
+        );
+        return Err(crate::sce_kernel_error(
+            crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        ));
     };
     if written != want {
         eprintln!("[REMu][OOZ] kraken length mismatch written={written} want={want}");
-        return Err(crate::sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+        return Err(crate::sce_kernel_error(
+            crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT,
+        ));
     }
 
     // SAFETY: caller validated the destination mapping before invoking the decode stage

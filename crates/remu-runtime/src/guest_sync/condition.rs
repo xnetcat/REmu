@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
@@ -126,15 +126,61 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (timed_out, interrupted) = if let Some(timeout) = timeout_usec {
         let duration = Duration::from_micros(timeout);
-        let (next_cond, wait_result) = entry
-            .wake
-            .wait_timeout_while(cond, duration, |cond| {
-                !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
-            })
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cond = next_cond;
+        let mut expired = false;
+        if let Some(report_after) = stall_report_interval().filter(|report| duration > *report) {
+            let started = Instant::now();
+            let mut reported = false;
+            loop {
+                let elapsed = started.elapsed();
+                let remaining = duration.saturating_sub(elapsed);
+                if remaining.is_zero() {
+                    expired = true;
+                    break;
+                }
+                let (next_cond, wait_result) = entry
+                    .wake
+                    .wait_timeout_while(cond, remaining.min(report_after), |cond| {
+                        !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
+                    })
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cond = next_cond;
+                if cond.waiter_released(waiter) || guest_exception_is_pending(guest_thread) {
+                    break;
+                }
+                if wait_result.timed_out() && started.elapsed() >= duration {
+                    expired = true;
+                    break;
+                }
+                if !reported {
+                    reported = true;
+                    eprintln!(
+                        "[REMu][STALL] timed condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} timeout_usec={timeout} notifies={}",
+                        report_after.as_secs(),
+                        current_guest_thread_name(),
+                        cond.notifies,
+                    );
+                }
+                if stall_break_enabled() {
+                    eprintln!(
+                        "[REMu][STALL] releasing stalled timed wait thread={:?} condition={condition:#x} ticket={waiter}",
+                        current_guest_thread_name(),
+                    );
+                    released_spuriously = true;
+                    break;
+                }
+            }
+        } else {
+            let (next_cond, wait_result) = entry
+                .wake
+                .wait_timeout_while(cond, duration, |cond| {
+                    !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cond = next_cond;
+            expired = wait_result.timed_out();
+        }
         let interrupted = !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
-        let expired = wait_result.timed_out() && !cond.waiter_released(waiter) && !interrupted;
+        expired = expired && !cond.waiter_released(waiter) && !interrupted;
         if expired {
             cond.timeouts = cond.timeouts.saturating_add(1);
         }

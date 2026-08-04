@@ -384,14 +384,15 @@ impl UniversalDataState {
             return Err(error);
         }
         if let Some(EventValue::Array(previous_array)) = previous
-            && previous_array != array {
-                self.arrays.remove(&previous_array);
-                self.events
-                    .get_mut(&owner)
-                    .expect("the owner event remains live after replacing an array")
-                    .arrays
-                    .remove(&previous_array);
-            }
+            && previous_array != array
+        {
+            self.arrays.remove(&previous_array);
+            self.events
+                .get_mut(&owner)
+                .expect("the owner event remains live after replacing an array")
+                .arrays
+                .remove(&previous_array);
+        }
         Ok(array)
     }
 
@@ -409,14 +410,15 @@ impl UniversalDataState {
         // Orphan arrays (created before ObjectSetArray) have no owning event yet; size is
         // enforced once they are attached.
         if let Some(owner) = self.event_owning_array(array)
-            && let Err(error) = self.validate_event_size(owner) {
-                self.arrays
-                    .get_mut(&array)
-                    .expect("the array remains live after a size rejection")
-                    .values
-                    .pop();
-                return Err(error);
-            }
+            && let Err(error) = self.validate_event_size(owner)
+        {
+            self.arrays
+                .get_mut(&array)
+                .expect("the array remains live after a size rejection")
+                .values
+                .pop();
+            return Err(error);
+        }
         Ok(())
     }
 

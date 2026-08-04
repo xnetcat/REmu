@@ -108,6 +108,26 @@ pub(super) fn apply_relocations_at(
     let mut stats = RelocationStats::default();
     for relocation in dynamic.relocations.iter().chain(&dynamic.jump_relocations) {
         let target = runtime_address_at(memory, image_base, relocation.offset, 8)?;
+        if std::env::var("REMU_TRACE_GUEST_RELOCATIONS").is_ok_and(|targets| {
+            targets.split(',').any(|candidate| {
+                let candidate = candidate.trim();
+                candidate
+                    .strip_prefix("0x")
+                    .and_then(|value| u64::from_str_radix(value, 16).ok())
+                    .or_else(|| candidate.parse().ok())
+                    == Some(target.get())
+            })
+        }) {
+            eprintln!(
+                "[REMu][GUEST-RELOCATION] target={:#018x} image_base={:#018x} offset={:#x} type={} symbol={} addend={:#x}",
+                target.get(),
+                image_base.get(),
+                relocation.offset.get(),
+                relocation.relocation_type,
+                relocation.symbol_index,
+                relocation.addend,
+            );
+        }
         let value = match relocation.relocation_type {
             R_X86_64_RELATIVE => {
                 stats.relative += 1;

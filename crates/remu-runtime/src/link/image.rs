@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::probe_entry;
-use crate::tls::{TlsImageInput, install_tls_support, scan_tls_immediate_stores, static_tls_offsets};
+use crate::tls::{
+    TlsImageInput, install_tls_support, scan_tls_immediate_stores, static_tls_offsets,
+};
 use crate::unwind::{GuestUnwindModule, collect_unwind_fdes_at, guest_unwind_module};
 use remu_core::GuestAddress;
 use remu_loader::{LoadedExecutable, resolve_module_dependency_graph};

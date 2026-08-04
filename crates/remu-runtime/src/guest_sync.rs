@@ -23,9 +23,9 @@ pub(crate) use self::condition::{
     guest_condition_wait_with_interrupt, wake_all_guest_sync_for_exception,
 };
 #[cfg(test)]
-pub(crate) use self::event_flag::guest_event_flag_entry;
-#[cfg(test)]
 pub(crate) use self::event_flag::EVENT_FLAG_WAIT_OR;
+#[cfg(test)]
+pub(crate) use self::event_flag::guest_event_flag_entry;
 pub(crate) use self::event_flag::guest_event_flag_wait;
 #[cfg(test)]
 pub(crate) use self::mutex::GUEST_MUTEX_WAKE_COUNT;
@@ -38,9 +38,9 @@ pub(crate) use self::rwlock::guest_rwlock_waiter_counts;
 pub(crate) use self::rwlock::{
     guest_rwlock_destroy, guest_rwlock_init, guest_rwlock_lock, guest_rwlock_unlock,
 };
-pub(crate) use self::semaphore::guest_semaphore_wait;
 #[cfg(test)]
 pub(crate) use self::semaphore::guest_semaphore_entry;
+pub(crate) use self::semaphore::guest_semaphore_wait;
 #[cfg(test)]
 pub(crate) use self::state::GuestConditionState;
 pub(crate) use self::state::guest_sync;
@@ -55,8 +55,8 @@ use self::semaphore::{
     guest_semaphore_create, guest_semaphore_delete, guest_semaphore_poll, guest_semaphore_signal,
 };
 use self::state::{
-    GuestMutexEntry, GuestMutexState,
-    MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard, guest_mutex_shards,
+    GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
+    guest_mutex_shards,
 };
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -987,20 +987,17 @@ fn condition_trace_stats(condition: u64) -> (usize, u64, u64) {
         .0
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    state
-        .conditions
-        .get(&condition)
-        .map_or((0, 0, 0), |entry| {
-            let condition = entry
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                condition.waiters.len(),
-                condition.notifies,
-                condition.timeouts,
-            )
-        })
+    state.conditions.get(&condition).map_or((0, 0, 0), |entry| {
+        let condition = entry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (
+            condition.waiters.len(),
+            condition.notifies,
+            condition.timeouts,
+        )
+    })
 }
 
 fn begin_main_timed_condition_trace(

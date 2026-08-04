@@ -260,10 +260,7 @@ fn audio_out2_update_context_queue_from_device(
         .saturating_add(u64::from(drained).saturating_mul(grain));
 }
 
-fn audio_out2_update_context_queue_from_instant(
-    context: &mut AudioOut2ContextState,
-    now: Instant,
-) {
+fn audio_out2_update_context_queue_from_instant(context: &mut AudioOut2ContextState, now: Instant) {
     let grain_duration = audio_out2_grain_duration(context.grain_frames);
     if context.queued == 0 {
         // Preserve a short amount of producer lateness as catch-up credit. Re-anchoring every

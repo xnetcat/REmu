@@ -553,7 +553,9 @@ fn ampr_reset_and_destroy_wait_for_the_same_buffer_submission_order() {
 fn ampr_completions_are_announced_by_submission_not_registration() {
     let mut state = ProbeDispatchState::default();
     let equeue = 0x4000;
-    crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(equeue); });
+    crate::event_state::with_event_state_mut(|e| {
+        e.kernel_equeues.insert(equeue);
+    });
     assert_eq!(
         kernel_add_ampr_event([equeue, 0x7502, 0xabc, 0, 0, 0], &mut state),
         0
@@ -589,12 +591,18 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
         ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
         0
     );
-    assert_eq!(crate::event_state::with_event_state(|e| e.pending_events.len()), 1);
-    let event = crate::event_state::with_event_state(|e| e.pending_events.front().cloned().unwrap());
+    assert_eq!(
+        crate::event_state::with_event_state(|e| e.pending_events.len()),
+        1
+    );
+    let event =
+        crate::event_state::with_event_state(|e| e.pending_events.front().cloned().unwrap());
     assert_eq!(event.equeue, equeue);
     assert_eq!(event.ident, 0x7502);
     assert_eq!(event.user_data, 0xabc);
-    crate::event_state::with_event_state_mut(|e| { e.pending_events.pop_front(); });
+    crate::event_state::with_event_state_mut(|e| {
+        e.pending_events.pop_front();
+    });
 
     assert_eq!(
         ampr_submit_command_buffer([command_buffer, 0, 0, 0, 0, 0], &mut state),
@@ -783,7 +791,9 @@ fn ampr_submit_contains_a_failed_read_and_still_publishes_its_completion() {
     let mut third = [0_u8; 4];
     let mut flag = 0_u64;
     let mut state = ProbeDispatchState::default();
-    crate::event_state::with_event_state_mut(|e| { e.kernel_equeues.insert(equeue); });
+    crate::event_state::with_event_state_mut(|e| {
+        e.kernel_equeues.insert(equeue);
+    });
     state.ampr_files.insert(file_id, path.clone());
     ampr_record_read_program(
         command_buffer,

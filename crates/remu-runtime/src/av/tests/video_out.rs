@@ -238,7 +238,8 @@ fn the_flip_status_reports_pending_depth_and_the_last_completed_flip() {
             },
             handle: 1,
             submit_process_time_counter: 210_000,
-        }); });
+        });
+    });
     state.video_out.completed_flip_count = 3;
     state.video_out.last_completed_flip = Some(CompletedVideoOutFlip {
         process_time: 111,

@@ -4,7 +4,7 @@
 use std::cell::UnsafeCell;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -227,7 +227,12 @@ impl SpscStereoRing {
             let sample = unsafe { *self.slots[index].get() };
             if self
                 .head
-                .compare_exchange(head, head.wrapping_add(1), Ordering::Release, Ordering::Relaxed)
+                .compare_exchange(
+                    head,
+                    head.wrapping_add(1),
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
                 .is_ok()
             {
                 return Some(sample);
@@ -278,9 +283,7 @@ struct AudioQueue {
 impl AudioQueue {
     fn with_capacity(maximum_queued_frames: usize) -> Self {
         Self {
-            ring: SpscStereoRing::with_capacity(
-                maximum_queued_frames.max(AUDIO_PREBUFFER_FRAMES),
-            ),
+            ring: SpscStereoRing::with_capacity(maximum_queued_frames.max(AUDIO_PREBUFFER_FRAMES)),
             consumed: AtomicU64::new(0),
             submitted: AtomicU64::new(0),
             state: AtomicU8::new(QUEUE_PRIMING),
@@ -687,7 +690,8 @@ impl AudioOutState {
                     highest = channel;
                 }
             }
-            let span = usize::try_from(highest.saturating_add(1).saturating_mul(4)).unwrap_or(usize::MAX);
+            let span =
+                usize::try_from(highest.saturating_add(1).saturating_mul(4)).unwrap_or(usize::MAX);
             if !process_guest_range_has_read_access(volumes, span) {
                 eprintln!(
                     "[REMu][AUDIO] sceAudioOutSetVolume rejected unreadable volume array at {volumes:#x} span={span}"
@@ -762,10 +766,7 @@ impl AudioOutState {
     pub(crate) fn get_last_output_time(&self, arguments: [u64; 6]) -> Result<(), AudioOutError> {
         let handle = low_i32(arguments[0]);
         let output = arguments[1];
-        let port = self
-            .ports
-            .get(&handle)
-            .ok_or(AudioOutError::InvalidPort)?;
+        let port = self.ports.get(&handle).ok_or(AudioOutError::InvalidPort)?;
         if output == 0 || !process_guest_range_has_read_access(output, std::mem::size_of::<u64>()) {
             eprintln!(
                 "[REMu][AUDIO] sceAudioOutGetLastOutputTime rejected invalid pointer {output:#x}"
@@ -818,20 +819,14 @@ impl AudioOutState {
         }
         if source_address == 0 {
             let sample_rate = self.host.as_ref().map(|host| host.sample_rate);
-            let port = self
-                .ports
-                .get_mut(&handle)
-                .expect("port was present above");
+            let port = self.ports.get_mut(&handle).expect("port was present above");
             return Ok(match sample_rate {
                 Some(rate) if port.queue.is_some() => port.output_deadline_from_consumed(rate),
                 _ => port.output_deadline(),
             });
         }
         let byte_length = {
-            let port = self
-                .ports
-                .get(&handle)
-                .expect("port was present above");
+            let port = self.ports.get(&handle).expect("port was present above");
             port.format
                 .buffer_bytes(port.buffer_frames)
                 .ok_or(AudioOutError::OutOfMemory)?
@@ -847,10 +842,7 @@ impl AudioOutState {
         let source =
             unsafe { std::slice::from_raw_parts(source_address as *const u8, byte_length) };
         let (resampled, uses_device_clock) = {
-            let port = self
-                .ports
-                .get_mut(&handle)
-                .expect("port was present above");
+            let port = self.ports.get_mut(&handle).expect("port was present above");
             let stereo = decode_stereo_frames(source, port);
             let resampled = if let Some(resampler) = port.resampler.as_mut() {
                 resampler.process(&stereo)
@@ -901,10 +893,7 @@ impl AudioOutState {
                 }
             }
         }
-        let port = self
-            .ports
-            .get_mut(&handle)
-            .expect("port was present above");
+        let port = self.ports.get_mut(&handle).expect("port was present above");
         Ok(match host_rate {
             Some(rate) if uses_device_clock => port.output_deadline_from_consumed(rate),
             _ => port.output_deadline(),
@@ -1224,9 +1213,7 @@ mod tests {
     fn get_last_output_time_publishes_consumed_microseconds() {
         let mut state = AudioOutState::default();
         state.use_timed_sink_for_test();
-        let handle = state
-            .open([0, 0, 0, 256, 48_000, 1])
-            .expect("timed open") as i32;
+        let handle = state.open([0, 0, 0, 256, 48_000, 1]).expect("timed open") as i32;
         // Timed sinks have no device queue; consumed stays zero.
         let mut output = 0xdead_u64;
         state
@@ -1327,10 +1314,7 @@ mod tests {
         let mut mixer = AudioMixer::default();
         let queue = Arc::new(AudioQueue::with_capacity(AUDIO_PREBUFFER_FRAMES));
         mixer.add_port(1, Arc::clone(&queue));
-        assert!(mixer.push(
-            1,
-            std::iter::repeat_n([0.5, -0.5], AUDIO_PREBUFFER_FRAMES)
-        ));
+        assert!(mixer.push(1, std::iter::repeat_n([0.5, -0.5], AUDIO_PREBUFFER_FRAMES)));
         let mut output = vec![0.0_f32; 256 * 2];
         let snapshot = mixer.snapshot_queues();
         AudioMixer::write_interleaved(&snapshot, &mut output, 2);

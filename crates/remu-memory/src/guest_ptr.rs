@@ -395,10 +395,7 @@ pub struct GuestSlice<'pin, T> {
 
 impl<'pin, T> GuestSlice<'pin, T> {
     /// Views the whole pin as `len` elements of `T`.
-    pub fn try_from_pin(
-        pin: &'pin GuestAccessPin,
-        len: usize,
-    ) -> Result<Self, GuestAccessError> {
+    pub fn try_from_pin(pin: &'pin GuestAccessPin, len: usize) -> Result<Self, GuestAccessError> {
         require_fit::<T>(pin, len)?;
         Ok(Self {
             pin,
@@ -582,9 +579,7 @@ fn require_fit<T>(pin: &GuestAccessPin, element_count: usize) -> Result<(), Gues
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
-    use super::{
-        GuestAccessError, GuestAccessKind, GuestAccessPin, GuestPtr, GuestSlice,
-    };
+    use super::{GuestAccessError, GuestAccessKind, GuestAccessPin, GuestPtr, GuestSlice};
     use crate::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -666,10 +661,7 @@ mod tests {
     fn typed_ptr_checks_alignment_and_refuses_read_only_writes() {
         let (mut memory, address) = map_rw_page();
         memory
-            .write(
-                GuestAddress::new(address),
-                &0x1122_3344_u32.to_le_bytes(),
-            )
+            .write(GuestAddress::new(address), &0x1122_3344_u32.to_le_bytes())
             .unwrap();
 
         let ptr = GuestPtr::<u32>::try_acquire(address).expect("aligned u32");

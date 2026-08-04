@@ -35,8 +35,7 @@ pub fn encode_nid(value: u64) -> String {
     let mut raw = [0_u8; 12];
     let be = value.to_be_bytes();
     // Standard base64 of 8 bytes → 12 characters including one `=`.
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut bits: u32 = 0;
     let mut bit_count = 0_u32;
     let mut out = 0_usize;

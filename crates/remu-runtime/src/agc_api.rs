@@ -879,9 +879,7 @@ pub(crate) fn agc_fuse_shader_halves(arguments: [u64; 6], _state: &mut ProbeDisp
                 back_program_address,
                 back_code_size: read_guest_u32(back + AGC_SHADER_SIZE_OFFSET),
             });
-        agc.shader_registry
-            .snapshots
-            .remove(&front_program_address);
+        agc.shader_registry.snapshots.remove(&front_program_address);
         agc.shader_registry
             .decode_failures
             .remove(&front_program_address);

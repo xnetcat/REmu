@@ -59,9 +59,15 @@ fn tls_relocation_values_are_module_offset_and_thread_pointer_relative() {
         static_offset: 0x100,
     };
     // DTPMOD64 names the module and ignores the addend.
-    assert_eq!(tls_relocation_value(R_X86_64_DTPMOD64, &resolution, 0x1000), 3);
+    assert_eq!(
+        tls_relocation_value(R_X86_64_DTPMOD64, &resolution, 0x1000),
+        3
+    );
     // DTPOFF64 is the offset within the module's own TLS block.
-    assert_eq!(tls_relocation_value(R_X86_64_DTPOFF64, &resolution, 8), 0x48);
+    assert_eq!(
+        tls_relocation_value(R_X86_64_DTPOFF64, &resolution, 8),
+        0x48
+    );
     // TPOFF64 is that offset expressed below the thread pointer (variant II).
     assert_eq!(
         tls_relocation_value(R_X86_64_TPOFF64, &resolution, 8),
@@ -90,8 +96,12 @@ fn a_cross_module_tls_reference_resolves_through_its_defining_module() {
         tls_symbols: &tls_symbols,
     };
 
-    let cross = resolve_tls_reference(&referencing, &context, &tls_relocation(R_X86_64_DTPMOD64, 1, 0))
-        .unwrap();
+    let cross = resolve_tls_reference(
+        &referencing,
+        &context,
+        &tls_relocation(R_X86_64_DTPMOD64, 1, 0),
+    )
+    .unwrap();
     // The defining module (5), not the referencing module (2), names the DTPMOD64 slot.
     assert_eq!(cross.module_id, 5);
     assert_eq!(tls_relocation_value(R_X86_64_DTPMOD64, &cross, 0), 5);
@@ -99,8 +109,12 @@ fn a_cross_module_tls_reference_resolves_through_its_defining_module() {
     // A symbol defined in the referencing module keeps its own module id and static offset.
     let mut defined = dynamic_namespace(false, 4, 3, 7, 2, 1);
     defined.symbols = vec![symbol("", 0, 0), symbol("localTls#E#D", 0x16, 7)];
-    let local =
-        resolve_tls_reference(&defined, &context, &tls_relocation(R_X86_64_TPOFF64, 1, 0x10)).unwrap();
+    let local = resolve_tls_reference(
+        &defined,
+        &context,
+        &tls_relocation(R_X86_64_TPOFF64, 1, 0x10),
+    )
+    .unwrap();
     assert_eq!(local.module_id, 2);
     assert_eq!(local.tls_offset, 0x100);
     assert_eq!(local.static_offset, 0x80);

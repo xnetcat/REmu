@@ -749,7 +749,10 @@ mod tests {
             0
         );
         assert_eq!(state.agc_submission_count, 1);
-        assert_eq!(crate::event_state::with_event_state(|e| e.pending_agc_completions.len()), 1);
+        assert_eq!(
+            crate::event_state::with_event_state(|e| e.pending_agc_completions.len()),
+            1
+        );
         assert!(matches!(
             receiver.recv(),
             Ok(remu_gpu::GpuEvent::QueueSubmission {
@@ -832,7 +835,10 @@ mod tests {
             0
         );
         assert_eq!(state.agc_submission_count, 2);
-        assert_eq!(crate::event_state::with_event_state(|e| e.pending_agc_completions.len()), 2);
+        assert_eq!(
+            crate::event_state::with_event_state(|e| e.pending_agc_completions.len()),
+            2
+        );
         for sequence in 1..=2 {
             assert!(matches!(
                 receiver.recv(),
@@ -870,7 +876,9 @@ mod tests {
             AGC_ERROR_PARAMETER_NULL
         );
         assert_eq!(state.agc_submission_count, 0);
-        assert!(crate::event_state::with_event_state(|e| e.pending_agc_completions.is_empty()));
+        assert!(crate::event_state::with_event_state(|e| e
+            .pending_agc_completions
+            .is_empty()));
     }
 
     #[test]
@@ -907,7 +915,10 @@ mod tests {
             0
         );
         queue_agc_event_write(&mut state, 7);
-        assert_eq!(crate::event_state::with_event_state(|e| e.pending_events.len()), 1);
+        assert_eq!(
+            crate::event_state::with_event_state(|e| e.pending_events.len()),
+            1
+        );
         crate::event_state::with_event_state_mut(|e| {
             e.pending_events
                 .front_mut()
@@ -925,8 +936,12 @@ mod tests {
             ),
             0
         );
-        assert!(crate::event_state::with_event_state(|e| e.kernel_event_registrations.is_empty()));
-        assert!(crate::event_state::with_event_state(|e| e.pending_events.is_empty()));
+        assert!(crate::event_state::with_event_state(|e| e
+            .kernel_event_registrations
+            .is_empty()));
+        assert!(crate::event_state::with_event_state(|e| e
+            .pending_events
+            .is_empty()));
         assert_eq!(
             state
                 .agc_completion_telemetry

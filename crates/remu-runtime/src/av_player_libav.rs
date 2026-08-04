@@ -229,10 +229,7 @@ impl LibavCodecSession {
     }
 
     /// Ok(Some) = frame, Ok(None) = need more input / drained, Err = hard failure.
-    pub(crate) fn receive_nv12(
-        &mut self,
-        out: &mut [u8],
-    ) -> Result<Option<(u32, u32, u32)>, ()> {
+    pub(crate) fn receive_nv12(&mut self, out: &mut [u8]) -> Result<Option<(u32, u32, u32)>, ()> {
         let mut width = 0_i32;
         let mut height = 0_i32;
         let mut pitch = 0_i32;

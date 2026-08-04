@@ -45,7 +45,6 @@ pub(crate) fn av_player_normalize_output_buffer_count(raw: i32) -> usize {
     }
 }
 
-
 #[derive(Debug, PartialEq, Eq)]
 enum AvPlayerDecoderPoll {
     Frame(Vec<u8>),
@@ -462,7 +461,8 @@ pub(crate) fn av_player_init(arguments: [u64; 6], state: &mut ProbeDispatchState
     // EventReplacement follows MemAllocator (0x28) and FileReplacement (0x28): object@0x50, cb@0x58.
     // auto_start sits after debug_level/base_priority/num_framebuffers (0x60+0xc = 0x6c).
     // numOutputVideoFrameBuffers is i32 at +0x68 (sceavplayer.h:413).
-    let num_output = av_player_normalize_output_buffer_count(read_guest_u32(parameter + 0x68) as i32);
+    let num_output =
+        av_player_normalize_output_buffer_count(read_guest_u32(parameter + 0x68) as i32);
     state.av_player.players.insert(
         handle,
         AvPlayerInstance {
@@ -583,8 +583,16 @@ pub(crate) fn av_player_init_ex(arguments: [u64; 6], state: &mut ProbeDispatchSt
             allocator_object: read_guest_u64(parameter + 8),
             allocate_texture_callback: read_guest_u64(parameter + 32),
             deallocate_texture_callback: read_guest_u64(parameter + 40),
-            event_object: if size >= 96 { read_guest_u64(parameter + 88) } else { 0 },
-            event_callback: if size >= 104 { read_guest_u64(parameter + 96) } else { 0 },
+            event_object: if size >= 96 {
+                read_guest_u64(parameter + 88)
+            } else {
+                0
+            },
+            event_callback: if size >= 104 {
+                read_guest_u64(parameter + 96)
+            } else {
+                0
+            },
             source: None,
             // Gen5 InitDataEx places autoStart after the event replacement, language pointer,
             // and debug level. Offset 0xa8 belongs to the first decoder-thread record; treating
@@ -845,8 +853,7 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
         player.video_buffer_stride = request.3;
         eprintln!(
             "[REMu][AVPLAYER] allocated guest video buffers count={} size={} addresses={buffers:#x?}",
-            request.4,
-            request.3
+            request.4, request.3
         );
         true
     } else {
@@ -994,11 +1001,7 @@ fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {
         eprintln!("[REMu][AVPLAYER] decoder start rejected: invalid frame size");
         return false;
     };
-    let session = match LibavDemuxSession::open(
-        Path::new(source),
-        audio,
-        player.decoder_seek,
-    ) {
+    let session = match LibavDemuxSession::open(Path::new(source), audio, player.decoder_seek) {
         Ok(session) => session,
         Err(error) => {
             eprintln!(
@@ -1160,11 +1163,7 @@ fn av_player_queue_natural_stop(
     }
 }
 
-pub(crate) fn av_player_nv12_layout(
-    width: u32,
-    height: u32,
-    extended: bool,
-) -> Option<Nv12Layout> {
+pub(crate) fn av_player_nv12_layout(width: u32, height: u32, extended: bool) -> Option<Nv12Layout> {
     let visible_width = usize::try_from(width).ok()?;
     let visible_height = usize::try_from(height).ok()?;
     // The Gen5 extended ABI exposes a 256-byte-aligned pitch and the raw visible height.
@@ -1185,7 +1184,8 @@ pub(crate) fn av_player_nv12_layout(
     // Chroma occupies `pitch` bytes per chroma row (interleaved UV), including pitch padding.
     let frame_bytes = chroma_offset.checked_add(pitch.checked_mul(storage_height.div_ceil(2))?)?;
     let crop_right = u32::try_from(pitch.saturating_sub(visible_width)).unwrap_or_default();
-    let crop_bottom = u32::try_from(storage_height.saturating_sub(visible_height)).unwrap_or_default();
+    let crop_bottom =
+        u32::try_from(storage_height.saturating_sub(visible_height)).unwrap_or_default();
     Some(Nv12Layout {
         visible_width,
         visible_height,

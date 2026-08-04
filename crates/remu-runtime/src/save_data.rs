@@ -137,6 +137,7 @@ pub(crate) fn save_data_terminate(state: &mut ProbeDispatchState) -> u64 {
     state.save_transaction_resources.clear();
     state.next_save_transaction_resource = 1;
     state.save_data_initialized = false;
+    crate::path_roots::republish_from_dispatch(state);
     if let Some(error) = cleanup_error {
         eprintln!("[REMu][SAVEDATA] terminate cleanup failed: {error}");
         sce_kernel_error(SAVE_DATA_ERROR_INTERNAL)
@@ -358,8 +359,8 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
         );
     }
 
-    let slot = crate::vfs::save_data_slots_root(&state.save_root)
-        .join(sanitize_save_segment(&dir_name));
+    let slot =
+        crate::vfs::save_data_slots_root(&state.save_root).join(sanitize_save_segment(&dir_name));
     let existed = slot.is_dir();
     let create = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE != 0;
     let create_if_missing = mount_mode & SAVE_DATA_MOUNT_MODE_CREATE_IF_MISSING != 0;
@@ -439,6 +440,9 @@ pub(crate) fn save_data_mount3(arguments: [u64; 6], state: &mut ProbeDispatchSta
         state.save_mounts.remove(&mount_point);
         return sce_kernel_error(SAVE_DATA_ERROR_INTERNAL);
     }
+    // Path syscalls run outside the dispatch lock against this immutable snapshot. Publish the
+    // new mount before returning to the guest or an immediately following open cannot resolve it.
+    crate::path_roots::republish_from_dispatch(state);
     eprintln!(
         "[REMu][SAVEDATA] mount3 user={user_id} dir={dir_name:?} blocks={blocks:#x} system_blocks={system_blocks:#x} mount_mode={mount_mode:#x} resource={resource} mode={mode:#x} mount={mount_point:?} host={:?}",
         slot.display()
@@ -480,6 +484,7 @@ pub(crate) fn save_data_umount2(arguments: [u64; 6], state: &mut ProbeDispatchSt
     }
     state.save_mounts.remove(&mount_point);
     let _ = state.vfs.unregister(&mount_point);
+    crate::path_roots::republish_from_dispatch(state);
     eprintln!("[REMu][SAVEDATA] unmounted {mount_point:?} mode={mode:#x}");
     0
 }
@@ -610,6 +615,8 @@ pub(crate) fn save_data_prepare(arguments: [u64; 6], state: &mut ProbeDispatchSt
             staging_path,
         },
     );
+    // Prepare changes both the host root and write policy observed by pre-lock path syscalls.
+    crate::path_roots::republish_from_dispatch(state);
     eprintln!("[REMu][SAVEDATA] prepared mount={mount_point:?} resource={resource}");
     0
 }
@@ -757,6 +764,7 @@ fn commit_save_data_resource(resource: u32, state: &mut ProbeDispatchState) -> u
     state
         .vfs
         .set_save_data_host_root(&transaction.mount_point, transaction.committed_path.clone());
+    crate::path_roots::republish_from_dispatch(state);
     eprintln!("[REMu][SAVEDATA] committed resource={resource}");
     0
 }
