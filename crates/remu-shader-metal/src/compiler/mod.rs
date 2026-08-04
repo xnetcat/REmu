@@ -246,12 +246,13 @@ impl Compiler<'_> {
         }
     }
 
-    fn ballot_words(&self, condition: &str) -> (String, String) {
+    fn ballot_word_expressions(&self, condition: &str) -> (String, String) {
         let ballot = Self::ballot(condition);
         if self.split_wave64() {
-            if self.is_hlsl() && self.options.hlsl_wave64_group_isolation_axis.is_some() {
-                let synchronized =
-                    format!("remu_wave64_ballot({condition}, remu_wave_index, remu_wave_half)");
+            if self.is_hlsl() {
+                let synchronized = format!(
+                    "remu_wave64_ballot({condition}, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z)"
+                );
                 return (format!("{synchronized}.x"), format!("{synchronized}.y"));
             }
             (
@@ -260,6 +261,20 @@ impl Compiler<'_> {
             )
         } else {
             (ballot, "0u".to_owned())
+        }
+    }
+
+    fn ballot_words(&mut self, condition: &str) -> (String, String) {
+        if self.split_wave64() && self.is_hlsl() {
+            let synchronized = self.temp(
+                "uint2",
+                &format!(
+                    "remu_wave64_ballot({condition}, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z)"
+                ),
+            );
+            (format!("{synchronized}.x"), format!("{synchronized}.y"))
+        } else {
+            self.ballot_word_expressions(condition)
         }
     }
 

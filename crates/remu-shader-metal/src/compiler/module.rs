@@ -569,7 +569,7 @@ impl Compiler<'_> {
         if contains_register_reference(&self.body, 's', EXEC_LO)
             || contains_register_reference(&self.body, 's', EXEC_HI)
         {
-            let (low, high) = self.ballot_words("true");
+            let (low, high) = self.ballot_word_expressions("true");
             if contains_register_reference(&self.body, 's', EXEC_LO) {
                 let _ = writeln!(source, "    s[{EXEC_LO}] = {low};");
             }

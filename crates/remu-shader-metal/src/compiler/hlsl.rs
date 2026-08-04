@@ -126,7 +126,10 @@ impl Compiler<'_> {
             );
         }
         if self.split_wave64() {
-            source.push_str("groupshared uint remu_wave64_ballot_words[32];\n");
+            source.push_str(
+                "groupshared uint remu_wave64_ballot_words[64];\n\
+                 groupshared uint remu_wave64_ballot_generations[32];\n",
+            );
             if self
                 .program
                 .instructions
@@ -378,7 +381,7 @@ impl Compiler<'_> {
                          \x20   uint remu_thread_index = remu_guest_wave * 64u + remu_native_thread_index;\n\
                          \x20   uint3 remu_local_id = uint3(remu_thread_index % {}u, (remu_thread_index / {}u) % {}u, remu_thread_index / {xy_threads}u);\n\
                          \x20   uint3 remu_dispatch_id = remu_native_group_id * uint3({}u, {}u, {}u) + remu_local_id;\n\
-                         \x20   if (all(remu_dispatch_limit != 0u) && any(remu_dispatch_id >= remu_dispatch_limit)) return;\n\
+                         \x20   remu_wave64_ballot_initialize(remu_native_thread_index);\n\
                          \x20   uint3 remu_group_id = remu_native_group_id + remu_dispatch_base_group;",
                         threads_per_group[0],
                         threads_per_group[0],
@@ -386,6 +389,11 @@ impl Compiler<'_> {
                         threads_per_group[0],
                         threads_per_group[1],
                         threads_per_group[2],
+                    );
+                } else if self.split_wave64() {
+                    source.push_str(
+                        "    remu_wave64_ballot_initialize(remu_thread_index);\n\
+                         \x20   uint3 remu_group_id = remu_native_group_id + remu_dispatch_base_group;\n",
                     );
                 } else {
                     source.push_str(
@@ -409,7 +417,12 @@ impl Compiler<'_> {
                     source.push_str(
                         "    uint remu_wave_index = remu_thread_index >> 6u;\n\
                          \x20   uint remu_wave_half = (remu_thread_index >> 5u) & 1u;\n\
-                         \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n",
+                         \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n\
+                         \x20   uint remu_wave64_ballot_epoch = 0u;\n\
+                         \x20   bool remu_dispatch_active = !(all(remu_dispatch_limit != 0u) && any(remu_dispatch_id >= remu_dispatch_limit));\n\
+                         \x20   exec = remu_dispatch_active;\n\
+                         \x20   uint2 remu_initial_exec = remu_wave64_ballot(exec, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z);\n\
+                         \x20   if ((remu_initial_exec.x | remu_initial_exec.y) == 0u) return;\n",
                     );
                 }
             }
@@ -430,12 +443,16 @@ impl Compiler<'_> {
                     .ok_or_else(|| {
                         MetalCompileError::InvalidInterface("NGG vertex record is too large".into())
                     })?;
+                if self.split_wave64() {
+                    source.push_str("    remu_wave64_ballot_initialize(remu_thread_index);\n");
+                }
                 source.push_str("    uint remu_lane = WaveGetLaneIndex();\n");
                 if self.split_wave64() {
                     source.push_str(
                         "    uint remu_wave_index = remu_thread_index >> 6u;\n\
                          \x20   uint remu_wave_half = (remu_thread_index >> 5u) & 1u;\n\
-                         \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n",
+                         \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n\
+                         \x20   uint remu_wave64_ballot_epoch = 0u;\n",
                     );
                 }
                 let _ = writeln!(
@@ -453,6 +470,11 @@ impl Compiler<'_> {
                     primitive_capacity,
                     primitive_capacity,
                 );
+                if self.split_wave64() {
+                    source.push_str(
+                        "    uint2 remu_initial_exec = remu_wave64_ballot(true, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z);\n",
+                    );
+                }
                 if self.options.render_target_array_length > 1 {
                     let _ = writeln!(
                         source,
@@ -507,7 +529,14 @@ impl Compiler<'_> {
         if contains_register_reference(&self.body, 's', crate::EXEC_LO)
             || contains_register_reference(&self.body, 's', crate::EXEC_HI)
         {
-            let (low, high) = self.ballot_words("true");
+            let (low, high) = if self.split_wave64() {
+                (
+                    "remu_initial_exec.x".to_owned(),
+                    "remu_initial_exec.y".to_owned(),
+                )
+            } else {
+                self.ballot_word_expressions("true")
+            };
             if contains_register_reference(&self.body, 's', crate::EXEC_LO) {
                 let _ = writeln!(
                     source,
@@ -1128,13 +1157,43 @@ uint remu_atomic_dec(uint descriptor, uint offset, uint limit) {
     );
     if split_wave64 {
         source.push_str(
-            r"uint2 remu_wave64_ballot(bool condition, uint wave_index, uint wave_half) {
-    uint local = (uint)simd_ballot(condition);
-    uint slot = (wave_index << 1u) | wave_half;
-    if (WaveGetLaneIndex() == 0u) remu_wave64_ballot_words[slot] = local;
+            r"void remu_wave64_ballot_initialize(uint native_thread_index) {
+    if (native_thread_index == 0u) {
+        [unroll] for (uint slot = 0u; slot < 32u; ++slot) {
+            remu_wave64_ballot_generations[slot] = 0u;
+        }
+    }
     GroupMemoryBarrierWithGroupSync();
-    uint base = wave_index << 1u;
-    return uint2(remu_wave64_ballot_words[base], remu_wave64_ballot_words[base + 1u]);
+}
+uint2 remu_wave64_ballot(bool condition, uint wave_index, uint wave_half, inout uint epoch, uint thread_count) {
+    uint local = (uint)simd_ballot(condition);
+    bool high_half_present = ((wave_index << 6u) + 32u) < thread_count;
+    if (!high_half_present) return uint2(local, 0u);
+
+    epoch += 1u;
+    uint half_slot = (wave_index << 1u) | wave_half;
+    uint parity = epoch & 1u;
+    uint mask_slot = (half_slot << 1u) | parity;
+    if (WaveGetLaneIndex() == 0u) {
+        remu_wave64_ballot_words[mask_slot] = local;
+        GroupMemoryBarrier();
+        uint ignored;
+        InterlockedExchange(remu_wave64_ballot_generations[half_slot], epoch, ignored);
+    }
+
+    uint peer_generation = 0u;
+    uint peer_slot = (wave_index << 1u) | (wave_half ^ 1u);
+    [allow_uav_condition]
+    while (peer_generation < epoch) {
+        InterlockedOr(remu_wave64_ballot_generations[peer_slot], 0u, peer_generation);
+    }
+    GroupMemoryBarrier();
+
+    uint base = wave_index << 2u;
+    return uint2(
+        remu_wave64_ballot_words[base | parity],
+        remu_wave64_ballot_words[base | 2u | parity]
+    );
 }
 
 ",

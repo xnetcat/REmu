@@ -314,13 +314,10 @@ impl Compiler<'_> {
         // A split guest wave64 runs as two SIMD32 groups: the first group owns bits 0..31 and the
         // second owns bits 32..63. Keeping masks half-local lets structured EXEC predication and
         // later B64 restore operations remain exact without cross-SIMD communication.
-        let old_expression = if self.split_wave64()
-            && self.is_hlsl()
-            && self.options.hlsl_wave64_group_isolation_axis.is_some()
-        {
+        let old_expression = if self.split_wave64() && self.is_hlsl() {
             let words = self.temp(
                 "uint2",
-                "remu_wave64_ballot(exec, remu_wave_index, remu_wave_half)",
+                "remu_wave64_ballot(exec, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z)",
             );
             format!("((ulong){words}.x | ((ulong){words}.y << 32u))")
         } else if self.split_wave64() {

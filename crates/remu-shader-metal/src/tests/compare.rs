@@ -183,7 +183,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
 }
 
 #[test]
-fn isolated_hlsl_wave64_compares_share_both_ballot_halves() {
+fn hlsl_wave64_compares_share_both_ballot_halves_through_a_per_wave_mailbox() {
     let program = Program::new(
         0x1000,
         vec![Instruction {
@@ -196,24 +196,37 @@ fn isolated_hlsl_wave64_compares_share_both_ballot_halves() {
             control: None,
         }],
     );
-    let mut options = MetalCompileOptions::compute_wave(0, 64);
-    options.hlsl_wave64_group_isolation_axis = Some(0);
+    let options = MetalCompileOptions::compute_wave(0, 64);
     let shader = compile_hlsl(&program, &empty_evaluation(), &options, [16, 16, 1])
-        .expect("isolated wave64 compare should lower");
+        .expect("non-isolated wave64 compare should lower");
 
     assert!(
         shader
             .source
-            .contains("groupshared uint remu_wave64_ballot_words[32]")
+            .contains("groupshared uint remu_wave64_ballot_words[64]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("groupshared uint remu_wave64_ballot_generations[32]")
     );
     assert!(
         shader
             .source
             .contains("uint2 remu_wave64_ballot(bool condition")
     );
-    assert!(shader.source.contains("remu_s_106 = remu_wave64_ballot(t"));
-    assert!(shader.source.contains("remu_wave_index, remu_wave_half).x"));
-    assert!(shader.source.contains("remu_wave_index, remu_wave_half).y"));
+    assert!(
+        shader
+            .source
+            .contains("InterlockedExchange(remu_wave64_ballot_generations[half_slot], epoch")
+    );
+    assert!(shader.source.contains("while (peer_generation < epoch)"));
+    assert!(shader.source.contains("[numthreads(16, 16, 1)]"));
+    assert!(shader.source.contains("remu_wave64_ballot(t"));
+    assert!(shader.source.contains("remu_wave64_ballot_epoch"));
+    assert!(shader.source.contains("remu_s_106 = t"));
+    assert!(shader.source.contains(".x;"));
+    assert!(shader.source.contains(".y;"));
     assert!(shader.source.contains("GroupMemoryBarrierWithGroupSync()"));
 }
 
