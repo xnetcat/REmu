@@ -999,7 +999,17 @@ impl Dx12GuestExecutor {
                         "none".to_owned()
                     };
                     decode_texture(binding)
-                        .map(|texture| format!("{texture:?} sampler={sampler}"))
+                        .map(|texture| {
+                            format!(
+                                "pc={:#x}:{} r_s{}={:08x?} s_s{}={:08x?} {texture:?} sampler={sampler}",
+                                binding.pc,
+                                binding.opcode,
+                                binding.control.scalar_resource,
+                                binding.resource_descriptor,
+                                binding.control.scalar_sampler,
+                                binding.sampler_descriptor,
+                            )
+                        })
                         .unwrap_or_else(|error| format!("decode-error({error})"))
                 })
                 .collect::<Vec<_>>();
