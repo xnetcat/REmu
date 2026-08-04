@@ -112,7 +112,7 @@ class WaitCandidate:
 
     @property
     def native_distance(self) -> int:
-        if self.source == "direct-guest":
+        if self.source != "import-frame":
             return 0
         return self.import_frame - self.native_sp
 
@@ -240,6 +240,34 @@ def decode_direct_guest_wait(
             return None
         frame_rbp = next_rbp
     return None
+
+
+def decode_unwound_guest_wait(
+    thread_id: int,
+    guest_pc: int,
+    guest_rsp: int,
+    guest_rbp: int,
+    read_u64: ReadU64,
+) -> Optional[WaitCandidate]:
+    """Decode the exact wait from a guest frame already unwound by LLDB.
+
+    Rosetta-aware debugserver can unwind through REmu's import trampoline even
+    while the stopped thread is inside a native condition wait.  This is both
+    cheaper and more robust than scanning the native stack, especially when a
+    thread has less than one full scan chunk committed above its current SP.
+    """
+
+    if guest_pc != GAME_THREAD_WAIT_RETURN:
+        return None
+    return _decode_wait_rbp(
+        guest_rbp,
+        thread_id,
+        guest_rsp,
+        0,
+        guest_rsp,
+        "unwound-guest",
+        read_u64,
+    )
 
 
 def select_wait_candidate(
@@ -489,6 +517,27 @@ def _direct_thread_wait_candidate(
     )
 
 
+def _unwound_thread_wait_candidate(
+    thread,
+    read_u64: ReadU64,
+) -> Optional[WaitCandidate]:
+    for index in range(min(thread.GetNumFrames(), GUEST_FRAME_CHAIN_LIMIT)):
+        frame = thread.GetFrameAtIndex(index)
+        if not frame.IsValid() or frame.GetPC() != GAME_THREAD_WAIT_RETURN:
+            continue
+        guest_rbp = frame.GetFP()
+        if guest_rbp in (0, (1 << 64) - 1):
+            guest_rbp = frame.FindRegister("rbp").GetValueAsUnsigned()
+        return decode_unwound_guest_wait(
+            thread.GetThreadID(),
+            frame.GetPC(),
+            frame.GetSP(),
+            guest_rbp,
+            read_u64,
+        )
+    return None
+
+
 def _thread_wait_candidates(
     process,
     thread,
@@ -630,6 +679,14 @@ def snapshot_taskgraph_stall(debugger, _command, result, _internal_dict):
             candidate = _direct_thread_wait_candidate(thread, read_u64)
             if candidate is not None:
                 candidates.append(candidate)
+
+        if not candidates:
+            for thread in scanned_threads:
+                candidate = _unwound_thread_wait_candidate(
+                    thread, read_u64
+                )
+                if candidate is not None:
+                    candidates.append(candidate)
 
         native_chunks = 0
         native_return_words = 0

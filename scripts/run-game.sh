@@ -314,9 +314,8 @@ fi
 
 
 # Interactive runs never inject controller input unless the caller explicitly supplies a schedule.
-# After its final scheduled pulse, the automation alternates Cross and Square once per second.
-# Separate button edges keep title UIs from rejecting the two-button chord. Set
-# REMU_AUTO_CROSS_REPEAT_MS=0 to keep an explicit schedule one-shot.
+# After its final scheduled pulse, the automation repeats Cross once per second with a release
+# edge between presses. Set REMU_AUTO_CROSS_REPEAT_MS=0 to keep an explicit schedule one-shot.
 auto_cross=${REMU_AUTO_CROSS:-}
 # Some first-boot and system-style title screens bind their explicit confirmation action to the
 # controller's Options button. Keep this as a separate one-shot schedule so it never forms a

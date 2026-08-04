@@ -163,12 +163,15 @@ set +e
     cd "$repo_dir"
     # This watchdog owns only LLDB. It never signals the separately launched
     # REmu target, whose own --timeout-seconds remains authoritative.
+    # Native LLDB can inspect the Rosetta x86_64 target through debugserver.
+    # Running LLDB itself as x86_64 is not portable because current arm64
+    # Command Line Tools installations may provide only an arm64 libxcrun.
     "$script_dir/run-with-watchdog.sh" \
         "$timeout_seconds" "$watchdog_grace_seconds" -- \
         env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME \
             TERM=dumb \
             REMU_DISABLE_CPU_WRITE_WATCH=1 \
-            arch -x86_64 /usr/bin/lldb --no-lldbinit -b \
+            /usr/bin/lldb --no-lldbinit -b \
             -o 'settings set interpreter.stop-command-source-on-error false' \
             -o "command script import '$snapshot_script'" \
             -o "process attach --pid $attach_pid" \

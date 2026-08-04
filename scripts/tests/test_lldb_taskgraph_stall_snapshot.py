@@ -120,6 +120,33 @@ class TaskGraphStallSnapshotTests(unittest.TestCase):
             )
         )
 
+    def test_decodes_exact_wait_from_an_lldb_unwound_guest_frame(self) -> None:
+        candidate = SNAPSHOT.decode_unwound_guest_wait(
+            9,
+            SNAPSHOT.GAME_THREAD_WAIT_RETURN,
+            self.guest_rsp,
+            self.wait_rbp,
+            self.read_u64,
+        )
+
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate.source, "unwound-guest")
+        self.assertEqual(candidate.wait_rbp, self.wait_rbp)
+        self.assertEqual(candidate.event, self.event)
+        self.assertEqual(candidate.native_distance, 0)
+
+    def test_unwound_decoder_rejects_a_different_guest_frame(self) -> None:
+        self.assertIsNone(
+            SNAPSHOT.decode_unwound_guest_wait(
+                9,
+                SNAPSHOT.GAME_THREAD_WAIT_RETURN + 1,
+                self.guest_rsp,
+                self.wait_rbp,
+                self.read_u64,
+            )
+        )
+
     def test_selects_nearest_native_import_frame(self) -> None:
         first = SNAPSHOT.decode_wait_candidate(
             self.import_frame, 9, self.native_sp, self.read_u64
