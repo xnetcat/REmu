@@ -34,6 +34,8 @@ pub(crate) mod vector;
 const MAX_METAL_THREADGROUP_THREADS: usize = 1_024;
 const METAL_THREADGROUP_MEMORY_LIMIT_BYTES: usize = 32 * 1_024;
 const SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP: usize = MAX_METAL_THREADGROUP_THREADS / 32;
+const HLSL_VECTOR_CONTROLLED_LOOP_WATCHDOG: u32 = 64;
+const HLSL_SCALAR_CONTROLLED_LOOP_WATCHDOG: u32 = 1_024;
 
 pub(crate) struct Compiler<'a> {
     program: &'a Program,
@@ -88,6 +90,32 @@ impl Compiler<'_> {
     fn dispatcher_step_limit(&self) -> u32 {
         let instructions = u32::try_from(self.program.instructions.len()).unwrap_or(u32::MAX);
         instructions.saturating_mul(32).max(16_384)
+    }
+
+    /// Returns a finite loop bound for compute HLSL.
+    ///
+    /// Windows resets a device when a dispatch cannot make progress within the TDR interval.
+    /// Decode-time resource snapshots can be older than ordered GPU producers, so even a normally
+    /// small scalar loop can transiently observe a poison/sentinel count. Keep every translated
+    /// compute loop statically finite. Scalar resource evaluation still supplies the useful trip
+    /// count, capped at a generous watchdog; loops whose exit depends on lane state use the tighter
+    /// conservative watchdog. Metal keeps its native structured loops unchanged.
+    fn hlsl_structured_loop_iteration_limit(&self) -> Option<u32> {
+        if !self.is_hlsl() {
+            return None;
+        }
+        let registers = self.evaluation.compute_system_registers?;
+        let vector_watchdog = registers
+            .has_evaluated_vector_controlled_loop
+            .then_some(HLSL_VECTOR_CONTROLLED_LOOP_WATCHDOG)
+            .unwrap_or_default();
+        Some(
+            registers
+                .maximum_evaluated_scalar_loop_iterations
+                .min(HLSL_SCALAR_CONTROLLED_LOOP_WATCHDOG)
+                .max(vector_watchdog)
+                .max(1),
+        )
     }
 
     fn readfirstlane_site_count(&self) -> usize {

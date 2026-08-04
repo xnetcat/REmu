@@ -170,6 +170,8 @@ struct Evaluator<'a, M> {
     vertex_inputs: Vec<VertexInputBinding>,
     evaluated_steps: usize,
     maximum_steps: usize,
+    maximum_scalar_loop_iterations: u32,
+    encountered_vector_controlled_loop: bool,
 }
 
 /// Evaluation paths abandoned before their end, keyed by reason and the guest address of the
@@ -275,6 +277,8 @@ fn evaluate_shader_within(
         vertex_inputs: Vec::with_capacity(4),
         evaluated_steps: 0,
         maximum_steps,
+        maximum_scalar_loop_iterations: 0,
+        encountered_vector_controlled_loop: false,
     };
     if !state.program.instructions.is_empty() {
         evaluator.queue_path(ScalarPath {
@@ -288,7 +292,24 @@ fn evaluate_shader_within(
         });
     }
     while let Some(path) = evaluator.pending_paths.pop() {
-        evaluator.execute_path(path)?;
+        match evaluator.execute_path(path) {
+            Ok(()) => {}
+            Err(EvaluationError::ControlFlowLimit { pc, .. })
+                if state.compute_system_registers.is_some() =>
+            {
+                // Runtime compute loops can observe stale/poison counts in decode-time resource
+                // snapshots. Resource evaluation is discovery, not shader execution: retain the
+                // bindings found so far, let the static-inactive pass cover the remaining sites,
+                // and force HLSL lowering onto its finite scalar-loop watchdog. Skipping the whole
+                // dispatch here loses ordered GPU work and can corrupt every later frame.
+                record_truncated_evaluation(
+                    "compute-control-flow-limit",
+                    state.program.instruction_address(pc),
+                );
+                evaluator.maximum_scalar_loop_iterations = u32::MAX;
+            }
+            Err(error) => return Err(error),
+        }
     }
     evaluator.bind_statically_inactive_resources()?;
     let scalar_register_count = state
@@ -298,6 +319,13 @@ fn evaluate_shader_within(
         .and_then(|register| usize::try_from(*register).ok())
         .and_then(|register| register.checked_add(1))
         .unwrap_or_default();
+    let compute_system_registers = state.compute_system_registers.map(|mut registers| {
+        registers.maximum_evaluated_scalar_loop_iterations =
+            evaluator.maximum_scalar_loop_iterations;
+        registers.has_evaluated_vector_controlled_loop =
+            evaluator.encountered_vector_controlled_loop;
+        registers
+    });
     Ok(ShaderEvaluation {
         initial_scalar_registers: SmallVec::from_slice(
             &evaluator.initial_registers[..scalar_register_count],
@@ -306,7 +334,7 @@ fn evaluate_shader_within(
         scalar_memory_reads: evaluator.scalar_memory_reads.into_sorted_vec(),
         image_bindings: evaluator.image_bindings,
         global_memory_bindings: evaluator.global_bindings,
-        compute_system_registers: state.compute_system_registers,
+        compute_system_registers,
         vertex_inputs: evaluator.vertex_inputs,
     })
 }
@@ -600,6 +628,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                             self.trace_scalar_loop_latch(instruction, target_pc);
                         }
                         if vector_controlled {
+                            self.encountered_vector_controlled_loop = true;
                             let recurrence = scalar_recurrence_state(
                                 &path.registers,
                                 self.state
@@ -619,10 +648,20 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                                 continue;
                             }
                             path.record_backward_branch_visit(instruction.pc);
+                        } else {
+                            let iterations = backward_visits.saturating_add(1);
+                            self.maximum_scalar_loop_iterations =
+                                self.maximum_scalar_loop_iterations.max(iterations);
+                            path.record_backward_branch_visit(instruction.pc);
                         }
                     }
                     path.instruction_index = target_index;
                 } else {
+                    if backward && !branch_condition_depends_on_vector_state(instruction.opcode) {
+                        self.maximum_scalar_loop_iterations = self
+                            .maximum_scalar_loop_iterations
+                            .max(backward_visits.saturating_add(1));
+                    }
                     path.instruction_index = path.instruction_index.saturating_add(1);
                 }
                 continue;

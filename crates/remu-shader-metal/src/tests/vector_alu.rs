@@ -73,60 +73,62 @@ fn lowers_relative_vector_moves_with_m0_and_the_allocated_register_limit() {
 }
 
 #[test]
-fn pixel_movrels_serialization_refuses_without_a_proven_metal_path() {
+fn pixel_movrels_serialization_refuses_metal_but_uses_hlsl_lane_survival() {
     // J3: the EXEC-preserving serialization peephole is deleted. The idiom must fail loudly.
     let mut options = MetalCompileOptions::pixel(Vec::new(), 0, 0);
     options.allocated_vector_register_count = 8;
-    let error = compile_msl(
-        &Program::new(
-            0x1000,
-            vec![
-                Instruction {
-                    pc: 0x1000,
-                    encoding: ShaderEncoding::Vop1,
-                    opcode: Opcode::Known("VReadfirstlaneB32"),
-                    words: vec![0],
-                    sources: vec![Operand::vector(5)],
-                    destinations: vec![Operand::scalar(4)],
-                    control: None,
-                },
-                Instruction {
-                    pc: 0x1004,
-                    encoding: ShaderEncoding::Vopc,
-                    opcode: Opcode::Known("VCmpxEqU32"),
-                    words: vec![0],
-                    sources: vec![Operand::scalar(4), Operand::vector(5)],
-                    destinations: vec![],
-                    control: None,
-                },
-                Instruction {
-                    pc: 0x1008,
-                    encoding: ShaderEncoding::Sop1,
-                    opcode: Opcode::Known("SMovB32"),
-                    words: vec![0],
-                    sources: vec![Operand::scalar(4)],
-                    destinations: vec![Operand::scalar(124)],
-                    control: None,
-                },
-                Instruction {
-                    pc: 0x100c,
-                    encoding: ShaderEncoding::Vop1,
-                    opcode: Opcode::Known("VMovrelsB32"),
-                    words: vec![0],
-                    sources: vec![Operand::vector(0)],
-                    destinations: vec![Operand::vector(2)],
-                    control: None,
-                },
-            ],
-        ),
-        &empty_evaluation(),
-        &options,
-    )
-    .expect_err("pixel movrels serialization must refuse");
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0x1000,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VReadfirstlaneB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(5)],
+                destinations: vec![Operand::scalar(4)],
+                control: None,
+            },
+            Instruction {
+                pc: 0x1004,
+                encoding: ShaderEncoding::Vopc,
+                opcode: Opcode::Known("VCmpxEqU32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(4), Operand::vector(5)],
+                destinations: vec![],
+                control: None,
+            },
+            Instruction {
+                pc: 0x1008,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(4)],
+                destinations: vec![Operand::scalar(124)],
+                control: None,
+            },
+            Instruction {
+                pc: 0x100c,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovrelsB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(0)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+        ],
+    );
+    let error = compile_msl(&program, &empty_evaluation(), &options)
+        .expect_err("Metal pixel movrels serialization must refuse");
     assert!(
         error.to_string().contains("V_MOVRELS serialization"),
         "loud refuse must name the idiom: {error}"
     );
+
+    let hlsl = compile_hlsl(&program, &empty_evaluation(), &options, [1, 1, 1])
+        .expect("HLSL keeps every native invocation alive while guest EXEC is false");
+    assert!(hlsl.source.contains("WaveActiveBallot"));
+    assert!(hlsl.source.contains("if (exec) remu_v_2 = t"));
 }
 
 #[test]

@@ -434,6 +434,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 lds_size_bytes: 0,
                 scratch_size_bytes: 0,
                 wave_lane_count: 64,
+                hlsl_wave64_group_isolation_axis: None,
                 allocated_vector_register_count: 256,
                 ngg_registers_proven: false,
             },

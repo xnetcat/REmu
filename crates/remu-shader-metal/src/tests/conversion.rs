@@ -225,6 +225,30 @@ fn rdna2_floor_and_packed_unorm_conversions_preserve_exact_integer_semantics() {
         "OMOD is ignored for this integer result"
     );
 
+    let round_positive_infinity = compile_vector_instruction(
+        Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VCvtRpiI32F32"),
+            words: vec![0],
+            sources: vec![Operand::vector(1)],
+            destinations: vec![Operand::vector(8)],
+            control: None,
+        },
+        MetalShaderStage::Pixel,
+    );
+    assert!(round_positive_infinity.source.contains("ceil(t0)"));
+    assert!(
+        round_positive_infinity
+            .source
+            .contains("t0 <= -2147483648.0f ? 0x80000000u")
+    );
+    assert!(
+        round_positive_infinity
+            .source
+            .contains("t0 >= 2147483648.0f ? 0x7FFFFFFFu")
+    );
+
     let packed = compile_vector_instruction(
         Instruction {
             pc: 0,

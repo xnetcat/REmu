@@ -825,6 +825,15 @@ impl Compiler<'_> {
                     "isnan({source}) ? 0u : ({source} <= -2147483648.0f ? 0x80000000u : ({source} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int)floor({source}))))"
                 )
             }
+            "VCvtRpiI32F32" => {
+                let source = self.temp("float", &self.float_source(instruction, 0)?);
+                // Round toward positive infinity, then apply the same saturating conversion as
+                // the other RDNA2 F32-to-I32 opcodes. Endpoint guards also keep HLSL/MSL casts
+                // away from NaN, infinity, and values outside the signed range.
+                format!(
+                    "isnan({source}) ? 0u : ({source} <= -2147483648.0f ? 0x80000000u : ({source} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int)ceil({source}))))"
+                )
+            }
             "VCvtOffF32I4" => {
                 let source = self.temp("uint", &self.raw_source(instruction, 0)?);
                 self.float_result(

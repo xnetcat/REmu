@@ -19,7 +19,7 @@ use remu_memory::{
     CpuWriteWatch, GuestRangeLease, GuestSharedMappingIdentity, GuestWriteSite,
     LeasePublishOutcome, guest_shared_backing_identity,
 };
-use remu_shader::{GlobalMemoryBinding, Program, ShaderEvaluation};
+use remu_shader::{GlobalMemoryBinding, InstructionControl, Program, ShaderEvaluation};
 use remu_shader_metal::{
     HlslBindingLayout, HlslEvaluationKey, HlslShader, MetalCompileOptions, MetalRegisterFootprint,
     MetalShaderStage, NggRegisters,
@@ -401,30 +401,39 @@ struct OrderedGlobalVersions {
 }
 
 impl OrderedGlobalVersions {
-    fn forwarded_slice(&self, address: u64, packet_bytes: &[u8]) -> Option<&[u8]> {
+    fn forwarded_slice(&self, address: u64, packet_bytes: &[u8]) -> Option<Vec<u8>> {
         let byte_count = u64::try_from(packet_bytes.len()).ok()?;
         let end = address.checked_add(byte_count)?;
         let live_identity = guest_shared_backing_identity(address, byte_count);
+        // A command packet's evaluated binding bytes are a decode-time snapshot. They can predate
+        // an already executed GPU producer by several submissions, so byte equality cannot decide
+        // whether the immutable snapshot or the ordered GPU version is newer. Like the Metal
+        // backend's version journal, the newest contained GPU version is authoritative until an
+        // explicit guest-memory write/acquire invalidates the range.
         self.entries.iter().rev().find_map(|version| {
             let version_bytes = u64::try_from(version.current_bytes.len()).ok()?;
-            let version_end = version.address.checked_add(version_bytes)?;
-            if address < version.address || end > version_end {
-                return None;
-            }
-            let offset = usize::try_from(address - version.address).ok()?;
-            if let Some(identity) = version.identity {
-                let expected = GuestSharedMappingIdentity {
-                    backing_id: identity.backing_id,
-                    backing_offset: identity.backing_offset.checked_add(offset as u64)?,
-                };
-                if live_identity != Some(expected) {
-                    return None;
+            let offset = match (version.identity, live_identity) {
+                (Some(producer), Some(consumer)) if producer.backing_id == consumer.backing_id => {
+                    let producer_end = producer.backing_offset.checked_add(version_bytes)?;
+                    let consumer_end = consumer.backing_offset.checked_add(byte_count)?;
+                    if consumer.backing_offset < producer.backing_offset
+                        || consumer_end > producer_end
+                    {
+                        return None;
+                    }
+                    usize::try_from(consumer.backing_offset - producer.backing_offset).ok()?
                 }
-            }
+                (Some(_), _) => return None,
+                (None, _) => {
+                    let version_end = version.address.checked_add(version_bytes)?;
+                    if address < version.address || end > version_end {
+                        return None;
+                    }
+                    usize::try_from(address - version.address).ok()?
+                }
+            };
             let range = offset..offset.checked_add(packet_bytes.len())?;
-            let original = version.original_bytes.get(range.clone())?;
-            let current = version.current_bytes.get(range)?;
-            (packet_bytes == original || packet_bytes == current).then_some(current)
+            version.current_bytes.get(range).map(<[u8]>::to_vec)
         })
     }
 
@@ -1009,10 +1018,14 @@ impl Dx12GuestExecutor {
         // D3D12 device, so reject stale or partially produced indirect arguments before compiling
         // shaders or creating resource views.
         let group_count = dispatch_group_count(dispatch)?;
+        let wave64_isolation = wave64_group_isolation(dispatch, &snapshot.program, group_count)?;
+        let native_group_count =
+            wave64_isolation.map_or(group_count, |isolation| isolation.native_group_count);
         let mut options = MetalCompileOptions::compute_wave(
             dispatch.launch.lds_size_bytes,
             dispatch.launch.wave_lane_count,
         );
+        options.hlsl_wave64_group_isolation_axis = wave64_isolation.map(|isolation| isolation.axis);
         options.allocated_vector_register_count = allocated_compute_vgprs(dispatch);
         let (_, compiled, _) = self.translate_shader_cached(
             &snapshot.program,
@@ -1087,7 +1100,11 @@ impl Dx12GuestExecutor {
                 root_constants.as_ptr().cast::<c_void>(),
                 0,
             );
-            commands.Dispatch(group_count[0], group_count[1], group_count[2]);
+            commands.Dispatch(
+                native_group_count[0],
+                native_group_count[1],
+                native_group_count[2],
+            );
         }
         for resource in &resources.globals {
             if let Some(readback) = &resource.readback {
@@ -3851,6 +3868,81 @@ fn shader_semantics(source: &str) -> String {
         .join(" | ")
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Wave64GroupIsolation {
+    axis: u8,
+    native_group_count: [u32; 3],
+}
+
+/// Packs each emulated wave64 into one 64-thread native group when whole-group HLSL barriers
+/// would otherwise synchronize unrelated guest waves.
+///
+/// `V_READLANE` and `V_READFIRSTLANE` exchange values between two forced SIMD32 halves through
+/// groupshared storage. A 256-thread guest group contains four independent guest waves; scalar
+/// control flow can legally send those waves through different helper sites, making a native
+/// 256-thread `GroupMemoryBarrierWithGroupSync` deadlock. When the guest has no workgroup-wide LDS
+/// semantics, expanding one dispatch axis preserves every logical invocation while giving each
+/// guest wave an independent 64-thread synchronization domain.
+fn wave64_group_isolation(
+    dispatch: &ComputeDispatch,
+    program: &Program,
+    group_count: [u32; 3],
+) -> Result<Option<Wave64GroupIsolation>, String> {
+    let uses_split_exchange = program.instructions.iter().any(|instruction| {
+        instruction.opcode.is("VReadlaneB32") || instruction.opcode.is("VReadfirstlaneB32")
+    });
+    let total_threads = u32::try_from(dispatch.launch.threads_per_group_total())
+        .map_err(|_| "compute threadgroup size does not fit u32")?;
+    if dispatch.launch.wave_lane_count != 64 || total_threads <= 64 || !uses_split_exchange {
+        return Ok(None);
+    }
+
+    let uses_guest_workgroup_synchronization = program.instructions.iter().any(|instruction| {
+        instruction.opcode.is("SBarrier")
+            || matches!(
+                instruction.control.as_ref(),
+                Some(InstructionControl::DataShare(_))
+            )
+            || matches!(
+                instruction.control.as_ref(),
+                Some(InstructionControl::BufferMemory(control)) if control.lds
+            )
+            || matches!(
+                instruction.control.as_ref(),
+                Some(InstructionControl::GlobalMemory(control)) if control.lds
+            )
+    });
+    if uses_guest_workgroup_synchronization {
+        return Err(format!(
+            "wave64 compute shader at {:#x} combines split-wave exchange with guest LDS/barrier semantics; refusing a D3D12 whole-group barrier deadlock",
+            dispatch.shader_address
+        ));
+    }
+    if total_threads % 64 != 0 {
+        return Err(format!(
+            "wave64 compute shader at {:#x} has {total_threads} threads; isolated D3D12 wave groups require a multiple of 64",
+            dispatch.shader_address
+        ));
+    }
+    let guest_wave_count = total_threads / 64;
+    let Some(axis) = group_count.iter().position(|count| {
+        count
+            .checked_mul(guest_wave_count)
+            .is_some_and(|expanded| expanded <= D3D12_MAX_DISPATCH_GROUPS_PER_DIMENSION)
+    }) else {
+        return Err(format!(
+            "wave64 compute dispatch {:?} cannot isolate {guest_wave_count} guest waves within D3D12's per-axis group limit",
+            group_count
+        ));
+    };
+    let mut native_group_count = group_count;
+    native_group_count[axis] *= guest_wave_count;
+    Ok(Some(Wave64GroupIsolation {
+        axis: u8::try_from(axis).expect("three dispatch axes fit u8"),
+        native_group_count,
+    }))
+}
+
 fn dispatch_group_count(dispatch: &ComputeDispatch) -> Result<[u32; 3], String> {
     let groups = match dispatch.launch.grid {
         ComputeGrid::Threadgroups(groups) => groups,
@@ -3889,7 +3981,7 @@ fn resolve_indirect_compute_ordered(
     let packet_dimensions = encoded_dispatch_dimensions(dispatch)?;
     let mut bytes = packet_dimensions.map(u32::to_le_bytes).concat();
     if let Some(forwarded) = ordered_versions.forwarded_slice(dimensions_address, &bytes) {
-        bytes.copy_from_slice(forwarded);
+        bytes.copy_from_slice(&forwarded);
         if std::env::var_os("REMU_TRACE_D3D12_BINDINGS").is_some_and(|value| value == "1") {
             eprintln!(
                 "[REMu][D3D12-BINDINGS] forwarded ordered indirect compute address={dimensions_address:#x} packet=[{}] gpu=[{}]",
@@ -7634,10 +7726,10 @@ fn snapshot_ordered_global(
             binding.base_address,
             binding.byte_count,
             preview_words(&packet_bytes),
-            preview_words(forwarded),
+            preview_words(&forwarded),
         );
     }
-    Ok(forwarded.to_vec())
+    Ok(forwarded)
 }
 
 fn snapshot_live_global(binding: &remu_shader::GlobalMemoryBinding) -> Result<Vec<u8>, String> {
@@ -8309,7 +8401,8 @@ mod tests {
         prepare_ngg_triangle_indices, presentable_bgra, primitive_restart_index,
         regroup_restart_list_indices, resolve_indirect_compute, resolve_indirect_compute_ordered,
         resolve_indirect_draw, snapshot_ordered_global, synthetic_ngg_binding,
-        texture_component_mapping, texture_format_component_remap, write_changed_ranges_direct,
+        texture_component_mapping, texture_format_component_remap, wave64_group_isolation,
+        write_changed_ranges_direct,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -8539,6 +8632,68 @@ mod tests {
         ])))
         .expect_err("oversized native dispatch must be rejected");
         assert!(error.contains("x-dimension 65536"), "{error}");
+    }
+
+    #[test]
+    fn isolates_each_split_wave64_in_a_native_threadgroup() {
+        let mut dispatch = dispatch_with_grid(ComputeGrid::Threadgroups([120, 1, 1]));
+        dispatch.launch.threads_per_group = [16, 16, 1];
+        dispatch.launch.wave_lane_count = 64;
+        dispatch.shader_address = 0x15700_e5ea00;
+        let program = Program::new(
+            dispatch.shader_address,
+            vec![Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VReadfirstlaneB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(4)],
+                destinations: vec![Operand::scalar(44)],
+                control: None,
+            }],
+        );
+
+        let isolation = wave64_group_isolation(&dispatch, &program, [120, 1, 1])
+            .expect("split-wave exchange without guest LDS should be isolatable")
+            .expect("four guest waves need independent native groups");
+        assert_eq!(isolation.axis, 0);
+        assert_eq!(isolation.native_group_count, [480, 1, 1]);
+    }
+
+    #[test]
+    fn rejects_split_wave64_isolation_when_guest_barriers_need_the_full_group() {
+        let mut dispatch = dispatch_with_grid(ComputeGrid::Threadgroups([120, 1, 1]));
+        dispatch.launch.threads_per_group = [16, 16, 1];
+        dispatch.launch.wave_lane_count = 64;
+        dispatch.shader_address = 0x15700_e5ea00;
+        let program = Program::new(
+            dispatch.shader_address,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VReadfirstlaneB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(4)],
+                    destinations: vec![Operand::scalar(44)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::Known("SBarrier"),
+                    words: vec![0],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+
+        let error = wave64_group_isolation(&dispatch, &program, [120, 1, 1])
+            .expect_err("guest-wide synchronization cannot be split into native groups");
+        assert!(error.contains("guest LDS/barrier semantics"), "{error}");
+        assert!(error.contains("deadlock"), "{error}");
     }
 
     #[test]
@@ -9488,11 +9643,51 @@ mod tests {
 
         versions.record(address, None, &packet, &produced);
 
-        let mut future = binding;
+        let mut future = binding.clone();
         future.data = super::words_as_bytes(&live);
         assert_eq!(
-            snapshot_ordered_global(&future, &versions).expect("keep newer packet bytes"),
+            snapshot_ordered_global(&future, &versions)
+                .expect("ordered GPU version supersedes stale packet bytes"),
+            produced
+        );
+        versions.invalidate(address, packet.len() as u64);
+        assert_eq!(
+            snapshot_ordered_global(&future, &versions).expect("observe bytes after invalidation"),
             future.data
+        );
+    }
+
+    #[test]
+    fn ordered_global_versions_follow_an_overlapping_gpu_producer_chain() {
+        let mut live = [0_u32, 0x1800_3fff, 0, 0x1800_3fff, 0];
+        let address = live.as_mut_ptr() as u64;
+        let stale_reset_packet = super::words_as_bytes(&[0xc000_0000_u32; 5]);
+        let reset_output = super::words_as_bytes(&[0_u32; 5]);
+        let classifier_output = super::words_as_bytes(&[0_u32, 0x78, 0, 0x1068, 0]);
+        let binding = GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: address,
+            instruction_pcs: Default::default(),
+            byte_count: stale_reset_packet.len(),
+            data: super::words_as_bytes(&live),
+            writable: false,
+            write_back_to_guest: false,
+        };
+        let mut versions = OrderedGlobalVersions::default();
+        versions.record(address, None, &stale_reset_packet, &reset_output);
+        versions.record(address, None, &reset_output, &classifier_output);
+
+        assert_eq!(
+            snapshot_ordered_global(&binding, &versions)
+                .expect("walk reset and classifier producer versions"),
+            classifier_output
+        );
+
+        let newer_packet = binding;
+        assert_eq!(
+            snapshot_ordered_global(&newer_packet, &versions)
+                .expect("latest ordered producer supersedes an unrelated stale packet"),
+            classifier_output
         );
     }
 

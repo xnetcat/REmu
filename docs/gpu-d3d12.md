@@ -211,11 +211,12 @@ The Poppy counter pipeline has since been isolated further: a one-group reset cl
 counter buffer, a 23x13 classifier accumulates into it, and a five-lane expander produces indirect
 triplets. Packet-time buffer snapshots can predate those GPU writes even when the events themselves
 remain ordered. The D3D12 executor now retains a bounded queue of GPU-produced buffer versions,
-keys leased entries by physical mapping identity, and forwards a producer only when a consumer's
-packet bytes still match either the producer baseline or its current output. A genuinely newer CPU
-packet wins. Ordered acquire, DMA, `WRITE_DATA`, and `RELEASE_MEM` destinations invalidate
-overlapping virtual or aliased physical entries. The cache is limited to 128 entries, 8 MiB per
-entry, and 64 MiB total.
+keys leased entries by physical mapping identity, and treats the newest contained GPU version as
+authoritative over decode-time packet bytes. This matches Metal's immutable version-journal model:
+packet bytes are snapshots, not evidence of a later CPU write. Ordered acquire, DMA, `WRITE_DATA`,
+and `RELEASE_MEM` destinations invalidate overlapping virtual or aliased physical entries before a
+later consumer can reuse them. The cache is limited to 128 entries, 8 MiB per entry, and 64 MiB
+total.
 
 That forwarding produces the intended counter `0x2428` and indirect triplet `[0x2428, 1, 1]`
 instead of the recycled `0x18003fff` sentinel. A physical GTX 1050 regression recreates the exact
@@ -223,8 +224,9 @@ five-thread formatted-buffer expansion into a 65,532-byte UAV and verifies all f
 Poppy then reaches compute 196 with the correct 9,256-group X dimension. Its next captured graphics
 feature was an NGG export using LDS/barriers. That class now has a backend-neutral subgroup decoder
 and a D3D12 compute-to-raster fallback which is physically validated on a device with no mesh-shader
-tier. A game-backed rerun is still required before claiming that the title advances through this
-point, and current per-draw/dispatch fencing remains too slow for interactive use. Per-format
+tier. A game-backed rerun now repeatedly executes `[120, 1, 1]` and `[4200, 1, 1]` indirect
+consumers with the intended arguments. Current per-draw/dispatch fencing remains too slow for
+interactive use. Per-format
 `D3D12_FEATURE_DATA_FORMAT_SUPPORT` checks confirm that this adapter advertises the required typed
 UAV store support.
 
@@ -272,6 +274,21 @@ sustained CPU, memory, shader translation, D3D12 graphics/presentation, AVPlayer
 execution in one title. It is not a Poppy playability claim yet: the run remained in the opening
 movie and guest progress was about 6.9 times slower than real time. Submission batching and the
 remaining per-draw synchronization/resource work are now the primary route to the menu.
+
+The post-dialog workload exposed two additional Windows TDR classes. First, structured wave64 HLSL
+was bounded only when split-wave group isolation was active; an ordinary 64-thread compute shader
+could still lower a resource-controlled loop to `while (true)`. All compute HLSL loops now use the
+evaluator-observed scalar trip count, capped at 1,024 iterations, or a tighter 64-iteration watchdog
+when the exit depends on vector state. This is backend policy rather than an adapter check and
+therefore applies to every D3D12 GPU. Second, compute resource discovery no longer drops a dispatch
+when a poison loop count consumes its one-million-instruction evaluation budget: it retains the
+discovered/static bindings and forces the generated loop onto that finite watchdog.
+
+A 180-second GTX 1050 run with DRED and binding tracing passed the former removals at compute 151
+and 1,688, reached compute 1,865 and more than 1,000 draws, and ended at the diagnostic timeout with
+no device removal. It sustained valid 120- and 4,200-group indirect consumers. The visible frame is
+still corrupt after the common dialogs (cyan surfaces and incomplete menu-shaped UI), so this is a
+substantial execution-stability result, not a title-menu or gameplay claim.
 
 ## Crate and data-flow boundaries
 

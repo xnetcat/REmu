@@ -232,6 +232,14 @@ pub struct MetalCompileOptions {
     /// Architectural lanes per guest compute wave. Apple executes SIMD32; wave64 shaders whose
     /// cross-lane operations are split-safe use this to place ballot masks in the correct half.
     pub wave_lane_count: u32,
+    /// D3D12-only packing axis used to execute each emulated wave64 in its own 64-thread native
+    /// group while retaining the guest workgroup's logical IDs.
+    ///
+    /// Full-group HLSL barriers cannot safely exchange the two SIMD32 halves of one guest wave
+    /// when sibling guest waves take different scalar branches. The DX12 executor enables this
+    /// only for multi-wave compute groups without guest LDS or workgroup barriers, and expands the
+    /// selected dispatch dimension by the number of guest waves. Metal ignores this field.
+    pub hlsl_wave64_group_isolation_axis: Option<u8>,
     /// Number of vector registers allocated by the guest stage's `PGM_RSRC1` state.
     ///
     /// Relative vector moves address `VGPR[base + M0]`. Metal does not allow the backend's
@@ -271,6 +279,7 @@ impl MetalCompileOptions {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -305,6 +314,7 @@ impl MetalCompileOptions {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -335,6 +345,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -365,6 +376,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             scratch_size_bytes: 0,
             wave_lane_count,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -409,6 +421,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }

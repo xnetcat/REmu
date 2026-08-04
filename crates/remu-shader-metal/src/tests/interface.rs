@@ -757,6 +757,7 @@ fn initializes_complete_rdna2_compute_system_register_state() {
         work_group_y: Some(5),
         work_group_z: Some(6),
         thread_group_size: Some(7),
+        ..ComputeSystemRegisters::default()
     });
 
     let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))

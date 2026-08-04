@@ -5,6 +5,7 @@
 //! edges and the vector-controlled loops scalar discovery must terminate on.
 
 use super::*;
+use crate::ComputeSystemRegisters;
 
 #[test]
 fn preserves_initial_image_descriptors_for_statically_inactive_blocks() {
@@ -92,7 +93,7 @@ fn bounds_vector_controlled_backward_loops_during_scalar_discovery() {
         None,
     );
     branch.words[0] = u32::from((-2_i16).cast_unsigned());
-    let shader = state(
+    let mut shader = state(
         vec![
             instruction(
                 0,
@@ -107,6 +108,7 @@ fn bounds_vector_controlled_backward_loops_during_scalar_discovery() {
         ],
         Vec::new(),
     );
+    shader.compute_system_registers = Some(ComputeSystemRegisters::default());
 
     let evaluation = evaluate_shader(
         &TestMemory::default(),
@@ -115,6 +117,12 @@ fn bounds_vector_controlled_backward_loops_during_scalar_discovery() {
     )
     .expect("vector-controlled runtime loop must not exhaust static discovery");
     assert!(evaluation.global_memory_bindings.is_empty());
+    assert!(
+        evaluation
+            .compute_system_registers
+            .expect("compute loop hints")
+            .has_evaluated_vector_controlled_loop
+    );
 }
 
 #[test]
@@ -272,7 +280,7 @@ fn executes_a_scalar_counted_loop_closed_by_an_unconditional_latch() {
         None,
     );
     back_edge.words[0] = u32::from((-4_i16).cast_unsigned());
-    let shader = state(
+    let mut shader = state(
         vec![
             instruction(
                 0,
@@ -308,6 +316,7 @@ fn executes_a_scalar_counted_loop_closed_by_an_unconditional_latch() {
             registers
         },
     );
+    shader.compute_system_registers = Some(ComputeSystemRegisters::default());
 
     let evaluation = evaluate_shader_within(
         &TestMemory::default(),
@@ -318,6 +327,58 @@ fn executes_a_scalar_counted_loop_closed_by_an_unconditional_latch() {
     .expect("scalar counted loop should run to its SCC exit");
 
     assert_eq!(evaluation.scalar_registers[107], 16_388);
+    assert_eq!(
+        evaluation
+            .compute_system_registers
+            .expect("compute loop hints")
+            .maximum_evaluated_scalar_loop_iterations,
+        4_097
+    );
+}
+
+#[test]
+fn compute_resource_discovery_degrades_to_a_finite_loop_hint_at_its_step_limit() {
+    let mut back_edge = instruction(
+        4,
+        ShaderEncoding::Sopp,
+        "SBranch",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    back_edge.words[0] = u32::from((-2_i16).cast_unsigned());
+    let mut shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SAddU32",
+                vec![Operand::scalar(20), Operand::source(132, None)],
+                vec![Operand::scalar(20)],
+                None,
+            ),
+            back_edge,
+            end(8),
+        ],
+        vec![0; 21],
+    );
+    shader.compute_system_registers = Some(ComputeSystemRegisters::default());
+
+    let evaluation = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        16,
+    )
+    .expect("compute discovery should defer termination to the HLSL watchdog");
+
+    assert_eq!(
+        evaluation
+            .compute_system_registers
+            .expect("compute loop hints")
+            .maximum_evaluated_scalar_loop_iterations,
+        u32::MAX
+    );
 }
 
 #[test]

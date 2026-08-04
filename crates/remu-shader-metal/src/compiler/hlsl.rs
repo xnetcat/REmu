@@ -215,14 +215,38 @@ impl Compiler<'_> {
             MetalShaderStage::Pixel => {
                 "[WaveOpsIncludeHelperLanes]\n[RootSignature(REMU_ROOT_SIGNATURE)]\nRemuPsOut remu_main(RemuPsIn remu_in)".to_owned()
             }
-            MetalShaderStage::Compute => format!(
-                "[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads({}, {}, {})]\nvoid remu_main(uint3 remu_local_id : SV_GroupThreadID, uint3 remu_native_group_id : SV_GroupID, uint3 remu_dispatch_id : SV_DispatchThreadID, uint remu_thread_index : SV_GroupIndex)",
-                threads_per_group[0], threads_per_group[1], threads_per_group[2]
-            ),
-            MetalShaderStage::Mesh => format!(
-                "[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads({}, 1, 1)]\nvoid remu_main(uint3 remu_local_id : SV_GroupThreadID, uint3 remu_group_id : SV_GroupID, uint remu_thread_index : SV_GroupIndex)",
-                self.options.mesh_threadgroup_size
-            ),
+            MetalShaderStage::Compute => {
+                let wave_size = if self.split_wave64() {
+                    "[WaveSize(32)]\n"
+                } else {
+                    ""
+                };
+                if self
+                    .options
+                    .hlsl_wave64_group_isolation_axis
+                    .is_some()
+                {
+                    format!(
+                        "{wave_size}[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads(64, 1, 1)]\nvoid remu_main(uint3 remu_packed_group_id : SV_GroupID, uint remu_native_thread_index : SV_GroupIndex)"
+                    )
+                } else {
+                    format!(
+                        "{wave_size}[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads({}, {}, {})]\nvoid remu_main(uint3 remu_local_id : SV_GroupThreadID, uint3 remu_native_group_id : SV_GroupID, uint3 remu_dispatch_id : SV_DispatchThreadID, uint remu_thread_index : SV_GroupIndex)",
+                        threads_per_group[0], threads_per_group[1], threads_per_group[2]
+                    )
+                }
+            }
+            MetalShaderStage::Mesh => {
+                let wave_size = if self.split_wave64() {
+                    "[WaveSize(32)]\n"
+                } else {
+                    ""
+                };
+                format!(
+                    "{wave_size}[RootSignature(REMU_ROOT_SIGNATURE)]\n[numthreads({}, 1, 1)]\nvoid remu_main(uint3 remu_local_id : SV_GroupThreadID, uint3 remu_group_id : SV_GroupID, uint remu_thread_index : SV_GroupIndex)",
+                    self.options.mesh_threadgroup_size
+                )
+            }
         };
         let _ = writeln!(source, "{signature} {{");
         source.push_str(
@@ -342,10 +366,34 @@ impl Compiler<'_> {
                 source.push_str(&translate_common_source(input_state));
             }
             MetalShaderStage::Compute => {
-                source.push_str(
-                    "    if (all(remu_dispatch_limit != 0u) && any(remu_dispatch_id >= remu_dispatch_limit)) return;\n\
-                     \x20   uint3 remu_group_id = remu_native_group_id + remu_dispatch_base_group;\n",
-                );
+                if let Some(axis) = self.options.hlsl_wave64_group_isolation_axis {
+                    let axis = ["x", "y", "z"][usize::from(axis)];
+                    let group_threads = threads_per_group.into_iter().product::<u32>();
+                    let guest_waves = group_threads / 64;
+                    let xy_threads = threads_per_group[0] * threads_per_group[1];
+                    let _ = writeln!(
+                        source,
+                        "    uint remu_guest_wave = remu_packed_group_id.{axis} % {guest_waves}u;\n\
+                         \x20   uint3 remu_native_group_id = remu_packed_group_id;\n\
+                         \x20   remu_native_group_id.{axis} /= {guest_waves}u;\n\
+                         \x20   uint remu_thread_index = remu_guest_wave * 64u + remu_native_thread_index;\n\
+                         \x20   uint3 remu_local_id = uint3(remu_thread_index % {}u, (remu_thread_index / {}u) % {}u, remu_thread_index / {xy_threads}u);\n\
+                         \x20   uint3 remu_dispatch_id = remu_native_group_id * uint3({}u, {}u, {}u) + remu_local_id;\n\
+                         \x20   if (all(remu_dispatch_limit != 0u) && any(remu_dispatch_id >= remu_dispatch_limit)) return;\n\
+                         \x20   uint3 remu_group_id = remu_native_group_id + remu_dispatch_base_group;",
+                        threads_per_group[0],
+                        threads_per_group[0],
+                        threads_per_group[1],
+                        threads_per_group[0],
+                        threads_per_group[1],
+                        threads_per_group[2],
+                    );
+                } else {
+                    source.push_str(
+                        "    if (all(remu_dispatch_limit != 0u) && any(remu_dispatch_id >= remu_dispatch_limit)) return;\n\
+                         \x20   uint3 remu_group_id = remu_native_group_id + remu_dispatch_base_group;\n",
+                    );
+                }
                 source.push_str("    uint remu_lane = WaveGetLaneIndex();\n");
                 let _ = writeln!(
                     source,
@@ -700,6 +748,16 @@ fn validate_hlsl_interface(
             return Err(MetalCompileError::InvalidInterface(format!(
                 "compute threadgroup {:?} is outside the D3D12 1..=1024-thread limit",
                 threads_per_group
+            )));
+        }
+        if let Some(axis) = compiler.options.hlsl_wave64_group_isolation_axis
+            && (compiler.options.wave_lane_count != 64
+                || total.is_none_or(|total| total <= 64 || total % 64 != 0)
+                || axis > 2)
+        {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "wave64 group isolation requires a multi-wave, 64-aligned compute group and axis 0..=2; group={threads_per_group:?} wave={} axis={axis}",
+                compiler.options.wave_lane_count
             )));
         }
     }

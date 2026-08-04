@@ -167,6 +167,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
         },

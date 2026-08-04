@@ -593,7 +593,22 @@ impl<'a> Compiler<'a> {
                 }
             }
             StructuredCfg::Loop(body) => {
-                self.line(indent, "while (true) {");
+                if let Some(iteration_limit) = self.hlsl_structured_loop_iteration_limit() {
+                    // Keep compute HLSL statically bounded so the D3D driver can prove forward
+                    // progress and stale/poison guest scalar state cannot become a device-wide
+                    // TDR. The evaluator supplies scalar trip counts while opaque vector loops
+                    // use a conservative watchdog.
+                    let guard = self.next_temp;
+                    self.next_temp += 1;
+                    self.line(
+                        indent,
+                        &format!(
+                            "for (uint remu_hlsl_loop_{guard} = 0u; remu_hlsl_loop_{guard} < {iteration_limit}u; ++remu_hlsl_loop_{guard}) {{"
+                        ),
+                    );
+                } else {
+                    self.line(indent, "while (true) {");
+                }
                 self.emit_structured_cfg(body, blocks, indent + 1, failures, failed_opcodes)?;
                 self.line(indent, "}");
             }

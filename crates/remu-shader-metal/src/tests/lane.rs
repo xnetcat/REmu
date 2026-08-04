@@ -266,6 +266,7 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             lds_size_bytes: 2_048,
             scratch_size_bytes: 0,
             wave_lane_count: 64,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
         },
@@ -292,6 +293,50 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
     );
     assert!(shader.source.contains("remu_readfirstlane_active"));
     assert!(shader.source.contains("remu_s_44 ="));
+}
+
+#[test]
+fn isolates_hlsl_wave64_exchange_in_one_native_group_per_guest_wave() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0xec,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VReadfirstlaneB32"),
+            words: vec![0],
+            sources: vec![Operand::vector(4)],
+            destinations: vec![Operand::scalar(44)],
+            control: None,
+        }],
+    );
+    let mut options = MetalCompileOptions::compute_wave(0, 64);
+    options.hlsl_wave64_group_isolation_axis = Some(0);
+    let shader = compile_hlsl(&program, &empty_evaluation(), &options, [16, 16, 1])
+        .expect("isolated wave64 HLSL should lower");
+
+    assert!(shader.source.contains("[WaveSize(32)]"));
+    assert!(shader.source.contains("[numthreads(64, 1, 1)]"));
+    assert!(
+        shader
+            .source
+            .contains("uint remu_guest_wave = remu_packed_group_id.x % 4u;")
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint remu_thread_index = remu_guest_wave * 64u")
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint3 remu_local_id = uint3(remu_thread_index % 16u")
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint3 remu_group_size = uint3(16u, 16u, 1u);")
+    );
+    assert!(shader.source.contains("GroupMemoryBarrierWithGroupSync()"));
 }
 
 #[test]
@@ -466,6 +511,7 @@ fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
         },

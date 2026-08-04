@@ -218,6 +218,44 @@ mod tests {
     }
 
     #[test]
+    fn isolated_split_wave64_compiles_to_real_sm66_dxil() {
+        let program = Program::new(
+            0x15700_e5ea00,
+            vec![
+                Instruction {
+                    pc: 0,
+                    encoding: ShaderEncoding::Vop1,
+                    opcode: Opcode::Known("VReadfirstlaneB32"),
+                    words: vec![0],
+                    sources: vec![Operand::vector(4)],
+                    destinations: vec![Operand::scalar(44)],
+                    control: None,
+                },
+                Instruction {
+                    pc: 4,
+                    encoding: ShaderEncoding::Sopp,
+                    opcode: Opcode::END_PROGRAM,
+                    words: vec![0xbf81_0000],
+                    sources: Vec::new(),
+                    destinations: Vec::new(),
+                    control: None,
+                },
+            ],
+        );
+        let mut options = MetalCompileOptions::compute_wave(0, 64);
+        options.hlsl_wave64_group_isolation_axis = Some(0);
+        let translated =
+            translate_guest_shader(&program, &empty_evaluation([]), &options, [16, 16, 1])
+                .expect("isolated split-wave shader should lower to HLSL");
+
+        assert!(translated.source.contains("[WaveSize(32)]"));
+        assert!(translated.source.contains("[numthreads(64, 1, 1)]"));
+        let dxil = compile_guest_shader(&translated, "remu_guest_wave64_isolation_test.hlsl")
+            .expect("isolated split-wave HLSL should compile to DXIL");
+        assert!(dxil.len() > 128, "DXIL container should not be empty");
+    }
+
+    #[test]
     fn guest_vertex_and_pixel_exports_compile_to_graphics_dxil() {
         let position_export = 0xf800_0000 | 0x0f | (12 << 4) | (1 << 11) | (1 << 12);
         let vertex_program = decode_program(0x2000, &[position_export, 0x0302_0100, 0xbf81_0000])

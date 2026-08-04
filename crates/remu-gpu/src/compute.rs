@@ -355,5 +355,7 @@ pub fn decode_compute_system_registers(shader_registers: &[GpuRegister]) -> Comp
         work_group_y: consume_enabled(1 << 8),
         work_group_z: consume_enabled(1 << 9),
         thread_group_size: consume_enabled(1 << 10),
+        maximum_evaluated_scalar_loop_iterations: 0,
+        has_evaluated_vector_controlled_loop: false,
     }
 }

@@ -456,6 +456,120 @@ fn irreducible_control_flow_keeps_the_step_capped_dispatcher_as_loud_fallback() 
 }
 
 #[test]
+fn hlsl_compute_loop_uses_and_caps_the_scalar_trip_count_without_wave_isolation() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                words: vec![2],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SBranch"),
+                words: vec![0xfffd],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let options = MetalCompileOptions::compute_wave(0, 64);
+    let mut evaluation = empty_evaluation();
+    evaluation.compute_system_registers = Some(ComputeSystemRegisters {
+        maximum_evaluated_scalar_loop_iterations: 299,
+        ..ComputeSystemRegisters::default()
+    });
+    let shader = compile_hlsl(&program, &evaluation, &options, [64, 1, 1])
+        .expect("ordinary compute loop should lower to bounded HLSL");
+
+    assert!(shader.source.contains("remu_hlsl_loop_"));
+    assert!(shader.source.contains("< 299u"));
+    assert!(!shader.source.contains("while (true)"));
+
+    evaluation
+        .compute_system_registers
+        .as_mut()
+        .expect("compute registers")
+        .maximum_evaluated_scalar_loop_iterations = u32::MAX;
+    let capped = compile_hlsl(&program, &evaluation, &options, [64, 1, 1])
+        .expect("poison scalar count should still lower to finite HLSL");
+    assert!(capped.source.contains("< 1024u"));
+}
+
+#[test]
+fn hlsl_vector_loop_uses_the_conservative_watchdog_without_wave_isolation() {
+    let mut branch = Instruction {
+        pc: 4,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::Known("SCbranchExecnz"),
+        words: vec![0],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    };
+    branch.words[0] = u32::from((-2_i16).cast_unsigned());
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(2)],
+                control: None,
+            },
+            branch,
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let options = MetalCompileOptions::compute_wave(0, 64);
+    let mut evaluation = empty_evaluation();
+    evaluation.compute_system_registers = Some(ComputeSystemRegisters {
+        has_evaluated_vector_controlled_loop: true,
+        ..ComputeSystemRegisters::default()
+    });
+
+    let shader = compile_hlsl(&program, &evaluation, &options, [64, 1, 1])
+        .expect("vector-controlled loop should lower to bounded HLSL");
+    assert!(shader.source.contains("< 64u"));
+}
+
+#[test]
 fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arrays() {
     let program = Program::new(
         0x1000,
