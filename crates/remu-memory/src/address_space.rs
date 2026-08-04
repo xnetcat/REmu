@@ -162,7 +162,7 @@ impl GuestAddressSpace {
                 mapping_id: 0,
             },
         );
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(GuestAddress::new(start))
     }
 
@@ -198,7 +198,7 @@ impl GuestAddressSpace {
                 mapping_id: 0,
             },
         );
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(GuestAddress::new(start))
     }
 
@@ -271,7 +271,7 @@ impl GuestAddressSpace {
                 },
             },
         );
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(GuestAddress::new(start))
     }
 
@@ -308,7 +308,7 @@ impl GuestAddressSpace {
                 mapping_id: 0,
             },
         );
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(GuestAddress::new(start))
     }
 
@@ -327,7 +327,7 @@ impl GuestAddressSpace {
         // addresses would observe them instead of fresh zeros.
         self.zero_committed_backing(start, end);
         self.remove_metadata_range(start, end);
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(())
     }
 
@@ -423,7 +423,7 @@ impl GuestAddressSpace {
                     )
                 };
                 if result != 0 {
-                    self.normalize();
+                    self.normalize_range(start, end);
                     return Err(host_error("protection change", sub_start, sub_end));
                 }
             }
@@ -435,7 +435,7 @@ impl GuestAddressSpace {
                 vma.protection = protection;
             }
         }
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(committed_bytes)
     }
 
@@ -454,7 +454,7 @@ impl GuestAddressSpace {
         for (_, vma) in self.vmas.range_mut(start..end) {
             vma.metadata = metadata;
         }
-        self.normalize();
+        self.normalize_range(start, end);
         Ok(())
     }
 

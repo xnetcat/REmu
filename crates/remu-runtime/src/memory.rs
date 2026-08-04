@@ -2,7 +2,7 @@
 use std::sync::atomic::AtomicBool;
 #[cfg(any(target_os = "macos", windows))]
 use std::sync::atomic::Ordering;
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, RwLock};
 #[cfg(windows)]
 use std::sync::{Mutex, OnceLock};
@@ -16,12 +16,13 @@ use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestM
 
 #[cfg(any(target_os = "macos", windows))]
 use crate::{
-    KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION,
     MACOS_GUEST_PAGE_ALIGNMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
     SCE_KERNEL_ERROR_PERMISSION_DENIED, SCE_KERNEL_ERROR_TRY_AGAIN, align_up_u64, guest_memset,
     kernel_memory, low_i32, read_guest_u8, read_guest_u32, read_guest_u64, trace_guest_vm,
     write_guest_u8, write_guest_u32, write_guest_u64,
 };
+#[cfg(target_os = "macos")]
+use crate::{KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION};
 use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NAME_TOO_LONG,
     SCE_KERNEL_ERROR_NOT_FOUND, read_guest_cstring, sce_kernel_error,
@@ -40,7 +41,7 @@ fn kernel_memory_mut(
         .expect("kernel memory was initialized immediately above"))
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 fn refresh_kernel_memory_readable_ranges(memory: &kernel_memory::KernelMemory) {
     *KERNEL_MEMORY_READABLE_RANGES
         .get_or_init(|| RwLock::new(Arc::from([])))
@@ -48,6 +49,14 @@ fn refresh_kernel_memory_readable_ranges(memory: &kernel_memory::KernelMemory) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         Arc::from(memory.readable_ranges().into_boxed_slice());
     KERNEL_MEMORY_READABLE_RANGES_GENERATION.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(windows)]
+#[inline]
+fn refresh_kernel_memory_readable_ranges(_memory: &kernel_memory::KernelMemory) {
+    // Only the macOS Mach-read and Metal shader-cache paths consume this snapshot. Rebuilding it
+    // for every Windows alias made titles with thousands of small direct mappings quadratic even
+    // though the D3D12 path validates guest ranges through the address-space registry directly.
 }
 
 #[cfg(windows)]

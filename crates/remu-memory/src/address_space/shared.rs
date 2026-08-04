@@ -1195,11 +1195,17 @@ fn unregister_shared_mapping_range_locked(
     let Some(end) = address.checked_add(byte_count) else {
         return;
     };
-    let overlaps = mappings
-        .range(..end)
-        .filter(|(start, record)| record.end > address && **start < end)
-        .map(|(&start, record)| (start, record.clone()))
-        .collect::<Vec<_>>();
+    let mut overlaps = Vec::new();
+    if let Some((&start, record)) = mappings.range(..=address).next_back()
+        && record.end > address
+    {
+        overlaps.push((start, record.clone()));
+    }
+    for (&start, record) in mappings.range(address..end) {
+        if overlaps.last().is_none_or(|(previous, _)| *previous != start) {
+            overlaps.push((start, record.clone()));
+        }
+    }
     for (start, record) in overlaps {
         mappings.remove(start);
         if start < address {
