@@ -17,7 +17,9 @@ use remu_gpu::{
 };
 use remu_memory::{
     CpuWriteWatch, GuestRangeLease, GuestSharedMappingIdentity, GuestWriteSite,
-    LeasePublishOutcome, guest_shared_backing_identity,
+    LeasePublishOutcome, guest_shared_backing_alias_segments_at_identity,
+    guest_shared_backing_identity, notify_guest_memory_written,
+    notify_guest_memory_written_excluding,
 };
 use remu_shader::{GlobalMemoryBinding, InstructionControl, Program, ShaderEvaluation};
 use remu_shader_metal::{
@@ -113,7 +115,7 @@ use crate::texture::write_texture_mip_chain;
 use crate::texture::{
     DecodedTexture, decode_dxgi_format, decode_texture, decode_texture_component_selectors,
     encode_texture_linear_over, read_texture_linear, read_texture_mip_chain_with_raw,
-    write_texture_linear,
+    write_texture_linear, write_texture_linear_unnotified,
 };
 
 const MAXIMUM_GLOBAL_BUFFER_BYTES: usize = 512 * 1024 * 1024;
@@ -4304,13 +4306,20 @@ fn create_stage_resources(
             };
             if !excluded_target_addresses.contains(&descriptor.address)
                 && let Some(target) = resident_targets
-                    .get(&descriptor.address)
-                    .filter(|target| render_target_can_alias_texture(target, descriptor))
+                    .values()
+                    .find(|target| {
+                        !excluded_target_addresses.contains(&target.target.descriptor.address)
+                            && render_target_can_alias_texture(target, descriptor)
+                    })
             {
                 if std::env::var_os("REMU_TRACE_D3D12_TIMING").is_some_and(|value| value == "1") {
                     eprintln!(
-                        "[REMu][D3D12-TIMING] alias_target={:#x} extent={}x{}",
-                        descriptor.address, descriptor.width, descriptor.height
+                        "[REMu][D3D12-TIMING] alias_target={:#x} resident={:#x} extent={}x{} physical={}",
+                        descriptor.address,
+                        target.target.descriptor.address,
+                        descriptor.width,
+                        descriptor.height,
+                        u8::from(descriptor.address != target.target.descriptor.address),
                     );
                 }
                 create_resident_render_target_texture(target, descriptor, component_selectors)
@@ -5549,12 +5558,35 @@ fn guest_resource_ranges_overlap(
     )
 }
 
+fn guest_resource_ranges_same_storage(
+    left_address: u64,
+    left_byte_count: u64,
+    right_address: u64,
+    right_byte_count: u64,
+) -> bool {
+    if left_byte_count == 0 || left_byte_count != right_byte_count {
+        return false;
+    }
+    if left_address == right_address {
+        return true;
+    }
+    matches!(
+        (
+            guest_shared_backing_identity(left_address, left_byte_count),
+            guest_shared_backing_identity(right_address, right_byte_count),
+        ),
+        (Some(left), Some(right))
+            if left.backing_id == right.backing_id
+                && left.backing_offset == right.backing_offset
+    )
+}
+
 fn render_target_can_alias_texture(target: &RenderTargetResource, texture: DecodedTexture) -> bool {
     let render = target.target.descriptor;
     target.pending_writeback
+        && !target.write_watch.is_retired()
         && target.target.sample_count == 1
         && !texture.writable
-        && texture.address == render.address
         && texture.width == render.width
         && texture.height == render.height
         && texture.pitch == render.pitch
@@ -5565,6 +5597,29 @@ fn render_target_can_alias_texture(target: &RenderTargetResource, texture: Decod
         && texture.texture_type == render.texture_type
         && texture.layer_count == render.layer_count
         && texture.mip_level_count == render.mip_level_count
+        && render
+            .raw_byte_count()
+            .ok()
+            .and_then(|render_bytes| {
+                texture
+                    .raw_byte_count()
+                    .ok()
+                    .map(|texture_bytes| (render_bytes, texture_bytes))
+            })
+            .and_then(|(render_bytes, texture_bytes)| {
+                Some((
+                    u64::try_from(render_bytes).ok()?,
+                    u64::try_from(texture_bytes).ok()?,
+                ))
+            })
+            .is_some_and(|(render_bytes, texture_bytes)| {
+                guest_resource_ranges_same_storage(
+                    render.address,
+                    render_bytes,
+                    texture.address,
+                    texture_bytes,
+                )
+            })
 }
 
 /// Returns the texture's logical RGBA components as indices in the typed D3D12 resource view.
@@ -5621,7 +5676,7 @@ fn evaluation_requires_render_target_publication(
     };
     let target_byte_count = u64::try_from(target_byte_count).unwrap_or(u64::MAX);
     if evaluation.global_memory_bindings.iter().any(|binding| {
-        guest_ranges_overlap(
+        guest_resource_ranges_overlap(
             binding.base_address,
             u64::try_from(binding.byte_count).unwrap_or(u64::MAX),
             descriptor.address,
@@ -5632,13 +5687,13 @@ fn evaluation_requires_render_target_publication(
         return true;
     }
     if evaluation.scalar_memory_reads.iter().any(|&(address, _)| {
-        guest_ranges_overlap(address, 4, descriptor.address, target_byte_count)
+        guest_resource_ranges_overlap(address, 4, descriptor.address, target_byte_count)
     }) {
         trace_render_target_dependency("scalar-read", descriptor, None);
         return true;
     }
     if evaluation.vertex_inputs.iter().any(|binding| {
-        guest_ranges_overlap(
+        guest_resource_ranges_overlap(
             binding.base_address,
             u64::try_from(binding.data.len().max(1)).unwrap_or(u64::MAX),
             descriptor.address,
@@ -5658,7 +5713,7 @@ fn evaluation_requires_render_target_publication(
             trace_render_target_dependency("invalid-image-size", descriptor, Some(texture));
             return true;
         };
-        let overlaps = guest_ranges_overlap(
+        let overlaps = guest_resource_ranges_overlap(
             texture.address,
             u64::try_from(byte_count).unwrap_or(u64::MAX),
             descriptor.address,
@@ -5704,19 +5759,19 @@ fn draw_requires_render_target_publication(
     };
     let target_byte_count = u64::try_from(target_byte_count).unwrap_or(u64::MAX);
     if let Some(address) = draw.indirect_arguments_address
-        && guest_ranges_overlap(address, 20, descriptor.address, target_byte_count)
+        && guest_resource_ranges_overlap(address, 20, descriptor.address, target_byte_count)
     {
         trace_render_target_dependency("indirect-arguments", descriptor, None);
         return true;
     }
     if let Some(address) = draw.indirect_count_address
-        && guest_ranges_overlap(address, 4, descriptor.address, target_byte_count)
+        && guest_resource_ranges_overlap(address, 4, descriptor.address, target_byte_count)
     {
         trace_render_target_dependency("indirect-count", descriptor, None);
         return true;
     }
     if draw.index_snapshot.is_none()
-        && guest_ranges_overlap(
+        && guest_resource_ranges_overlap(
             draw.index_buffer_address,
             u64::from(draw.index_count).saturating_mul(u64::from(draw.index_size.max(1))),
             descriptor.address,
@@ -5750,7 +5805,7 @@ fn compute_requires_render_target_publication(
     };
     let target_byte_count = u64::try_from(target_byte_count).unwrap_or(u64::MAX);
     if let ComputeDispatchSource::Indirect { dimensions_address } = dispatch.source
-        && guest_ranges_overlap(
+        && guest_resource_ranges_overlap(
             dimensions_address,
             12,
             descriptor.address,
@@ -6007,8 +6062,18 @@ fn write_back_render_target(target: &mut RenderTargetResource) -> Result<(), Str
     let descriptor = target.target.descriptor;
     let write_result = target
         .write_watch
-        .with_live_mapping(|| write_texture_linear(descriptor, &linear))
+        .with_live_mapping(|| write_texture_linear_unnotified(descriptor, &linear))
         .map_err(|error| format!("could not open render-target watch for writeback: {error}"))?;
+    if write_result.is_ok()
+        && let Ok(byte_count) = descriptor.raw_byte_count()
+        && let Ok(byte_count) = u64::try_from(byte_count)
+    {
+        let _ = notify_guest_memory_written_excluding(
+            descriptor.address,
+            byte_count,
+            &[&target.write_watch],
+        );
+    }
     let rearm_result = target
         .write_watch
         .rearm()
@@ -7941,40 +8006,54 @@ fn publish_texture_linear(resource: &TextureResource, linear: &[u8]) -> Result<(
             TEXTURE_WRITEBACK_CHUNK_BYTES,
         ),
         #[cfg(not(test))]
-        TextureWritebackGuard::Anonymous(watch) => match watch.with_live_mapping(|| {
-            write_changed_ranges_direct(
+        TextureWritebackGuard::Anonymous(watch) => {
+            match watch.with_live_mapping(|| {
+                write_changed_ranges_direct(
+                    resource.descriptor.address,
+                    &candidate,
+                    &writeback.baseline,
+                    WritebackJournalSites::TEXTURE.direct,
+                    "texture",
+                    TEXTURE_WRITEBACK_CHUNK_BYTES,
+                )
+            }) {
+                Ok(result) => {
+                    for (address, byte_count) in result? {
+                        let _ =
+                            notify_guest_memory_written_excluding(address, byte_count, &[watch]);
+                    }
+                    Ok(())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    trace_discarded_writeback(
+                        resource.descriptor.address,
+                        writeback.baseline.len(),
+                        "anonymous texture mapping retired",
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(format!(
+                    "D3D12 writable texture mapping could not be pinned for completion address={:#x} bytes={}: {error}",
+                    resource.descriptor.address,
+                    writeback.baseline.len()
+                )),
+            }
+        }
+        #[cfg(test)]
+        TextureWritebackGuard::Direct => {
+            let published = write_changed_ranges_direct(
                 resource.descriptor.address,
                 &candidate,
                 &writeback.baseline,
                 WritebackJournalSites::TEXTURE.direct,
                 "texture",
                 TEXTURE_WRITEBACK_CHUNK_BYTES,
-            )
-        }) {
-            Ok(result) => result,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                trace_discarded_writeback(
-                    resource.descriptor.address,
-                    writeback.baseline.len(),
-                    "anonymous texture mapping retired",
-                );
-                Ok(())
+            )?;
+            for (address, byte_count) in published {
+                let _ = notify_guest_memory_written(address, byte_count);
             }
-            Err(error) => Err(format!(
-                "D3D12 writable texture mapping could not be pinned for completion address={:#x} bytes={}: {error}",
-                resource.descriptor.address,
-                writeback.baseline.len()
-            )),
-        },
-        #[cfg(test)]
-        TextureWritebackGuard::Direct => write_changed_ranges_direct(
-            resource.descriptor.address,
-            &candidate,
-            &writeback.baseline,
-            WritebackJournalSites::TEXTURE.direct,
-            "texture",
-            TEXTURE_WRITEBACK_CHUNK_BYTES,
-        ),
+            Ok(())
+        }
     }
 }
 
@@ -8122,7 +8201,15 @@ fn write_back_globals(
                         0,
                     )
                 }) {
-                    Ok(result) => result?,
+                    Ok(result) => {
+                        for (address, byte_count) in result? {
+                            let _ = notify_guest_memory_written_excluding(
+                                address,
+                                byte_count,
+                                &[watch],
+                            );
+                        }
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         trace_discarded_writeback(
                             binding.base_address,
@@ -8139,14 +8226,19 @@ fn write_back_globals(
                 }
             }
             #[cfg(test)]
-            GlobalWritebackGuard::Direct => write_changed_ranges_direct(
-                binding.base_address,
-                current_bytes,
-                &resource.original_bytes,
-                WritebackJournalSites::GLOBAL.direct,
-                "global",
-                0,
-            )?,
+            GlobalWritebackGuard::Direct => {
+                let published = write_changed_ranges_direct(
+                    binding.base_address,
+                    current_bytes,
+                    &resource.original_bytes,
+                    WritebackJournalSites::GLOBAL.direct,
+                    "global",
+                    0,
+                )?;
+                for (address, byte_count) in published {
+                    let _ = notify_guest_memory_written(address, byte_count);
+                }
+            }
         }
         let identity = match guard {
             GlobalWritebackGuard::Lease(lease) => Some(lease.identity()),
@@ -8220,10 +8312,29 @@ fn write_changed_ranges_leased(
         }
         match outcome {
             LeasePublishOutcome::AppliedAtLiveVa => {
-                journal_guest_write(sites.live, address, source)
+                journal_guest_write(sites.live, address, source);
+                let _ = notify_guest_memory_written(
+                    address,
+                    u64::try_from(source.len()).unwrap_or(u64::MAX),
+                );
             }
             LeasePublishOutcome::AppliedByIdentity => {
-                journal_guest_write(sites.identity, address, source)
+                journal_guest_write(sites.identity, address, source);
+                let identity = lease.identity();
+                if let Some(backing_offset) = identity.backing_offset.checked_add(run_offset) {
+                    let run_identity = GuestSharedMappingIdentity {
+                        backing_id: identity.backing_id,
+                        backing_offset,
+                    };
+                    if let Some(aliases) = guest_shared_backing_alias_segments_at_identity(
+                        run_identity,
+                        u64::try_from(source.len()).unwrap_or(u64::MAX),
+                    ) {
+                        for alias in aliases {
+                            let _ = notify_guest_memory_written(alias.address, alias.byte_count);
+                        }
+                    }
+                }
             }
             LeasePublishOutcome::GuestModified => {
                 trace_kept_guest_bytes(address, source.len(), "leased")
@@ -8251,9 +8362,10 @@ fn write_changed_ranges_direct(
     site: GuestWriteSite,
     resource_kind: &str,
     chunk_bytes: usize,
-) -> Result<(), String> {
+) -> Result<Vec<(u64, u64)>, String> {
     let destination = usize::try_from(guest_address)
         .map_err(|_| format!("D3D12 writable {resource_kind} address does not fit usize"))?;
+    let mut published = Vec::new();
     visit_changed_byte_ranges(current_bytes, original_bytes, chunk_bytes, |start, end| {
         // SAFETY: Production holds the CpuWriteWatch registry lock across this comparison and
         // any following copy. Unit tests retain their destination allocation for the whole call.
@@ -8282,8 +8394,10 @@ fn write_changed_ranges_direct(
                 end - start,
             );
         }
+        published.push((address, u64::try_from(end - start).unwrap_or(u64::MAX)));
         Ok(true)
-    })
+    })?;
+    Ok(published)
 }
 
 fn visit_changed_byte_ranges(
@@ -8676,8 +8790,8 @@ mod tests {
         GpuRegister, GpuScanoutTarget, IndexedDraw, ShaderSnapshot,
     };
     use remu_memory::{
-        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-        GuestProtection,
+        CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection, GuestRangeLease,
     };
     use remu_shader::{
         BufferMemoryControl, DataShareControl, ExportControl, GlobalMemoryBinding,
@@ -8690,13 +8804,14 @@ mod tests {
         DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_FORMAT_R8G8B8A8_UNORM, DecodedRenderTarget,
         DecodedTexture, Dx12GuestExecutor, OrderedGlobalVersions, WritebackJournalSites,
         decode_render_target_format, decode_sampler, dispatch_group_count,
-        expand_primitive_indices, guest_resource_ranges_overlap, indirect_draw_count_allows,
+        expand_primitive_indices, guest_resource_ranges_overlap,
+        guest_resource_ranges_same_storage, indirect_draw_count_allows,
         initial_render_target_clear, native_present_format_supported, ngg_raster_vertex_shader,
         prepare_ngg_triangle_indices, presentable_bgra, primitive_restart_index,
         procedural_rectangle_geometry, regroup_restart_list_indices, resolve_indirect_compute,
         resolve_indirect_compute_ordered, resolve_indirect_draw, snapshot_ordered_global,
         synthetic_ngg_binding, texture_component_mapping, texture_format_component_remap,
-        wave64_group_isolation, write_changed_ranges_direct,
+        wave64_group_isolation, write_changed_ranges_direct, write_changed_ranges_leased,
     };
 
     fn dispatch_with_grid(grid: ComputeGrid) -> ComputeDispatch {
@@ -8774,6 +8889,77 @@ mod tests {
             unrelated.get(),
             GUEST_PAGE_SIZE,
         ));
+        assert!(guest_resource_ranges_same_storage(
+            target.get(),
+            GUEST_PAGE_SIZE,
+            alias.get(),
+            GUEST_PAGE_SIZE,
+        ));
+        assert!(!guest_resource_ranges_same_storage(
+            target.get(),
+            GUEST_PAGE_SIZE,
+            alias.get() + 64,
+            GUEST_PAGE_SIZE,
+        ));
+        assert!(!guest_resource_ranges_same_storage(
+            target.get(),
+            GUEST_PAGE_SIZE,
+            unrelated.get(),
+            GUEST_PAGE_SIZE,
+        ));
+    }
+
+    #[test]
+    fn texture_writeback_invalidates_sampled_caches_through_physical_aliases() {
+        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("physical backing");
+        let target = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("target mapping");
+        let alias = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("sampled alias mapping");
+        // SAFETY: both shared mappings remain live through the watches and writeback.
+        let target_watch = unsafe { CpuWriteWatch::new(target.get(), 4).expect("target watch") };
+        // SAFETY: the alias has the same lifetime guarantee.
+        let alias_watch = unsafe { CpuWriteWatch::new(alias.get(), 4).expect("alias watch") };
+        let descriptor = DecodedTexture {
+            address: target.get(),
+            width: 1,
+            height: 1,
+            pitch: 1,
+            tile_mode: 0,
+            format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            bytes_per_element: 4,
+            block_extent: [1, 1],
+            texture_type: 9,
+            layer_count: 1,
+            mip_level_count: 1,
+            writable: true,
+        };
+
+        super::write_texture_linear(descriptor, &[1, 2, 3, 4])
+            .expect("publish texture through the target mapping");
+
+        assert!(target_watch.consume_dirty());
+        assert!(
+            alias_watch.consume_dirty(),
+            "the physically aliased sampled cache must observe a backend writeback"
+        );
     }
 
     #[test]
@@ -9022,7 +9208,7 @@ mod tests {
         let mut guest = original;
         guest[4..8].fill(9);
 
-        write_changed_ranges_direct(
+        let published = write_changed_ranges_direct(
             guest.as_mut_ptr() as u64,
             &current,
             &original,
@@ -9036,6 +9222,75 @@ mod tests {
         // changed on the CPU. This prevents a stale full-buffer snapshot from corrupting the
         // guest-owned update.
         assert_eq!(guest, [0, 0, 0, 0, 9, 9, 9, 9, 0, 0, 0, 0]);
+        assert!(published.is_empty());
+    }
+
+    #[test]
+    fn identity_writeback_invalidates_surviving_physical_aliases_after_va_reuse() {
+        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("physical backing");
+        let producer = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("producer mapping");
+        let observer = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("observer alias");
+        let lease = GuestRangeLease::acquire(producer.get(), 4).expect("writeback lease");
+
+        memory
+            .unmap(producer, GUEST_PAGE_SIZE)
+            .expect("recycle producer VA");
+        let recycled = memory
+            .map_shared(
+                GuestMapPlacement::Fixed(producer),
+                GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                GUEST_PAGE_SIZE,
+            )
+            .expect("replacement mapping");
+        // SAFETY: the observer mapping remains live until after the watch is consumed.
+        let observer_watch = unsafe { CpuWriteWatch::new(observer.get(), 4).expect("alias watch") };
+
+        write_changed_ranges_leased(
+            producer.get(),
+            &[0x5a; 4],
+            &[0; 4],
+            &lease,
+            WritebackJournalSites::TEXTURE,
+            "texture",
+            0,
+        )
+        .expect("publish through producer identity");
+
+        assert!(
+            observer_watch.consume_dirty(),
+            "the surviving sampled alias must observe the physical writeback"
+        );
+        let mut observed = [0_u8; 4];
+        memory
+            .read(observer, &mut observed)
+            .expect("read original physical bytes");
+        assert_eq!(observed, [0x5a; 4]);
+        memory
+            .read(recycled, &mut observed)
+            .expect("read recycled VA bytes");
+        assert_eq!(observed, [0; 4], "the recycled VA names unrelated bytes");
     }
 
     #[test]
@@ -9109,7 +9364,7 @@ mod tests {
         // published, and padding is never considered GPU-owned.
         guest[4..8].fill(0x99);
         guest[10] = 0xa5;
-        write_changed_ranges_direct(
+        let published = write_changed_ranges_direct(
             descriptor.address,
             &candidate,
             &baseline,
@@ -9123,6 +9378,7 @@ mod tests {
         assert_eq!(&guest[4..8], &[0x99; 4]);
         assert_eq!(guest[10], 0xa5);
         assert_eq!(&guest[16..24], &[0x11; 8]);
+        assert_eq!(published, vec![(descriptor.address + 16, 16)]);
     }
 
     fn literal(value: u32) -> Operand {

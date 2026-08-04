@@ -8,7 +8,7 @@ Windows execution status: the workspace passes serially on `x86_64-pc-windows-gn
 System V guest boundary, sparse/aliased address space, VEH write watch, HLSL/DXIL translator,
 D3D12 event executor, DXGI presenter, XInput polling, and WASAPI mixer are connected. The
 development GTX 1050 passes the current baseline (FL 12_1, SM 6.8, binding tier 3, wave32, shader
-int64) and all 61 D3D12 tests, including event-based bounded fence waits, physical
+int64) and all 68 D3D12 tests, including event-based bounded fence waits, physical
 normalized/integer color MSAA, and depth/stencil
 MSAA; the serial runtime suite has 662 passing tests. Dreaming Sarah now enters New Game, renders
 the first forest layout, and scrolls under a live guest D-pad event with active, underrun-free
@@ -24,9 +24,9 @@ BGRA8/RGBA8/R10G10B10A2 presentation are active. GFX10 image destination selecto
 typed D3D12 views, guest-memory publication follows only overlapping virtual/physical alias ranges,
 and hidden windows retire flips without repeated 4K readbacks. DXGI reports live
 process-local/non-local budget, usage, and reservation telemetry rather than treating static
-dedicated VRAM as an allocation limit. Poppy Playtime now sustains 244 flips plus opening-movie
-video and underrun-free audio in a 65-second run without device loss, but remains roughly 6.9 times
-slower than real time and has not reached its menu. This establishes one playable Windows title,
+dedicated VRAM as an allocation limit. Poppy Playtime now passes opening-movie playback and common
+dialogs into its title renderer without device loss, but its 2848x1600 scene intermediate remains
+corrupt before the final 4K composite. This establishes one playable Windows title,
 not broad compatibility: additional NGG modes, FMASK/DCC and remaining primitive/texture metadata
 paths, persistent depth/MSAA resources, remaining display/sleep/controller lifecycle stress, and
 broader title validation are still open. See [windows-support.md](windows-support.md)

@@ -210,7 +210,7 @@ Completed locally on the development Windows host:
    D3D12 and audio probes have run against physical hardware.
 3. Fixed-image and sparse/alias/write-watch memory suites pass.
 4. Runtime CPU, import, thread, TLS, fiber, filesystem, and libc suites pass.
-5. The D3D12 crate's 61 tests pass, including event-based asynchronous fence completion and
+5. The D3D12 crate's 68 tests pass, including event-based asynchronous fence completion and
    timeout, physical copy/readback, translated compute/graphics,
    ordered single/multi indirect arguments, tiled texture, mip-chain, primitive normalization,
    render/depth/stencil, normalized/integer color MSAA, D32 and combined D32/S8 MSAA, and
@@ -234,10 +234,11 @@ Completed locally on the development Windows host:
     completed submission 1002, and kept the 48 kHz stereo WASAPI callback active with zero
     underrun frames. The bounded run reported no panic, access violation, backend error, shader
     evaluation failure, or D3D12 device removal.
-11. A 65-second Poppy Playtime Chapter 1 release probe completed 244 flips, delivered 226 of 230
-    decoded opening-movie frames, kept the 48 kHz stereo output active for 2,938,176 frames with
-    zero underruns, and reported no D3D12 device loss. The menu/input path remains unvalidated
-    because current guest execution is still substantially slower than real time.
+11. Poppy Playtime Chapter 1 release probes now pass the opening movie and common dialogs into the
+    title renderer, sustain hundreds of native-format writes without D3D12 device loss, and keep
+    decoded video and 48 kHz stereo audio active. The 2848x1600 scene intermediate is still visibly
+    corrupt before the final 4K composite, so this is launch/renderer evidence rather than a usable
+    menu or gameplay validation.
 
 Still required before a broad Windows compatibility claim:
 

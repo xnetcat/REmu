@@ -345,8 +345,12 @@ fn host_write_notification_reaches_every_shared_alias_watch() {
     assert!(crate::notify_guest_memory_written(first.get() + 32, 8));
     assert!(first_watch.is_dirty());
     assert!(second_watch.is_dirty());
-    assert_eq!(first_watch.dirty_page_ranges(), [(first.get(), 4096)]);
-    assert_eq!(second_watch.dirty_page_ranges(), [(second.get(), 4096)]);
+    let page_bytes = host_page_size().expect("host page size");
+    assert_eq!(first_watch.dirty_page_ranges(), [(first.get(), page_bytes)]);
+    assert_eq!(
+        second_watch.dirty_page_ranges(),
+        [(second.get(), page_bytes)]
+    );
 }
 
 #[test]
@@ -610,6 +614,15 @@ fn a_lease_follows_a_recycled_va_through_the_identity_licence() {
             GUEST_PAGE_SIZE,
         )
         .unwrap();
+
+    assert_eq!(
+        guest_shared_backing_alias_segments_at_identity(lease.identity(), 8),
+        Some(vec![GuestSharedBackingSegment {
+            address: observer.get(),
+            byte_count: 8,
+        }]),
+        "identity lookup follows the original bytes, not the recycled VA"
+    );
 
     assert_eq!(
         lease.publish_run_if_baseline(0, &[0; 8], &[0x5a; 8]),

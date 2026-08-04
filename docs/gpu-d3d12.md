@@ -40,6 +40,10 @@ Implemented and physically validated on the development host:
   their already-linear output for DXGI presentation while still writing guest-visible bytes back.
   Guest-memory publication is range-scoped and follows both virtual ranges and their physical
   aliases, so unrelated resident targets no longer stall or round-trip through guest memory.
+  Compatible sampled descriptors may reuse a resident target through another VA naming the exact
+  same physical byte range. Current output resources remain excluded from SRV selection. Host
+  writeback notifies every live physical-alias watch, including the producer-identity path after a
+  submission-time VA has been recycled, without falsely invalidating the writer's own watch.
 - Typed BGRA8 target storage can satisfy a logically RGBA8 sampled image by applying the guest
   GFX10 destination selectors through `D3D12_SHADER_RESOURCE_VIEW_DESC::Shader4ComponentMapping`.
   Component order is therefore descriptor state, not an adapter-specific byte-layout guess;
@@ -75,7 +79,7 @@ Implemented and physically validated on the development host:
   from the physical adapter or render-target format.
 - Headless copy/readback, translated compute/graphics, tiled-resource, depth/stencil, mip-chain,
   primitive-expansion, lifecycle/input-neutralization, DRED-format, and physical-GPU tests. The
-  current D3D12 crate has 65 passing tests on the GTX 1050, including a physical general-LDS NGG
+  current D3D12 crate has 68 passing tests on the GTX 1050, including a physical general-LDS NGG
   compute-to-raster test on this mesh-shader-tier-0 adapter.
 
 This is a playable vertical slice for one tested title and sustained boot/media execution for a
@@ -374,7 +378,9 @@ The Windows design therefore needs explicit ownership:
   alias range overlaps the operation. A command that touches one allocation cannot force every
   resident render target back to the CPU.
 - `GuestRangeLease` identity checks must guard delayed uploads/readbacks so a recycled virtual
-  address never publishes into a new mapping.
+  address never publishes into a new mapping. If a lease legitimately publishes through its old
+  physical identity, invalidation is resolved from that identity and reaches only surviving aliases;
+  the recycled VA is neither written nor dirtied.
 - Writable textures retain the exact raw upload snapshot. Completion retiles into that baseline
   and publishes only baseline-matching chunks; newer guest bytes win, retired mappings discard the
   completion, and one-megabyte coalescing avoids turning random image changes into millions of

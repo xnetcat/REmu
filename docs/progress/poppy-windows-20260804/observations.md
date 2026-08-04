@@ -54,6 +54,10 @@ sent Enter only to the focused `REMu | Direct3D 12` window.
     older cyan frame and incomplete pale geometry remain. This confirms that the synthesized cover
     changes the final image as intended while the remaining defect originates in an earlier normal
     indexed render pass.
+18. [`20-physical-coherency-validation-dialog.png`](20-physical-coherency-validation-dialog.png) —
+    the host keyboard dialog during the release run that added physical-backing identity to D3D12
+    target reuse and writeback invalidation. The readable overlay confirms host UI composition;
+    it is not a title-menu or gameplay capture.
 
 ## Current boundary
 
@@ -83,3 +87,10 @@ procedural covers returns to the earlier cyan and partial-geometry frame rather 
 usable scene, independently confirming that boundary. Generated
 HLSL, shader IR, binding traces, and DRED logs remain in ignored `.remu/logs/` and `target/`
 directories because game-derived shader material must not be committed.
+
+The physical-coherency run reached 312 traced native-format writers without device removal. Every
+resident-target reuse in the captured title frame resolved to the same guest VA (`physical=0`);
+none used the newly supported alternate-VA path. This rules out a missed physical alias as the
+cause of Poppy's current scene corruption while retaining the fix as a general D3D12 correctness
+requirement. The next trace boundary remains the first producer of the 2848x1600 format-26 scene
+texture consumed by the format-24 conversion pass.

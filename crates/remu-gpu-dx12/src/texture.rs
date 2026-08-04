@@ -826,6 +826,19 @@ pub(super) fn write_texture_linear(
     descriptor: DecodedTexture,
     linear: &[u8],
 ) -> Result<(), String> {
+    write_texture_linear_unnotified(descriptor, linear)?;
+    if let Ok(byte_count) = descriptor.raw_byte_count()
+        && let Ok(byte_count) = u64::try_from(byte_count)
+    {
+        let _ = remu_memory::notify_guest_memory_written(descriptor.address, byte_count);
+    }
+    Ok(())
+}
+
+pub(super) fn write_texture_linear_unnotified(
+    descriptor: DecodedTexture,
+    linear: &[u8],
+) -> Result<(), String> {
     if descriptor.address == 0 {
         return Ok(());
     }

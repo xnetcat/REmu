@@ -41,9 +41,10 @@ pub use shared::watch_guest_shared_backing_writes;
 pub use shared::{
     GuardedBackingWrite, GuestRangeLease, GuestSharedBackingRange, GuestSharedBackingSegment,
     GuestSharedMappingIdentity, LeasePublishOutcome, guest_shared_backing_alias_segments,
-    guest_shared_backing_identity, guest_shared_backing_range, guest_shared_backing_ranges_overlap,
-    guest_shared_backing_segments, guest_shared_mapping_epoch, guest_shared_mapping_identity,
-    read_guest_shared_backing, write_guest_shared_backing, write_guest_shared_backing_at_identity,
+    guest_shared_backing_alias_segments_at_identity, guest_shared_backing_identity,
+    guest_shared_backing_range, guest_shared_backing_ranges_overlap, guest_shared_backing_segments,
+    guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
+    write_guest_shared_backing, write_guest_shared_backing_at_identity,
     write_guest_shared_backing_at_identity_with_baseline, write_guest_shared_backing_if_identity,
     write_guest_shared_backing_if_identity_and_baseline, write_guest_shared_backing_scattered,
 };
