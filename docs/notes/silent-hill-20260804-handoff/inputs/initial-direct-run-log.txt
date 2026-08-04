@@ -1,0 +1,156 @@
+❯ target/x86_64-apple-darwin/release/remu run /Volumes/Untitled/sharpemu/games/void\ tRrLM\ Void\ Terrarium/eboot.bin
+[REMu][PERF-STARTUP] milestone=cli-run-start elapsed_us=1
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b2500 offset=0xb2500 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b25a5 offset=0xb25a5 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b2950 offset=0xb2950 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b2a80 offset=0xb2a80 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b2b25 offset=0xb2b25 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b2ed0 offset=0xb2ed0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3000 offset=0xb3000 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b30a5 offset=0xb30a5 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3450 offset=0xb3450 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b36d0 offset=0xb36d0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3775 offset=0xb3775 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3a20 offset=0xb3a20 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3b80 offset=0xb3b80 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3c25 offset=0xb3c25 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8000b3ed0 offset=0xb3ed0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80016b8d4 offset=0x16b8d4 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80019fca5 offset=0x19fca5 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8001b1323 offset=0x1b1323 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80036af26 offset=0x36af26 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80036b1f6 offset=0x36b1f6 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003715e9 offset=0x3715e9 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003716bc offset=0x3716bc encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037176a offset=0x37176a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037181a offset=0x37181a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003718ca offset=0x3718ca encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037197a offset=0x37197a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800371a2a offset=0x371a2a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800371ada offset=0x371ada encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800372605 offset=0x372605 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800372855 offset=0x372855 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800372aa5 offset=0x372aa5 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800372cf5 offset=0x372cf5 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800372f45 offset=0x372f45 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800373195 offset=0x373195 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003733e5 offset=0x3733e5 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800373635 offset=0x373635 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800373f90 offset=0x373f90 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003740a0 offset=0x3740a0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003741c0 offset=0x3741c0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003742d0 offset=0x3742d0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003743f0 offset=0x3743f0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374500 offset=0x374500 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374620 offset=0x374620 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374730 offset=0x374730 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374850 offset=0x374850 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374960 offset=0x374960 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374a80 offset=0x374a80 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374b90 offset=0x374b90 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374cb0 offset=0x374cb0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374dc0 offset=0x374dc0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374ee0 offset=0x374ee0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800374ff0 offset=0x374ff0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800379597 offset=0x379597 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037962e offset=0x37962e encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037965a offset=0x37965a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037a999 offset=0x37a999 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037aa1a offset=0x37aa1a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037aa4a offset=0x37aa4a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037ab54 offset=0x37ab54 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037acea offset=0x37acea encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037ad1b offset=0x37ad1b encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037adf2 offset=0x37adf2 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037ae77 offset=0x37ae77 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037aea7 offset=0x37aea7 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037afdc offset=0x37afdc encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037bc05 offset=0x37bc05 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037bdc7 offset=0x37bdc7 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037bdf7 offset=0x37bdf7 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037c7f3 offset=0x37c7f3 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037c87a offset=0x37c87a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037c8ad offset=0x37c8ad encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80037d7ce offset=0x37d7ce encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003845c9 offset=0x3845c9 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80039164d offset=0x39164d encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800398a0f offset=0x398a0f encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80039ebad offset=0x39ebad encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80039ec5f offset=0x39ec5f encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80039f0fa offset=0x39f0fa encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80039f297 offset=0x39f297 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x80039f35f offset=0x39f35f encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a0862 offset=0x3a0862 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a1bdf offset=0x3a1bdf encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a4ac9 offset=0x3a4ac9 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a60f4 offset=0x3a60f4 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a623f offset=0x3a623f encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a62b1 offset=0x3a62b1 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a63af offset=0x3a63af encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a63fd offset=0x3a63fd encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003a645c offset=0x3a645c encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003ab1a9 offset=0x3ab1a9 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003ab674 offset=0x3ab674 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003ab80a offset=0x3ab80a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003ac589 offset=0x3ac589 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003ac97c offset=0x3ac97c encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003c7aeb offset=0x3c7aeb encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003cad0a offset=0x3cad0a encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003cff3c offset=0x3cff3c encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003d3586 offset=0x3d3586 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003da736 offset=0x3da736 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003dce08 offset=0x3dce08 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003ef2e9 offset=0x3ef2e9 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003f472b offset=0x3f472b encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003f52a0 offset=0x3f52a0 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003f79c7 offset=0x3f79c7 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003f7dbc offset=0x3f7dbc encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8003f8395 offset=0x3f8395 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8004008d7 offset=0x4008d7 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800400a10 offset=0x400a10 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x800400b40 offset=0x400b40 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] decode-summary region=execute-region base=0x800000000 byte_scan_hits=109 boundary_mismatches=109 decoder_confirmed_loads=0
+[REMu][TLS][FS] boundary-mismatch total=109 — byte-scan hits rejected; only seeded-decode sites are rewritten
+[REMu][MODULE] loaded /Volumes/Untitled/sharpemu/games/void tRrLM Void Terrarium/sce_module/libc.prx
+[REMu][MODULE] dependency graph: bundled=1 system/HLE=27 app_root=/Volumes/Untitled/sharpemu/games/void tRrLM Void Terrarium
+[REMu][PERF-STARTUP] milestone=process-image-linked elapsed_us=522622
+[REMu][PERF-STARTUP] milestone=event-sink-installed elapsed_us=522718
+[REMu][PERF-STARTUP] milestone=guest-probe-entry elapsed_us=522828
+[REMu][PERF-STARTUP] milestone=presenter-enter elapsed_us=523023
+[REMu] file descriptor budget: 9223372036854775807 open files (hard limit unlimited)
+[REMu][CXX] registered 12200 guest unwind records from 2 sections in 0.001s
+[REMu][METAL] starting AppKit event loop
+[REMu][METAL] discovered bundled offline Metal compiler /Users/xnetcat/Documents/REmu/.remu/toolchains/Metal-27A5209h/Metal.xctoolchain/usr/bin/metal
+[REMu][METAL] offline linker selected through metallib multicall entry path=/Users/xnetcat/Documents/REmu/.remu/toolchains/Metal-27A5209h/Metal.xctoolchain/usr/bin/metallib
+[REMu][METAL] persistent shader cache hit=1 stage=presentation path=/Users/xnetcat/Library/Caches/REMu/metal/f35a1ba57e1fb668d6386ba255c7c9f8812eb6a3.metallib
+[REMu][TIME] process counter source=CLOCK_UPTIME_RAW-nanoseconds
+[REMu][VFS] direct immutable app path routing enabled
+[REMu][PTHREAD] guest thread-id source=darwin-pthread-tsd key=264
+[REMu][SYSTEM] showing installed splash /Volumes/Untitled/sharpemu/games/void tRrLM Void Terrarium/sce_sys/pic0.png (3840x2160)
+[REMu][PERF-STARTUP] milestone=guest-runtime-configured elapsed_us=635049
+[REMu][MODULE] initializing runtime at 0x0000000800724010 args=0x0/0x0
+[REMu][IMPORT] first_hit=1 nid=rNhWz+lvOMU name=_sceKernelSetThreadDtors return=0x800724110 args=0x80075c0b0,0x0,0x0,0x600003a103e0,0x2,0x1
+[REMu][IMPORT] first_hit=2 nid=pB-yGZ2nQ9o name=_sceKernelSetThreadAtexitCount return=0x80072411c args=0x80075c390,0x2,0x0,0x1,0x1bc8959d,0x1
+[REMu][IMPORT] first_hit=3 nid=WhCc1w3EhSI name=_sceKernelSetThreadAtexitReport return=0x800724128 args=0x80075c5c0,0x2,0x0,0x1,0x1bcc5af2,0x1
+[REMu][IMPORT] first_hit=4 nid=959qrazPIrg name=sceKernelGetProcParam return=0x800729c96 args=0x30da3a390,0x2,0x0,0x1,0x1bcec37b,0x1
+[REMu][IMPORT] first_hit=5 nid=p5EcQeEeJAE name=_sceKernelRtldSetApplicationHeapAPI return=0x800729eaa args=0x800834f48,0x800369110,0x800368d60,0x0,0x800368fb0,0x800368fd0
+[REMu][IMPORT] first_hit=6 nid=bnZxYgAFeA0 name=sceKernelGetSanitizerNewReplaceExternal return=0x80073a257 args=0x800369410,0x8003693e0,0x800369380,0x0,0x800369440,0x800369460
+[REMu][IMPORT] first_hit=8 nid=NWtTN10cJzE name=sceLibcHeapGetTraceInfo return=0x80072f771 args=0x30da3a3d0,0x2,0x0,0x80001,0x1bd8fc2e,0x1
+[REMu][IMPORT] first_hit=9 nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory return=0x800368ce6 args=0x60000000,0x0,0xc,0x800625c90,0x1bda6559,0x1
+[REMu][IMPORT] first_hit=10 nid=L-Q3LEjIbgA name=sceKernelMapDirectMemory return=0x800368d03 args=0x800625c98,0x60000000,0xc2,0x0,0x0,0x0
+[REMu][IMPORT] first_hit=11 nid=lLMT9vJAck0 name=clock_gettime return=0x800794f9a args=0xd,0x30da3a398,0x0,0x1,0x1bf5b0a7,0x1
+[REMu][IMPORT] first_hit=12 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x8007611d2 args=0x800839380,0x0,0x30da3a430,0x9e3779b97f4a7c15,0x600001314e00,0x0
+[REMu][PTHREAD] mutex lookup cache enabled slots=16 uncontended-wake-elision=true
+[REMu][IMPORT] first_hit=16 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x80072493b args=0x30da39b98,0x8007f5040,0x0,0x9e3779b97f4a7c15,0x600001314e00,0x0
+[REMu][IMPORT] first_hit=17 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x800724952 args=0x30da39b98,0x2,0x0,0x1,0x1c16483d,0x1
+[REMu][IMPORT] first_hit=19 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x80072497f args=0x30da39b98,0x3,0x0,0x1,0x1,0xfffe
+[REMu][PERF-DIRECT] thread-owned publication enabled stripes=256
+[REMu][IMPORT] first_hit=60 nid=mkx2fVhNMsg name=pthread_cond_broadcast return=0x8007a699c args=0x80083a370,0x267d99,0x0,0x600003a1ca60,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=61 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x8007e6668 args=0x30da3a468,0x80083ac10,0x800834000,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=62 nid=x1X76arYMxU name=scePthreadAttrGet return=0x8007e6681 args=0x7fda4381f200,0x30da3a468,0x10510e2e8,0x1,0x1c288077,0x1
+[REMu][IMPORT] first_hit=63 nid=8+s5BzZjxSg name=scePthreadAttrGetaffinity return=0x8007e6692 args=0x30da3a468,0x30da3a460,0x0,0x1,0x1c2f5212,0x1
+[REMu][IMPORT] first_hit=64 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x8007e669b args=0x30da3a468,0x2,0x0,0x1,0x1c31d83a,0x1
+[REMu][PERF-STARTUP] milestone=module-initializers-complete elapsed_us=645213
+[REMu][PERF-STARTUP] milestone=guest-entry-begin elapsed_us=645228
+[REMu][IMPORT] first_hit=68 nid=hv1luiJrqQM name=scePadInit return=0x800000064 args=0x30da3a3f0,0x0,0x800524010,0x9e3779b97f4a7c15,0x7000be60d0,0x7000000300
+zsh: segmentation fault  target/x86_64-apple-darwin/release/remu run

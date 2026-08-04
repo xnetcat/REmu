@@ -1,0 +1,6430 @@
+export=[
+    Instruction {
+        pc: 0,
+        encoding: Sopp,
+        opcode: SInstPrefetch,
+        words: [
+            3214934019,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 3,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 4,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481716995,
+            524296,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 3,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 524296,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 12,
+        encoding: Sop2,
+        opcode: SAndB32,
+        words: [
+            2264989443,
+            255,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 3,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 255,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 20,
+        encoding: Sop2,
+        opcode: SLshlB32,
+        words: [
+            2406124651,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 140,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 24,
+        encoding: Sop2,
+        opcode: SOrB32,
+        words: [
+            2289854976,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 124,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 28,
+        encoding: Sopp,
+        opcode: SSendmsg,
+        words: [
+            3213885449,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 9,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 32,
+        encoding: Sop2,
+        opcode: SSubI32,
+        words: [
+            2179623872,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 192,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 36,
+        encoding: Sop2,
+        opcode: SLshrB64,
+        words: [
+            2432592577,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 193,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 126,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 40,
+        encoding: Exp,
+        opcode: Exp,
+        words: [
+            4160751937,
+            0,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: Some(
+            Export(
+                ExportControl {
+                    target: 20,
+                    enable_mask: 1,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 48,
+        encoding: Sop2,
+        opcode: SSubI32,
+        words: [
+            2179596480,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 192,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 52,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213688591,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 65295,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 56,
+        encoding: Sop2,
+        opcode: SLshrB64,
+        words: [
+            2432592577,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 193,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 126,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 60,
+        encoding: Smem,
+        opcode: SLoadDwordx2,
+        words: [
+            4093905161,
+            4194304000,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 125,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 36,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 2,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 68,
+        encoding: Smem,
+        opcode: SBufferLoadDwordx4,
+        words: [
+            4096262150,
+            4194305120,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 125,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 1,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 2,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 3,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 4,
+                    immediate_offset_bytes: 1120,
+                    dynamic_offset_register: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 76,
+        encoding: Sop1,
+        opcode: SMovB32,
+        words: [
+            3197240319,
+            36438532,
+        ],
+        sources: [
+            Operand {
+                kind: LiteralConstant,
+                value: 36438532,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 84,
+        encoding: Sop1,
+        opcode: SMovB32,
+        words: [
+            3197305855,
+            262931372,
+        ],
+        sources: [
+            Operand {
+                kind: LiteralConstant,
+                value: 262931372,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 19,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 92,
+        encoding: Smem,
+        opcode: SBufferLoadDwordx4,
+        words: [
+            4096262406,
+            4194306032,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 125,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 4,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 5,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 6,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 7,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 4,
+                    immediate_offset_bytes: 2032,
+                    dynamic_offset_register: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 100,
+        encoding: Smem,
+        opcode: SBufferLoadDwordx16,
+        words: [
+            4096787718,
+            4194304000,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 125,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 20,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 21,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 22,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 23,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 24,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 25,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 26,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 27,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 28,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 29,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 30,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 31,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 32,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 33,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 34,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 35,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 16,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 108,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213672575,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 49279,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 112,
+        encoding: Sop2,
+        opcode: SLshlB32,
+        words: [
+            2406188069,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 132,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 116,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481651493,
+            65562,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 65562,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 124,
+        encoding: Sop2,
+        opcode: SAndB32,
+        words: [
+            2272001899,
+            496,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 496,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 132,
+        encoding: Sopc,
+        opcode: SCmpEqI32,
+        words: [
+            3204475520,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 136,
+        encoding: Smem,
+        opcode: SLoadDwordx4,
+        words: [
+            4094165768,
+            3590324224,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 13,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 14,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 4,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: Some(
+                        107,
+                    ),
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 144,
+        encoding: Sop2,
+        opcode: SCselectB64,
+        words: [
+            2242281598,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 126,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 38,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 148,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2474901285,
+            458759,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 458759,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 156,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481651493,
+            131077,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 131077,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 164,
+        encoding: Sop2,
+        opcode: SLshlB32,
+        words: [
+            2401930243,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 3,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 140,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 42,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 168,
+        encoding: Sop2,
+        opcode: SLshl4AddU32,
+        words: [
+            2565603178,
+            786432,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 786432,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 176,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213672575,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 49279,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 180,
+        encoding: Sop2,
+        opcode: SAndB32,
+        words: [
+            2271936271,
+            4294443008,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 4294443008,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 188,
+        encoding: Sop2,
+        opcode: SBfeU64,
+        words: [
+            2494065426,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 40,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 192,
+        encoding: Sop2,
+        opcode: SOrB32,
+        words: [
+            2288659050,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 42,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 196,
+        encoding: Vop3,
+        opcode: VCndmaskB32,
+        words: [
+            3573612544,
+            10095368,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 38,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 204,
+        encoding: Sop2,
+        opcode: SOrB32,
+        words: [
+            2288658538,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 40,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 208,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481717029,
+            786446,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 786446,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 216,
+        encoding: Sopc,
+        opcode: SCmpEqU32,
+        words: [
+            3204874243,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 3,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 220,
+        encoding: Sopp,
+        opcode: SNop,
+        words: [
+            3212836864,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 224,
+        encoding: Sop2,
+        opcode: SCselectB32,
+        words: [
+            2232379919,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 228,
+        encoding: Sop2,
+        opcode: SLshlB32,
+        words: [
+            2406122532,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 36,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 132,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 232,
+        encoding: Mubuf,
+        opcode: BufferLoadFormatX,
+        words: [
+            3758104576,
+            1795359488,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: Some(
+            BufferMemory(
+                BufferMemoryControl {
+                    dword_count: 1,
+                    vector_address: 0,
+                    vector_data: 3,
+                    scalar_resource: 12,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 240,
+        encoding: Sop2,
+        opcode: SAndB32,
+        words: [
+            2272001898,
+            496,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 496,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 248,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481651492,
+            65562,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 36,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 65562,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 256,
+        encoding: Smem,
+        opcode: SLoadDwordx4,
+        words: [
+            4094165768,
+            3590324224,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 13,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 14,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 4,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: Some(
+                        107,
+                    ),
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 264,
+        encoding: Sopc,
+        opcode: SCmpEqI32,
+        words: [
+            3204475520,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 268,
+        encoding: Sopp,
+        opcode: SNop,
+        words: [
+            3212836864,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 272,
+        encoding: Sop2,
+        opcode: SCselectB64,
+        words: [
+            2240839806,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 126,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 276,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2477195044,
+            458759,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 36,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 458759,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 38,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 284,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481717028,
+            131077,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 36,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 131077,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 292,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213672575,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 49279,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 296,
+        encoding: Sop2,
+        opcode: SAndB32,
+        words: [
+            2267414287,
+            4294443008,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 4294443008,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 304,
+        encoding: Sop2,
+        opcode: SLshlB32,
+        words: [
+            2406124582,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 38,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 140,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 308,
+        encoding: Sop2,
+        opcode: SLshl4AddU32,
+        words: [
+            2565603179,
+            786432,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 786432,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 316,
+        encoding: Sop2,
+        opcode: SOrB32,
+        words: [
+            2284153381,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 320,
+        encoding: Sop2,
+        opcode: SBfeU64,
+        words: [
+            2498390802,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 324,
+        encoding: Vop3,
+        opcode: VCndmaskB32,
+        words: [
+            3573612544,
+            4328200,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 332,
+        encoding: Sop2,
+        opcode: SOrB32,
+        words: [
+            2288740901,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 37,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 336,
+        encoding: Sop2,
+        opcode: SBfeU32,
+        words: [
+            2481651492,
+            786446,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 36,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 786446,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 344,
+        encoding: Sopc,
+        opcode: SCmpEqU32,
+        words: [
+            3204874278,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 38,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 348,
+        encoding: Sopp,
+        opcode: SNop,
+        words: [
+            3212836864,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 352,
+        encoding: Sop2,
+        opcode: SCselectB32,
+        words: [
+            2232380175,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 107,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 15,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 356,
+        encoding: Mubuf,
+        opcode: BufferLoadFormatXyz,
+        words: [
+            3758628864,
+            1778581504,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 106,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: Some(
+            BufferMemory(
+                BufferMemoryControl {
+                    dword_count: 3,
+                    vector_address: 0,
+                    vector_data: 0,
+                    scalar_resource: 12,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 364,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639537,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16241,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 368,
+        encoding: Vop2,
+        opcode: VLshlrevB32,
+        words: [
+            872810114,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 130,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 372,
+        encoding: Vop3,
+        opcode: VLshlAddU32,
+        words: [
+            3611688965,
+            67962627,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 131,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 380,
+        encoding: Vop2,
+        opcode: VAddI32,
+        words: [
+            1242040961,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 129,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 384,
+        encoding: Vop2,
+        opcode: VAddI32,
+        words: [
+            1241909890,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 130,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 388,
+        encoding: Vop2,
+        opcode: VAddI32,
+        words: [
+            1242303107,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 131,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 392,
+        encoding: Mubuf,
+        opcode: BufferLoadDwordx3,
+        words: [
+            3762036736,
+            2147617797,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: Some(
+            BufferMemory(
+                BufferMemoryControl {
+                    dword_count: 3,
+                    vector_address: 5,
+                    vector_data: 12,
+                    scalar_resource: 8,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 400,
+        encoding: Mubuf,
+        opcode: BufferLoadDwordx3,
+        words: [
+            3762036736,
+            2147617028,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        control: Some(
+            BufferMemory(
+                BufferMemoryControl {
+                    dword_count: 3,
+                    vector_address: 4,
+                    vector_data: 9,
+                    scalar_resource: 8,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 408,
+        encoding: Mubuf,
+        opcode: BufferLoadDwordx3,
+        words: [
+            3762036736,
+            2147615491,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: Some(
+            BufferMemory(
+                BufferMemoryControl {
+                    dword_count: 3,
+                    vector_address: 3,
+                    vector_data: 3,
+                    scalar_resource: 8,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 416,
+        encoding: Mubuf,
+        opcode: BufferLoadDwordx3,
+        words: [
+            3762036736,
+            2147616262,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            BufferMemory(
+                BufferMemoryControl {
+                    dword_count: 3,
+                    vector_address: 6,
+                    vector_data: 6,
+                    scalar_resource: 8,
+                    instruction_format: None,
+                    offset_bytes: 0,
+                    index_enabled: true,
+                    offset_enabled: false,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                    tfe: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 424,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639539,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16243,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 428,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270139661,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 432,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639536,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16240,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 436,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101584385,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 440,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270270734,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 444,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101715970,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 448,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268435724,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 452,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041896705,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 456,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042028289,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 460,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040192257,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 464,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041893634,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 468,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042025218,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 472,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101321728,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 476,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040189186,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 480,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            100929293,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 484,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101060878,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 488,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            100666112,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 492,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806856,
+            1967109,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 5,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 500,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806853,
+            8521244,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 28,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 32,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 508,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806854,
+            9307679,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 31,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 35,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 516,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806855,
+            9045534,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 30,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 34,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 524,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806856,
+            1142948357,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 5,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 2,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 532,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806852,
+            8783389,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 29,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 33,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 540,
+        encoding: Vop2,
+        opcode: VSubrevF32,
+        words: [
+            167903232,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 544,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806857,
+            68551704,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 24,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 552,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806853,
+            68813851,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 27,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 560,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041237510,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 6,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 564,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806854,
+            69075994,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 26,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 572,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806850,
+            68289561,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 25,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 580,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041367060,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 20,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 584,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040842775,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 23,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 588,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806856,
+            1142948870,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 6,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 2,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 596,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040973846,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 600,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040449557,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 604,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041236484,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 608,
+        encoding: Exp,
+        opcode: Exp,
+        words: [
+            4160749775,
+            84279817,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [],
+        control: Some(
+            Export(
+                ExportControl {
+                    target: 12,
+                    enable_mask: 15,
+                    compressed: false,
+                    done: false,
+                    valid_mask: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 616,
+        encoding: Exp,
+        opcode: Exp,
+        words: [
+            4160751825,
+            8,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: Some(
+            Export(
+                ExportControl {
+                    target: 13,
+                    enable_mask: 1,
+                    compressed: false,
+                    done: true,
+                    valid_mask: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 624,
+        encoding: Sopp,
+        opcode: SEndpgm,
+        words: [
+            3212902400,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+]
+
+pixel=[
+    Instruction {
+        pc: 0,
+        encoding: Sopp,
+        opcode: SInstPrefetch,
+        words: [
+            3214934019,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 3,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 4,
+        encoding: Sop1,
+        opcode: SMovB32,
+        words: [
+            3204186896,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 124,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 8,
+        encoding: Smem,
+        opcode: SBufferLoadDwordx8,
+        words: [
+            4096525318,
+            4194304000,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 12,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 125,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 17,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 19,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 20,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 21,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 22,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 23,
+            },
+        ],
+        control: Some(
+            ScalarMemory(
+                ScalarMemoryControl {
+                    destination_count: 8,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 16,
+        encoding: Vintrp,
+        opcode: VInterpP1F32,
+        words: [
+            3355967488,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: Some(
+            Interpolation(
+                InterpolationControl {
+                    attribute: 0,
+                    channel: 0,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 20,
+        encoding: Vintrp,
+        opcode: VInterpP2F32,
+        words: [
+            3356033025,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: Some(
+            Interpolation(
+                InterpolationControl {
+                    attribute: 0,
+                    channel: 0,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 24,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213672575,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 49279,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 28,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806851,
+            63308816,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 36,
+        encoding: Vintrp,
+        opcode: VInterpP1F32,
+        words: [
+            3355443456,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: Some(
+            Interpolation(
+                InterpolationControl {
+                    attribute: 0,
+                    channel: 1,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 40,
+        encoding: Vintrp,
+        opcode: VInterpP2F32,
+        words: [
+            3355508993,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: Some(
+            Interpolation(
+                InterpolationControl {
+                    attribute: 0,
+                    channel: 1,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 44,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806849,
+            63185664,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 17,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 52,
+        encoding: Vop1,
+        opcode: VFloorF32,
+        words: [
+            2114472195,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 56,
+        encoding: Vop1,
+        opcode: VFloorF32,
+        words: [
+            2114996481,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 60,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101058800,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 240,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 64,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101845247,
+            1075838976,
+        ],
+        sources: [
+            Operand {
+                kind: LiteralConstant,
+                value: 1075838976,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 72,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101452017,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 76,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            100798704,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 240,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 80,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102240511,
+            1075838976,
+        ],
+        sources: [
+            Operand {
+                kind: LiteralConstant,
+                value: 1075838976,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 88,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806855,
+            2215511056,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 16,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 4,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 96,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101322993,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 100,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268700690,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 104,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806852,
+            2214863616,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 17,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 4,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 112,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270014483,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 19,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 116,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            269881095,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 120,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            269093395,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 19,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 124,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            269226514,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 128,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268437764,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 132,
+        encoding: Vop2,
+        opcode: VMinF32,
+        words: [
+            503579670,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 136,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270276359,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 140,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806858,
+            69080839,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 148,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806857,
+            2217613063,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 4,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 156,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270139652,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 160,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806856,
+            68288772,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 168,
+        encoding: Vop2,
+        opcode: VFmacF32,
+        words: [
+            1444682992,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 240,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 172,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806855,
+            70128881,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 180,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806858,
+            2214723844,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 4,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 188,
+        encoding: Vop2,
+        opcode: VFmacF32,
+        words: [
+            1444551408,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 240,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 192,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806856,
+            67244273,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 200,
+        encoding: Vop2,
+        opcode: VMadMkF32,
+        words: [
+            1075191051,
+            3223322624,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 3223322624,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 208,
+        encoding: Vop2,
+        opcode: VMinF32,
+        words: [
+            505154071,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 23,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 212,
+        encoding: Vop2,
+        opcode: VMinF32,
+        words: [
+            504106006,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 216,
+        encoding: Vop2,
+        opcode: VMadMkF32,
+        words: [
+            1075452672,
+            3223322624,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: LiteralConstant,
+                value: 3223322624,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 224,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268964592,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 240,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 228,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102110962,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 242,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 232,
+        encoding: Vop2,
+        opcode: VMaxF32,
+        words: [
+            537134100,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 20,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 236,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            269096176,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 240,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 240,
+        encoding: Vop2,
+        opcode: VMaxF32,
+        words: [
+            536874004,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 20,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 244,
+        encoding: Vop2,
+        opcode: VMaxF32,
+        words: [
+            537664533,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 248,
+        encoding: Vop2,
+        opcode: VMinF32,
+        words: [
+            505288727,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 23,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 15,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 252,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102243058,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 242,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 256,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102373113,
+            370542087,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: Some(
+            Sdwa(
+                SdwaControl {
+                    destination_select: 6,
+                    destination_unused: 0,
+                    source0_select: 6,
+                    source1_select: 6,
+                    source0_sign_extend: false,
+                    source1_sign_extend: false,
+                    absolute_mask: 0,
+                    negate_mask: 3,
+                    output_modifier: 0,
+                    clamp: false,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 264,
+        encoding: Vop2,
+        opcode: VMaxF32,
+        words: [
+            538844693,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 15,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 15,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 268,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102766841,
+            370542088,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+        ],
+        control: Some(
+            Sdwa(
+                SdwaControl {
+                    destination_select: 6,
+                    destination_unused: 0,
+                    source0_select: 6,
+                    source1_select: 6,
+                    source0_sign_extend: false,
+                    source1_sign_extend: false,
+                    absolute_mask: 0,
+                    negate_mask: 3,
+                    output_modifier: 0,
+                    clamp: false,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 276,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041896177,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 280,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042289905,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 241,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 284,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102505202,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 242,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 288,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            102375666,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 242,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 292,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101850379,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 296,
+        encoding: Vop2,
+        opcode: VAddF32,
+        words: [
+            101980940,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 300,
+        encoding: Vop1,
+        opcode: VRcpF32,
+        words: [
+            2115392777,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 304,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            271061768,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 20,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 308,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270668549,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 17,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 312,
+        encoding: Vop1,
+        opcode: VRcpF32,
+        words: [
+            2114999562,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 316,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040586510,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 320,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270800135,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 18,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 324,
+        encoding: Vop3,
+        opcode: VMadF32,
+        words: [
+            3577806855,
+            72488199,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 20,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 332,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270537993,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 336,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1040322829,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 340,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268830226,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 18,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 344,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270931204,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 19,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 348,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041109770,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 352,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268567059,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 19,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 356,
+        encoding: Vop2,
+        opcode: VMinF32,
+        words: [
+            503711254,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 360,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041107210,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 364,
+        encoding: Vop2,
+        opcode: VMinF32,
+        words: [
+            503448087,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 23,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 368,
+        encoding: Vop2,
+        opcode: VMaxF32,
+        words: [
+            539756052,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 20,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 22,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 372,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041107721,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 376,
+        encoding: Vop2,
+        opcode: VMaxF32,
+        words: [
+            537002517,
+        ],
+        sources: [
+            Operand {
+                kind: ScalarRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 380,
+        encoding: Vop1,
+        opcode: VRcpF32,
+        words: [
+            2116703495,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 21,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 384,
+        encoding: Mimg,
+        opcode: ImageSampleLz,
+        words: [
+            4036757258,
+            4197398,
+            6,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: Some(
+            Image(
+                ImageControl {
+                    dmask: 7,
+                    vector_address: 22,
+                    address_registers: [
+                        22,
+                        6,
+                        0,
+                        0,
+                        0,
+                    ],
+                    vector_data: 12,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 396,
+        encoding: Mimg,
+        opcode: ImageSampleLz,
+        words: [
+            4036757258,
+            4196610,
+            1,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        control: Some(
+            Image(
+                ImageControl {
+                    dmask: 7,
+                    vector_address: 2,
+                    address_registers: [
+                        2,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ],
+                    vector_data: 9,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 408,
+        encoding: Mimg,
+        opcode: ImageSampleLz,
+        words: [
+            4036757256,
+            4195072,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        control: Some(
+            Image(
+                ImageControl {
+                    dmask: 7,
+                    vector_address: 0,
+                    address_registers: [
+                        0,
+                    ],
+                    vector_data: 3,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 416,
+        encoding: Mimg,
+        opcode: ImageSampleLz,
+        words: [
+            4036757258,
+            4195862,
+            1,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        control: Some(
+            Image(
+                ImageControl {
+                    dmask: 7,
+                    vector_address: 22,
+                    address_registers: [
+                        22,
+                        1,
+                        0,
+                        0,
+                        0,
+                    ],
+                    vector_data: 6,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 428,
+        encoding: Mimg,
+        opcode: ImageSampleLz,
+        words: [
+            4036757258,
+            4194326,
+            15,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 22,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 15,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: Some(
+            Image(
+                ImageControl {
+                    dmask: 7,
+                    vector_address: 22,
+                    address_registers: [
+                        22,
+                        15,
+                        0,
+                        0,
+                        0,
+                    ],
+                    vector_data: 0,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 440,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639540,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16244,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 444,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270018828,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 20,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 448,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270149901,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 20,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 452,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            270280974,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 20,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 456,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639539,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16243,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 460,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041765138,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 18,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 9,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 464,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041896722,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 18,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 10,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 468,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042028306,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 18,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 11,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 472,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639537,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16241,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 476,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041763600,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 6,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 480,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041895184,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 7,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 484,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042026768,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 16,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 8,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 488,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041762067,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 19,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 3,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 492,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041893651,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 19,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 4,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 496,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042025235,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 19,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 5,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 500,
+        encoding: Sopp,
+        opcode: SWaitcnt,
+        words: [
+            3213639536,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 16240,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+    Instruction {
+        pc: 504,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041760529,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 17,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 508,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1041892113,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 17,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 512,
+        encoding: Vop2,
+        opcode: VMacF32,
+        words: [
+            1042023697,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 17,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 516,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268441877,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 12,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 520,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268573461,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 13,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 524,
+        encoding: Vop2,
+        opcode: VMulF32,
+        words: [
+            268705045,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 21,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 14,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 528,
+        encoding: Vop2,
+        opcode: VCvtPkrtzF16F32,
+        words: [
+            1577059072,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        control: None,
+    },
+    Instruction {
+        pc: 532,
+        encoding: Vop3,
+        opcode: VCvtPkrtzF16F32,
+        words: [
+            3576627201,
+            65794,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 2,
+            },
+            Operand {
+                kind: EncodedConstant,
+                value: 128,
+            },
+            Operand {
+                kind: ScalarRegister,
+                value: 0,
+            },
+        ],
+        destinations: [
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+        ],
+        control: Some(
+            Vop3(
+                Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 540,
+        encoding: Exp,
+        opcode: Exp,
+        words: [
+            4160756751,
+            256,
+        ],
+        sources: [
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 1,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+            Operand {
+                kind: VectorRegister,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: Some(
+            Export(
+                ExportControl {
+                    target: 0,
+                    enable_mask: 15,
+                    compressed: true,
+                    done: true,
+                    valid_mask: true,
+                },
+            ),
+        ),
+    },
+    Instruction {
+        pc: 548,
+        encoding: Sopp,
+        opcode: SEndpgm,
+        words: [
+            3212902400,
+        ],
+        sources: [
+            Operand {
+                kind: EncodedConstant,
+                value: 0,
+            },
+        ],
+        destinations: [],
+        control: None,
+    },
+]

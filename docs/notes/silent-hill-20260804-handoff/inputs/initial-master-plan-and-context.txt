@@ -1,0 +1,118 @@
+═══════════════════════════════════════════════════════════════════════════════
+MISSION: Finish the REmu PS5-emulator master plan.
+Repo: /Users/xnetcat/Documents/REmu — Rust workspace, macOS/Metal host, x86_64 guest
+executed under Rosetta 2. A large amount is already done; continue, do not restart.
+Drive EVERY remaining plan item to implementation with maximum safe parallelism.
+═══════════════════════════════════════════════════════════════════════════════
+
+── READ FIRST, before any code (in this order) ──
+1. ~/Documents/REmu-research/implementation-notes/NOTES.md — the running log. Dated entries are
+   real state: what landed (commit hashes), what prior multi-agent waves did, and the
+   "deferred / carried-forward" items with exact file:line integration seams. APPEND to it as you go.
+2. ~/Documents/REmu-research/architecture-audit-20260802/MASTER-PLAN.md — canonical plan: §0 (SDK
+   oracle), workstreams A–R, §3 (HARD orderings), §4 (definition of done).
+3. docs/status.md — subsystem truth + the anti-claim contract (never infer compatibility from a
+   splash/timeout/absence-of-errors; completion = stable interactive progress with correct output).
+4. Memory notes in ~/.claude/projects/-Users-xnetcat-Documents-REmu/memory/ — especially
+   remu-verification-gate, remu-crash-evidence-discipline, remu-sdk-source-policy,
+   remu-writeback-is-an-artefact, remu-half-rate-display-mode, mac-load-invalidates-timing,
+   remu-measure-before-inferring, remu-pinned-nids, agc-shader-type-register-axes.
+5. THE SDK IS GROUND TRUTH: ~/Documents/REmu-research/sdk-1000/sdk/target/ (headers, Sony AGC Core
+   C++ sources, .scenid stubs; index at sdk-1000/INDEX.md). Answer every ABI/opcode/packet question
+   from the SDK first and cite file:line in commits and NOTES. Never copy SDK sources into the repo.
+
+── CURRENT GIT STATE ──
+- main = commit 4f852c1, compiles clean on native arm64 AND x86_64.
+- Already landed: A1 A2 C5 D2 E1(infra) E2(partial) E4 F1 P0 P1 R1 H1 K2; plus agent waves —
+  memory N1–N4/M3/D5-primitive, runtime R2(partial)/R3/R4/R5/J4, gpu-metal A3/A4/K1/M2,
+  shader Q1/Q2/Q3(core), shader-metal Q5(NGG).
+- ONE UNMERGED BRANCH TO SALVAGE FIRST: worktree-agent-af58510f70d397b54 has 2 good commits
+  (G1 slot-allocated file ids; F2 TLS relocations) + 1 uncommitted file. Verify base, finish the
+  stray file, cargo-check both targets, merge it before starting new runtime work.
+
+── OWNER DIRECTIVES (honor all) ──
+- Implement the ENTIRE plan, all phases; defer nothing by choice.
+- Do NOT run test suites or game gates — the owner runs those after the whole plan is implemented.
+  `cargo check --all-targets` on BOTH targets IS required before every commit (it is not a test-run).
+- Use as many parallel worker agents as the file-scoping allows; you manage their worktrees and merges.
+- The "30 FPS Dreaming Sarah" the owner saw is NOT a regression: per the remu-half-rate-display-mode
+  note it is a per-launch presentation-cadence lottery that reproduces on the pristine bf50225
+  baseline and tracks host contention (Spotlight/mds, parallel builds). Loading is fine. The E1
+  DisplayTimebase infra is landed but its flap-cure effect is UNMEASURED — leave it to the owner's
+  quiet-machine A/B (load<4, no mds burst) vs a bf50225 control.
+
+── NON-NEGOTIABLE DOCTRINE ──
+- TDD: write the failing test first for every behavior (you won't run them, but write them).
+- SDK-first, cite file:line. LOUD specific error over fabricated or silently-wrong success — a gap
+  fails loudly in the correct ABI, NEVER accept-and-fake. No behaviour env flags, no title-keyed
+  branches. Validated guest pointers everywhere (never raw-deref without a readability check). Use
+  abi-inventory/sdk10-nid-map.tsv for NIDs; never hash-guess AGC (16 are pinned).
+- HARD orderings (§3): D3 needs the chunk-fingerprint rework first; B2 needs its two preconditions;
+  C2 is paths→events→AGC; J3 is add-real-NGG-state-first THEN delete-heuristic; Q3-backend behind
+  its differential harness; P0 before any codec (done).
+- Gate-dependent GPU/shader items (failure mode = silently-wrong pixels or guest-memory corruption):
+  implement UP TO the point of proof, leave a LOUD fallback, and NOTE the exact seam — do NOT ship
+  them blind. The owner validates them with the interactive gate.
+
+── ORCHESTRATION PROTOCOL ──
+- The repo funnels through shared files (remu-runtime/src/lib.rs above all). Parallel workers MUST own
+  DISJOINT crates/modules or they become unmergeable. Give each worker its own git worktree branched
+  from current main, with a STEP-0 check: `git log --oneline -1` must show a recent "merge:"/"style:"
+  commit; if it shows bf50225, `git reset --hard main && git clean -fd`.
+- Run a batch of disjoint-scope workers concurrently → merge each branch → run `cargo check --workspace
+  --all-targets` on BOTH targets after each merge (must stay 0 errors, warnings not increasing from
+  baseline 40) → then the next batch. Two workers on the same crate must serialize.
+- Long workers may die on API/session limits: salvage their worktree (rebase onto main, keep partial
+  diffs), resume, don't discard.
+
+── WORK BREAKDOWN (scope = the ONLY files a worker may edit; run batches in order) ──
+BATCH A (6 concurrent, fully disjoint):
+  A1 remu-runtime fs/vfs/savedata: G2 (VfsMount, /temp0, download mount), G3 (journaled savedata +
+     recovery scan + clonefile(2)).
+  A2 remu-runtime ajm_engine.rs + ajm_engine/** + vendored/** + build.rs + Cargo.toml ONLY: P2 AAC
+     (vendor real decoder, codec type 2, ajm/m4aac_decoder.h), P3 Kraken/Oodle (vendor powzix/ooz;
+     decode-stage closure FnMut(&std::fs::File,u32,u64,u64,u64,usize)->Result<usize,u64>; seam
+     ampr_api.rs:942 — NOTE it, don't edit ampr_api), P6 MP3(minimp3)/Opus if clean. Unregistered
+     codecs stay loudly-failing per P0.
+  A3 remu-runtime pad/hid: I5 input lifetime/disconnect/timestamps/deadzones/motion.
+  A4 remu-shader-metal ONLY: wire remu-shader StructuredCfg into the MSL translator (driver.rs:230-266)
+     to delete the step-cap truncation (structured MSL only on a proven canonical reducible shape,
+     loud fallback else); J3 delete the remaining six glyph peepholes one-at-a-time via the Q5
+     NggRegisters path, each leaving a loud error.
+  A5 remu-gpu-metal present/window.rs PERF + telemetry.rs: K3 parse the nineteen unparsed PERF
+     channels into telemetry.jsonl.
+  A6 scripts/ + .github/: H2 build-lock for parallel run-game.sh; E3 scaffolding (submission-record →
+     `remu replay` harness stub + criterion benches).
+BATCH B (after A integrates; B4/B5 both edit gpu-metal → serialize those two):
+  B1 remu-runtime av/audio_out + av/ngs2: I2 validated AudioOut pointers (INVALID_POINTER not SIGSEGV),
+     I3 consumed-frame clock + SPSC ring mixer + honest underrun.
+  B2 remu-runtime av/av_player + videodec2: I4 AvPlayer (purge callbacks on Close, single Nv12Layout,
+     edge padding, numOutputVideoFrameBuffers), P5 in-process libavcodec decode (delete ffmpeg subprocess).
+  B3 remu-runtime link/ + tls.rs + module-lifecycle: salvage the af585 branch, then F3 (fs: seeded
+     linear decode, boundary diagnostic first), F4 (GuestModule lifecycle outside dispatch state).
+  B4 remu-gpu-metal texture/residency + write_watch + cache: D3 chunk-fingerprint rework THEN
+     texture-writeback via GuestRangeLease, D4-texture epoch invalidation (loud discard+Stale),
+     D5-gpu-wiring (async-signal-safe materializer for remu_memory::set_read_watch_materializer —
+     bounded memcpy from pre-staged host-visible buffer, NO Metal in handler; if not fully signal-safe,
+     arm+prestage and leave the copy behind a loud refusal).
+  B5 remu-gpu-metal attachment/MSAA/occlusion: B1 zero-copy sweep, B4 TBDR hygiene, J1-gpu-side
+     MTLVisibilityResultBuffer (delete synthetic occlusion; needs the runtime occlusion event — also
+     emit it: lib.rs:1113, agc_submission/decode.rs:39, agc_dcb.rs:38).
+  B6 remu-memory (+ list-only runtime seam): M1 GuestPtr<T>/GuestSlice validated layer; enumerate the
+     runtime raw from_raw_parts derefs to migrate (don't edit runtime yet); M4 review-rule doc.
+SOLO (each alone, touches shared cores):
+  S1 remu-runtime lib.rs core: C1 NID→u64 link-time route table, C2 dispatch-lock split paths→events→AGC
+     with publication-ticket rework + lock-hierarchy asserts, C3 per-object sync, C4 TLS store thunks.
+  S2 remu-gpu-metal new tiler module: B2 GPU tiler — port src/agc_gpu_address/generated_5.cpp +
+     generated_27.cpp to MSL (CPU tiler stays as differential oracle; settle non-power-of-two mip
+     rounding FROM the SDK equations first), then B3 deferred readbacks, B5 end-state, Q4 absolute-address.
+  S3 whole workspace, LAST: H3 warning debt → 0, then flip CI clippy to -D warnings.
+Also: J5 done; J4 done; R2 tail is blocked on live libSceAgc packet layouts (loud-declined, correct).
+
+── DEFINITION OF DONE / FINAL REPORT ──
+Every item either implemented or LOUDLY refused in the correct ABI. main compiles clean both targets,
+warnings not above baseline. Produce a written, honest per-item status (complete vs partial-with-seam;
+never claim completeness you didn't reach). Do NOT run test suites or game gates — hand the owner the
+verification list: `cargo test --workspace -- --test-threads=1` on both targets, the Dreaming Sarah 45s
+interactive gate (60 FPS / ~899 draws/s) on a quiet machine (vm.loadavg<5), and a Poppy soak with
+REMU_GUEST_WRITE_JOURNAL=1 (crash claims need n≥5). Keep NOTES.md current throughout.

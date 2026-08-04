@@ -1,0 +1,10 @@
+revision=30bd087-dirty
+game=/Volumes/Untitled/sharpemu/games/SILENT HILL The Short Message/PPSA10112-app/eboot.bin
+timeout_seconds=300
+elapsed_seconds=16
+outcome=guest-failure
+exit_status=139
+captured_frames=2
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=ue4-ps5-backbuffer
