@@ -3,8 +3,8 @@
 
 //! FFI to the in-process libav bridge (plan P5).
 //!
-//! Production AvPlayer/Videodec2 decode goes through these symbols. When the bridge is compiled
-//! as a stub (cross-target without system ffmpeg), every open/probe fails loudly.
+//! Production AvPlayer/Videodec2 decode goes through these symbols. Cargo builds and statically
+//! links the pinned FFmpeg subset for the active macOS target.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
@@ -133,8 +133,7 @@ impl LibavDemuxSession {
     pub(crate) fn open(path: &Path, audio: bool, seek: Duration) -> Result<Self, String> {
         if !libav_available() {
             return Err(
-                "in-process libavcodec unavailable on this build (system ffmpeg not linked)"
-                    .to_owned(),
+                "in-process libavcodec failed its build-time availability contract".to_owned(),
             );
         }
         let path = CString::new(path.to_string_lossy().as_bytes())
@@ -196,8 +195,7 @@ impl LibavCodecSession {
     pub(crate) fn open(codec_id: u32) -> Result<Self, String> {
         if !libav_available() {
             return Err(
-                "in-process libavcodec unavailable on this build (system ffmpeg not linked)"
-                    .to_owned(),
+                "in-process libavcodec failed its build-time availability contract".to_owned(),
             );
         }
         let mut err = vec![0_u8; 256];

@@ -1844,39 +1844,37 @@ fn contained_global_writeback_offset(
     );
     if let Some(producer_identity) = writeback.mapping_identity() {
         if let Some(read_identity) = guest_shared_backing_identity(address, byte_count)
-            && read_identity.backing_id == producer_identity.backing_id {
-                let producer_start = producer_identity.backing_offset;
-                if let (Some(producer_end), Some(read_end)) = (
-                    producer_start.checked_add(writeback_byte_count),
-                    read_identity.backing_offset.checked_add(byte_count),
-                ) {
-                    let read_start = read_identity.backing_offset;
-                    if producer_start < read_end && read_start < producer_end {
-                        if read_start >= producer_start && read_end <= producer_end
-                            && let Some(offset) =
-                                writeback.offset.checked_add(read_start - producer_start)
-                            {
-                                return QueuedWriteReadMatch::Buffer {
-                                    offset,
-                                    physical_identity: Some(read_identity),
-                                };
-                            }
-                        return QueuedWriteReadMatch::Synchronize;
+            && read_identity.backing_id == producer_identity.backing_id
+        {
+            let producer_start = producer_identity.backing_offset;
+            if let (Some(producer_end), Some(read_end)) = (
+                producer_start.checked_add(writeback_byte_count),
+                read_identity.backing_offset.checked_add(byte_count),
+            ) {
+                let read_start = read_identity.backing_offset;
+                if producer_start < read_end && read_start < producer_end {
+                    if read_start >= producer_start
+                        && read_end <= producer_end
+                        && let Some(offset) =
+                            writeback.offset.checked_add(read_start - producer_start)
+                    {
+                        return QueuedWriteReadMatch::Buffer {
+                            offset,
+                            physical_identity: Some(read_identity),
+                        };
                     }
+                    return QueuedWriteReadMatch::Synchronize;
                 }
             }
-        // VA recycled onto a different physical interval while this writeback is still queued.
-        // Forward the live Metal buffer by virtual offset instead of Synchronize→guest snapshot:
-        // draining then re-reading the remapped VA observes pre-dispatch bytes (Poppy tofu).
-        if virtual_overlap {
-            return contained_global_writeback_virtual_offset(
-                writeback,
-                address,
-                byte_count,
-                writeback_byte_count,
-            );
         }
-        return QueuedWriteReadMatch::None;
+        // A recycled VA names a new allocation once its physical identity changes. Forwarding the
+        // producer buffer by virtual offset would hand stale bytes to that new owner. Retire the
+        // old producer, then snapshot the replacement mapping.
+        return if virtual_overlap {
+            QueuedWriteReadMatch::Synchronize
+        } else {
+            QueuedWriteReadMatch::None
+        };
     }
     if !guest_physical_ranges_overlap(
         writeback.guest_address,

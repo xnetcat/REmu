@@ -1280,10 +1280,10 @@ fn writable_physical_alias_uses_exact_staging_and_preserves_adjacent_bytes() {
 }
 
 #[test]
-fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
-    // Poppy Slate glyph prep recycles a direct-memory VA onto a later heap offset while the
-    // producing compute writeback is still draining. Publishing through the captured producer
-    // identity keeps GPU results on the original physical pages instead of discarding them.
+fn remapped_exact_writable_writeback_is_discarded_after_va_recycle() {
+    // A captured writable global is owned by its guest VA mapping. Once the guest recycles that
+    // VA onto a different physical range, a delayed GPU completion must not publish through a
+    // surviving alias of the old pages: those pages have returned to the guest allocator.
     let mut address_space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
     let producer_alias = address_space
@@ -1370,8 +1370,8 @@ fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
             binding_byte_count,
         );
     }
-    let applied = write_back_pending_globals(&pending).expect("remapped writeback publishes");
-    assert_eq!(applied.len(), 1);
+    let applied = write_back_pending_globals(&pending).expect("remapped writeback is discarded");
+    assert!(applied.is_empty());
 
     let observer_binding = observer_alias.get() + 64;
     // SAFETY: observer still maps the original producer physical page.
@@ -1379,7 +1379,8 @@ fn remapped_exact_writable_writeback_publishes_to_producer_physical_pages() {
         for offset in 0..binding_byte_count {
             assert_eq!(
                 ((observer_binding + u64::try_from(offset).unwrap()) as *const u8).read(),
-                0x5a
+                0x11,
+                "the recycled producer pages retain the guest's bytes"
             );
         }
     }
@@ -1555,11 +1556,10 @@ fn exact_writeback_skips_runs_the_guest_wrote_after_capture() {
 }
 
 #[test]
-fn remapped_writeback_skips_guest_recycled_physical_pages() {
-    // Same as remapped_exact_writable_writeback_publishes_to_producer_physical_pages, except the
-    // guest also stores to the producer physical pages after the capture. Publishing by producer
-    // identity must then yield to the guest bytes instead of splatting stale GPU output over a
-    // live allocation — the recorded 0x40-poison crash mechanism.
+fn remapped_writeback_preserves_guest_recycled_physical_pages() {
+    // Once the captured VA is recycled, the entire delayed writable-global completion is stale.
+    // Neither untouched capture-time bytes nor later guest stores on the released physical pages
+    // may be overwritten through an old alias — the recorded 0x40-poison crash mechanism.
     let mut address_space = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
     let producer_alias = address_space
@@ -1653,7 +1653,7 @@ fn remapped_writeback_skips_guest_recycled_physical_pages() {
             binding_byte_count,
         );
     }
-    write_back_pending_globals(&pending).expect("guarded identity writeback completes");
+    write_back_pending_globals(&pending).expect("stale remapped writeback is discarded");
 
     // SAFETY: the observer alias remains mapped for the assertions.
     unsafe {
@@ -1661,14 +1661,14 @@ fn remapped_writeback_skips_guest_recycled_physical_pages() {
             assert_eq!(
                 ((observer_binding + offset) as *const u8).read(),
                 0x77,
-                "guest stores onto recycled producer pages survive the identity publish"
+                "guest stores onto recycled producer pages survive stale completion"
             );
         }
         for offset in 8..16_u64 {
             assert_eq!(
                 ((observer_binding + offset) as *const u8).read(),
                 0x11,
-                "a guest-modified changed run is skipped whole in identity mode too"
+                "capture-time bytes on released pages survive stale completion"
             );
         }
     }
@@ -2254,6 +2254,102 @@ fn remapped_zero_copy_writer_address_synchronizes_before_reuse() {
         producer.buffer.as_ref(),
         synchronized.buffer.as_ref()
     ));
+}
+
+#[test]
+fn remapped_copied_writer_address_never_forwards_the_old_allocation() {
+    let mut address_space = GuestAddressSpace::new(3 * GUEST_PAGE_SIZE).unwrap();
+    let base = address_space.base();
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let producer_alias = address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(base),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .unwrap();
+    let producer_address = producer_alias.get() + 128;
+    let byte_count = 64_usize;
+    // SAFETY: the mapped producer range contains the exact test span.
+    unsafe {
+        std::ptr::write_bytes(producer_address as *mut u8, 0x11, byte_count);
+    }
+
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.set_active_guest_queue(Some(7));
+    presenter
+        .ensure_active_open_guest_batch()
+        .expect("producer batch opens");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let producer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_address,
+        instruction_pcs: Default::default(),
+        byte_count,
+        data: Vec::new(),
+        writable: true,
+        write_back_to_guest: true,
+    };
+    let producer = presenter
+        .upload_global_buffer(&device, &producer_binding)
+        .expect("copied writable producer uploads");
+    let evaluation = evaluation_with_global(producer_binding);
+    let mut pending = Vec::new();
+    collect_pending_global_writebacks(std::slice::from_ref(&producer), &evaluation, &mut pending)
+        .expect("copied producer writeback is recorded");
+    append_unique_global_writebacks(
+        &mut presenter
+            .active_open_guest_batch_mut()
+            .expect("producer batch stays open")
+            .global_writebacks,
+        pending,
+    );
+
+    address_space
+        .unmap(producer_alias, GUEST_PAGE_SIZE)
+        .unwrap();
+    let replacement_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    address_space
+        .map_shared(
+            GuestMapPlacement::Fixed(producer_alias),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .unwrap();
+    // SAFETY: the replacement mapping contains the exact consumer span.
+    unsafe {
+        std::ptr::write_bytes(producer_address as *mut u8, 0x77, byte_count);
+    }
+    let consumer_binding = GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: producer_address + 16,
+        instruction_pcs: Default::default(),
+        byte_count: 16,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    };
+    let consumer = presenter
+        .upload_global_buffer(&device, &consumer_binding)
+        .expect("replacement mapping is snapshotted after draining the stale producer");
+    assert!(!std::ptr::eq(
+        producer.buffer.as_ref(),
+        consumer.buffer.as_ref()
+    ));
+    let bytes = super::super::MetalBytes::new(&consumer.buffer)
+        .slice(
+            usize::try_from(consumer.offset).unwrap(),
+            consumer_binding.byte_count,
+        )
+        .expect("consumer snapshot is in bounds");
+    assert_eq!(bytes, [0x77; 16]);
 }
 
 #[test]

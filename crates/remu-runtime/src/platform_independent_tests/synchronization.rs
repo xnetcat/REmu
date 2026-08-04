@@ -145,6 +145,24 @@ fn condition_signal_selects_one_waiter_and_broadcast_selects_the_rest() {
 }
 
 #[test]
+fn condition_timeout_retires_its_ticket_before_a_late_notify_can_select_it() {
+    let mut condition = crate::GuestConditionState::default();
+    let waiter = 1;
+    assert!(condition.register_waiter(waiter, 0x1234));
+
+    // This is the timeout-side operation performed while the condition state lock is still held.
+    condition.cancel_wait(waiter);
+
+    assert_eq!(
+        condition.release_one(),
+        None,
+        "a notify arriving after timeout must not consume its signal on the expired ticket"
+    );
+    assert!(!condition.take_release(waiter));
+    assert!(condition.is_idle());
+}
+
+#[test]
 fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
     let _guard = GUEST_CONDITION_TEST
         .lock()

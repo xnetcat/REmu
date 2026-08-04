@@ -713,7 +713,7 @@ impl GuestTextureWriteWatch {
         }
 
         let started = Instant::now();
-        let chunks = snapshot_dirty_content_fingerprints(self, dirty_ranges)?;
+        let (chunks, stable) = snapshot_dirty_content_fingerprints(self, dirty_ranges)?;
         let validated_bytes = chunks
             .iter()
             .fold(0_u64, |total, chunk| total.saturating_add(chunk.byte_count));
@@ -721,19 +721,20 @@ impl GuestTextureWriteWatch {
             .content_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let changed = chunks.iter().any(|chunk| {
-            !state
-                .initialized_chunks
-                .get(chunk.index)
-                .copied()
-                .unwrap_or(false)
-                || state
-                    .chunk_fingerprints
+        let changed = !stable
+            || chunks.iter().any(|chunk| {
+                !state
+                    .initialized_chunks
                     .get(chunk.index)
                     .copied()
-                    .unwrap_or_default()
-                    != chunk.fingerprint
-        });
+                    .unwrap_or(false)
+                    || state
+                        .chunk_fingerprints
+                        .get(chunk.index)
+                        .copied()
+                        .unwrap_or_default()
+                        != chunk.fingerprint
+            });
         state.pending_dirty_ranges.clear();
         drop(state);
 
@@ -860,7 +861,7 @@ impl GuestTextureWriteWatch {
     /// alias renewal does not look like a CPU rewrite. Copying multi-megabyte Unreal surfaces
     /// into a throwaway `Vec` dominated texture snapshot time on title screens.
     pub(crate) fn record_live_content_baseline(&self) -> Result<(), String> {
-        let chunks = snapshot_dirty_content_fingerprints(self, vec![self.range()])?;
+        let (chunks, _stable) = snapshot_dirty_content_fingerprints(self, vec![self.range()])?;
         let mut state = self
             .content_state
             .lock()
@@ -1068,7 +1069,8 @@ fn fingerprint_dirty_chunk_run(
 fn snapshot_dirty_content_fingerprints(
     write_watch: &GuestTextureWriteWatch,
     mut dirty_ranges: Vec<(u64, u64)>,
-) -> Result<Vec<DirtyContentFingerprint>, String> {
+) -> Result<(Vec<DirtyContentFingerprint>, bool), String> {
+    let mut attempts = 0_u32;
     loop {
         dirty_ranges.extend(write_watch.dirty_page_ranges());
         dirty_ranges = normalize_content_ranges(write_watch, dirty_ranges);
@@ -1089,7 +1091,16 @@ fn snapshot_dirty_content_fingerprints(
             })
             .and_then(|result| result)?;
         if write_watch.generations() == generations && !write_watch.is_dirty() {
-            return Ok(chunks);
+            return Ok((chunks, true));
+        }
+        attempts += 1;
+        if attempts >= MAX_STABLE_SNAPSHOT_ATTEMPTS {
+            // A guest thread can legally keep writing an image while the renderer is deciding
+            // whether a cached copy remains authoritative. Never monopolize the presenter trying
+            // to observe a quiescent instant that does not exist. The caller treats this unstable
+            // snapshot as changed, while the latest protection fault leaves the watch dirty for
+            // the subsequent reload/snapshot path.
+            return Ok((chunks, false));
         }
     }
 }

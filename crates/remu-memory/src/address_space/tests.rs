@@ -588,6 +588,57 @@ fn a_lease_follows_a_recycled_va_through_the_identity_licence() {
 }
 
 #[test]
+fn a_live_va_publication_is_revoked_when_the_va_is_recycled() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let observer = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    memory.write(mapped, &[0x11; 8]).unwrap();
+    let lease = GuestRangeLease::acquire(mapped.get(), 8).expect("live range leases");
+
+    memory.unmap(mapped, GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            GUEST_PAGE_SIZE,
+        )
+        .unwrap();
+
+    assert_eq!(
+        lease.publish_run_at_live_va_if_baseline(0, &[0x11; 8], &[0x5a; 8]),
+        LeasePublishOutcome::Revoked
+    );
+    let mut observed = [0_u8; 8];
+    memory.read(observer, &mut observed).unwrap();
+    assert_eq!(
+        observed, [0x11; 8],
+        "the recycled physical pages are untouched"
+    );
+}
+
+#[test]
 fn a_lease_yields_to_guest_stores_on_recycled_physical_pages() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

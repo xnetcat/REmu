@@ -1,8 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::{
@@ -133,10 +133,8 @@ where
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cond = next_cond;
-        let interrupted =
-            !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
-        let expired =
-            wait_result.timed_out() && !cond.waiter_released(waiter) && !interrupted;
+        let interrupted = !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+        let expired = wait_result.timed_out() && !cond.waiter_released(waiter) && !interrupted;
         if expired {
             cond.timeouts = cond.timeouts.saturating_add(1);
         }
@@ -186,8 +184,7 @@ where
                 }
             }
         }
-        let interrupted =
-            !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+        let interrupted = !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         (false, interrupted)
     } else {
         cond = entry
@@ -196,8 +193,7 @@ where
                 !cond.waiter_released(waiter) && !guest_exception_is_pending(guest_thread)
             })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let interrupted =
-            !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
+        let interrupted = !cond.waiter_released(waiter) && guest_exception_is_pending(guest_thread);
         (false, interrupted)
     };
     if timed_out && trace_guest_sync() {
@@ -207,6 +203,14 @@ where
                 "[REMu][COND] timeout sequence={timeouts} thread={guest_thread:#x} condition={condition:#x} mutex={mutex_address:#x} requested_usec={timeout_usec:?}"
             );
         }
+    }
+    if timed_out || interrupted || released_spuriously {
+        // Timeout/interrupt was decided while holding this condition's state lock. Retire the
+        // ticket before releasing that lock so a concurrent notify cannot select it in the gap
+        // before `finish_condition_wait` acquires the registry lock. Selecting an already-expired
+        // ticket both loses the signal and used to trip the exactly-one-winner assertion.
+        debug_assert!(!cond.waiter_released(waiter));
+        cond.cancel_wait(waiter);
     }
     drop(cond);
 

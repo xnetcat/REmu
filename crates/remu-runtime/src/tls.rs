@@ -33,15 +33,12 @@ pub(crate) const TLS_HELPER_REGION_SIZE: u64 = TLS_LOAD_HELPER_SIZE * TLS_LOAD_H
 
 const TLS_HELPER_REGION_SIZE_USIZE: usize = 16 * TLS_LOAD_HELPER_SIZE_USIZE;
 
-/// Slim Rosetta-clean store helper: no XSAVE / pushfq (plan C4).
-const TLS_STORE_HELPER_SIZE: u64 = 96;
+/// The store helper preserves every architectural value that the replaced MOV leaves untouched.
+const TLS_STORE_HELPER_SIZE: u64 = 192;
 
-const TLS_STORE_HELPER_SIZE_USIZE: usize = 96;
+const TLS_STORE_HELPER_SIZE_USIZE: usize = 192;
 
 const TLS_HELPER_SAVED_REGISTERS: [u8; 15] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-
-/// Caller-saved GPRs a SysV call may clobber (excluding RAX, which returns the TLS pointer).
-const TLS_STORE_SAVED_REGISTERS: [u8; 8] = [1, 2, 6, 7, 8, 9, 10, 11];
 
 const TLS_IMMEDIATE_STORE_SIZE: usize = 12;
 
@@ -474,44 +471,56 @@ fn write_tls_helpers(memory: &mut GuestImage, helper_base: GuestAddress) -> Resu
     for destination in 0_u8..16 {
         let offset = usize::from(destination) * TLS_LOAD_HELPER_SIZE_USIZE;
         let slot = &mut helpers[offset..offset + TLS_LOAD_HELPER_SIZE_USIZE];
-        let mut cursor = 0;
-        // No pushfq: the callee is a plain Cell::get that preserves flags once we use lea for
-        // stack adjust (plan C4 steps 1/3).
-        for register in TLS_HELPER_SAVED_REGISTERS {
-            emit_push_register(slot, &mut cursor, register);
-        }
-        // lea rsp, [rsp-8] — does not write flags (unlike sub rsp, 8).
-        slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xf8]);
-        cursor += 5;
-        slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
-        slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
-        cursor += 10;
-        slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]);
-        cursor += 2;
-        // lea rsp, [rsp+8]
-        slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x08]);
-        cursor += 5;
-        let saved_index = TLS_HELPER_SAVED_REGISTERS
-            .iter()
-            .position(|register| *register == destination)
-            .unwrap_or(0);
-        let saved_offset = (TLS_HELPER_SAVED_REGISTERS.len() - 1 - saved_index) * 8;
-        slot[cursor..cursor + 5].copy_from_slice(&[
-            0x48,
-            0x89,
-            0x44,
-            0x24,
-            u8::try_from(saved_offset).map_err(|_| LinkError::AddressOverflow)?,
-        ]);
-        cursor += 5;
-        for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
-            emit_pop_register(slot, &mut cursor, register);
-        }
-        slot[cursor] = 0xc3;
-        let _ = cursor;
+        encode_tls_load_helper(slot, dispatcher, destination)?;
     }
     memory.write(helper_base, &helpers)?;
     Ok(())
+}
+
+fn encode_tls_load_helper(
+    slot: &mut [u8],
+    dispatcher: u64,
+    destination: u8,
+) -> Result<usize, LinkError> {
+    let mut cursor = 0;
+    // The replaced MOV does not change flags. The Darwin TLV resolver called by the Rust
+    // thread-local getter is an ordinary SysV callee and may change them.
+    slot[cursor] = 0x9c; // pushfq
+    cursor += 1;
+    for register in TLS_HELPER_SAVED_REGISTERS {
+        emit_push_register(slot, &mut cursor, register);
+    }
+    // lea rsp, [rsp-8] — aligns the SysV call without changing flags.
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xf8]);
+    cursor += 5;
+    slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
+    slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
+    cursor += 10;
+    slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]);
+    cursor += 2;
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x08]);
+    cursor += 5;
+    let saved_index = TLS_HELPER_SAVED_REGISTERS
+        .iter()
+        .position(|register| *register == destination)
+        .unwrap_or(0);
+    let saved_offset = (TLS_HELPER_SAVED_REGISTERS.len() - 1 - saved_index) * 8;
+    slot[cursor..cursor + 5].copy_from_slice(&[
+        0x48,
+        0x89,
+        0x44,
+        0x24,
+        u8::try_from(saved_offset).map_err(|_| LinkError::AddressOverflow)?,
+    ]);
+    cursor += 5;
+    for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
+        emit_pop_register(slot, &mut cursor, register);
+    }
+    slot[cursor] = 0x9d; // popfq
+    cursor += 1;
+    slot[cursor] = 0xc3;
+    cursor += 1;
+    Ok(cursor)
 }
 
 fn write_tls_store_helpers(
@@ -559,30 +568,86 @@ fn encode_tls_store_helper(
 
 fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
     let mut cursor = 0;
-    // No pushfq / XSAVE: the getter only returns a u64 through rax (plan C4).
-    for register in TLS_STORE_SAVED_REGISTERS {
+    slot[cursor] = 0x9c; // pushfq
+    cursor += 1;
+    for register in TLS_HELPER_SAVED_REGISTERS {
         emit_push_register(slot, &mut cursor, register);
     }
-    // Align to 16 for the SysV call without writing flags.
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xf8]); // lea rsp,[rsp-8]
+    // A patched instruction can occur at any stack depth, not just at a SysV call boundary.
+    // Retain the post-save stack in callee-saved R15, allocate the exact XCR0-enabled save area
+    // reported by CPUID.0D.0:EBX, and align the dispatcher stack to 64 bytes.
+    slot[cursor..cursor + 3].copy_from_slice(&[0x49, 0x89, 0xe7]); // mov r15, rsp
+    cursor += 3;
+    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
+    cursor += 2;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x0f, 0x01, 0xd0]); // xgetbv
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xd6]); // mov r14d, edx
+    cursor += 3;
+    slot[cursor..cursor + 5].copy_from_slice(&[0xb8, 0x0d, 0, 0, 0]); // mov eax, 0xd
+    cursor += 5;
+    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
+    cursor += 2;
+    slot[cursor..cursor + 2].copy_from_slice(&[0x0f, 0xa2]); // cpuid
+    cursor += 2;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xdc]); // mov r12d, ebx
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x29, 0xe4]); // sub rsp, r12
+    cursor += 3;
+    slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x3f]); // sub rsp, 63
+    cursor += 4;
+    slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xe4, 0xc0]); // and rsp, -64
+    cursor += 4;
+    // XRSTOR requires the standard-format XSAVE header's reserved bytes to be zero.
+    // Guest flags were saved already, so CLD is safe and POPFQ restores the original DF.
+    slot[cursor] = 0xfc; // cld
+    cursor += 1;
+    slot[cursor..cursor + 8].copy_from_slice(&[0x48, 0x8d, 0xbc, 0x24, 0, 0x02, 0, 0]); // lea rdi,[rsp+512]
+    cursor += 8;
+    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc0]); // xor eax, eax
+    cursor += 2;
+    slot[cursor..cursor + 5].copy_from_slice(&[0xb9, 0x08, 0, 0, 0]); // mov ecx, 8
+    cursor += 5;
+    slot[cursor..cursor + 3].copy_from_slice(&[0xf3, 0x48, 0xab]); // rep stosq
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
+    cursor += 3;
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x24, 0x24]); // xsave64 [rsp]
     cursor += 5;
     slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
     slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
     cursor += 10;
     slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]); // call rax
     cursor += 2;
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x08]); // lea rsp,[rsp+8]
+    slot[cursor..cursor + 3].copy_from_slice(&[0x49, 0x89, 0xc2]); // mov r10, rax
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
+    cursor += 3;
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x2c, 0x24]); // xrstor64 [rsp]
     cursor += 5;
-    // Trap on a null TLS pointer rather than writing host address zero.
+    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x89, 0xd0]); // mov rax, r10
+    cursor += 3;
+    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x89, 0xfc]); // mov rsp, r15
+    cursor += 3;
+    // Guest code is entered only after assigning its per-thread pointer. Turn an invariant breach
+    // into an explicit trap rather than accessing host address zero.
     slot[cursor..cursor + 7].copy_from_slice(&[0x48, 0x85, 0xc0, 0x75, 0x02, 0x0f, 0x0b]);
     cursor += 7;
     cursor
 }
 
 fn emit_tls_store_helper_epilogue(slot: &mut [u8], mut cursor: usize) -> usize {
-    for register in TLS_STORE_SAVED_REGISTERS.into_iter().rev() {
+    for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
         emit_pop_register(slot, &mut cursor, register);
     }
+    slot[cursor] = 0x9d; // popfq
+    cursor += 1;
     // The patched store moves RSP below the 128-byte guest red zone before calling us.
     slot[cursor..cursor + 3].copy_from_slice(&[0xc2, 0x80, 0]); // ret 128
     cursor += 3;
@@ -684,6 +749,7 @@ fn patch_tls_loads_with_seeds(
                     u64::try_from(site.offset).map_err(|_| LinkError::AddressOverflow)?,
                 )?,
                 site.destination,
+                site.length,
             ));
         }
     }
@@ -693,7 +759,7 @@ fn patch_tls_loads_with_seeds(
         );
     }
 
-    for (address, destination) in &patches {
+    for (address, destination, instruction_length) in &patches {
         let helper = add_address(helper_base, u64::from(*destination) * TLS_LOAD_HELPER_SIZE)?;
         let next = address
             .get()
@@ -705,12 +771,18 @@ fn patch_tls_loads_with_seeds(
                 instruction: *address,
                 helper,
             })?;
-        let mut replacement = [0x90_u8; 9];
-        replacement[0] = 0xe8;
-        replacement[1..5].copy_from_slice(&displacement.to_le_bytes());
+        let replacement = encode_tls_load_patch(*instruction_length, displacement);
         memory.write(*address, &replacement)?;
     }
     Ok(patches.len())
+}
+
+fn encode_tls_load_patch(instruction_length: usize, displacement: i32) -> Vec<u8> {
+    debug_assert!(instruction_length >= 5);
+    let mut replacement = vec![0x90_u8; instruction_length];
+    replacement[0] = 0xe8;
+    replacement[1..5].copy_from_slice(&displacement.to_le_bytes());
+    replacement
 }
 
 fn patch_tls_immediate_stores(
@@ -759,8 +831,9 @@ mod tests {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
     use super::{
-        TLS_STORE_HELPER_SIZE_USIZE, TLS_STORE_THUNK_HITS, encode_tls_store_helper,
-        encode_tls_store_patch, reachable_tls_immediate_store_offsets,
+        TLS_STORE_HELPER_SIZE_USIZE, TLS_STORE_THUNK_HITS, encode_tls_load_helper,
+        encode_tls_load_patch, encode_tls_store_helper, encode_tls_store_patch,
+        reachable_tls_immediate_store_offsets,
     };
     use std::sync::atomic::Ordering;
 
@@ -791,7 +864,7 @@ mod tests {
     }
 
     #[test]
-    fn tls_store_helper_is_rosetta_clean_without_xsave_or_pushfq() {
+    fn tls_store_helper_preserves_guest_flags_and_vector_state() {
         let mut slot = [0x90_u8; TLS_STORE_HELPER_SIZE_USIZE];
         let encoded = encode_tls_store_helper(
             &mut slot,
@@ -801,13 +874,14 @@ mod tests {
         );
 
         assert!(encoded <= TLS_STORE_HELPER_SIZE_USIZE);
-        assert_ne!(slot[0], 0x9c, "pushfq must be gone");
+        assert_eq!(slot[0], 0x9c, "the replaced MOV must preserve RFLAGS");
         let mnemonics = decoded_mnemonics(&slot[..encoded]);
         assert!(
-            !mnemonics
-                .iter()
-                .any(|m| matches!(m, Mnemonic::Xsave64 | Mnemonic::Xrstor64 | Mnemonic::Pushfq)),
-            "store helper must not use XSAVE/pushfq: {mnemonics:?}"
+            mnemonics.iter().any(|m| matches!(m, Mnemonic::Xsave64))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Xrstor64))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Pushfq))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Popfq)),
+            "store helper must preserve the state a MOV leaves untouched: {mnemonics:?}"
         );
         assert!(
             mnemonics.contains(&Mnemonic::Lea),
@@ -815,6 +889,16 @@ mod tests {
         );
         // Ends with ret 128.
         assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
+    }
+
+    #[test]
+    fn tls_load_helper_preserves_guest_flags_around_the_tlv_call() {
+        let mut slot = [0x90_u8; super::TLS_LOAD_HELPER_SIZE_USIZE];
+        let encoded = encode_tls_load_helper(&mut slot, 0x1122_3344_5566_7788, 0).unwrap();
+        let mnemonics = decoded_mnemonics(&slot[..encoded]);
+        assert_eq!(mnemonics.first(), Some(&Mnemonic::Pushfq));
+        assert_eq!(mnemonics.last(), Some(&Mnemonic::Ret));
+        assert!(mnemonics.contains(&Mnemonic::Popfq));
     }
 
     #[test]
@@ -829,6 +913,16 @@ mod tests {
             encode_tls_store_patch(0x1234_5678),
             [
                 0x48, 0x8d, 0x64, 0x24, 0x80, 0xe8, 0x78, 0x56, 0x34, 0x12, 0x90, 0x90
+            ]
+        );
+    }
+
+    #[test]
+    fn tls_load_patch_consumes_every_redundant_prefix_byte() {
+        assert_eq!(
+            encode_tls_load_patch(12, 0x1234_5678),
+            [
+                0xe8, 0x78, 0x56, 0x34, 0x12, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
             ]
         );
     }

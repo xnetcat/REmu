@@ -20,7 +20,7 @@ use super::{
     PendingGlobalWriteback, PendingGuestWriteRange, UploadedGlobalBuffer,
     guest_physical_ranges_overlap, guest_ranges_overlap,
 };
-use crate::presenter::diagnostics::{journal_guest_write, trace_diagnostic_guest_write};
+use crate::presenter::diagnostics::journal_guest_write;
 use crate::presenter::{
     PhysicalFootprintRange, SharedEventGlobalBufferVersion, SharedEventResidentTextureVersion,
     SharedEventSignalCheckpoint, SharedEventUnresolvedWriteRange, SharedEventWriteKind,
@@ -2255,17 +2255,14 @@ pub(crate) fn write_back_pending_globals(
             let byte_count = u64::try_from(writeback.byte_count)
                 .map_err(|_| "writable global buffer byte count does not fit u64")?;
             if !lease.live_va_matches() {
-                // Prospero recycles direct-memory VAs while GPU work is still draining. Publishing
-                // through the captured producer identity keeps GPU results on those physical pages
-                // (Poppy Slate glyph prep at 0x9010960000). Discarding left every later reader of
-                // that backing with the pre-dispatch snapshot and solid tofu glyphs. The lease
-                // still yields every run the guest has since written.
-                trace_remapped_global_writeback_published_by_identity(
+                trace_discarded_stale_global_writeback(
                     writeback.guest_address,
                     writeback.byte_count,
+                    "before completion",
                     lease.identity(),
                     guest_shared_backing_identity(writeback.guest_address, byte_count),
                 );
+                continue;
             }
             write_changed_global_ranges_leased(writeback, current_bytes, original_bytes, lease)?
         } else if let Some(write_watch) = writeback.write_watch.as_ref() {
@@ -2371,18 +2368,15 @@ fn write_changed_global_ranges_leased(
             .map_err(|_| "writable global buffer changed byte count does not fit u64")?;
         let source = &current_bytes[start..cursor];
         let baseline = &original_bytes[start..cursor];
-        match lease.publish_run_if_baseline(run_offset, baseline, source) {
+        match lease.publish_run_at_live_va_if_baseline(run_offset, baseline, source) {
             LeasePublishOutcome::AppliedAtLiveVa => {
                 journal_guest_write(GuestWriteSite::GlobalWriteback, address, byte_count, source);
             }
             LeasePublishOutcome::AppliedByIdentity => {
-                trace_diagnostic_guest_write("global-producer-identity", address, byte_count);
-                journal_guest_write(
-                    GuestWriteSite::GlobalWritebackIdentity,
-                    address,
-                    byte_count,
-                    source,
-                );
+                return Err(format!(
+                    "live-VA-only global writeback unexpectedly published by identity address={address:#x} bytes={}",
+                    cursor - start,
+                ));
             }
             LeasePublishOutcome::GuestModified => {
                 trace_kept_guest_bytes_over_writeback(address, cursor - start, "leased");
@@ -2420,21 +2414,6 @@ fn trace_discarded_stale_global_writeback(
     if sequence <= 16 || sequence.is_power_of_two() {
         eprintln!(
             "[REMu][METAL] discarded stale writable global writeback sequence={sequence} mapping changed {stage} address={address:#x} bytes={byte_count} expected={expected:?} current={current:?}"
-        );
-    }
-}
-
-fn trace_remapped_global_writeback_published_by_identity(
-    address: u64,
-    byte_count: usize,
-    expected: GuestSharedMappingIdentity,
-    current: Option<GuestSharedMappingIdentity>,
-) {
-    static PUBLISHED: AtomicUsize = AtomicUsize::new(0);
-    let sequence = PUBLISHED.fetch_add(1, Ordering::Relaxed) + 1;
-    if sequence <= 16 || sequence.is_power_of_two() {
-        eprintln!(
-            "[REMu][METAL] published remapped writable global writeback sequence={sequence} by producer identity address={address:#x} bytes={byte_count} expected={expected:?} current={current:?}"
         );
     }
 }

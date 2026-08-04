@@ -1228,6 +1228,99 @@ fn a_continuously_written_resource_still_completes_its_snapshot() {
 }
 
 #[test]
+fn a_continuously_written_resource_still_completes_content_validation() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const TEXTURE_PAGES: u64 = 1024;
+    let texture_bytes = TEXTURE_PAGES * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(2 * texture_bytes).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(texture_bytes).expect("guest physical backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            texture_bytes,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("contiguous texture mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 2048,
+        height: 2048,
+        pitch: 2048,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let watch = watch_guest_texture(descriptor).expect("contiguous texture watch");
+    snapshot_watched_guest_texture_raw(descriptor, &watch).expect("initialize fingerprints");
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let writer_finished = Arc::clone(&finished);
+    let writer_address = usize::try_from(address.get()).expect("guest address fits usize");
+    let writer_page_bytes = usize::try_from(GUEST_PAGE_SIZE).expect("guest page size fits usize");
+    let writer = std::thread::spawn(move || {
+        let mut value = 0_u8;
+        let mut page = 0_usize;
+        while !writer_finished.load(Ordering::Acquire) {
+            value = value.wrapping_add(1);
+            // SAFETY: the mapping outlives this thread and the write watch restores access on
+            // every protection fault before the store retries.
+            unsafe {
+                (writer_address as *mut u8)
+                    .add(page * writer_page_bytes)
+                    .write_volatile(value)
+            };
+            page = (page + 1) % usize::try_from(TEXTURE_PAGES).unwrap();
+            std::hint::spin_loop();
+        }
+    });
+
+    // Prove the writer has actually faulted and dirtied the armed watch before timing the
+    // validator. Without this handshake, a busy host can schedule the validator first and the
+    // test legitimately observes unchanged bytes, making the assertion depend on thread luck.
+    let writer_start_deadline = Instant::now() + Duration::from_secs(2);
+    while !watch.is_dirty() {
+        assert!(
+            Instant::now() < writer_start_deadline,
+            "guest writer did not dirty the armed texture watch"
+        );
+        std::thread::yield_now();
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let validator = std::thread::spawn(move || {
+        let result = watch.content_has_changed();
+        let _ = sender.send(result);
+    });
+    let completed_while_writing = receiver.recv_timeout(Duration::from_millis(250));
+    let completed_in_time = completed_while_writing.is_ok();
+    finished.store(true, Ordering::Release);
+    writer.join().expect("guest writer thread");
+    let result = match completed_while_writing {
+        Ok(result) => result,
+        Err(_) => receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("content validation finishes after the writer stops"),
+    };
+    validator.join().expect("content validator thread");
+
+    assert!(
+        completed_in_time,
+        "content validation must not retry forever while guest writes continue"
+    );
+    assert!(result.expect("content validation succeeds"));
+}
+
+#[test]
 fn live_content_baseline_skips_full_host_snapshot_copy() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,

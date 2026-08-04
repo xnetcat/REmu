@@ -514,7 +514,7 @@ fn av_player_stall_snapshot_distinguishes_decoder_and_guest_progress() {
     assert!(snapshot.decoder_queue_blocked);
 }
 
-/// Generates a two-second 128x96 test clip (mpeg4 video + AAC sine audio) with the same ffmpeg
+/// Generates a two-second 128x96 test clip (H.264 video + AAC sine audio) with the same ffmpeg
 /// binary the runtime decoder requires. Returns None — after logging loudly — when the tools
 /// are unavailable, mirroring the accepted environmental-skip pattern.
 fn av_player_generate_test_clip(name: &str) -> Option<std::path::PathBuf> {
@@ -545,7 +545,7 @@ fn av_player_generate_test_clip(name: &str) -> Option<std::path::PathBuf> {
                 "-i",
                 "sine=frequency=440:duration=2",
                 "-c:v",
-                "mpeg4",
+                "libx264",
                 "-pix_fmt",
                 "yuv420p",
                 "-c:a",

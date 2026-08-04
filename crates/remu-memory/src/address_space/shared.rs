@@ -972,6 +972,50 @@ impl GuestRangeLease {
         guest_shared_backing_identity(self.address, self.byte_count) == Some(self.identity)
     }
 
+    /// Publishes one changed run only while its capture-time VA still names the leased backing.
+    ///
+    /// This is the publication rule for resources whose ownership is expressed by a guest
+    /// virtual address, such as copied writable global buffers. Unlike
+    /// [`Self::publish_run_if_baseline`], it never follows the old physical backing through a
+    /// surviving alias after the guest recycles that VA.
+    #[must_use]
+    pub fn publish_run_at_live_va_if_baseline(
+        &self,
+        run_offset: u64,
+        baseline: &[u8],
+        source: &[u8],
+    ) -> LeasePublishOutcome {
+        debug_assert_eq!(baseline.len(), source.len());
+        let Ok(run_bytes) = u64::try_from(source.len()) else {
+            return LeasePublishOutcome::Revoked;
+        };
+        if run_bytes == 0 {
+            return LeasePublishOutcome::Revoked;
+        }
+        let Some(run_address) = self.address.checked_add(run_offset) else {
+            return LeasePublishOutcome::Revoked;
+        };
+        let Some(run_backing_offset) = self.identity.backing_offset.checked_add(run_offset) else {
+            return LeasePublishOutcome::Revoked;
+        };
+        let mappings = shared_mappings()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((backing, offset, _)) =
+            resolve_shared_backing_range(&mappings, run_address, run_bytes)
+        else {
+            return LeasePublishOutcome::Revoked;
+        };
+        if backing.id() != self.identity.backing_id || offset != run_backing_offset {
+            return LeasePublishOutcome::Revoked;
+        }
+        match guarded_backing_write(&backing, offset, baseline, source) {
+            GuardedBackingWrite::Applied => LeasePublishOutcome::AppliedAtLiveVa,
+            GuardedBackingWrite::GuestModified => LeasePublishOutcome::GuestModified,
+            GuardedBackingWrite::Unavailable => LeasePublishOutcome::WriteFailed,
+        }
+    }
+
     /// Publishes one changed run while the capture-time baseline still holds.
     ///
     /// One registry-lock pass: if the run's VA still resolves to the leased identity, the

@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
  * In-process libav* decode for AvPlayer + Videodec2 (MASTER-PLAN P5).
- * When REMU_LIBAV_STUB is defined the symbols exist but refuse work loudly via return codes.
+ * The Cargo build supplies a pinned static FFmpeg build for the active target.
  */
 
 #include "remu_libav_bridge.h"
@@ -11,98 +11,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#ifdef REMU_LIBAV_STUB
-
-int remu_libav_available(void) { return 0; }
-
-int remu_libav_probe_video(
-    const char *path,
-    int32_t *width_out,
-    int32_t *height_out,
-    double *fps_out,
-    double *duration_out) {
-    (void)path;
-    (void)width_out;
-    (void)height_out;
-    (void)fps_out;
-    (void)duration_out;
-    return 0;
-}
-
-int remu_libav_probe_has_audio(const char *path) {
-    (void)path;
-    return 0;
-}
-
-RemuLibavDemux *remu_libav_demux_open(
-    const char *path,
-    int audio,
-    double seek_seconds,
-    char *err_buf,
-    size_t err_buf_len) {
-    (void)path;
-    (void)audio;
-    (void)seek_seconds;
-    if (err_buf && err_buf_len) {
-        snprintf(err_buf, err_buf_len, "libav bridge stub (no system ffmpeg for this target)");
-    }
-    return NULL;
-}
-
-int remu_libav_demux_read_frame(RemuLibavDemux *session, uint8_t *out, size_t out_len) {
-    (void)session;
-    (void)out;
-    (void)out_len;
-    return -1;
-}
-
-void remu_libav_demux_close(RemuLibavDemux *session) { (void)session; }
-
-RemuLibavCodec *remu_libav_codec_open(uint32_t codec_id, char *err_buf, size_t err_buf_len) {
-    (void)codec_id;
-    if (err_buf && err_buf_len) {
-        snprintf(err_buf, err_buf_len, "libav bridge stub (no system ffmpeg for this target)");
-    }
-    return NULL;
-}
-
-int remu_libav_codec_send(
-    RemuLibavCodec *codec,
-    const uint8_t *au,
-    size_t au_size,
-    int64_t pts) {
-    (void)codec;
-    (void)au;
-    (void)au_size;
-    (void)pts;
-    return -1;
-}
-
-int remu_libav_codec_receive_nv12(
-    RemuLibavCodec *codec,
-    uint8_t *out,
-    size_t out_len,
-    int32_t *width_out,
-    int32_t *height_out,
-    int32_t *pitch_out) {
-    (void)codec;
-    (void)out;
-    (void)out_len;
-    (void)width_out;
-    (void)height_out;
-    (void)pitch_out;
-    return -1;
-}
-
-int remu_libav_codec_flush(RemuLibavCodec *codec) {
-    (void)codec;
-    return -1;
-}
-
-void remu_libav_codec_close(RemuLibavCodec *codec) { (void)codec; }
-
-#else /* real libav* */
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
@@ -731,5 +639,3 @@ void remu_libav_codec_close(RemuLibavCodec *codec) {
     }
     free(codec);
 }
-
-#endif /* REMU_LIBAV_STUB */

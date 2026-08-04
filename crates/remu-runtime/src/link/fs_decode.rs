@@ -9,7 +9,7 @@
 //! (ELF entry, `DT_INIT*`, reloc targets, `.eh_frame` FDE starts) and reports every
 //! byte-scan hit that is not an instruction boundary before any rewrite runs.
 
-use iced_x86::{Decoder, DecoderOptions, FlowControl};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction, Mnemonic, OpKind, Register};
 use remu_core::GuestAddress;
 use std::collections::{BTreeSet, VecDeque};
 
@@ -30,7 +30,13 @@ pub(crate) struct FsLoadBoundaryReport {
 /// One authenticated `mov r64, fs:[0]` at an instruction boundary.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct FsLoadSite {
+    /// Start of the complete decoded instruction, including redundant prefixes.
     pub(crate) offset: usize,
+    /// Complete decoded instruction length. The replacement must cover all of it so no prefix
+    /// can leak onto the helper call.
+    pub(crate) length: usize,
+    /// Offset where the canonical nine-byte `fs:` encoding begins inside the instruction.
+    pub(crate) encoding_offset: usize,
     /// Destination register number in the AMD64 encoding (0=rax … 15=r15).
     pub(crate) destination: u8,
 }
@@ -42,16 +48,21 @@ pub(crate) fn byte_scan_fs_load_offsets(bytes: &[u8]) -> Vec<usize> {
         return hits;
     }
     for offset in 0..=bytes.len() - FS_LOAD_ENCODING_LEN {
-        if let Some(destination) = fs_load_destination(&bytes[offset..offset + FS_LOAD_ENCODING_LEN])
-            && destination != 4 {
-                hits.push(offset);
-            }
+        if let Some(destination) =
+            fs_load_destination(&bytes[offset..offset + FS_LOAD_ENCODING_LEN])
+            && destination != 4
+        {
+            hits.push(offset);
+        }
     }
     hits
 }
 
 /// Seeded linear decode: walk from each seed, collect instruction starts and authenticated loads.
-pub(crate) fn seeded_fs_load_sites(bytes: &[u8], seeds: &[usize]) -> (BTreeSet<usize>, Vec<FsLoadSite>) {
+pub(crate) fn seeded_fs_load_sites(
+    bytes: &[u8],
+    seeds: &[usize],
+) -> (BTreeSet<usize>, Vec<FsLoadSite>) {
     let mut pending = VecDeque::new();
     for &seed in seeds {
         if seed < bytes.len() {
@@ -74,28 +85,32 @@ pub(crate) fn seeded_fs_load_sites(bytes: &[u8], seeds: &[usize]) -> (BTreeSet<u
             if next > bytes.len() {
                 break;
             }
-            if instruction.len() == FS_LOAD_ENCODING_LEN
-                && let Some(destination) =
-                    fs_load_destination(&bytes[offset..next]).filter(|&reg| reg != 4)
-            {
-                loads.push(FsLoadSite {
-                    offset,
-                    destination,
-                });
+            if let Some(site) = decoded_fs_load_site(&instruction, bytes, offset, next) {
+                loads.push(site);
             }
             match instruction.flow_control() {
-                FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
+                FlowControl::Next | FlowControl::IndirectCall => {
+                    offset = next;
+                }
+                FlowControl::Call => {
+                    if let Some(target) =
+                        in_buffer_target(instruction.near_branch_target(), bytes.len())
+                    {
+                        pending.push_back(target);
+                    }
                     offset = next;
                 }
                 FlowControl::ConditionalBranch => {
-                    if let Some(target) = in_buffer_target(instruction.near_branch_target(), bytes.len())
+                    if let Some(target) =
+                        in_buffer_target(instruction.near_branch_target(), bytes.len())
                     {
                         pending.push_back(target);
                     }
                     offset = next;
                 }
                 FlowControl::UnconditionalBranch => {
-                    if let Some(target) = in_buffer_target(instruction.near_branch_target(), bytes.len())
+                    if let Some(target) =
+                        in_buffer_target(instruction.near_branch_target(), bytes.len())
                     {
                         pending.push_back(target);
                     }
@@ -122,10 +137,14 @@ pub(crate) fn diagnose_fs_load_boundary_mismatches(
     seeds: &[usize],
 ) -> FsLoadBoundaryReport {
     let byte_hits = byte_scan_fs_load_offsets(bytes);
-    let (boundaries, confirmed) = seeded_fs_load_sites(bytes, seeds);
+    let (_boundaries, confirmed) = seeded_fs_load_sites(bytes, seeds);
+    let confirmed_encodings = confirmed
+        .iter()
+        .map(|site| site.encoding_offset)
+        .collect::<BTreeSet<_>>();
     let mismatches = byte_hits
         .iter()
-        .filter(|offset| !boundaries.contains(offset))
+        .filter(|offset| !confirmed_encodings.contains(offset))
         .count();
     FsLoadBoundaryReport {
         byte_scan_hits: byte_hits.len(),
@@ -142,10 +161,14 @@ pub(crate) fn report_fs_load_boundary_mismatches(
     seeds: &[usize],
 ) -> FsLoadBoundaryReport {
     let byte_hits = byte_scan_fs_load_offsets(bytes);
-    let (boundaries, confirmed) = seeded_fs_load_sites(bytes, seeds);
+    let (_boundaries, confirmed) = seeded_fs_load_sites(bytes, seeds);
+    let confirmed_encodings = confirmed
+        .iter()
+        .map(|site| site.encoding_offset)
+        .collect::<BTreeSet<_>>();
     let mut mismatches = 0_usize;
     for offset in &byte_hits {
-        if boundaries.contains(offset) {
+        if confirmed_encodings.contains(offset) {
             continue;
         }
         mismatches += 1;
@@ -188,6 +211,65 @@ fn fs_load_destination(encoding: &[u8]) -> Option<u8> {
         return None;
     }
     Some(((mod_rm >> 3) & 7) | ((rex & 4) << 1))
+}
+
+fn decoded_fs_load_site(
+    instruction: &Instruction,
+    bytes: &[u8],
+    offset: usize,
+    next: usize,
+) -> Option<FsLoadSite> {
+    if instruction.mnemonic() != Mnemonic::Mov
+        || instruction.op_count() != 2
+        || instruction.op0_kind() != OpKind::Register
+        || instruction.op1_kind() != OpKind::Memory
+        || instruction.memory_segment() != Register::FS
+        || instruction.memory_base() != Register::None
+        || instruction.memory_index() != Register::None
+        || instruction.memory_displacement64() != 0
+    {
+        return None;
+    }
+    let decoded_destination = gpr64_number(instruction.op0_register())?;
+    let last_encoding_start = next.checked_sub(FS_LOAD_ENCODING_LEN)?;
+    for encoding_offset in offset..=last_encoding_start {
+        let Some(destination) =
+            fs_load_destination(&bytes[encoding_offset..encoding_offset + FS_LOAD_ENCODING_LEN])
+        else {
+            continue;
+        };
+        if destination == decoded_destination && destination != 4 {
+            return Some(FsLoadSite {
+                offset,
+                length: instruction.len(),
+                encoding_offset,
+                destination,
+            });
+        }
+    }
+    None
+}
+
+fn gpr64_number(register: Register) -> Option<u8> {
+    match register {
+        Register::RAX => Some(0),
+        Register::RCX => Some(1),
+        Register::RDX => Some(2),
+        Register::RBX => Some(3),
+        Register::RSP => Some(4),
+        Register::RBP => Some(5),
+        Register::RSI => Some(6),
+        Register::RDI => Some(7),
+        Register::R8 => Some(8),
+        Register::R9 => Some(9),
+        Register::R10 => Some(10),
+        Register::R11 => Some(11),
+        Register::R12 => Some(12),
+        Register::R13 => Some(13),
+        Register::R14 => Some(14),
+        Register::R15 => Some(15),
+        _ => None,
+    }
 }
 
 fn in_buffer_target(target: u64, length: usize) -> Option<usize> {
@@ -296,6 +378,8 @@ mod tests {
             seeded_fs_load_sites(&code, &[0]).1,
             vec![FsLoadSite {
                 offset: 0,
+                length: 9,
+                encoding_offset: 0,
                 destination: 0
             }]
         );
@@ -325,12 +409,55 @@ mod tests {
             seeded_fs_load_sites(&code, &[0]).1,
             vec![FsLoadSite {
                 offset: 1,
+                length: 9,
+                encoding_offset: 1,
                 destination: 0
             }]
         );
         let report = diagnose_fs_load_boundary_mismatches(&code, &[0]);
         assert_eq!(report.boundary_mismatches, 0);
         assert_eq!(report.decoder_confirmed_loads, 1);
+    }
+
+    #[test]
+    fn seeded_decode_follows_a_direct_call_into_a_leaf_without_its_own_seed() {
+        // call +1 → offset 6; the fall-through path returns at offset 5. Small leaf functions do
+        // not necessarily have an FDE/symbol of their own, so their direct call edge is the only
+        // authenticated route to the TLS load.
+        let mut code = vec![0xe8, 1, 0, 0, 0, 0xc3];
+        code.extend_from_slice(&FS_LOAD_RAX);
+        code.push(0xc3);
+        assert_eq!(
+            seeded_fs_load_sites(&code, &[0]).1,
+            vec![FsLoadSite {
+                offset: 6,
+                length: 9,
+                encoding_offset: 6,
+                destination: 0
+            }]
+        );
+    }
+
+    #[test]
+    fn redundant_prefixes_remain_part_of_one_authenticated_tls_load() {
+        // Clang may align a hot-patchable instruction with redundant operand-size prefixes.
+        // The `fs:` prefix is therefore not necessarily the first byte of the decoded MOV.
+        let mut code = vec![0x66, 0x66, 0x66];
+        code.extend_from_slice(&FS_LOAD_RAX);
+        code.push(0xc3);
+        let report = diagnose_fs_load_boundary_mismatches(&code, &[0]);
+        assert_eq!(report.byte_scan_hits, 1);
+        assert_eq!(report.boundary_mismatches, 0);
+        assert_eq!(report.decoder_confirmed_loads, 1);
+        assert_eq!(
+            seeded_fs_load_sites(&code, &[0]).1,
+            vec![FsLoadSite {
+                offset: 0,
+                length: 12,
+                encoding_offset: 3,
+                destination: 0
+            }]
+        );
     }
 
     #[test]

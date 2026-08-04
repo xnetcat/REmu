@@ -47,8 +47,6 @@ if [ -z "$repo_dir" ] || [ -z "$raw_binary" ] || [ -z "$app_bundle" ]; then
     usage
 fi
 
-script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
-
 if [ "$skip_build" -eq 0 ]; then
     echo "[REMu] building the Rosetta release runner" >&2
     cargo build --manifest-path "$repo_dir/Cargo.toml" \
@@ -63,6 +61,6 @@ fi
 if [ "$headless" -eq 1 ]; then
     printf '%s\n' "$raw_binary"
 else
-    "$script_dir/build-macos-app.sh" "$raw_binary" "$app_bundle" >/dev/null
+    "$repo_dir/scripts/build-macos-app.sh" "$raw_binary" "$app_bundle" >/dev/null
     printf '%s\n' "$app_bundle/Contents/MacOS/remu"
 fi
