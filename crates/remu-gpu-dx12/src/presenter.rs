@@ -171,6 +171,10 @@ impl PresentationState {
     }
 }
 
+const fn should_process_flip_pixels(state: PresentationState) -> bool {
+    !state.is_paused()
+}
+
 struct Dx12Renderer {
     adapter_name: String,
     device: windows::Win32::Graphics::Direct3D12::ID3D12Device,
@@ -778,62 +782,66 @@ impl Dx12Presenter {
                 };
                 self.display = Some(display);
                 self.last_flip_address = Some(address);
-                let direct_target = if self.splash.is_none()
-                    && self.dialog.is_none()
-                    && self.toast.is_none()
-                    && !self.presentation_state.is_paused()
-                {
-                    self.guest_executor.as_mut().and_then(|executor| {
-                        match executor.native_present_target(address, width, height) {
-                            Ok(target) => target,
-                            Err(error) => {
-                                eprintln!(
-                                    "[REMu][D3D12] could not complete native flip target at {address:#x}: {error}"
-                                );
-                                None
+                // The pause transition preserves the latest guest frame once. Subsequent flips
+                // still retire normally, but do not need another full-resolution readback until
+                // resume refreshes the most recently submitted address.
+                if should_process_flip_pixels(self.presentation_state) {
+                    let direct_target = if self.splash.is_none()
+                        && self.dialog.is_none()
+                        && self.toast.is_none()
+                    {
+                        self.guest_executor.as_mut().and_then(|executor| {
+                            match executor.native_present_target(address, width, height) {
+                                Ok(target) => target,
+                                Err(error) => {
+                                    eprintln!(
+                                        "[REMu][D3D12] could not complete native flip target at {address:#x}: {error}"
+                                    );
+                                    None
+                                }
                             }
-                        }
-                    })
-                } else {
-                    None
-                };
-                let presented_directly = direct_target.as_ref().is_some_and(|target| {
-                    self.renderer.as_mut().is_some_and(|renderer| {
-                        match renderer.present_native(target) {
-                            Ok(()) => true,
-                            Err(error) => {
-                                eprintln!(
-                                    "[REMu][D3D12] direct presentation at {address:#x} failed: {error}"
-                                );
-                                false
+                        })
+                    } else {
+                        None
+                    };
+                    let presented_directly = direct_target.as_ref().is_some_and(|target| {
+                        self.renderer.as_mut().is_some_and(|renderer| {
+                            match renderer.present_native(target) {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    eprintln!(
+                                        "[REMu][D3D12] direct presentation at {address:#x} failed: {error}"
+                                    );
+                                    false
+                                }
                             }
-                        }
-                    })
-                });
-                if !presented_directly {
-                    let rendered = self.guest_executor.as_mut().and_then(|executor| {
-                        match executor.prepare_presentable_bgra(address, width, height) {
-                            Ok(frame) => frame.map(|bgra8| HostFrame {
-                                width,
-                                height,
-                                bgra8,
-                            }),
-                            Err(error) => {
-                                eprintln!(
-                                    "[REMu][D3D12] could not flush flip target at {address:#x}: {error}"
-                                );
-                                None
-                            }
-                        }
+                        })
                     });
-                    match rendered.map_or_else(|| snapshot_guest_frame(address, display), Ok) {
-                        Ok(frame) => {
-                            self.guest_frame = Some(frame);
-                            self.render_current_frame();
+                    if !presented_directly {
+                        let rendered = self.guest_executor.as_mut().and_then(|executor| {
+                            match executor.prepare_presentable_bgra(address, width, height) {
+                                Ok(frame) => frame.map(|bgra8| HostFrame {
+                                    width,
+                                    height,
+                                    bgra8,
+                                }),
+                                Err(error) => {
+                                    eprintln!(
+                                        "[REMu][D3D12] could not flush flip target at {address:#x}: {error}"
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                        match rendered.map_or_else(|| snapshot_guest_frame(address, display), Ok) {
+                            Ok(frame) => {
+                                self.guest_frame = Some(frame);
+                                self.render_current_frame();
+                            }
+                            Err(error) => eprintln!(
+                                "[REMu][D3D12] could not snapshot flip at {address:#x}: {error}"
+                            ),
                         }
-                        Err(error) => eprintln!(
-                            "[REMu][D3D12] could not snapshot flip at {address:#x}: {error}"
-                        ),
                     }
                 }
                 remu_gpu::record_gpu_flip_completed(GpuFlipCompletion {
@@ -1097,6 +1105,7 @@ impl Dx12Presenter {
         if paused && !was_paused {
             self.capture_latest_guest_frame();
         } else if !paused && was_paused {
+            self.capture_latest_guest_frame();
             self.render_current_frame();
         }
     }
@@ -1974,7 +1983,8 @@ mod tests {
 
     use super::{
         HostFrame, PresentationState, compose_pad_state, compose_system_ui, detile_mode27_bgra,
-        is_fullscreen_shortcut, merge_xinput, mode27_offsets, xinput_vibration,
+        is_fullscreen_shortcut, merge_xinput, mode27_offsets, should_process_flip_pixels,
+        xinput_vibration,
     };
     use remu_gpu::{
         HostDialogButtons, HostDialogKind, HostDialogRequest, HostPadState, HostPadVibration,
@@ -2003,6 +2013,20 @@ mod tests {
         assert!(state.is_paused());
         state.suspended = false;
         assert!(!state.is_paused());
+    }
+
+    #[test]
+    fn hidden_windows_retire_flips_without_processing_pixels() {
+        let mut state = PresentationState::default();
+        assert!(should_process_flip_pixels(state));
+        state.occluded = true;
+        assert!(!should_process_flip_pixels(state));
+        state.occluded = false;
+        state.zero_sized = true;
+        assert!(!should_process_flip_pixels(state));
+        state.zero_sized = false;
+        state.suspended = true;
+        assert!(!should_process_flip_pixels(state));
     }
 
     #[test]
