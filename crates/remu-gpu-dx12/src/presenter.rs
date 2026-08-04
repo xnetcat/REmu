@@ -2058,10 +2058,12 @@ mod tests {
         let mut keys = HashSet::new();
         keys.insert(KeyCode::KeyD);
         keys.insert(KeyCode::Enter);
-        let mut controller = XINPUT_GAMEPAD::default();
-        controller.wButtons = XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_DPAD_RIGHT;
-        controller.bRightTrigger = 255;
-        controller.sThumbLX = i16::MAX;
+        let controller = XINPUT_GAMEPAD {
+            wButtons: XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_DPAD_RIGHT,
+            bRightTrigger: 255,
+            sThumbLX: i16::MAX,
+            ..XINPUT_GAMEPAD::default()
+        };
 
         assert_eq!(
             compose_pad_state(&keys, Some(controller), false),

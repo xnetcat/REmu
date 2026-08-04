@@ -105,10 +105,11 @@ impl Compiler<'_> {
             return None;
         }
         let registers = self.evaluation.compute_system_registers?;
-        let vector_watchdog = registers
-            .has_evaluated_vector_controlled_loop
-            .then_some(HLSL_VECTOR_CONTROLLED_LOOP_WATCHDOG)
-            .unwrap_or_default();
+        let vector_watchdog = if registers.has_evaluated_vector_controlled_loop {
+            HLSL_VECTOR_CONTROLLED_LOOP_WATCHDOG
+        } else {
+            0
+        };
         Some(
             registers
                 .maximum_evaluated_scalar_loop_iterations

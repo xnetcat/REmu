@@ -296,9 +296,7 @@ pub(crate) fn record_guest_cpu_page_open(
     if ENABLED.load(Ordering::Relaxed) != ENABLED_YES || page_byte_count == 0 {
         return None;
     }
-    let Some(slots) = SLOTS.get() else {
-        return None;
-    };
+    let slots = SLOTS.get()?;
     let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let slot = &slots[(sequence as usize) & (CAPACITY - 1)];
     slot.stamp.store(0, Ordering::Release);

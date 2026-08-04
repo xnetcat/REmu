@@ -491,12 +491,14 @@ mod tests {
             D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED,
         ];
         let completed = 1_u32;
-        let mut node = D3D12_AUTO_BREADCRUMB_NODE1::default();
-        node.pCommandQueueDebugNameA = queue.as_ptr().cast();
-        node.pCommandListDebugNameA = list.as_ptr().cast();
-        node.BreadcrumbCount = history.len() as u32;
-        node.pLastBreadcrumbValue = &raw const completed;
-        node.pCommandHistory = history.as_ptr();
+        let node = D3D12_AUTO_BREADCRUMB_NODE1 {
+            pCommandQueueDebugNameA: queue.as_ptr().cast(),
+            pCommandListDebugNameA: list.as_ptr().cast(),
+            BreadcrumbCount: history.len() as u32,
+            pLastBreadcrumbValue: &raw const completed,
+            pCommandHistory: history.as_ptr(),
+            ..D3D12_AUTO_BREADCRUMB_NODE1::default()
+        };
         let breadcrumbs = summarize_breadcrumbs(&D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 {
             pHeadAutoBreadcrumbNode: &raw const node,
         });
@@ -512,9 +514,11 @@ mod tests {
         );
 
         let resource = CString::new("target 0x1234").expect("literal has no null");
-        let mut allocation = D3D12_DRED_ALLOCATION_NODE1::default();
-        allocation.ObjectNameA = resource.as_ptr().cast();
-        allocation.AllocationType = D3D12_DRED_ALLOCATION_TYPE_RESOURCE;
+        let allocation = D3D12_DRED_ALLOCATION_NODE1 {
+            ObjectNameA: resource.as_ptr().cast(),
+            AllocationType: D3D12_DRED_ALLOCATION_TYPE_RESOURCE,
+            ..D3D12_DRED_ALLOCATION_NODE1::default()
+        };
         let page_fault = summarize_page_fault1(&D3D12_DRED_PAGE_FAULT_OUTPUT1 {
             PageFaultVA: 0x1234,
             pHeadExistingAllocationNode: &raw const allocation,

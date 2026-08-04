@@ -1757,7 +1757,7 @@ mod tests {
             decode_texture_component_selectors(&image_binding_with_word3(identity)),
             Ok([4, 5, 6, 7])
         );
-        let constants_and_reverse = 0 | (1 << 3) | (7 << 6) | (4 << 9);
+        let constants_and_reverse = (1 << 3) | (7 << 6) | (4 << 9);
         assert_eq!(
             decode_texture_component_selectors(&image_binding_with_word3(constants_and_reverse)),
             Ok([0, 1, 7, 4])

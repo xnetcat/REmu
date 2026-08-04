@@ -1516,7 +1516,7 @@ impl Dx12GuestExecutor {
         let vertex_requires_writeback = stage_resources_require_writeback(&vertex_resources);
         let pixel_requires_writeback = pixel_resources
             .as_ref()
-            .is_some_and(|resources| stage_resources_require_writeback(resources));
+            .is_some_and(stage_resources_require_writeback);
         let defer_gpu_completion = defer_render_target_writeback
             && depth.is_none()
             && targets_defer_eligible
@@ -3743,7 +3743,7 @@ fn create_graphics_pipeline(
 fn graphics_pipeline_creation_error(device: &ID3D12Device, error: &windows::core::Error) -> String {
     let mut output =
         backend_error("ID3D12Device::CreateGraphicsPipelineState(guest)", error).to_string();
-    if !std::env::var_os("REMU_D3D12_DEBUG").is_some_and(|value| value == "1") {
+    if std::env::var_os("REMU_D3D12_DEBUG").is_none_or(|value| value != "1") {
         return output;
     }
     let Ok(info) = device.cast::<ID3D12InfoQueue>() else {
@@ -4074,11 +4074,16 @@ fn create_stage_resources(
     let mut scalar_words = evaluation.initial_scalar_registers.to_vec();
     if let Some((registers, user_base, scalar_base)) = live_scalars {
         let scalar_end = scalar_base.saturating_add(64).min(scalar_words.len());
-        for scalar in scalar_base..scalar_end {
+        for (scalar, word) in scalar_words
+            .iter_mut()
+            .enumerate()
+            .take(scalar_end)
+            .skip(scalar_base)
+        {
             let offset = u32::try_from(scalar - scalar_base)
                 .map_err(|_| "live scalar-register offset exceeds u32")?;
             if let Some(value) = register_value(registers, user_base + offset) {
-                scalar_words[scalar] = value;
+                *word = value;
             }
         }
     }
@@ -6216,7 +6221,6 @@ fn create_depth_msaa_initialization_pipeline(
         StencilWriteMask: u8::MAX,
         FrontFace: replace_stencil,
         BackFace: replace_stencil,
-        ..D3D12_DEPTH_STENCIL_DESC::default()
     };
     let rasterizer = D3D12_RASTERIZER_DESC {
         FillMode: D3D12_FILL_MODE_SOLID,
@@ -8045,10 +8049,8 @@ fn visit_changed_byte_ranges(
         while cursor < current_bytes.len() && current_bytes[cursor] != original_bytes[cursor] {
             cursor += 1;
         }
-        if start != cursor {
-            if !visit(start, cursor)? {
-                break;
-            }
+        if start != cursor && !visit(start, cursor)? {
+            break;
         }
     }
     Ok(())
@@ -8981,48 +8983,49 @@ mod tests {
             },
         ];
         let mut pc = 8_u32;
-        let mut push_vop = |opcode, sources: Vec<Operand>, destination| {
-            instructions.push(Instruction {
-                pc,
-                encoding: ShaderEncoding::Vop2,
-                opcode: Opcode::Known(opcode),
-                words: vec![0],
-                sources,
-                destinations: vec![Operand::vector(destination)],
-                control: None,
-            });
-            pc += 4;
-        };
-        push_vop("VLshlrevB32", vec![literal(1), Operand::vector(5)], 20);
-        push_vop("VAndB32", vec![Operand::vector(20), literal(2)], 20);
-        push_vop("VCvtF32U32", vec![Operand::vector(20)], 20);
-        push_vop(
-            "VMulF32",
-            vec![Operand::vector(20), literal(2.0_f32.to_bits())],
-            20,
-        );
-        push_vop(
-            "VAddF32",
-            vec![Operand::vector(20), literal((-1.0_f32).to_bits())],
-            20,
-        );
-        push_vop("VAndB32", vec![Operand::vector(5), literal(2)], 21);
-        push_vop("VCvtF32U32", vec![Operand::vector(21)], 21);
-        push_vop(
-            "VMulF32",
-            vec![Operand::vector(21), literal((-2.0_f32).to_bits())],
-            21,
-        );
-        push_vop(
-            "VAddF32",
-            vec![Operand::vector(21), literal(1.0_f32.to_bits())],
-            21,
-        );
-        push_vop("VMovB32", vec![literal(0)], 22);
-        push_vop("VMovB32", vec![literal(1.0_f32.to_bits())], 23);
-        push_vop("VMovB32", vec![literal(0)], 9);
-        push_vop("VMovB32", vec![literal(0)], 10);
-        drop(push_vop);
+        {
+            let mut push_vop = |opcode, sources: Vec<Operand>, destination| {
+                instructions.push(Instruction {
+                    pc,
+                    encoding: ShaderEncoding::Vop2,
+                    opcode: Opcode::Known(opcode),
+                    words: vec![0],
+                    sources,
+                    destinations: vec![Operand::vector(destination)],
+                    control: None,
+                });
+                pc += 4;
+            };
+            push_vop("VLshlrevB32", vec![literal(1), Operand::vector(5)], 20);
+            push_vop("VAndB32", vec![Operand::vector(20), literal(2)], 20);
+            push_vop("VCvtF32U32", vec![Operand::vector(20)], 20);
+            push_vop(
+                "VMulF32",
+                vec![Operand::vector(20), literal(2.0_f32.to_bits())],
+                20,
+            );
+            push_vop(
+                "VAddF32",
+                vec![Operand::vector(20), literal((-1.0_f32).to_bits())],
+                20,
+            );
+            push_vop("VAndB32", vec![Operand::vector(5), literal(2)], 21);
+            push_vop("VCvtF32U32", vec![Operand::vector(21)], 21);
+            push_vop(
+                "VMulF32",
+                vec![Operand::vector(21), literal((-2.0_f32).to_bits())],
+                21,
+            );
+            push_vop(
+                "VAddF32",
+                vec![Operand::vector(21), literal(1.0_f32.to_bits())],
+                21,
+            );
+            push_vop("VMovB32", vec![literal(0)], 22);
+            push_vop("VMovB32", vec![literal(1.0_f32.to_bits())], 23);
+            push_vop("VMovB32", vec![literal(0)], 9);
+            push_vop("VMovB32", vec![literal(0)], 10);
+        }
         instructions.push(Instruction {
             pc,
             encoding: ShaderEncoding::Ds,
@@ -9784,7 +9787,7 @@ mod tests {
         descriptor[0] = (address >> 8) as u32;
         descriptor[1] =
             (((address >> 40) as u32) & 0xff) | (unified << 20) | ((width_minus_one & 3) << 30);
-        descriptor[2] = (width_minus_one >> 2) | (0 << 14);
+        descriptor[2] = width_minus_one >> 2;
         descriptor[3] = 0x0fac | (9 << 28);
         descriptor[4] = WIDTH as u32 - 1;
         let control = ImageControl {
@@ -9928,8 +9931,8 @@ mod tests {
         super::write_texture_mip_chain(
             texture_descriptor,
             &[
-                vec![200, 0, 0, 255].repeat(WIDTH),
-                vec![100, 0, 0, 255].repeat(WIDTH / 2),
+                [200, 0, 0, 255].repeat(WIDTH),
+                [100, 0, 0, 255].repeat(WIDTH / 2),
             ],
         )
         .expect("encode two-level guest mip chain");

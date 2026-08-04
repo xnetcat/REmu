@@ -388,17 +388,17 @@ fn decode_save_data_dialog_request(parameters: u64) -> DecodedSaveDataDialogRequ
             let system = read_guest_u64(
                 parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_SYSTEM_MESSAGE_OFFSET),
             );
-            let message_type = (system != 0)
-                .then(|| read_guest_u32(system))
-                .unwrap_or_default();
+            let message_type = if system != 0 {
+                read_guest_u32(system)
+            } else {
+                0
+            };
             save_data_system_message(message_type, display_type)
         }
         SAVE_DATA_DIALOG_MODE_ERROR_CODE => {
             let error =
                 read_guest_u64(parameters.saturating_add(SAVE_DATA_DIALOG_PARAM_ERROR_CODE_OFFSET));
-            let code = (error != 0)
-                .then(|| read_guest_u32(error))
-                .unwrap_or_default();
+            let code = if error != 0 { read_guest_u32(error) } else { 0 };
             (
                 format!("Saved data error {code:#010x}"),
                 HostDialogButtons::Ok,

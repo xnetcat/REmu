@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(packed.words.len(), NGG_MESHLET_WORDS_PER_GROUP);
         assert_eq!(packed.words[0], 4 | (2 << 8));
         assert_eq!(&packed.words[2..6], &[10, 11, 12, 13]);
-        assert_eq!(packed.words[258], 0 | (1 << 10) | (2 << 20));
+        assert_eq!(packed.words[258], (1 << 10) | (2 << 20));
         assert_eq!(packed.words[259], 2 | (1 << 10) | (3 << 20));
     }
 }

@@ -918,7 +918,7 @@ fn opens_a_content_directory_and_enumerates_its_pak() {
     let pak_directory = temporary.path.join("poppy_playtime/content/paks");
     std::fs::create_dir_all(&pak_directory).unwrap();
     std::fs::write(pak_directory.join("pakchunk0-ps5.pak"), b"pak").unwrap();
-    let mut state = ProbeDispatchState {
+    let state = ProbeDispatchState {
         game_root: temporary.path.clone(),
         ..ProbeDispatchState::default()
     };
@@ -926,7 +926,7 @@ fn opens_a_content_directory_and_enumerates_its_pak() {
 
     let fd = guest_kernel_open(
         [path.as_ptr().addr() as u64, 0x0002_0000, 0, 0, 0, 0],
-        &mut state,
+        &state,
     );
     assert!(
         fd >= 3 && fd <= u64::from(i32::MAX.cast_unsigned()),

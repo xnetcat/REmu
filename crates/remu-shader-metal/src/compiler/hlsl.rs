@@ -203,9 +203,7 @@ impl Compiler<'_> {
 
         let signature = match self.options.stage {
             MetalShaderStage::Vertex => {
-                format!(
-                    "[RootSignature(REMU_ROOT_SIGNATURE)]\nRemuVsOut remu_main(uint remu_vertex_id : SV_VertexID, uint remu_instance_id : SV_InstanceID)"
-                )
+                "[RootSignature(REMU_ROOT_SIGNATURE)]\nRemuVsOut remu_main(uint remu_vertex_id : SV_VertexID, uint remu_instance_id : SV_InstanceID)".to_owned()
             }
             MetalShaderStage::Pixel if self.options.pixel_outputs.is_empty()
                 && !self.options.pixel_depth_export =>

@@ -44,7 +44,7 @@ pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
             .share_mode(FILE_SHARE_READ_WRITE_DELETE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(directory)?;
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -58,11 +58,11 @@ fn sync_file(path: &Path) -> std::io::Result<()> {
     {
         // FlushFileBuffers, which backs File::sync_all on Windows, requires a handle opened with
         // write access even when no bytes are changed by this operation.
-        return std::fs::OpenOptions::new()
+        std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)?
-            .sync_all();
+            .sync_all()
     }
     #[cfg(not(windows))]
     {

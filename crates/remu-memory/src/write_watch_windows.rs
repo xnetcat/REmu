@@ -487,12 +487,11 @@ fn remove_range_pages(state: &mut WatchState, range: &WatchedRange) {
         } else {
             false
         };
-        if remove {
-            if let Some(page) = state.pages.remove(&page_address) {
-                if !page.open {
-                    let _ = set_page_protection(page_address, page.writable_protection);
-                }
-            }
+        if remove
+            && let Some(page) = state.pages.remove(&page_address)
+            && !page.open
+        {
+            let _ = set_page_protection(page_address, page.writable_protection);
         }
     }
 }
@@ -918,13 +917,13 @@ fn retire_overlapping(address: u64, byte_count: u64, reason: u8) -> Vec<Arc<Watc
         .ranges
         .values()
         .filter(|range| overlaps((range.address, range.byte_count), (address, byte_count)))
-        .filter_map(|range| {
+        .filter(|range| {
             range
                 .retirement
                 .compare_exchange(WATCH_ACTIVE, reason, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
-                .then(|| Arc::clone(range))
         })
+        .cloned()
         .collect::<Vec<_>>();
     for range in &ranges {
         remove_range_pages(&mut state, range);

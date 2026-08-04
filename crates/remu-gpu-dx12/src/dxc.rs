@@ -60,11 +60,10 @@ pub(super) fn compile_hlsl(
             .get_result()
             .map(|blob| blob.to_vec())
             .map_err(|error| format!("DXC returned no DXIL object for {source_name}: {error}"))
-            .map(|dxil| {
-                if let Some(path) = cache_path {
-                    persist_dxil(&path, &dxil);
+            .inspect(|dxil| {
+                if let Some(path) = &cache_path {
+                    persist_dxil(path, dxil);
                 }
-                dxil
             }),
         Err((result, hresult)) => {
             let diagnostics = result
@@ -134,10 +133,8 @@ fn persist_dxil(path: &Path, dxil: &[u8]) {
     }
     let temporary_id = NEXT_TEMPORARY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let temporary = path.with_extension(format!("{}-{temporary_id}.tmp", std::process::id()));
-    if std::fs::write(&temporary, dxil).is_ok() {
-        if std::fs::rename(&temporary, path).is_err() {
-            let _ = std::fs::remove_file(&temporary);
-        }
+    if std::fs::write(&temporary, dxil).is_ok() && std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
     }
 }
 
@@ -153,19 +150,19 @@ pub(super) fn find_dxcompiler() -> Result<PathBuf, String> {
         ));
     }
 
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            let adjacent = directory.join(DXCOMPILER_FILE);
-            if adjacent.is_file() {
-                return Ok(adjacent);
-            }
-            for ancestor in directory.ancestors() {
-                if ancestor.file_name().is_some_and(|name| name == "target") {
-                    if let Some(path) = newest_development_dxc(ancestor) {
-                        return Ok(path);
-                    }
-                    break;
+    if let Ok(executable) = std::env::current_exe()
+        && let Some(directory) = executable.parent()
+    {
+        let adjacent = directory.join(DXCOMPILER_FILE);
+        if adjacent.is_file() {
+            return Ok(adjacent);
+        }
+        for ancestor in directory.ancestors() {
+            if ancestor.file_name().is_some_and(|name| name == "target") {
+                if let Some(path) = newest_development_dxc(ancestor) {
+                    return Ok(path);
                 }
+                break;
             }
         }
     }
