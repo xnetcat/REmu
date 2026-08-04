@@ -110,6 +110,9 @@ const R_RELEASE_MEM: u32 = 0x18;
 const VGT_INDEX_TYPE: u32 = 0x243;
 const MAX_PACKET_DWORDS: u32 = 0x4001;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

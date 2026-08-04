@@ -5,6 +5,7 @@ mod net;
 mod thread;
 
 use std::io::Seek;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use super::*;

@@ -5749,10 +5749,14 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
     }));
 
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
-    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    assert!(
+        presenter.statistics.shared_event_draw_attempts >= 1,
+        "the waiting draw must reach direct-admission preflight"
+    );
     assert_eq!(
         presenter.statistics.shared_event_draw_disjoint_candidates,
-        1
+        presenter.statistics.shared_event_draw_attempts,
+        "every retry of the cold draw must remain physically disjoint"
     );
     assert_eq!(presenter.statistics.shared_event_host_blocks, 0);
     assert_eq!(

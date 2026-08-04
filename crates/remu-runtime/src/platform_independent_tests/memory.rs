@@ -1,14 +1,16 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#[cfg(any(target_os = "macos", windows))]
+use super::batch_map_entry;
 use super::{
     BATCH_MAP_OPERATION_MAP_DIRECT, ProbeDispatchState, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
     SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OUT_OF_MEMORY, allocate_direct_memory,
-    available_direct_memory_size, available_flexible_memory_size, batch_map_entry,
-    kernel_batch_map, kernel_release_direct_memory, kernel_virtual_query, sce_kernel_error,
+    available_direct_memory_size, available_flexible_memory_size, kernel_batch_map,
+    kernel_release_direct_memory, kernel_virtual_query, sce_kernel_error,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn batch_map_applies_entries_in_order_and_reports_the_completed_count() {
     let mut state = ProbeDispatchState::default();
@@ -49,7 +51,7 @@ fn batch_map_applies_entries_in_order_and_reports_the_completed_count() {
     assert_ne!(first, second);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn batch_map_stops_at_the_first_invalid_entry_and_still_reports_progress() {
     let mut state = ProbeDispatchState::default();
@@ -87,7 +89,7 @@ fn batch_map_stops_at_the_first_invalid_entry_and_still_reports_progress() {
     assert_eq!(u64::from_le_bytes(entries[2][0..8].try_into().unwrap()), 0);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn maps_named_flexible_memory_with_cpu_read_write_protection() {
     let mut state = ProbeDispatchState::default();
@@ -138,7 +140,7 @@ fn maps_named_flexible_memory_with_cpu_read_write_protection() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn rejects_invalid_named_flexible_memory_arguments() {
     let mut state = ProbeDispatchState::default();
@@ -192,7 +194,7 @@ fn rejects_invalid_named_flexible_memory_arguments() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn mspace_allocates_inside_named_flexible_memory_and_reuses_freed_blocks() {
     let mut state = ProbeDispatchState::default();
@@ -254,7 +256,7 @@ fn mspace_allocates_inside_named_flexible_memory_and_reuses_freed_blocks() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn available_direct_memory_size_reports_a_span_the_allocator_grants() {
     let mut state = ProbeDispatchState::default();
@@ -316,7 +318,7 @@ fn available_direct_memory_size_reports_a_span_the_allocator_grants() {
     assert_eq!(preallocated, 0);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn available_direct_memory_size_rejects_missing_outputs_and_an_exhausted_window() {
     let mut state = ProbeDispatchState::default();
@@ -400,7 +402,7 @@ fn available_direct_memory_size_rejects_missing_outputs_and_an_exhausted_window(
     assert_eq!(size, u64::MAX);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn available_flexible_memory_size_shrinks_as_flexible_memory_is_mapped() {
     let mut state = ProbeDispatchState::default();
@@ -451,7 +453,7 @@ fn available_flexible_memory_size_shrinks_as_flexible_memory_is_mapped() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn describes_a_tracked_direct_mapping_to_the_guest() {
     let mut state = ProbeDispatchState::default();
@@ -515,7 +517,7 @@ fn describes_a_tracked_direct_mapping_to_the_guest() {
     assert_eq!(&output[42..], &[0; 30]);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn allocates_direct_memory_from_real_free_ranges() {
     let mut state = ProbeDispatchState::default();
@@ -551,7 +553,7 @@ fn allocates_direct_memory_from_real_free_ranges() {
     assert_eq!(output, 0);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn release_direct_memory_splits_the_owned_physical_range() {
     let mut state = ProbeDispatchState::default();
@@ -593,7 +595,7 @@ fn release_direct_memory_splits_the_owned_physical_range() {
     assert_eq!(replacement, 0x4000);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn direct_memory_mappings_alias_the_same_physical_bytes() {
     use crate::{kernel_munmap, map_direct_memory};
@@ -640,7 +642,7 @@ fn direct_memory_mappings_alias_the_same_physical_bytes() {
     assert_eq!(kernel_munmap([second, 0x4000, 0, 0, 0, 0], &mut state), 0);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn direct_memory_abi_honors_fixed_and_hinted_placement_without_overwrite() {
     let mut state = ProbeDispatchState::default();
@@ -717,7 +719,7 @@ fn direct_memory_abi_honors_fixed_and_hinted_placement_without_overwrite() {
     );
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 #[test]
 fn gen5_direct_memory_v2_and_checked_release_preserve_their_distinct_abi() {
     let mut state = ProbeDispatchState::default();

@@ -77,6 +77,46 @@ pub(crate) fn image_component_type(binding: &ImageBinding) -> &'static str {
 }
 
 impl Compiler<'_> {
+    fn emit_hlsl_image_dimensions(
+        &mut self,
+        binding_index: usize,
+        kind: ImageKind,
+    ) -> (String, String, String) {
+        let width = self.temp("uint", "0u");
+        let height = self.temp("uint", "0u");
+        let extent = self.temp("uint", "1u");
+        let dimension = metal_image_dimension(kind);
+        if kind.writable {
+            if matches!(dimension, 2 | 3) {
+                self.line(
+                    3,
+                    &format!("tex{binding_index}.GetDimensions({width}, {height}, {extent});"),
+                );
+            } else {
+                self.line(
+                    3,
+                    &format!("tex{binding_index}.GetDimensions({width}, {height});"),
+                );
+            }
+        } else {
+            let levels = self.temp("uint", "0u");
+            if matches!(dimension, 2 | 3) {
+                self.line(
+                    3,
+                    &format!(
+                        "tex{binding_index}.GetDimensions(0u, {width}, {height}, {extent}, {levels});"
+                    ),
+                );
+            } else {
+                self.line(
+                    3,
+                    &format!("tex{binding_index}.GetDimensions(0u, {width}, {height}, {levels});"),
+                );
+            }
+        }
+        (width, height, extent)
+    }
+
     pub(crate) fn emit_image(&mut self, instruction: &Instruction) -> Result<(), String> {
         let Some(InstructionControl::Image(image)) = instruction.control.as_ref() else {
             return Err("missing image control".to_owned());
@@ -155,18 +195,42 @@ impl Compiler<'_> {
     ) -> Result<(), String> {
         let mip = self.temp("uint", &self.image_uint_address(image, 0));
         let kind = self.image_kinds[binding_index];
-        let width = self.temp("uint", &format!("tex{binding_index}.get_width({mip})"));
-        let height = self.temp("uint", &format!("tex{binding_index}.get_height({mip})"));
         // AMD Z is depth for 3D, otherwise array/cube layer count (or 1 for plain 2D).
         let metal_dim = metal_image_dimension(kind);
-        let depth = if metal_dim == 2 {
-            self.temp("uint", &format!("tex{binding_index}.get_depth({mip})"))
-        } else if metal_dim == 3 || image.is_array {
-            self.temp("uint", &format!("tex{binding_index}.get_array_size()"))
+        let (width, height, depth, levels) = if self.is_hlsl() {
+            let width = self.temp("uint", "0u");
+            let height = self.temp("uint", "0u");
+            let depth = self.temp("uint", "1u");
+            let levels = self.temp("uint", "0u");
+            if metal_dim == 2 || metal_dim == 3 || image.is_array {
+                self.line(
+                    3,
+                    &format!(
+                        "tex{binding_index}.GetDimensions({mip}, {width}, {height}, {depth}, {levels});"
+                    ),
+                );
+            } else {
+                self.line(
+                    3,
+                    &format!(
+                        "tex{binding_index}.GetDimensions({mip}, {width}, {height}, {levels});"
+                    ),
+                );
+            }
+            (width, height, depth, levels)
         } else {
-            self.temp("uint", "1u")
+            let width = self.temp("uint", &format!("tex{binding_index}.get_width({mip})"));
+            let height = self.temp("uint", &format!("tex{binding_index}.get_height({mip})"));
+            let depth = if metal_dim == 2 {
+                self.temp("uint", &format!("tex{binding_index}.get_depth({mip})"))
+            } else if metal_dim == 3 || image.is_array {
+                self.temp("uint", &format!("tex{binding_index}.get_array_size()"))
+            } else {
+                self.temp("uint", "1u")
+            };
+            let levels = self.temp("uint", &format!("tex{binding_index}.get_num_mip_levels()"));
+            (width, height, depth, levels)
         };
-        let levels = self.temp("uint", &format!("tex{binding_index}.get_num_mip_levels()"));
         let components = [width, height, depth, levels];
         let mut values = Vec::with_capacity(4);
         for (component, value) in components.iter().enumerate() {
@@ -268,13 +332,20 @@ impl Compiler<'_> {
             });
             input += 1;
         }
+        let hlsl_dimensions = self
+            .is_hlsl()
+            .then(|| self.emit_hlsl_image_dimensions(binding_index, image_kind));
         let z_bounds = z_or_layer.as_ref().map_or_else(String::new, |z| {
-            let extent = if is_2d_array {
-                "get_array_size"
+            if let Some((_, _, extent)) = hlsl_dimensions.as_ref() {
+                format!(" && {z} >= 0 && {z} < (int){extent}")
             } else {
-                "get_depth"
-            };
-            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
+                let extent = if is_2d_array {
+                    "get_array_size"
+                } else {
+                    "get_depth"
+                };
+                format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
+            }
         });
         let coordinates = if is_3d {
             format!(
@@ -294,17 +365,42 @@ impl Compiler<'_> {
         } else {
             String::new()
         };
-        self.line(3, &format!("if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {{"));
-        self.line(
-            4,
-            &format!(
-                "tex{binding_index}.write(vec<{kind}, 4>({}, {}, {}, {}), {coordinates}{layer_argument});",
-                logical_components[0],
-                logical_components[1],
-                logical_components[2],
-                logical_components[3]
-            ),
+        let (width, height) = hlsl_dimensions.as_ref().map_or_else(
+            || {
+                (
+                    format!("tex{binding_index}.get_width()"),
+                    format!("tex{binding_index}.get_height()"),
+                )
+            },
+            |(width, height, _)| (width.clone(), height.clone()),
         );
+        self.line(3, &format!("if (exec && {x} >= 0 && {y} >= 0 && {x} < (int){width} && {y} < (int){height}{z_bounds}) {{"));
+        let value = format!(
+            "vec<{kind}, 4>({}, {}, {}, {})",
+            logical_components[0],
+            logical_components[1],
+            logical_components[2],
+            logical_components[3]
+        );
+        if self.is_hlsl() {
+            let hlsl_coordinates = if is_2d_array {
+                format!(
+                    "uint3((uint){x}, (uint){y}, (uint){})",
+                    z_or_layer.as_ref().expect("array image has a layer")
+                )
+            } else {
+                coordinates.clone()
+            };
+            self.line(
+                4,
+                &format!("tex{binding_index}[{hlsl_coordinates}] = {value};"),
+            );
+        } else {
+            self.line(
+                4,
+                &format!("tex{binding_index}.write({value}, {coordinates}{layer_argument});"),
+            );
+        }
         self.line(3, "}");
         Ok(())
     }
@@ -343,13 +439,20 @@ impl Compiler<'_> {
             let raw_z = self.image_uint_address(image, 2);
             self.temp("int", &format!("as_type<int>({raw_z})"))
         });
+        let hlsl_dimensions = self
+            .is_hlsl()
+            .then(|| self.emit_hlsl_image_dimensions(binding_index, image_kind));
         let z_bounds = z_or_layer.as_ref().map_or_else(String::new, |z| {
-            let extent = if is_2d_array {
-                "get_array_size"
+            if let Some((_, _, extent)) = hlsl_dimensions.as_ref() {
+                format!(" && {z} >= 0 && {z} < (int){extent}")
             } else {
-                "get_depth"
-            };
-            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
+                let extent = if is_2d_array {
+                    "get_array_size"
+                } else {
+                    "get_depth"
+                };
+                format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
+            }
         });
         let coordinates = if is_3d {
             format!(
@@ -371,14 +474,49 @@ impl Compiler<'_> {
         };
         let kind = self.image_kinds[binding_index].component;
         let zero = if kind == "float" { "0.0f" } else { "0" };
-        let loaded = self.temp(
-            &format!("vec<{kind}, 4>"),
-            &format!("vec<{kind}, 4>({zero})"),
+        let zero_vector = if self.is_hlsl() {
+            format!("vec<{kind}, 4>({zero}, {zero}, {zero}, {zero})")
+        } else {
+            format!("vec<{kind}, 4>({zero})")
+        };
+        let loaded = self.temp(&format!("vec<{kind}, 4>"), &zero_vector);
+        let (width, height) = hlsl_dimensions.as_ref().map_or_else(
+            || {
+                (
+                    format!("tex{binding_index}.get_width()"),
+                    format!("tex{binding_index}.get_height()"),
+                )
+            },
+            |(width, height, _)| (width.clone(), height.clone()),
         );
+        let read = if self.is_hlsl() {
+            let hlsl_coordinates = if is_2d_array {
+                format!(
+                    "uint3((uint){x}, (uint){y}, (uint){})",
+                    z_or_layer.as_ref().expect("array image has a layer")
+                )
+            } else {
+                coordinates.clone()
+            };
+            if image_kind.writable {
+                format!("tex{binding_index}[{hlsl_coordinates}]")
+            } else if is_3d || is_2d_array {
+                format!(
+                    "tex{binding_index}.Load(int4((int){x}, (int){y}, (int){}, 0))",
+                    z_or_layer
+                        .as_ref()
+                        .expect("3D/array image has a third address")
+                )
+            } else {
+                format!("tex{binding_index}.Load(int3((int){x}, (int){y}, 0))")
+            }
+        } else {
+            format!("tex{binding_index}.read({coordinates}{layer_argument})")
+        };
         self.line(
             3,
             &format!(
-                "if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {loaded} = tex{binding_index}.read({coordinates}{layer_argument});"
+                "if (exec && {x} >= 0 && {y} >= 0 && {x} < (int){width} && {y} < (int){height}{z_bounds}) {loaded} = {read};"
             ),
         );
         let destination_select = self.image_destination_select(image);
@@ -619,7 +757,7 @@ impl Compiler<'_> {
         } else {
             bias.clone()
         };
-        if has_offset && metal_dim == 2 {
+        if has_offset && metal_dim == 2 && !self.is_hlsl() {
             if image.dimension == 3 {
                 return Err("cube sampling does not support integer texel offsets".to_owned());
             }
@@ -666,20 +804,24 @@ impl Compiler<'_> {
             // compile (seen in Silent Hill's post-warning scene shaders).
             sample_coordinates = self.temp("float3", &format!("float3({coordinates}, 0.0f)"));
         }
+        let hlsl_array_extent = (self.is_hlsl() && metal_dim == 3)
+            .then(|| self.emit_hlsl_image_dimensions(binding_index, kind).2);
         let coordinate_arguments = if metal_dim == 3 {
+            let array_extent = hlsl_array_extent.as_ref().map_or_else(
+                || format!("tex{binding_index}.get_array_size()"),
+                Clone::clone,
+            );
             let (array_uv, layer) = if image.dimension == 3 {
                 // Cube coordinates are the face-atlas triple described above.
                 (
                     self.temp(
                         "float2",
-                        &format!(
-                            "float2({coordinates}.x - 1.0f, {coordinates}.y - 1.0f)"
-                        ),
+                        &format!("float2({coordinates}.x - 1.0f, {coordinates}.y - 1.0f)"),
                     ),
                     self.temp(
                         "uint",
                         &format!(
-                            "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                            "min(uint(rint(max({coordinates}.z, 0.0f))), {array_extent} - 1u)"
                         ),
                     ),
                 )
@@ -692,7 +834,7 @@ impl Compiler<'_> {
                     self.temp(
                         "uint",
                         &format!(
-                            "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                            "min(uint(rint(max({coordinates}.z, 0.0f))), {array_extent} - 1u)"
                         ),
                     ),
                 )
@@ -701,7 +843,11 @@ impl Compiler<'_> {
                 // still bind an array resource, in which case the only represented layer is 0.
                 (sample_coordinates.clone(), "0u".to_owned())
             };
-            format!("{array_uv}, {layer}")
+            if self.is_hlsl() {
+                format!("float3({array_uv}, (float){layer})")
+            } else {
+                format!("{array_uv}, {layer}")
+            }
         } else {
             sample_coordinates
         };
@@ -742,22 +888,117 @@ impl Compiler<'_> {
         let vector_kind = format!("vec<{}, 4>", kind.component);
         let global_count = self.evaluation.global_memory_bindings.len();
         let initial_index = if global_count > 30 { 1 } else { global_count };
-        let sampler = if initial_index.saturating_add(1) > 30 {
+        let sampler = if self.is_hlsl() {
+            if has_compare {
+                format!("remu_compare_sampler_{sampler_slot}")
+            } else {
+                format!("remu_sampler_{sampler_slot}")
+            }
+        } else if initial_index.saturating_add(1) > 30 {
             format!("remu_sampler_{sampler_slot}")
         } else {
             format!("remu_samplers.s{sampler_slot}")
         };
-        let native_offset = if has_offset && metal_dim != 2 {
-            format!("int2({offset_x}, {offset_y})")
+        let native_offset = if has_offset && (metal_dim != 2 || self.is_hlsl()) {
+            if self.is_hlsl() && metal_dim == 2 {
+                format!("int3({offset_x}, {offset_y}, {offset_z})")
+            } else {
+                format!("int2({offset_x}, {offset_y})")
+            }
         } else {
             "int2(0)".to_owned()
         };
-        let sample_offset = if has_offset && metal_dim != 2 {
+        let sample_offset = if has_offset && (metal_dim != 2 || self.is_hlsl()) {
             format!(", {native_offset}")
         } else {
             String::new()
         };
-        let physical = if is_gather && has_compare {
+        let physical = if self.is_hlsl() {
+            if has_compare && (has_gradients || has_bias || (has_lod && !has_zero_lod)) {
+                return Err(format!(
+                    "comparison image opcode {name} requires SM 6.8 comparison sampling"
+                ));
+            }
+            if is_gather && has_compare {
+                self.temp(
+                    &vector_kind,
+                    &format!(
+                        "tex{binding_index}.GatherCmp({sampler}, {coordinate_arguments}, {compare}{sample_offset})"
+                    ),
+                )
+            } else if is_gather {
+                let destination_select = self.image_destination_select(image);
+                let logical_component = image.dmask.trailing_zeros();
+                let selector = self.temp(
+                    "uint",
+                    &format!("({destination_select} >> {}u) & 7u", logical_component * 3),
+                );
+                let methods = ["GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"];
+                let gathers = methods.map(|method| {
+                    self.temp(
+                        &vector_kind,
+                        &format!(
+                            "tex{binding_index}.{method}({sampler}, {coordinate_arguments}{sample_offset})"
+                        ),
+                    )
+                });
+                let (zero, one) = match kind.component {
+                    "float" => ("0.0f", "1.0f"),
+                    "uint" => ("0u", "1u"),
+                    _ => ("0", "1"),
+                };
+                let zero = format!("{vector_kind}({zero}, {zero}, {zero}, {zero})");
+                let one = format!("{vector_kind}({one}, {one}, {one}, {one})");
+                self.temp(
+                    &vector_kind,
+                    &format!(
+                        "{selector} == 1u ? {one} : ({selector} == 4u ? {} : ({selector} == 5u ? {} : ({selector} == 6u ? {} : ({selector} == 7u ? {} : {zero}))))",
+                        gathers[0], gathers[1], gathers[2], gathers[3]
+                    ),
+                )
+            } else if has_compare {
+                let method = if has_zero_lod {
+                    "SampleCmpLevelZero"
+                } else {
+                    "SampleCmp"
+                };
+                let compared = self.temp(
+                    "float",
+                    &format!(
+                        "tex{binding_index}.{method}({sampler}, {coordinate_arguments}, {compare}{sample_offset})"
+                    ),
+                );
+                self.temp(
+                    &vector_kind,
+                    &format!("{vector_kind}({compared}, {compared}, {compared}, {compared})"),
+                )
+            } else {
+                let call = if has_gradients {
+                    let (dx, dy) =
+                        if metal_dim == 3 || (metal_dim == 1 && matches!(image.dimension, 2 | 3)) {
+                            (format!("{gradient_x}.xy"), format!("{gradient_y}.xy"))
+                        } else {
+                            (gradient_x.clone(), gradient_y.clone())
+                        };
+                    format!(
+                        "tex{binding_index}.SampleGrad({sampler}, {coordinate_arguments}, {dx}, {dy}{sample_offset})"
+                    )
+                } else if has_zero_lod || has_lod {
+                    format!(
+                        "tex{binding_index}.SampleLevel({sampler}, {coordinate_arguments}, {lod}{sample_offset})"
+                    )
+                } else if has_bias {
+                    format!(
+                        "tex{binding_index}.SampleBias({sampler}, {coordinate_arguments}, {bias}{sample_offset})"
+                    )
+                } else {
+                    format!(
+                        "tex{binding_index}.Sample({sampler}, {coordinate_arguments}{sample_offset})"
+                    )
+                };
+                self.temp(&vector_kind, &call)
+            }
+        } else if is_gather && has_compare {
             self.temp(
                 &vector_kind,
                 &format!(

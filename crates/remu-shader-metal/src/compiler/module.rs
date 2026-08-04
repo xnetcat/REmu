@@ -569,7 +569,7 @@ impl Compiler<'_> {
         if contains_register_reference(&self.body, 's', EXEC_LO)
             || contains_register_reference(&self.body, 's', EXEC_HI)
         {
-            let (low, high) = self.ballot_words("true");
+            let (low, high) = self.ballot_word_expressions("true");
             if contains_register_reference(&self.body, 's', EXEC_LO) {
                 let _ = writeln!(source, "    s[{EXEC_LO}] = {low};");
             }
@@ -787,7 +787,7 @@ pub(crate) fn contains_register_reference(source: &str, kind: char, register: u3
     })
 }
 
-fn scalarize_register_state(
+pub(crate) fn scalarize_register_state(
     source: &str,
 ) -> Result<(String, RegisterReferences), MetalCompileError> {
     const MARKER: &str = "    /* REMU_REGISTER_STATE */\n";

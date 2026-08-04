@@ -50,6 +50,7 @@ impl GuestProtection {
         Self(self.0 | other.0)
     }
 
+    #[cfg(target_os = "macos")]
     pub(super) const fn host_flags(self) -> i32 {
         let mut flags = libc::PROT_NONE;
         if self.contains(Self::READ) || self.contains(Self::EXECUTE) {
@@ -62,6 +63,30 @@ impl GuestProtection {
             flags |= libc::PROT_EXEC;
         }
         flags
+    }
+
+    #[cfg(windows)]
+    pub(super) const fn host_flags(self) -> windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS {
+        use windows::Win32::System::Memory::{
+            PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
+            PAGE_READWRITE,
+        };
+
+        if self.contains(Self::EXECUTE) {
+            if self.contains(Self::WRITE) {
+                PAGE_EXECUTE_READWRITE
+            } else if self.contains(Self::READ) {
+                PAGE_EXECUTE_READ
+            } else {
+                PAGE_EXECUTE
+            }
+        } else if self.contains(Self::WRITE) {
+            PAGE_READWRITE
+        } else if self.contains(Self::READ) {
+            PAGE_READONLY
+        } else {
+            PAGE_NOACCESS
+        }
     }
 }
 

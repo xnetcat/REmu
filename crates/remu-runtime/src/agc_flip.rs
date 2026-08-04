@@ -253,9 +253,22 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .iter()
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
+        if trace_logarithmic_sequence(state.video_out.completed_flip_count, 8) {
+            eprintln!(
+                "[REMu][VIDEO] completed flip count={} handle={} index={} address={:#x} argument={:#x} runtime_pending={} backend_pending={} equeues={}",
+                state.video_out.completed_flip_count,
+                pending.handle,
+                pending.completion.buffer_index,
+                pending.completion.address,
+                pending.completion.flip_argument,
+                events.pending_video_out_flips.len(),
+                remu_gpu::gpu_flips_pending(),
+                registrations.len(),
+            );
+        }
         for (equeue, user_data) in registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 6,
@@ -269,12 +282,6 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                 },
             );
             queued = true;
-            if trace_logarithmic_sequence(state.agc_submission_count, 8) {
-                eprintln!(
-                    "[REMu][VIDEO] completed flip handle={} index={} address={:#x} equeue={equeue:#x}",
-                    pending.handle, pending.completion.buffer_index, pending.completion.address,
-                );
-            }
         }
         // Flip completion coincides with a display vblank on the console. Wake vblank waiters with
         // OrbisVideoOutInternalEventId::Vblank (ident=1).
@@ -285,8 +292,8 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in vblank_registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 1,

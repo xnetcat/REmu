@@ -22,6 +22,54 @@ use std::path::{Path, PathBuf};
 
 use crate::SaveDataTransaction;
 
+/// Flushes directory namespace changes where the host exposes that primitive.
+///
+/// Unix provides directory `fsync`. Windows does not expose an equivalent durable directory flush
+/// through ordinary unprivileged file handles; file payloads are still flushed before renames and
+/// NTFS journals the namespace operations. Opening the directory with backup semantics verifies
+/// that it remains reachable without turning the unsupported flush into a save-data failure.
+pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(directory)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0007;
+        std::fs::OpenOptions::new()
+            .access_mode(0)
+            .share_mode(FILE_SHARE_READ_WRITE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(directory)?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        Ok(())
+    }
+}
+
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // FlushFileBuffers, which backs File::sync_all on Windows, requires a handle opened with
+        // write access even when no bytes are changed by this operation.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)?
+            .sync_all()
+    }
+    #[cfg(not(windows))]
+    {
+        File::open(path)?.sync_all()
+    }
+}
+
 /// Named steps of a journaled commit. Tests drive the sequence one step at a time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CommitStep {
@@ -144,7 +192,7 @@ fn run_commit_step(step: CommitStep, state: &mut CommitInFlight) -> std::io::Res
         }
         CommitStep::WriteJournal => {
             if let Some(parent) = state.paths.journal_path.parent() {
-                File::open(parent)?.sync_all()?;
+                sync_directory(parent)?;
             }
             write_journal(
                 &state.paths.journal_path,
@@ -182,7 +230,7 @@ fn run_commit_step(step: CommitStep, state: &mut CommitInFlight) -> std::io::Res
         }
         CommitStep::SyncParent => {
             if let Some(parent) = state.paths.committed.parent() {
-                File::open(parent)?.sync_all()?;
+                sync_directory(parent)?;
             }
             Ok(())
         }
@@ -325,7 +373,7 @@ fn recover_journal_record(record: &JournalRecord) -> std::io::Result<()> {
             std::fs::remove_dir_all(&record.backup_path)?;
         }
         if let Some(parent) = record.committed.parent() {
-            File::open(parent)?.sync_all()?;
+            sync_directory(parent)?;
         }
         return Ok(());
     }
@@ -333,7 +381,7 @@ fn recover_journal_record(record: &JournalRecord) -> std::io::Result<()> {
     if record.backup_path.is_dir() {
         std::fs::rename(&record.backup_path, &record.committed)?;
         if let Some(parent) = record.committed.parent() {
-            File::open(parent)?.sync_all()?;
+            sync_directory(parent)?;
         }
         return Ok(());
     }
@@ -383,10 +431,32 @@ fn delete_orphaned_transactions(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     // SAFETY: kill(pid, 0) is the POSIX existence probe; it does not signal the target.
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
     result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+fn process_exists(pid: u32) -> bool {
+    use windows::Win32::Foundation::{CloseHandle, E_ACCESSDENIED};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: this requests a query-only handle and never signals or mutates the target process.
+    match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => {
+            // SAFETY: OpenProcess returned one owned kernel handle, released exactly once here.
+            let _ = unsafe { CloseHandle(handle) };
+            true
+        }
+        Err(error) => error.code() == E_ACCESSDENIED,
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_exists(_pid: u32) -> bool {
+    false
 }
 
 /// Clone `source` onto `destination` via `clonefile(2)` on macOS, else recursive copy.
@@ -483,13 +553,13 @@ fn sync_tree(root: &Path) -> std::io::Result<()> {
             if file_type.is_dir() {
                 directories.push(entry.path());
             } else if file_type.is_file() {
-                File::open(entry.path())?.sync_all()?;
+                sync_file(&entry.path())?;
             }
         }
         index += 1;
     }
     for directory in directories.into_iter().rev() {
-        File::open(directory)?.sync_all()?;
+        sync_directory(&directory)?;
     }
     Ok(())
 }
@@ -615,16 +685,17 @@ mod tests {
     #[test]
     fn orphaned_staging_from_a_dead_pid_is_removed() {
         let root = scratch("orphan-staging");
-        let orphan = root.join("sce_transaction_1_9");
-        std::fs::create_dir_all(&orphan).unwrap();
-        std::fs::write(orphan.join("x.bin"), b"x").unwrap();
-        // PID 1 is init and always live on Unix — use a synthetic high pid unlikely to exist.
+        let live_pid = std::process::id();
+        let live = root.join(format!("sce_transaction_{live_pid}_9"));
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("x.bin"), b"x").unwrap();
+        // Use a synthetic high PID unlikely to exist on any supported host.
         let dead = root.join("sce_transaction_2147483646_9");
         std::fs::create_dir_all(&dead).unwrap();
         recover_save_data_root(&root).unwrap();
         assert!(
-            orphan.exists(),
-            "pid 1 is live; its staging must not be deleted"
+            live.exists(),
+            "the current process is live; its staging must not be deleted"
         );
         assert!(
             !dead.exists(),

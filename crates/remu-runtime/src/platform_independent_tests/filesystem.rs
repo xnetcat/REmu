@@ -5,22 +5,26 @@ use std::path::Path;
 
 use std::sync::Mutex;
 
-use crate::guest_files::resolve_probe_guest_path_from_roots;
+use crate::guest_files::{DIRENT_TYPE_FILE, resolve_probe_guest_path_from_roots};
+use crate::{guest_kernel_close, guest_kernel_getdents, guest_kernel_open};
 
+#[cfg(target_os = "macos")]
 use super::{
-    AMPR_INVALID_FILE_ID, AprResolveOutputs, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KERNEL_FILES,
-    KernelDirectory, KernelFileState, ProbeDispatchState, SAVE_DATA_ERROR_BUSY,
-    SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND, SAVE_DATA_ERROR_RESOURCE_BUSY,
-    SAVE_DATA_ERROR_RESOURCE_FULL, SAVE_DATA_ERROR_RESOURCE_INVALID, SAVE_DATA_PARAM_SIZE,
-    SCE_KERNEL_ERROR_NOT_FOUND, SaveDataMount, TemporaryTestDirectory, ampr_resolve_file_paths,
-    ampr_resolve_paths_core, discover_runtime_module_paths, guest_kernel_fstat,
-    guest_kernel_ftruncate, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
-    join_guest_path, kernel_stat_payload, read_guest_u32, resolve_guest_path,
-    resolve_probe_guest_path, sanitize_save_segment, save_data_commit,
-    save_data_create_transaction_resource, save_data_delete, save_data_delete_transaction_resource,
-    save_data_dir_name_search, save_data_mount3, save_data_pattern_matches, save_data_prepare,
-    save_data_save_icon, save_data_set_param, save_data_terminate, save_data_umount2,
-    sce_kernel_error, set_current_guest_thread_pointer, write_guest_u32, write_guest_u64,
+    AMPR_INVALID_FILE_ID, AprResolveOutputs, ampr_resolve_file_paths, ampr_resolve_paths_core,
+};
+use super::{
+    DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, KERNEL_FILES, KernelDirectory, KernelFileState,
+    ProbeDispatchState, SAVE_DATA_ERROR_BUSY, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
+    SAVE_DATA_ERROR_RESOURCE_BUSY, SAVE_DATA_ERROR_RESOURCE_FULL, SAVE_DATA_ERROR_RESOURCE_INVALID,
+    SAVE_DATA_PARAM_SIZE, SCE_KERNEL_ERROR_NOT_FOUND, SaveDataMount, TemporaryTestDirectory,
+    discover_runtime_module_paths, guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_lseek,
+    guest_kernel_read, guest_posix_file_result, join_guest_path, kernel_stat_payload,
+    read_guest_u32, resolve_guest_path, resolve_probe_guest_path, sanitize_save_segment,
+    save_data_commit, save_data_create_transaction_resource, save_data_delete,
+    save_data_delete_transaction_resource, save_data_dir_name_search, save_data_mount3,
+    save_data_pattern_matches, save_data_prepare, save_data_save_icon, save_data_set_param,
+    save_data_terminate, save_data_umount2, sce_kernel_error, set_current_guest_thread_pointer,
+    write_guest_u32, write_guest_u64,
 };
 
 #[test]
@@ -906,4 +910,49 @@ fn directory_records_pack_console_dirents_without_crossing_blocks() {
             .collect::<Vec<_>>()
     );
     assert_eq!(next_file_number, 41);
+}
+
+#[test]
+fn opens_a_content_directory_and_enumerates_its_pak() {
+    let temporary = TemporaryTestDirectory::new("directory-descriptor");
+    let pak_directory = temporary.path.join("poppy_playtime/content/paks");
+    std::fs::create_dir_all(&pak_directory).unwrap();
+    std::fs::write(pak_directory.join("pakchunk0-ps5.pak"), b"pak").unwrap();
+    let state = ProbeDispatchState {
+        game_root: temporary.path.clone(),
+        ..ProbeDispatchState::default()
+    };
+    let path = b"/app0/poppy_playtime/content/paks\0";
+
+    let fd = guest_kernel_open(
+        [path.as_ptr().addr() as u64, 0x0002_0000, 0, 0, 0, 0],
+        &state,
+    );
+    assert!(
+        fd >= 3 && fd <= u64::from(i32::MAX.cast_unsigned()),
+        "directory open returned {fd:#x}"
+    );
+
+    let mut records = [0_u8; DIRENT_BLOCK_SIZE];
+    assert_eq!(
+        guest_kernel_getdents(
+            [
+                fd,
+                records.as_mut_ptr().addr() as u64,
+                records.len() as u64,
+                0,
+                0,
+                0
+            ],
+            false,
+        ),
+        DIRENT_BLOCK_SIZE as u64
+    );
+    let name_length = usize::from(records[7]);
+    assert_eq!(
+        &records[DIRENT_HEADER_SIZE..DIRENT_HEADER_SIZE + name_length],
+        b"pakchunk0-ps5.pak"
+    );
+    assert_eq!(records[6], DIRENT_TYPE_FILE);
+    assert_eq!(guest_kernel_close([fd, 0, 0, 0, 0, 0]), 0);
 }

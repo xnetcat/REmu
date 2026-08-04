@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::ProcessGuestMemory;
 #[cfg(target_os = "macos")]
 use crate::cached_kernel_memory_readable_range_end;
+#[cfg(not(target_os = "macos"))]
+use remu_shader::GuestMemoryReader;
 
 pub(crate) const SHADER_EVALUATION_CACHE_CAPACITY: usize = 16 * 1024;
 

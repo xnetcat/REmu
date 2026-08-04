@@ -81,9 +81,61 @@ unsafe fn install_sigill_handler_once() -> Result<(), i32> {
     Ok(())
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe fn install_sigill_handler_once() -> Result<(), i32> {
+    use windows::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+
+    // Install ahead of application handlers so guest illegal instructions are decoded before a
+    // crash reporter or language runtime treats them as fatal. The returned registration remains
+    // process-owned intentionally: guest threads can execute these opcodes for the entire run.
+    let registration = unsafe { AddVectoredExceptionHandler(1, Some(sha_ni_exception_handler)) };
+    if registration.is_null() {
+        Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(1))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+)))]
 unsafe fn install_sigill_handler_once() -> Result<(), i32> {
     Ok(())
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+unsafe extern "system" fn sha_ni_exception_handler(
+    information: *mut windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows::Win32::Foundation::EXCEPTION_ILLEGAL_INSTRUCTION;
+    use windows::Win32::System::Diagnostics::Debug::{
+        EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH,
+    };
+
+    if information.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: Windows supplies both records for the lifetime of a vectored-exception callback.
+    let information = unsafe { &mut *information };
+    if information.ExceptionRecord.is_null() || information.ContextRecord.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: null was rejected and the record remains live during this callback.
+    let record = unsafe { &*information.ExceptionRecord };
+    if record.ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    let context = information.ContextRecord.cast::<std::ffi::c_void>();
+    if try_recover_sha_ni(context) {
+        RECOVERED.fetch_add(1, Ordering::Relaxed);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if try_recover_sse4a(context) {
+        RECOVERED_SSE4A.fetch_add(1, Ordering::Relaxed);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    EXCEPTION_CONTINUE_SEARCH
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
@@ -243,7 +295,91 @@ fn try_recover_sse4a(context: *mut std::ffi::c_void) -> bool {
     true
 }
 
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn try_recover_sse4a(context: *mut std::ffi::c_void) -> bool {
+    use windows::Win32::System::Diagnostics::Debug::CONTEXT;
+
+    if context.is_null() {
+        return false;
+    }
+    // SAFETY: the vectored-exception callback supplies a writable CONTEXT for this thread.
+    let context = unsafe { &mut *context.cast::<CONTEXT>() };
+    let rip = context.Rip;
+    if rip == 0 {
+        return false;
+    }
+    // SAFETY: RIP addresses the faulting instruction. Accepted register encodings are at most
+    // eight bytes, the same bounded decode window used by the Darwin recovery path.
+    let bytes = unsafe { std::slice::from_raw_parts(rip as *const u8, 8) };
+    let mut cursor = 0;
+    let mut has_66 = false;
+    let mut has_f2 = false;
+    let mut rex = 0_u8;
+    while cursor < 3 {
+        match bytes[cursor] {
+            0x66 => has_66 = true,
+            0xf2 => has_f2 = true,
+            byte @ 0x40..=0x4f => rex = byte,
+            _ => break,
+        }
+        cursor += 1;
+    }
+    if bytes[cursor] != 0x0f || has_66 == has_f2 {
+        return false;
+    }
+    let opcode = bytes[cursor + 1];
+    let modrm = bytes[cursor + 2];
+    if !matches!(opcode, 0x78 | 0x79) || modrm >> 6 != 0b11 {
+        return false;
+    }
+    let reg = (modrm >> 3) & 7 | ((rex >> 2) & 1) << 3;
+    let rm = modrm & 7 | (rex & 1) << 3;
+    let mut length = u64::from(cursor as u8) + 3;
+    let applied = match (has_66, opcode) {
+        (true, 0x78) => {
+            if (modrm >> 3) & 7 != 0 {
+                return false;
+            }
+            length += 2;
+            let mut value = read_xmm_u64(context, rm);
+            value[0] = sse4a_extract(value[0], bytes[cursor + 3], bytes[cursor + 4]);
+            write_xmm_u64(context, rm, value);
+            true
+        }
+        (true, 0x79) => {
+            let descriptor = read_xmm_u64(context, rm)[0];
+            let mut value = read_xmm_u64(context, reg);
+            value[0] = sse4a_extract(value[0], descriptor as u8, (descriptor >> 8) as u8);
+            write_xmm_u64(context, reg, value);
+            true
+        }
+        (false, 0x78) => {
+            length += 2;
+            let source = read_xmm_u64(context, rm)[0];
+            let mut value = read_xmm_u64(context, reg);
+            value[0] = sse4a_insert(value[0], source, bytes[cursor + 3], bytes[cursor + 4]);
+            write_xmm_u64(context, reg, value);
+            true
+        }
+        (false, 0x79) => {
+            let source = read_xmm_u64(context, rm);
+            let mut value = read_xmm_u64(context, reg);
+            value[0] = sse4a_insert(value[0], source[0], source[1] as u8, (source[1] >> 8) as u8);
+            write_xmm_u64(context, reg, value);
+            true
+        }
+        _ => false,
+    };
+    if applied {
+        context.Rip = rip.wrapping_add(length);
+    }
+    applied
+}
+
+#[cfg(not(any(
+    all(target_os = "macos", target_arch = "x86_64"),
+    all(windows, target_arch = "x86_64")
+)))]
 fn try_recover_sse4a(_context: *mut std::ffi::c_void) -> bool {
     false
 }
@@ -303,6 +439,36 @@ fn write_xmm_u64(mcontext: &mut libc::__darwin_mcontext64, index: u8, value: [u6
     );
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn read_xmm_u64(
+    context: &windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    index: u8,
+) -> [u64; 2] {
+    let words = read_xmm(context, index);
+    [
+        u64::from(words[0]) | u64::from(words[1]) << 32,
+        u64::from(words[2]) | u64::from(words[3]) << 32,
+    ]
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn write_xmm_u64(
+    context: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    index: u8,
+    value: [u64; 2],
+) {
+    write_xmm(
+        context,
+        index,
+        [
+            value[0] as u32,
+            (value[0] >> 32) as u32,
+            value[1] as u32,
+            (value[1] >> 32) as u32,
+        ],
+    );
+}
+
 /// A SIGILL nobody recovers is a crash that previously died with no pc, no registers and no
 /// journal (exit 132, three of fifteen soak runs). Report it through the same signal-safe path
 /// as the protection faults before the default disposition kills the process.
@@ -348,9 +514,6 @@ fn report_unrecovered_sigill(information: *mut libc::siginfo_t, context: *mut st
     }
     remu_memory::report_unrecovered_signal(b"SIGILL", pc, fault_address, &anchors[..anchor_count]);
 }
-
-#[cfg(not(all(target_os = "macos", target_arch = "x86_64")))]
-fn report_unrecovered_sigill(_information: *mut libc::siginfo_t, _context: *mut std::ffi::c_void) {}
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn try_recover_sha_ni(context: *mut std::ffi::c_void) -> bool {
@@ -423,6 +586,71 @@ fn try_recover_sha_ni(context: *mut std::ffi::c_void) -> bool {
     true
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn try_recover_sha_ni(context: *mut std::ffi::c_void) -> bool {
+    use windows::Win32::System::Diagnostics::Debug::CONTEXT;
+
+    if context.is_null() {
+        return false;
+    }
+    // SAFETY: the vectored-exception callback supplies a writable CONTEXT for this thread.
+    let context = unsafe { &mut *context.cast::<CONTEXT>() };
+    let rip = context.Rip;
+    if rip == 0 {
+        return false;
+    }
+    // SAFETY: RIP addresses the faulting instruction and the decoder examines at most eight
+    // bytes, covering the longest supported REX/register/immediate encoding.
+    let bytes = unsafe { std::slice::from_raw_parts(rip as *const u8, 8) };
+    let Some(decoded) = decode_sha1_ni(bytes) else {
+        return false;
+    };
+    match decoded.op {
+        Sha1Op::Msg1 => {
+            let mut destination = read_xmm(context, decoded.dest);
+            sha1_msg1(&mut destination, read_xmm(context, decoded.src));
+            write_xmm(context, decoded.dest, destination);
+        }
+        Sha1Op::Msg2 => {
+            let mut destination = read_xmm(context, decoded.dest);
+            sha1_msg2(&mut destination, read_xmm(context, decoded.src));
+            write_xmm(context, decoded.dest, destination);
+        }
+        Sha1Op::Nexte => {
+            let source = read_xmm(context, decoded.dest);
+            let mut destination = read_xmm(context, decoded.src);
+            sha1_nexte_apply_src1(&mut destination, source);
+            write_xmm(context, decoded.dest, destination);
+        }
+        Sha1Op::Sha256Msg1 => {
+            let mut destination = read_xmm(context, decoded.dest);
+            sha256_msg1(&mut destination, read_xmm(context, decoded.src));
+            write_xmm(context, decoded.dest, destination);
+        }
+        Sha1Op::Sha256Msg2 => {
+            let mut destination = read_xmm(context, decoded.dest);
+            sha256_msg2(&mut destination, read_xmm(context, decoded.src));
+            write_xmm(context, decoded.dest, destination);
+        }
+        Sha1Op::Sha256Rnds2 => {
+            let mut destination = read_xmm(context, decoded.dest);
+            sha256_rnds2(
+                &mut destination,
+                read_xmm(context, decoded.src),
+                read_xmm(context, 0),
+            );
+            write_xmm(context, decoded.dest, destination);
+        }
+        Sha1Op::Rnds4 { imm } => {
+            let mut destination = read_xmm(context, decoded.dest);
+            sha1_rnds4(&mut destination, read_xmm(context, decoded.src), imm);
+            write_xmm(context, decoded.dest, destination);
+        }
+    }
+    context.Rip = rip.wrapping_add(u64::from(decoded.length));
+    true
+}
+
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 fn read_xmm(mcontext: &libc::__darwin_mcontext64, index: u8) -> [u32; 4] {
     let xmm = xmm_reg(mcontext, index);
@@ -439,6 +667,47 @@ fn write_xmm(mcontext: &mut libc::__darwin_mcontext64, index: u8, value: [u32; 4
     let xmm = xmm_reg_mut(mcontext, index);
     for (lane, word) in value.into_iter().enumerate() {
         xmm[lane * 4..lane * 4 + 4].copy_from_slice(&word.to_le_bytes());
+    }
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn read_xmm(context: &windows::Win32::System::Diagnostics::Debug::CONTEXT, index: u8) -> [u32; 4] {
+    let index = usize::from(index);
+    if index >= 16 {
+        return [0; 4];
+    }
+    // SAFETY: x86-64 CONTEXT stores XMM0..15 in the XSAVE-format union member.
+    let value = unsafe { context.Anonymous.FltSave.XmmRegisters[index] };
+    let low = value.Low;
+    let high = value.High.cast_unsigned();
+    [
+        low as u32,
+        (low >> 32) as u32,
+        high as u32,
+        (high >> 32) as u32,
+    ]
+}
+
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn write_xmm(
+    context: &mut windows::Win32::System::Diagnostics::Debug::CONTEXT,
+    index: u8,
+    value: [u32; 4],
+) {
+    use windows::Win32::System::Diagnostics::Debug::M128A;
+
+    let index = usize::from(index);
+    if index >= 16 {
+        return;
+    }
+    let low = u64::from(value[0]) | u64::from(value[1]) << 32;
+    let high = u64::from(value[2]) | u64::from(value[3]) << 32;
+    // Assignment selects the active FltSave union view already supplied by Windows.
+    unsafe {
+        context.Anonymous.FltSave.XmmRegisters[index] = M128A {
+            Low: low,
+            High: high.cast_signed(),
+        };
     }
 }
 
@@ -913,5 +1182,32 @@ mod tests {
         );
         // Length zero replaces the whole low quadword.
         assert_eq!(super::sse4a_insert(u64::MAX, 0x1234, 0, 0), 0x1234);
+    }
+
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn windows_vectored_handler_recovers_an_sse4a_instruction() {
+        super::install_sha_ni_sigill_recovery().expect("install Windows illegal-instruction VEH");
+        let destination = 0xffff_ffff_ffff_ffff_u64;
+        let source = 0xdead_beef_u64;
+        let output: u64;
+        // INSERTQ is supported by the PS5's AMD CPU but not by Intel hosts. On unsupported hosts
+        // this deliberately raises EXCEPTION_ILLEGAL_INSTRUCTION and exercises the installed VEH;
+        // AMD hosts execute it natively and must produce the identical architectural result.
+        unsafe {
+            std::arch::asm!(
+                "movq xmm0, {destination}",
+                "movq xmm1, {source}",
+                ".byte 0xf2, 0x0f, 0x78, 0xc1, 0x20, 0x10",
+                "movq {output}, xmm0",
+                destination = in(reg) destination,
+                source = in(reg) source,
+                output = lateout(reg) output,
+                out("xmm0") _,
+                out("xmm1") _,
+                options(nostack),
+            );
+        }
+        assert_eq!(output, super::sse4a_insert(destination, source, 0x20, 0x10));
     }
 }

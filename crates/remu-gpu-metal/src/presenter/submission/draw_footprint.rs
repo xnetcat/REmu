@@ -953,6 +953,8 @@ mod tests {
             sequence: 7,
             indexed: true,
             indirect_arguments_address: None,
+            indirect_count_address: None,
+            indirect_draw_index: 0,
             instance_count: 1,
             index_buffer_address: 0,
             index_resource_address: 0,

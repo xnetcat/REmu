@@ -34,14 +34,18 @@ SELF / ELF / PRX
 - `remu-memory`: guest address-space reservation, mapping, and CPU write watching.
 - `remu-runtime`: dynamic linking, HLE kernel and library services, audio, and guest execution.
 - `remu-gpu`: backend-neutral host GPU contracts expressed in guest-domain terms.
+- `remu-gpu-dx12`: Windows DXGI/D3D12 capability discovery and presenter/resource backend.
 - `remu-gpu-metal`: direct macOS Metal presenter and resource backend.
 - `remu-shader`: RDNA2 shader decoding, typed IR, and static evaluation.
-- `remu-shader-metal`: MSL lowering for the typed shader IR.
+- `remu-shader-metal`: shared MSL and HLSL lowering for the typed shader IR.
 - `remu-cli`: inspection, diagnostics, and game launch orchestration.
 
 Further crates (a debugger, other GPU backends, a native CPU translator) are introduced only when
 a vertical slice requires them. This avoids cementing placeholder APIs before their invariants are
 understood.
+
+The Windows host architecture and D3D12 resource/shader design are specified in
+[windows-support.md](windows-support.md) and [gpu-d3d12.md](gpu-d3d12.md).
 
 ## Graphics rules
 

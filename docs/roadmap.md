@@ -59,7 +59,13 @@ This milestone does not map or execute guest code.
 
 ## M7: other host backends
 
-- Add D3D12 plus HLSL/DXIL on Windows.
+Status: executable vertical slice. Native x86-64 guest execution, sparse memory, WASAPI, XInput,
+HLSL/DXIL translation, D3D12 event execution, and DXGI presentation are connected and launch the
+first local test title. Transient normalized/integer color and depth/stencil MSAA plus ordered
+indirect multi-draw are physically covered; compatibility growth, NGG fallback, GPU residency/batching,
+clean-machine packaging, and multi-title validation remain in progress.
+
+- Complete and optimize D3D12 plus HLSL/DXIL compatibility on Windows.
 - Add Vulkan plus SPIR-V on Linux.
 - Share guest decoding and shader IR, not host-API abstractions that erase important semantics.
 

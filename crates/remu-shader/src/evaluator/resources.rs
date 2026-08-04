@@ -225,6 +225,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     live.instruction_pcs.push(pc);
                 }
                 live.writable |= writable;
+                live.write_back_to_guest |= writable;
                 continue;
             }
             if let Some(null_binding) = self.global_bindings.iter_mut().find(|binding| {
@@ -296,6 +297,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 }
             }
             live.writable |= null_writable;
+            live.write_back_to_guest |= null_writable;
             eprintln!(
                 "[REMu][SHADER] coalesce null global binding scalar={scalar_address} pcs={null_pc_count} into live base={live_base:#x} (removed placeholder)"
             );
@@ -758,6 +760,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 binding.instruction_pcs.push(instruction.pc);
             }
             binding.writable |= request.writable;
+            binding.write_back_to_guest |= request.writable && binding.base_address != 0;
             return Ok(());
         }
         if let Some(index) = self.global_bindings.iter().position(|binding| {
@@ -776,6 +779,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 binding.instruction_pcs.push(instruction.pc);
             }
             binding.writable |= request.writable;
+            binding.write_back_to_guest |= request.writable && binding.base_address != 0;
             return Ok(());
         }
         // Recording a live V# for a slot that already has a null stub: fold the stub's PCs into the
@@ -795,14 +799,15 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             if !instruction_pcs.contains(&instruction.pc) {
                 instruction_pcs.push(instruction.pc);
             }
+            let writable = request.writable || null_writable;
             self.global_bindings.push(GlobalMemoryBinding {
                 scalar_address: request.scalar_address,
                 base_address: request.base_address,
                 instruction_pcs,
                 byte_count,
                 data,
-                writable: request.writable || null_writable,
-                write_back_to_guest: true,
+                writable,
+                write_back_to_guest: writable && request.base_address != 0,
             });
             return Ok(());
         }
@@ -816,7 +821,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             byte_count,
             data,
             writable: request.writable,
-            write_back_to_guest: request.base_address != 0,
+            write_back_to_guest: request.writable && request.base_address != 0,
         };
         self.global_bindings.push(binding);
         Ok(())

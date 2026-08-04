@@ -169,6 +169,12 @@ pub struct ComputeSystemRegisters {
     pub work_group_y: Option<u32>,
     pub work_group_z: Option<u32>,
     pub thread_group_size: Option<u32>,
+    /// Largest exact scalar-controlled loop trip count observed while resolving this dispatch.
+    /// This is a transient compiler watchdog hint, not a hardware register.
+    pub maximum_evaluated_scalar_loop_iterations: u32,
+    /// Whether resource evaluation encountered a loop whose exit depends on vector lane state.
+    /// Such loops cannot be bounded exactly by the scalar evaluator.
+    pub has_evaluated_vector_controlled_loop: bool,
 }
 
 impl ComputeSystemRegisters {

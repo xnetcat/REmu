@@ -32,8 +32,10 @@ class FfmpegBuildIntegrationTests(unittest.TestCase):
     def test_cold_ffmpeg_build_reserves_stdout_for_the_install_path(self) -> None:
         script = (SCRIPTS / "lib" / "ensure-ffmpeg.sh").read_text(encoding="utf-8")
         self.assertIn(") >&2\n\n", script)
-        self.assertIn('make -C "$object_dir" -j"$build_jobs" >&2', script)
-        self.assertIn('make -C "$object_dir" install >&2', script)
+        self.assertIn("make_command=make", script)
+        self.assertIn("make_command=mingw32-make", script)
+        self.assertIn('"$make_command" -C "$object_dir" -j"$build_jobs" >&2', script)
+        self.assertIn('"$make_command" -C "$object_dir" install >&2', script)
 
     def test_rosetta_packager_resolves_the_repo_level_bundle_script(self) -> None:
         prepare = (SCRIPTS / "lib" / "prepare-rosetta-runner.sh").read_text(

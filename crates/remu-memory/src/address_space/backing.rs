@@ -1,12 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Shareable guest physical backing objects built on POSIX shared memory.
+//! Sparse, shareable guest physical backing objects.
 
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::io;
-use std::sync::Arc;
-use std::sync::Mutex;
+#[cfg(windows)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+#[cfg(windows)]
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+#[cfg(windows)]
+use windows::Win32::System::Memory::{
+    CreateFileMappingW, MEM_COMMIT, MapViewOfFile3, PAGE_EXECUTE_READWRITE, PAGE_PROTECTION_FLAGS,
+    PAGE_READWRITE, SEC_RESERVE, UnmapViewOfFile, VIRTUAL_ALLOCATION_TYPE, VirtualAlloc,
+};
 
 use super::{
     AddressSpaceError, GUEST_PAGE_SIZE, align_up, host_page_size, host_size, require_aligned,
@@ -14,40 +24,165 @@ use super::{
 
 static NEXT_BACKING_ID: AtomicU64 = AtomicU64::new(1);
 
-// Runtime backing objects can span 16 GiB of direct memory or a 1 TiB sparse virtual arena, so
-// mapping an entire object permanently would distort VM accounting. Retain only the hot physical
-// windows used by repeated GPU reads and let the fixed limits bound both aliases and residency.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticBackingWriteWatch {
+    backing_id: u64,
+    offset: u64,
+    byte_count: u64,
+}
+
+#[cfg(windows)]
+fn diagnostic_backing_write_watch() -> &'static Mutex<Option<DiagnosticBackingWriteWatch>> {
+    static WATCH: OnceLock<Mutex<Option<DiagnosticBackingWriteWatch>>> = OnceLock::new();
+    WATCH.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(windows)]
+fn trace_diagnostic_backing_write(backing_id: u64, offset: u64, source: &[u8]) {
+    let watch = *diagnostic_backing_write_watch()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(watch) = watch else {
+        return;
+    };
+    let Some(end) = offset.checked_add(source.len() as u64) else {
+        return;
+    };
+    let watch_end = watch.offset + watch.byte_count;
+    if backing_id != watch.backing_id || offset >= watch_end || watch.offset >= end {
+        return;
+    }
+    let mut prefix = [0_u8; 8];
+    let copied = prefix.len().min(source.len());
+    prefix[..copied].copy_from_slice(&source[..copied]);
+    eprintln!(
+        "[REMu][JOURNAL][BACKING-WRITE] backing={backing_id} offset={offset:#x} bytes={:#x} payload={:#x} thread={:?}\n{}",
+        source.len(),
+        u64::from_le_bytes(prefix),
+        std::thread::current().name(),
+        std::backtrace::Backtrace::force_capture(),
+    );
+}
+
 const READ_MAPPING_CACHE_CAPACITY: usize = 256;
 const READ_MAPPING_CACHE_BYTE_CAPACITY: usize = 16 * 1024 * 1024;
+#[cfg(windows)]
+const WINDOWS_ALLOCATION_GRANULARITY: u64 = 64 * 1024;
+
+#[derive(Debug)]
+struct HostBackingMapping {
+    mapping_address: usize,
+    #[cfg(target_os = "macos")]
+    mapping_byte_count: usize,
+    address: usize,
+}
+
+impl HostBackingMapping {
+    fn new(inner: &BackingInner, backing_offset: u64, byte_count: usize) -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let file_offset = libc::off_t::try_from(backing_offset).ok()?;
+            // SAFETY: The caller validates the page-aligned section interval.
+            let mapping = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    byte_count,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    inner.descriptor,
+                    file_offset,
+                )
+            };
+            if mapping == libc::MAP_FAILED {
+                return None;
+            }
+            Some(Self {
+                mapping_address: mapping as usize,
+                mapping_byte_count: byte_count,
+                address: mapping as usize,
+            })
+        }
+
+        #[cfg(windows)]
+        {
+            let aligned_offset = backing_offset - backing_offset % WINDOWS_ALLOCATION_GRANULARITY;
+            let in_mapping_offset = usize::try_from(backing_offset - aligned_offset).ok()?;
+            let page_size = host_page_size().ok()?;
+            let mapping_byte_count = u64::try_from(in_mapping_offset)
+                .ok()?
+                .checked_add(u64::try_from(byte_count).ok()?)
+                .and_then(|size| align_up(size, page_size).ok())
+                .and_then(|size| host_size(size).ok())?;
+            // SAFETY: The range is within a live sparse pagefile-backed section. A null base lets
+            // Windows choose a suitably aligned temporary address.
+            let mapping = unsafe {
+                MapViewOfFile3(
+                    inner.windows_handle(),
+                    None,
+                    None,
+                    aligned_offset,
+                    mapping_byte_count,
+                    VIRTUAL_ALLOCATION_TYPE(0),
+                    PAGE_READWRITE.0,
+                    None,
+                )
+            };
+            if mapping.Value.is_null() {
+                return None;
+            }
+            let committed = unsafe {
+                VirtualAlloc(
+                    Some(mapping.Value.cast_const()),
+                    mapping_byte_count,
+                    MEM_COMMIT,
+                    PAGE_READWRITE,
+                )
+            };
+            if committed != mapping.Value {
+                let _ = unsafe { UnmapViewOfFile(mapping) };
+                return None;
+            }
+            Some(Self {
+                mapping_address: mapping.Value as usize,
+                address: mapping.Value as usize + in_mapping_offset,
+            })
+        }
+    }
+}
+
+impl Drop for HostBackingMapping {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::munmap(
+                self.mapping_address as *mut libc::c_void,
+                self.mapping_byte_count,
+            );
+        }
+        #[cfg(windows)]
+        {
+            let _ = unsafe {
+                UnmapViewOfFile(windows::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.mapping_address as *mut std::ffi::c_void,
+                })
+            };
+        }
+    }
+}
 
 #[derive(Debug)]
 struct CachedReadMapping {
-    address: usize,
+    host: HostBackingMapping,
     backing_offset: u64,
     byte_count: usize,
     last_use: u64,
 }
 
 impl CachedReadMapping {
-    fn new(descriptor: i32, backing_offset: u64, byte_count: usize) -> Option<Self> {
-        let file_offset = libc::off_t::try_from(backing_offset).ok()?;
-        // SAFETY: the caller validated that this page-aligned file interval belongs to the live
-        // shared-memory object. The mapping remains owned by this value until Drop.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_count,
-                libc::PROT_READ,
-                libc::MAP_SHARED,
-                descriptor,
-                file_offset,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            return None;
-        }
+    fn new(inner: &BackingInner, backing_offset: u64, byte_count: usize) -> Option<Self> {
         Some(Self {
-            address: mapping as usize,
+            host: HostBackingMapping::new(inner, backing_offset, byte_count)?,
             backing_offset,
             byte_count,
             last_use: 0,
@@ -74,23 +209,13 @@ impl CachedReadMapping {
         debug_assert!(self.contains(offset, destination.len()));
         let in_mapping_offset =
             usize::try_from(offset - self.backing_offset).expect("contained offset fits usize");
-        // SAFETY: `contains` proves this immutable mapping covers the requested physical range,
-        // and `destination` provides an independently owned writable range of the same length.
+        // SAFETY: `contains` proves the temporary mapping covers the requested range.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                (self.address as *const u8).add(in_mapping_offset),
+                (self.host.address as *const u8).add(in_mapping_offset),
                 destination.as_mut_ptr(),
                 destination.len(),
             );
-        }
-    }
-}
-
-impl Drop for CachedReadMapping {
-    fn drop(&mut self) {
-        // SAFETY: this value owns the complete mmap interval and releases it exactly once.
-        unsafe {
-            libc::munmap(self.address as *mut libc::c_void, self.byte_count);
         }
     }
 }
@@ -159,32 +284,16 @@ impl ReadMappingCache {
 /// guest alias of that object.
 #[derive(Debug)]
 struct CachedWriteMapping {
-    address: usize,
+    host: HostBackingMapping,
     backing_offset: u64,
     byte_count: usize,
     last_use: u64,
 }
 
 impl CachedWriteMapping {
-    fn new(descriptor: i32, backing_offset: u64, byte_count: usize) -> Option<Self> {
-        let file_offset = libc::off_t::try_from(backing_offset).ok()?;
-        // SAFETY: the caller validated that this page-aligned file interval belongs to the live
-        // shared-memory object. The mapping remains owned by this value until Drop.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_count,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                descriptor,
-                file_offset,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            return None;
-        }
+    fn new(inner: &BackingInner, backing_offset: u64, byte_count: usize) -> Option<Self> {
         Some(Self {
-            address: mapping as usize,
+            host: HostBackingMapping::new(inner, backing_offset, byte_count)?,
             backing_offset,
             byte_count,
             last_use: 0,
@@ -216,18 +325,9 @@ impl CachedWriteMapping {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 source.as_ptr(),
-                (self.address as *mut u8).add(in_mapping_offset),
+                (self.host.address as *mut u8).add(in_mapping_offset),
                 source.len(),
             );
-        }
-    }
-}
-
-impl Drop for CachedWriteMapping {
-    fn drop(&mut self) {
-        // SAFETY: this value owns the complete mmap interval and releases it exactly once.
-        unsafe {
-            libc::munmap(self.address as *mut libc::c_void, self.byte_count);
         }
     }
 }
@@ -294,16 +394,30 @@ pub(super) struct BackingInner {
     pub(super) id: u64,
     size: u64,
     virtually_keyed: bool,
+    #[cfg(target_os = "macos")]
     pub(super) descriptor: i32,
+    #[cfg(windows)]
+    handle: isize,
     read_mappings: Mutex<ReadMappingCache>,
     write_mappings: Mutex<WriteMappingCache>,
 }
 
+impl BackingInner {
+    #[cfg(windows)]
+    fn windows_handle(&self) -> HANDLE {
+        HANDLE(self.handle as *mut std::ffi::c_void)
+    }
+}
+
 impl Drop for BackingInner {
     fn drop(&mut self) {
-        // SAFETY: The descriptor is owned by this object and closed exactly once.
+        #[cfg(target_os = "macos")]
         unsafe {
             libc::close(self.descriptor);
+        }
+        #[cfg(windows)]
+        {
+            let _ = unsafe { CloseHandle(self.windows_handle()) };
         }
     }
 }
@@ -313,21 +427,16 @@ pub struct GuestPhysicalBacking {
     pub(super) inner: Arc<BackingInner>,
 }
 
-/// One page-aligned writable mapping of a shared guest physical backing.
-///
-/// This mapping is independent of the guest virtual aliases which exposed the backing range.
-/// Consumers may retain it while asynchronous GPU work is in flight; dropping it releases the
-/// host virtual mapping without changing the backing object or any guest alias.
 #[derive(Debug)]
 pub struct GuestSharedBackingView {
-    address: usize,
+    host: HostBackingMapping,
     byte_count: usize,
 }
 
 impl GuestSharedBackingView {
     #[must_use]
     pub const fn as_ptr(&self) -> *const std::ffi::c_void {
-        self.address as *const std::ffi::c_void
+        self.host.address as *const std::ffi::c_void
     }
 
     #[must_use]
@@ -336,26 +445,11 @@ impl GuestSharedBackingView {
     }
 }
 
-impl Drop for GuestSharedBackingView {
-    fn drop(&mut self) {
-        // SAFETY: this object owns the complete mmap interval and releases it exactly once.
-        unsafe {
-            libc::munmap(self.address as *mut libc::c_void, self.byte_count);
-        }
-    }
-}
-
 impl GuestPhysicalBacking {
-    /// Creates a physically keyed backing: its offsets name stable guest physical bytes.
     pub fn new(size: u64) -> Result<Self, AddressSpaceError> {
         Self::create(size, false)
     }
 
-    /// Creates a virtually keyed backing, whose offsets are guest virtual placements.
-    ///
-    /// Only an address space's committed-memory object may use this: byte `offset` of the object
-    /// is guest address `base + offset`, so a recorded `(backing, offset)` pair names a *virtual*
-    /// address whose contents the allocator may already have handed to another object.
     pub(super) fn new_virtually_keyed(size: u64) -> Result<Self, AddressSpaceError> {
         Self::create(size, true)
     }
@@ -365,54 +459,77 @@ impl GuestPhysicalBacking {
             return Err(AddressSpaceError::ZeroBackingSize);
         }
         require_aligned("backing size", size, GUEST_PAGE_SIZE)?;
-        let truncate_size = libc::off_t::try_from(size)
-            .map_err(|_| AddressSpaceError::HostSizeOverflow { value: size })?;
         let id = NEXT_BACKING_ID.fetch_add(1, Ordering::Relaxed);
-        let name = CString::new(format!("/remu-{}-{id}", std::process::id())).map_err(|error| {
-            AddressSpaceError::BackingOperationFailed {
-                operation: "name generation",
-                source: io::Error::new(io::ErrorKind::InvalidInput, error),
-            }
-        })?;
 
-        // SAFETY: `name` is a live C string and the flags/mode are valid for shm_open.
-        let descriptor = unsafe {
-            libc::shm_open(
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
-                0o600,
-            )
+        #[cfg(target_os = "macos")]
+        let descriptor = {
+            let truncate_size = libc::off_t::try_from(size)
+                .map_err(|_| AddressSpaceError::HostSizeOverflow { value: size })?;
+            let name =
+                CString::new(format!("/remu-{}-{id}", std::process::id())).map_err(|error| {
+                    AddressSpaceError::BackingOperationFailed {
+                        operation: "name generation",
+                        source: io::Error::new(io::ErrorKind::InvalidInput, error),
+                    }
+                })?;
+            let descriptor = unsafe {
+                libc::shm_open(
+                    name.as_ptr(),
+                    libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+                    0o600,
+                )
+            };
+            if descriptor < 0 {
+                return Err(AddressSpaceError::BackingOperationFailed {
+                    operation: "creation",
+                    source: io::Error::last_os_error(),
+                });
+            }
+            unsafe {
+                libc::shm_unlink(name.as_ptr());
+            }
+            if unsafe { libc::ftruncate(descriptor, truncate_size) } != 0 {
+                let source = io::Error::last_os_error();
+                unsafe {
+                    libc::close(descriptor);
+                }
+                return Err(AddressSpaceError::BackingOperationFailed {
+                    operation: "resize",
+                    source,
+                });
+            }
+            descriptor
         };
-        if descriptor < 0 {
-            return Err(AddressSpaceError::BackingOperationFailed {
+
+        #[cfg(windows)]
+        let handle = {
+            let protection = PAGE_PROTECTION_FLAGS(PAGE_EXECUTE_READWRITE.0 | SEC_RESERVE.0);
+            let result = unsafe {
+                CreateFileMappingW(
+                    INVALID_HANDLE_VALUE,
+                    None,
+                    protection,
+                    (size >> 32) as u32,
+                    size as u32,
+                    windows::core::PCWSTR::null(),
+                )
+            };
+            let handle = result.map_err(|_| AddressSpaceError::BackingOperationFailed {
                 operation: "creation",
                 source: io::Error::last_os_error(),
-            });
-        }
-        // The descriptor keeps the object alive; unlinking immediately prevents leaked names.
-        // SAFETY: `name` remains valid for this call.
-        unsafe {
-            libc::shm_unlink(name.as_ptr());
-        }
-        // SAFETY: `descriptor` is live and `truncate_size` is representable by off_t.
-        if unsafe { libc::ftruncate(descriptor, truncate_size) } != 0 {
-            let source = io::Error::last_os_error();
-            // SAFETY: The descriptor is owned locally because BackingInner was not constructed.
-            unsafe {
-                libc::close(descriptor);
-            }
-            return Err(AddressSpaceError::BackingOperationFailed {
-                operation: "resize",
-                source,
-            });
-        }
+            })?;
+            handle.0 as isize
+        };
 
         Ok(Self {
             inner: Arc::new(BackingInner {
                 id,
                 size,
                 virtually_keyed,
+                #[cfg(target_os = "macos")]
                 descriptor,
+                #[cfg(windows)]
+                handle,
                 read_mappings: Mutex::new(ReadMappingCache::default()),
                 write_mappings: Mutex::new(WriteMappingCache::default()),
             }),
@@ -429,13 +546,30 @@ impl GuestPhysicalBacking {
         self.inner.size
     }
 
-    /// Reports whether this object is keyed by guest virtual placement rather than physical bytes.
-    ///
-    /// A recorded offset into such an object is not a durable physical identity, so no writer may
-    /// republish captured bytes there once the naming mapping is gone.
     #[must_use]
     pub fn is_virtually_keyed(&self) -> bool {
         self.inner.virtually_keyed
+    }
+
+    #[cfg(windows)]
+    pub(super) fn install_write_diagnostic(&self, offset: u64, byte_count: u64) {
+        *diagnostic_backing_write_watch()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(DiagnosticBackingWriteWatch {
+                backing_id: self.id(),
+                offset,
+                byte_count,
+            });
+        eprintln!(
+            "[REMu][JOURNAL] watching backing={} offset={offset:#x} length={byte_count:#x}",
+            self.id(),
+        );
+    }
+
+    #[cfg(windows)]
+    pub(super) fn windows_handle(&self) -> HANDLE {
+        self.inner.windows_handle()
     }
 
     pub(super) fn map_shared_view(
@@ -448,24 +582,8 @@ impl GuestPhysicalBacking {
         {
             return None;
         }
-        let file_offset = libc::off_t::try_from(backing_offset).ok()?;
-        // SAFETY: the shared-range resolver validated the interval against this live backing.
-        // The returned owner keeps the mapping alive until its eventual Drop.
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                byte_count,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                self.inner.descriptor,
-                file_offset,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            return None;
-        }
         Some(GuestSharedBackingView {
-            address: mapping as usize,
+            host: HostBackingMapping::new(&self.inner, backing_offset, byte_count)?,
             byte_count,
         })
     }
@@ -499,8 +617,7 @@ impl GuestPhysicalBacking {
             if cache.copy_if_present(offset, destination) {
                 return true;
             }
-            let Some(mapping) =
-                CachedReadMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+            let Some(mapping) = CachedReadMapping::new(&self.inner, aligned_offset, mapping_length)
             else {
                 return false;
             };
@@ -508,8 +625,7 @@ impl GuestPhysicalBacking {
             cache.insert(mapping);
             return true;
         }
-        let Some(mapping) =
-            CachedReadMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+        let Some(mapping) = CachedReadMapping::new(&self.inner, aligned_offset, mapping_length)
         else {
             return false;
         };
@@ -534,6 +650,8 @@ impl GuestPhysicalBacking {
         if end > self.size() {
             return false;
         }
+        #[cfg(windows)]
+        trace_diagnostic_backing_write(self.id(), offset, source);
         let Ok(page_size) = host_page_size() else {
             return false;
         };
@@ -563,7 +681,7 @@ impl GuestPhysicalBacking {
                 return true;
             }
             let Some(mapping) =
-                CachedWriteMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+                CachedWriteMapping::new(&self.inner, aligned_offset, mapping_length)
             else {
                 return false;
             };
@@ -571,8 +689,7 @@ impl GuestPhysicalBacking {
             cache.insert(mapping);
             return true;
         }
-        let Some(mapping) =
-            CachedWriteMapping::new(self.inner.descriptor, aligned_offset, mapping_length)
+        let Some(mapping) = CachedWriteMapping::new(&self.inner, aligned_offset, mapping_length)
         else {
             return false;
         };

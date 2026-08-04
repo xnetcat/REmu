@@ -42,6 +42,13 @@ const TLS_HELPER_SAVED_REGISTERS: [u8; 15] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11,
 
 const TLS_IMMEDIATE_STORE_SIZE: usize = 12;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TlsVectorStateSave {
+    Xsave,
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+    Fxsave,
+}
+
 #[derive(Clone, Copy)]
 struct TlsImmediateStore {
     address: GuestAddress,
@@ -534,12 +541,19 @@ fn write_tls_store_helpers(
         .ok_or(LinkError::AddressOverflow)?;
     let mut helpers = vec![0x90_u8; byte_count];
     let dispatcher = tls_store_thread_pointer as *const () as usize as u64;
+    let vector_state_save = tls_vector_state_save();
     for (index, store) in stores.iter().enumerate() {
         let offset = index
             .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
             .ok_or(LinkError::AddressOverflow)?;
         let slot = &mut helpers[offset..offset + TLS_STORE_HELPER_SIZE_USIZE];
-        encode_tls_store_helper(slot, dispatcher, store.displacement, store.immediate);
+        encode_tls_store_helper(
+            slot,
+            dispatcher,
+            store.displacement,
+            store.immediate,
+            vector_state_save,
+        );
     }
     memory.write(helper_base, &helpers)?;
     Ok(())
@@ -556,8 +570,9 @@ fn encode_tls_store_helper(
     dispatcher: u64,
     displacement: [u8; 4],
     immediate: [u8; 4],
+    vector_state_save: TlsVectorStateSave,
 ) -> usize {
-    let mut cursor = emit_tls_store_helper_prologue(slot, dispatcher);
+    let mut cursor = emit_tls_store_helper_prologue(slot, dispatcher, vector_state_save);
     // mov dword ptr [rax+disp], imm32
     slot[cursor..cursor + 2].copy_from_slice(&[0xc7, 0x80]);
     slot[cursor + 2..cursor + 6].copy_from_slice(&displacement);
@@ -566,7 +581,11 @@ fn encode_tls_store_helper(
     emit_tls_store_helper_epilogue(slot, cursor)
 }
 
-fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
+fn emit_tls_store_helper_prologue(
+    slot: &mut [u8],
+    dispatcher: u64,
+    vector_state_save: TlsVectorStateSave,
+) -> usize {
     let mut cursor = 0;
     slot[cursor] = 0x9c; // pushfq
     cursor += 1;
@@ -574,50 +593,64 @@ fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
         emit_push_register(slot, &mut cursor, register);
     }
     // A patched instruction can occur at any stack depth, not just at a SysV call boundary.
-    // Retain the post-save stack in callee-saved R15, allocate the exact XCR0-enabled save area
-    // reported by CPUID.0D.0:EBX, and align the dispatcher stack to 64 bytes.
+    // Retain the post-save stack in callee-saved R15 and align the dispatcher stack to 64 bytes.
     slot[cursor..cursor + 3].copy_from_slice(&[0x49, 0x89, 0xe7]); // mov r15, rsp
     cursor += 3;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
-    cursor += 2;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x0f, 0x01, 0xd0]); // xgetbv
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xd6]); // mov r14d, edx
-    cursor += 3;
-    slot[cursor..cursor + 5].copy_from_slice(&[0xb8, 0x0d, 0, 0, 0]); // mov eax, 0xd
-    cursor += 5;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
-    cursor += 2;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x0f, 0xa2]); // cpuid
-    cursor += 2;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xdc]); // mov r12d, ebx
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x29, 0xe4]); // sub rsp, r12
-    cursor += 3;
-    slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x3f]); // sub rsp, 63
-    cursor += 4;
-    slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xe4, 0xc0]); // and rsp, -64
-    cursor += 4;
-    // XRSTOR requires the standard-format XSAVE header's reserved bytes to be zero.
-    // Guest flags were saved already, so CLD is safe and POPFQ restores the original DF.
-    slot[cursor] = 0xfc; // cld
-    cursor += 1;
-    slot[cursor..cursor + 8].copy_from_slice(&[0x48, 0x8d, 0xbc, 0x24, 0, 0x02, 0, 0]); // lea rdi,[rsp+512]
-    cursor += 8;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc0]); // xor eax, eax
-    cursor += 2;
-    slot[cursor..cursor + 5].copy_from_slice(&[0xb9, 0x08, 0, 0, 0]); // mov ecx, 8
-    cursor += 5;
-    slot[cursor..cursor + 3].copy_from_slice(&[0xf3, 0x48, 0xab]); // rep stosq
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
-    cursor += 3;
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x24, 0x24]); // xsave64 [rsp]
-    cursor += 5;
+    match vector_state_save {
+        TlsVectorStateSave::Xsave => {
+            // Allocate the exact XCR0-enabled save area reported by CPUID.0D.0:EBX. XRSTOR
+            // requires the standard-format XSAVE header's reserved bytes to be zero.
+            slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
+            cursor += 2;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x0f, 0x01, 0xd0]); // xgetbv
+            cursor += 3;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xc5]); // mov r13d, eax
+            cursor += 3;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xd6]); // mov r14d, edx
+            cursor += 3;
+            slot[cursor..cursor + 5].copy_from_slice(&[0xb8, 0x0d, 0, 0, 0]); // mov eax, 0xd
+            cursor += 5;
+            slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc9]); // xor ecx, ecx
+            cursor += 2;
+            slot[cursor..cursor + 2].copy_from_slice(&[0x0f, 0xa2]); // cpuid
+            cursor += 2;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x41, 0x89, 0xdc]); // mov r12d, ebx
+            cursor += 3;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x29, 0xe4]); // sub rsp, r12
+            cursor += 3;
+            slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xec, 0x3f]); // sub rsp, 63
+            cursor += 4;
+            slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xe4, 0xc0]); // and rsp, -64
+            cursor += 4;
+            // Guest flags were saved already, so CLD is safe and POPFQ restores the original DF.
+            slot[cursor] = 0xfc; // cld
+            cursor += 1;
+            slot[cursor..cursor + 8].copy_from_slice(&[0x48, 0x8d, 0xbc, 0x24, 0, 0x02, 0, 0]); // lea rdi,[rsp+512]
+            cursor += 8;
+            slot[cursor..cursor + 2].copy_from_slice(&[0x31, 0xc0]); // xor eax, eax
+            cursor += 2;
+            slot[cursor..cursor + 5].copy_from_slice(&[0xb9, 0x08, 0, 0, 0]); // mov ecx, 8
+            cursor += 5;
+            slot[cursor..cursor + 3].copy_from_slice(&[0xf3, 0x48, 0xab]); // rep stosq
+            cursor += 3;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
+            cursor += 3;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
+            cursor += 3;
+            slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x24, 0x24]); // xsave64 [rsp]
+            cursor += 5;
+        }
+        TlsVectorStateSave::Fxsave => {
+            // FXSAVE is part of the x86-64 baseline and is translated by Rosetta. It preserves
+            // x87/MMX, MXCSR and XMM0-15 without the XGETBV/XSAVE instructions Rosetta rejects.
+            slot[cursor..cursor + 7].copy_from_slice(&[0x48, 0x81, 0xec, 0x3f, 0x02, 0, 0]); // sub rsp, 575
+            cursor += 7;
+            slot[cursor..cursor + 4].copy_from_slice(&[0x48, 0x83, 0xe4, 0xc0]); // and rsp, -64
+            cursor += 4;
+            slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x04, 0x24]); // fxsave64 [rsp]
+            cursor += 5;
+        }
+    }
     slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
     slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
     cursor += 10;
@@ -625,12 +658,20 @@ fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
     cursor += 2;
     slot[cursor..cursor + 3].copy_from_slice(&[0x49, 0x89, 0xc2]); // mov r10, rax
     cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
-    cursor += 3;
-    slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
-    cursor += 3;
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x2c, 0x24]); // xrstor64 [rsp]
-    cursor += 5;
+    match vector_state_save {
+        TlsVectorStateSave::Xsave => {
+            slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xe8]); // mov eax, r13d
+            cursor += 3;
+            slot[cursor..cursor + 3].copy_from_slice(&[0x44, 0x89, 0xf2]); // mov edx, r14d
+            cursor += 3;
+            slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x2c, 0x24]); // xrstor64 [rsp]
+            cursor += 5;
+        }
+        TlsVectorStateSave::Fxsave => {
+            slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x0f, 0xae, 0x0c, 0x24]); // fxrstor64 [rsp]
+            cursor += 5;
+        }
+    }
     slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x89, 0xd0]); // mov rax, r10
     cursor += 3;
     slot[cursor..cursor + 3].copy_from_slice(&[0x4c, 0x89, 0xfc]); // mov rsp, r15
@@ -640,6 +681,19 @@ fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
     slot[cursor..cursor + 7].copy_from_slice(&[0x48, 0x85, 0xc0, 0x75, 0x02, 0x0f, 0x0b]);
     cursor += 7;
     cursor
+}
+
+fn tls_vector_state_save() -> TlsVectorStateSave {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if remu_platform::host_info().process_translation
+            == remu_platform::TranslationState::Translated
+            || !std::is_x86_feature_detected!("xsave")
+        {
+            return TlsVectorStateSave::Fxsave;
+        }
+    }
+    TlsVectorStateSave::Xsave
 }
 
 fn emit_tls_store_helper_epilogue(slot: &mut [u8], mut cursor: usize) -> usize {
@@ -831,9 +885,9 @@ mod tests {
     use iced_x86::{Decoder, DecoderOptions, Mnemonic};
 
     use super::{
-        TLS_STORE_HELPER_SIZE_USIZE, TLS_STORE_THUNK_HITS, encode_tls_load_helper,
-        encode_tls_load_patch, encode_tls_store_helper, encode_tls_store_patch,
-        reachable_tls_immediate_store_offsets,
+        TLS_STORE_HELPER_SIZE_USIZE, TLS_STORE_THUNK_HITS, TlsVectorStateSave,
+        encode_tls_load_helper, encode_tls_load_patch, encode_tls_store_helper,
+        encode_tls_store_patch, reachable_tls_immediate_store_offsets,
     };
     use std::sync::atomic::Ordering;
 
@@ -871,6 +925,7 @@ mod tests {
             0x1122_3344_5566_7788,
             [0x28, 0, 0, 0],
             [0x0b, 0, 0x02, 0xa0],
+            TlsVectorStateSave::Xsave,
         );
 
         assert!(encoded <= TLS_STORE_HELPER_SIZE_USIZE);
@@ -888,6 +943,33 @@ mod tests {
             "stack adjust must use lea: {mnemonics:?}"
         );
         // Ends with ret 128.
+        assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
+    }
+
+    #[test]
+    fn tls_store_helper_has_an_fxsave_fallback_for_translators() {
+        let mut slot = [0x90_u8; TLS_STORE_HELPER_SIZE_USIZE];
+        let encoded = encode_tls_store_helper(
+            &mut slot,
+            0x1122_3344_5566_7788,
+            [0x28, 0, 0, 0],
+            [0x0b, 0, 0x02, 0xa0],
+            TlsVectorStateSave::Fxsave,
+        );
+
+        assert!(encoded <= TLS_STORE_HELPER_SIZE_USIZE);
+        let mnemonics = decoded_mnemonics(&slot[..encoded]);
+        assert!(
+            mnemonics.contains(&Mnemonic::Fxsave64) && mnemonics.contains(&Mnemonic::Fxrstor64),
+            "fallback must preserve baseline x86-64 vector state: {mnemonics:?}"
+        );
+        assert!(
+            !mnemonics.iter().any(|mnemonic| matches!(
+                mnemonic,
+                Mnemonic::Xgetbv | Mnemonic::Xsave64 | Mnemonic::Xrstor64
+            )),
+            "fallback must not emit instructions rejected by Rosetta: {mnemonics:?}"
+        );
         assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
     }
 

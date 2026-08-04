@@ -1,6 +1,32 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+/// Defines a callback that guest x86-64 code may call directly.
+///
+/// Windows hosts must spell the guest ABI explicitly because their native C ABI is Win64. On
+/// every other supported build target the C ABI is the only portable declaration; non-x86 hosts
+/// compile these entry points for tooling and tests but never execute x86-64 guest code.
+macro_rules! guest_abi_function {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident($($argument:ident: $argument_type:ty),* $(,)?) $(-> $return_type:ty)? $body:block) => {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        $(#[$meta])*
+        $vis extern "sysv64" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        $(#[$meta])*
+        $vis extern "C" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+    };
+    ($(#[$meta:meta])* $vis:vis unsafe fn $name:ident($($argument:ident: $argument_type:ty),* $(,)?) $(-> $return_type:ty)? $body:block) => {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        $(#[$meta])*
+        $vis unsafe extern "sysv64" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
+        $(#[$meta])*
+        $vis unsafe extern "C" fn $name($($argument: $argument_type),*) $(-> $return_type)? $body
+    };
+}
+
 mod agc_acb;
 mod agc_api;
 mod agc_command_abi;
@@ -19,6 +45,7 @@ mod ajm_engine;
 mod ampr;
 mod ampr_api;
 mod audio;
+pub use audio::{HostAudioInfo, probe_host_audio};
 mod audio_out2;
 mod audio_out2_abi;
 mod av;
@@ -40,7 +67,7 @@ mod fiber;
 mod guest_sync;
 mod hid;
 mod kernel_api;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 mod kernel_memory;
 mod link;
 mod memory;
@@ -64,6 +91,8 @@ mod unwind;
 mod vfs;
 mod video_out;
 mod videodec2;
+#[cfg(windows)]
+mod windows_stack;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -71,9 +100,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::CString;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::sync::Once;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use remu_core::GuestAddress;
@@ -91,14 +122,14 @@ pub(crate) use agc_api::{
     AGC_DB_Z_WRITE_BASE_HI, AGC_IT_CLEAR_STATE, AGC_IT_COND_EXEC, AGC_IT_DISPATCH_DIRECT,
     AGC_IT_DISPATCH_INDIRECT, AGC_IT_DMA_DATA, AGC_IT_DRAW_INDEX_2, AGC_IT_DRAW_INDEX_AUTO,
     AGC_IT_DRAW_INDEX_INDIRECT, AGC_IT_DRAW_INDEX_INDIRECT_MULTI, AGC_IT_DRAW_INDEX_OFFSET,
-    AGC_IT_DRAW_INDIRECT, AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE,
-    AGC_IT_INDEX_TYPE, AGC_IT_INDIRECT_BUFFER, AGC_IT_NOP, AGC_IT_NUM_INSTANCES,
-    AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE, AGC_IT_SET_CONTEXT_REG,
-    AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_PREDICATION, AGC_IT_SET_SH_REG,
-    AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX,
-    AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET,
-    AGC_R_ACQUIRE_MEM, AGC_R_CX_REGS_INDIRECT, AGC_R_DMA_DATA, AGC_R_DRAW_INDEX_AUTO,
-    AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_SH_REGS_INDIRECT,
+    AGC_IT_DRAW_INDIRECT, AGC_IT_DRAW_INDIRECT_MULTI, AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE,
+    AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE, AGC_IT_INDIRECT_BUFFER, AGC_IT_NOP,
+    AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE,
+    AGC_IT_SET_CONTEXT_REG, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_PREDICATION,
+    AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG,
+    AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_IT_WAIT_REG_MEM,
+    AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_CX_REGS_INDIRECT, AGC_R_DMA_DATA,
+    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_SH_REGS_INDIRECT,
     AGC_R_UC_REGS_INDIRECT, AGC_R_WAIT_FLIP_DONE, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64,
     AGC_R_WRITE_DATA, AGC_SHADER_SH_REGISTER_COUNT_OFFSET, AGC_SHADER_SH_REGISTERS_OFFSET,
     AGC_SHADER_SPECIALS_OFFSET, AGC_SHADER_TYPE_OFFSET, AGC_SPI_PS_INPUT_CNTL_0,
@@ -154,6 +185,8 @@ pub(crate) use agc_submission::{
 };
 #[cfg(test)]
 pub(crate) use agc_submission::{agc_future_scanout_targets, decode_agc_pipeline_barrier};
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) use ampr_api::AMPR_INVALID_FILE_ID;
 pub(crate) use ampr_api::{
     AMPR_COMMAND_RECORD_SIZE, AprResolveOutputs, ampr_apr_command_buffer_constructor,
     ampr_command_buffer_clear_buffer, ampr_command_buffer_constructor,
@@ -167,7 +200,7 @@ pub(crate) use ampr_api::{
 };
 #[cfg(test)]
 pub(crate) use ampr_api::{
-    AMPR_INVALID_FILE_ID, ampr_command_buffer_record_read, ampr_read_file_to_guest,
+    ampr_command_buffer_record_read, ampr_read_file_to_guest,
     ampr_submit_command_buffer_two_phase_with, join_guest_path,
 };
 pub(crate) use audio_out2::dispatch_audio_out2_import;
@@ -185,7 +218,7 @@ pub(crate) use audio_out2_abi::{
     trace_audio_out2_mastering_memory, trace_audio_out2_memory, trace_audio_out2_pcm,
     write_audio_out2_context_param, write_audio_out2_port_state,
 };
-#[cfg(all(test, target_arch = "x86_64"))]
+#[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use av_player::av_player_nv12_layout;
 #[cfg(test)]
 pub(crate) use av_player::{
@@ -220,7 +253,7 @@ pub(crate) use dialog::{
     save_data_dialog_is_ready_to_display, save_data_dialog_open, save_data_dialog_terminate,
     save_data_dialog_update_status,
 };
-#[cfg(any(test, not(unix)))]
+#[cfg(test)]
 pub(crate) use guest_files::kernel_stat_payload;
 #[cfg(test)]
 pub(crate) use guest_files::{
@@ -256,11 +289,11 @@ pub(crate) use guest_sync::{GUEST_SYNC, GuestSyncState};
 pub(crate) use guest_sync::{
     dispatch_guest_sync_import_at_import, guest_sync, is_guest_sync_import,
 };
-#[cfg(any(test, target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "macos", target_arch = "x86_64")))]
 pub(crate) use guest_sync::{
     guest_mutex_lock, guest_mutex_unlock, guest_rwlock_lock, guest_rwlock_unlock,
 };
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use hid::reset_hid_runtime;
 #[cfg(test)]
 pub(crate) use memory::BATCH_MAP_OPERATION_MAP_DIRECT;
@@ -293,7 +326,7 @@ pub(crate) use np_api::{
     np_universal_data_register_context, np_universal_data_terminate,
 };
 pub(crate) use pad::dispatch_pad_import;
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(test, target_arch = "x86_64"))]
 pub(crate) use pad::reset_pad_runtime;
 #[cfg(test)]
 pub(crate) use pad::{
@@ -393,9 +426,24 @@ unsafe extern "C" {
 }
 
 #[cfg(windows)]
-#[link(name = "ucrt")]
+#[cfg_attr(target_env = "msvc", link(name = "ucrt"))]
+#[cfg_attr(target_env = "gnu", link(name = "msvcrt"))]
 unsafe extern "C" {
     fn _localtime64_s(tm_dest: *mut libc::tm, source_time: *const i64) -> i32;
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut std::ffi::c_void;
+    fn TerminateProcess(process: *mut std::ffi::c_void, exit_code: u32) -> i32;
+    fn ReadProcessMemory(
+        process: *mut std::ffi::c_void,
+        base_address: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        bytes_read: *mut usize,
+    ) -> i32;
 }
 
 /// Returns the number of guest pthread workers that are still executing.
@@ -419,11 +467,11 @@ pub fn active_guest_thread_count() -> usize {
 #[derive(Debug, Default)]
 struct ProbeDispatchState {
     unimplemented_nids: BTreeSet<String>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     kernel_memory: Option<kernel_memory::KernelMemory>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     process_mapping_start: u64,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     process_mapping_end: u64,
     next_thread_unique_id: u64,
     thread_handles: BTreeMap<u64, std::thread::JoinHandle<u64>>,
@@ -834,6 +882,27 @@ const DEFAULT_THREAD_PRIORITY: i32 = 700;
 /// size the title requested; Rosetta plus deep AGC HLE on graphics submit threads needs more than
 /// the console's 16 KiB minimum.
 const HOST_PTHREAD_STACK_FLOOR: usize = 0x20_0000;
+
+/// Commits the Windows stack reservation before this thread enters native PS5 code.
+///
+/// Console binaries use the SysV ABI and therefore do not contain Windows `__chkstk` probes.
+/// A single large guest frame can jump over Windows' one-page guard and fault in an otherwise
+/// adequately reserved thread stack. Native guest-capable threads call this once up front so the
+/// reservation is resident before an unprobed frame moves RSP across it.
+fn prepare_current_guest_thread_stack(role: &str) {
+    #[cfg(windows)]
+    match windows_stack::precommit_current_thread_stack() {
+        Ok(bytes) if trace_guest_sync() => {
+            eprintln!("[REMu][THREAD] committed Windows {role} stack bytes={bytes:#x}");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("[REMu][THREAD] could not commit Windows {role} stack: {error}");
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = role;
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PthreadAttrState {
@@ -1369,9 +1438,9 @@ static NEXT_NP_WEB_API2_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static GUEST_EXCEPTION_DELIVERY: OnceLock<Mutex<GuestExceptionDeliveryState>> = OnceLock::new();
 
 static GUEST_EXCEPTION_PENDING: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 static KERNEL_MEMORY_READABLE_RANGES: OnceLock<RwLock<Arc<[(u64, u64)]>>> = OnceLock::new();
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 static KERNEL_MEMORY_READABLE_RANGES_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1462,6 +1531,7 @@ thread_local! {
     static CURRENT_GUEST_THREAD_POINTER: Cell<u64> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_HANDLE: Cell<u64> = const { Cell::new(0) };
     static CURRENT_GUEST_THREAD_UNIQUE_ID: Cell<u32> = const { Cell::new(0) };
+    #[cfg(target_arch = "x86_64")]
     static CURRENT_GUEST_THREAD_EXIT_CONTEXT: Cell<*mut GuestThreadExitContext> = const { Cell::new(std::ptr::null_mut()) };
     static GUEST_PTHREAD_SPECIFIC: RefCell<[(u64, u64); 256]> = const { RefCell::new([(0, 0); 256]) };
     static IMPORT_TELEMETRY_CACHE: RefCell<Option<(usize, Arc<ImportTelemetry>)>> = const { RefCell::new(None) };
@@ -1536,8 +1606,10 @@ fn cached_import_telemetry() -> *const ImportTelemetry {
     })
 }
 
-extern "C" fn current_guest_thread_pointer() -> u64 {
-    CURRENT_GUEST_THREAD_POINTER.get()
+guest_abi_function! {
+    fn current_guest_thread_pointer() -> u64 {
+        CURRENT_GUEST_THREAD_POINTER.get()
+    }
 }
 
 fn set_current_guest_thread_pointer(thread_pointer: u64) {
@@ -1635,6 +1707,7 @@ fn guest_thread_unique_id_key() -> Option<libc::pthread_key_t> {
     (key < GUEST_THREAD_UNIQUE_ID_KEY_FAILED).then_some(key as libc::pthread_key_t)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Debug, Default)]
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
@@ -1649,7 +1722,7 @@ struct GuestThreadExitContext {
 /// after their non-returning exit import. Calling host `pthread_exit` would bypass Rust's thread
 /// closure and abort the process. This boundary instead restores its own callee-saved frame and
 /// lets the Rust wrapper complete normally with the guest-supplied return value.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn invoke_guest_entry_with_exit_boundary(
@@ -1686,11 +1759,83 @@ unsafe extern "C" fn invoke_guest_entry_with_exit_boundary(
     );
 }
 
-#[cfg(target_arch = "x86_64")]
+/// Enters System V guest code from a native Microsoft x64 caller.
+///
+/// Windows additionally makes RDI, RSI, and XMM6-XMM15 nonvolatile. The guest ABI may freely
+/// clobber those registers, so the boundary retains them alongside the state both ABIs share.
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+unsafe extern "C" fn invoke_guest_entry_with_exit_boundary(
+    _entry: u64,
+    _argument0: u64,
+    _argument1: u64,
+    _context: *mut GuestThreadExitContext,
+) -> u64 {
+    core::arch::naked_asm!(
+        "push rbp",
+        "mov rbp, rsp",
+        "push rbx",
+        "push rdi",
+        "push rsi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "sub rsp, 0xa8",
+        "movdqu [rsp + 0x00], xmm6",
+        "movdqu [rsp + 0x10], xmm7",
+        "movdqu [rsp + 0x20], xmm8",
+        "movdqu [rsp + 0x30], xmm9",
+        "movdqu [rsp + 0x40], xmm10",
+        "movdqu [rsp + 0x50], xmm11",
+        "movdqu [rsp + 0x60], xmm12",
+        "movdqu [rsp + 0x70], xmm13",
+        "movdqu [rsp + 0x80], xmm14",
+        "movdqu [rsp + 0x90], xmm15",
+        "mov [r9], rsp",
+        "lea rax, [rip + 2f]",
+        "mov [r9 + 8], rax",
+        "mov r10, rcx",
+        "mov rdi, rdx",
+        "mov rsi, r8",
+        "call r10",
+        "2:",
+        "movdqu xmm6, [rsp + 0x00]",
+        "movdqu xmm7, [rsp + 0x10]",
+        "movdqu xmm8, [rsp + 0x20]",
+        "movdqu xmm9, [rsp + 0x30]",
+        "movdqu xmm10, [rsp + 0x40]",
+        "movdqu xmm11, [rsp + 0x50]",
+        "movdqu xmm12, [rsp + 0x60]",
+        "movdqu xmm13, [rsp + 0x70]",
+        "movdqu xmm14, [rsp + 0x80]",
+        "movdqu xmm15, [rsp + 0x90]",
+        "add rsp, 0xa8",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rsi",
+        "pop rdi",
+        "pop rbx",
+        "pop rbp",
+        "ret",
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", not(windows)))]
 #[unsafe(no_mangle)]
 #[unsafe(naked)]
 unsafe extern "C" fn escape_guest_entry(_context: *const GuestThreadExitContext, _value: u64) -> ! {
     core::arch::naked_asm!("mov rsp, [rdi]", "mov rax, rsi", "jmp [rdi + 8]",);
+}
+
+#[cfg(all(target_arch = "x86_64", windows))]
+#[unsafe(no_mangle)]
+#[unsafe(naked)]
+unsafe extern "C" fn escape_guest_entry(_context: *const GuestThreadExitContext, _value: u64) -> ! {
+    core::arch::naked_asm!("mov rsp, [rcx]", "mov rax, rdx", "jmp [rcx + 8]",);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1721,12 +1866,12 @@ fn guest_pthread_exit(value: u64) -> ! {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn guest_pthread_exit(_value: u64) -> ! {
-    unreachable!("guest pthread execution requires an x86-64 host process")
+    unreachable!("guest pthread execution requires a supported x86-64 System V boundary")
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 fn invoke_guest_entry_with_exit(_entry: u64, _argument0: u64, _argument1: u64) -> u64 {
-    unreachable!("guest pthread execution requires an x86-64 host process")
+    unreachable!("guest entry requires a supported x86-64 System V boundary")
 }
 
 fn allocate_pthread_thread_object(state: &mut ProbeDispatchState, name: &str) -> Option<u64> {
@@ -1793,6 +1938,7 @@ fn spawn_guest_capable_thread(
         .name(trace_name.clone())
         .stack_size(HOST_PTHREAD_STACK_FLOOR)
         .spawn(move || {
+            prepare_current_guest_thread_stack("guest-capable worker");
             set_current_guest_thread_handle(handle);
             set_current_guest_thread_unique_id(unique_id);
             set_current_guest_thread_name(Some(trace_name));
@@ -1901,6 +2047,9 @@ fn run_av_player_controller() {
     // publishes without signalling still has its callback delivered.
     const IDLE_POLL: Duration = Duration::from_millis(250);
     let controller = av_player_controller();
+    if av_player::av_player_trace_enabled() {
+        eprintln!("[REMu][AVPLAYER] controller worker entered");
+    }
     loop {
         {
             let mut signal = controller
@@ -1928,6 +2077,12 @@ fn run_av_player_controller() {
             let mut state = lock_probe_dispatch_for_write(dispatch);
             take_av_player_controller_callbacks(&mut state)
         };
+        if !callbacks.is_empty() && av_player::av_player_trace_enabled() {
+            eprintln!(
+                "[REMu][AVPLAYER] controller dequeued {} callback(s)",
+                callbacks.len()
+            );
+        }
         for callback in callbacks {
             controller
                 .signal
@@ -2032,7 +2187,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         Arc::new(ImportTelemetry::new(nids, maximum_hits));
     IMPORT_TELEMETRY_GENERATION.fetch_add(1, Ordering::Release);
     state.unimplemented_nids.clear();
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         state.kernel_memory = None;
         *KERNEL_MEMORY_READABLE_RANGES
@@ -2114,6 +2269,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.json_runtime = JsonRuntimeState::default();
     state.av_player = AvPlayerRuntimeState::default();
     state.services = RuntimeServiceState::default();
+    #[cfg(any(test, target_arch = "x86_64"))]
     reset_pad_runtime();
     #[cfg(any(test, target_arch = "x86_64"))]
     reset_hid_runtime();
@@ -2788,6 +2944,9 @@ fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame) {
         "[REMu][KERNEL] delivering cooperative exception target={thread:#x} type={} handler={:#x} rip={:#x} rsp={:#x}",
         pending.exception, pending.handler, frame.guest_return_address, frame.guest_rsp,
     );
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type GuestExceptionHandler = unsafe extern "sysv64" fn(i32, *mut u8);
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     type GuestExceptionHandler = unsafe extern "C" fn(i32, *mut u8);
     // SAFETY: The process installed this mapped executable guest handler for the requested signal.
     // Delivery runs at an import boundary on the target's own native thread, so its guest TLS and
@@ -2803,10 +2962,11 @@ fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame) {
         .remove(&thread);
 }
 
-#[cfg(target_arch = "x86_64")]
-#[unsafe(naked)]
-unsafe extern "C" fn import_dispatch_trampoline() {
-    core::arch::naked_asm!(
+guest_abi_function! {
+    #[cfg(target_arch = "x86_64")]
+    #[unsafe(naked)]
+    unsafe fn import_dispatch_trampoline() {
+        core::arch::naked_asm!(
         "sub rsp, 0xe0",
         "mov [rsp + 0x00], rdi",
         "mov [rsp + 0x08], rsi",
@@ -2837,7 +2997,8 @@ unsafe extern "C" fn import_dispatch_trampoline() {
         "add rsp, 8",
         "ret",
         dispatch = sym import_dispatch_entry,
-    );
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]
@@ -2846,10 +3007,11 @@ const TEST_CAPTURE_DISPATCH_INDEX: u64 = i32::MAX as u64;
 #[cfg(all(test, target_arch = "x86_64"))]
 static TEST_CAPTURED_IMPORT_FRAME: Mutex<Option<ImportCallFrame>> = Mutex::new(None);
 
-#[cfg(all(test, target_arch = "x86_64"))]
-#[unsafe(naked)]
-unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
-    core::arch::naked_asm!(
+guest_abi_function! {
+    #[cfg(all(test, target_arch = "x86_64"))]
+    #[unsafe(naked)]
+    unsafe fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
+        core::arch::naked_asm!(
         "mov r11, rdi",
         "push rbx",
         "mov rbx, 0x7172737475767778",
@@ -2879,7 +3041,8 @@ unsafe extern "C" fn invoke_test_import_stub(_stub: u64) -> ProbeImportReturn {
         "call r11",
         "pop rbx",
         "ret",
-    );
+        );
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
@@ -3014,7 +3177,13 @@ static IMPORT_CALL_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Guards the one-time process-wide condition summary printed with the first stall report.
 static STALL_SNAPSHOT_EMITTED: AtomicBool = AtomicBool::new(false);
 
-extern "C" fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
+guest_abi_function! {
+    fn import_dispatch_entry(frame: *const ImportCallFrame) -> ProbeImportReturn {
+        import_dispatch_entry_impl(frame)
+    }
+}
+
+fn import_dispatch_entry_impl(frame: *const ImportCallFrame) -> ProbeImportReturn {
     let _guest_import_trace = (!frame.is_null())
         // SAFETY: the import trampoline supplies one live frame for the complete dispatch.
         .then(|| GuestImportTraceGuard::enter(unsafe { &*frame }))
@@ -3149,6 +3318,9 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             float: low_xmm_f64(frame.xmm_arguments[7]),
         };
     }
+    #[cfg(windows)]
+    let _diagnostic_direct_write_rearm =
+        memory::diagnostic_direct_write_rearm(frame.dispatch_index, frame.guest_return_address);
     deliver_pending_guest_exception_at_import(frame);
     let call_args = frame.integer_arguments;
     let float_argument0 = low_xmm_f64(frame.xmm_arguments[0]);
@@ -3626,10 +3798,19 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
                 posix,
             ));
         };
-        let object = state.pthread_threads.remove(&thread_id);
-        state.thread_attributes.remove(&call_args[0]);
+        // Keep the guest-visible thread object and attributes registered while joining. The
+        // target remains live until its entry function returns and may query its own attributes
+        // after another thread has already entered scePthreadJoin (Dreaming Sarah does this
+        // during its main-worker bootstrap).
         drop(state);
         let return_value = handle.join().unwrap_or(u64::MAX);
+        let object = if let Some(dispatch) = PROBE_DISPATCH.get() {
+            let mut state = lock_probe_dispatch_for_write(dispatch);
+            state.thread_attributes.remove(&thread_id);
+            state.pthread_threads.remove(&thread_id)
+        } else {
+            None
+        };
         if let Some(object) = object {
             guest_free(object.handle);
         }
@@ -4043,7 +4224,7 @@ fn dispatch_kernel_fd_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
 }
 
 #[cfg(target_arch = "x86_64")]
-type GuestModuleInitializer = unsafe extern "C" fn(u64, u64, u64) -> i32;
+type GuestModuleInitializer = unsafe extern "sysv64" fn(u64, u64, u64) -> i32;
 
 #[cfg(target_arch = "x86_64")]
 fn invoke_guest_module_initializers(
@@ -4230,9 +4411,9 @@ fn kernel_dlsym(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     };
     let hle_target = match symbol.as_str() {
         "scriptingGetMem" => scripting_get_mem as *const () as usize as u64,
-        "scriptingFreeMem" => libc::free as *const () as usize as u64,
-        "scriptingRealloc" => libc::realloc as *const () as usize as u64,
-        "scriptingCalloc" => libc::calloc as *const () as usize as u64,
+        "scriptingFreeMem" => scripting_free_mem as *const () as usize as u64,
+        "scriptingRealloc" => scripting_realloc as *const () as usize as u64,
+        "scriptingCalloc" => scripting_calloc as *const () as usize as u64,
         _ => 0,
     };
     let handle = low_u32(arguments[0]);
@@ -4380,8 +4561,28 @@ fn kernel_module_info_from_addr(arguments: [u64; 6], state: &ProbeDispatchState)
     0
 }
 
-extern "C" fn scripting_get_mem(alignment: u64, size: u64) -> u64 {
-    guest_aligned_alloc(alignment, size)
+guest_abi_function! {
+    fn scripting_get_mem(alignment: u64, size: u64) -> u64 {
+        guest_aligned_alloc(alignment, size)
+    }
+}
+
+guest_abi_function! {
+    fn scripting_free_mem(pointer: u64) {
+        guest_free(pointer);
+    }
+}
+
+guest_abi_function! {
+    fn scripting_realloc(pointer: u64, size: u64) -> u64 {
+        guest_realloc(pointer, size)
+    }
+}
+
+guest_abi_function! {
+    fn scripting_calloc(count: u64, size: u64) -> u64 {
+        guest_calloc(count, size)
+    }
 }
 
 fn kernel_install_exception_handler(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
@@ -4640,6 +4841,7 @@ fn dispatch_stateless_import(
         "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => 0,
         "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
+        "eLdDw6l0-bU" => guest_snprintf(arguments),
         "tcVi5SivF7Q" => guest_sprintf(arguments),
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
         "3GPpjQdAMTw" => guest_guard_acquire(arguments[0]),
@@ -5045,6 +5247,7 @@ fn dispatch_probe_import(
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
         // Preserve the SysV variadic register layout for the integer/pointer formats used by the
         // game's asset path builder. Floating-point varargs require a wider import frame later.
+        "eLdDw6l0-bU" => guest_snprintf(arguments),
         "tcVi5SivF7Q" => guest_sprintf(arguments),
         // libc fputs
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
@@ -6051,6 +6254,9 @@ fn take_exit_callbacks(
 fn invoke_guest_exit_callbacks(callbacks: Vec<GuestExitCallback>) {
     for callback in callbacks {
         if let Some(argument) = callback.argument {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            type Destructor = unsafe extern "sysv64" fn(u64);
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
             type Destructor = unsafe extern "C" fn(u64);
             // SAFETY: The guest registered a live Itanium destructor function and its opaque
             // argument. It remains executable until the corresponding module is finalized.
@@ -6058,6 +6264,9 @@ fn invoke_guest_exit_callbacks(callbacks: Vec<GuestExitCallback>) {
             // SAFETY: The registration defines the function and argument ABI above.
             unsafe { destructor(argument) };
         } else {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            type Callback = unsafe extern "sysv64" fn();
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
             type Callback = unsafe extern "C" fn();
             // SAFETY: C atexit registers a live no-argument callback in guest executable memory.
             let callback: Callback = unsafe { std::mem::transmute(callback.function) };
@@ -7494,7 +7703,34 @@ impl GuestMemoryReader for ProcessGuestMemory {
             }
             complete
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(windows)]
+        {
+            let Ok(source) = usize::try_from(address) else {
+                return false;
+            };
+            if source == 0 {
+                return false;
+            }
+            let mut copied = 0_usize;
+            // SAFETY: the destination is the live output slice. ReadProcessMemory validates the
+            // complete source span in this process and fails instead of dereferencing an invalid
+            // guest pointer.
+            let succeeded = unsafe {
+                ReadProcessMemory(
+                    GetCurrentProcess(),
+                    source as *const std::ffi::c_void,
+                    output.as_mut_ptr().cast(),
+                    output.len(),
+                    &raw mut copied,
+                )
+            };
+            let complete = succeeded != 0 && copied == output.len();
+            if complete {
+                apply_agc_memory_shadow(address, output);
+            }
+            complete
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         {
             let _ = address;
             false
@@ -7546,8 +7782,10 @@ pub(crate) fn process_guest_range_has_read_access(address: u64, length: usize) -
     }
 }
 
-extern "C" fn guest_locale_virtual_noop(locale: u64) -> u64 {
-    locale
+guest_abi_function! {
+    fn guest_locale_virtual_noop(locale: u64) -> u64 {
+        locale
+    }
 }
 
 fn guest_global_locale(state: &mut ProbeDispatchState) -> u64 {
@@ -7581,6 +7819,7 @@ fn run_guest_thread(entry: u64, argument: u64) -> u64 {
     if entry == 0 {
         return 0;
     }
+    prepare_current_guest_thread_stack("pthread");
     invoke_guest_entry_with_exit(entry, argument, 0)
 }
 
@@ -8150,15 +8389,11 @@ unsafe fn host_strcasecmp(left: *const libc::c_char, right: *const libc::c_char)
     unsafe { libc::strcasecmp(left, right) }
 }
 
-#[cfg(windows)]
+#[cfg(not(unix))]
 unsafe fn host_strcasecmp(left: *const libc::c_char, right: *const libc::c_char) -> i32 {
-    // SAFETY: caller supplies two NUL-terminated C strings; MSVC exports `_stricmp`.
-    unsafe { libc::stricmp(left, right) }
-}
-
-#[cfg(not(any(unix, windows)))]
-unsafe fn host_strcasecmp(left: *const libc::c_char, right: *const libc::c_char) -> i32 {
-    // SAFETY: caller supplies two NUL-terminated C strings.
+    // SAFETY: caller supplies two NUL-terminated C strings. Keep this implementation local so
+    // both the GNU and MSVC Windows targets have identical behavior without depending on which C
+    // runtime happens to export `_stricmp`.
     unsafe {
         let mut left = left;
         let mut right = right;
@@ -8222,8 +8457,11 @@ fn guest_qsort(arguments: [u64; 6]) -> u64 {
     };
     // The guest comparator is native x86-64 code in this Rosetta process. Dropping the dispatcher
     // lock before entering this function permits a comparator that itself crosses an import stub.
-    let compare: unsafe extern "C" fn(*const u8, *const u8) -> i32 =
-        unsafe { std::mem::transmute(comparator) };
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type Compare = unsafe extern "sysv64" fn(*const u8, *const u8) -> i32;
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
+    type Compare = unsafe extern "C" fn(*const u8, *const u8) -> i32;
+    let compare: Compare = unsafe { std::mem::transmute(comparator) };
     let mut key = vec![0_u8; size];
     for index in 1..count {
         // SAFETY: qsort's ABI guarantees a writable `count * size` byte range at `base`.
@@ -8475,6 +8713,33 @@ fn guest_sprintf(arguments: [u64; 6]) -> u64 {
             arguments[0] as *mut libc::c_char,
             arguments[1] as *const libc::c_char,
             arguments[2],
+            arguments[3],
+            arguments[4],
+            arguments[5],
+        )
+    })
+}
+
+/// Formats the integer/pointer subset of the guest `snprintf` ABI through the host C runtime.
+///
+/// The import trampoline has already converted the SysV guest call into six captured integer
+/// argument slots. Re-emitting those slots as C varargs preserves pointers and the low bits of
+/// promoted integers on every x86-64 host ABI. Floating-point conversions need captured XMM
+/// varargs and deliberately remain outside this helper rather than being silently misformatted.
+fn guest_snprintf(arguments: [u64; 6]) -> u64 {
+    if arguments[2] == 0 || (arguments[0] == 0 && arguments[1] != 0) {
+        return u64::MAX;
+    }
+    let Ok(capacity) = usize::try_from(arguments[1]) else {
+        return u64::MAX;
+    };
+    // SAFETY: snprintf's guest ABI supplies `capacity` writable destination bytes (or permits a
+    // null destination when capacity is zero), a C format string, and integer/pointer varargs.
+    signed_i32_return(unsafe {
+        libc::snprintf(
+            arguments[0] as *mut libc::c_char,
+            capacity,
+            arguments[2] as *const libc::c_char,
             arguments[3],
             arguments[4],
             arguments[5],
@@ -8819,6 +9084,7 @@ fn probe_entry(
     if let Err(error) = sha_ni::install_sha_ni_sigill_recovery() {
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");
     }
+    prepare_current_guest_thread_stack("main guest");
     trace_linked_guest_code(image);
     trace_linked_guest_references(image);
     start_abi_gap_reporter();
@@ -8865,11 +9131,13 @@ const fn probe_entry(
     Err(LinkError::ProbeRequiresX86_64)
 }
 
-#[cfg(target_arch = "x86_64")]
-extern "C" fn guest_exit(code: i32) {
-    eprintln!("[REMu][PROBE] guest exit handler called with code {code}");
-    run_all_guest_exit_callbacks();
-    terminate_probe(code);
+guest_abi_function! {
+    #[cfg(target_arch = "x86_64")]
+    fn guest_exit(code: i32) {
+        eprintln!("[REMu][PROBE] guest exit handler called with code {code}");
+        run_all_guest_exit_callbacks();
+        terminate_probe(code);
+    }
 }
 
 /// Prints the shader opcode histogram accumulated by this run, one `[REMu][SHADER-OPCODES]` line
@@ -9166,73 +9434,111 @@ fn report_diagnostic_stall_attribution() {
         .get()
         .and_then(|dispatch| dispatch.try_read().ok())
         .map(|state| state.agc_completion_telemetry.clone());
-    let (_h, events) = event_state::lock_event_state_for_read();
-    let pending_graphics_range = events
-        .pending_agc_completions
-        .front()
-        .map(|&(sequence, _)| sequence)
-        .zip(
-            events
-                .pending_agc_completions
-                .back()
-                .map(|&(sequence, _)| sequence),
-        );
-    let pending_compute_range = events
-        .pending_agc_user_interrupts
-        .front()
-        .copied()
-        .zip(events.pending_agc_user_interrupts.back().copied());
-    let pending_graphics_notifications = events
-        .pending_events
-        .iter()
-        .map(|event| u64::from(event.agc_graphics_completions))
-        .sum::<u64>();
-    let pending_user_interrupts = events
-        .pending_events
-        .iter()
-        .map(|event| u64::from(event.agc_user_interrupts))
-        .sum::<u64>();
-    let graphics_registrations = events
-        .kernel_event_registrations
-        .keys()
-        .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
-        .count();
-    let user_interrupt_registrations = events
-        .kernel_event_registrations
-        .keys()
-        .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
-        .count();
-    if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
-        eprintln!(
-            "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
-            submission_count,
-            backend_unclaimed.len(),
-            events.pending_agc_completions.len(),
-            events.pending_agc_user_interrupts.len(),
-            telemetry.refreshed_graphics,
-            telemetry.last_refreshed_graphics,
-            telemetry.refreshed_compute,
-            telemetry.last_refreshed_compute,
-            telemetry.queued_graphics_notifications,
-            telemetry.delivered_graphics_notifications,
-            telemetry.cancelled_graphics_notifications,
-            pending_graphics_notifications,
-            telemetry.queued_user_interrupts,
-            telemetry.delivered_user_interrupts,
-            telemetry.cancelled_user_interrupts,
-            pending_user_interrupts,
-            telemetry.missing_graphics_registration,
-            telemetry.missing_user_interrupt_registration,
-            telemetry.unmatched_backend_ids,
-            telemetry.last_unmatched_backend_id,
-        );
+    let video_progress = PROBE_DISPATCH
+        .get()
+        .and_then(|dispatch| dispatch.try_read().ok())
+        .map(|state| {
+            let last_completed_flip = state.video_out.last_completed_flip.map(|flip| {
+                (
+                    flip.buffer_index,
+                    flip.flip_argument,
+                    flip.process_time_counter,
+                )
+            });
+            (
+                state.video_out.completed_flip_count,
+                state.video_out.flip_events.len(),
+                state.video_out.vblank_events.len(),
+                last_completed_flip,
+            )
+        });
+    if let Some((_h, events)) = event_state::try_lock_event_state_for_read() {
+        let pending_graphics_range = events
+            .pending_agc_completions
+            .front()
+            .map(|&(sequence, _)| sequence)
+            .zip(
+                events
+                    .pending_agc_completions
+                    .back()
+                    .map(|&(sequence, _)| sequence),
+            );
+        let pending_compute_range = events
+            .pending_agc_user_interrupts
+            .front()
+            .copied()
+            .zip(events.pending_agc_user_interrupts.back().copied());
+        let pending_graphics_notifications = events
+            .pending_events
+            .iter()
+            .map(|event| u64::from(event.agc_graphics_completions))
+            .sum::<u64>();
+        let pending_user_interrupts = events
+            .pending_events
+            .iter()
+            .map(|event| u64::from(event.agc_user_interrupts))
+            .sum::<u64>();
+        let graphics_registrations = events
+            .kernel_event_registrations
+            .keys()
+            .filter(|(_, filter, _)| *filter == KERNEL_EVENT_FILTER_GRAPHICS)
+            .count();
+        let user_interrupt_registrations = events
+            .kernel_event_registrations
+            .keys()
+            .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
+            .count();
+        if let Some((
+            completed_flips,
+            flip_event_registrations,
+            vblank_event_registrations,
+            last_completed_flip,
+        )) = video_progress
+        {
+            eprintln!(
+                "[REMu][STALL-VIDEO] completed_flips={} runtime_pending={} backend_pending={gpu_flips} flip_event_registrations={} vblank_event_registrations={} last_completed={last_completed_flip:?}",
+                completed_flips,
+                events.pending_video_out_flips.len(),
+                flip_event_registrations,
+                vblank_event_registrations,
+            );
+        }
+        if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
+            eprintln!(
+                "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
+                submission_count,
+                backend_unclaimed.len(),
+                events.pending_agc_completions.len(),
+                events.pending_agc_user_interrupts.len(),
+                telemetry.refreshed_graphics,
+                telemetry.last_refreshed_graphics,
+                telemetry.refreshed_compute,
+                telemetry.last_refreshed_compute,
+                telemetry.queued_graphics_notifications,
+                telemetry.delivered_graphics_notifications,
+                telemetry.cancelled_graphics_notifications,
+                pending_graphics_notifications,
+                telemetry.queued_user_interrupts,
+                telemetry.delivered_user_interrupts,
+                telemetry.cancelled_user_interrupts,
+                pending_user_interrupts,
+                telemetry.missing_graphics_registration,
+                telemetry.missing_user_interrupt_registration,
+                telemetry.unmatched_backend_ids,
+                telemetry.last_unmatched_backend_id,
+            );
+        } else {
+            eprintln!(
+                "[REMu][STALL-AGC] runtime=unavailable-or-dispatch-busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
+                backend_unclaimed.len(),
+            );
+        }
     } else {
         eprintln!(
-            "[REMu][STALL-AGC] runtime=unavailable-or-dispatch-busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
+            "[REMu][STALL-AGC] event_state=busy backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?}",
             backend_unclaimed.len(),
         );
     }
-    drop(events);
     guest_sync::report_condition_stall_attribution();
 
     let dispatch_state = PROBE_DISPATCH
@@ -9319,10 +9625,40 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
                 return;
             }
             eprintln!("[REMu] diagnostic time limit of {timeout_seconds}s reached");
+            std::thread::Builder::new()
+                .name("remu-timeout-hard-stop".to_owned())
+                .spawn(|| {
+                    // Diagnostics deliberately inspect live runtime state. Even their try-lock
+                    // paths may encounter an unforeseen OS or driver stall, so retain a hard,
+                    // bounded backstop after giving the report time to flush.
+                    std::thread::sleep(Duration::from_secs(2));
+                    hard_terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
+                })
+                .ok();
             report_diagnostic_stall_attribution();
             terminate_probe(DIAGNOSTIC_TIMEOUT_EXIT_STATUS);
         })
         .ok();
+}
+
+fn hard_terminate_probe(code: i32) -> ! {
+    #[cfg(windows)]
+    // SAFETY: the normal diagnostic termination path has already stalled. TerminateProcess is the
+    // Windows equivalent of `_exit` and does not unwind through live guest or driver frames.
+    unsafe {
+        let exit_code = u32::try_from(code).unwrap_or(u32::MAX);
+        let _ = TerminateProcess(GetCurrentProcess(), exit_code);
+        std::process::abort();
+    }
+
+    #[cfg(unix)]
+    // SAFETY: this is the final backstop for an isolated CLI probe whose reporting path wedged.
+    unsafe {
+        libc::_exit(code);
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    std::process::exit(code)
 }
 
 fn terminate_probe(code: i32) -> ! {

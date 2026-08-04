@@ -1,16 +1,23 @@
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
+#[cfg(any(target_os = "macos", windows))]
 use std::sync::atomic::Ordering;
 #[cfg(target_os = "macos")]
 use std::sync::{Arc, RwLock};
+#[cfg(windows)]
+use std::sync::{Mutex, OnceLock};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 use remu_core::GuestAddress;
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+use remu_memory::CpuWriteWatch;
+#[cfg(any(target_os = "macos", windows))]
 use remu_memory::{AddressSpaceError, GUEST_PAGE_SIZE, GuestMapCoalescing, GuestMapPlacement};
 
 #[cfg(target_os = "macos")]
+use crate::{KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION};
+#[cfg(any(target_os = "macos", windows))]
 use crate::{
-    KERNEL_MEMORY_READABLE_RANGES, KERNEL_MEMORY_READABLE_RANGES_GENERATION,
     MACOS_GUEST_PAGE_ALIGNMENT, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_OUT_OF_MEMORY,
     SCE_KERNEL_ERROR_PERMISSION_DENIED, SCE_KERNEL_ERROR_TRY_AGAIN, align_up_u64, guest_memset,
     kernel_memory, low_i32, read_guest_u8, read_guest_u32, read_guest_u64, trace_guest_vm,
@@ -21,7 +28,7 @@ use crate::{
     SCE_KERNEL_ERROR_NOT_FOUND, read_guest_cstring, sce_kernel_error,
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_memory_mut(
     state: &mut ProbeDispatchState,
 ) -> Result<&mut kernel_memory::KernelMemory, kernel_memory::KernelMemoryError> {
@@ -44,7 +51,332 @@ fn refresh_kernel_memory_readable_ranges(memory: &kernel_memory::KernelMemory) {
     KERNEL_MEMORY_READABLE_RANGES_GENERATION.fetch_add(1, Ordering::Release);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+#[inline]
+fn refresh_kernel_memory_readable_ranges(_memory: &kernel_memory::KernelMemory) {
+    // Only the macOS Mach-read and Metal shader-cache paths consume this snapshot. Rebuilding it
+    // for every Windows alias made titles with thousands of small direct mappings quadratic even
+    // though the D3D12 path validates guest ranges through the address-space registry directly.
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct DiagnosticDirectRange {
+    start: u64,
+    byte_count: u64,
+}
+
+#[cfg(windows)]
+fn parse_diagnostic_number(value: &str) -> Option<u64> {
+    let value = value.trim();
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hexadecimal| u64::from_str_radix(hexadecimal, 16).ok(),
+        )
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_range() -> Option<DiagnosticDirectRange> {
+    static RANGE: OnceLock<Option<DiagnosticDirectRange>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let value = std::env::var("REMU_WATCH_DIRECT_RANGE").ok()?;
+        let (start, byte_count) = value
+            .split_once(':')
+            .map_or((value.as_str(), "0x10000"), |(start, length)| {
+                (start, length)
+            });
+        let start = parse_diagnostic_number(start)?;
+        let byte_count = parse_diagnostic_number(byte_count)?;
+        (byte_count != 0 && start.checked_add(byte_count).is_some())
+            .then_some(DiagnosticDirectRange { start, byte_count })
+    })
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_thread() -> Option<&'static str> {
+    static THREAD: OnceLock<Option<String>> = OnceLock::new();
+    THREAD
+        .get_or_init(|| {
+            std::env::var("REMU_WATCH_DIRECT_THREAD")
+                .ok()
+                .filter(|name| !name.is_empty())
+        })
+        .as_deref()
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_value_offset() -> Option<u64> {
+    static OFFSET: OnceLock<Option<u64>> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        std::env::var("REMU_WATCH_DIRECT_VALUE_OFFSET")
+            .ok()
+            .and_then(|value| parse_diagnostic_number(&value))
+    })
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_precise() -> bool {
+    static PRECISE: OnceLock<bool> = OnceLock::new();
+    *PRECISE.get_or_init(|| {
+        std::env::var_os("REMU_WATCH_DIRECT_PRECISE").is_some_and(|value| value == "1")
+    })
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct DiagnosticDirectWatch {
+    watch: CpuWriteWatch,
+    value_address: Option<u64>,
+    last_value: Option<u64>,
+    pointee_watch: Option<CpuWriteWatch>,
+    pointee_address: Option<u64>,
+    pointee_last_value: Option<u64>,
+}
+
+#[cfg(windows)]
+fn diagnostic_direct_watches() -> &'static Mutex<Vec<DiagnosticDirectWatch>> {
+    static WATCHES: OnceLock<Mutex<Vec<DiagnosticDirectWatch>>> = OnceLock::new();
+    WATCHES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+#[cfg(windows)]
+fn watch_diagnostic_direct_mapping(direct_start: u64, mapped: u64, byte_count: u64) {
+    static THREAD_WATCH_CLAIMED: AtomicBool = AtomicBool::new(false);
+    let Some(direct_end) = direct_start.checked_add(byte_count) else {
+        return;
+    };
+    let current_thread = crate::current_guest_thread_name();
+    let thread_match = diagnostic_direct_thread().is_some_and(|name| {
+        // Keep the opt-in watch bounded: allocator metadata mappings are 64 KiB, while render
+        // targets can span hundreds of MiB and are unsuitable for import-boundary reprotection.
+        current_thread == name && byte_count <= 0x1_0000
+    });
+    let range_overlap = diagnostic_direct_range().and_then(|target| {
+        let target_end = target.start + target.byte_count;
+        let start = direct_start.max(target.start);
+        let end = direct_end.min(target_end);
+        (start < end).then_some((start, end))
+    });
+    let (overlap_start, overlap_end) = if thread_match {
+        if THREAD_WATCH_CLAIMED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        (direct_start, direct_end)
+    } else if let Some(overlap) = range_overlap {
+        overlap
+    } else {
+        return;
+    };
+    let Some(address) = mapped.checked_add(overlap_start - direct_start) else {
+        return;
+    };
+    let watch_byte_count = overlap_end - overlap_start;
+    // SAFETY: this runs immediately after map_direct_with_options created the shared guest
+    // mapping. Address-space replacement retires the watch before invalidating that mapping.
+    let result = if diagnostic_direct_precise() {
+        unsafe { CpuWriteWatch::new_precise(address, watch_byte_count) }
+    } else {
+        unsafe { CpuWriteWatch::new(address, watch_byte_count) }
+    };
+    match result {
+        Ok(watch) => {
+            if diagnostic_direct_precise()
+                && !remu_memory::watch_guest_shared_backing_writes(address, watch_byte_count)
+            {
+                eprintln!(
+                    "[REMu][JOURNAL] could not resolve physical backing for precise watch address={address:#x} length={watch_byte_count:#x}"
+                );
+            }
+            let value_address = diagnostic_direct_value_offset().and_then(|offset| {
+                (offset.checked_add(8)? <= watch_byte_count).then(|| address + offset)
+            });
+            let last_value = value_address.map(|value_address| {
+                // SAFETY: the diagnostic offset was checked against the retained live watch.
+                unsafe { std::ptr::read_unaligned(value_address as *const u64) }
+            });
+            if let Some(value_address) = value_address {
+                let _ = watch.set_diagnostic_sample(value_address);
+            }
+            eprintln!(
+                "[REMu][JOURNAL] watching direct={overlap_start:#x} address={address:#x} length={watch_byte_count:#x} thread={current_thread:?} value_address={value_address:#x?} initial={last_value:#x?}"
+            );
+            diagnostic_direct_watches()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(DiagnosticDirectWatch {
+                    watch,
+                    value_address,
+                    last_value,
+                    pointee_watch: None,
+                    pointee_address: None,
+                    pointee_last_value: None,
+                });
+        }
+        Err(error) => {
+            if thread_match {
+                THREAD_WATCH_CLAIMED.store(false, Ordering::Release);
+            }
+            eprintln!(
+                "[REMu][JOURNAL] could not watch direct={overlap_start:#x} address={address:#x} length={watch_byte_count:#x}: {error}"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct DiagnosticDirectWriteRearm {
+    dispatch_index: u64,
+    return_address: u64,
+}
+
+#[cfg(windows)]
+impl Drop for DiagnosticDirectWriteRearm {
+    fn drop(&mut self) {
+        if diagnostic_direct_range().is_none() && diagnostic_direct_thread().is_none() {
+            return;
+        }
+        diagnostic_direct_watches()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain_mut(|diagnostic| {
+                if let (Some(watch), Some(address)) =
+                    (&diagnostic.pointee_watch, diagnostic.pointee_address)
+                {
+                    if crate::process_guest_range_is_readable(address, 8) {
+                        // SAFETY: the retained watch pins this qword's mapping.
+                        let value = unsafe { std::ptr::read_unaligned(address as *const u64) };
+                        if diagnostic.pointee_last_value != Some(value) {
+                            let precise_change = watch.take_diagnostic_sample_change();
+                            if value != 0 && !crate::process_guest_range_is_readable(value, 1) {
+                                let (previous, changed, fault, program_counter, registers) = precise_change
+                                    .unwrap_or((
+                                    diagnostic.pointee_last_value.unwrap_or_default(),
+                                    value,
+                                    0,
+                                    0,
+                                    [0; 6],
+                                    ));
+                                eprintln!(
+                                    "[REMu][JOURNAL][POINTEE-CORRUPTION] address={address:#x} previous={:#x?} value={value:#x} changed_previous={previous:#x} changed_value={changed:#x} write_fault={fault:#x} write_pc={program_counter:#x} rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} caller={:#x} dispatch={} return={:#x} thread={:?}",
+                                    diagnostic.pointee_last_value,
+                                    registers[0],
+                                    registers[1],
+                                    registers[2],
+                                    registers[3],
+                                    registers[4],
+                                    registers[5],
+                                    self.dispatch_index,
+                                    self.return_address,
+                                    crate::current_guest_thread_name(),
+                                );
+                            }
+                            diagnostic.pointee_last_value = Some(value);
+                        }
+                        if watch.rearm().is_err() {
+                            diagnostic.pointee_watch = None;
+                            diagnostic.pointee_address = None;
+                            diagnostic.pointee_last_value = None;
+                        }
+                    } else {
+                        diagnostic.pointee_watch = None;
+                        diagnostic.pointee_address = None;
+                        diagnostic.pointee_last_value = None;
+                    }
+                }
+                if let Some(value_address) = diagnostic.value_address {
+                    // SAFETY: CpuWriteWatch retains this exact mapping until retirement. This is
+                    // diagnostic sampling at an import boundary, after the guest store returned.
+                    let value = unsafe { std::ptr::read_unaligned(value_address as *const u64) };
+                    if diagnostic.last_value != Some(value) {
+                        let precise_change = diagnostic.watch.take_diagnostic_sample_change();
+                        if value != 0 && !crate::process_guest_range_is_readable(value, 1) {
+                            let (changed_previous, changed_value, fault, program_counter, registers) =
+                                precise_change.unwrap_or_else(|| {
+                                    let (fault, program_counter) = diagnostic
+                                        .watch
+                                        .last_guest_write()
+                                        .unwrap_or_default();
+                                    (
+                                        diagnostic.last_value.unwrap_or_default(),
+                                        value,
+                                        fault,
+                                        program_counter,
+                                        [0; 6],
+                                    )
+                                });
+                            eprintln!(
+                                "[REMu][JOURNAL][CORRUPTION] address={value_address:#x} previous={:#x?} value={value:#x} changed_previous={changed_previous:#x} changed_value={changed_value:#x} write_fault={fault:#x} write_pc={program_counter:#x} rax={:#x} rcx={:#x} rdx={:#x} r8={:#x} r9={:#x} caller={:#x} dispatch={} return={:#x} thread={:?}",
+                                diagnostic.last_value,
+                                registers[0],
+                                registers[1],
+                                registers[2],
+                                registers[3],
+                                registers[4],
+                                registers[5],
+                                self.dispatch_index,
+                                self.return_address,
+                                crate::current_guest_thread_name(),
+                            );
+                        }
+                        diagnostic.last_value = Some(value);
+                    }
+                    if value >= 0x10_000
+                        && crate::process_guest_range_is_readable(value, 8)
+                        && diagnostic.pointee_address != Some(value)
+                    {
+                        // SAFETY: readability was validated and the diagnostic watch itself pins
+                        // the mapping until replacement retirement.
+                        match unsafe { CpuWriteWatch::new_precise(value, 8) } {
+                            Ok(watch) => {
+                                let _ = watch.set_diagnostic_sample(value);
+                                let _ = watch.rearm();
+                                // SAFETY: the newly retained watch covers the qword.
+                                let initial =
+                                    unsafe { std::ptr::read_unaligned(value as *const u64) };
+                                diagnostic.pointee_watch = Some(watch);
+                                diagnostic.pointee_address = Some(value);
+                                diagnostic.pointee_last_value = Some(initial);
+                                eprintln!(
+                                    "[REMu][JOURNAL] watching free-list node address={value:#x} initial={initial:#x}"
+                                );
+                            }
+                            Err(error) => eprintln!(
+                                "[REMu][JOURNAL] could not watch free-list node address={value:#x}: {error}"
+                            ),
+                        }
+                    }
+                }
+                match diagnostic.watch.rearm() {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        eprintln!(
+                            "[REMu][JOURNAL] could not rearm direct-memory write watch address={:#x} length={:#x}: {error}",
+                            diagnostic.watch.range().0,
+                            diagnostic.watch.range().1,
+                        );
+                        true
+                    }
+                }
+            });
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn diagnostic_direct_write_rearm(
+    dispatch_index: u64,
+    return_address: u64,
+) -> DiagnosticDirectWriteRearm {
+    DiagnosticDirectWriteRearm {
+        dispatch_index,
+        return_address,
+    }
+}
+
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
     use kernel_memory::KernelMemoryError;
 
@@ -83,7 +415,7 @@ fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
     sce_kernel_error(code)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     const DIRECT_MEMORY_SIZE: u64 = kernel_memory::DIRECT_MEMORY_SIZE;
     let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
@@ -134,7 +466,7 @@ pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispa
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn allocate_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
@@ -145,7 +477,7 @@ pub(crate) fn allocate_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDis
 /// allocators call this before reserving their pool, so the arguments are normalized exactly as
 /// [`allocate_direct_memory`] normalizes its own: whatever this reports, the caller's next
 /// allocation of that span has to succeed.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn available_direct_memory_size(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -198,7 +530,7 @@ pub(crate) fn available_direct_memory_size(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn available_direct_memory_size(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -211,7 +543,7 @@ pub(crate) fn available_direct_memory_size(
 /// Reports how much of the flexible-memory budget the guest has not mapped yet. Engines read this
 /// once to size their own flexible pool and again while mapping into it, so it has to fall as
 /// mappings are made rather than report a fixed total.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn available_flexible_memory_size(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -232,7 +564,7 @@ pub(crate) fn available_flexible_memory_size(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn available_flexible_memory_size(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -240,7 +572,7 @@ pub(crate) fn available_flexible_memory_size(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn allocate_main_direct_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -258,7 +590,7 @@ pub(crate) fn allocate_main_direct_memory(
     )
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn allocate_main_direct_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -266,7 +598,7 @@ pub(crate) fn allocate_main_direct_memory(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn direct_memory_query(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let offset = arguments[0];
     let find_next = arguments[1] & 1 != 0;
@@ -288,17 +620,17 @@ pub(crate) fn direct_memory_query(arguments: [u64; 6], state: &mut ProbeDispatch
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn direct_memory_query(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     map_direct_memory_core(arguments, None, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_direct_memory_2(
     arguments: [u64; 6],
     alignment: u64,
@@ -318,7 +650,7 @@ pub(crate) fn map_direct_memory_2(
     )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn map_direct_memory_core(
     arguments: [u64; 6],
     memory_type: Option<i32>,
@@ -385,6 +717,8 @@ fn map_direct_memory_core(
             return kernel_memory_error(&error);
         }
     };
+    #[cfg(windows)]
+    watch_diagnostic_direct_mapping(direct_start, mapped.get(), length);
     refresh_kernel_memory_readable_ranges(memory);
     write_guest_u64(output, mapped.get());
     if trace_guest_vm() {
@@ -396,12 +730,12 @@ fn map_direct_memory_core(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_direct_memory(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_direct_memory_2(
     _arguments: [u64; 6],
     _alignment: u64,
@@ -410,7 +744,7 @@ pub(crate) fn map_direct_memory_2(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_named_flexible_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -440,7 +774,7 @@ pub(crate) fn map_named_flexible_memory(
 /// Shared placement and mapping behavior for every flexible-memory entry point.
 ///
 /// The named, unnamed, and batch forms differ only in how the caller supplies the range name.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn map_flexible_memory_core(
     output: u64,
     length: u64,
@@ -481,7 +815,7 @@ pub(crate) fn map_flexible_memory_core(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_flexible_memory_core(
     _output: u64,
     _length: u64,
@@ -493,7 +827,7 @@ pub(crate) fn map_flexible_memory_core(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn map_named_flexible_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -512,12 +846,12 @@ const BATCH_MAP_OPERATION_TYPE_PROTECT: u32 = 4;
 /// `MAP_FIXED`. The single-argument batch entry point always maps at the caller's addresses.
 const KERNEL_MAP_FIXED: u64 = 0x10;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_batch_map(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     kernel_batch_map_core(arguments, KERNEL_MAP_FIXED, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_batch_map_2(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     kernel_batch_map_core(arguments, arguments[3], state)
 }
@@ -527,7 +861,7 @@ pub(crate) fn kernel_batch_map_2(arguments: [u64; 6], state: &mut ProbeDispatchS
 /// Each entry is executed in order and the batch stops at the first rejected entry, reporting how
 /// many entries completed. The count is written even when the batch fails, because the guest uses
 /// it to resume or unwind a partially applied batch; only a null output pointer skips it.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_batch_map_core(arguments: [u64; 6], flags: u64, state: &mut ProbeDispatchState) -> u64 {
     let (entries, output) = (arguments[0], arguments[2]);
     let count = low_i32(arguments[1]);
@@ -591,18 +925,18 @@ fn kernel_batch_map_core(arguments: [u64; 6], flags: u64, state: &mut ProbeDispa
     result
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_batch_map(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_batch_map_2(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
 /// Reprotects a range and assigns it a new guest memory type in the same operation.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_mtypeprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (address, length) = (arguments[0], arguments[1]);
     let memory_type = low_i32(arguments[2]);
@@ -640,12 +974,12 @@ pub(crate) fn kernel_mtypeprotect(arguments: [u64; 6], state: &mut ProbeDispatch
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_mtypeprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_reserve_virtual_range(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -693,7 +1027,7 @@ pub(crate) fn kernel_reserve_virtual_range(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_reserve_virtual_range(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -711,7 +1045,7 @@ pub(crate) fn kernel_set_virtual_range_name(arguments: [u64; 6]) -> u64 {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let address = arguments[0];
     let length = arguments[1];
@@ -746,16 +1080,33 @@ pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchStat
         let Ok(host_length) = usize::try_from(aligned_length) else {
             return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
         };
-        // SAFETY: The range was page-aligned and bounds-checked against the live process image.
-        let result = unsafe {
-            libc::mprotect(
-                host_address as *mut libc::c_void,
-                host_length,
-                host_protection_from_guest(protection),
-            )
+        #[cfg(target_os = "macos")]
+        let succeeded = {
+            // SAFETY: The range was page-aligned and bounds-checked against the live process image.
+            (unsafe {
+                libc::mprotect(
+                    host_address as *mut libc::c_void,
+                    host_length,
+                    host_protection_from_guest(protection),
+                )
+            }) == 0
+        };
+        #[cfg(windows)]
+        let succeeded = {
+            let mut old = windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS::default();
+            // SAFETY: The range was page-aligned and bounds-checked against the live process image.
+            unsafe {
+                windows::Win32::System::Memory::VirtualProtect(
+                    host_address as *const std::ffi::c_void,
+                    host_length,
+                    windows_host_protection_from_guest(protection),
+                    &raw mut old,
+                )
+            }
+            .is_ok()
         };
         drop(reprotection);
-        if result != 0 {
+        if !succeeded {
             return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         }
         if trace_guest_vm() {
@@ -786,7 +1137,7 @@ pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchStat
     0
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) const fn process_mapping_contains(
     mapping_start: u64,
     mapping_end: u64,
@@ -815,12 +1166,41 @@ pub(crate) const fn host_protection_from_guest(raw: i32) -> i32 {
     protection
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+const fn windows_host_protection_from_guest(
+    raw: i32,
+) -> windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS {
+    use windows::Win32::System::Memory::{
+        PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, PAGE_NOACCESS, PAGE_READONLY,
+        PAGE_READWRITE,
+    };
+
+    let readable = raw & (0x01 | 0x02 | 0x10) != 0;
+    let writable = raw & (0x02 | 0x20) != 0;
+    let executable = raw & 0x04 != 0;
+    if executable {
+        if writable {
+            PAGE_EXECUTE_READWRITE
+        } else if readable {
+            PAGE_EXECUTE_READ
+        } else {
+            PAGE_EXECUTE
+        }
+    } else if writable {
+        PAGE_READWRITE
+    } else if readable {
+        PAGE_READONLY
+    } else {
+        PAGE_NOACCESS
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_mprotect(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
     const VIRTUAL_QUERY_INFO_SIZE: u64 = 72;
     let (query, flags, output, output_size) = (
@@ -867,12 +1247,12 @@ pub(crate) fn kernel_virtual_query(arguments: [u64; 6], state: &ProbeDispatchSta
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_virtual_query(_arguments: [u64; 6], _state: &ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let (address, length) = (arguments[0], arguments[1]);
     if address == 0
@@ -900,12 +1280,12 @@ pub(crate) fn kernel_munmap(arguments: [u64; 6], state: &mut ProbeDispatchState)
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_munmap(_arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_release_direct_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -913,7 +1293,7 @@ pub(crate) fn kernel_release_direct_memory(
     kernel_release_direct_memory_core(arguments, false, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 pub(crate) fn kernel_checked_release_direct_memory(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
@@ -921,7 +1301,7 @@ pub(crate) fn kernel_checked_release_direct_memory(
     kernel_release_direct_memory_core(arguments, true, state)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn kernel_release_direct_memory_core(
     arguments: [u64; 6],
     checked: bool,
@@ -959,7 +1339,7 @@ fn kernel_release_direct_memory_core(
     0
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_release_direct_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,
@@ -967,7 +1347,7 @@ pub(crate) fn kernel_release_direct_memory(
     sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 pub(crate) fn kernel_checked_release_direct_memory(
     _arguments: [u64; 6],
     _state: &mut ProbeDispatchState,

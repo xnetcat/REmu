@@ -454,15 +454,17 @@ pub(super) const fn native_import_target(_nid: &str) -> Option<u64> {
     None
 }
 
-extern "C" fn synthetic_data_noop(
-    _argument0: u64,
-    _argument1: u64,
-    _argument2: u64,
-    _argument3: u64,
-    _argument4: u64,
-    _argument5: u64,
-) -> u64 {
-    0
+guest_abi_function! {
+    fn synthetic_data_noop(
+        _argument0: u64,
+        _argument1: u64,
+        _argument2: u64,
+        _argument3: u64,
+        _argument4: u64,
+        _argument5: u64,
+    ) -> u64 {
+        0
+    }
 }
 
 pub(super) struct SyntheticDataImports {

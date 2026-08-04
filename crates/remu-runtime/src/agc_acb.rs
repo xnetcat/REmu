@@ -76,6 +76,9 @@ const MAX_WORKLOAD_ID: u32 = 63;
 const MAX_WORKLOAD_IDS: u64 = 64;
 const WORKLOAD_ID_BYTES: u64 = 4;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.
@@ -763,19 +766,21 @@ mod tests {
 
     #[test]
     fn a_full_command_buffer_is_grown_through_the_guest_callback() {
-        unsafe extern "C" fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
-            if requested != 2 {
-                return false;
+        guest_abi_function! {
+            unsafe fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
+                if requested != 2 {
+                    return false;
+                }
+                write_u64(
+                    command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET,
+                    read_u64(user_data),
+                );
+                write_u64(
+                    command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
+                    read_u64(user_data + 8),
+                );
+                true
             }
-            write_u64(
-                command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET,
-                read_u64(user_data),
-            );
-            write_u64(
-                command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
-                read_u64(user_data + 8),
-            );
-            true
         }
 
         let mut fixture = CommandFixture::new();

@@ -252,7 +252,8 @@ pub(crate) fn compile_metal_library_with_tools(
     let library_path = directory.0.join(format!("{stage}.metallib"));
     std::fs::write(&source_path, source)
         .map_err(|error| format!("could not write {}: {error}", source_path.display()))?;
-    run_metal_tool(
+    let compile_operation = format!("{stage} compilation");
+    let compile_result = run_metal_tool(
         Command::new(&compiler)
             .current_dir(&directory.0)
             .arg("-fmetal-math-mode=safe")
@@ -260,8 +261,31 @@ pub(crate) fn compile_metal_library_with_tools(
             .arg(&source_path)
             .arg("-o")
             .arg(&air_path),
-        &format!("{stage} compilation"),
-    )?;
+        &compile_operation,
+    );
+    if let Err(error) = compile_result {
+        if !metal_safe_math_mode_flag_is_unsupported(&error) {
+            return Err(error);
+        }
+        // `-fmetal-math-mode=safe` is the current spelling, but the Metal compiler bundled
+        // with Xcode 15 (including the macOS 14 CI image) predates it. Its Clang-compatible
+        // `-fno-fast-math` spelling preserves the same requirement: do not make lossy
+        // floating-point transformations. Retry only this explicit unknown-option failure so
+        // source diagnostics and genuine compiler failures remain loud.
+        eprintln!(
+            "[REMu][METAL] {compile_operation} compiler predates -fmetal-math-mode; using -fno-fast-math"
+        );
+        run_metal_tool(
+            Command::new(&compiler)
+                .current_dir(&directory.0)
+                .arg("-fno-fast-math")
+                .arg("-c")
+                .arg(&source_path)
+                .arg("-o")
+                .arg(&air_path),
+            &compile_operation,
+        )?;
+    }
     run_metal_tool(
         Command::new(&linker)
             .current_dir(&directory.0)
@@ -327,6 +351,13 @@ pub(crate) fn metal_compile_failure_is_transient(error: &str) -> bool {
     error.contains("could not start ")
         || error.contains("could not create ")
         || error.contains("could not write ")
+}
+
+fn metal_safe_math_mode_flag_is_unsupported(error: &str) -> bool {
+    error.contains("unknown argument: '-fmetal-math-mode=safe'")
+        || error.contains("unknown argument: \"-fmetal-math-mode=safe\"")
+        || error.contains("unsupported option '-fmetal-math-mode=safe'")
+        || error.contains("unsupported option \"-fmetal-math-mode=safe\"")
 }
 
 fn canonical_tool_path(path: PathBuf) -> PathBuf {
@@ -415,7 +446,7 @@ pub(crate) fn dump_compute_shader_msl(
 mod tests {
     use super::{
         MetalCompileDirectory, canonical_tool_path, discover_bundled_metal_compiler,
-        metallib_tool_path,
+        metal_safe_math_mode_flag_is_unsupported, metallib_tool_path,
     };
     use std::ffi::OsStr;
     use std::fs::File;
@@ -474,5 +505,21 @@ mod tests {
             std::fs::canonicalize(&linker).expect("resolve linker symlink"),
             std::fs::canonicalize(linker_target).expect("resolve linker target")
         );
+    }
+
+    #[test]
+    fn safe_math_flag_fallback_matches_only_the_new_option_diagnostic() {
+        assert!(metal_safe_math_mode_flag_is_unsupported(
+            "metal: error: unknown argument: '-fmetal-math-mode=safe'"
+        ));
+        assert!(metal_safe_math_mode_flag_is_unsupported(
+            "metal: error: unsupported option \"-fmetal-math-mode=safe\""
+        ));
+        assert!(!metal_safe_math_mode_flag_is_unsupported(
+            "shader.metal:12: error: use of undeclared identifier 'value'"
+        ));
+        assert!(!metal_safe_math_mode_flag_is_unsupported(
+            "metal: error: unknown argument: '-other-option'"
+        ));
     }
 }

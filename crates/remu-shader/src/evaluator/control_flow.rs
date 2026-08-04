@@ -19,6 +19,10 @@ pub(crate) struct ScalarPath {
     pub(crate) exec_mask: u64,
     pub(crate) scalar_condition: bool,
     pub(crate) supplemental: bool,
+    /// This compute path is walking the CFG once for supplemental resource discovery. Back edges
+    /// are forced to their fall-through successor and forward conditional edges are both explored
+    /// so runtime loops and snapshot-only SCC decisions cannot hide descriptor loads.
+    pub(crate) structural_rescue: bool,
     /// Backward edges already traversed by this lineage, keyed by branch pc. Forked paths inherit
     /// these counts so static alternate-edge discovery is performed once per loop lineage.
     pub(crate) backward_branch_visits: SmallVec<[(u32, u32); 4]>,
@@ -100,8 +104,8 @@ impl ScalarPath {
 }
 
 pub(crate) struct VisitedPaths {
-    pub(crate) small: Vec<(u32, u64)>,
-    pub(crate) large: Option<HashSet<(u32, u64)>>,
+    pub(crate) small: Vec<(u32, u64, bool)>,
+    pub(crate) large: Option<HashSet<(u32, u64, bool)>>,
 }
 
 pub(crate) fn scalar_state_hash(
@@ -210,7 +214,7 @@ impl VisitedPaths {
         }
     }
 
-    pub(crate) fn insert(&mut self, key: (u32, u64)) -> bool {
+    pub(crate) fn insert(&mut self, key: (u32, u64, bool)) -> bool {
         if let Some(large) = self.large.as_mut() {
             return large.insert(key);
         }

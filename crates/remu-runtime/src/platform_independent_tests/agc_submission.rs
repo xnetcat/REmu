@@ -389,6 +389,8 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     remu_gpu::clear_thread_local_event_sink();
+    crate::event_state::reset_event_state_for_tests();
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
     let mut state = ProbeDispatchState {
         agc_submission_count: 41,
         ..ProbeDispatchState::default()
@@ -506,6 +508,8 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
     let completed = remu_gpu::gpu_completed_submission_sequence();
     let first = completed.saturating_add(1);
     let second = first.saturating_add(1);
@@ -598,6 +602,8 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
     let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
     let mut state = ProbeDispatchState::default();
     crate::event_state::with_event_state_mut(|e| {
@@ -678,6 +684,8 @@ fn completion_ledger_identifies_a_backend_id_without_a_runtime_owner() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
     let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
     let mut state = ProbeDispatchState::default();
     remu_gpu::record_gpu_submission_completed(sequence);
@@ -704,6 +712,12 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         video_out: targetless_scanout_test_video(address),
         ..ProbeDispatchState::default()
     };
+    let equeue = 0x44;
+    let user_data = 0x1234_5678;
+    state.video_out.flip_events.insert(equeue, user_data);
+    crate::event_state::with_event_state_mut(|events| {
+        events.kernel_equeues.insert(equeue);
+    });
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_thread_local_event_sink(sender);
 
@@ -745,6 +759,14 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         0
     );
     assert_eq!(state.video_out.completed_flip_count, 1);
+    crate::event_state::with_event_state(|events| {
+        assert!(events.pending_events.iter().any(|event| {
+            event.equeue == equeue
+                && event.ident == 6
+                && event.filter == -13
+                && event.user_data == user_data
+        }));
+    });
     assert!(receiver.try_recv().is_err());
     remu_gpu::clear_thread_local_event_sink();
 }

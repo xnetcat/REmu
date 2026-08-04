@@ -170,6 +170,8 @@ struct Evaluator<'a, M> {
     vertex_inputs: Vec<VertexInputBinding>,
     evaluated_steps: usize,
     maximum_steps: usize,
+    maximum_scalar_loop_iterations: u32,
+    encountered_vector_controlled_loop: bool,
 }
 
 /// Evaluation paths abandoned before their end, keyed by reason and the guest address of the
@@ -275,6 +277,8 @@ fn evaluate_shader_within(
         vertex_inputs: Vec::with_capacity(4),
         evaluated_steps: 0,
         maximum_steps,
+        maximum_scalar_loop_iterations: 0,
+        encountered_vector_controlled_loop: false,
     };
     if !state.program.instructions.is_empty() {
         evaluator.queue_path(ScalarPath {
@@ -283,12 +287,52 @@ fn evaluate_shader_within(
             exec_mask,
             scalar_condition: false,
             supplemental: false,
+            structural_rescue: false,
             backward_branch_visits: SmallVec::new(),
             backward_branch_recurrences: SmallVec::new(),
         });
     }
-    while let Some(path) = evaluator.pending_paths.pop() {
-        evaluator.execute_path(path)?;
+    let exact_truncated = evaluator.execute_pending_paths()?;
+    let missing_image_binding = state.program.instructions.iter().any(|instruction| {
+        matches!(
+            instruction.control.as_ref(),
+            Some(InstructionControl::Image(_))
+        ) && !evaluator
+            .image_bindings
+            .iter()
+            .any(|binding| binding.pc == instruction.pc)
+    });
+    if state.compute_system_registers.is_some()
+        && options.discover_static_control_flow
+        && (exact_truncated || missing_image_binding)
+        && !state.program.instructions.is_empty()
+    {
+        // Exact compute evaluation can legitimately spend millions of iterations in a runtime
+        // loop, or take an SCC edge that is only valid for the snapshot lane state. Resource
+        // discovery is not shader execution, so make one independent, bounded structural pass:
+        // forward conditions explore both successors and back edges fall through. Resetting the
+        // visited set is essential because this deliberately different traversal must revisit
+        // scalar states already seen by exact evaluation.
+        evaluator.pending_paths.clear();
+        evaluator.visited_paths = VisitedPaths::new();
+        let rescue_steps = state
+            .program
+            .instructions
+            .len()
+            .saturating_mul(8)
+            .max(4_096);
+        evaluator.maximum_steps = evaluator.evaluated_steps.saturating_add(rescue_steps);
+        evaluator.queue_path(ScalarPath {
+            instruction_index: 0,
+            registers: evaluator.initial_registers,
+            exec_mask: RDNA_WAVE_MASK,
+            scalar_condition: false,
+            supplemental: true,
+            structural_rescue: true,
+            backward_branch_visits: SmallVec::new(),
+            backward_branch_recurrences: SmallVec::new(),
+        });
+        evaluator.execute_pending_paths()?;
     }
     evaluator.bind_statically_inactive_resources()?;
     let scalar_register_count = state
@@ -298,6 +342,13 @@ fn evaluate_shader_within(
         .and_then(|register| usize::try_from(*register).ok())
         .and_then(|register| register.checked_add(1))
         .unwrap_or_default();
+    let compute_system_registers = state.compute_system_registers.map(|mut registers| {
+        registers.maximum_evaluated_scalar_loop_iterations =
+            evaluator.maximum_scalar_loop_iterations;
+        registers.has_evaluated_vector_controlled_loop =
+            evaluator.encountered_vector_controlled_loop;
+        registers
+    });
     Ok(ShaderEvaluation {
         initial_scalar_registers: SmallVec::from_slice(
             &evaluator.initial_registers[..scalar_register_count],
@@ -306,12 +357,37 @@ fn evaluate_shader_within(
         scalar_memory_reads: evaluator.scalar_memory_reads.into_sorted_vec(),
         image_bindings: evaluator.image_bindings,
         global_memory_bindings: evaluator.global_bindings,
-        compute_system_registers: state.compute_system_registers,
+        compute_system_registers,
         vertex_inputs: evaluator.vertex_inputs,
     })
 }
 
 impl<M: GuestMemoryReader> Evaluator<'_, M> {
+    fn execute_pending_paths(&mut self) -> Result<bool, EvaluationError> {
+        let mut truncated = false;
+        while let Some(path) = self.pending_paths.pop() {
+            match self.execute_path(path) {
+                Ok(()) => {}
+                Err(EvaluationError::ControlFlowLimit { pc, .. })
+                    if self.state.compute_system_registers.is_some() =>
+                {
+                    // Runtime compute loops can observe stale/poison counts in decode-time
+                    // resource snapshots. Keep proven bindings, force HLSL lowering onto its
+                    // finite scalar-loop watchdog, and let the structural pass recover resources
+                    // hidden behind the abandoned edge.
+                    record_truncated_evaluation(
+                        "compute-control-flow-limit",
+                        self.state.program.instruction_address(pc),
+                    );
+                    self.maximum_scalar_loop_iterations = u32::MAX;
+                    truncated = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(truncated)
+    }
+
     fn trace_scalar_loop_latch(&self, instruction: &Instruction, header_pc: u32) {
         static ENABLED: OnceLock<bool> = OnceLock::new();
         static SITES: Mutex<BTreeSet<u64>> = Mutex::new(BTreeSet::new());
@@ -407,6 +483,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     .program
                     .evaluation_live_scalar_condition(instruction_index),
             ),
+            path.structural_rescue,
         );
         if self.visited_paths.insert(key) {
             self.pending_paths.push(path);
@@ -540,7 +617,8 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 // global path budget. EXEC and VCC may be changed by skipped vector instructions;
                 // retain alternate-edge discovery only for those runtime-vector conditions.
                 if self.options.discover_static_control_flow
-                    && branch_condition_depends_on_vector_state(instruction.opcode)
+                    && (branch_condition_depends_on_vector_state(instruction.opcode)
+                        || (path.structural_rescue && !backward))
                     && (!backward || backward_visits == 0)
                 {
                     let alternate_index = if taken {
@@ -560,6 +638,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     self.queue_path(alternate);
                 }
                 if taken {
+                    if path.structural_rescue && backward {
+                        path.instruction_index = path.instruction_index.saturating_add(1);
+                        continue;
+                    }
                     if path.supplemental && target_pc <= instruction.pc {
                         break;
                     }
@@ -600,6 +682,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                             self.trace_scalar_loop_latch(instruction, target_pc);
                         }
                         if vector_controlled {
+                            self.encountered_vector_controlled_loop = true;
                             let recurrence = scalar_recurrence_state(
                                 &path.registers,
                                 self.state
@@ -619,10 +702,20 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                                 continue;
                             }
                             path.record_backward_branch_visit(instruction.pc);
+                        } else {
+                            let iterations = backward_visits.saturating_add(1);
+                            self.maximum_scalar_loop_iterations =
+                                self.maximum_scalar_loop_iterations.max(iterations);
+                            path.record_backward_branch_visit(instruction.pc);
                         }
                     }
                     path.instruction_index = target_index;
                 } else {
+                    if backward && !branch_condition_depends_on_vector_state(instruction.opcode) {
+                        self.maximum_scalar_loop_iterations = self
+                            .maximum_scalar_loop_iterations
+                            .max(backward_visits.saturating_add(1));
+                    }
                     path.instruction_index = path.instruction_index.saturating_add(1);
                 }
                 continue;

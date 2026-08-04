@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=REMU_SH");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG");
     build_atrac9();
     build_minimp3();
     build_ooz();
@@ -144,7 +146,12 @@ fn ensure_ffmpeg(target: &str) -> PathBuf {
             .expect("Cargo always provides CARGO_MANIFEST_DIR to build scripts"),
     );
     let script = manifest_dir.join("../../scripts/lib/ensure-ffmpeg.sh");
-    let output = Command::new("sh")
+    let shell = unix_shell().unwrap_or_else(|| {
+        panic!(
+            "bundled FFmpeg requires a POSIX shell; install Git for Windows or set REMU_SH to sh.exe"
+        )
+    });
+    let output = Command::new(&shell)
         .arg(&script)
         .arg(target)
         .output()
@@ -168,9 +175,52 @@ fn ensure_ffmpeg(target: &str) -> PathBuf {
     root
 }
 
+fn executable_on_path(names: &[&str]) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|directory| {
+        names.iter().find_map(|name| {
+            let candidate = directory.join(name);
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
+fn unix_shell() -> Option<PathBuf> {
+    if let Some(shell) = std::env::var_os("REMU_SH") {
+        // `Command` resolves a bare executable name through PATH, while an absolute or relative
+        // override remains usable as-is. Let the eventual spawn error describe an invalid value.
+        return Some(PathBuf::from(shell));
+    }
+    if let Some(shell) = executable_on_path(if cfg!(windows) {
+        &["bash.exe", "sh.exe"]
+    } else {
+        &["sh", "bash"]
+    }) {
+        return Some(shell);
+    }
+    if cfg!(windows) {
+        let mut candidates = Vec::new();
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            let git = PathBuf::from(program_files).join("Git");
+            candidates.push(git.join("bin/bash.exe"));
+            candidates.push(git.join("usr/bin/sh.exe"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let git = PathBuf::from(local_app_data).join("Programs/Git");
+            candidates.push(git.join("bin/bash.exe"));
+            candidates.push(git.join("usr/bin/sh.exe"));
+        }
+        return candidates.into_iter().find(|candidate| candidate.is_file());
+    }
+    None
+}
+
 fn validate_ffmpeg_root(root: &Path, target: &str) {
     let required = [
         root.join("include/libavcodec/avcodec.h"),
+        root.join("include/libavutil/samplefmt.h"),
+        root.join("include/libavutil/pixfmt.h"),
+        root.join("include/libavutil/frame.h"),
         root.join("lib/libavformat.a"),
         root.join("lib/libavcodec.a"),
         root.join("lib/libavutil.a"),
@@ -197,7 +247,21 @@ struct PkgConfigFlags {
 }
 
 fn libav_pkg_config_flags(pkgconfig_dir: &Path, target: &str) -> PkgConfigFlags {
-    let output = Command::new("pkg-config")
+    let pkg_config = std::env::var_os("PKG_CONFIG")
+        .map(PathBuf::from)
+        .or_else(|| {
+            executable_on_path(if cfg!(windows) {
+                &["pkg-config.exe", "pkgconf.exe"]
+            } else {
+                &["pkg-config", "pkgconf"]
+            })
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "FFmpeg linkage requires pkg-config/pkgconf; install it or set PKG_CONFIG to the executable"
+            )
+        });
+    let output = Command::new(pkg_config)
         .args([
             "--static",
             "--cflags",

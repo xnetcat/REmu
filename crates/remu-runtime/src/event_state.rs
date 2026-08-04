@@ -6,7 +6,7 @@
 
 #![allow(dead_code)] // with_/reset helpers exercised in tests; production still uses lock_* directly.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use crate::dispatch_locks::{LockHierarchyGuard, LockLevel, held_lock_level};
 use crate::{KernelQueuedEvent, PendingVideoOutFlip};
@@ -63,6 +63,25 @@ pub(crate) fn lock_event_state_for_read() -> (
     (hierarchy, guard)
 }
 
+/// Non-blocking read used by watchdog diagnostics.
+///
+/// A timeout report runs precisely when another thread may be wedged while owning EventState. It
+/// must describe that lock as busy instead of turning the watchdog into another blocked thread.
+pub(crate) fn try_lock_event_state_for_read() -> Option<(
+    Option<LockHierarchyGuard>,
+    RwLockReadGuard<'static, EventState>,
+)> {
+    let hierarchy = match held_lock_level() {
+        Some(LockLevel::ProbeDispatch) | Some(LockLevel::AgcState) => None,
+        _ => Some(LockHierarchyGuard::enter(LockLevel::EventState)),
+    };
+    match cell().try_read() {
+        Ok(guard) => Some((hierarchy, guard)),
+        Err(TryLockError::Poisoned(error)) => Some((hierarchy, error.into_inner())),
+        Err(TryLockError::WouldBlock) => None,
+    }
+}
+
 pub(crate) fn reset_event_state() {
     let mut state = cell()
         .write()
@@ -115,28 +134,43 @@ pub(crate) fn with_event_state<R>(f: impl FnOnce(&EventState) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_event_state_for_write, reset_event_state_for_tests};
+    use super::{
+        lock_event_state_for_write, reset_event_state_for_tests, try_lock_event_state_for_read,
+    };
     use crate::dispatch_locks::{LockHierarchyGuard, LockLevel};
 
     #[test]
     fn event_state_lock_is_usable_without_probe_dispatch() {
         reset_event_state_for_tests();
-        let (_h, mut state) = lock_event_state_for_write();
-        state.next_equeue = 7;
-        crate::event_state::with_event_state_mut(|e| {
-            e.kernel_equeues.insert(7);
+        {
+            let (_h, mut state) = lock_event_state_for_write();
+            state.next_equeue = 7;
+        }
+        crate::event_state::with_event_state_mut(|events| {
+            events.kernel_equeues.insert(7);
         });
-        assert!(state.kernel_equeues.contains(&7));
+        crate::event_state::with_event_state(|events| {
+            assert_eq!(events.next_equeue, 7);
+            assert!(events.kernel_equeues.contains(&7));
+        });
     }
 
     #[test]
     fn event_state_may_nest_under_probe_dispatch() {
         reset_event_state_for_tests();
         let _dispatch = LockHierarchyGuard::enter(LockLevel::ProbeDispatch);
-        let (_h, state) = lock_event_state_for_write();
-        crate::event_state::with_event_state_mut(|e| {
-            e.kernel_equeues.insert(3);
+        crate::event_state::with_event_state_mut(|events| {
+            events.kernel_equeues.insert(3);
         });
-        assert!(state.kernel_equeues.contains(&3));
+        crate::event_state::with_event_state(|events| {
+            assert!(events.kernel_equeues.contains(&3));
+        });
+    }
+
+    #[test]
+    fn diagnostic_read_reports_a_busy_writer_without_blocking() {
+        reset_event_state_for_tests();
+        let (_hierarchy, _writer) = lock_event_state_for_write();
+        assert!(try_lock_event_state_for_read().is_none());
     }
 }

@@ -77,14 +77,27 @@ impl Compiler<'_> {
                 // have consumed the current value.
                 self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
                 selected
-            } else if source_vgpr
-                .filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
-                .is_some()
+            } else if let Some(vgpr) =
+                source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
             {
-                return Err(
-                    "pixel/vertex V_READLANE of a V_WRITELANE wave-constant table has no proven Metal lane occupancy; refusing the private lane-file peephole"
-                        .into(),
-                );
+                if !self.is_hlsl() {
+                    return Err(
+                        "pixel/vertex V_READLANE of a V_WRITELANE wave-constant table has no proven Metal lane occupancy; refusing the private lane-file peephole"
+                            .into(),
+                    );
+                }
+                // Every HLSL graphics invocation executes the same uniform V_WRITELANE stream,
+                // so its private table represents lanes that need not be occupied by the host
+                // wave. This is a dialect capability, not an adapter-specific workaround.
+                let lane_mask = if self.options.wave_lane_count == 64 {
+                    63
+                } else {
+                    31
+                };
+                self.temp(
+                    "uint",
+                    &format!("remu_v_{vgpr}_lanes[({lane}) & {lane_mask}u]"),
+                )
             } else {
                 self.temp(
                     "uint",
@@ -154,7 +167,7 @@ impl Compiler<'_> {
             // Metal fragment/vertex simdgroups do not prove architectural lane occupancy for
             // V_WRITELANE tables, so this path refuses loudly rather than silently filling tofu
             // via simd_shuffle or inventing a title-specific private table.
-            if !self.is_threadgroup_stage() {
+            if !self.is_threadgroup_stage() && !self.is_hlsl() {
                 return Err(
                     "pixel/vertex V_WRITELANE wave-constant table has no proven Metal lane occupancy; refusing the private lane-file peephole"
                         .into(),
@@ -173,6 +186,12 @@ impl Compiler<'_> {
                 31
             };
             let lane_index = format!("({lane}) & {lane_mask}u");
+            if self.is_hlsl() && self.graphics_lane_file_vgpr(destination) {
+                self.line(
+                    3,
+                    &format!("remu_v_{destination}_lanes[{lane_index}] = {value};"),
+                );
+            }
             self.line(
                 3,
                 &format!("if ({architectural_lane} == ({lane_index})) v[{destination}] = {value};"),
@@ -804,6 +823,15 @@ impl Compiler<'_> {
                 // infinity, or an out-of-range float to int is otherwise undefined.
                 format!(
                     "isnan({source}) ? 0u : ({source} <= -2147483648.0f ? 0x80000000u : ({source} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int)floor({source}))))"
+                )
+            }
+            "VCvtRpiI32F32" => {
+                let source = self.temp("float", &self.float_source(instruction, 0)?);
+                // Round toward positive infinity, then apply the same saturating conversion as
+                // the other RDNA2 F32-to-I32 opcodes. Endpoint guards also keep HLSL/MSL casts
+                // away from NaN, infinity, and values outside the signed range.
+                format!(
+                    "isnan({source}) ? 0u : ({source} <= -2147483648.0f ? 0x80000000u : ({source} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int)ceil({source}))))"
                 )
             }
             "VCvtOffF32I4" => {

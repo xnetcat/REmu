@@ -234,7 +234,10 @@ fn write_elf_header(bytes: &mut [u8]) {
     bytes[4] = 2;
     bytes[5] = 1;
     bytes[0x12..0x14].copy_from_slice(&62_u16.to_le_bytes());
-    bytes[0x18..0x20].copy_from_slice(&0x4000_u64.to_le_bytes());
+    // The seeded TLS decoder only rewrites instructions reachable from authenticated code
+    // entrances. Point this synthetic image at the executable fixture below rather than the
+    // PT_DYNAMIC bytes that share its load segment.
+    bytes[0x18..0x20].copy_from_slice(&0x4140_u64.to_le_bytes());
     bytes[0x20..0x28].copy_from_slice(&64_u64.to_le_bytes());
     bytes[0x34..0x36].copy_from_slice(&64_u16.to_le_bytes());
     bytes[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes());

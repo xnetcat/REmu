@@ -86,16 +86,11 @@ pub(crate) fn execute_scalar_alu(
         };
         return Ok(());
     }
-    // Hardware-register access is opaque to resource discovery. S_SETREG(_IMM32) writes a mode
+    // Hardware-register writes are opaque to resource discovery. S_SETREG(_IMM32) writes a mode
     // register and must not disturb the SGPR the decoder placed in the destination slot (it is the
-    // data source, not a real destination). S_GETREG returns a mode/status value that no address
-    // computation depends on; feed a conservative zero so a prologue that reads HW_ID keeps
-    // evaluating instead of aborting the whole shader.
+    // data source, not a real destination). S_GETREG was rejected above because fabricating its
+    // mode/status value could steer descriptor selection.
     if instruction.opcode.is("SSetregB32") || instruction.opcode.is("SSetregImm32B32") {
-        return Ok(());
-    }
-    if instruction.opcode.is("SGetregB32") {
-        registers[destination as usize] = 0;
         return Ok(());
     }
     if instruction.opcode.is("SGetpcB64") {

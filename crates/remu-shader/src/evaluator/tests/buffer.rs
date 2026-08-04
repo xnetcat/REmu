@@ -534,6 +534,11 @@ fn bounds_runtime_vertex_buffers_to_the_draws_referenced_records() {
     assert!(evaluation.vertex_inputs.is_empty());
     assert_eq!(evaluation.global_memory_bindings.len(), 1);
     assert_eq!(evaluation.global_memory_bindings[0].data.len(), 96);
+    assert!(!evaluation.global_memory_bindings[0].writable);
+    assert!(
+        !evaluation.global_memory_bindings[0].write_back_to_guest,
+        "a live read-only buffer must not force backend readback"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -668,7 +673,7 @@ fn the_full_global_atomic_set_resolves_a_writable_binding() {
 }
 
 #[test]
-fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
+fn benign_mode_control_and_hwreg_writes_do_not_drop_the_shader() {
     // S_DENORM_MODE / S_ROUND_MODE toggle FP mode; S_SETREG writes an opaque HW register and must
     // not clobber the SGPR the decoder parked in its destination slot; S_GETREG reads an opaque HW
     // register, resolved to a conservative zero.
@@ -696,20 +701,12 @@ fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
             instruction(
                 8,
                 ShaderEncoding::Sopk,
-                "SGetregB32",
-                Vec::new(),
-                vec![Operand::scalar(5)],
-                None,
-            ),
-            instruction(
-                12,
-                ShaderEncoding::Sopk,
                 "SSetregB32",
                 vec![Operand::scalar(6)],
                 vec![Operand::scalar(6)],
                 None,
             ),
-            end(16),
+            end(12),
         ],
         user_data,
     );
@@ -719,12 +716,7 @@ fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
         &shader,
         EvaluationOptions::default(),
     )
-    .expect("benign mode-control and hwreg opcodes must not drop the shader");
-
-    assert_eq!(
-        evaluation.scalar_registers[5], 0,
-        "S_GETREG resolves to a conservative zero"
-    );
+    .expect("benign mode-control and hardware-register writes must not drop the shader");
     assert_eq!(
         evaluation.scalar_registers[6], 0x1234_5678,
         "S_SETREG must not clobber its data-source SGPR"

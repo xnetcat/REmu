@@ -1,13 +1,17 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#[cfg(unix)]
+use crate::low_u32;
 use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
     SCE_KERNEL_ERROR_IS_DIRECTORY, SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NOT_FOUND,
-    SCE_KERNEL_ERROR_OUT_OF_MEMORY, SCE_KERNEL_ERROR_PERMISSION_DENIED, low_i32, low_u32,
+    SCE_KERNEL_ERROR_OUT_OF_MEMORY, SCE_KERNEL_ERROR_PERMISSION_DENIED, low_i32,
     process_guest_range_has_read_access, read_guest_cstring, read_guest_u64,
     resolve_probe_guest_path, sce_kernel_error, sce_kernel_io_error,
 };
+#[cfg(windows)]
+use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
@@ -251,7 +255,20 @@ fn positional_write(file: &std::fs::File, source: &[u8], offset: u64) -> std::io
     }
     #[cfg(windows)]
     {
-        file.seek_write(source, offset)
+        // Windows FileExt::seek_write intentionally updates the shared file cursor. The guest
+        // positional-I/O contract does not, and the descriptor table lock held by the caller
+        // makes this save/restore sequence atomic with respect to other guest file operations.
+        let mut cursor = file;
+        let original = cursor.stream_position()?;
+        let transferred = file.seek_write(source, offset);
+        let restored = cursor.seek(SeekFrom::Start(original));
+        match transferred {
+            Ok(transferred) => restored.map(|_| transferred),
+            Err(error) => {
+                let _ = restored;
+                Err(error)
+            }
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -271,7 +288,18 @@ fn positional_read(
     }
     #[cfg(windows)]
     {
-        file.seek_read(destination, offset)
+        // Windows FileExt::seek_read also updates the shared file cursor; restore it for pread.
+        let mut cursor = file;
+        let original = cursor.stream_position()?;
+        let transferred = file.seek_read(destination, offset);
+        let restored = cursor.seek(SeekFrom::Start(original));
+        match transferred {
+            Ok(transferred) => restored.map(|_| transferred),
+            Err(error) => {
+                let _ = restored;
+                Err(error)
+            }
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

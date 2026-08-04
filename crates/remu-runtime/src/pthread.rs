@@ -548,6 +548,9 @@ pub(crate) fn run_guest_thread_destructors() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .thread_dtors_callback;
     if thread_dtors != 0 {
+        #[cfg(all(windows, target_arch = "x86_64"))]
+        type Callback = unsafe extern "sysv64" fn();
+        #[cfg(not(all(windows, target_arch = "x86_64")))]
         type Callback = unsafe extern "C" fn();
         // SAFETY: `_sceKernelSetThreadDtors` registers a live no-argument guest callback. The
         // process dispatch lock is not held, so the callback may freely re-enter guest imports.
@@ -568,6 +571,9 @@ pub(crate) fn run_guest_thread_destructors() {
             break;
         }
         for (function, argument) in destructors {
+            #[cfg(all(windows, target_arch = "x86_64"))]
+            type Destructor = unsafe extern "sysv64" fn(u64);
+            #[cfg(not(all(windows, target_arch = "x86_64")))]
             type Destructor = unsafe extern "C" fn(u64);
             // SAFETY: pthread-key creation registers a live guest SysV destructor and the value is
             // the opaque pointer installed by this same thread. It was cleared before this call so

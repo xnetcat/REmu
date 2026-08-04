@@ -21,5 +21,8 @@ remu-runtime = { path = "../remu-runtime" }
 [target.'cfg(target_os = "macos")'.dependencies]
 remu-gpu-metal = { path = "../remu-gpu-metal" }
 
+[target.'cfg(windows)'.dependencies]
+remu-gpu-dx12 = { path = "../remu-gpu-dx12" }
+
 [lints]
 workspace = true

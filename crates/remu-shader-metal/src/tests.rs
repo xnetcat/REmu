@@ -40,6 +40,127 @@ fn empty_evaluation() -> ShaderEvaluation {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn compile_generated_msl_with_safe_math(
+    compiler: &std::path::Path,
+    source: &std::path::Path,
+    air: &std::path::Path,
+) -> std::process::Output {
+    fn run(
+        compiler: &std::path::Path,
+        math_option: &str,
+        source: &std::path::Path,
+        air: &std::path::Path,
+    ) -> std::process::Output {
+        std::process::Command::new(compiler)
+            .args(["-c", "-target", "air64-apple-macosx15.0"])
+            .arg(math_option)
+            .arg("-o")
+            .arg(air)
+            .arg(source)
+            .output()
+            .expect("run Apple Metal compiler")
+    }
+
+    let output = run(compiler, "-fmetal-math-mode=safe", source, air);
+    if output.status.success() {
+        return output;
+    }
+    let diagnostics = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !diagnostics.contains("unknown argument: '-fmetal-math-mode=safe'")
+        && !diagnostics.contains("unknown argument: \"-fmetal-math-mode=safe\"")
+        && !diagnostics.contains("unsupported option '-fmetal-math-mode=safe'")
+        && !diagnostics.contains("unsupported option \"-fmetal-math-mode=safe\"")
+    {
+        return output;
+    }
+
+    let _ = std::fs::remove_file(air);
+    run(compiler, "-fno-fast-math", source, air)
+}
+
+#[test]
+fn hlsl_evaluation_key_excludes_live_resource_addresses_and_captured_data() {
+    let uint_format = (0..0x200)
+        .find(|format| remu_shader::decode_unified_format(*format) == Some((10, 4)))
+        .expect("RGBA8 uint unified format exists");
+    let mut first = empty_evaluation();
+    first.initial_scalar_registers[0] = 0x1111_0000;
+    first.global_memory_bindings = vec![remu_shader::GlobalMemoryBinding {
+        scalar_address: 8,
+        base_address: 0x1_0000,
+        instruction_pcs: [0x20].into_iter().collect(),
+        byte_count: 256,
+        data: vec![1; 16],
+        writable: false,
+        write_back_to_guest: false,
+    }];
+    first.image_bindings = vec![remu_shader::ImageBinding {
+        pc: 0x40,
+        opcode: Opcode::Known("ImageSample"),
+        control: remu_shader::ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 16,
+            scalar_sampler: 24,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+            unorm: false,
+        },
+        // Word zero and the low byte of word one carry the live texture address. The unified
+        // format in word one and TYPE in word three are code-facing resource shape.
+        resource_descriptor: vec![0x1234_5678, uint_format << 20, 63, 9 << 28].into(),
+        sampler_descriptor: vec![1, 2, 3, 4].into(),
+        mip_level: Some(0),
+    }];
+    first.vertex_inputs = vec![remu_shader::VertexInputBinding {
+        pc: 0x20,
+        location: 0,
+        component_count: 4,
+        data_format: 10,
+        number_format: 0,
+        base_address: 0x2_0000,
+        stride: 16,
+        offset_bytes: 0,
+        data: vec![2; 64],
+    }];
+
+    let mut second = first.clone();
+    second.initial_scalar_registers[0] = 0x9999_0000;
+    second.global_memory_bindings[0].base_address = 0x8_0000;
+    second.global_memory_bindings[0].byte_count = 4_096;
+    second.global_memory_bindings[0].data = vec![9; 32];
+    second.global_memory_bindings[0].write_back_to_guest = true;
+    second.image_bindings[0].resource_descriptor[0] = 0xabcd_1234;
+    second.image_bindings[0].sampler_descriptor = vec![8, 7, 6, 5].into();
+    second.image_bindings[0].mip_level = Some(4);
+    second.vertex_inputs[0].base_address = 0x9_0000;
+    second.vertex_inputs[0].stride = 32;
+    second.vertex_inputs[0].data = vec![3; 128];
+
+    assert_eq!(
+        HlslEvaluationKey::new(&first),
+        HlslEvaluationKey::new(&second)
+    );
+
+    second.image_bindings[0].resource_descriptor[1] = 0;
+    assert_ne!(
+        HlslEvaluationKey::new(&first),
+        HlslEvaluationKey::new(&second),
+        "changing the component type must select different HLSL"
+    );
+}
+
 fn vector_instruction(
     name: &'static str,
     source_count: usize,
@@ -175,6 +296,7 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
         &MetalCompileOptions {
             stage,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -194,6 +316,7 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
         },

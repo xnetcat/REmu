@@ -18,7 +18,8 @@ impl Compiler<'_> {
         // peephole is deleted. Metal fragment simdgroups cannot prove divergent-lane survival for
         // that idiom, so detecting it is a loud refuse rather than silently skipping V_CMPX
         // (which would leave EXEC wrong) or running the architectural serialization (tofu).
-        if name.starts_with("VCmpx")
+        if !self.is_hlsl()
+            && name.starts_with("VCmpx")
             && self
                 .pixel_movrels_serialization_index_vgpr(instruction)
                 .is_some()

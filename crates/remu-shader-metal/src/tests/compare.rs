@@ -147,6 +147,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
         &MetalCompileOptions {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -166,6 +167,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
         },
@@ -178,6 +180,54 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
     );
     assert!(shader.source.contains("(uint)(uint64_t)simd_ballot("));
     assert!(!shader.source.contains("const uint remu_lane = 0u"));
+}
+
+#[test]
+fn hlsl_wave64_compares_share_both_ballot_halves_through_a_per_wave_mailbox() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vopc,
+            opcode: Opcode::Known("VCmpEqU32"),
+            words: vec![0],
+            sources: vec![Operand::vector(1), Operand::vector(2)],
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let options = MetalCompileOptions::compute_wave(0, 64);
+    let shader = compile_hlsl(&program, &empty_evaluation(), &options, [16, 16, 1])
+        .expect("non-isolated wave64 compare should lower");
+
+    assert!(
+        shader
+            .source
+            .contains("groupshared uint remu_wave64_ballot_words[64]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("groupshared uint remu_wave64_ballot_generations[32]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint2 remu_wave64_ballot(bool condition")
+    );
+    assert!(
+        shader
+            .source
+            .contains("InterlockedExchange(remu_wave64_ballot_generations[half_slot], epoch")
+    );
+    assert!(shader.source.contains("while (peer_generation < epoch)"));
+    assert!(shader.source.contains("[numthreads(16, 16, 1)]"));
+    assert!(shader.source.contains("remu_wave64_ballot(t"));
+    assert!(shader.source.contains("remu_wave64_ballot_epoch"));
+    assert!(shader.source.contains("remu_s_106 = t"));
+    assert!(shader.source.contains(".x;"));
+    assert!(shader.source.contains(".y;"));
+    assert!(shader.source.contains("GroupMemoryBarrierWithGroupSync()"));
 }
 
 #[test]

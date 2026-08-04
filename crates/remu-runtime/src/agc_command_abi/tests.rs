@@ -856,19 +856,21 @@ fn command_buffer_reservation_and_alignment_are_enforced() {
 
 #[test]
 fn invokes_the_gen5_growth_callback_before_allocating() {
-    unsafe extern "C" fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
-        if requested != 7 {
-            return false;
+    guest_abi_function! {
+        unsafe fn grow(command_buffer: u64, requested: u32, user_data: u64) -> bool {
+            if requested != 7 {
+                return false;
+            }
+            write_u64(
+                command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET,
+                read_u64(user_data),
+            );
+            write_u64(
+                command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
+                read_u64(user_data + 8),
+            );
+            true
         }
-        write_u64(
-            command_buffer + COMMAND_BUFFER_CURSOR_UP_OFFSET,
-            read_u64(user_data),
-        );
-        write_u64(
-            command_buffer + COMMAND_BUFFER_CURSOR_DOWN_OFFSET,
-            read_u64(user_data + 8),
-        );
-        true
     }
 
     let mut fixture = CommandFixture::new(2);

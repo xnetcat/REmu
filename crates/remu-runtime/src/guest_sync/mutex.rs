@@ -155,6 +155,9 @@ pub(crate) fn guest_pthread_once(control: u64, routine: u64) -> u64 {
     }
     drop(state);
 
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type OnceRoutine = unsafe extern "sysv64" fn();
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     type OnceRoutine = unsafe extern "C" fn();
     // SAFETY: scePthreadOnce's ABI requires a live no-argument guest function pointer. No REmu
     // state lock is held while it runs, so initialization may call back through other imports.

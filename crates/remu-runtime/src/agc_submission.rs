@@ -6,18 +6,18 @@ use crate::{
     AGC_IT_CLEAR_STATE, AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_DMA_DATA,
     AGC_IT_DRAW_INDEX_2, AGC_IT_DRAW_INDEX_AUTO, AGC_IT_DRAW_INDEX_INDIRECT,
     AGC_IT_DRAW_INDEX_INDIRECT_MULTI, AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_DRAW_INDIRECT,
-    AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE, AGC_IT_NOP,
-    AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM, AGC_IT_SET_BASE,
-    AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM, AGC_R_DMA_DATA,
-    AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM, AGC_R_WAIT_FLIP_DONE,
-    AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA, AgcComputeDispatchError,
-    AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory,
-    VideoOutState, agc_apply_set_base, agc_apply_submission_registers, agc_decode_compute_dispatch,
-    agc_emit_draw, agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw,
-    agc_image_binding_address, agc_submit_ordered_video_out_flip, agc_video_out_target,
-    emit_agc_gpu_event, read_guest_u32, read_guest_u64, trace_agc_blend_provenance,
-    trace_agc_programs, trace_agc_registers, trace_agc_shaders, trace_guest_sync,
-    trace_logarithmic_sequence,
+    AGC_IT_DRAW_INDIRECT_MULTI, AGC_IT_EVENT_WRITE, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE,
+    AGC_IT_INDEX_TYPE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_PFP_SYNC_ME, AGC_IT_RELEASE_MEM,
+    AGC_IT_SET_BASE, AGC_IT_WAIT_REG_MEM, AGC_IT_WRITE_DATA, AGC_R_ACB_RESET, AGC_R_ACQUIRE_MEM,
+    AGC_R_DMA_DATA, AGC_R_DRAW_INDEX_AUTO, AGC_R_DRAW_RESET, AGC_R_FLIP, AGC_R_RELEASE_MEM,
+    AGC_R_WAIT_FLIP_DONE, AGC_R_WAIT_MEM_32, AGC_R_WAIT_MEM_64, AGC_R_WRITE_DATA,
+    AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError,
+    AgcVideoOutTarget, ProcessGuestMemory, VideoOutState, agc_apply_set_base,
+    agc_apply_submission_registers, agc_decode_compute_dispatch, agc_emit_draw,
+    agc_emit_draw_with_indirect_arguments, agc_emit_indexed_draw, agc_image_binding_address,
+    agc_submit_ordered_video_out_flip, agc_video_out_target, emit_agc_gpu_event, read_guest_u32,
+    read_guest_u64, trace_agc_blend_provenance, trace_agc_programs, trace_agc_registers,
+    trace_agc_shaders, trace_guest_sync, trace_logarithmic_sequence,
 };
 mod decode;
 mod driver;
@@ -59,6 +59,7 @@ pub(crate) struct AgcSubmissionPacket {
 }
 
 const INDIRECT_DRAW_REGISTER_UNMAPPED: u32 = 0x280;
+const MAXIMUM_INDIRECT_DRAWS_PER_PACKET: u32 = 1_048_576;
 /// Gen5 result blocks contain sixteen 16-byte render-backend counter pairs.
 ///
 /// Native PS5 command streams clear the full 0x100-byte payload before issuing
@@ -128,8 +129,11 @@ fn agc_emit_indirect_draw(
     base_vertex_register: u32,
     first_element_register: Option<u32>,
     first_instance_register: u32,
+    draw_id_register: Option<u32>,
     draw_flags: u32,
     arguments_address: u64,
+    indirect_count_address: Option<u64>,
+    indirect_draw_index: u32,
     future_scanout_target: Option<AgcVideoOutTarget>,
 ) {
     static INDIRECT_DRAW_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -174,6 +178,20 @@ fn agc_emit_indirect_draw(
             neutralized_registers.push((register, graphics.shader_registers.insert(register, 0)));
         }
     }
+    if let Some(register) =
+        draw_id_register.filter(|&register| register != INDIRECT_DRAW_REGISTER_UNMAPPED)
+    {
+        if !neutralized_registers
+            .iter()
+            .any(|&(saved, _)| saved == register)
+        {
+            neutralized_registers
+                .push((register, graphics.shader_registers.get(&register).copied()));
+        }
+        graphics
+            .shader_registers
+            .insert(register, indirect_draw_index);
+    }
 
     let previous_instance_count =
         std::mem::replace(&mut graphics.instance_count, arguments.instance_count);
@@ -191,6 +209,8 @@ fn agc_emit_indirect_draw(
         draw_flags,
         future_scanout_target,
         Some(arguments_address),
+        indirect_count_address,
+        indirect_draw_index,
     );
     graphics.instance_count = previous_instance_count;
     if let Some(value) = previous_base_vertex {
@@ -227,17 +247,20 @@ fn agc_handle_indirect_draw(
     video_out: &VideoOutState,
     future_scanout_target: Option<AgcVideoOutTarget>,
 ) -> Result<(), AgcSubmissionError> {
-    if packet.opcode == AGC_IT_DRAW_INDEX_INDIRECT_MULTI {
-        return Err(AgcSubmissionError::UnsupportedIndirectDrawPacket(
-            packet.opcode,
-        ));
-    }
-    let indexed = packet.opcode != AGC_IT_DRAW_INDIRECT;
-    if packet.length != 5 {
+    let multi = matches!(
+        packet.opcode,
+        AGC_IT_DRAW_INDIRECT_MULTI | AGC_IT_DRAW_INDEX_INDIRECT_MULTI
+    );
+    let indexed = !matches!(
+        packet.opcode,
+        AGC_IT_DRAW_INDIRECT | AGC_IT_DRAW_INDIRECT_MULTI
+    );
+    let expected_length = if multi { 10 } else { 5 };
+    if packet.length != expected_length {
         return Err(AgcSubmissionError::IndirectDrawPacketLength {
             opcode: packet.opcode,
             actual: packet.length,
-            expected: 5,
+            expected: expected_length,
         });
     }
     let data_offset = read_guest_u32(packet.address + 4);
@@ -245,23 +268,76 @@ fn agc_handle_indirect_draw(
     let base_vertex_register = register_word & 0xffff;
     let first_element_register = indexed.then_some(register_word >> 16);
     let first_instance_register = read_guest_u32(packet.address + 12) & 0xffff;
-    let draw_flags = read_guest_u32(packet.address + 16);
-    let address = agc_indirect_draw_argument_address(graphics, data_offset)?;
-    let arguments = agc_read_indirect_draw_arguments(address, indexed)?;
-    agc_emit_indirect_draw(
-        packet.address,
-        graphics,
-        shaders,
-        video_out,
-        indexed,
-        arguments,
-        base_vertex_register,
-        first_element_register,
-        first_instance_register,
-        draw_flags,
-        address,
-        future_scanout_target,
-    );
+    let control_or_flags = read_guest_u32(packet.address + 16);
+    let base_address = agc_indirect_draw_argument_address(graphics, data_offset)?;
+    if !multi {
+        let arguments = agc_read_indirect_draw_arguments(base_address, indexed)?;
+        agc_emit_indirect_draw(
+            packet.address,
+            graphics,
+            shaders,
+            video_out,
+            indexed,
+            arguments,
+            base_vertex_register,
+            first_element_register,
+            first_instance_register,
+            None,
+            control_or_flags,
+            base_address,
+            None,
+            0,
+            future_scanout_target,
+        );
+        return Ok(());
+    }
+
+    let maximum_count = read_guest_u32(packet.address + 20);
+    if maximum_count > MAXIMUM_INDIRECT_DRAWS_PER_PACKET {
+        return Err(AgcSubmissionError::IndirectDrawCountTooLarge(maximum_count));
+    }
+    let count_address = (control_or_flags & (1 << 30) != 0).then(|| {
+        u64::from(read_guest_u32(packet.address + 24))
+            | (u64::from(read_guest_u32(packet.address + 28)) << 32)
+    });
+    if let Some(address) = count_address {
+        let mut count = [0_u8; 4];
+        if !ProcessGuestMemory.read(address, &mut count) {
+            return Err(AgcSubmissionError::UnreadableIndirectDrawCount(address));
+        }
+    }
+    let stride = read_guest_u32(packet.address + 32);
+    if stride & 3 != 0 {
+        return Err(AgcSubmissionError::InvalidIndirectDrawStride(stride));
+    }
+    let draw_flags = read_guest_u32(packet.address + 36);
+    let draw_id_register = (control_or_flags & (1 << 31) != 0).then_some(control_or_flags & 0xffff);
+    for draw_index in 0..maximum_count {
+        let byte_offset = u64::from(draw_index)
+            .checked_mul(u64::from(stride))
+            .ok_or(AgcSubmissionError::IndirectDrawAddressOverflow)?;
+        let address = base_address
+            .checked_add(byte_offset)
+            .ok_or(AgcSubmissionError::IndirectDrawAddressOverflow)?;
+        let arguments = agc_read_indirect_draw_arguments(address, indexed)?;
+        agc_emit_indirect_draw(
+            packet.address,
+            graphics,
+            shaders,
+            video_out,
+            indexed,
+            arguments,
+            base_vertex_register,
+            first_element_register,
+            first_instance_register,
+            draw_id_register,
+            draw_flags,
+            address,
+            count_address,
+            draw_index,
+            future_scanout_target,
+        );
+    }
     Ok(())
 }
 
@@ -536,7 +612,10 @@ pub(crate) fn agc_handle_submission_packet(
     }
     if matches!(
         opcode,
-        AGC_IT_DRAW_INDIRECT | AGC_IT_DRAW_INDEX_INDIRECT | AGC_IT_DRAW_INDEX_INDIRECT_MULTI
+        AGC_IT_DRAW_INDIRECT
+            | AGC_IT_DRAW_INDIRECT_MULTI
+            | AGC_IT_DRAW_INDEX_INDIRECT
+            | AGC_IT_DRAW_INDEX_INDIRECT_MULTI
     ) {
         agc_handle_indirect_draw(packet, graphics, shaders, video_out, future_scanout_target)?;
     }

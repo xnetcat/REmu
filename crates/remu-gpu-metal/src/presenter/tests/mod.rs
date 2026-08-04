@@ -192,6 +192,8 @@ fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw 
         sequence: 1,
         indexed: true,
         indirect_arguments_address: None,
+        indirect_count_address: None,
+        indirect_draw_index: 0,
         instance_count: 1,
         index_buffer_address: address,
         index_resource_address: 0,

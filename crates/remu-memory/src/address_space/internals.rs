@@ -11,9 +11,11 @@ use super::shared::{
 };
 use super::{
     AddressSpaceError, CpuWriteWatch, GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement,
-    GuestPhysicalBacking, GuestProtection, Vma, VmaKind, align_up, checked_end, host_error,
-    host_pointer, host_size, overlap_error, require_aligned,
+    GuestPhysicalBacking, GuestProtection, Vma, VmaKind, align_up, checked_end, overlap_error,
+    require_aligned,
 };
+#[cfg(target_os = "macos")]
+use super::{host_error, host_pointer, host_size};
 
 impl GuestAddressSpace {
     pub(super) fn validate_allocation(size: u64, alignment: u64) -> Result<(), AddressSpaceError> {
@@ -221,31 +223,38 @@ impl GuestAddressSpace {
         size: u64,
         protection: GuestProtection,
     ) -> Result<(), AddressSpaceError> {
+        #[cfg(windows)]
+        let _ = protection;
         debug_assert!(start >= self.base().get());
         debug_assert!(start.saturating_add(size) <= self.end);
         let _mapping_mutation = begin_shared_mapping_mutation();
         CpuWriteWatch::retire_overlapping(start, size);
-        let pointer = host_pointer(start)?;
-        // SAFETY: Placement validation proves this fixed range lies entirely inside our host
-        // reservation and does not cover another mapped VMA.
-        let result = unsafe {
-            libc::mmap(
-                pointer,
-                host_size(size)?,
-                protection.host_flags(),
-                libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if result == libc::MAP_FAILED {
-            return Err(host_error(
-                "anonymous mapping",
-                start,
-                checked_end(start, size)?,
-            ));
+        #[cfg(target_os = "macos")]
+        {
+            let pointer = host_pointer(start)?;
+            // SAFETY: Placement validation proves this fixed range lies entirely inside our host
+            // reservation and does not cover another mapped VMA.
+            let result = unsafe {
+                libc::mmap(
+                    pointer,
+                    host_size(size)?,
+                    protection.host_flags(),
+                    libc::MAP_FIXED | libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if result == libc::MAP_FAILED {
+                return Err(host_error(
+                    "anonymous mapping",
+                    start,
+                    checked_end(start, size)?,
+                ));
+            }
+            debug_assert_eq!(result, pointer);
         }
-        debug_assert_eq!(result, pointer);
+        #[cfg(windows)]
+        self.reservation.restore_placeholder(start, size)?;
         // The fixed anonymous mapping just replaced every byte in the range with zeros without a
         // single byte store; record it so a zero-poisoned crash can name it.
         crate::record_guest_write(crate::GuestWriteSite::MapZero, start, size, &[0], 0);
@@ -271,41 +280,53 @@ impl GuestAddressSpace {
             })
             .collect::<Vec<_>>();
         CpuWriteWatch::retire_overlapping(start, size);
-        let pointer = host_pointer(start)?;
-        let offset = libc::off_t::try_from(backing_offset).map_err(|_| {
-            AddressSpaceError::HostSizeOverflow {
-                value: backing_offset,
+        #[cfg(target_os = "macos")]
+        {
+            let pointer = host_pointer(start)?;
+            let offset = libc::off_t::try_from(backing_offset).map_err(|_| {
+                AddressSpaceError::HostSizeOverflow {
+                    value: backing_offset,
+                }
+            })?;
+            // SAFETY: Placement and backing validation prove both the fixed VA range and file range.
+            let result = unsafe {
+                libc::mmap(
+                    pointer,
+                    host_size(size)?,
+                    protection.host_flags(),
+                    libc::MAP_FIXED | libc::MAP_SHARED,
+                    backing.inner.descriptor,
+                    offset,
+                )
+            };
+            if result == libc::MAP_FAILED {
+                return Err(host_error(
+                    "shared mapping",
+                    start,
+                    checked_end(start, size)?,
+                ));
             }
-        })?;
-        // SAFETY: Placement and backing validation prove both the fixed VA range and file range.
-        let result = unsafe {
-            libc::mmap(
-                pointer,
-                host_size(size)?,
-                protection.host_flags(),
-                libc::MAP_FIXED | libc::MAP_SHARED,
-                backing.inner.descriptor,
-                offset,
-            )
-        };
-        if result == libc::MAP_FAILED {
-            return Err(host_error(
-                "shared mapping",
-                start,
-                checked_end(start, size)?,
-            ));
+            debug_assert_eq!(result, pointer);
         }
-        debug_assert_eq!(result, pointer);
+        #[cfg(windows)]
+        self.reservation
+            .map_shared(start, size, protection, backing, backing_offset)?;
         register_shared_mapping_range(start, size, backing, backing_offset);
         Ok(())
     }
 
     pub(super) fn remove_metadata_range(&mut self, start: u64, end: u64) {
-        let keys: Vec<_> = self
-            .vmas
-            .iter()
-            .filter_map(|(&key, vma)| (vma.start < end && vma.end > start).then_some(key))
-            .collect();
+        let mut keys = Vec::new();
+        if let Some((&key, vma)) = self.vmas.range(..=start).next_back()
+            && vma.end > start
+        {
+            keys.push(key);
+        }
+        for (&key, _) in self.vmas.range(start..end) {
+            if keys.last().copied() != Some(key) {
+                keys.push(key);
+            }
+        }
         for key in keys {
             let original = self.vmas.remove(&key).expect("VMA key was just collected");
             if original.start < start {
@@ -338,20 +359,53 @@ impl GuestAddressSpace {
         self.vmas.insert(right.start, right);
     }
 
-    pub(super) fn normalize(&mut self) {
-        let old = std::mem::take(&mut self.vmas);
-        for (_, vma) in old {
-            if let Some(previous_key) = self.vmas.last_key_value().map(|(&key, _)| key) {
-                let previous = self
+    /// Coalesces VMA boundaries changed by an operation on `start..end`.
+    ///
+    /// VMAs outside that interval were normalized before the operation, so only its predecessor,
+    /// its own records, and its immediate successor can have become mergeable. Keeping the pass
+    /// local prevents thousands of small fixed aliases from turning mapping into O(n²) work.
+    pub(super) fn normalize_range(&mut self, start: u64, end: u64) {
+        let Some(mut current_key) = self
+            .vmas
+            .range(..start)
+            .next_back()
+            .or_else(|| self.vmas.range(start..).next())
+            .map(|(&key, _)| key)
+        else {
+            return;
+        };
+        loop {
+            let Some(next_key) = self
+                .vmas
+                .range((
+                    std::ops::Bound::Excluded(current_key),
+                    std::ops::Bound::Unbounded,
+                ))
+                .next()
+                .map(|(&key, _)| key)
+            else {
+                break;
+            };
+            let merge = {
+                let current = self
                     .vmas
-                    .get_mut(&previous_key)
-                    .expect("last VMA key was just observed");
-                if previous.can_merge(&vma) {
-                    previous.end = vma.end;
-                    continue;
-                }
+                    .get(&current_key)
+                    .expect("current VMA key is live");
+                let next = self.vmas.get(&next_key).expect("next VMA key is live");
+                current.can_merge(next)
+            };
+            if merge {
+                let next = self.vmas.remove(&next_key).expect("next VMA key is live");
+                self.vmas
+                    .get_mut(&current_key)
+                    .expect("current VMA key is live")
+                    .end = next.end;
+                continue;
             }
-            self.vmas.insert(vma.start, vma);
+            if next_key > end {
+                break;
+            }
+            current_key = next_key;
         }
     }
 }

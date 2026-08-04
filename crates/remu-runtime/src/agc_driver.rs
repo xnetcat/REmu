@@ -86,6 +86,9 @@ const MARKER_PROBE_BYTES: u64 = 64;
 /// Wavefront debugging is refused on a target whose PA Debug setting is off.
 const SHADER_DEBUGGING_NOT_AVAILABLE: u64 = 1;
 
+#[cfg(all(windows, target_arch = "x86_64"))]
+type GrowCallback = unsafe extern "sysv64" fn(u64, u32, u64) -> bool;
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 type GrowCallback = unsafe extern "C" fn(u64, u32, u64) -> bool;
 
 /// Names registered for the workload stream identifiers Razor GPU can select between.
@@ -813,6 +816,7 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_every_listed_command_buffer() {
+        crate::event_state::reset_event_state_for_tests();
         let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_thread_local_event_sink(sender);
         let stream = command_stream();
@@ -856,6 +860,7 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_nothing_when_one_entry_is_invalid() {
+        crate::event_state::reset_event_state_for_tests();
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let addresses = [address, 0];

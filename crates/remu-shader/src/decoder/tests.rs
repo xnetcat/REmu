@@ -1598,6 +1598,15 @@ fn decodes_scratch_memory_without_treating_offsets_as_guest_pointers() {
         }))
     ));
 
+    // SVE explicitly adds the vector offset when SADDR is present.
+    let word = flat_word(0x0c, 1) | (1 << 13);
+    let frame = decode_frame(0, &[word, extra]).expect("SVE SCRATCH load frame");
+    let instruction = create_instruction(0, frame.encoding, frame.opcode, vec![word, extra]);
+    assert_eq!(
+        instruction.sources,
+        [Operand::vector(0), Operand::scalar(5)]
+    );
+
     // Without SADDR the 32-bit VADDR is the only address register: no phantom vaddr+1 pair.
     let word = flat_word(0x1a, 1); // scratch_store_short
     let extra = 3 | (9 << 8) | (0x7f << 16);
@@ -1799,13 +1808,18 @@ fn unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the
         (0xbfaa_0000, RawOpcodeFamily::Sopp, 0x2a), // reserved SOPP hint space
         (0xbd85_0007, RawOpcodeFamily::Sopk, 0x1b), // reserved SOPK
         (0x7e00_d504, RawOpcodeFamily::Vop1, 0x6a), // reserved VOP1
-        (0x7dd8_0704, RawOpcodeFamily::Vopc, 0xec), // reserved VOPC
+        (0x7dc0_0704, RawOpcodeFamily::Vopc, 0xe0), // reserved VOPC
         (0x1a08_0704, RawOpcodeFamily::Vop2, 0x0d), // VOP2 space beyond the table
         (0xd8f4_0000, RawOpcodeFamily::Ds, 0x3d),   // DS code outside the table
         (0xdd04_8000, RawOpcodeFamily::Flat, 0x41), // GLOBAL code outside the table
     ];
     for &(word, family, code) in raw_words {
-        let program = decode_program(0x1000, &[word, 0xbf81_0000])
+        let frame = decode_frame(0, &[word, 0, 0])
+            .unwrap_or_else(|error| panic!("raw frame for {family:?}: {error}"));
+        let mut words = vec![word];
+        words.resize(frame.dwords, 0);
+        words.push(0xbf81_0000);
+        let program = decode_program(0x1000, &words)
             .unwrap_or_else(|error| panic!("raw fallback for {family:?}: {error}"));
         let instruction = &program.instructions[0];
         match instruction.opcode {

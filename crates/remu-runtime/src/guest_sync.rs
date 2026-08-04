@@ -6,7 +6,7 @@ use crate::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, TryLockError};
 use std::time::Instant;
 
 mod condition;
@@ -381,9 +381,14 @@ fn finish_condition_notify_observation(observation: Option<ConditionNotifyCallTr
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn report_condition_stall_attribution() {
     let now = guest_import_trace_nanos();
-    let trace = condition_lifecycle_trace()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let trace = match condition_lifecycle_trace().try_lock() {
+        Ok(trace) => trace,
+        Err(TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(TryLockError::WouldBlock) => {
+            eprintln!("[REMu][STALL-COND] lifecycle_trace=busy");
+            return;
+        }
+    };
     eprintln!(
         "[REMu][STALL-COND] active_waits={} active_notifies={} recent_returns={} recent_notifies={} dropped_waits={} dropped_notifies={}",
         trace.active_waits.len(),

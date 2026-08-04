@@ -741,6 +741,7 @@ fn generated_memory_msl_compiles_with_apple_metal() {
         work_group_y: Some(117),
         work_group_z: Some(118),
         thread_group_size: Some(119),
+        ..ComputeSystemRegisters::default()
     });
     let shader = compile_msl(&program, &evaluation, &MetalCompileOptions::compute(0))
         .expect("complete decoded VMEM surface should lower");
@@ -764,14 +765,7 @@ fn generated_memory_msl_compiles_with_apple_metal() {
         let source = directory.join(format!("{name}.metal"));
         let air = directory.join(format!("{name}.air"));
         std::fs::write(&source, shader.source).expect("write generated memory MSL");
-        let output = Command::new(&compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(&compiler, &source, &air);
         assert!(
             output.status.success(),
             "{name} MSL failed to compile:\n{}\n{}",

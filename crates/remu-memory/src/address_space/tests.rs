@@ -314,6 +314,46 @@ fn private_backing_write_is_coherent_without_falsely_dirtying_cpu_watches() {
 }
 
 #[test]
+fn host_write_notification_reaches_every_shared_alias_watch() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let first = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let second = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    // SAFETY: both shared mappings remain live through the watches' lifetime.
+    let first_watch = unsafe { CpuWriteWatch::new(first.get(), GUEST_PAGE_SIZE).unwrap() };
+    // SAFETY: same mapping lifetime guarantee as above.
+    let second_watch = unsafe { CpuWriteWatch::new(second.get(), GUEST_PAGE_SIZE).unwrap() };
+
+    assert!(crate::notify_guest_memory_written(first.get() + 32, 8));
+    assert!(first_watch.is_dirty());
+    assert!(second_watch.is_dirty());
+    let page_bytes = host_page_size().expect("host page size");
+    assert_eq!(first_watch.dirty_page_ranges(), [(first.get(), page_bytes)]);
+    assert_eq!(
+        second_watch.dirty_page_ranges(),
+        [(second.get(), page_bytes)]
+    );
+}
+
+#[test]
 fn identity_guarded_backing_write_rejects_reused_guest_address() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let first_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
@@ -574,6 +614,15 @@ fn a_lease_follows_a_recycled_va_through_the_identity_licence() {
             GUEST_PAGE_SIZE,
         )
         .unwrap();
+
+    assert_eq!(
+        guest_shared_backing_alias_segments_at_identity(lease.identity(), 8),
+        Some(vec![GuestSharedBackingSegment {
+            address: observer.get(),
+            byte_count: 8,
+        }]),
+        "identity lookup follows the original bytes, not the recycled VA"
+    );
 
     assert_eq!(
         lease.publish_run_if_baseline(0, &[0; 8], &[0x5a; 8]),

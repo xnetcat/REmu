@@ -368,6 +368,7 @@ impl KernelMemory {
     /// after changing a mapping or its protection. Adjacent readable VMAs are one continuous host
     /// virtual range for that purpose even when their guest query metadata or physical backing
     /// offsets differ.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn readable_ranges(&self) -> Vec<(u64, u64)> {
         let mut ranges: Vec<(u64, u64)> = Vec::new();
         for mapping in self.virtual_memory.vmas().into_iter().filter(|mapping| {

@@ -21,6 +21,7 @@ use crate::{MetalCompileOptions, MetalShaderStage};
 pub(crate) mod control_flow;
 pub(crate) mod driver;
 pub(crate) mod export;
+pub(crate) mod hlsl;
 pub(crate) mod image;
 pub(crate) mod interface;
 pub(crate) mod memory;
@@ -33,11 +34,14 @@ pub(crate) mod vector;
 const MAX_METAL_THREADGROUP_THREADS: usize = 1_024;
 const METAL_THREADGROUP_MEMORY_LIMIT_BYTES: usize = 32 * 1_024;
 const SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP: usize = MAX_METAL_THREADGROUP_THREADS / 32;
+const HLSL_VECTOR_CONTROLLED_LOOP_WATCHDOG: u32 = 64;
+const HLSL_SCALAR_CONTROLLED_LOOP_WATCHDOG: u32 = 1_024;
 
 pub(crate) struct Compiler<'a> {
     program: &'a Program,
     evaluation: &'a ShaderEvaluation,
     options: &'a MetalCompileOptions,
+    dialect: SourceDialect,
     pub(crate) body: String,
     pub(crate) next_temp: u32,
     vertex_outputs: BTreeSet<u32>,
@@ -48,7 +52,17 @@ pub(crate) struct Compiler<'a> {
     control_flow: ControlFlowLowering,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceDialect {
+    Metal,
+    Hlsl,
+}
+
 impl Compiler<'_> {
+    pub(crate) const fn is_hlsl(&self) -> bool {
+        matches!(self.dialect, SourceDialect::Hlsl)
+    }
+
     fn is_threadgroup_stage(&self) -> bool {
         matches!(
             self.options.stage,
@@ -76,6 +90,33 @@ impl Compiler<'_> {
     fn dispatcher_step_limit(&self) -> u32 {
         let instructions = u32::try_from(self.program.instructions.len()).unwrap_or(u32::MAX);
         instructions.saturating_mul(32).max(16_384)
+    }
+
+    /// Returns a finite loop bound for compute HLSL.
+    ///
+    /// Windows resets a device when a dispatch cannot make progress within the TDR interval.
+    /// Decode-time resource snapshots can be older than ordered GPU producers, so even a normally
+    /// small scalar loop can transiently observe a poison/sentinel count. Keep every translated
+    /// compute loop statically finite. Scalar resource evaluation still supplies the useful trip
+    /// count, capped at a generous watchdog; loops whose exit depends on lane state use the tighter
+    /// conservative watchdog. Metal keeps its native structured loops unchanged.
+    fn hlsl_structured_loop_iteration_limit(&self) -> Option<u32> {
+        if !self.is_hlsl() {
+            return None;
+        }
+        let registers = self.evaluation.compute_system_registers?;
+        let vector_watchdog = if registers.has_evaluated_vector_controlled_loop {
+            HLSL_VECTOR_CONTROLLED_LOOP_WATCHDOG
+        } else {
+            0
+        };
+        Some(
+            registers
+                .maximum_evaluated_scalar_loop_iterations
+                .min(HLSL_SCALAR_CONTROLLED_LOOP_WATCHDOG)
+                .max(vector_watchdog)
+                .max(1),
+        )
     }
 
     fn readfirstlane_site_count(&self) -> usize {
@@ -205,15 +246,35 @@ impl Compiler<'_> {
         }
     }
 
-    fn ballot_words(&self, condition: &str) -> (String, String) {
+    fn ballot_word_expressions(&self, condition: &str) -> (String, String) {
         let ballot = Self::ballot(condition);
         if self.split_wave64() {
+            if self.is_hlsl() {
+                let synchronized = format!(
+                    "remu_wave64_ballot({condition}, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z)"
+                );
+                return (format!("{synchronized}.x"), format!("{synchronized}.y"));
+            }
             (
                 format!("remu_wave_half == 0u ? {ballot} : 0u"),
                 format!("remu_wave_half == 0u ? 0u : {ballot}"),
             )
         } else {
             (ballot, "0u".to_owned())
+        }
+    }
+
+    fn ballot_words(&mut self, condition: &str) -> (String, String) {
+        if self.split_wave64() && self.is_hlsl() {
+            let synchronized = self.temp(
+                "uint2",
+                &format!(
+                    "remu_wave64_ballot({condition}, remu_wave_index, remu_wave_half, remu_wave64_ballot_epoch, remu_group_size.x * remu_group_size.y * remu_group_size.z)"
+                ),
+            );
+            (format!("{synchronized}.x"), format!("{synchronized}.y"))
+        } else {
+            self.ballot_word_expressions(condition)
         }
     }
 

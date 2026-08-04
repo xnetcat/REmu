@@ -4,17 +4,17 @@ use std::sync::{Arc, Mutex};
 
 use super::{
     AGC_IT_DISPATCH_DIRECT, AGC_IT_DISPATCH_INDIRECT, AGC_IT_DRAW_INDEX_INDIRECT,
-    AGC_IT_DRAW_INDIRECT, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP,
-    AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG,
-    AGC_IT_SET_SH_REG_INDIRECT, AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX,
-    AGC_IT_SET_UCONFIG_REG_INDIRECT, AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO,
-    AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET, AGC_SHADER_INPUT_SEMANTICS_OFFSET,
-    AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET, AGC_SHADER_OUTPUT_SEMANTICS_OFFSET,
-    AGC_SPI_PS_INPUT_CNTL_0, AGC_VGT_INDEX_TYPE, AMPR_INVALID_FILE_ID,
+    AGC_IT_DRAW_INDEX_INDIRECT_MULTI, AGC_IT_DRAW_INDIRECT, AGC_IT_INDEX_BASE,
+    AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_IT_SET_BASE,
+    AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
+    AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
+    AGC_R_ACB_RESET, AGC_R_DRAW_INDEX_AUTO, AGC_SHADER_INPUT_SEMANTICS_COUNT_OFFSET,
+    AGC_SHADER_INPUT_SEMANTICS_OFFSET, AGC_SHADER_OUTPUT_SEMANTICS_COUNT_OFFSET,
+    AGC_SHADER_OUTPUT_SEMANTICS_OFFSET, AGC_SPI_PS_INPUT_CNTL_0, AGC_VGT_INDEX_TYPE,
     AUDIO_OUT2_CONTEXT_MEMORY_BASE_SIZE, AUDIO_OUT2_CONTEXT_MEMORY_QUEUE_STRIDE,
     AUDIO_OUT2_CONTEXT_PARAM_SIZE, AUDIO_OUT2_DEFAULT_GRAIN_FRAMES, AUDIO_OUT2_DEFAULT_QUEUE_DEPTH,
     AUDIO_OUT2_PORT_TYPE_VIBRATION, AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState,
-    AgcShaderRegistry, AmprCommandBufferState, AprResolveOutputs, BATCH_MAP_OPERATION_MAP_DIRECT,
+    AgcShaderRegistry, AmprCommandBufferState, BATCH_MAP_OPERATION_MAP_DIRECT,
     DEFAULT_FLIP_INTERVAL_MICROSECONDS, DIRENT_BLOCK_SIZE, DIRENT_HEADER_SIZE, GPU_EVENT_SINK_TEST,
     GuestExitCallback, KERNEL_FILES, KernelDirectory, KernelFileState, ProbeDispatchState,
     PthreadAttrState, SAVE_DATA_ERROR_BUSY, SAVE_DATA_ERROR_EXISTS, SAVE_DATA_ERROR_NOT_FOUND,
@@ -31,20 +31,20 @@ use super::{
     agc_decode_compute_dispatch, agc_driver_submit_acb, agc_fuse_shader_halves,
     agc_get_fused_shader_size, agc_pm4, allocate_direct_memory, allocate_pthread_thread_object,
     ampr_command_buffer_write_address_on_completion, ampr_command_buffer_write_kernel_event_queue,
-    ampr_resolve_file_paths, ampr_resolve_paths_core, ampr_submit_command_buffer,
-    available_direct_memory_size, available_flexible_memory_size, civil_from_unix_seconds,
-    clone_guest_tls, create_pthread_attr, decode_agc_dma_data, decode_agc_memory_acquire,
-    decode_agc_memory_wait, decode_audio_out2_attribute, decode_audio_out2_channel_format,
-    destroy_pthread_attr, discover_runtime_module_paths, dispatch_audio_out2_import,
-    dispatch_guest_numeric_parser, dispatch_probe_import, draw_required_vertex_record_count,
-    flip_interval_microseconds, guest_clock_gettime, guest_free, guest_global_locale,
-    guest_kernel_convert_localtime_to_utc, guest_kernel_convert_utc_to_localtime,
-    guest_kernel_fstat, guest_kernel_ftruncate, guest_kernel_gettimeofday, guest_kernel_lseek,
-    guest_kernel_read, guest_posix_file_result, guest_posix_gettimeofday, guest_pthread_once,
-    guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr, guest_wmemcmp,
-    guest_wmemcpy, guest_wmemmove, join_guest_path, kernel_add_ampr_event, kernel_batch_map,
-    kernel_release_direct_memory, kernel_stat_payload, kernel_virtual_query, low_f32, low_u32,
-    pace_video_out_flip, process_clock_nanos, process_time_since_nanos, pthread_attr_get_affinity,
+    ampr_submit_command_buffer, available_direct_memory_size, available_flexible_memory_size,
+    civil_from_unix_seconds, clone_guest_tls, create_pthread_attr, decode_agc_dma_data,
+    decode_agc_memory_acquire, decode_agc_memory_wait, decode_audio_out2_attribute,
+    decode_audio_out2_channel_format, destroy_pthread_attr, discover_runtime_module_paths,
+    dispatch_audio_out2_import, dispatch_guest_numeric_parser, dispatch_probe_import,
+    draw_required_vertex_record_count, flip_interval_microseconds, guest_clock_gettime, guest_free,
+    guest_global_locale, guest_kernel_convert_localtime_to_utc,
+    guest_kernel_convert_utc_to_localtime, guest_kernel_fstat, guest_kernel_ftruncate,
+    guest_kernel_gettimeofday, guest_kernel_lseek, guest_kernel_read, guest_posix_file_result,
+    guest_posix_gettimeofday, guest_pthread_once, guest_qsort, guest_snprintf, guest_tolower_table,
+    guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
+    join_guest_path, kernel_add_ampr_event, kernel_batch_map, kernel_release_direct_memory,
+    kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pace_video_out_flip,
+    process_clock_nanos, process_time_since_nanos, pthread_attr_get_affinity,
     pthread_attr_get_stack, pthread_attr_set_affinity, pthread_attr_set_detach_state,
     pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16, read_guest_u32,
     read_guest_u64, resolve_guest_path, resolve_probe_guest_path, rtc_get_current_clock_local_time,
@@ -56,6 +56,10 @@ use super::{
     take_exit_callbacks, tls_dtv_entry_offset, unix_days_from_civil, video_out_open,
     video_out_submit_flip, write_guest_u8, write_guest_u16, write_guest_u32, write_guest_u64,
     write_import_stub,
+};
+#[cfg(target_os = "macos")]
+use super::{
+    AMPR_INVALID_FILE_ID, AprResolveOutputs, ampr_resolve_file_paths, ampr_resolve_paths_core,
 };
 mod agc_draw;
 mod agc_packets;
@@ -185,22 +189,28 @@ static GUEST_EXCEPTION_TEST: Mutex<()> = Mutex::new(());
 static DELIVERED_EXCEPTION: AtomicU32 = AtomicU32::new(0);
 static ONCE_CALLBACKS: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "C" fn once_test_callback() {
-    ONCE_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+guest_abi_function! {
+    unsafe fn once_test_callback() {
+        ONCE_CALLBACKS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-#[cfg(target_arch = "x86_64")]
-unsafe extern "C" fn pthread_exit_boundary_test_entry(argument0: u64, argument1: u64) -> u64 {
-    super::guest_pthread_exit(argument0 + argument1);
+guest_abi_function! {
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn pthread_exit_boundary_test_entry(argument0: u64, argument1: u64) -> u64 {
+        super::guest_pthread_exit(argument0 + argument1);
+    }
 }
 
 static DELIVERED_EXCEPTION_RSP: AtomicUsize = AtomicUsize::new(0);
 
-unsafe extern "C" fn capture_guest_exception(exception: i32, context: *mut u8) {
-    DELIVERED_EXCEPTION.store(exception.cast_unsigned(), Ordering::SeqCst);
-    // SAFETY: the delivery test passes a complete 0x500-byte synthesized Orbis ucontext.
-    let rsp = unsafe { std::ptr::read_unaligned(context.add(0xf8).cast::<u64>()) };
-    DELIVERED_EXCEPTION_RSP.store(usize::try_from(rsp).unwrap(), Ordering::SeqCst);
+guest_abi_function! {
+    unsafe fn capture_guest_exception(exception: i32, context: *mut u8) {
+        DELIVERED_EXCEPTION.store(exception.cast_unsigned(), Ordering::SeqCst);
+        // SAFETY: the delivery test passes a complete 0x500-byte synthesized Orbis ucontext.
+        let rsp = unsafe { std::ptr::read_unaligned(context.add(0xf8).cast::<u64>()) };
+        DELIVERED_EXCEPTION_RSP.store(usize::try_from(rsp).unwrap(), Ordering::SeqCst);
+    }
 }
 
 fn compute_graphics_state(program_address: u64) -> (AgcGraphicsState, AgcShaderRegistry) {
@@ -264,6 +274,8 @@ fn targetless_scanout_test_draw() -> remu_gpu::IndexedDraw {
         sequence: 1,
         indexed: false,
         indirect_arguments_address: None,
+        indirect_count_address: None,
+        indirect_draw_index: 0,
         instance_count: 1,
         index_buffer_address: 0,
         index_resource_address: 0,
@@ -407,15 +419,17 @@ fn wait_for_guest_condition_waiters(condition: u64, expected: usize) {
     }
 }
 
-unsafe extern "C" fn compare_i32(left: *const u8, right: *const u8) -> i32 {
-    // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
-    let left = unsafe { std::ptr::read_unaligned(left.cast::<i32>()) };
-    // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
-    let right = unsafe { std::ptr::read_unaligned(right.cast::<i32>()) };
-    match left.cmp(&right) {
-        std::cmp::Ordering::Less => -1,
-        std::cmp::Ordering::Equal => 0,
-        std::cmp::Ordering::Greater => 1,
+guest_abi_function! {
+    unsafe fn compare_i32(left: *const u8, right: *const u8) -> i32 {
+        // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
+        let left = unsafe { std::ptr::read_unaligned(left.cast::<i32>()) };
+        // SAFETY: guest_qsort passes pointers to complete i32 elements in the test array.
+        let right = unsafe { std::ptr::read_unaligned(right.cast::<i32>()) };
+        match left.cmp(&right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        }
     }
 }
 
@@ -444,7 +458,7 @@ impl Drop for TemporaryTestDirectory {
 
 /// Builds one `sceKernelBatchMap` entry: start, direct offset, length, protection, type, and
 /// operation at the console's fixed field offsets.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", windows))]
 fn batch_map_entry(
     start: u64,
     offset: u64,

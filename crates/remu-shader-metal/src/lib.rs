@@ -7,6 +7,7 @@
 //! semantics or compilation fails with the instruction PC and opcode; this crate never substitutes
 //! a placeholder color, drops an unknown memory access, or selects behavior by game identity.
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 mod compiler;
@@ -19,10 +20,13 @@ pub(crate) use compiler::operand::format_u32;
 use compiler::vector::is_supported_dpp_control;
 #[cfg(test)]
 use remu_shader::{
-    ExportControl, ImageBinding, ImageControl, InstructionControl, Operand, OperandKind,
-    PixelExportFormat, PixelOutputKind, SdwaControl, ShaderEncoding,
+    ExportControl, ImageBinding, ImageControl, Operand, PixelExportFormat, PixelOutputKind,
+    SdwaControl, ShaderEncoding,
 };
-use remu_shader::{Opcode, PixelOutputBinding, Program, ShaderEvaluation, VertexInputBinding};
+use remu_shader::{
+    InstructionControl, Opcode, OperandKind, PixelOutputBinding, Program, ShaderEvaluation,
+    VertexInputBinding,
+};
 
 const SCALAR_REGISTER_COUNT: u32 = 128;
 const VECTOR_REGISTER_COUNT: u32 = 256;
@@ -103,6 +107,71 @@ impl PixelInputControl {
     }
 }
 
+/// Determines which physical rectangle parameters supply texture coordinates to a pixel shader.
+///
+/// The procedural rectangle export stage has no conventional parameter exports. Trace the first
+/// texture sample's address VGPRs back to their interpolation instructions so every native backend
+/// can synthesize the same architectural interface.
+#[must_use]
+pub fn rectangle_coordinate_parameter_mask(
+    program: &Program,
+    controls: &[u32; PIXEL_INPUT_CONTROL_COUNT],
+) -> Option<u32> {
+    let (sample_index, image) =
+        program
+            .instructions
+            .iter()
+            .enumerate()
+            .find_map(|(index, instruction)| {
+                (instruction.opcode.starts_with("ImageSample")
+                    || instruction.opcode.starts_with("ImageGather"))
+                .then_some(match instruction.control.as_ref() {
+                    Some(InstructionControl::Image(image)) => Some((index, image)),
+                    _ => None,
+                })
+                .flatten()
+            })?;
+
+    let mut live_vectors = image
+        .address_registers
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut mask = 0_u32;
+    for instruction in program.instructions[..sample_index].iter().rev() {
+        let writes_live_vector = instruction.destinations.iter().any(|destination| {
+            destination.kind == OperandKind::VectorRegister
+                && live_vectors.contains(&destination.value)
+        });
+        if !writes_live_vector {
+            continue;
+        }
+        for destination in &instruction.destinations {
+            if destination.kind == OperandKind::VectorRegister {
+                live_vectors.remove(&destination.value);
+            }
+        }
+
+        if let Some(InstructionControl::Interpolation(interpolation)) = instruction.control.as_ref()
+            && !instruction.opcode.starts_with("VInterpP1")
+            && interpolation.attribute < PIXEL_INPUT_CONTROL_COUNT as u32
+        {
+            let control =
+                PixelInputControl::from_register(controls[interpolation.attribute as usize]);
+            if !control.uses_default() {
+                mask |= 1_u32 << control.input_offset;
+            }
+            continue;
+        }
+        for source in &instruction.sources {
+            if source.kind == OperandKind::VectorRegister {
+                live_vectors.insert(source.value);
+            }
+        }
+    }
+    (mask != 0).then_some(mask)
+}
+
 #[must_use]
 pub const fn identity_pixel_input_controls() -> [PixelInputControl; PIXEL_INPUT_CONTROL_COUNT] {
     let mut controls = [PixelInputControl::ZERO; PIXEL_INPUT_CONTROL_COUNT];
@@ -165,10 +234,14 @@ impl NggRegisters {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct MetalCompileOptions {
     pub stage: MetalShaderStage,
     pub required_vertex_output_count: u32,
+    /// Exact vertex parameter locations consumed by the linked pixel stage. `None` retains the
+    /// legacy count-based interface; D3D12 supplies `Some` so unused guest exports do not shift
+    /// later DXIL linkage registers.
+    pub required_vertex_output_locations: Option<Vec<u32>>,
     /// Raw `PA_CL_VS_OUT_CNTL` state used to map `EXP POS1..3` onto clip/cull distances and
     /// miscellaneous fixed-function vertex outputs.
     ///
@@ -228,6 +301,14 @@ pub struct MetalCompileOptions {
     /// Architectural lanes per guest compute wave. Apple executes SIMD32; wave64 shaders whose
     /// cross-lane operations are split-safe use this to place ballot masks in the correct half.
     pub wave_lane_count: u32,
+    /// D3D12-only packing axis used to execute each emulated wave64 in its own 64-thread native
+    /// group while retaining the guest workgroup's logical IDs.
+    ///
+    /// Full-group HLSL barriers cannot safely exchange the two SIMD32 halves of one guest wave
+    /// when sibling guest waves take different scalar branches. The DX12 executor enables this
+    /// only for multi-wave compute groups without guest LDS or workgroup barriers, and expands the
+    /// selected dispatch dimension by the number of guest waves. Metal ignores this field.
+    pub hlsl_wave64_group_isolation_axis: Option<u8>,
     /// Number of vector registers allocated by the guest stage's `PGM_RSRC1` state.
     ///
     /// Relative vector moves address `VGPR[base + M0]`. Metal does not allow the backend's
@@ -247,6 +328,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Vertex,
             required_vertex_output_count,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -266,6 +348,7 @@ impl MetalCompileOptions {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -280,6 +363,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs,
@@ -299,6 +383,7 @@ impl MetalCompileOptions {
             lds_size_bytes: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -309,6 +394,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -328,6 +414,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -338,6 +425,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -357,6 +445,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             scratch_size_bytes: 0,
             wave_lane_count,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -381,6 +470,7 @@ impl MetalCompileOptions {
         Self {
             stage: MetalShaderStage::Mesh,
             required_vertex_output_count,
+            required_vertex_output_locations: None,
             vertex_output_control: 0,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
@@ -400,6 +490,7 @@ impl MetalCompileOptions {
             lds_size_bytes,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
+            hlsl_wave64_group_isolation_axis: None,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
         }
@@ -491,6 +582,134 @@ pub struct MetalRegisterFootprint {
     pub direct_control_flow: bool,
 }
 
+/// D3D12 binding-table ABI emitted with a translated HLSL shader.
+///
+/// Root constant `b0` contains the shader-visible descriptor index of a structured `uint` table.
+/// Word zero selects the initial-SGPR buffer, followed by global-memory descriptors, image
+/// descriptors, and sampler-heap indices. Global memory uses raw UAV descriptors so the same
+/// generated code preserves guest loads, stores, and atomics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HlslBindingLayout {
+    /// Root constants: descriptor-table index, exact dispatch limit XYZ, and base group XYZ.
+    pub root_constant_words: u32,
+    pub binding_table_words: u32,
+    pub global_buffer_count: u32,
+    pub texture_count: u32,
+    pub sampler_count: u32,
+    pub threadgroup_memory_bytes: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HlslShader {
+    pub source: String,
+    pub entry_point: String,
+    pub target_profile: String,
+    pub stage: MetalShaderStage,
+    pub bindings: HlslBindingLayout,
+    pub vertex_inputs: Vec<VertexInputBinding>,
+    pub interpolated_attribute_count: u32,
+    /// Ordered physical `TEXCOORD` locations consumed by a pixel shader.
+    pub interpolated_attribute_locations: Vec<u32>,
+    pub register_footprint: MetalRegisterFootprint,
+}
+
+/// Evaluation state that can change generated HLSL, excluding per-draw resource addresses and
+/// captured bytes. D3D12 backends can use this as a translation-cache key while still uploading
+/// the current evaluation's descriptors and data for every dispatch or draw.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct HlslEvaluationKey {
+    initial_scalar_register_count: usize,
+    global_bindings: Vec<HlslGlobalBindingKey>,
+    image_bindings: Vec<HlslImageBindingKey>,
+    image_kinds: Vec<HlslImageKindKey>,
+    texture_count: u32,
+    sampler_count: u32,
+    compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct HlslGlobalBindingKey {
+    scalar_address: u32,
+    instruction_pcs: Vec<u32>,
+    writable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HlslImageBindingKey {
+    pc: u32,
+    opcode: Opcode,
+    texture_slot: u32,
+    sampler_slot: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct HlslImageKindKey {
+    component: u8,
+    storage: bool,
+    writable: bool,
+    comparison: bool,
+    dimension: u32,
+    texture_type: u32,
+}
+
+impl HlslEvaluationKey {
+    /// Extracts exactly the evaluated resource topology consumed by HLSL generation.
+    #[must_use]
+    pub fn new(evaluation: &ShaderEvaluation) -> Self {
+        let slots = evaluation.image_binding_slots();
+        let image_bindings = evaluation
+            .image_bindings
+            .iter()
+            .enumerate()
+            .map(|(index, binding)| HlslImageBindingKey {
+                pc: binding.pc,
+                opcode: binding.opcode,
+                texture_slot: slots.texture_slots[index],
+                sampler_slot: slots.sampler_slots[index],
+            })
+            .collect();
+        let mut image_kinds = Vec::with_capacity(slots.texture_count as usize);
+        for (index, binding) in evaluation.image_bindings.iter().enumerate() {
+            if slots.texture_slots[index] as usize != image_kinds.len() {
+                continue;
+            }
+            let component = match compiler::image::image_component_type(binding) {
+                "uint" => 1,
+                "int" => 2,
+                _ => 0,
+            };
+            image_kinds.push(HlslImageKindKey {
+                component,
+                storage: compiler::image::is_storage_image(binding.opcode),
+                writable: compiler::image::is_writable_image(binding.opcode),
+                comparison: remu_shader::image_is_comparison(binding.opcode),
+                dimension: binding.control.dimension,
+                texture_type: binding
+                    .resource_descriptor
+                    .get(3)
+                    .map_or(0, |word| (word >> 28) & 0xf),
+            });
+        }
+        Self {
+            initial_scalar_register_count: evaluation.initial_scalar_registers.len(),
+            global_bindings: evaluation
+                .global_memory_bindings
+                .iter()
+                .map(|binding| HlslGlobalBindingKey {
+                    scalar_address: binding.scalar_address,
+                    instruction_pcs: binding.instruction_pcs.iter().copied().collect(),
+                    writable: binding.writable,
+                })
+                .collect(),
+            image_bindings,
+            image_kinds,
+            texture_count: slots.texture_count,
+            sampler_count: slots.sampler_count,
+            compute_system_registers: evaluation.compute_system_registers,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum MetalCompileError {
     #[error("shader program is empty")]
@@ -517,6 +736,24 @@ pub fn compile_msl(
     options: &MetalCompileOptions,
 ) -> Result<MetalShader, MetalCompileError> {
     Compiler::new(program, evaluation, options)?.compile()
+}
+
+/// Lowers one decoded Gen5 shader to SM 6.6 HLSL for Direct3D 12.
+///
+/// `threads_per_group` is part of a compute shader's DXIL identity because HLSL declares it in
+/// the entry-point attribute. Graphics callers pass `[1, 1, 1]`.
+///
+/// # Errors
+///
+/// Returns an error for invalid launch dimensions, an interface that cannot be represented by
+/// D3D12, or any guest instruction without exact lowering semantics.
+pub fn compile_hlsl(
+    program: &Program,
+    evaluation: &ShaderEvaluation,
+    options: &MetalCompileOptions,
+    threads_per_group: [u32; 3],
+) -> Result<HlslShader, MetalCompileError> {
+    Compiler::new_hlsl(program, evaluation, options)?.compile_hlsl(threads_per_group)
 }
 
 /// Builds the fixed-function equivalent of the common fused ES/GS rectangle expansion used for
@@ -664,6 +901,77 @@ pub fn compile_procedural_rectangle_vertex(
         },
         vertex_inputs: Vec::new(),
         interpolated_attribute_count,
+        register_footprint: MetalRegisterFootprint {
+            scalar_values: 0,
+            vector_values: 0,
+            direct_control_flow: true,
+        },
+    }
+}
+
+/// Builds the Direct3D 12 equivalent of the procedural Gen5 rectangle export stage.
+///
+/// The generated semantic locations exactly match the paired translated pixel shader. An
+/// oversized triangle avoids native rectangle-list expansion and makes the result independent of
+/// guest culling/winding conventions; the presenter disables culling for this stage.
+#[must_use]
+pub fn compile_procedural_rectangle_hlsl(
+    interpolated_attribute_locations: &[u32],
+    coordinate_parameter_mask: u32,
+) -> HlslShader {
+    let mut source = String::from(
+        "#define REMU_ROOT_SIGNATURE \"RootFlags(ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT | CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED | SAMPLER_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=7, b0, space=0, visibility=SHADER_VISIBILITY_VERTEX), RootConstants(num32BitConstants=7, b0, space=1, visibility=SHADER_VISIBILITY_PIXEL), RootConstants(num32BitConstants=7, b0, space=2, visibility=SHADER_VISIBILITY_ALL)\"\n\n\
+         struct RemuVsOut {\n\
+         \x20   float4 position : SV_Position;\n",
+    );
+    for &location in interpolated_attribute_locations {
+        let _ = writeln!(source, "    float4 param{location} : TEXCOORD{location};");
+    }
+    source.push_str(
+        "};\n\n\
+         [RootSignature(REMU_ROOT_SIGNATURE)]\n\
+         RemuVsOut remu_main(uint remu_vertex_id : SV_VertexID) {\n\
+         \x20   static const float2 remu_positions[3] = {\n\
+         \x20       float2(-1.0f, -1.0f),\n\
+         \x20       float2( 3.0f, -1.0f),\n\
+         \x20       float2(-1.0f,  3.0f),\n\
+         \x20   };\n\
+         \x20   static const float2 remu_uvs[3] = {\n\
+         \x20       float2(0.0f, 0.0f),\n\
+         \x20       float2(2.0f, 0.0f),\n\
+         \x20       float2(0.0f, 2.0f),\n\
+         \x20   };\n\
+         \x20   uint remu_index = min(remu_vertex_id, 2u);\n\
+         \x20   float2 remu_uv = remu_uvs[remu_index];\n\
+         \x20   RemuVsOut remu_out = (RemuVsOut)0;\n\
+         \x20   remu_out.position = float4(remu_positions[remu_index], 0.0f, 1.0f);\n",
+    );
+    for &location in interpolated_attribute_locations {
+        let value = if coordinate_parameter_mask & (1 << location) != 0 {
+            "float4(remu_uv.x, 1.0f - remu_uv.y, 1.0f, 1.0f)"
+        } else {
+            "float4(1.0f, 1.0f, 1.0f, 1.0f)"
+        };
+        let _ = writeln!(source, "    remu_out.param{location} = {value};");
+    }
+    source.push_str("    return remu_out;\n}\n");
+
+    HlslShader {
+        source,
+        entry_point: "remu_main".to_owned(),
+        target_profile: "vs_6_6".to_owned(),
+        stage: MetalShaderStage::Vertex,
+        bindings: HlslBindingLayout {
+            root_constant_words: 7,
+            binding_table_words: 0,
+            global_buffer_count: 0,
+            texture_count: 0,
+            sampler_count: 0,
+            threadgroup_memory_bytes: 0,
+        },
+        vertex_inputs: Vec::new(),
+        interpolated_attribute_count: interpolated_attribute_locations.len() as u32,
+        interpolated_attribute_locations: interpolated_attribute_locations.to_vec(),
         register_footprint: MetalRegisterFootprint {
             scalar_values: 0,
             vector_values: 0,

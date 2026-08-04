@@ -259,6 +259,30 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         shader.source.contains("remu_v_8 = remu_group_id.y"),
         "mesh instance ID must come from the second dispatch-grid dimension"
     );
+    let mut hlsl_evaluation = empty_evaluation();
+    hlsl_evaluation.global_memory_bindings = (0..4)
+        .map(|index| remu_shader::GlobalMemoryBinding {
+            scalar_address: 0xffff_ff00 + index,
+            base_address: 0,
+            instruction_pcs: Default::default(),
+            byte_count: 4096,
+            data: vec![0; 4096],
+            writable: index >= 2,
+            write_back_to_guest: false,
+        })
+        .collect();
+    let hlsl = compile_hlsl(
+        &program,
+        &hlsl_evaluation,
+        &MetalCompileOptions::mesh(2, 16 * 1024, 96, 96, 96),
+        [96, 1, 1],
+    )
+    .expect("NGG compute fallback lowering");
+    assert_eq!(hlsl.target_profile, "cs_6_6");
+    assert!(hlsl.source.contains("[numthreads(96, 1, 1)]"));
+    assert!(hlsl.source.contains("remu_ngg_set_index"));
+    assert!(hlsl.source.contains("remu_mesh_vertices"));
+    assert!(hlsl.source.contains("remu_mesh_indices"));
     #[cfg(target_os = "macos")]
     if let Some(compiler) = std::env::var_os("REMU_METAL_COMPILER") {
         let directory =
@@ -267,14 +291,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         let source = directory.join("mesh.metal");
         let air = directory.join("mesh.air");
         std::fs::write(&source, &shader.source).expect("write generated mesh MSL");
-        let output = std::process::Command::new(compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(compiler.as_ref(), &source, &air);
         assert!(
             output.status.success(),
             "mesh MSL failed to compile:\n{}\n{}",
@@ -327,6 +344,33 @@ fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
             .source
             .contains("((remu_thread_index >> 5u) & 0xfu) << 24u"),
         "SIMD32 halves must not leak into the guest-visible merged wave info"
+    );
+
+    let mut hlsl_evaluation = empty_evaluation();
+    hlsl_evaluation.global_memory_bindings = (0..4)
+        .map(|index| remu_shader::GlobalMemoryBinding {
+            scalar_address: 0xffff_ff00 + index,
+            base_address: 0,
+            instruction_pcs: Default::default(),
+            byte_count: 4096,
+            data: vec![0; 4096],
+            writable: index >= 2,
+            write_back_to_guest: false,
+        })
+        .collect();
+    let hlsl = compile_hlsl(&program, &hlsl_evaluation, &options, [128, 1, 1])
+        .expect("wave64 NGG compute fallback lowering");
+    assert!(
+        hlsl.source
+            .contains("uint remu_wave_index = remu_thread_index >> 6u;")
+    );
+    assert!(
+        hlsl.source
+            .contains("uint remu_wave_half = (remu_thread_index >> 5u) & 1u;")
+    );
+    assert!(
+        hlsl.source
+            .contains("uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);")
     );
 }
 
@@ -926,14 +970,7 @@ fn generated_ds_msl_compiles_with_apple_metal_in_every_valid_stage() {
         let source = directory.join(format!("{stem}.metal"));
         let air = directory.join(format!("{stem}.air"));
         std::fs::write(&source, shader.source).expect("write generated DS MSL");
-        let output = Command::new(&compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(&compiler, &source, &air);
         assert!(
             output.status.success(),
             "{stem} DS MSL failed to compile:\n{}\n{}",

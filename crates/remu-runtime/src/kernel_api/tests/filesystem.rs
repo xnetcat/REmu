@@ -125,6 +125,7 @@ fn removing_a_directory_through_the_posix_name_reports_minus_one_when_it_is_abse
 }
 
 #[test]
+#[cfg(unix)]
 fn changing_permissions_keeps_only_the_mode_bits_the_guest_may_set() {
     let mut fixture = MountFixture::new("chmod");
     let path = fixture.write("save.bin", b"payload");

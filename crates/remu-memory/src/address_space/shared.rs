@@ -347,6 +347,24 @@ pub fn guest_shared_backing_identity(
     )
 }
 
+/// Installs a Windows-only diagnostic on the physical backing behind a live guest range.
+///
+/// This follows writes made through temporary backing views, which intentionally bypass virtual
+/// address page protection and therefore cannot be attributed by `CpuWriteWatch` alone.
+#[cfg(windows)]
+#[must_use]
+pub fn watch_guest_shared_backing_writes(address: u64, byte_count: u64) -> bool {
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, byte_count)
+    else {
+        return false;
+    };
+    backing.install_write_diagnostic(offset, byte_count);
+    true
+}
+
 /// Resolves an exact live guest range to a lazily mapped, page-aligned backing view.
 ///
 /// Unlike a no-copy view over the guest VA, this remains contiguous when consecutive physical
@@ -461,6 +479,52 @@ pub fn guest_shared_backing_alias_segments(
             let mapping_length = record.end.checked_sub(mapping_start)?;
             let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
             let intersection_start = record.backing_offset.max(physical_start);
+            let intersection_end = mapping_backing_end.min(physical_end);
+            (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
+                address: mapping_start + (intersection_start - record.backing_offset),
+                byte_count: intersection_end - intersection_start,
+            })
+        })
+        .collect::<Vec<_>>();
+    aliases.sort_unstable_by_key(|segment| (segment.address, segment.byte_count));
+    aliases.dedup();
+    (!aliases.is_empty()).then_some(aliases)
+}
+
+/// Returns every live CPU alias intersecting an already-resolved physical backing range.
+///
+/// GPU work can outlive the VA through which it was submitted. When a guarded lease publishes
+/// through its producer identity after that VA is recycled, cache invalidation must follow the
+/// physical bytes to their surviving aliases instead of touching the unrelated replacement VA.
+#[must_use]
+pub fn guest_shared_backing_alias_segments_at_identity(
+    identity: GuestSharedMappingIdentity,
+    byte_count: u64,
+) -> Option<Vec<GuestSharedBackingSegment>> {
+    if byte_count == 0 {
+        return None;
+    }
+    let physical_end = identity.backing_offset.checked_add(byte_count)?;
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let backing = mappings.any_backing(identity.backing_id)?;
+    if physical_end > backing.size()
+        || !identity_range_is_live(
+            &mappings,
+            identity.backing_id,
+            identity.backing_offset,
+            physical_end,
+        )
+    {
+        return None;
+    }
+    let mut aliases = mappings
+        .backing_records(identity.backing_id)
+        .filter_map(|(mapping_start, record)| {
+            let mapping_length = record.end.checked_sub(mapping_start)?;
+            let mapping_backing_end = record.backing_offset.checked_add(mapping_length)?;
+            let intersection_start = record.backing_offset.max(identity.backing_offset);
             let intersection_end = mapping_backing_end.min(physical_end);
             (intersection_start < intersection_end).then(|| GuestSharedBackingSegment {
                 address: mapping_start + (intersection_start - record.backing_offset),
@@ -1177,11 +1241,20 @@ fn unregister_shared_mapping_range_locked(
     let Some(end) = address.checked_add(byte_count) else {
         return;
     };
-    let overlaps = mappings
-        .range(..end)
-        .filter(|(start, record)| record.end > address && **start < end)
-        .map(|(&start, record)| (start, record.clone()))
-        .collect::<Vec<_>>();
+    let mut overlaps = Vec::new();
+    if let Some((&start, record)) = mappings.range(..=address).next_back()
+        && record.end > address
+    {
+        overlaps.push((start, record.clone()));
+    }
+    for (&start, record) in mappings.range(address..end) {
+        if overlaps
+            .last()
+            .is_none_or(|(previous, _)| *previous != start)
+        {
+            overlaps.push((start, record.clone()));
+        }
+    }
     for (start, record) in overlaps {
         mappings.remove(start);
         if start < address {

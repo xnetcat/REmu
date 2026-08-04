@@ -722,6 +722,9 @@ pub(crate) fn invoke_av_player_event_callbacks(callbacks: Vec<AvPlayerEventCallb
 }
 
 pub(crate) fn invoke_av_player_event_callback(callback: AvPlayerEventCallback) {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type Callback = unsafe extern "sysv64" fn(u64, u64, u64, u64);
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     type Callback = unsafe extern "C" fn(u64, u64, u64, u64);
     if !process_guest_range_is_readable(callback.function, 1) {
         eprintln!(
@@ -757,6 +760,9 @@ pub(crate) fn invoke_av_player_event_callback(callback: AvPlayerEventCallback) {
 pub(crate) fn invoke_av_player_texture_deallocations(
     deallocations: Vec<AvPlayerTextureDeallocation>,
 ) {
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type DeallocateTexture = unsafe extern "sysv64" fn(u64, u64);
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     type DeallocateTexture = unsafe extern "C" fn(u64, u64);
     for deallocation in deallocations {
         if deallocation.address == 0 {
@@ -815,6 +821,9 @@ pub(crate) fn prepare_av_player_video_buffers(handle: u64, extended: bool) {
         );
         return;
     }
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    type AllocateTexture = unsafe extern "sysv64" fn(u64, u32, u32) -> u64;
+    #[cfg(not(all(windows, target_arch = "x86_64")))]
     type AllocateTexture = unsafe extern "C" fn(u64, u32, u32) -> u64;
     // SAFETY: InitEx supplies the live guest texture-allocation callback and opaque allocator
     // object. This runs before the process dispatch lock is acquired, so the allocator may call
@@ -1546,7 +1555,7 @@ fn av_player_wall_clock_catch_up_enabled() -> bool {
     })
 }
 
-fn av_player_trace_enabled() -> bool {
+pub(crate) fn av_player_trace_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED
         .get_or_init(|| std::env::var_os("REMU_TRACE_AVPLAYER").is_some_and(|value| value == "1"))

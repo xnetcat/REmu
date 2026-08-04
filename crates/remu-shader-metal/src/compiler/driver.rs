@@ -11,6 +11,7 @@ use remu_shader::{
     StructuredCfg, image_is_comparison,
 };
 
+use super::SourceDialect;
 use crate::compiler::control_flow::{
     ControlFlowLowering, LoweringFailure, analyze_control_flow, branch_target,
     combined_lowering_error, dispatcher_basic_blocks, scalar_branch_taken_condition,
@@ -32,6 +33,23 @@ impl<'a> Compiler<'a> {
         program: &'a Program,
         evaluation: &'a ShaderEvaluation,
         options: &'a MetalCompileOptions,
+    ) -> Result<Self, MetalCompileError> {
+        Self::new_with_dialect(program, evaluation, options, SourceDialect::Metal)
+    }
+
+    pub(crate) fn new_hlsl(
+        program: &'a Program,
+        evaluation: &'a ShaderEvaluation,
+        options: &'a MetalCompileOptions,
+    ) -> Result<Self, MetalCompileError> {
+        Self::new_with_dialect(program, evaluation, options, SourceDialect::Hlsl)
+    }
+
+    fn new_with_dialect(
+        program: &'a Program,
+        evaluation: &'a ShaderEvaluation,
+        options: &'a MetalCompileOptions,
+        dialect: SourceDialect,
     ) -> Result<Self, MetalCompileError> {
         if program.instructions.is_empty() {
             return Err(MetalCompileError::EmptyProgram);
@@ -142,7 +160,12 @@ impl<'a> Compiler<'a> {
             options.stage,
             MetalShaderStage::Vertex | MetalShaderStage::Mesh
         ) {
-            vertex_outputs.extend(0..options.required_vertex_output_count);
+            if let Some(required) = &options.required_vertex_output_locations {
+                vertex_outputs.retain(|location| required.contains(location));
+                vertex_outputs.extend(required.iter().copied());
+            } else {
+                vertex_outputs.extend(0..options.required_vertex_output_count);
+            }
         }
 
         let image_slots = evaluation.image_binding_slots();
@@ -206,6 +229,7 @@ impl<'a> Compiler<'a> {
             program,
             evaluation,
             options,
+            dialect,
             body: String::new(),
             next_temp: 0,
             vertex_outputs,
@@ -218,6 +242,71 @@ impl<'a> Compiler<'a> {
     }
 
     pub(crate) fn compile(mut self) -> Result<MetalShader, MetalCompileError> {
+        self.lower_body()?;
+
+        let direct_control_flow = matches!(
+            self.control_flow,
+            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. }
+        );
+        let (source, register_references) = self.emit_module()?;
+        let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
+            .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
+        let sampler_count = self.image_slots.sampler_count;
+        let global_argument_buffer_index = (global_buffer_count > 30).then_some(0);
+        let initial_scalar_buffer_index = if global_argument_buffer_index.is_some() {
+            1
+        } else {
+            global_buffer_count
+        };
+        let direct_sampler_bindings =
+            sampler_count != 0 && initial_scalar_buffer_index.saturating_add(1) > 30;
+        let threadgroup_memory_bytes = if self
+            .program
+            .instructions
+            .iter()
+            .any(is_lds_memory_instruction)
+        {
+            self.options.lds_size_bytes
+        } else {
+            0
+        };
+        Ok(MetalShader {
+            source,
+            entry_point: "remu_main".into(),
+            stage: self.options.stage,
+            bindings: MetalBindingLayout {
+                global_buffer_count,
+                global_argument_buffer_index,
+                initial_scalar_buffer_index,
+                sampler_argument_buffer_index: (sampler_count != 0 && !direct_sampler_bindings)
+                    .then_some(initial_scalar_buffer_index + 1),
+                texture_count: self.image_slots.texture_count,
+                sampler_count,
+                threadgroup_memory_bytes,
+            },
+            vertex_inputs: self.evaluation.vertex_inputs.clone(),
+            interpolated_attribute_count: self
+                .pixel_attributes
+                .iter()
+                .filter_map(|attribute| {
+                    let input = self.options.pixel_input_controls[*attribute as usize];
+                    (!input.uses_default()).then_some(u32::from(input.input_offset) + 1)
+                })
+                .max()
+                .unwrap_or(0),
+            register_footprint: MetalRegisterFootprint {
+                scalar_values: u32::try_from(register_references.scalar.len()).map_err(|_| {
+                    MetalCompileError::InvalidInterface("too many live scalar values".into())
+                })?,
+                vector_values: u32::try_from(register_references.vector.len()).map_err(|_| {
+                    MetalCompileError::InvalidInterface("too many live vector values".into())
+                })?,
+                direct_control_flow,
+            },
+        })
+    }
+
+    pub(crate) fn lower_body(&mut self) -> Result<(), MetalCompileError> {
         // Lowering continues past a failed instruction so that one attempt names every opcode a
         // shader needs. A body produced after a failure is only ever discarded with the error.
         let mut failures = Vec::new();
@@ -287,67 +376,7 @@ impl<'a> Compiler<'a> {
         if let Some(error) = combined_lowering_error(failures) {
             return Err(error);
         }
-
-        let direct_control_flow = matches!(
-            self.control_flow,
-            ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. }
-        );
-        let (source, register_references) = self.emit_module()?;
-        let global_buffer_count = u32::try_from(self.evaluation.global_memory_bindings.len())
-            .map_err(|_| MetalCompileError::InvalidInterface("too many global buffers".into()))?;
-        let sampler_count = self.image_slots.sampler_count;
-        let global_argument_buffer_index = (global_buffer_count > 30).then_some(0);
-        let initial_scalar_buffer_index = if global_argument_buffer_index.is_some() {
-            1
-        } else {
-            global_buffer_count
-        };
-        let direct_sampler_bindings =
-            sampler_count != 0 && initial_scalar_buffer_index.saturating_add(1) > 30;
-        let threadgroup_memory_bytes = if self
-            .program
-            .instructions
-            .iter()
-            .any(is_lds_memory_instruction)
-        {
-            self.options.lds_size_bytes
-        } else {
-            0
-        };
-        Ok(MetalShader {
-            source,
-            entry_point: "remu_main".into(),
-            stage: self.options.stage,
-            bindings: MetalBindingLayout {
-                global_buffer_count,
-                global_argument_buffer_index,
-                initial_scalar_buffer_index,
-                sampler_argument_buffer_index: (sampler_count != 0 && !direct_sampler_bindings)
-                    .then_some(initial_scalar_buffer_index + 1),
-                texture_count: self.image_slots.texture_count,
-                sampler_count,
-                threadgroup_memory_bytes,
-            },
-            vertex_inputs: self.evaluation.vertex_inputs.clone(),
-            interpolated_attribute_count: self
-                .pixel_attributes
-                .iter()
-                .filter_map(|attribute| {
-                    let input = self.options.pixel_input_controls[*attribute as usize];
-                    (!input.uses_default()).then_some(u32::from(input.input_offset) + 1)
-                })
-                .max()
-                .unwrap_or(0),
-            register_footprint: MetalRegisterFootprint {
-                scalar_values: u32::try_from(register_references.scalar.len()).map_err(|_| {
-                    MetalCompileError::InvalidInterface("too many live scalar values".into())
-                })?,
-                vector_values: u32::try_from(register_references.vector.len()).map_err(|_| {
-                    MetalCompileError::InvalidInterface("too many live vector values".into())
-                })?,
-                direct_control_flow,
-            },
-        })
+        Ok(())
     }
 
     fn emit_instruction(
@@ -564,7 +593,22 @@ impl<'a> Compiler<'a> {
                 }
             }
             StructuredCfg::Loop(body) => {
-                self.line(indent, "while (true) {");
+                if let Some(iteration_limit) = self.hlsl_structured_loop_iteration_limit() {
+                    // Keep compute HLSL statically bounded so the D3D driver can prove forward
+                    // progress and stale/poison guest scalar state cannot become a device-wide
+                    // TDR. The evaluator supplies scalar trip counts while opaque vector loops
+                    // use a conservative watchdog.
+                    let guard = self.next_temp;
+                    self.next_temp += 1;
+                    self.line(
+                        indent,
+                        &format!(
+                            "for (uint remu_hlsl_loop_{guard} = 0u; remu_hlsl_loop_{guard} < {iteration_limit}u; ++remu_hlsl_loop_{guard}) {{"
+                        ),
+                    );
+                } else {
+                    self.line(indent, "while (true) {");
+                }
                 self.emit_structured_cfg(body, blocks, indent + 1, failures, failed_opcodes)?;
                 self.line(indent, "}");
             }

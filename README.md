@@ -3,14 +3,16 @@
 REmu is an experimental PlayStation 5 compatibility layer written in Rust. Its goal is to run
 legally dumped games directly on desktop operating systems without emulating the PlayStation shell.
 
-The project maps and runs authorized x86-64 game dumps under Rosetta. The first small test title
-currently boots through resource loading, submits AGC draw streams, compiles observed RDNA2 shaders
-to Metal, and flips its display buffers. Early splash frames render correctly through the translated
-path; complete render state and later gameplay draws are still in progress, so playability is not
-claimed.
+The project maps and runs authorized x86-64 game dumps natively on Windows and under Rosetta on
+macOS. Windows uses Direct3D 12/DXGI, WASAPI, winit, and XInput; macOS uses Metal, CoreAudio, and
+AppKit. The first small test titles boot through resource loading, submit AGC draw streams, compile
+observed RDNA2 shaders, and flip their display buffers. Dreaming Sarah reaches its first playable
+forest area on the current Windows/D3D12 development host; broad game compatibility and complete
+playability are not yet claimed.
 
-See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md), and
-[subsystem status](docs/status.md); adapted implementation sources are tracked in
+See the [architecture](docs/architecture.md), [implementation roadmap](docs/roadmap.md),
+[subsystem status](docs/status.md), [Windows support](docs/windows-support.md), and
+[D3D12 backend integration](docs/gpu-d3d12.md); adapted implementation sources are tracked in
 [provenance](docs/provenance.md). Contributions are welcome — start with
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -33,6 +35,17 @@ cargo run -p remu-cli -- link /path/to/eboot.bin
 cargo run -p remu-cli -- probe /path/to/eboot.bin
 cargo run -p remu-cli -- run /path/to/eboot.bin
 cargo run -p remu-cli -- gpu-info
+cargo run -p remu-cli -- gpu-self-test
+cargo run -p remu-cli -- gpu-present-test
+cargo run -p remu-cli -- audio-info
+cargo run -p remu-cli -- input-info
+```
+
+On Windows, a release build can launch a local title directly:
+
+```powershell
+cargo build --release -p remu-cli
+.\target\release\remu.exe run "C:\path\to\game\eboot.bin"
 ```
 
 For repeatable Apple Silicon game runs, use the runner. It builds the x86-64 release, records

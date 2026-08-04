@@ -248,8 +248,18 @@ pub fn record_guest_write(
     payload: &[u8],
     submission: u64,
 ) {
+    let _ = record_guest_write_sequence(site, address, byte_count, payload, submission);
+}
+
+fn record_guest_write_sequence(
+    site: GuestWriteSite,
+    address: u64,
+    byte_count: u64,
+    payload: &[u8],
+    submission: u64,
+) -> Option<u64> {
     if !guest_write_journal_enabled() || byte_count == 0 {
-        return;
+        return None;
     }
     let mut uniform = uniform_byte(payload);
     if u64::try_from(payload.len()).unwrap_or(u64::MAX) < byte_count {
@@ -267,6 +277,7 @@ pub fn record_guest_write(
     slot.uniform.store(uniform, Ordering::Relaxed);
     slot.stamp
         .store(sequence.wrapping_add(1), Ordering::Release);
+    Some(sequence)
 }
 
 /// Records the guest instruction which opened a watched host page for CPU writes.
@@ -281,13 +292,11 @@ pub(crate) fn record_guest_cpu_page_open(
     page_byte_count: u64,
     fault_address: u64,
     program_counter: u64,
-) {
+) -> Option<u64> {
     if ENABLED.load(Ordering::Relaxed) != ENABLED_YES || page_byte_count == 0 {
-        return;
+        return None;
     }
-    let Some(slots) = SLOTS.get() else {
-        return;
-    };
+    let slots = SLOTS.get()?;
     let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let slot = &slots[(sequence as usize) & (CAPACITY - 1)];
     slot.stamp.store(0, Ordering::Release);
@@ -300,6 +309,7 @@ pub(crate) fn record_guest_cpu_page_open(
     slot.uniform.store(MIXED_PAYLOAD, Ordering::Relaxed);
     slot.stamp
         .store(sequence.wrapping_add(1), Ordering::Release);
+    Some(sequence)
 }
 
 /// Returns the already-resolved journal state without consulting the environment.
@@ -685,7 +695,31 @@ fn write_diagnostic(buffer: &DiagnosticBuffer) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn write_diagnostic(buffer: &DiagnosticBuffer) {
+    use windows::Win32::Storage::FileSystem::WriteFile;
+    use windows::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE};
+
+    // WriteFile does not allocate and is safe to call from this last-chance vectored exception
+    // path. Short writes are intentionally ignored, matching the Unix signal implementation.
+    let Ok(stderr) = (unsafe { GetStdHandle(STD_ERROR_HANDLE) }) else {
+        return;
+    };
+    if stderr.is_invalid() {
+        return;
+    }
+    let mut written = 0_u32;
+    unsafe {
+        let _ = WriteFile(
+            stderr,
+            Some(buffer.as_slice()),
+            Some(&raw mut written),
+            None,
+        );
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn write_diagnostic(_buffer: &DiagnosticBuffer) {}
 
 #[cfg(test)]
@@ -693,9 +727,12 @@ mod tests {
     use super::{
         CAPACITY, ENABLED, ENABLED_YES, GuestWriteSite, JournalEntry, MIXED_PAYLOAD, NEXT_SEQUENCE,
         SAMPLED_PAYLOAD, address_looks_poisoned, payload_prefix, read_slot,
-        record_guest_cpu_page_open, record_guest_write, slots_for_recording, uniform_byte,
+        record_guest_cpu_page_open, record_guest_write, record_guest_write_sequence,
+        slots_for_recording, uniform_byte,
     };
-    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, atomic::Ordering};
+
+    static JOURNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn enable_journal() {
         ENABLED.store(ENABLED_YES, Ordering::Relaxed);
@@ -748,18 +785,24 @@ mod tests {
 
     #[test]
     fn recorded_entries_survive_a_full_ring_wrap_and_name_their_site() {
+        let _guard = JOURNAL_TEST_LOCK.lock().expect("journal test lock is live");
         enable_journal();
-        let first = NEXT_SEQUENCE.load(Ordering::Relaxed);
+        let mut first = None;
+        let mut last = None;
         for index in 0..CAPACITY as u64 + 4 {
-            record_guest_write(
+            let sequence = record_guest_write_sequence(
                 GuestWriteSite::DmaFill,
                 0x9000_0000 + index * 0x100,
                 0x100,
                 &[0x40; 0x100],
                 index,
-            );
+            )
+            .expect("enabled test journal records a sequence");
+            first.get_or_insert(sequence);
+            last = Some(sequence);
         }
-        let last = NEXT_SEQUENCE.load(Ordering::Relaxed) - 1;
+        let first = first.expect("the loop records at least one entry");
+        let last = last.expect("the loop records at least one entry");
         let entry = read_slot(last).expect("the newest entry is live");
         assert_eq!(entry.uniform, 0x40);
         assert_eq!(entry.payload, 0x4040_4040_4040_4040);
@@ -773,6 +816,7 @@ mod tests {
 
     #[test]
     fn marks_a_uniformity_verdict_taken_from_less_than_the_published_run() {
+        let _guard = JOURNAL_TEST_LOCK.lock().expect("journal test lock is live");
         enable_journal();
         record_guest_write(GuestWriteSite::DmaCopy, 0x9100_0000, 0x2000, &[0x00; 8], 7);
         let entry =
@@ -783,11 +827,13 @@ mod tests {
 
     #[test]
     fn watched_guest_page_open_retains_the_exact_fault_and_guest_pc() {
+        let _guard = JOURNAL_TEST_LOCK.lock().expect("journal test lock is live");
         enable_journal();
         let _ = slots_for_recording();
-        record_guest_cpu_page_open(0x900c_8d00_00, 0x4000, 0x900c_8d05_a0, 0x8012_3456_7);
-        let entry = read_slot(NEXT_SEQUENCE.load(Ordering::Relaxed) - 1)
-            .expect("the watched guest page opening is live");
+        let sequence =
+            record_guest_cpu_page_open(0x900c_8d00_00, 0x4000, 0x900c_8d05_a0, 0x8012_3456_7)
+                .expect("enabled test journal records a sequence");
+        let entry = read_slot(sequence).expect("the watched guest page opening is live");
         assert!(entry.site == GuestWriteSite::GuestCpuPageOpen);
         assert_eq!(entry.address, 0x900c_8d00_00);
         assert_eq!(entry.byte_count, 0x4000);

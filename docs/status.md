@@ -4,9 +4,38 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+Windows execution status: the workspace passes serially on `x86_64-pc-windows-gnu`; the native
+System V guest boundary, sparse/aliased address space, VEH write watch, HLSL/DXIL translator,
+D3D12 event executor, DXGI presenter, XInput polling, and WASAPI mixer are connected. The
+development GTX 1050 passes the current baseline (FL 12_1, SM 6.8, binding tier 3, wave32, shader
+int64) and all 68 D3D12 tests, including event-based bounded fence waits, physical
+normalized/integer color MSAA, and depth/stencil
+MSAA; the serial runtime suite has 662 passing tests. Dreaming Sarah now enters New Game, renders
+the first forest layout, and scrolls under a live guest D-pad event with active, underrun-free
+audio. Invalidated CPAL/WASAPI streams now reopen the current default endpoint while preserving
+guest port identities, retargeting resamplers, and reporting a reroute. A separate untraced
+20-second run presented 998 frames and reached about 53--54 FPS after
+startup. F11/Alt+Enter borderless fullscreen and retained-frame pause/restore across
+minimize, occlusion, suspension, and zero-sized resize are live-game validated. Persistent
+single-sample targets, cached mode-27 conversion, Windows write-watch
+invalidation, shared descriptor/upload arenas, command-list recycling, event-based fence waits,
+exact DXIL stage linkage, bounded opt-in DRED removal reports with named GPU objects, and direct
+BGRA8/RGBA8/R10G10B10A2 presentation are active. GFX10 image destination selectors map through
+typed D3D12 views, guest-memory publication follows only overlapping virtual/physical alias ranges,
+and hidden windows retire flips without repeated 4K readbacks. DXGI reports live
+process-local/non-local budget, usage, and reservation telemetry rather than treating static
+dedicated VRAM as an allocation limit. Poppy Playtime now passes opening-movie playback and common
+dialogs into its title renderer without device loss, but its 2848x1600 scene intermediate remains
+corrupt before the final 4K composite. This establishes one playable Windows title,
+not broad compatibility: additional NGG modes, FMASK/DCC and remaining primitive/texture metadata
+paths, persistent depth/MSAA resources, remaining display/sleep/controller lifecycle stress, and
+broader title validation are still open. See [windows-support.md](windows-support.md)
+and [gpu-d3d12.md](gpu-d3d12.md).
+
 Current overall state: the first small test title boots through resource loading, submits AGC
-draw streams, compiles observed RDNA2 shaders to Metal, and flips its display buffers. Early
-splash frames render correctly; full scene rendering and playability are still open. A second,
+draw streams, compiles observed RDNA2 shaders, and flips its display buffers. On Windows/D3D12,
+Dreaming Sarah's first full scene and keyboard-driven movement are now validated; other titles and
+the Metal path retain their separately recorded gaps. A second,
 Unity/IL2CPP title (which commits nearly all of its memory by reserving virtual ranges and
 `sceKernelMprotect`-committing them rather than mapping direct memory) now gets resident,
 write-watched textures; its environment backdrop, lighting, and menu UI now render with the
@@ -455,5 +484,5 @@ thread-local capture today, so the second option is new code, not a rewiring of 
 | Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Crackling from 15–17% audio underruns under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
 | Video / Bink | Initial AvPlayer MP4/H.264 and audio decode through ffmpeg pipes, stream enumeration, play/pause/resume/seek/loop/trick-speed state, media-clock frame gating, NV12 buffers, and deferred event callbacks, covered by generated fixtures. | Present the Unity title's intro frames and resolve its preparation/pause transition; Bink has no compatibility claim yet. |
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |
-| Input | Keyboard-backed pad state and opt-in deterministic input sequences. | Complete handle lifetime, disconnect, timestamps, dead zones, motion/touchpad, controller mapping, and focus semantics as titles exercise them. |
+| Input | Keyboard and four-slot XInput polling, first-connected-slot failover, standard button/trigger/stick mapping with dead zones, monotonic guest timestamps, short-press edge retention, focus/suspend neutralization, two-motor guest vibration with stop-on-close/lifecycle behavior, and opt-in deterministic input sequences. | Physical disconnect/reconnect stress, multi-pad guest routing, motion/touchpad, battery/light-bar/trigger effects, and GameInput/DualSense-specific output. |
 | Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, and diagnostics; bounded logarithmic log checkpoints; opt-in VM tracing; live window-title performance statistics; per-run summaries. | A versioned, documented configuration file with strict precedence and validation, plus structured persistence of the live counters. |

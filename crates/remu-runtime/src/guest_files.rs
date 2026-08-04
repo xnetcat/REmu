@@ -13,16 +13,19 @@ use std::ffi::CString;
 use std::io::{Read, Seek, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, RwLock};
 
+#[cfg(unix)]
+use crate::low_u32;
 use crate::{
     ProbeDispatchState, SCE_KERNEL_ERROR_ALREADY_EXISTS, SCE_KERNEL_ERROR_BAD_FILE_DESCRIPTOR,
     SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_MEMORY_FAULT,
     SCE_KERNEL_ERROR_NOT_DIRECTORY, SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_PERMISSION_DENIED,
-    SCE_KERNEL_STAT_SIZE, low_i32, low_u32, read_guest_cstring, sce_kernel_error,
-    sce_kernel_io_error, signed_i32_return, trace_guest_vfs, trace_guest_vfs_miss,
-    write_guest_bytes, write_guest_u64,
+    SCE_KERNEL_STAT_SIZE, low_i32, read_guest_cstring, sce_kernel_error, sce_kernel_io_error,
+    signed_i32_return, trace_guest_vfs, trace_guest_vfs_miss, write_guest_bytes, write_guest_u64,
 };
 
 pub(crate) static KERNEL_FILES: OnceLock<Mutex<KernelFileState>> = OnceLock::new();
@@ -65,6 +68,12 @@ pub(crate) const DIRENT_BLOCK_SIZE: usize = 512;
 pub(crate) const DIRENT_TYPE_DIRECTORY: u8 = 4;
 
 pub(crate) const DIRENT_TYPE_FILE: u8 = 8;
+
+/// `CreateFileW` needs this flag before it will return a handle for a directory. Rust's Windows
+/// `OpenOptions` otherwise reports `ERROR_ACCESS_DENIED`, even for a read-only directory open.
+/// The value is the Win32 `FILE_FLAG_BACKUP_SEMANTICS` ABI constant.
+#[cfg(windows)]
+const WINDOWS_FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
 impl KernelDirectory {
     /// Packs one directory listing into console dirent records.
@@ -754,7 +763,8 @@ pub(crate) fn guest_ftell(handle: u64) -> u64 {
 }
 
 #[cfg(windows)]
-#[link(name = "ucrt")]
+#[cfg_attr(target_env = "msvc", link(name = "ucrt"))]
+#[cfg_attr(target_env = "gnu", link(name = "msvcrt"))]
 unsafe extern "C" {
     #[link_name = "_fseeki64"]
     fn windows_fseeki64(stream: *mut libc::FILE, offset: i64, origin: i32) -> i32;
@@ -839,6 +849,14 @@ fn guest_kernel_open_with_resolver(
     #[cfg(unix)]
     {
         options.mode(low_u32(arguments[2]));
+    }
+    #[cfg(windows)]
+    if host_path.is_dir() {
+        // PS5 engines enumerate content by opening a directory with O_DIRECTORY and passing the
+        // resulting descriptor to getdents. Windows refuses a directory CreateFile request unless
+        // FILE_FLAG_BACKUP_SEMANTICS is present; this does not grant backup privileges, it merely
+        // opts into normal directory-handle semantics.
+        options.custom_flags(WINDOWS_FILE_FLAG_BACKUP_SEMANTICS);
     }
     let file = match options.open(&host_path) {
         Ok(file) => file,

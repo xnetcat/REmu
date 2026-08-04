@@ -3,6 +3,24 @@
 
 use std::sync::atomic::Ordering;
 
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn VirtualAlloc(
+        address: *mut std::ffi::c_void,
+        size: usize,
+        allocation_type: u32,
+        protect: u32,
+    ) -> *mut std::ffi::c_void;
+    fn VirtualProtect(
+        address: *mut std::ffi::c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32;
+    fn VirtualFree(address: *mut std::ffi::c_void, size: usize, free_type: u32) -> i32;
+}
+
 use super::{
     DELIVERED_EXCEPTION, DELIVERED_EXCEPTION_RSP, GUEST_EXCEPTION_TEST, GuestExitCallback,
     ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
@@ -181,7 +199,7 @@ fn import_stack_arguments_are_read_from_the_captured_guest_frame() {
     );
 }
 
-#[cfg(all(unix, target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[test]
 fn import_trampoline_captures_the_complete_sysv_register_frame() {
     const PAGE_SIZE: usize = 0x4000;
@@ -194,6 +212,7 @@ fn import_trampoline_captures_the_complete_sysv_register_frame() {
     .unwrap();
     // SAFETY: This test owns one anonymous page and changes it from writable to executable
     // before calling the complete import stub copied into it.
+    #[cfg(unix)]
     let mapping = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -204,14 +223,30 @@ fn import_trampoline_captures_the_complete_sysv_register_frame() {
             0,
         )
     };
+    #[cfg(windows)]
+    // SAFETY: the test requests one private committed page and checks the returned pointer.
+    let mapping = unsafe { VirtualAlloc(std::ptr::null_mut(), PAGE_SIZE, 0x1000 | 0x2000, 0x04) };
+    #[cfg(unix)]
     assert_ne!(mapping, libc::MAP_FAILED);
+    #[cfg(windows)]
+    assert!(!mapping.is_null());
     // SAFETY: mapping owns PAGE_SIZE writable bytes and slot fits at its start.
     unsafe { std::ptr::copy_nonoverlapping(slot.as_ptr(), mapping.cast::<u8>(), slot.len()) };
     // SAFETY: mapping and its exact size came from mmap above.
+    #[cfg(unix)]
     assert_eq!(
         unsafe { libc::mprotect(mapping, PAGE_SIZE, libc::PROT_READ | libc::PROT_EXEC) },
         0
     );
+    #[cfg(windows)]
+    {
+        let mut old_protect = 0;
+        // SAFETY: `mapping` owns the complete committed page and `old_protect` is writable.
+        assert_ne!(
+            unsafe { VirtualProtect(mapping, PAGE_SIZE, 0x20, &raw mut old_protect) },
+            0
+        );
+    }
     *crate::TEST_CAPTURED_IMPORT_FRAME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
@@ -225,7 +260,11 @@ fn import_trampoline_captures_the_complete_sysv_register_frame() {
         .take()
         .expect("test dispatch captured its frame");
     // SAFETY: mapping and its exact size came from mmap and are no longer in use.
+    #[cfg(unix)]
     assert_eq!(unsafe { libc::munmap(mapping, PAGE_SIZE) }, 0);
+    #[cfg(windows)]
+    // SAFETY: `mapping` is the base returned by VirtualAlloc; MEM_RELEASE requires a zero size.
+    assert_ne!(unsafe { VirtualFree(mapping, 0, 0x8000) }, 0);
 
     assert_eq!(
         frame.integer_arguments,

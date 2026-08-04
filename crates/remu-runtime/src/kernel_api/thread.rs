@@ -132,6 +132,11 @@ const PS5_LOGICAL_CPU_COUNT: u32 = 13;
 /// only advances when a thread is placed for the first time or migrated after an affinity change.
 static NEXT_CORE_PLACEMENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+pub(super) fn reset_core_placement_for_tests() {
+    NEXT_CORE_PLACEMENT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Reports which logical CPU the calling thread is running on.
 ///
 /// REmu runs guest threads on host threads and does not pin them to emulated cores, and macOS does

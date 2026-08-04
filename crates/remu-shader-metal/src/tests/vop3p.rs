@@ -414,6 +414,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
             MetalShaderStage::Compute => MetalCompileOptions {
                 stage,
                 required_vertex_output_count: 0,
+                required_vertex_output_locations: None,
                 vertex_output_control: 0,
                 render_target_array_length: 1,
                 pixel_outputs: Vec::new(),
@@ -433,6 +434,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 lds_size_bytes: 0,
                 scratch_size_bytes: 0,
                 wave_lane_count: 64,
+                hlsl_wave64_group_isolation_axis: None,
                 allocated_vector_register_count: 256,
                 ngg_registers_proven: false,
             },
@@ -449,14 +451,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
         let source = directory.join(format!("{stem}.metal"));
         let air = directory.join(format!("{stem}.air"));
         std::fs::write(&source, shader.source).expect("write generated MSL");
-        let output = Command::new(&compiler)
-            .args(["-c", "-target", "air64-apple-macosx15.0"])
-            .arg("-fmetal-math-mode=safe")
-            .arg("-o")
-            .arg(&air)
-            .arg(&source)
-            .output()
-            .expect("run Apple Metal compiler");
+        let output = compile_generated_msl_with_safe_math(&compiler, &source, &air);
         assert!(
             output.status.success(),
             "{stage:?} VOP3P/conversion/lane MSL failed to compile:\n{}\n{}",
