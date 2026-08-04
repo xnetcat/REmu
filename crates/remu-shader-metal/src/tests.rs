@@ -95,7 +95,7 @@ fn vop3p_instruction(name: &'static str, control: Vop3pControl) -> Instruction {
     }
 }
 
-const DS_OPCODES: [(u32, &str); 39] = [
+const DS_OPCODES: [(u32, &str); 44] = [
     (0x00, "DsAddU32"),
     (0x01, "DsSubU32"),
     (0x03, "DsIncU32"),
@@ -129,6 +129,11 @@ const DS_OPCODES: [(u32, &str); 39] = [
     (0x37, "DsRead2B32"),
     (0x38, "DsRead2St64B32"),
     (0x4d, "DsWriteB64"),
+    (0x4e, "DsWrite2B64"),
+    (0x4f, "DsWrite2St64B64"),
+    (0x76, "DsReadB64"),
+    (0x77, "DsRead2B64"),
+    (0x78, "DsRead2St64B64"),
     (0xb0, "DsWriteAddtidB32"),
     (0xb1, "DsReadAddtidB32"),
     (0xde, "DsWriteB96"),
@@ -187,6 +192,7 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,

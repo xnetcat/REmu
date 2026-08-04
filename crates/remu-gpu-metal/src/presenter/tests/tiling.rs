@@ -33,7 +33,10 @@ fn sdk_npot_mip_rounding_uses_floor_for_visible_and_shift_ceil_for_padding() {
     assert_eq!(mode5_layout.levels[0].height, 257);
     assert_eq!(mode5_layout.levels[1].width, 256); // floor(513>>1), not ceil 257
     assert_eq!(mode5_layout.levels[1].height, 128); // floor(257>>1), not ceil 129
-    assert_eq!(mode5_layout.levels[1].padded_width % mode5_layout.block_width, 0);
+    assert_eq!(
+        mode5_layout.levels[1].padded_width % mode5_layout.block_width,
+        0
+    );
     // Padding is derived from shiftCeil, so it is at least the ceil extent.
     assert!(mode5_layout.levels[1].padded_width >= 257);
 

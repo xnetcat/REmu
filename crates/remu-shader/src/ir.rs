@@ -87,11 +87,64 @@ pub enum PixelOutputKind {
     Sint,
 }
 
+/// Component encoding selected by one `SPI_SHADER_COL_FORMAT` nibble.
+///
+/// RDNA2's compressed `EXP` payload is not intrinsically FP16. The color-export format tells
+/// the raster backend whether each packed 16-bit lane contains FP16, normalized fixed point, or
+/// an integer. Keeping that state on the output binding prevents a backend from interpreting a
+/// packed UNORM normal as an FP16 NaN.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum PixelExportFormat {
+    Zero,
+    R32,
+    Gr32,
+    Ar32,
+    AbgrFp16,
+    AbgrUnorm16,
+    AbgrSnorm16,
+    AbgrUint16,
+    AbgrSint16,
+    Abgr32,
+}
+
+impl PixelExportFormat {
+    /// Decode one four-bit GFX10 `SPI_SHADER_COL_FORMAT.COLn_EXPORT_FORMAT` value.
+    #[must_use]
+    pub const fn from_register_nibble(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Zero),
+            1 => Some(Self::R32),
+            2 => Some(Self::Gr32),
+            3 => Some(Self::Ar32),
+            4 => Some(Self::AbgrFp16),
+            5 => Some(Self::AbgrUnorm16),
+            6 => Some(Self::AbgrSnorm16),
+            7 => Some(Self::AbgrUint16),
+            8 => Some(Self::AbgrSint16),
+            9 => Some(Self::Abgr32),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_packed(self) -> bool {
+        matches!(
+            self,
+            Self::AbgrFp16
+                | Self::AbgrUnorm16
+                | Self::AbgrSnorm16
+                | Self::AbgrUint16
+                | Self::AbgrSint16
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PixelOutputBinding {
     pub guest_slot: u32,
     pub host_location: u32,
     pub kind: PixelOutputKind,
+    pub export_format: PixelExportFormat,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

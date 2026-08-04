@@ -17,7 +17,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
         NggRegisters {
             pgm_rsrc1: 0x8,
             gs_max_vert_out: 0,
-            ge_ngg_subgrp_cntl: 0,
+            ge_max_output_per_subgroup: 0,
         }
         .allocated_vgprs_wave32(),
         72,
@@ -27,7 +27,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
         NggRegisters {
             pgm_rsrc1: 0x0,
             gs_max_vert_out: 0,
-            ge_ngg_subgrp_cntl: 0,
+            ge_max_output_per_subgroup: 0,
         }
         .allocated_vgprs_wave32(),
         8,
@@ -39,7 +39,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
         NggRegisters {
             pgm_rsrc1: 0xFFFF_FFC0 | 0x3f,
             gs_max_vert_out: 0,
-            ge_ngg_subgrp_cntl: 0,
+            ge_max_output_per_subgroup: 0,
         }
         .allocated_vgprs_wave32(),
         512,
@@ -50,12 +50,17 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
 #[test]
 fn gs_max_vert_out_is_the_eleven_bit_vgt_field() {
     // SDK `CxGsMaxVertOut::getVertices()` (registerstructs.h:13165-13168): `value & 0x7ff`.
-    for (raw, expected) in [(0u32, 0u32), (64, 64), (0x7ff, 2047), (0xFFFF_F800 | 64, 64)] {
+    for (raw, expected) in [
+        (0u32, 0u32),
+        (64, 64),
+        (0x7ff, 2047),
+        (0xFFFF_F800 | 64, 64),
+    ] {
         assert_eq!(
             NggRegisters {
                 pgm_rsrc1: 0,
                 gs_max_vert_out: raw,
-                ge_ngg_subgrp_cntl: 0,
+                ge_max_output_per_subgroup: 0,
             }
             .gs_max_output_vertices(),
             expected,
@@ -65,19 +70,24 @@ fn gs_max_vert_out_is_the_eleven_bit_vgt_field() {
 }
 
 #[test]
-fn subgroup_vertex_cap_is_the_ten_bit_ge_ngg_field() {
+fn subgroup_vertex_cap_is_the_ten_bit_ge_max_output_field() {
     // SDK `CxGeMaxOutputPerSubgroup::getMaxVertsPerSubgroup()` (registerstructs.h:6241-6246):
     // `value & 0x3ff`.
-    for (raw, expected) in [(0u32, 0u32), (96, 96), (0x3ff, 1023), (0xFFFF_FC00 | 128, 128)] {
+    for (raw, expected) in [
+        (0u32, 0u32),
+        (96, 96),
+        (0x3ff, 1023),
+        (0xFFFF_FC00 | 128, 128),
+    ] {
         assert_eq!(
             NggRegisters {
                 pgm_rsrc1: 0,
                 gs_max_vert_out: 0,
-                ge_ngg_subgrp_cntl: raw,
+                ge_max_output_per_subgroup: raw,
             }
             .max_verts_per_subgroup(),
             expected,
-            "GE_NGG_SUBGRP_CNTL caps per-subgroup output vertices in a 10-bit field"
+            "GE_MAX_OUTPUT_PER_SUBGROUP caps per-subgroup output vertices in a 10-bit field"
         );
     }
 }
@@ -90,7 +100,7 @@ fn mesh_options_derive_capacities_and_vgpr_allocation_from_registers() {
     let registers = NggRegisters {
         pgm_rsrc1: 15,
         gs_max_vert_out: 200,
-        ge_ngg_subgrp_cntl: 96,
+        ge_max_output_per_subgroup: 96,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(4, 0, 64, registers);
     assert_eq!(options.stage, MetalShaderStage::Mesh);
@@ -112,12 +122,12 @@ fn mesh_options_derive_capacities_and_vgpr_allocation_from_registers() {
 
 #[test]
 fn zero_subgroup_cap_falls_back_to_gs_max_vert_out() {
-    // A stage that never programmed GE_NGG_SUBGRP_CNTL (field 0) still bounds its Metal records by
+    // A stage that never programmed GE_MAX_OUTPUT_PER_SUBGROUP (field 0) still bounds its Metal records by
     // VGT_GS_MAX_VERT_OUT rather than collapsing to an invalid zero-capacity mesh pipeline.
     let registers = NggRegisters {
         pgm_rsrc1: 0x8,
         gs_max_vert_out: 128,
-        ge_ngg_subgrp_cntl: 0,
+        ge_max_output_per_subgroup: 0,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(0, 0, 32, registers);
     assert_eq!(options.mesh_max_vertex_count, 128);
@@ -132,11 +142,14 @@ fn derived_capacities_stay_inside_the_metal_validation_window() {
     let registers = NggRegisters {
         pgm_rsrc1: 0x3f,
         gs_max_vert_out: 0x7ff,
-        ge_ngg_subgrp_cntl: 0x3ff,
+        ge_max_output_per_subgroup: 0x3ff,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(0, 0, 256, registers);
     assert!((1..=256).contains(&options.mesh_max_vertex_count));
     assert!((1..=256).contains(&options.mesh_max_primitive_count));
     assert!((1..=VECTOR_REGISTER_COUNT).contains(&options.allocated_vector_register_count));
-    assert_eq!(options.allocated_vector_register_count, VECTOR_REGISTER_COUNT);
+    assert_eq!(
+        options.allocated_vector_register_count,
+        VECTOR_REGISTER_COUNT
+    );
 }

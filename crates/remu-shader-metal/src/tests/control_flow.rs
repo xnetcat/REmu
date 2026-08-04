@@ -587,7 +587,11 @@ fn structured_if_emits_then_arm_instructions_inline() {
     );
     // Both arms' ALU work is present; the PC dispatcher is gone.
     assert!(shader.source.contains("remu_v_2") || shader.source.contains("v[2]"));
-    assert!(shader.source.contains("remu_v_5") || shader.source.contains("v[5]") || shader.source.contains("remu_v_3"));
+    assert!(
+        shader.source.contains("remu_v_5")
+            || shader.source.contains("v[5]")
+            || shader.source.contains("remu_v_3")
+    );
     assert!(!shader.source.contains("if (active && pc =="));
     assert!(!shader.source.contains("while (active)"));
     assert!(!shader.source.contains("switch (pc)"));

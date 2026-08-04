@@ -215,9 +215,9 @@ impl MetalPresenter {
                         descriptor.guest.address, descriptor.layer_count
                     ));
                     DepthArrayResidentTexture {
-                            texture,
-                            slice_versions: vec![u64::MAX; descriptor.layer_count as usize],
-                        }
+                        texture,
+                        slice_versions: vec![u64::MAX; descriptor.layer_count as usize],
+                    }
                 });
                 let entry = self
                     .depth_array_textures

@@ -737,15 +737,14 @@ impl MetalPresenter {
                     );
                     if let Err(error) = result {
                         // Every dropped draw is counted so a scene pass failing each frame stays
-                        // visible in the perf trail; the message still logs once per key.
-                        *self
+                        // visible in the perf trail; log the first failure for every concrete
+                        // guest shader pair because multiple addresses can share one pipeline key.
+                        let dropped = self
                             .dropped_draw_executions
                             .entry((draw.export_shader_address, draw.pixel_shader_address))
-                            .or_default() += 1;
-                        if key
-                            .as_ref()
-                            .is_ok_and(|key| self.failed_draw_execution.insert(key.clone()))
-                        {
+                            .or_default();
+                        *dropped += 1;
+                        if *dropped == 1 {
                             eprintln!(
                                 "[REMu][METAL] Gen5 draw es={:#x} ps={:#x} could not execute: {error}",
                                 draw.export_shader_address, draw.pixel_shader_address

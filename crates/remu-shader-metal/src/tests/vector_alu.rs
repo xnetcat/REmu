@@ -150,6 +150,41 @@ fn lowers_unsigned_vector_bitfield_extract_without_overrunning_the_word() {
 }
 
 #[test]
+fn lowers_each_unsigned_byte_to_f32_conversion_from_the_selected_source_bits() {
+    for (name, shift) in [
+        ("VCvtF32Ubyte0", 0),
+        ("VCvtF32Ubyte1", 8),
+        ("VCvtF32Ubyte2", 16),
+        ("VCvtF32Ubyte3", 24),
+    ] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0xd48,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand::vector(5)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            },
+            MetalShaderStage::Compute,
+        );
+
+        assert!(
+            shader
+                .source
+                .contains(&format!("(float)((remu_v_5 >> {shift}u) & 0xFFu)")),
+            "{name} must extract byte {shift}/8 before conversion:\n{}",
+            shader.source
+        );
+        assert!(
+            shader.source.contains("as_type<uint>("),
+            "the f32 result must be stored as architectural VGPR bits"
+        );
+    }
+}
+
+#[test]
 fn lowers_vector_bitfield_insert_select_with_exact_mask_semantics() {
     let shader = compile_vector_instruction(
         Instruction {

@@ -8,7 +8,7 @@ use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, MetalTextureSwizzleChannels,
     RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
     SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
-    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey, WriteWatchRefresh,
+    SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey, SpanQueryOrder, WriteWatchRefresh,
     comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
@@ -18,7 +18,7 @@ use super::{
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, sampled_alias_descriptor, texture_element_layout,
     trace_image_descriptors, trace_resident_texture_removal, trace_target_sampling,
-    trace_video_target_consumers, SpanQueryOrder,
+    trace_video_target_consumers,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -623,7 +623,7 @@ pub(crate) fn create_sampled_guest_texture(
         }
     }
     let comparison_linear = comparison
-        .then(|| comparison_depth32_upload(guest.pixel_format, linear))
+        .then(|| comparison_depth32_upload(guest, linear))
         .transpose()?
         .flatten();
     let upload = comparison_linear.as_deref().unwrap_or(linear);
@@ -632,8 +632,18 @@ pub(crate) fn create_sampled_guest_texture(
     } else {
         bytes_per_element
     };
-    let face_bytes = elements_wide
-        .checked_mul(elements_high)
+    let (upload_width, upload_height) = if comparison_linear.is_some()
+        && compressed_texture_block_extent(guest.pixel_format).is_some()
+    {
+        (
+            usize::try_from(guest.width).map_err(|_| "sampled width does not fit usize")?,
+            usize::try_from(guest.height).map_err(|_| "sampled height does not fit usize")?,
+        )
+    } else {
+        (elements_wide, elements_high)
+    };
+    let face_bytes = upload_width
+        .checked_mul(upload_height)
         .and_then(|elements| elements.checked_mul(upload_bytes_per_element))
         .ok_or("Metal sampled texture upload dimensions overflow")?;
     // GFX10 packs small mip levels into a tiled mip tail. Until that guest layout is decoded,
@@ -689,7 +699,7 @@ pub(crate) fn create_sampled_guest_texture(
     descriptor.set_storage_mode(MTLStorageMode::Shared);
     descriptor.set_usage(sampled_texture_usage(comparison, writable)?);
     let texture = device.new_texture(&descriptor);
-    let bytes_per_row = u64::try_from(elements_wide)
+    let bytes_per_row = u64::try_from(upload_width)
         .expect("validated texture element width fits u64")
         * u64::try_from(upload_bytes_per_element)
             .expect("validated texture element byte count fits u64");
@@ -744,19 +754,14 @@ pub(crate) fn create_sampled_guest_texture(
     if base_mip_level == 0 {
         return Ok(texture);
     }
-    if texture_type != 9 {
-        return Err(format!(
-            "nonzero sampled base mip {base_mip_level} is not implemented for texture type {texture_type}"
-        ));
-    }
     Ok(texture.new_texture_view_from_slice(
         pixel_format,
-        MTLTextureType::D2,
+        texture.texture_type(),
         NSRange::new(
             u64::from(base_mip_level),
             u64::from(requested_mip_level_count.max(1)),
         ),
-        NSRange::new(0, 1),
+        NSRange::new(0, texture.array_length()),
     ))
 }
 

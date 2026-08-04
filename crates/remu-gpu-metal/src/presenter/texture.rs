@@ -108,12 +108,13 @@ pub(crate) use self::upload::{
 #[cfg(test)]
 pub(crate) use self::watch::guest_texture_raw_range;
 pub(crate) use self::watch::{
-    persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
-    refresh_sampled_texture_write_watch, resident_texture_raw_byte_count, sampled_texture_raw_range,
+    TextureWritebackOutcome, persistent_sampled_texture_write_watch,
+    refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
+    resident_texture_raw_byte_count, sampled_texture_raw_range,
     sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
     snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, write_watched_guest_range, TextureWritebackOutcome,
+    watch_sampled_texture, write_watched_guest_range,
 };
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.

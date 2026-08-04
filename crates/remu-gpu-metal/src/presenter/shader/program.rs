@@ -76,6 +76,7 @@ pub(crate) fn compute_pipeline_key(
         // negative cache entries; an allocator cannot recycle a dropped Program into this key.
         program_identity: ProgramIdentity(Arc::clone(program)),
         lds_size_bytes: dispatch.launch.lds_size_bytes,
+        scratch_size_bytes: dispatch.launch.scratch_size_bytes,
         wave_lane_count: dispatch.launch.wave_lane_count,
         allocated_vector_register_count: compute_allocated_vector_register_count(
             &dispatch.shader_registers,
@@ -282,9 +283,12 @@ pub(crate) fn shader_scalar_metadata_for_registers(
     let scalar_end = scalar_register_base
         .saturating_add(64)
         .min(evaluation.initial_scalar_registers.len());
-    for (offset, word) in words[scalar_register_base..scalar_end].iter_mut().enumerate() {
-        let offset = u32::try_from(offset)
-            .map_err(|_| "shader scalar register offset does not fit u32")?;
+    for (offset, word) in words[scalar_register_base..scalar_end]
+        .iter_mut()
+        .enumerate()
+    {
+        let offset =
+            u32::try_from(offset).map_err(|_| "shader scalar register offset does not fit u32")?;
         *word = register_value(shader_registers, user_data_register + offset).unwrap_or_default();
     }
     // Live SH/user-data reloads restore guest NUM_RECORDS after evaluation expanded the Metal
@@ -508,10 +512,10 @@ pub(crate) fn ngg_export_uses_wave64_exec(program: &Program) -> bool {
 
 /// True when an NGG export stages geometry records through general LDS (not ADDTID spills).
 ///
-/// GFX10 NGG recognition ([`ngg_mesh_export_stage`]) only needs alloc + prim/pos export. Mesh
-/// lowering additionally requires general LDS: LDS-free pass-through exports bind correctly as
-/// ordinary vertex shaders (GS_ALLOC_REQ is ignored on that path), while memoryless fullscreen
-/// covers use the separate procedural cover path.
+/// This distinguishes pass-through NGG from stages that exchange ES/GS records; it does not
+/// select the host stage. Even LDS-free NGG still consumes merged-wave system values and emits
+/// primitive connectivity, so non-procedural programs require the mesh ABI.
+#[cfg(test)]
 pub(crate) fn ngg_export_uses_general_lds(program: &Program) -> bool {
     program.instructions.iter().any(|instruction| {
         matches!(instruction.control, Some(InstructionControl::DataShare(_)))
@@ -563,16 +567,15 @@ pub(crate) fn ngg_memoryless_cover_export_stage(program: &Program) -> bool {
 
 /// Returns whether a direct native draw can be represented by the CPU-prepared NGG meshlet ABI.
 pub(crate) const fn ngg_mesh_draw_supported(draw: &IndexedDraw) -> bool {
-    draw.indirect_arguments_address.is_none()
-        && match (draw.indexed, draw.primitive_type) {
-            // Triangle lists/strips expand into the meshlet triangle ABI.
-            (true, 4 | 6) => true,
-            // Point lists feed one vertex per input primitive; GS/NGG amplification emits triangles.
-            (true, 1) | (false, 1) => true,
-            // Non-indexed strips synthesize consecutive vertex IDs, then expand the same way.
-            (false, 6) => true,
-            _ => false,
-        }
+    match (draw.indexed, draw.primitive_type) {
+        // Triangle lists/strips expand into the meshlet triangle ABI.
+        (true, 4 | 6) => true,
+        // Point lists feed one vertex per input primitive; GS/NGG amplification emits triangles.
+        (true, 1) | (false, 1) => true,
+        // Non-indexed strips synthesize consecutive vertex IDs, then expand the same way.
+        (false, 6) => true,
+        _ => false,
+    }
 }
 
 /// Selects NGG mesh lowering only when the presenter can prepare exact ordered source geometry.
@@ -581,11 +584,6 @@ pub(crate) fn ngg_mesh_stage_for_draw(
     draw: &IndexedDraw,
 ) -> Result<bool, String> {
     if !ngg_mesh_export_stage(program) {
-        return Ok(false);
-    }
-    // Meshlets only when the export stages through general LDS. LDS-free NGG exports run as
-    // ordinary vertex shaders; memoryless fullscreen covers use [`ngg_fullscreen_cover_draw`].
-    if !ngg_export_uses_general_lds(program) {
         return Ok(false);
     }
     if ngg_mesh_draw_supported(draw) {
@@ -607,13 +605,6 @@ pub(crate) fn ngg_mesh_stage_for_draw(
     }
     if procedural_rectangle_stage_for_draw(program, draw) {
         return Ok(false);
-    }
-    if draw.indirect_arguments_address.is_some() {
-        return Err(format!(
-            "draw {} uses indirect arguments with an NGG mesh stage; ordered GPU-side mesh \
-             geometry preparation is not implemented",
-            draw.sequence,
-        ));
     }
     Err(format!(
         "draw {} uses unsupported topology {:#x} (indexed={}) with an NGG mesh stage",

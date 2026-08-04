@@ -77,7 +77,10 @@ impl Compiler<'_> {
                 // have consumed the current value.
                 self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
                 selected
-            } else if source_vgpr.filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr)).is_some() {
+            } else if source_vgpr
+                .filter(|vgpr| self.graphics_lane_file_vgpr(*vgpr))
+                .is_some()
+            {
                 return Err(
                     "pixel/vertex V_READLANE of a V_WRITELANE wave-constant table has no proven Metal lane occupancy; refusing the private lane-file peephole"
                         .into(),
@@ -707,6 +710,26 @@ impl Compiler<'_> {
                 instruction,
                 &format!("(float){}", self.raw_source(instruction, 0)?),
             ),
+            name @ ("VCvtF32Ubyte0"
+            | "VCvtF32Ubyte1"
+            | "VCvtF32Ubyte2"
+            | "VCvtF32Ubyte3") => {
+                // RDNA2 V_CVT_F32_UBYTE{0..3} selects one unsigned byte from S0 and
+                // numerically converts it to f32.  Keep S0 untyped until after extraction;
+                // interpreting the source as a float first changes the byte payload.
+                let shift = match name {
+                    "VCvtF32Ubyte0" => 0,
+                    "VCvtF32Ubyte1" => 8,
+                    "VCvtF32Ubyte2" => 16,
+                    "VCvtF32Ubyte3" => 24,
+                    _ => unreachable!("matched the complete UBYTE conversion family"),
+                };
+                let source = self.raw_source(instruction, 0)?;
+                self.float_result(
+                    instruction,
+                    &format!("(float)(({source} >> {shift}u) & 0xFFu)"),
+                )
+            }
             "VCvtF16F32" => {
                 let source = self.float_source(instruction, 0)?;
                 self.f16_result(instruction, destination, &source)

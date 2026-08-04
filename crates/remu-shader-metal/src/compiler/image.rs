@@ -112,7 +112,6 @@ impl Compiler<'_> {
         }
         let native_2d_array = image.dimension == 5 && kind.texture_type == 13;
         if !native_2d_array && (image.is_array || !matches!(image.dimension, 0..=3)) {
-
             return Err(format!(
                 "sampled image dimension {} array={} requires its matching Metal texture type",
                 image.dimension, image.is_array
@@ -660,6 +659,12 @@ impl Compiler<'_> {
         let mut sample_coordinates = coordinates.clone();
         if metal_dim == 1 && matches!(image.dimension, 2 | 3 | 5) {
             sample_coordinates = self.temp("float2", &format!("{coordinates}.xy"));
+        } else if metal_dim == 2 && !matches!(image.dimension, 2 | 3 | 5) {
+            // A 1D/2D MIMG address can legally target a 3D SRD view.  The guest address has no
+            // depth operand, so it names slice zero.  Metal's texture3d overload still requires
+            // an explicit float3; passing the guest float2 makes the whole pipeline fail to
+            // compile (seen in Silent Hill's post-warning scene shaders).
+            sample_coordinates = self.temp("float3", &format!("float3({coordinates}, 0.0f)"));
         }
         let coordinate_arguments = if metal_dim == 3 {
             let (array_uv, layer) = if image.dimension == 3 {
@@ -712,8 +717,13 @@ impl Compiler<'_> {
                     format!(", gradient2d({gradient_x}, {gradient_y})")
                 }
             } else if metal_dim == 2 {
-                let gradient = "gradient3d";
-                format!(", {gradient}({gradient_x}, {gradient_y})")
+                if matches!(image.dimension, 2 | 3) {
+                    format!(", gradient3d({gradient_x}, {gradient_y})")
+                } else {
+                    // As above, a guest 2D address selects depth slice zero.  Its derivatives
+                    // have no Z lane, so supply the mathematically matching zero derivative.
+                    format!(", gradient3d(float3({gradient_x}, 0.0f), float3({gradient_y}, 0.0f))")
+                }
             } else if matches!(image.dimension, 2 | 3) && metal_dim == 1 {
                 // Rematerialized 2D: discard the unused Z derivative lane.
                 format!(", gradient2d({gradient_x}.xy, {gradient_y}.xy)")

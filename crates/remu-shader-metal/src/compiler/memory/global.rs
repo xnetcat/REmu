@@ -8,6 +8,8 @@ use remu_shader::{Instruction, InstructionControl, OperandKind};
 
 use crate::{Compiler, format_u32};
 
+use super::buffer::{raw_load_shape, raw_store_shape};
+
 impl Compiler<'_> {
     pub(crate) fn emit_scalar_memory(&mut self, instruction: &Instruction) -> Result<(), String> {
         let Some(InstructionControl::ScalarMemory(control)) = instruction.control.as_ref() else {
@@ -52,6 +54,9 @@ impl Compiler<'_> {
             .opcode
             .known_name()
             .ok_or_else(|| "raw global opcode".to_owned())?;
+        if name.starts_with("Scratch") {
+            return self.emit_scratch_memory(instruction, control, name);
+        }
         let guest_address = if let Some(scalar_address) = control.scalar_address {
             self.temp(
                 "ulong",
@@ -107,5 +112,126 @@ impl Compiler<'_> {
             control.lds,
             false,
         )
+    }
+
+    /// Lowers RDNA2 SCRATCH into Metal's lane-private `thread` address space.
+    ///
+    /// The guest offset is 32-bit and comes from either one VGPR or one SGPR; unlike GLOBAL it is
+    /// never a 64-bit guest pointer.  The hardware swizzles lanes into the per-wave temp ring.
+    /// Each Metal invocation already owns one private array, so using the unswizzled byte offset
+    /// within that array is the equivalent representation.
+    fn emit_scratch_memory(
+        &mut self,
+        instruction: &Instruction,
+        control: &remu_shader::GlobalMemoryControl,
+        name: &str,
+    ) -> Result<(), String> {
+        if self.options.scratch_size_bytes == 0 {
+            return Err(
+                "SCRATCH instruction has no COMPUTE_TMPRING_SIZE lane allocation".to_owned(),
+            );
+        }
+        if control.lds || name.contains("Atomic") {
+            return Err(format!(
+                "unsupported SCRATCH transfer shape lds={} opcode={name}",
+                control.lds
+            ));
+        }
+        let register_offset = instruction
+            .sources
+            .iter()
+            .find(|operand| operand.kind == OperandKind::ScalarRegister)
+            .map_or_else(
+                || format!("v[{}]", control.vector_address),
+                |operand| format!("s[{}]", operand.value),
+            );
+        let address = self.temp(
+            "uint",
+            &format!(
+                "{register_offset} + {}",
+                format_u32(control.offset_bytes.cast_unsigned())
+            ),
+        );
+        let scratch_length = format_u32(self.options.scratch_size_bytes);
+
+        if name.contains("Load") {
+            let (width, signed, d16, high) = raw_load_shape(name)?;
+            for component in 0..control.dword_count {
+                let component_address = if component == 0 {
+                    address.clone()
+                } else {
+                    format!("{address} + {}u", component * 4)
+                };
+                let loaded = match width {
+                    1 => format!("(uint)remu_scratch[{component_address}]"),
+                    2 => format!(
+                        "(uint)remu_scratch[{component_address}] | ((uint)remu_scratch[{component_address} + 1u] << 8u)"
+                    ),
+                    4 => format!(
+                        "(uint)remu_scratch[{component_address}] | ((uint)remu_scratch[{component_address} + 1u] << 8u) | ((uint)remu_scratch[{component_address} + 2u] << 16u) | ((uint)remu_scratch[{component_address} + 3u] << 24u)"
+                    ),
+                    _ => unreachable!("raw scratch load widths are fixed"),
+                };
+                let raw = self.temp(
+                    "uint",
+                    &format!(
+                        "remu_range_valid({component_address}, {width}u, {scratch_length}) ? ({loaded}) : 0u"
+                    ),
+                );
+                let converted = if signed && width == 1 {
+                    format!("({raw} & 0x80u) != 0u ? ({raw} | 0xFFFFFF00u) : {raw}")
+                } else if signed && width == 2 {
+                    format!("({raw} & 0x8000u) != 0u ? ({raw} | 0xFFFF0000u) : {raw}")
+                } else {
+                    raw
+                };
+                let register = control.vector_destination + component;
+                let value = if d16 && high {
+                    format!("(v[{register}] & 0xFFFFu) | (({converted} & 0xFFFFu) << 16)")
+                } else if d16 {
+                    format!("(v[{register}] & 0xFFFF0000u) | ({converted} & 0xFFFFu)")
+                } else {
+                    converted
+                };
+                self.store_vector(register, &value);
+            }
+            return Ok(());
+        }
+
+        if name.contains("Store") {
+            let (width, high) = raw_store_shape(name)?;
+            for component in 0..control.dword_count {
+                let component_address = if component == 0 {
+                    address.clone()
+                } else {
+                    format!("{address} + {}u", component * 4)
+                };
+                let source = format!("v[{}]", control.vector_data + component);
+                let value = if high {
+                    format!("{source} >> 16u")
+                } else {
+                    source
+                };
+                self.line(
+                    3,
+                    &format!(
+                        "if (exec && remu_range_valid({component_address}, {width}u, {scratch_length})) {{"
+                    ),
+                );
+                for byte in 0..width {
+                    self.line(
+                        4,
+                        &format!(
+                            "remu_scratch[{component_address} + {byte}u] = (uchar)({value} >> {}u);",
+                            byte * 8
+                        ),
+                    );
+                }
+                self.line(3, "}");
+            }
+            return Ok(());
+        }
+
+        Err(format!("unsupported SCRATCH opcode {name}"))
     }
 }

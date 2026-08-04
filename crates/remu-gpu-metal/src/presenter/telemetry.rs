@@ -490,7 +490,10 @@ impl PerfChannelSample {
                 "pipeline_compute_gates",
                 TelemetryValue::from(self.pipeline_compute_gates),
             ),
-            ("pipeline_blocks", TelemetryValue::from(self.pipeline_blocks)),
+            (
+                "pipeline_blocks",
+                TelemetryValue::from(self.pipeline_blocks),
+            ),
             (
                 "pipeline_memory_blocks",
                 TelemetryValue::from(self.pipeline_memory_blocks),
@@ -513,7 +516,10 @@ impl PerfChannelSample {
                 "dropped_draw_keys",
                 TelemetryValue::from(self.dropped_draw_keys),
             ),
-            ("dropped_compute", TelemetryValue::from(self.dropped_compute)),
+            (
+                "dropped_compute",
+                TelemetryValue::from(self.dropped_compute),
+            ),
             (
                 "dropped_compute_keys",
                 TelemetryValue::from(self.dropped_compute_keys),
@@ -601,7 +607,10 @@ impl PerfChannelSample {
                 TelemetryValue::from(self.texcache_watches),
             ),
             ("texcache_hits", TelemetryValue::from(self.texcache_hits)),
-            ("texcache_misses", TelemetryValue::from(self.texcache_misses)),
+            (
+                "texcache_misses",
+                TelemetryValue::from(self.texcache_misses),
+            ),
             (
                 "texcache_dirty_reloads",
                 TelemetryValue::from(self.texcache_dirty_reloads),

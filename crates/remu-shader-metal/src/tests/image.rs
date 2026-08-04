@@ -1122,3 +1122,21 @@ fn array_srd_separates_a_3d_mimg_z_coordinate_into_a_layer() {
         "array sample must pass separate coordinate and layer arguments: {sample}"
     );
 }
+
+#[test]
+fn three_d_srd_supplies_zero_depth_for_a_2d_mimg_address() {
+    let source = compile_array_srd_sample(10, 1);
+    assert!(source.contains("texture3d<float> tex0"));
+    assert!(
+        source.contains("float3(") && source.contains(", 0.0f)"),
+        "TYPE=3D DIM=2D must explicitly select depth slice zero:\n{source}"
+    );
+    let sample = source
+        .lines()
+        .find(|line| line.contains("tex0.sample("))
+        .expect("sample call");
+    assert!(
+        !sample.contains("float2("),
+        "a Metal texture3d sample must not receive float2 coordinates: {sample}"
+    );
+}

@@ -427,11 +427,10 @@ impl ShaderEvaluationCache {
                     .entries
                     .get(&old_key)
                     .is_some_and(|entry| entry.admission_id == admission_id);
-                if is_current
-                    && let Some(retired) = self.entries.remove(&old_key) {
-                        retire_shader_evaluation(retired.value);
-                        self.evictions = self.evictions.saturating_add(1);
-                    }
+                if is_current && let Some(retired) = self.entries.remove(&old_key) {
+                    retire_shader_evaluation(retired.value);
+                    self.evictions = self.evictions.saturating_add(1);
+                }
             }
             let admission_id = self.next_admission_id;
             self.next_admission_id = self.next_admission_id.wrapping_add(1);

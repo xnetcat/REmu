@@ -64,7 +64,11 @@ impl AbsoluteAddressPool {
     }
 
     /// Host-only / test helper when a real shared backing is unavailable.
-    pub(crate) fn host_placeholder(device: &Device, base_va: u64, byte_count: u64) -> Result<Self, String> {
+    pub(crate) fn host_placeholder(
+        device: &Device,
+        base_va: u64,
+        byte_count: u64,
+    ) -> Result<Self, String> {
         if byte_count == 0 {
             return Err("Q4 absolute-address pool: zero-sized placeholder refused".to_owned());
         }

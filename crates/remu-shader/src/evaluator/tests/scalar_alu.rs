@@ -674,10 +674,7 @@ fn s_bitset_and_bitreplicate_modify_the_destination_pair() {
         &mut registers,
         &mut scalar_condition,
     );
-    assert_eq!(
-        (registers[4], registers[5]),
-        (u32::MAX, !(1 << 7))
-    );
+    assert_eq!((registers[4], registers[5]), (u32::MAX, !(1 << 7)));
 
     registers[2] = 0b101;
     run_unary(

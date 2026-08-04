@@ -355,7 +355,7 @@ fn proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole() {
         NggRegisters {
             pgm_rsrc1: 0x8,
             gs_max_vert_out: 64,
-            ge_ngg_subgrp_cntl: 64,
+            ge_max_output_per_subgroup: 64,
         },
     );
     options.wave_lane_count = 64;
@@ -476,7 +476,7 @@ fn proven_ngg_registers_lower_compacted_vertex_exp_without_staging_peephole() {
         NggRegisters {
             pgm_rsrc1: 0x8,
             gs_max_vert_out: 64,
-            ge_ngg_subgrp_cntl: 64,
+            ge_max_output_per_subgroup: 64,
         },
     );
     options.wave_lane_count = 64;
@@ -908,6 +908,7 @@ fn generated_ds_msl_compiles_with_apple_metal_in_every_valid_stage() {
                     guest_slot: 0,
                     host_location: 0,
                     kind: PixelOutputKind::Float,
+                    export_format: PixelExportFormat::Abgr32,
                 }],
                 0,
                 0,

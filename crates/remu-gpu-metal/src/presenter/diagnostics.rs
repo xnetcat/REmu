@@ -262,12 +262,6 @@ fn diagnostic_video_chain_match(
                 .copied()
                 .find(|(candidate, _)| guest_texture_descriptors_share_storage(*candidate, sampled))
         })
-        .or_else(|| {
-            tracked
-                .iter()
-                .copied()
-                .find(|(candidate, _)| guest_texture_descriptors_overlap(*candidate, sampled))
-        })
 }
 
 pub(super) fn diagnostic_video_chain_matches(
@@ -501,8 +495,13 @@ pub(super) fn trace_video_target_draw_consumer(draw: &IndexedDraw) {
             }
         }
     }
-    static LOGGED_DRAWS: AtomicU64 = AtomicU64::new(0);
-    let logged = LOGGED_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;
+    static LOGGED_ROOT_DRAWS: AtomicU64 = AtomicU64::new(0);
+    static LOGGED_CHAIN_DRAWS: AtomicU64 = AtomicU64::new(0);
+    let logged = if root {
+        LOGGED_ROOT_DRAWS.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        LOGGED_CHAIN_DRAWS.fetch_add(1, Ordering::Relaxed) + 1
+    };
     if logged <= 16 || logged.is_power_of_two() {
         eprintln!(
             "[REMu][METAL][VIDEO-CHAIN] kind=draw generation={} root={} sequence={} es={:#x} ps={:#x} ps_insns={} indexed={} count={} instances={} target_mask={:#010x} depth=[{}] raster=[{}] geometry=[{}] export=[{}] pixel=[{}] export_chain=[{}] pixel_chain=[{}] targets=[{}]",
@@ -578,8 +577,13 @@ pub(super) fn trace_video_target_compute_consumer(dispatch: &ComputeDispatch) {
             descriptor.guest.tile_mode,
         ));
     }
-    static LOGGED_DISPATCHES: AtomicU64 = AtomicU64::new(0);
-    let logged = LOGGED_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    static LOGGED_ROOT_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    static LOGGED_CHAIN_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+    let logged = if root.is_some() {
+        LOGGED_ROOT_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        LOGGED_CHAIN_DISPATCHES.fetch_add(1, Ordering::Relaxed) + 1
+    };
     if logged <= 16 || logged.is_power_of_two() {
         eprintln!(
             "[REMu][METAL][VIDEO-CHAIN] kind=compute generation={} root={} sequence={} cs={:#x} grid={:?} groups={:?} threads_per_group={:?} root_bindings=[{}] chain_bindings=[{}] outputs=[{}]",
@@ -948,6 +952,18 @@ pub(super) fn diagnostic_dump_target_pixel_shader() -> Option<u64> {
     })
 }
 
+pub(super) fn diagnostic_dump_depth_export_shader() -> Option<u64> {
+    static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
+    *ADDRESS.get_or_init(|| {
+        let value = std::env::var("REMU_DUMP_DEPTH_ES").ok()?;
+        if value.eq_ignore_ascii_case("auto") {
+            return Some(0);
+        }
+        let value = value.strip_prefix("0x").unwrap_or(&value);
+        u64::from_str_radix(value, 16).ok()
+    })
+}
+
 fn diagnostic_dump_target_sample_address() -> Option<u64> {
     static ADDRESS: OnceLock<Option<u64>> = OnceLock::new();
     *ADDRESS.get_or_init(|| {
@@ -1113,6 +1129,17 @@ pub(super) fn diagnostic_dump_complex_msaa() -> bool {
     })
 }
 
+pub(super) fn diagnostic_dump_gbuffer() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var_os("REMU_DUMP_GBUFFER").is_some_and(|value| value == "1");
+        if enabled {
+            eprintln!("[REMu][METAL][DIAGNOSTIC] G-buffer target dump enabled");
+        }
+        enabled
+    })
+}
+
 pub(super) fn diagnostic_texture_writer_enabled() -> bool {
     trace_scanout_writes()
         || diagnostic_guest_write_trace_range().is_some()
@@ -1121,6 +1148,7 @@ pub(super) fn diagnostic_texture_writer_enabled() -> bool {
         || diagnostic_dump_target_sample_address().is_some()
         || diagnostic_dump_target_pixel_instruction_count().is_some()
         || diagnostic_dump_complex_msaa()
+        || diagnostic_dump_gbuffer()
         || diagnostic_dump_shadow_consumer()
         || diagnostic_dump_video_target_consumer()
         || diagnostic_dump_video_chain_consumer()
@@ -1134,6 +1162,23 @@ pub(super) fn diagnostic_dump_target_minimum_draw() -> u64 {
             .and_then(|value| value.parse().ok())
             .unwrap_or(131_072)
     })
+}
+
+pub(super) fn diagnostic_dump_compute_texture_minimum_dispatch() -> u64 {
+    static DISPATCH: OnceLock<u64> = OnceLock::new();
+    *DISPATCH.get_or_init(|| {
+        std::env::var("REMU_DUMP_COMPUTE_TEXTURE_MIN_DISPATCH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default()
+    })
+}
+
+pub(super) const fn diagnostic_compute_texture_dispatch_is_eligible(
+    dispatch_sequence: u64,
+    minimum_dispatch: u64,
+) -> bool {
+    dispatch_sequence >= minimum_dispatch
 }
 
 pub(super) fn diagnostic_dump_target_index_count() -> Option<u32> {
@@ -1364,6 +1409,38 @@ pub(super) fn diagnostic_related_texture_writers(
 pub(super) fn record_diagnostic_memory_copy(copy: &GpuMemoryCopy) {
     if !diagnostic_texture_writer_enabled() {
         return;
+    }
+    if trace_video_target_consumers() && copy.source_selection != 2 {
+        let tracked = diagnostic_video_chain_textures()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter_map(|(descriptor, producer)| {
+                let byte_count = guest_texture_byte_count(*descriptor)?;
+                guest_ranges_overlap(
+                    descriptor.address,
+                    byte_count,
+                    copy.source_address,
+                    copy.byte_count,
+                )
+                .then_some((*descriptor, *producer, byte_count))
+            })
+            .collect::<Vec<_>>();
+        for (descriptor, producer, byte_count) in tracked {
+            eprintln!(
+                "[REMu][METAL][VIDEO-CHAIN] kind=dma generation={} source={:#x}+{:#x} producer={}:{}:{:#x} destination={:#x}+{:#x} selectors={}/{}",
+                producer.generation.saturating_add(1),
+                descriptor.address,
+                byte_count,
+                producer.stage,
+                producer.sequence,
+                producer.shader,
+                copy.destination_address,
+                copy.byte_count,
+                copy.source_selection,
+                copy.destination_selection,
+            );
+        }
     }
     if let Some(overlap) = diagnostic_guest_write_overlap(copy.destination_address, copy.byte_count)
     {
@@ -1629,6 +1706,19 @@ pub(super) fn dump_msl_instruction_filter_matches(pixel_instruction_count: usize
 mod tests {
     use super::super::ResourceSpan;
     use super::*;
+
+    #[test]
+    fn compute_texture_dump_honors_minimum_dispatch_sequence() {
+        assert!(!diagnostic_compute_texture_dispatch_is_eligible(
+            8_999, 9_000
+        ));
+        assert!(diagnostic_compute_texture_dispatch_is_eligible(
+            9_000, 9_000
+        ));
+        assert!(diagnostic_compute_texture_dispatch_is_eligible(
+            9_001, 9_000
+        ));
+    }
     use metal::{Device, MTLResourceOptions};
 
     #[test]
@@ -1730,7 +1820,7 @@ mod tests {
     }
 
     #[test]
-    fn video_chain_write_retires_stale_overlapping_producer() {
+    fn video_chain_write_retires_stale_overlap_without_fabricating_a_consumer() {
         let old_surface = GuestTextureDescriptor {
             address: 0x1000,
             width: 4,
@@ -1762,7 +1852,7 @@ mod tests {
         record_diagnostic_video_chain_texture_in(&mut tracked, new_alias, "draw", 20, 0x2000, 1);
 
         assert!(!tracked.contains_key(&old_surface));
-        assert_eq!(
+        assert!(
             diagnostic_video_chain_match(
                 &tracked
                     .iter()
@@ -1770,8 +1860,8 @@ mod tests {
                     .collect::<Vec<_>>(),
                 old_surface,
             )
-            .map(|(descriptor, producer)| (descriptor, producer.sequence)),
-            Some((new_alias, 20)),
+            .is_none(),
+            "an unrelated layout that merely overlaps the retired surface is not its consumer",
         );
     }
 

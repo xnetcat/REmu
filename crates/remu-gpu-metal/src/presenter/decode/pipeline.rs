@@ -6,10 +6,10 @@ use super::{
     DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
-    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, VGT_GS_INSTANCE_CNT,
-    VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
+    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, SPI_SHADER_COL_FORMAT,
+    VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
-    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
+    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
     diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
@@ -29,7 +29,7 @@ use metal::{
     MTLPrimitiveType, MTLTriangleFillMode, MTLWinding,
 };
 use remu_gpu::IndexedDraw;
-use remu_shader::{ShaderEvaluation, image_is_comparison};
+use remu_shader::{PixelExportFormat, ShaderEvaluation, image_is_comparison};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -435,6 +435,34 @@ pub(crate) fn decode_ngg_subgroup_limits(
     .map(Some)
 }
 
+/// Captures the raw SDK register state required to prove NGG mesh lowering.
+///
+/// `SPI_SHADER_PGM_RSRC1_*` is two SH-register slots before the merged stage's user-data base.
+/// The other values are context registers. In particular, SDK 10
+/// `CxGeMaxOutputPerSubgroup::getMaxVertsPerSubgroup()` reads the low ten bits of
+/// `GE_MAX_OUTPUT_PER_SUBGROUP`; `GE_NGG_SUBGRP_CNTL` instead controls subgroup threads and must
+/// never be substituted for the output capacity.
+pub(crate) fn decode_ngg_registers_from_state(
+    shader_registers: &[remu_gpu::GpuRegister],
+    context_registers: &[remu_gpu::GpuRegister],
+    export_user_data_register: u32,
+) -> Result<remu_shader_metal::NggRegisters, String> {
+    let pgm_rsrc1 = register_value(
+        shader_registers,
+        export_user_data_register.saturating_sub(2),
+    )
+    .ok_or("NGG state is missing merged-stage SPI_SHADER_PGM_RSRC1")?;
+    let gs_max_vert_out = register_value(context_registers, VGT_GS_MAX_VERT_OUT)
+        .ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
+    let ge_max_output_per_subgroup = register_value(context_registers, GE_MAX_OUTPUT_PER_SUBGROUP)
+        .ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
+    Ok(remu_shader_metal::NggRegisters {
+        pgm_rsrc1,
+        gs_max_vert_out,
+        ge_max_output_per_subgroup,
+    })
+}
+
 /// Builds the GFX10 NGG workgroups consumed by a merged export/geometry shader.
 ///
 /// The guest registers independently limit unique ES vertices and GS primitives in each subgroup.
@@ -772,6 +800,27 @@ fn graphics_diagnostic_pipeline_state(
     pixel_program: &remu_shader::Program,
     sample_count: u32,
 ) -> GraphicsDiagnosticPipelineState {
+    if diagnostic_dump_gbuffer() && draw.pixel_shader_address >= 0x8030_0000_00 {
+        eprintln!(
+            "[REMu][METAL][GBUFFER-CANDIDATE] draw={} es={:#x} ps={:#x} count={} indexed={} col_format={:#010x} targets={:?}",
+            draw.sequence,
+            draw.export_shader_address,
+            draw.pixel_shader_address,
+            draw.index_count,
+            draw.indexed,
+            register_value(&draw.context_registers, SPI_SHADER_COL_FORMAT).unwrap_or_default(),
+            targets
+                .iter()
+                .map(|target| (
+                    target.guest_slot,
+                    target.texture.address,
+                    target.texture.width,
+                    target.texture.height,
+                    target.texture.pixel_format,
+                ))
+                .collect::<Vec<_>>(),
+        );
+    }
     let selected_target = draw.sequence >= diagnostic_dump_target_minimum_draw()
         && targets.iter().any(|target| {
             diagnostic_target_address_matches(
@@ -784,6 +833,13 @@ fn graphics_diagnostic_pipeline_state(
     let selected_shader = diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address)
         || diagnostic_dump_target_pixel_instruction_count()
             == Some(pixel_program.instructions.len())
+        || (diagnostic_dump_gbuffer()
+            && draw.index_count == 6
+            && !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| target.texture.width == 1_920 && target.texture.height == 1_080)
+            && (targets.len() >= 4 || draw.pixel_shader_address >= 0x8030_0000_00))
         || (diagnostic_dump_video_target_consumer()
             && video_target_binding_summary(pixel_evaluation).is_some())
         || (diagnostic_dump_video_chain_consumer()
@@ -888,6 +944,16 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                 .any(|register| register.offset == base - 1)
         })
         .unwrap_or(0x0cc);
+    let ngg_subgroup_limits = decode_ngg_subgroup_limits(&draw.context_registers)?;
+    let ngg_registers = ngg_subgroup_limits
+        .map(|_| {
+            decode_ngg_registers_from_state(
+                &draw.shader_registers,
+                &draw.context_registers,
+                export_user_data_register,
+            )
+        })
+        .transpose()?;
     Ok(GraphicsPipelineKey {
         export_shader_address: draw.export_shader_address,
         pixel_shader_address: draw.pixel_shader_address,
@@ -920,7 +986,8 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         } else {
             pixel_input_controls(&draw.context_registers)
         },
-        ngg_subgroup_limits: decode_ngg_subgroup_limits(&draw.context_registers)?,
+        ngg_subgroup_limits,
+        ngg_registers,
         pixel_depth_export: !fragmentless
             && pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         diagnostics: graphics_diagnostic_pipeline_state(
@@ -931,9 +998,20 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             sample_count,
         ),
         targets: {
+            let shader_color_formats =
+                register_value(&draw.context_registers, SPI_SHADER_COL_FORMAT).unwrap_or_default();
             let mut targets = targets
                 .iter()
                 .map(|target| {
+                    let export_nibble =
+                        (shader_color_formats >> (target.guest_slot.saturating_mul(4))) & 0xf;
+                    let export_format = PixelExportFormat::from_register_nibble(export_nibble)
+                        .ok_or_else(|| {
+                            format!(
+                                "color target {} has invalid SPI_SHADER_COL_FORMAT nibble {export_nibble:#x} in {shader_color_formats:#010x}",
+                                target.guest_slot
+                            )
+                        })?;
                     let control = register_value(
                         &draw.context_registers,
                         CB_BLEND0_CONTROL + target.guest_slot,
@@ -943,7 +1021,14 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                         guest_slot: target.guest_slot,
                         pixel_format: target.texture.pixel_format,
                         output_kind: target.output_kind,
-                        write_mask: target.write_mask,
+                        export_format,
+                        // A ZERO export format suppresses the corresponding CB write even if the
+                        // shader contains an EXP instruction and CB_TARGET_MASK remains enabled.
+                        write_mask: if export_format == PixelExportFormat::Zero {
+                            0
+                        } else {
+                            target.write_mask
+                        },
                         blend: decode_metal_blend_attachment(control).map_err(|error| {
                             format!(
                                 "color target {} has invalid CB_BLEND_CONTROL={control:#010x}: {error}",

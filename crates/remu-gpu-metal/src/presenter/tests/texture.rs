@@ -663,7 +663,15 @@ fn sampled_texture_cache_budget_uses_resident_bytes_and_rejects_oversize_entries
 #[test]
 fn comparison_sampling_converts_srgb_color_red_to_linear_depth() {
     let upload = comparison_depth32_upload(
-        MTLPixelFormat::RGBA8Unorm_sRGB,
+        GuestTextureDescriptor {
+            address: 0x10000,
+            width: 3,
+            height: 1,
+            pitch: 3,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::RGBA8Unorm_sRGB,
+            bytes_per_pixel: 4,
+        },
         &[0, 1, 2, 255, 128, 3, 4, 255, 255, 5, 6, 255],
     )
     .expect("sRGB color texture is comparison-compatible")
@@ -675,6 +683,30 @@ fn comparison_sampling_converts_srgb_color_red_to_linear_depth() {
     assert_eq!(depths[0], 0.0);
     assert!((depths[1] - 0.215_86).abs() < 0.000_1);
     assert_eq!(depths[2], 1.0);
+}
+
+#[test]
+fn comparison_sampling_decompresses_bc1_red_to_depth() {
+    let upload = comparison_depth32_upload(
+        GuestTextureDescriptor {
+            address: 0x10000,
+            width: 4,
+            height: 4,
+            pitch: 4,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::BC1_RGBA,
+            bytes_per_pixel: 8,
+        },
+        &[0x00, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+    )
+    .expect("BC1 color texture is comparison-compatible")
+    .expect("BC1 color texture needs a depth upload");
+    let depths = upload
+        .chunks_exact(4)
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("one float")))
+        .collect::<Vec<_>>();
+    assert_eq!(depths.len(), 16);
+    assert!(depths.iter().all(|&depth| depth == 1.0));
 }
 
 #[test]

@@ -51,6 +51,7 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
             threads_per_group: [8, 8, 1],
             wave_lane_count: 64,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             initiator: 1,
         },
         shader_address: 0x5000,
@@ -67,6 +68,7 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
     let key = ComputePipelineKey {
         program_identity: ProgramIdentity(program),
         lds_size_bytes: 0,
+        scratch_size_bytes: 0,
         wave_lane_count: 64,
         allocated_vector_register_count: 4,
         compute_system_registers: None,
@@ -123,6 +125,7 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
             .insert(ComputePipelineKey {
                 program_identity: ProgramIdentity(Arc::new(Program::new(address, Vec::new()))),
                 lds_size_bytes: 0,
+                scratch_size_bytes: 0,
                 wave_lane_count: 64,
                 allocated_vector_register_count: 4,
                 compute_system_registers: None,
@@ -460,23 +463,23 @@ fn recognizes_the_architectural_procedural_rectangle_export_stage() {
     );
     assert_eq!(
         ngg_mesh_stage_for_draw(&program, &draw),
-        Ok(false),
-        "memoryless LDS-free quads keep the ordinary vertex-shader path"
+        Ok(true),
+        "direct classification preserves the NGG mesh contract; pipeline cover recognition selects the synthesized path first"
     );
     draw.indexed = false;
     draw.primitive_type = 7;
     draw.index_count = 4;
-    assert_eq!(
-        ngg_mesh_stage_for_draw(&program, &draw),
-        Ok(false),
-        "LDS-free NGG keeps ordinary VS even for non-exact rectangle topologies"
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("unsupported NGG rectangle topology cannot silently become a vertex shader")
+            .contains("unsupported topology")
     );
     draw.index_count = 3;
     draw.indirect_arguments_address = Some(0x4000);
-    assert_eq!(
-        ngg_mesh_stage_for_draw(&program, &draw),
-        Ok(false),
-        "LDS-free indirect NGG stays off the mesh path"
+    assert!(
+        ngg_mesh_stage_for_draw(&program, &draw)
+            .expect_err("indirect NGG rectangle topology cannot silently become a vertex shader")
+            .contains("unsupported topology")
     );
 }
 
@@ -524,10 +527,11 @@ fn recognizes_poppy_truncated_memoryless_ngg_rectangle_cover() {
 }
 
 #[test]
-fn keeps_lds_free_vertex_fetching_ngg_quads_off_the_mesh_path() {
+fn keeps_lds_free_vertex_fetching_ngg_quads_on_the_mesh_path() {
     // Minimal NGG contract (alloc + prim/pos export) plus a buffer fetch. Topology matches the
-    // memoryless cover heuristic, but without general LDS the draw stays on ordinary VS; cover
-    // must also stay off so per-draw bounds are not replaced by a fullscreen triangle.
+    // memoryless cover heuristic. The cover must stay off so per-draw bounds are not replaced by
+    // a fullscreen triangle, and the merged-wave primitive contract requires the mesh ABI even
+    // though this pass-through stage does not exchange records through general LDS.
     let program = Program::new(
         0x5000,
         vec![
@@ -599,8 +603,8 @@ fn keeps_lds_free_vertex_fetching_ngg_quads_off_the_mesh_path() {
     );
     assert_eq!(
         ngg_mesh_stage_for_draw(&program, &draw),
-        Ok(false),
-        "LDS-free buffer-fetching NGG quads keep the ordinary VS path"
+        Ok(true),
+        "LDS-free buffer-fetching NGG quads still require the mesh path"
     );
     draw.indexed = false;
     draw.primitive_type = 6;
@@ -611,8 +615,8 @@ fn keeps_lds_free_vertex_fetching_ngg_quads_off_the_mesh_path() {
     );
     assert_eq!(
         ngg_mesh_stage_for_draw(&program, &draw),
-        Ok(false),
-        "LDS-free buffer-fetching strips execute as ordinary vertex shaders"
+        Ok(true),
+        "LDS-free buffer-fetching strips require the mesh ABI"
     );
 }
 
@@ -831,7 +835,10 @@ fn accepts_native_ngg_triangle_lists_and_triangle_strips() {
 
     draw.indexed = true;
     draw.primitive_type = 4;
-    assert!(!ngg_mesh_draw_supported(&draw));
+    assert!(
+        ngg_mesh_draw_supported(&draw),
+        "indexed indirect triangles use ordered GPU meshlet preparation"
+    );
 
     draw.indirect_arguments_address = None;
     draw.primitive_type = 7;

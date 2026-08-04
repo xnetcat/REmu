@@ -471,6 +471,96 @@ fn range_checks_raw_dword_vectors_per_component() {
 }
 
 #[test]
+fn scratch_spills_use_the_tmpring_sized_lane_private_byte_array() {
+    let scratch_control = |vector_data, vector_destination| {
+        InstructionControl::GlobalMemory(remu_shader::GlobalMemoryControl {
+            dword_count: 1,
+            vector_address: 3,
+            vector_data,
+            vector_destination,
+            scalar_address: None,
+            offset_bytes: 4,
+            dlc: false,
+            lds: false,
+            glc: false,
+            slc: false,
+        })
+    };
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0x1000,
+                encoding: ShaderEncoding::Flat,
+                opcode: Opcode::Known("ScratchStoreDword"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(3), Operand::vector(9)],
+                destinations: Vec::new(),
+                control: Some(scratch_control(9, 0)),
+            },
+            Instruction {
+                pc: 0x1008,
+                encoding: ShaderEncoding::Flat,
+                opcode: Opcode::Known("ScratchLoadDword"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(3)],
+                destinations: vec![Operand::vector(10)],
+                control: Some(scratch_control(0, 10)),
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::compute(0);
+    options.scratch_size_bytes = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("lane-private scratch spill/reload should lower");
+
+    assert!(shader.source.contains("thread uchar remu_scratch[64];"));
+    assert!(shader.source.contains("remu_v_3 + 4u"));
+    assert!(shader.source.contains("remu_scratch["));
+    assert!(shader.source.contains("remu_range_valid("));
+    assert!(
+        !shader.source.contains("device uchar* b0"),
+        "SCRATCH must not fabricate a guest-global binding"
+    );
+}
+
+#[test]
+fn scratch_without_a_tmpring_allocation_fails_loudly() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0x1000,
+            encoding: ShaderEncoding::Flat,
+            opcode: Opcode::Known("ScratchLoadDword"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(3)],
+            destinations: vec![Operand::vector(10)],
+            control: Some(InstructionControl::GlobalMemory(
+                remu_shader::GlobalMemoryControl {
+                    dword_count: 1,
+                    vector_address: 3,
+                    vector_data: 0,
+                    vector_destination: 10,
+                    scalar_address: None,
+                    offset_bytes: 0,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                },
+            )),
+        }],
+    );
+    let error = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect_err("missing lane allocation must not guess a scratch extent");
+    assert!(error.to_string().contains("COMPUTE_TMPRING_SIZE"));
+}
+
+#[test]
 fn structured_buffer_oob_uses_guest_num_records_without_binding_span_expansion() {
     // J3: the NUM_RECORDS expansion peephole is deleted. Guest NUM_RECORDS alone drives OOB;
     // Q4 absolute-address pools are the real fix for instanced draws past the guest count.

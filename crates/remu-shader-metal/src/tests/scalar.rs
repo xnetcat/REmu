@@ -27,6 +27,55 @@ fn lowers_observed_64_bit_and_not_scalar_operation() {
 }
 
 #[test]
+fn hardware_register_writes_do_not_fabricate_an_sgpr_destination() {
+    for (name, sources, words) in [
+        (
+            "SSetregB32",
+            vec![
+                Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 0xf801,
+                },
+                Operand::scalar(5),
+            ],
+            vec![0xb905_f801],
+        ),
+        (
+            "SSetregImm32B32",
+            vec![
+                Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 0xf801,
+                },
+                Operand {
+                    kind: OperandKind::LiteralConstant,
+                    value: 0x1122_3344,
+                },
+            ],
+            vec![0xb985_f801, 0x1122_3344],
+        ),
+    ] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x24,
+                encoding: ShaderEncoding::Sopk,
+                opcode: Opcode::Known(name),
+                words,
+                sources,
+                destinations: Vec::new(),
+                control: None,
+            },
+            MetalShaderStage::Compute,
+        );
+        assert!(shader.source.contains("kernel void remu_main"));
+        assert!(
+            !shader.source.contains("remu_s_5 ="),
+            "{name} reads hardware-state operands but writes no SGPR"
+        );
+    }
+}
+
+#[test]
 fn lowers_s_bcnt1_i32_b64_to_one_uint_destination_and_scc() {
     let shader = compile_vector_instruction(
         Instruction {

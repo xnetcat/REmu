@@ -7,7 +7,7 @@ use super::{
     GraphicsPipelineKey, GraphicsShaderResourceKey, GuestScissor, GuestTextureDescriptor,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
     RenderTargetFormat, RenderTargetPipelineState, ResourceSpan, decode_sampled_texture_format,
-    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
+    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
     diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
@@ -35,15 +35,16 @@ pub(crate) use self::image::{
     fallback_image_descriptor, image_component_class, sampled_alias_descriptor,
 };
 pub(crate) use self::pipeline::{
-    ColorOperationMode, color_operation_is_raster_noop, decode_color_operation_mode,
-    decode_metal_blend_attachment, decode_raster_state, graphics_pipeline_key,
-    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    ngg_mesh_base_vertex, noop_placeholder_cover_draw, prepare_indexed_ngg_indices,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    ColorOperationMode, NGG_MESHLET_WORDS_PER_GROUP, color_operation_is_raster_noop,
+    decode_color_operation_mode, decode_metal_blend_attachment, decode_raster_state,
+    graphics_pipeline_key, metal_color_write_mask, metal_nonindexed_vertex_count,
+    metal_primitive_type, ngg_mesh_base_vertex, noop_placeholder_cover_draw,
+    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
+    prepare_nonindexed_ngg_indices,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
-    NGG_MESHLET_WORDS_PER_GROUP, apply_transparent_premultiplied_fill_clear,
+    apply_transparent_premultiplied_fill_clear, decode_ngg_registers_from_state,
     decode_ngg_subgroup_limits, disabled_metal_blend_attachment, graphics_shader_resource_key,
     is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
     ngg_fullscreen_cover_draw,
@@ -77,6 +78,9 @@ pub(super) const CB_BLEND_BLUE: u32 = 0x107;
 pub(super) const CB_BLEND_ALPHA: u32 = 0x108;
 
 pub(super) const SPI_PS_INPUT_CNTL_0: u32 = 0x191;
+
+/// GFX10 `SPI_SHADER_COL_FORMAT` (`R_028714`, normalized from the context-register base).
+pub(super) const SPI_SHADER_COL_FORMAT: u32 = 0x1c5;
 
 pub(super) const CB_BLEND0_CONTROL: u32 = 0x1e0;
 
@@ -265,12 +269,6 @@ pub(super) fn intersect_scissor_pair(
     bounds[3] = bounds[3].min(pair[3]);
 }
 
-pub(super) fn guest_viewport_y_scale_is_negative(draw: &IndexedDraw) -> bool {
-    register_value(&draw.context_registers, 0x111)
-        .map(f32::from_bits)
-        .is_some_and(|y_scale| y_scale.is_finite() && y_scale < 0.0)
-}
-
 pub(super) fn decode_viewport(
     draw: &IndexedDraw,
     target_width: u32,
@@ -300,8 +298,11 @@ pub(super) fn decode_viewport(
     {
         let mut origin_y = y_offset - y_scale;
         let mut height = y_scale * 2.0;
-        // Absolute Metal height: guest VPORT_YSCALE < 0 still maps NDC+Y to the top of the
-        // target after this conversion. Passing a signed height inverted the image on Metal.
+        // Metal only accepts a positive viewport height. Its upper-left framebuffer coordinates
+        // already retain the guest's screen-space winding for a negative VPORT_YSCALE, so the
+        // PA_SU_SC_MODE_CNTL front-face value must be passed through unchanged. Flipping both the
+        // height and front-face state double-inverts UE fullscreen geometry and culls every
+        // fragment when back-face culling is enabled.
         if height < 0.0 {
             origin_y += height;
             height = -height;
@@ -366,10 +367,12 @@ pub(super) fn read_draw_indices(draw: &IndexedDraw) -> Option<Arc<[u32]>> {
     // When VGT_INDEX_TYPE is stuck at the 16-bit CLEAR default but the buffer is 32-bit, small
     // indices decode as `(lo, 0)` pairs — e.g. u32 `[0,1,2]` → u16 `[0,0,1,0,2,0]`. Re-read as
     // 32-bit so NGG/UI quads keep real connectivity instead of degenerate fans.
-    if element_size == 2 && indices_look_like_u32_read_as_u16(indices.as_ref())
-        && let Some(recovered) = read_draw_indices_with_element_size(draw, 4) {
-            return Some(recovered);
-        }
+    if element_size == 2
+        && indices_look_like_u32_read_as_u16(indices.as_ref())
+        && let Some(recovered) = read_draw_indices_with_element_size(draw, 4)
+    {
+        return Some(recovered);
+    }
     Some(indices)
 }
 

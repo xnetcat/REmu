@@ -7,7 +7,7 @@ use metal::{
     MTLTriangleFillMode, MTLWinding, RenderPipelineDescriptor,
 };
 use remu_gpu::{GpuRegister, ShaderSnapshot};
-use remu_shader::{PixelOutputKind, Program, ShaderEvaluation, decode_program};
+use remu_shader::{PixelExportFormat, PixelOutputKind, Program, ShaderEvaluation, decode_program};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -24,9 +24,9 @@ use super::{
     common_render_target_array_length, consume_color_metadata_clear, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
-    decode_metal_blend_attachment, decode_ngg_subgroup_limits, decode_raster_state,
-    decode_render_target_format, decode_render_targets_from_registers, decode_scissor,
-    decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch,
+    decode_metal_blend_attachment, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
+    decode_raster_state, decode_render_target_format, decode_render_targets_from_registers,
+    decode_scissor, decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch,
     fragmentless_pixel_program, graphics_pipeline_key, guest_texture_byte_count,
     guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
@@ -635,7 +635,7 @@ fn decodes_observed_clockwise_back_face_culling() {
 }
 
 #[test]
-fn preserves_guest_winding_with_a_negative_viewport_height() {
+fn negative_height_viewport_keeps_sdk_front_face_for_metal() {
     let mut draw = indexed_draw(0, 0, 0);
     draw.context_registers.extend([
         GpuRegister {
@@ -669,6 +669,17 @@ fn preserves_guest_winding_with_a_negative_viewport_height() {
             front_winding: MTLWinding::Clockwise,
             fill_mode: MTLTriangleFillMode::Fill,
         }
+    );
+    let viewport = decode_viewport(&draw, 1_920, 1_080, GuestScissor::Full);
+    assert_eq!(viewport.originY, 0.0);
+    assert_eq!(viewport.height, 1_080.0);
+    // SCE AGC CxPrimitiveSetup::FrontFace::kCw is bit 2. Metal's positive viewport keeps that
+    // SDK-facing value; callers must not compensate for the guest's negative Y scale again.
+    assert_eq!(
+        decode_raster_state(&draw)
+            .expect("negative-height viewport front face")
+            .front_winding,
+        MTLWinding::Clockwise,
     );
 }
 
@@ -1378,6 +1389,7 @@ fn treats_chowdren_transparent_premultiplied_fills_as_overwrites() {
         guest_slot: 0,
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         output_kind: PixelOutputKind::Float,
+        export_format: PixelExportFormat::Abgr32,
         write_mask: 0xf,
         blend,
     }];
@@ -1439,6 +1451,7 @@ fn does_not_rewrite_straight_alpha_transparent_fills_as_clears() {
         guest_slot: 0,
         pixel_format: MTLPixelFormat::RGBA8Unorm,
         output_kind: PixelOutputKind::Float,
+        export_format: PixelExportFormat::Abgr32,
         write_mask: 0xf,
         blend,
     }];
@@ -1685,6 +1698,40 @@ fn decodes_captured_ngg_subgroup_limits_and_derives_ninety_six_threads() {
         Some(NggOutputPrimitiveType::TriangleStrip)
     );
     assert_eq!(limits.threadgroup_threads, 96);
+}
+
+#[test]
+fn captures_proven_ngg_compile_registers_from_the_live_draw_state() {
+    // The merged export stage's PGM_RSRC1 sits two registers before its user-data base. The
+    // geometry limits are context registers and GE_MAX_OUTPUT_PER_SUBGROUP—not
+    // GE_NGG_SUBGRP_CNTL—owns the SDK's ten-bit post-amplification vertex cap.
+    let registers = decode_ngg_registers_from_state(
+        &[GpuRegister {
+            offset: 0x08a,
+            value: 0x25,
+        }],
+        &[
+            GpuRegister {
+                offset: 0x1ff,
+                value: 96,
+            },
+            GpuRegister {
+                offset: 0x2ce,
+                value: 24,
+            },
+            GpuRegister {
+                offset: 0x2d3,
+                value: 7,
+            },
+        ],
+        0x08c,
+    )
+    .expect("the complete live register set proves NGG sizing");
+
+    assert_eq!(registers.pgm_rsrc1, 0x25);
+    assert_eq!(registers.gs_max_vert_out, 24);
+    assert_eq!(registers.ge_max_output_per_subgroup, 96);
+    assert_eq!(registers.max_verts_per_subgroup(), 96);
 }
 
 #[test]

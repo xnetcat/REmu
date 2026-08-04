@@ -18,7 +18,9 @@
 //! after a loud diagnostic — never invent a non-zero count.
 
 use metal::{Buffer, Device, MTLResourceOptions, MTLVisibilityResultMode, RenderCommandEncoder};
-use remu_gpu::{GpuMemoryRelease, GpuMemoryReleaseValue, PIXEL_PIPE_STAT_COUNTER_PAIRS, PIXEL_PIPE_STAT_VALID};
+use remu_gpu::{
+    GpuMemoryRelease, GpuMemoryReleaseValue, PIXEL_PIPE_STAT_COUNTER_PAIRS, PIXEL_PIPE_STAT_VALID,
+};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::super::metal_bytes::MetalBytes;

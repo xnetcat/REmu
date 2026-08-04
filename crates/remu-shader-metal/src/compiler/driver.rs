@@ -238,7 +238,8 @@ impl<'a> Compiler<'a> {
                 }
             }
             ControlFlowLowering::Structured { tree, blocks } => {
-                if let Err(message) = self.emit_structured_cfg(&tree, &blocks, 2, &mut failures, &mut failed_opcodes)
+                if let Err(message) =
+                    self.emit_structured_cfg(&tree, &blocks, 2, &mut failures, &mut failed_opcodes)
                 {
                     // Structural emission failure (missing condition block, etc.) — surface as a
                     // loud interface error rather than a silently truncated dispatcher body.
@@ -509,7 +510,14 @@ impl<'a> Compiler<'a> {
     ) -> Result<(), String> {
         match tree {
             StructuredCfg::Block(block_id) => {
-                self.emit_structured_block(*block_id, blocks, indent, failures, failed_opcodes, false)?;
+                self.emit_structured_block(
+                    *block_id,
+                    blocks,
+                    indent,
+                    failures,
+                    failed_opcodes,
+                    false,
+                )?;
             }
             StructuredCfg::Sequence(nodes) => {
                 for node in nodes {
@@ -535,7 +543,13 @@ impl<'a> Compiler<'a> {
                     format!("!({taken})")
                 };
                 self.line(indent, &format!("if ({predicate}) {{"));
-                self.emit_structured_cfg(then_branch, blocks, indent + 1, failures, failed_opcodes)?;
+                self.emit_structured_cfg(
+                    then_branch,
+                    blocks,
+                    indent + 1,
+                    failures,
+                    failed_opcodes,
+                )?;
                 self.line(indent, "}");
                 if let Some(else_branch) = else_branch {
                     self.line(indent, "else {");

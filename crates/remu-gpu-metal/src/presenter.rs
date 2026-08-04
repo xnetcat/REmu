@@ -22,6 +22,7 @@ use remu_gpu::{
 use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, GuestSharedBackingRange, GuestSharedMappingIdentity,
 };
+mod attachment;
 mod cache;
 mod completion;
 mod decode;
@@ -31,7 +32,6 @@ mod execute;
 mod format;
 mod host_ui;
 mod metal_bytes;
-mod attachment;
 mod present;
 mod readback;
 mod sampler;
@@ -48,14 +48,14 @@ use self::decode::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_BLEND0_CONTROL,
     CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
     CB_TARGET_MASK, ColorOperationMode, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
-    DEFAULT_CB_COLOR_CONTROL, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    color_operation_is_raster_noop, decode_color_eliminate_fast_clear_target,
-    decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,
-    decode_depth_target_without_diagnostics, decode_image_descriptor,
-    decode_image_descriptor_without_diagnostics, decode_metal_blend_attachment,
-    decode_raster_state, decode_render_target_format, decode_render_targets, decode_scissor,
-    decode_viewport, fallback_image_descriptor, graphics_pipeline_key,
-    guest_viewport_y_scale_is_negative, image_component_class, initial_depth_clear_for_target,
+    DEFAULT_CB_COLOR_CONTROL, NGG_MESHLET_WORDS_PER_GROUP, PA_SC_AA_MASK_X0Y0_X1Y0,
+    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, color_operation_is_raster_noop,
+    decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
+    decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
+    decode_image_descriptor, decode_image_descriptor_without_diagnostics,
+    decode_metal_blend_attachment, decode_raster_state, decode_render_target_format,
+    decode_render_targets, decode_scissor, decode_viewport, fallback_image_descriptor,
+    graphics_pipeline_key, image_component_class, initial_depth_clear_for_target,
     initial_render_target_clear_color, metal_color_write_mask, metal_nonindexed_vertex_count,
     metal_primitive_type, ngg_mesh_base_vertex, noop_placeholder_cover_draw,
     prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
@@ -68,10 +68,10 @@ use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_CMASK, CB_COLOR0_INFO, CB_COLOR0_VIEW,
     DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE,
-    DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, NGG_MESHLET_WORDS_PER_GROUP,
-    SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
-    VIDEO_OUT_TILING_MODE_TILE, apply_transparent_premultiplied_fill_clear,
-    common_render_target_array_length, decode_fast_clear_color, decode_ngg_subgroup_limits,
+    DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0,
+    VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
+    apply_transparent_premultiplied_fill_clear, common_render_target_array_length,
+    decode_fast_clear_color, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
     decode_render_targets_from_registers, decode_scanout_target, disabled_metal_blend_attachment,
     graphics_shader_resource_key, initial_depth_clear_value,
     is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
@@ -84,20 +84,21 @@ use self::diagnostics::{
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     capture_target_sample_textures, diagnostic_capture_pixel_output,
-    diagnostic_capture_vertex_position, diagnostic_context_register_snapshot,
-    diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
-    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa, diagnostic_dump_glyph_draw,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
-    diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_index_count,
-    diagnostic_dump_target_match_index, diagnostic_dump_target_minimum_draw,
-    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
-    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
-    diagnostic_dump_video_target_consumer, diagnostic_force_msaa_pixel_color,
-    diagnostic_force_msaa_vertex_pattern, diagnostic_force_vertex_fetch_id,
-    diagnostic_force_visible_clip_depth, diagnostic_global_binding_head,
-    diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
-    diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
-    diagnostic_scanout_writer, diagnostic_scanout_writer_slot,
+    diagnostic_capture_vertex_position, diagnostic_compute_texture_dispatch_is_eligible,
+    diagnostic_context_register_snapshot, diagnostic_disable_blending, diagnostic_disable_culling,
+    diagnostic_disable_depth, diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_dump_depth_export_shader,
+    diagnostic_dump_gbuffer, diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
+    diagnostic_dump_target_address, diagnostic_dump_target_before_pixel_shader,
+    diagnostic_dump_target_index_count, diagnostic_dump_target_match_index,
+    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
+    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
+    diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
+    diagnostic_global_binding_head, diagnostic_overlapping_global_writers,
+    diagnostic_overlapping_memory_copies, diagnostic_overlapping_texture_writers,
+    diagnostic_related_texture_writers, diagnostic_scanout_writer, diagnostic_scanout_writer_slot,
     diagnostic_scanout_writer_target_selected, diagnostic_shader_summary,
     diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, diagnostic_target_address_matches,
     diagnostic_target_draw_filter, diagnostic_texture_writer, diagnostic_texture_writer_enabled,
@@ -122,6 +123,7 @@ use self::format::{
     half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
     texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
 };
+use self::metal_bytes::MetalBytes;
 #[cfg(test)]
 use self::present::{
     appkit_persistent_state_is_ignored, clear_appkit_persistent_state_override,
@@ -136,7 +138,7 @@ use self::readback::{
     WRITEBACK_TRIGGER_COUNT, WRITEBACK_TRIGGERS, WritebackTrigger, capture_guest_frame,
     diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
     metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, read_texture_array_linear,
-    read_texture_linear, read_texture_volume_linear,
+    read_texture_linear, read_texture_linear_after_event, read_texture_volume_linear,
 };
 #[cfg(test)]
 use self::sampler::sampler_lod_bias;
@@ -163,7 +165,6 @@ use self::shader::{
     rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
     truncated_memoryless_ngg_rectangle_cover,
 };
-use self::metal_bytes::MetalBytes;
 use self::shared_event::{
     GpuWaitFenceMap, SharedEventFence, SharedEventProducerId, SharedEventTimeline,
 };
@@ -210,17 +211,17 @@ use self::submission::{
 };
 use self::texture::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
-    SpanQueryOrder, WrittenRegion, decode_guest_texture_linear_from_raw,
-    refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
-    resident_declared_span, resident_depth_sample_is_eligible, resident_texture_activity_stats,
+    SpanQueryOrder, TextureWritebackOutcome, WrittenRegion, decode_guest_texture_linear_from_raw,
+    ensure_read_watch_materializer_registered, refresh_resident_texture_write_watch,
+    resident_color_view_sample_is_eligible, resident_declared_span,
+    resident_depth_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
     resident_texture_raw_byte_count, retire_multisample_textures_overlapping_writeback,
     retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
     sampled_texture_raw_range, snapshot_guest_texture_raw, snapshot_watched_guest_range,
     storage_image_requires_mip_hierarchy, trace_resident_texture_removal, upload_image_textures,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear, TextureWritebackOutcome,
-    ensure_read_watch_materializer_registered,
+    write_watched_guest_texture_linear,
 };
 #[cfg(test)]
 use self::texture::{
@@ -257,7 +258,7 @@ use self::tiling::{
 
 #[cfg(test)]
 use remu_memory::guest_shared_mapping_identity;
-use remu_shader::PixelOutputKind;
+use remu_shader::{PixelExportFormat, PixelOutputKind};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::KeyCode;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -602,6 +603,7 @@ struct RenderTargetPipelineState {
     guest_slot: u32,
     pixel_format: MTLPixelFormat,
     output_kind: PixelOutputKind,
+    export_format: PixelExportFormat,
     write_mask: u32,
     blend: MetalBlendAttachmentState,
 }
@@ -652,6 +654,10 @@ struct GraphicsPipelineKey {
     /// and meshlet preparation require it rather than assuming that execution wave width is also
     /// the guest input/output geometry capacity.
     ngg_subgroup_limits: Option<NggSubgroupLimits>,
+    /// Raw SDK-defined registers proving the merged NGG stage's allocation and output bounds.
+    /// The shader backend uses their presence to lower architectural empty-subgroup sequences;
+    /// an incomplete command state remains a loud pipeline refusal.
+    ngg_registers: Option<remu_shader_metal::NggRegisters>,
     /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`, gated by an active depth attachment.
     pixel_depth_export: bool,
     /// Diagnostic lowerings alter the generated Metal function body and interface. Keep the
@@ -864,6 +870,7 @@ impl Hash for ProgramIdentity {
 struct ComputePipelineKey {
     program_identity: ProgramIdentity,
     lds_size_bytes: u32,
+    scratch_size_bytes: u32,
     wave_lane_count: u32,
     allocated_vector_register_count: u32,
     compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
@@ -2277,7 +2284,6 @@ struct MetalPresenter {
     compiled_shader_pairs: HashMap<GraphicsPipelineKey, CompiledShaderPair>,
     compiling_shader_pairs: HashSet<GraphicsPipelineKey>,
     failed_shader_pairs: HashSet<GraphicsPipelineKey>,
-    failed_draw_execution: HashSet<GraphicsPipelineKey>,
     /// Draws whose execution failed after pipeline compilation, keyed by
     /// (export shader address, pixel shader address). Every failing execution counts, not just
     /// the first: a scene pass failing every frame must be visible in every run's perf trail
@@ -2286,10 +2292,12 @@ struct MetalPresenter {
     compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
     compiling_compute_pipelines: HashSet<ComputePipelineKey>,
     rectangle_indirect_pipeline: Option<ComputePipelineState>,
+    ngg_indirect_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_scatter_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_gather_pipeline: Option<ComputePipelineState>,
     /// B3: deferred in-batch readbacks. Encoding records here; never invents bytes.
-    #[allow(dead_code)] // Wired for QueueBlockReason::GuestReadback; open-batch resolve is next.
+    #[allow(dead_code)]
+    // Wired for QueueBlockReason::GuestReadback; open-batch resolve is next.
     deferred_guest_reads: tiler::DeferredGuestReadTracker,
     /// Q4: absolute-address pool bind (gpu-metal half). None until a live shared backing proves.
     #[allow(dead_code)] // Bind surface until shader-metal agrees on slot + lowering.
@@ -2531,11 +2539,11 @@ impl MetalPresenter {
             compiled_shader_pairs: HashMap::new(),
             compiling_shader_pairs: HashSet::new(),
             failed_shader_pairs: HashSet::new(),
-            failed_draw_execution: HashSet::new(),
             dropped_draw_executions: HashMap::new(),
             compiled_compute_pipelines: HashMap::new(),
             compiling_compute_pipelines: HashSet::new(),
             rectangle_indirect_pipeline: None,
+            ngg_indirect_pipeline: None,
             mode27_rematerialisation_scatter_pipeline: None,
             mode27_rematerialisation_gather_pipeline: None,
             deferred_guest_reads: tiler::DeferredGuestReadTracker::new(),

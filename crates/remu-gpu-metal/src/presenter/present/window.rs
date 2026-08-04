@@ -205,8 +205,7 @@ impl MetalPresenter {
         let (metal_allocated_mib, metal_recommended_mib) =
             self.device.as_ref().map_or((0, 0), |device| {
                 (
-                    device.current_allocated_size()
-                        .div_ceil(1024 * 1024),
+                    device.current_allocated_size().div_ceil(1024 * 1024),
                     device
                         .recommended_max_working_set_size()
                         .div_ceil(1024 * 1024),
@@ -715,9 +714,7 @@ impl MetalPresenter {
                     ResidencyState::Live => live += 1,
                     ResidencyState::Stale(_) => {
                         stale += 1;
-                        stale_bytes = stale_bytes.saturating_add(
-                            resident.texture.allocated_size(),
-                        );
+                        stale_bytes = stale_bytes.saturating_add(resident.texture.allocated_size());
                     }
                 }
                 owned_bytes = owned_bytes.saturating_add(resident.owned.byte_count());
@@ -752,9 +749,7 @@ impl MetalPresenter {
                     stale_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
-            let texture_allocated_bytes = |texture: &metal::Texture| {
-                texture.allocated_size()
-            };
+            let texture_allocated_bytes = |texture: &metal::Texture| texture.allocated_size();
             let resident_target_bytes =
                 self.resident_guest_textures
                     .values()
@@ -1253,20 +1248,16 @@ impl MetalPresenter {
                             self.compiled_compute_pipelines.len(),
                         )
                         .unwrap_or(0),
-                        pipeline_active_graphics: u64::try_from(
-                            self.compiling_shader_pairs.len(),
-                        )
-                        .unwrap_or(0),
+                        pipeline_active_graphics: u64::try_from(self.compiling_shader_pairs.len())
+                            .unwrap_or(0),
                         pipeline_active_compute: u64::try_from(
                             self.compiling_compute_pipelines.len(),
                         )
                         .unwrap_or(0),
                         pipeline_failed_graphics: u64::try_from(self.failed_shader_pairs.len())
                             .unwrap_or(0),
-                        pipeline_failed_compute: u64::try_from(
-                            self.failed_compute_pipelines.len(),
-                        )
-                        .unwrap_or(0),
+                        pipeline_failed_compute: u64::try_from(self.failed_compute_pipelines.len())
+                            .unwrap_or(0),
                         pipeline_enqueued: compile_enqueued,
                         pipeline_queue_full: compile_queue_full,
                         pipeline_completed: compile_completed,
@@ -1321,10 +1312,8 @@ impl MetalPresenter {
                         metal_res_sampled_count: telemetry_textures,
                         metal_res_sampled_mib: sampled_texture_cache_resident_bytes as f64
                             / (1024.0 * 1024.0),
-                        metal_res_targets_count: u64::try_from(
-                            self.resident_guest_textures.len(),
-                        )
-                        .unwrap_or(0),
+                        metal_res_targets_count: u64::try_from(self.resident_guest_textures.len())
+                            .unwrap_or(0),
                         metal_res_targets_mib: resident_target_bytes as f64 / (1024.0 * 1024.0),
                         metal_res_depth_arrays_count: u64::try_from(
                             self.depth_array_textures.len(),

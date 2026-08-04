@@ -522,7 +522,7 @@ impl MetalPresenter {
             self.statistics.shared_event_host_wakes =
                 self.statistics.shared_event_host_wakes.saturating_add(1);
         }
-        
+
         consumer
             .host_dependencies
             .iter()
@@ -1251,7 +1251,8 @@ impl MetalPresenter {
     ) -> Result<(), String> {
         if self
             .guest_queue_batches
-            .get(&queue_id).is_none_or(|state| state.open_batch.is_none())
+            .get(&queue_id)
+            .is_none_or(|state| state.open_batch.is_none())
         {
             return Ok(());
         }
@@ -1506,6 +1507,56 @@ impl MetalPresenter {
 
     pub(crate) fn wait_for_guest_command_batches(&mut self) -> Result<(), String> {
         self.wait_for_guest_command_batches_within(COMMAND_BUFFER_SETTLE_TIMEOUT)
+    }
+
+    /// Commits and settles only the logical guest queue currently being translated.
+    ///
+    /// Synchronous diagnostics need the render pass containing the sampled draw to be complete,
+    /// but draining unrelated queues can deadlock behind guest-side cross-queue dependencies. The
+    /// normal CPU synchronization path intentionally drains every queue; this narrower path is for
+    /// observations whose resources are owned by the active queue itself.
+    pub(crate) fn wait_for_active_guest_queue_command_batches(&mut self) -> Result<(), String> {
+        if !self.per_queue_guest_batches {
+            return self.wait_for_guest_command_batches();
+        }
+        self.guest_batch_cpu_synchronization_epoch =
+            self.guest_batch_cpu_synchronization_epoch.saturating_add(1);
+        let queue_id = self
+            .active_guest_queue
+            .ok_or("active-queue synchronization has no logical guest queue")?;
+        let deadline = Instant::now() + COMMAND_BUFFER_SETTLE_TIMEOUT;
+        let mut result = self.flush_guest_queue_command_batch_by(
+            queue_id,
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CpuSynchronization,
+            deadline,
+        );
+        debug_assert!(
+            result.is_err()
+                || self
+                    .guest_queue_batches
+                    .get(&queue_id)
+                    .is_none_or(|state| state.open_batch.is_none())
+        );
+        loop {
+            match self.settle_front_guest_queue_batch(queue_id, deadline) {
+                FrontBatchSettlement::Empty => return result,
+                FrontBatchSettlement::Retired(batch_result) => {
+                    result = merge_guest_batch_result(
+                        result,
+                        "later active guest queue batch",
+                        batch_result,
+                    );
+                }
+                FrontBatchSettlement::Pending(error) => {
+                    return merge_guest_batch_result(
+                        result,
+                        "pending active guest queue batch",
+                        Err(error),
+                    );
+                }
+            }
+        }
     }
 
     pub(crate) fn wait_for_guest_command_batches_within(
@@ -1815,6 +1866,19 @@ impl GuestCommandBatch {
         Ok((
             buffer,
             u64::try_from(offset).map_err(|_| "global upload offset does not fit Metal")?,
+        ))
+    }
+
+    /// Reserves batch-owned shared storage that a later Metal encoder initializes in full.
+    pub(crate) fn allocate_global_bytes(
+        &mut self,
+        device: &Device,
+        byte_count: usize,
+    ) -> Result<(Buffer, u64), String> {
+        let (buffer, offset) = self.reserve_global_upload(device, byte_count)?;
+        Ok((
+            buffer,
+            u64::try_from(offset).map_err(|_| "global allocation offset does not fit Metal")?,
         ))
     }
 

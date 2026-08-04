@@ -662,7 +662,7 @@ impl Compiler<'_> {
         Ok(())
     }
 }
-fn raw_load_shape(name: &str) -> Result<(u32, bool, bool, bool), String> {
+pub(super) fn raw_load_shape(name: &str) -> Result<(u32, bool, bool, bool), String> {
     if !name.contains("Load") {
         return Err(format!("{name} is not a raw load"));
     }
@@ -683,7 +683,7 @@ fn raw_load_shape(name: &str) -> Result<(u32, bool, bool, bool), String> {
     ))
 }
 
-fn raw_store_shape(name: &str) -> Result<(u32, bool), String> {
+pub(super) fn raw_store_shape(name: &str) -> Result<(u32, bool), String> {
     if !name.contains("Store") {
         return Err(format!("{name} is not a raw store"));
     }

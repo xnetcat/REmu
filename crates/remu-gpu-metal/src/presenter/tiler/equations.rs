@@ -163,19 +163,9 @@ mod tests {
 
     #[test]
     fn physical_offset_places_mode27_4bpp_texels_inside_the_64kib_block() {
-        let offset = tiled_physical_byte_offset(
-            GpuTilerMode::Mode27,
-            3,
-            5,
-            128,
-            4,
-            0,
-            0,
-            0,
-            false,
-            0,
-        )
-        .expect("physical offset");
+        let offset =
+            tiled_physical_byte_offset(GpuTilerMode::Mode27, 3, 5, 128, 4, 0, 0, 0, false, 0)
+                .expect("physical offset");
         assert!(offset < 65_536);
         assert_eq!(offset % 4, 0);
     }

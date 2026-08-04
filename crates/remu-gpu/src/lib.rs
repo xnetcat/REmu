@@ -21,9 +21,10 @@ mod compute;
 pub use compute::{
     COMPUTE_NUM_THREAD_X_REGISTER, COMPUTE_NUM_THREAD_Y_REGISTER, COMPUTE_NUM_THREAD_Z_REGISTER,
     COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER, COMPUTE_PGM_RSRC2_REGISTER,
-    COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER, COMPUTE_START_Z_REGISTER, ComputeDispatch,
-    ComputeDispatchDecodeError, ComputeDispatchSource, ComputeGrid, ComputeIndirectDimensions,
-    ComputeIndirectPacket, ComputeLaunch, compute_program_address, decode_compute_dispatch_direct,
+    COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER, COMPUTE_START_Z_REGISTER,
+    COMPUTE_TMPRING_SIZE_REGISTER, ComputeDispatch, ComputeDispatchDecodeError,
+    ComputeDispatchSource, ComputeGrid, ComputeIndirectDimensions, ComputeIndirectPacket,
+    ComputeLaunch, compute_program_address, decode_compute_dispatch_direct,
     decode_compute_dispatch_indirect, decode_compute_launch, decode_compute_system_registers,
 };
 
@@ -82,7 +83,7 @@ mod dialog;
 pub use dialog::{
     HostDialogButtons, HostDialogKind, HostDialogRequest, HostDialogResult, HostDialogResultCode,
     HostToastRequest, begin_host_dialog, cancel_host_dialog, complete_host_dialog,
-    host_dialog_is_pending, host_dialog_result, reset_host_dialog_state,
+    host_dialog_is_pending, host_dialog_result, reset_host_dialog_state, unattended_dialog_result,
 };
 
 mod system_ui;

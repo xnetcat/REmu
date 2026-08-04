@@ -5,7 +5,8 @@
 //! parameter interpolation instructions the pixel stage reads them back with.
 
 use remu_shader::{
-    ExportControl, Instruction, InstructionControl, OperandKind, PixelOutputKind, Program,
+    ExportControl, Instruction, InstructionControl, OperandKind, PixelExportFormat,
+    PixelOutputKind, Program,
 };
 
 use crate::compiler::interface::vertex_clip_distance_mask;
@@ -308,22 +309,38 @@ impl Compiler<'_> {
                     component
                 }],
             )?;
-            values.push(match (output.kind, export.compressed) {
-                (PixelOutputKind::Float, false) => format!("as_type<float>(v[{register}])"),
-                (PixelOutputKind::Float, true) => {
+            values.push(match (output.kind, export.compressed, output.export_format) {
+                (PixelOutputKind::Float, false, _) => {
+                    format!("as_type<float>(v[{register}])")
+                }
+                (PixelOutputKind::Float, true, PixelExportFormat::AbgrFp16) => {
                     format!("(float)as_type<half2>(v[{register}])[{}]", component & 1)
                 }
+                (PixelOutputKind::Float, true, PixelExportFormat::AbgrUnorm16) => format!(
+                    "(float)as_type<ushort2>(v[{register}])[{}] * (1.0f / 65535.0f)",
+                    component & 1
+                ),
+                (PixelOutputKind::Float, true, PixelExportFormat::AbgrSnorm16) => format!(
+                    "fmax(-1.0f, (float)as_type<short2>(v[{register}])[{}] * (1.0f / 32767.0f))",
+                    component & 1
+                ),
                 // Integer color exports carry integer component bits. Reinterpreting those bits
                 // as float first and then value-converting made every small ID/culling value a
                 // subnormal float which converted to zero. Unreal's GPU-driven passes rely on
                 // these integer render targets before the visible scene can be composed.
-                (PixelOutputKind::Uint, false) => format!("v[{register}]"),
-                (PixelOutputKind::Sint, false) => format!("as_type<int>(v[{register}])"),
-                (PixelOutputKind::Uint, true) => {
+                (PixelOutputKind::Uint, false, _) => format!("v[{register}]"),
+                (PixelOutputKind::Sint, false, _) => format!("as_type<int>(v[{register}])"),
+                (PixelOutputKind::Uint, true, PixelExportFormat::AbgrUint16) => {
                     format!("(uint)as_type<ushort2>(v[{register}])[{}]", component & 1)
                 }
-                (PixelOutputKind::Sint, true) => {
+                (PixelOutputKind::Sint, true, PixelExportFormat::AbgrSint16) => {
                     format!("(int)as_type<short2>(v[{register}])[{}]", component & 1)
+                }
+                (kind, true, format) => {
+                    return Err(format!(
+                        "compressed MRT{} export format {format:?} is incompatible with {kind:?} output",
+                        output.guest_slot
+                    ));
                 }
             });
         }

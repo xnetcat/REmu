@@ -31,8 +31,8 @@ use super::{
     decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,
     decode_fast_clear_color, decode_guest_texture_linear_from_raw, decode_image_descriptor,
     decode_metal_blend_attachment, decode_mode5_mip_chain_from_raw,
-    decode_mode27_mip_chain_from_raw, decode_ngg_subgroup_limits, decode_raster_state,
-    decode_render_target_format, decode_render_targets_from_registers,
+    decode_mode27_mip_chain_from_raw, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
+    decode_raster_state, decode_render_target_format, decode_render_targets_from_registers,
     decode_sampled_texture_format, decode_sampled_texture_linear_from_raw, decode_scanout_target,
     decode_scissor, decode_viewport, depth_array_face_descriptor, depth_array_face_set_is_complete,
     diagnostic_texture_depth_plane_summaries, disable_appkit_state_restoration,
@@ -175,6 +175,7 @@ fn cold_graphics_pipeline_key() -> GraphicsPipelineKey {
         }),
         pixel_depth_export: false,
         ngg_subgroup_limits: None,
+        ngg_registers: None,
         diagnostics: GraphicsDiagnosticPipelineState::default(),
         targets: Vec::new(),
         depth: None,
@@ -270,6 +271,7 @@ fn compute_launch() -> ComputeLaunch {
         threads_per_group: [32, 2, 1],
         wave_lane_count: 32,
         lds_size_bytes: 16 * 1024,
+        scratch_size_bytes: 0,
         initiator: 0x8045,
     }
 }

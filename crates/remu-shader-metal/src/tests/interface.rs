@@ -16,6 +16,21 @@ fn compile_pixel_export_mask(
     compressed: bool,
     enable_mask: u32,
 ) -> MetalShader {
+    let export_format = match (kind, compressed) {
+        (PixelOutputKind::Float, true) => PixelExportFormat::AbgrFp16,
+        (PixelOutputKind::Uint, true) => PixelExportFormat::AbgrUint16,
+        (PixelOutputKind::Sint, true) => PixelExportFormat::AbgrSint16,
+        (_, false) => PixelExportFormat::Abgr32,
+    };
+    compile_pixel_export_mask_and_format(kind, compressed, enable_mask, export_format)
+}
+
+fn compile_pixel_export_mask_and_format(
+    kind: PixelOutputKind,
+    compressed: bool,
+    enable_mask: u32,
+    export_format: PixelExportFormat,
+) -> MetalShader {
     // Decode a real GCN EXP instead of constructing compiler IR by hand. This locks the raw
     // VGPR payload and COMPR/EN bit semantics to the generated Metal source.
     let export_word =
@@ -39,11 +54,39 @@ fn compile_pixel_export_mask(
             guest_slot: 0,
             host_location: 0,
             kind,
+            export_format,
         }],
         0,
         0,
     );
     compile_msl(&program, &empty_evaluation(), &options).expect("pixel export should lower")
+}
+
+#[test]
+fn compressed_normalized_exports_decode_fixed_point_instead_of_fp16() {
+    let unorm = compile_pixel_export_mask_and_format(
+        PixelOutputKind::Float,
+        true,
+        0x05,
+        PixelExportFormat::AbgrUnorm16,
+    );
+    assert!(unorm.source.contains(
+        "float4((float)as_type<ushort2>(remu_v_0)[0] * (1.0f / 65535.0f), (float)as_type<ushort2>(remu_v_0)[1] * (1.0f / 65535.0f), (float)as_type<ushort2>(remu_v_1)[0] * (1.0f / 65535.0f), (float)as_type<ushort2>(remu_v_1)[1] * (1.0f / 65535.0f))"
+    ));
+    assert!(!unorm.source.contains("as_type<half2>(remu_v_0)"));
+
+    let snorm = compile_pixel_export_mask_and_format(
+        PixelOutputKind::Float,
+        true,
+        0x05,
+        PixelExportFormat::AbgrSnorm16,
+    );
+    assert!(
+        snorm
+            .source
+            .contains("fmax(-1.0f, (float)as_type<short2>(remu_v_0)[0] * (1.0f / 32767.0f))")
+    );
+    assert!(!snorm.source.contains("as_type<half2>(remu_v_0)"));
 }
 
 #[test]

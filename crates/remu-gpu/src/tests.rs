@@ -4,10 +4,10 @@ use super::{
     COMPUTE_NUM_THREAD_X_REGISTER, COMPUTE_NUM_THREAD_Y_REGISTER, COMPUTE_NUM_THREAD_Z_REGISTER,
     COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER, COMPUTE_PGM_RSRC2_REGISTER,
     COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER, COMPUTE_START_Z_REGISTER,
-    ComputeDispatchDecodeError, ComputeGrid, GPU_EVENT_QUEUE_CAPACITY,
-    GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuMemoryAcquire,
-    GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames, audio_progress_age_millis,
-    audio_underrun_frames, clear_event_sink, compute_program_address,
+    COMPUTE_TMPRING_SIZE_REGISTER, ComputeDispatchDecodeError, ComputeGrid,
+    GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuEvent, GpuFlipCompletion,
+    GpuHostImage, GpuMemoryAcquire, GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames,
+    audio_progress_age_millis, audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
     decode_compute_system_registers, emit_event, emit_event_with_admission,
     gpu_completed_submission_ids_snapshot, gpu_completed_submission_sequence, gpu_event_channel,
@@ -691,6 +691,8 @@ fn compute_registers(thread_words: [u32; 3], starts: [u32; 3]) -> Vec<GpuRegiste
         (COMPUTE_START_Y_REGISTER, starts[1]),
         (COMPUTE_START_Z_REGISTER, starts[2]),
         (COMPUTE_PGM_RSRC2_REGISTER, 64 << 15),
+        // Two 1-KiB blocks per wave: 64 bytes per lane for this wave32 launch.
+        (COMPUTE_TMPRING_SIZE_REGISTER, 2 << 12),
     ]
     .map(|(offset, value)| GpuRegister { offset, value })
     .to_vec()
@@ -709,6 +711,7 @@ fn decodes_direct_group_dimensions_wave_size_and_lds() {
     assert_eq!(launch.threads_per_group_total(), 128);
     assert_eq!(launch.wave_lane_count, 32);
     assert_eq!(launch.lds_size_bytes, 32 * 1024);
+    assert_eq!(launch.scratch_size_bytes, 64);
 }
 
 #[test]

@@ -237,10 +237,12 @@ pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<
     // When VGT_INDEX_TYPE is stuck at the 16-bit CLEAR default but the buffer is 32-bit, small
     // indices decode as `(lo, 0)` pairs. Recover by re-reading as 32-bit before the snapshot is
     // frozen onto the draw (Metal prefers `index_snapshot` over a live re-read).
-    if element_size == 2 && indices_look_like_u32_read_as_u16(indices.as_ref())
-        && let Some(recovered) = snapshot_draw_indices_with_element_size(draw, 4) {
-            return Some(recovered);
-        }
+    if element_size == 2
+        && indices_look_like_u32_read_as_u16(indices.as_ref())
+        && let Some(recovered) = snapshot_draw_indices_with_element_size(draw, 4)
+    {
+        return Some(recovered);
+    }
     Some(indices)
 }
 
@@ -403,23 +405,15 @@ pub(crate) fn evaluate_draw_shader_requests_parallel(
         }
         (Some(Ok(export)), pixel) => (
             Some(evaluate_local(export, local_cache)),
-            pixel.map(|result| {
-                result.map(|_| unreachable!("pixel request was not successful"))
-            }),
+            pixel.map(|result| result.map(|_| unreachable!("pixel request was not successful"))),
         ),
         (export, Some(Ok(pixel))) => (
-            export.map(|result| {
-                result.map(|_| unreachable!("export request was not successful"))
-            }),
+            export.map(|result| result.map(|_| unreachable!("export request was not successful"))),
             Some(evaluate_local(pixel, local_cache)),
         ),
         (export, pixel) => (
-            export.map(|result| {
-                result.map(|_| unreachable!("export request was not successful"))
-            }),
-            pixel.map(|result| {
-                result.map(|_| unreachable!("pixel request was not successful"))
-            }),
+            export.map(|result| result.map(|_| unreachable!("export request was not successful"))),
+            pixel.map(|result| result.map(|_| unreachable!("pixel request was not successful"))),
         ),
     }
 }
@@ -510,21 +504,33 @@ fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> S
         Err(error) => return format!("ps-{error}"),
     };
     let mut host_location = 0_u32;
-    let pixel_outputs = (0..8)
-        .filter_map(|guest_slot| {
-            let mask =
-                (pixel_snapshot.program.pixel_color_export_masks() >> (guest_slot * 4)) & 0xf;
-            (mask != 0).then(|| {
-                let binding = remu_shader::PixelOutputBinding {
-                    guest_slot,
-                    host_location,
-                    kind: remu_shader::PixelOutputKind::Float,
-                };
-                host_location += 1;
-                binding
-            })
-        })
-        .collect();
+    let shader_color_formats = draw
+        .context_registers
+        .iter()
+        .find(|register| register.offset == 0x1c5)
+        .map_or(0, |register| register.value);
+    let mut pixel_outputs = Vec::new();
+    for guest_slot in 0..8 {
+        let mask = (pixel_snapshot.program.pixel_color_export_masks() >> (guest_slot * 4)) & 0xf;
+        if mask == 0 {
+            continue;
+        }
+        let format_nibble = (shader_color_formats >> (guest_slot * 4)) & 0xf;
+        let Some(export_format) =
+            remu_shader::PixelExportFormat::from_register_nibble(format_nibble)
+        else {
+            return format!(
+                "ps-invalid-col-format(slot={guest_slot},nibble={format_nibble:#x},register={shader_color_formats:#010x})"
+            );
+        };
+        pixel_outputs.push(remu_shader::PixelOutputBinding {
+            guest_slot,
+            host_location,
+            kind: remu_shader::PixelOutputKind::Float,
+            export_format,
+        });
+        host_location += 1;
+    }
     let mut pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
         pixel_outputs,
         draw.context_registers

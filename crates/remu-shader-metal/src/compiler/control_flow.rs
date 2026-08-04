@@ -59,7 +59,9 @@ pub(crate) fn structured_cfg_is_fully_reducible(tree: &StructuredCfg) -> bool {
 fn structured_cfg_needs_structured_emission(tree: &StructuredCfg) -> bool {
     match tree {
         StructuredCfg::If { .. } | StructuredCfg::Loop(_) => true,
-        StructuredCfg::Sequence(nodes) => nodes.iter().any(structured_cfg_needs_structured_emission),
+        StructuredCfg::Sequence(nodes) => {
+            nodes.iter().any(structured_cfg_needs_structured_emission)
+        }
         StructuredCfg::Block(_) | StructuredCfg::Continue | StructuredCfg::Break => false,
         StructuredCfg::Dispatcher { .. } => false,
     }

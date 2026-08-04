@@ -33,7 +33,10 @@ fn presentation_runs_on_a_dedicated_metal_queue() {
     // queue.
     let (_sender, receiver) = gpu_event_channel();
     let presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
-    let guest = presenter.command_queue.as_ref().expect("guest command queue");
+    let guest = presenter
+        .command_queue
+        .as_ref()
+        .expect("guest command queue");
     let present = presenter
         .presentation_queue
         .as_ref()

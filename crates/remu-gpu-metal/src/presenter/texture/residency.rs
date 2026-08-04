@@ -1368,8 +1368,7 @@ impl MetalPresenter {
                 // Writing back an older overlapping version may already have retired this alias.
                 continue;
             };
-            let allocated_bytes =
-                resident.texture.allocated_size();
+            let allocated_bytes = resident.texture.allocated_size();
             let refresh = refresh_resident_texture_write_watch(resident)?;
             if refresh == WriteWatchRefresh::Reprotecting {
                 // A concurrent CPU write is changing watch ownership. Leave this resident in

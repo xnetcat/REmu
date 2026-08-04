@@ -9,7 +9,9 @@ use super::{
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
     collect_shared_event_global_versions, compute_pipeline_key, compute_program_can_split_wave64,
-    create_global_argument_buffer, decode_image_descriptor, diagnostic_texture_writer_enabled,
+    create_global_argument_buffer, decode_image_descriptor,
+    diagnostic_compute_texture_dispatch_is_eligible,
+    diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_texture_writer_enabled,
     dump_msl_compute_filter_matches, image_resource_descriptor_is_null, is_storage_image_opcode,
     is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
@@ -436,6 +438,10 @@ impl MetalPresenter {
         }
         if let Some(directory) = std::env::var_os("REMU_DUMP_COMPUTE_TEXTURE_DIR")
             && dump_msl_compute_filter_matches(dispatch.shader_address)
+            && diagnostic_compute_texture_dispatch_is_eligible(
+                dispatch.sequence,
+                diagnostic_dump_compute_texture_minimum_dispatch(),
+            )
             && textures.iter().any(|texture| {
                 texture.descriptor.guest.width >= 1_000 && texture.descriptor.guest.height >= 500
             })

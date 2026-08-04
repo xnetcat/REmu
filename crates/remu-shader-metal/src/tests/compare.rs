@@ -164,6 +164,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,

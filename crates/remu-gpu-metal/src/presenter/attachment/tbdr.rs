@@ -111,10 +111,7 @@ pub(crate) fn msaa_memoryless_decision(
         );
     }
     if render_passes == 0 {
-        return refuse(
-            "no render-pass denominator for draws/pass gate",
-            0.0,
-        );
+        return refuse("no render-pass denominator for draws/pass gate", 0.0);
     }
     let draws_per_pass = ratio(draws_in_pass, render_passes);
     if draws_per_pass > MEMORYLESS_MSAA_MIN_DRAWS_PER_PASS {
@@ -186,10 +183,7 @@ mod tests {
     fn memoryless_msaa_refuses_below_threshold() {
         // 1.1 draws/pass — the measured TBDR fragmentation regime.
         let decision = msaa_memoryless_decision(11, 10, false);
-        assert!(matches!(
-            decision,
-            MsaaMemorylessDecision::Refused { .. }
-        ));
+        assert!(matches!(decision, MsaaMemorylessDecision::Refused { .. }));
         assert_eq!(
             color_store_action(true, &decision),
             AttachmentStorePolicy::StoreAndMultisampleResolve
@@ -199,10 +193,7 @@ mod tests {
     #[test]
     fn memoryless_msaa_eligible_above_threshold_when_not_reentered() {
         let decision = msaa_memoryless_decision(13, 10, false);
-        assert!(matches!(
-            decision,
-            MsaaMemorylessDecision::Eligible { .. }
-        ));
+        assert!(matches!(decision, MsaaMemorylessDecision::Eligible { .. }));
         assert_eq!(
             color_store_action(true, &decision),
             AttachmentStorePolicy::MultisampleResolve

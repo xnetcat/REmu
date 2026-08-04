@@ -18,8 +18,8 @@ use super::{
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
     CpuWriteWatch, CpuWriteWatchRetirement, GuestRangeLease, GuestWriteSite, LeasePublishOutcome,
-    guest_shared_backing_alias_segments, guest_shared_backing_identity,
-    guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
+    guest_shared_backing_alias_segments, guest_shared_backing_identity, guest_shared_mapping_epoch,
+    guest_shared_mapping_identity, read_guest_shared_backing,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -312,8 +312,7 @@ impl MetalPresenter {
             if let Some(resident_descriptor) = gpu_written_resident_serving_sampled_key(
                 &self.resident_guest_textures,
                 sampled_span,
-            )
-                && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
+            ) && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
                 && !resident.write_watch.content_has_changed()?
             {
                 resident.note_gpu_write();
@@ -1300,10 +1299,10 @@ pub(crate) fn snapshot_guest_texture_raw(
     {
         // Tests also exercise the tiler with ordinary process-local allocations.
         // SAFETY: those test descriptors retain their complete source allocation.
-        Ok(unsafe {
-            std::slice::from_raw_parts(_source_address as *const u8, source_length)
-        }
-        .to_vec())
+        Ok(
+            unsafe { std::slice::from_raw_parts(_source_address as *const u8, source_length) }
+                .to_vec(),
+        )
     }
     #[cfg(not(test))]
     Err(format!(
@@ -1420,7 +1419,11 @@ pub(crate) fn snapshot_watched_guest_range(
     let started = Instant::now();
     let caller_line = std::panic::Location::caller().line();
     let precise_tracking = write_watch.precise_tracking();
-    let dirty_page_ranges = if precise_tracking { write_watch.dirty_page_ranges() } else { Default::default() };
+    let dirty_page_ranges = if precise_tracking {
+        write_watch.dirty_page_ranges()
+    } else {
+        Default::default()
+    };
     let dirty_bytes = dirty_page_ranges
         .iter()
         .fold(0_u64, |total, (_, range_byte_count)| {
@@ -1627,8 +1630,9 @@ fn publish_segments_leased(
                 },
                 None,
             ) => {
-                let Some((_, bytes)) =
-                    captured.iter().find(|(run_offset, _)| *run_offset == *offset)
+                let Some((_, bytes)) = captured
+                    .iter()
+                    .find(|(run_offset, _)| *run_offset == *offset)
                 else {
                     return Err(format!(
                         "texture writeback missing capture baseline for offset={offset:#x}"
@@ -1729,8 +1733,8 @@ pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(
 #[cfg(test)]
 mod content_validation_tests {
     use super::{
-        CONTENT_FINGERPRINT_CHUNK_BYTES, TextureWritebackOutcome, contiguous_dirty_chunk_runs,
-        content_fingerprint, write_watched_guest_range,
+        CONTENT_FINGERPRINT_CHUNK_BYTES, TextureWritebackOutcome, content_fingerprint,
+        contiguous_dirty_chunk_runs, write_watched_guest_range,
     };
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1749,10 +1753,8 @@ mod content_validation_tests {
     #[test]
     fn partial_chunk_publish_refingerprints_from_live_guest() {
         // D3 precondition: a sub-chunk publish must not leave the chunk fingerprint stale.
-        let mut memory =
-            GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
-        let backing =
-            GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
+        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
         let address = memory
             .map_shared(
                 GuestMapPlacement::Anywhere,
@@ -1814,10 +1816,8 @@ mod content_validation_tests {
 
     #[test]
     fn revoked_texture_lease_publish_is_discarded_stale() {
-        let mut memory =
-            GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
-        let backing =
-            GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
+        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
         let address = memory
             .map_shared(
                 GuestMapPlacement::Anywhere,
@@ -1871,9 +1871,8 @@ mod content_validation_tests {
             )),
         };
         let raw = [0x5a_u8; 64];
-        let outcome =
-            write_watched_guest_range(address.get(), &raw, None, None, &watch, None)
-                .expect("publish");
+        let outcome = write_watched_guest_range(address.get(), &raw, None, None, &watch, None)
+            .expect("publish");
         assert_eq!(outcome, TextureWritebackOutcome::Applied);
     }
 }

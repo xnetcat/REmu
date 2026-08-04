@@ -45,9 +45,7 @@ impl<'a> MetalBytes<'a> {
     }
 
     fn in_bounds(&self, offset: usize, len: usize) -> bool {
-        offset
-            .checked_add(len)
-            .is_some_and(|end| end <= self.len)
+        offset.checked_add(len).is_some_and(|end| end <= self.len)
     }
 
     /// An immutable byte subslice, or `None` if `[offset, offset + len)` leaves the mapping.
@@ -82,7 +80,10 @@ impl<'a> MetalBytes<'a> {
         if !self.in_bounds(offset, byte_count) {
             return None;
         }
-        if !(self.base as usize).wrapping_add(offset).is_multiple_of(std::mem::align_of::<T>()) {
+        if !(self.base as usize)
+            .wrapping_add(offset)
+            .is_multiple_of(std::mem::align_of::<T>())
+        {
             return None;
         }
         // SAFETY: bounds and `T`-alignment checked above; `_buffer` keeps the mapping live for

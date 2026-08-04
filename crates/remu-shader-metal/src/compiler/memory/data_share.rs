@@ -63,14 +63,18 @@ impl Compiler<'_> {
             "DsWriteB64" => self.emit_ds_write(instruction, control, 2),
             "DsWriteB96" => self.emit_ds_write(instruction, control, 3),
             "DsWriteB128" => self.emit_ds_write(instruction, control, 4),
-            "DsWrite2B32" => self.emit_ds_write_pair(instruction, control, false),
-            "DsWrite2St64B32" => self.emit_ds_write_pair(instruction, control, true),
+            "DsWrite2B32" => self.emit_ds_write_pair(instruction, control, false, 1),
+            "DsWrite2St64B32" => self.emit_ds_write_pair(instruction, control, true, 1),
+            "DsWrite2B64" => self.emit_ds_write_pair(instruction, control, false, 2),
+            "DsWrite2St64B64" => self.emit_ds_write_pair(instruction, control, true, 2),
             "DsReadB32" => self.emit_ds_read(instruction, control, 1),
             "DsReadB64" => self.emit_ds_read(instruction, control, 2),
             "DsReadB96" => self.emit_ds_read(instruction, control, 3),
             "DsReadB128" => self.emit_ds_read(instruction, control, 4),
-            "DsRead2B32" => self.emit_ds_read_pair(instruction, control, false),
-            "DsRead2St64B32" => self.emit_ds_read_pair(instruction, control, true),
+            "DsRead2B32" => self.emit_ds_read_pair(instruction, control, false, 1),
+            "DsRead2St64B32" => self.emit_ds_read_pair(instruction, control, true, 1),
+            "DsRead2B64" => self.emit_ds_read_pair(instruction, control, false, 2),
+            "DsRead2St64B64" => self.emit_ds_read_pair(instruction, control, true, 2),
             _ if is_lds_atomic_name(name) => self.emit_ds_atomic(instruction, control, name),
             _ => Err(format!("unsupported LDS opcode {name}")),
         }
@@ -239,21 +243,36 @@ impl Compiler<'_> {
         instruction: &Instruction,
         control: &DataShareControl,
         stride64: bool,
+        dwords_per_element: usize,
     ) -> Result<(), String> {
-        if instruction.sources.len() < 3 {
-            return Err("LDS write2 requires two data dwords".to_owned());
+        let required_sources = 1 + 2 * dwords_per_element;
+        if instruction.sources.len() < required_sources {
+            return Err(format!(
+                "LDS write2 requires {} data dwords",
+                2 * dwords_per_element
+            ));
         }
         let base = self.temp("uint", &self.raw_source(instruction, 0)?);
-        let first = self.temp("uint", &self.raw_source(instruction, 1)?);
-        let second = self.temp("uint", &self.raw_source(instruction, 2)?);
-        let scale = if stride64 { 4 * 64 } else { 4 };
-        for (offset, value) in [
-            (control.offset0 * scale, first),
-            (control.offset1 * scale, second),
-        ] {
-            let address = self.ds_address(&base, offset);
-            let index = self.temp("uint", &format!("{address} >> 2"));
-            self.emit_ds_store_index(&index, &value);
+        let element_bytes = u32::try_from(dwords_per_element)
+            .map_err(|_| "LDS write2 element width overflows".to_owned())?
+            * 4;
+        let scale = if stride64 {
+            element_bytes * 64
+        } else {
+            element_bytes
+        };
+        for (element, element_offset) in [control.offset0, control.offset1].into_iter().enumerate()
+        {
+            for component in 0..dwords_per_element {
+                let source = 1 + element * dwords_per_element + component;
+                let value = self.temp("uint", &self.raw_source(instruction, source)?);
+                let component_offset = u32::try_from(component)
+                    .map_err(|_| "LDS write2 component index overflows".to_owned())?
+                    * 4;
+                let address = self.ds_address(&base, element_offset * scale + component_offset);
+                let index = self.temp("uint", &format!("{address} >> 2"));
+                self.emit_ds_store_index(&index, &value);
+            }
         }
         Ok(())
     }
@@ -291,17 +310,33 @@ impl Compiler<'_> {
         instruction: &Instruction,
         control: &DataShareControl,
         stride64: bool,
+        dwords_per_element: usize,
     ) -> Result<(), String> {
-        if instruction.destinations.len() < 2 {
-            return Err("LDS read2 requires two destination dwords".to_owned());
+        let required_destinations = 2 * dwords_per_element;
+        if instruction.destinations.len() < required_destinations {
+            return Err(format!(
+                "LDS read2 requires {required_destinations} destination dwords"
+            ));
         }
         let base = self.temp("uint", &self.raw_source(instruction, 0)?);
-        let scale = if stride64 { 4 * 64 } else { 4 };
-        let mut values = Vec::with_capacity(2);
-        for offset in [control.offset0 * scale, control.offset1 * scale] {
-            let address = self.ds_address(&base, offset);
-            let index = self.temp("uint", &format!("{address} >> 2"));
-            values.push(self.emit_ds_load_index(&index));
+        let element_bytes = u32::try_from(dwords_per_element)
+            .map_err(|_| "LDS read2 element width overflows".to_owned())?
+            * 4;
+        let scale = if stride64 {
+            element_bytes * 64
+        } else {
+            element_bytes
+        };
+        let mut values = Vec::with_capacity(required_destinations);
+        for element_offset in [control.offset0, control.offset1] {
+            for component in 0..dwords_per_element {
+                let component_offset = u32::try_from(component)
+                    .map_err(|_| "LDS read2 component index overflows".to_owned())?
+                    * 4;
+                let address = self.ds_address(&base, element_offset * scale + component_offset);
+                let index = self.temp("uint", &format!("{address} >> 2"));
+                values.push(self.emit_ds_load_index(&index));
+            }
         }
         for (destination, value) in instruction.destinations.iter().zip(values) {
             self.store_vector(vector_operand(*destination)?, &value);

@@ -306,6 +306,18 @@ impl Compiler<'_> {
         }
         source.push_str("    /* REMU_REGISTER_STATE */\n");
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
+        if self
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode.starts_with("Scratch"))
+        {
+            let _ = writeln!(
+                source,
+                "    thread uchar remu_scratch[{}];",
+                self.options.scratch_size_bytes
+            );
+        }
         if self.options.stage == MetalShaderStage::Mesh && uses_lds_memory {
             let _ = writeln!(
                 source,
@@ -545,7 +557,7 @@ impl Compiler<'_> {
                     );
                 }
                 if contains_register_reference(&self.body, 'v', 8) {
-                    source.push_str("    v[8] = remu_group_id.y;\n");
+                    source.push_str("    v[8] = remu_group_id.y + remu_draw[3];\n");
                 }
             }
         }
@@ -604,16 +616,33 @@ impl Compiler<'_> {
                              \x20   if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_debug_pixel_xy.x < 1920u && remu_debug_pixel_xy.y < 1080u) {{\n\
                              \x20       uint remu_debug_pixel_base = (remu_debug_pixel_xy.y * 1920u + remu_debug_pixel_xy.x) * 5u;"
                         );
+                        let diagnostic_values = self
+                            .options
+                            .pixel_outputs
+                            .iter()
+                            .find(|output| output.guest_slot == 4)
+                            .map(|output| {
+                                let field = format!("remu_out.mrt{}", output.guest_slot);
+                                [
+                                    "as_type<uint>(remu_in.attr1[0])".to_owned(),
+                                    format!("as_type<uint>({field}[0])"),
+                                    format!("as_type<uint>({field}[1])"),
+                                    format!("as_type<uint>({field}[2])"),
+                                ]
+                            });
                         for component in 0..4 {
-                            let value = match output.kind {
-                                PixelOutputKind::Float => {
-                                    format!("as_type<uint>({field}[{component}])")
-                                }
-                                PixelOutputKind::Uint => format!("{field}[{component}]"),
-                                PixelOutputKind::Sint => {
-                                    format!("as_type<uint>({field}[{component}])")
-                                }
-                            };
+                            let value = diagnostic_values.as_ref().map_or_else(
+                                || match output.kind {
+                                    PixelOutputKind::Float => {
+                                        format!("as_type<uint>({field}[{component}])")
+                                    }
+                                    PixelOutputKind::Uint => format!("{field}[{component}]"),
+                                    PixelOutputKind::Sint => {
+                                        format!("as_type<uint>({field}[{component}])")
+                                    }
+                                },
+                                |values| values[component].clone(),
+                            );
                             let _ = writeln!(
                                 source,
                                 "        atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + {}u], {value}, memory_order_relaxed);",

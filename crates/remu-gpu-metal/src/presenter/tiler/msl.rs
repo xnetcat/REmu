@@ -239,7 +239,10 @@ pub(crate) fn tiler_kernel_name(mode: GpuTilerMode, kind: TilerKernelKind) -> &'
 
 /// Compiles the tiler library for `mode`. Failures stay loud — never fall back to a
 /// silently-wrong kernel.
-pub(crate) fn compile_tiler_library(device: &Device, mode: GpuTilerMode) -> Result<Library, String> {
+pub(crate) fn compile_tiler_library(
+    device: &Device,
+    mode: GpuTilerMode,
+) -> Result<Library, String> {
     let options = CompileOptions::new();
     device
         .new_library_with_source(tiler_kernel_source(mode), &options)
@@ -248,7 +251,10 @@ pub(crate) fn compile_tiler_library(device: &Device, mode: GpuTilerMode) -> Resu
 
 /// Cached per-process libraries so residency / deferred paths share one compile.
 #[allow(dead_code)] // Used once residency migrates off the inline rematerialisation source.
-pub(crate) fn cached_tiler_library(device: &Device, mode: GpuTilerMode) -> Result<&'static Library, String> {
+pub(crate) fn cached_tiler_library(
+    device: &Device,
+    mode: GpuTilerMode,
+) -> Result<&'static Library, String> {
     match mode {
         GpuTilerMode::Mode27 => {
             static LIB: OnceLock<Result<Library, String>> = OnceLock::new();
@@ -293,12 +299,18 @@ mod tests {
             .expect("mode-27 tiler MSL must compile");
         assert!(
             library
-                .get_function(tiler_kernel_name(GpuTilerMode::Mode27, TilerKernelKind::Detile), None)
+                .get_function(
+                    tiler_kernel_name(GpuTilerMode::Mode27, TilerKernelKind::Detile),
+                    None
+                )
                 .is_ok()
         );
         assert!(
             library
-                .get_function(tiler_kernel_name(GpuTilerMode::Mode27, TilerKernelKind::Retile), None)
+                .get_function(
+                    tiler_kernel_name(GpuTilerMode::Mode27, TilerKernelKind::Retile),
+                    None
+                )
                 .is_ok()
         );
     }
@@ -309,11 +321,14 @@ mod tests {
             eprintln!("[REMu][TILER] no Metal device; skipping compile proof");
             return;
         };
-        let library =
-            compile_tiler_library(&device, GpuTilerMode::Mode5).expect("mode-5 tiler MSL must compile");
+        let library = compile_tiler_library(&device, GpuTilerMode::Mode5)
+            .expect("mode-5 tiler MSL must compile");
         assert!(
             library
-                .get_function(tiler_kernel_name(GpuTilerMode::Mode5, TilerKernelKind::Detile), None)
+                .get_function(
+                    tiler_kernel_name(GpuTilerMode::Mode5, TilerKernelKind::Detile),
+                    None
+                )
                 .is_ok()
         );
     }

@@ -23,16 +23,6 @@ fn dependency_ingress_budget() -> usize {
     }
 }
 
-/// Extra decoded-event storage used only to discover an independent queue behind blocked tails.
-///
-/// Two complete bounded-channel windows cover a producer which was blocked while the receiver
-/// filled its ordinary pending budget, plus the next window made available by draining it. This is
-/// deliberately finite: a malformed or genuinely cyclic stream containing only more work for
-/// blocked queues must retain backpressure instead of moving an unbounded command stream into the
-/// presenter.
-const BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY: usize =
-    remu_gpu::GPU_EVENT_QUEUE_CAPACITY * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE * 2;
-
 /// Largest producer write, in bytes, indexed per 8-byte cell in `producer_labels`.
 ///
 /// Fence labels and release/write payloads are a few dwords; indexing a multi-megabyte DMA or
@@ -164,8 +154,17 @@ impl OrderedGpuEventReceiver {
             // producer visible, so the decision is per received event. The producer index
             // keeps this evaluation O(blocked queues), not O(queued events).
             let pending_capacity = if self.needs_dependency_ingress() {
-                remu_gpu::GPU_PENDING_EVENT_CAPACITY
-                    .saturating_add(BLOCKED_DEPENDENCY_LOOKAHEAD_CAPACITY)
+                // A producer queue can be arbitrarily far behind an already-decoded tail from
+                // the blocked queue. A fixed lookahead merely moves the deadlock boundary: Silent
+                // Hill's level load needed 290 more events than the old two-channel reserve and
+                // parked both hardware queues until Unreal's 120-second RenderThread watchdog.
+                //
+                // The publishing thread already owns the complete decoded submission and is
+                // synchronously splitting it into bounded chunks. Draining those chunks here
+                // transfers that existing state to its per-queue FIFO; it does not allow any tail
+                // event to overtake the front wait. Stop as soon as the producer index sees a
+                // matching write, at which point ordinary decoded-event backpressure resumes.
+                usize::MAX
             } else {
                 remu_gpu::GPU_PENDING_EVENT_CAPACITY
             };
@@ -228,11 +227,10 @@ impl OrderedGpuEventReceiver {
     /// backlog cap in that state creates a host-only deadlock: the blocked queue cannot consume
     /// its tail, and the producer cannot become visible.
     ///
-    /// Move a finite reserve of already-decoded chunks into queue FIFOs only while every known
-    /// guest queue is memory-wait blocked. As soon as one newly discovered queue is runnable, the
-    /// next loop iteration restores the normal cap. If no runnable queue is found within the
-    /// reserve, ingress stops with backpressure intact. No event executes out of order, and a
-    /// blocked queue's tail remains behind its wait.
+    /// Move already-decoded chunks into queue FIFOs only until a matching producer becomes
+    /// visible. As soon as one newly discovered queue is runnable, or the producer index records
+    /// the awaited write, the next loop iteration restores the normal cap. No event executes out
+    /// of order, and a blocked queue's tail remains behind its wait.
     fn needs_dependency_ingress(&self) -> bool {
         let has_memory_wait = self
             .blocked_queues

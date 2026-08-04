@@ -27,6 +27,10 @@ pub const COMPUTE_PGM_HI_REGISTER: u32 = 0x20d;
 
 pub const COMPUTE_PGM_RSRC2_REGISTER: u32 = 0x213;
 
+/// `COMPUTE_TMPRING_SIZE`: WAVESIZE[24:12] is the private scratch allocation per wave in
+/// 256-dword (1 KiB) blocks.
+pub const COMPUTE_TMPRING_SIZE_REGISTER: u32 = 0x218;
+
 const PM4_TYPE3: u32 = 3;
 
 const PM4_DISPATCH_DIRECT: u32 = 0x15;
@@ -59,6 +63,8 @@ pub struct ComputeLaunch {
     pub threads_per_group: [u32; 3],
     pub wave_lane_count: u32,
     pub lds_size_bytes: u32,
+    /// Lane-private scratch bytes available to each compute invocation.
+    pub scratch_size_bytes: u32,
     pub initiator: u32,
 }
 
@@ -222,17 +228,23 @@ pub fn decode_compute_launch(
         }
     };
     let resource2 = register(COMPUTE_PGM_RSRC2_REGISTER);
+    let wave_lane_count = if initiator & DISPATCH_WAVE32 != 0 {
+        32
+    } else {
+        64
+    };
+    let scratch_wave_blocks = (register(COMPUTE_TMPRING_SIZE_REGISTER) >> 12) & 0x1fff;
+    // One WAVESIZE block is 256 dwords = 1 KiB per architectural wave.  Scratch instructions
+    // address one lane's private byte range, so Metal receives the per-lane quotient.
+    let scratch_size_bytes = scratch_wave_blocks * 1024 / wave_lane_count;
     Ok(ComputeLaunch {
         grid,
         group_count,
         base_group,
         threads_per_group,
-        wave_lane_count: if initiator & DISPATCH_WAVE32 != 0 {
-            32
-        } else {
-            64
-        },
+        wave_lane_count,
         lds_size_bytes: ((resource2 >> 15) & 0x1ff) * 512,
+        scratch_size_bytes,
         initiator,
     })
 }

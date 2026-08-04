@@ -19,7 +19,9 @@ impl Compiler<'_> {
         // that idiom, so detecting it is a loud refuse rather than silently skipping V_CMPX
         // (which would leave EXEC wrong) or running the architectural serialization (tofu).
         if name.starts_with("VCmpx")
-            && self.pixel_movrels_serialization_index_vgpr(instruction).is_some()
+            && self
+                .pixel_movrels_serialization_index_vgpr(instruction)
+                .is_some()
         {
             return Err(
                 "pixel V_MOVRELS serialization idiom (V_READFIRSTLANE/V_CMPX/S_MOV M0/V_MOVRELS) has no proven Metal lowering; refusing the title-specific EXEC-preserving peephole"

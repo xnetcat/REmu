@@ -1967,6 +1967,7 @@ fn same_queue_compute_snapshots_unsnapshotted_physical_global_after_the_gpu_wait
             threads_per_group: [1, 1, 1],
             wave_lane_count: 32,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             initiator: 1,
         },
         shader_address: 0x6100,
@@ -3644,6 +3645,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
             threads_per_group: [8, 8, 1],
             wave_lane_count: 64,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             initiator: 1,
         },
         shader_address: 0x5000,
@@ -3656,6 +3658,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
     let key = ComputePipelineKey {
         program_identity: ProgramIdentity(program),
         lds_size_bytes: 0,
+        scratch_size_bytes: 0,
         wave_lane_count: 64,
         allocated_vector_register_count: 4,
         compute_system_registers: None,
@@ -3750,6 +3753,7 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
             threads_per_group: [8, 8, 1],
             wave_lane_count: 64,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             initiator: 1,
         },
         shader_address: 0x9000,
@@ -4084,20 +4088,12 @@ fn unpolled_wait_front_does_not_hide_a_third_queue_dependency() {
 
     assert!(
         ordered.submissions.contains_key(&34),
-        "an unpolled wait front must not suppress bounded dependency ingress"
-    );
-    assert!(
-        ordered.pending_event_count()
-            <= remu_gpu::GPU_PENDING_EVENT_CAPACITY
-                + remu_gpu::GPU_EVENT_QUEUE_CAPACITY
-                    * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
-                    * 2,
-        "dependency discovery must retain the finite pending-event bound"
+        "an unpolled wait front must not suppress dependency ingress"
     );
 }
 
 #[test]
-fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
+fn blocked_wait_dependency_ingress_finds_a_producer_beyond_any_fixed_chunk_reserve() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let wait = GpuMemoryWait {
         address: 0x5000,
@@ -4125,6 +4121,15 @@ fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
             })
             .expect("queue repeated blocked graphics tail");
     }
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease {
+                address: wait.address,
+                value: GpuMemoryReleaseValue::Immediate32(1),
+            })],
+        })
+        .expect("queue producer beyond the old fixed dependency reserve");
 
     let mut ordered = OrderedGpuEventReceiver::new(receiver);
     let source = match ordered.try_recv(|_| true) {
@@ -4144,18 +4149,26 @@ fn blocked_wait_dependency_ingress_has_a_finite_pending_event_bound() {
     );
     ordered.ingest(usize::MAX);
 
-    let dependency_pending_capacity = remu_gpu::GPU_PENDING_EVENT_CAPACITY
-        + remu_gpu::GPU_EVENT_QUEUE_CAPACITY * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE * 2;
     assert!(
-        ordered.pending_event_count() <= dependency_pending_capacity,
-        "blocked-only ingress must retain a finite decoded-event bound"
+        ordered.pending_event_count()
+            > remu_gpu::GPU_PENDING_EVENT_CAPACITY
+                + remu_gpu::GPU_EVENT_QUEUE_CAPACITY
+                    * remu_gpu::GPU_EVENT_SUBMISSION_CHUNK_SIZE
+                    * 2,
+        "the regression producer must begin beyond the former fixed lookahead"
     );
-    // The wait has no ingested producer, so the presenter keeps polling in case a CPU store
-    // satisfies it. That must not let the 64 blocked barrier submissions behind the wait run.
-    assert!(ordered.has_runnable_events());
     assert!(
-        matches!(ordered.try_recv(|_| true), OrderedEventPoll::Blocked),
-        "blocked queue tails must never become runnable ahead of their wait"
+        matches!(
+            ordered.try_recv(|_| true),
+            OrderedEventPoll::Event {
+                source: OrderedEventSource::GuestQueue(33),
+                event: GpuEvent::MemoryRelease(GpuMemoryRelease {
+                    address: 0x5000,
+                    value: GpuMemoryReleaseValue::Immediate32(1),
+                }),
+            }
+        ),
+        "dependency ingress must find the independent producer without executing the blocked tail"
     );
 }
 
@@ -5393,6 +5406,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             threads_per_group: [1, 1, 1],
             wave_lane_count: 32,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             initiator: 1,
         },
         shader_address: 0x5000,
@@ -5568,6 +5582,7 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
             threads_per_group: [1, 1, 1],
             wave_lane_count: 32,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             initiator: 1,
         },
         shader_address: 0x6000,

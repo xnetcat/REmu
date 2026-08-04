@@ -72,6 +72,14 @@ impl Compiler<'_> {
         if instruction.encoding == ShaderEncoding::Sopc {
             return self.emit_scalar_compare(instruction, name, "SCmp");
         }
+        if matches!(name, "SVersion" | "SSetregB32" | "SSetregImm32B32") {
+            // These SOPK instructions have no SGPR destination.  S_VERSION is a toolchain
+            // declaration; S_SETREG writes per-wave hardware state (MODE/TRAPSTS/etc.) from
+            // either an SGPR or the trailing literal.  Register-state discovery already keeps
+            // their source operands alive, while Metal supplies no writable AMD hardware
+            // register.  Do not reinterpret SOPK's SDST/HWREG field as an SGPR destination.
+            return Ok(());
+        }
         let destination = destination_scalar(instruction)?;
         if instruction.encoding == ShaderEncoding::Sopk {
             let immediate = u16::try_from(instruction.words[0] & 0xffff)

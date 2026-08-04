@@ -310,6 +310,7 @@ impl MetalPresenter {
             dispatch.launch.lds_size_bytes,
             dispatch.launch.wave_lane_count,
         );
+        options.scratch_size_bytes = dispatch.launch.scratch_size_bytes;
         options.allocated_vector_register_count = key.allocated_vector_register_count;
         let lowering_started = Instant::now();
         let lowered = remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
@@ -438,6 +439,7 @@ impl MetalPresenter {
                 host_location: u32::try_from(host_location)
                     .expect("at most eight color targets fit u32"),
                 kind: target.output_kind,
+                export_format: target.export_format,
             })
             .collect();
         let mut pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
@@ -523,15 +525,17 @@ impl MetalPresenter {
                     limits.output_primitive_type
                 ));
             }
-            // Triangle-strip GS output cannot produce more primitives than emitted vertices.
-            // Reserve the guest-programmed subgroup output capacity for both Metal arrays. The
-            // host thread count is derived separately from all input and output limits.
-            let mut mesh_options = remu_shader_metal::MetalCompileOptions::mesh(
+            let registers = key
+                .ngg_registers
+                .ok_or("NGG mesh shader is missing its raw SDK sizing registers")?;
+            // Q5: derive the Metal interface and proof flag from the live SDK register dwords.
+            // Meshlet preparation still uses the more detailed decoded limits above, including
+            // the independent input-primitive bound.
+            let mut mesh_options = remu_shader_metal::MetalCompileOptions::mesh_from_ngg_registers(
                 pixel_msl.interpolated_attribute_count,
                 NGG_MESH_LDS_BYTES,
-                limits.max_output_vertices_per_subgroup,
-                limits.max_output_primitives_per_subgroup,
                 limits.threadgroup_threads,
+                registers,
             );
             if ngg_export_uses_wave64_exec(&export.program) {
                 // Wave64 NGG exports (Poppy Playtime UI/LUT quads) gate their exports on
@@ -543,6 +547,10 @@ impl MetalPresenter {
                 let blockers = wave64_split_blockers(&export.program);
                 if blockers.is_empty() {
                     mesh_options.wave_lane_count = 64;
+                    // SDK PGM_RSRC1 reports VGPRs in wave32 units and explicitly requires
+                    // dividing by two for wave64 execution.
+                    mesh_options.allocated_vector_register_count =
+                        key.export_allocated_vector_register_count;
                 } else {
                     eprintln!(
                         "[REMu][METAL] wave64 NGG mesh export {:#x} cannot split across SIMD32 halves: {blockers:?}",
@@ -554,7 +562,10 @@ impl MetalPresenter {
         } else {
             remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
         };
-        vertex_options.allocated_vector_register_count = key.export_allocated_vector_register_count;
+        if !uses_mesh_stage {
+            vertex_options.allocated_vector_register_count =
+                key.export_allocated_vector_register_count;
+        }
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.diagnostic_force_visible_clip_depth =

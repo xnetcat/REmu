@@ -165,9 +165,78 @@ fn diagnostic_zero_r16_row_samples() -> bool {
 }
 
 pub(crate) fn comparison_depth32_upload(
-    format: MTLPixelFormat,
+    guest: GuestTextureDescriptor,
     linear: &[u8],
 ) -> Result<Option<Vec<u8>>, String> {
+    let format = guest.pixel_format;
+    if matches!(
+        format,
+        MTLPixelFormat::BC1_RGBA | MTLPixelFormat::BC1_RGBA_sRGB
+    ) {
+        let width =
+            usize::try_from(guest.width).map_err(|_| "comparison BC1 width does not fit usize")?;
+        let height = usize::try_from(guest.height)
+            .map_err(|_| "comparison BC1 height does not fit usize")?;
+        let blocks_wide = width.div_ceil(4);
+        let blocks_high = height.div_ceil(4);
+        let face_bytes = blocks_wide
+            .checked_mul(blocks_high)
+            .and_then(|blocks| blocks.checked_mul(8))
+            .ok_or("comparison BC1 face size overflows")?;
+        if face_bytes == 0 || !linear.len().is_multiple_of(face_bytes) {
+            return Err(format!(
+                "comparison BC1 source has {} bytes, not whole {face_bytes}-byte faces",
+                linear.len()
+            ));
+        }
+        let srgb = format == MTLPixelFormat::BC1_RGBA_sRGB;
+        let mut depth = Vec::with_capacity(
+            width
+                .checked_mul(height)
+                .and_then(|pixels| pixels.checked_mul(linear.len() / face_bytes))
+                .and_then(|pixels| pixels.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or("comparison BC1 output size overflows")?,
+        );
+        for face in linear.chunks_exact(face_bytes) {
+            for y in 0..height {
+                for x in 0..width {
+                    let block = (y / 4) * blocks_wide + x / 4;
+                    let encoded = &face[block * 8..block * 8 + 8];
+                    let color0 = u16::from_le_bytes([encoded[0], encoded[1]]);
+                    let color1 = u16::from_le_bytes([encoded[2], encoded[3]]);
+                    let red0 = f32::from((color0 >> 11) & 0x1f) / 31.0;
+                    let red1 = f32::from((color1 >> 11) & 0x1f) / 31.0;
+                    let palette = if color0 > color1 {
+                        [
+                            red0,
+                            red1,
+                            (2.0 * red0 + red1) / 3.0,
+                            (red0 + 2.0 * red1) / 3.0,
+                        ]
+                    } else {
+                        [red0, red1, (red0 + red1) / 2.0, 0.0]
+                    };
+                    let selectors =
+                        u32::from_le_bytes([encoded[4], encoded[5], encoded[6], encoded[7]]);
+                    let texel = (y % 4) * 4 + x % 4;
+                    let selector = usize::try_from((selectors >> (texel * 2)) & 0x3)
+                        .expect("BC1 selector fits usize");
+                    let encoded_red = palette[selector];
+                    let value = if srgb {
+                        if encoded_red <= 0.040_45 {
+                            encoded_red / 12.92
+                        } else {
+                            ((encoded_red + 0.055) / 1.055).powf(2.4)
+                        }
+                    } else {
+                        encoded_red
+                    };
+                    depth.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+        }
+        return Ok(Some(depth));
+    }
     let (stride, red_offset, srgb) = match format {
         MTLPixelFormat::R16Unorm | MTLPixelFormat::R32Float => return Ok(None),
         MTLPixelFormat::R8Unorm => (1, 0, false),
@@ -659,7 +728,10 @@ pub(crate) fn upload_image_textures(
                         )
                         .ok_or("fallback image byte count overflows")?;
                     let mut linear = vec![0; byte_count];
-                    if matches!(
+                    // Sampled unbound images use opaque black because guest shaders commonly
+                    // modulate UI color by their alpha. Storage loads follow image-load semantics
+                    // and return zero in every component.
+                    if !storage && matches!(
                         descriptor.guest.pixel_format,
                         MTLPixelFormat::RGBA8Unorm
                             | MTLPixelFormat::RGBA8Unorm_sRGB

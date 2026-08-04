@@ -34,7 +34,7 @@ use super::{
     compile_metal_library_with_tools, completed_command_buffer_gpu_duration,
     decode_guest_texture_linear_from_raw, describe_guest_batch, diagnostic_scanout_writer,
     diagnostic_texture_writer, process_memory_statistics, raw_video_out_texture_descriptor,
-    read_texture_linear, refresh_resident_texture_write_watch,
+    read_texture_linear, read_texture_linear_after_event, refresh_resident_texture_write_watch,
     resident_texture_activity_latest_work, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_lifetime_diagnostics_enabled,
     resident_texture_ownership_stats, snapshot_guest_texture_raw, take_mode27_work_details,
@@ -148,7 +148,21 @@ impl MetalPresenter {
                 self.command_queue.as_ref().cloned(),
             )
         {
-            match read_texture_linear(&device, &queue, texture, *descriptor) {
+            let rendered = if let Some((fence, event)) = snapshot_wait.as_ref() {
+                read_texture_linear_after_event(
+                    &device,
+                    &queue,
+                    texture,
+                    *descriptor,
+                    event,
+                    fence.value(),
+                )
+            } else {
+                // Host-sourced snapshots are encoded on this same serial queue, so ordinary
+                // queue ordering is the exact dependency for their diagnostic readback.
+                read_texture_linear(&device, &queue, texture, *descriptor)
+            };
+            match rendered {
                 Ok(rendered) => self.capture_translated_frame_if_changed(*descriptor, &rendered),
                 Err(error) => {
                     eprintln!("[REMu][METAL] could not capture live translated frame: {error}");

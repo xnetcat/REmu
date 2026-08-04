@@ -1690,18 +1690,19 @@ fn contained_global_version_offset(
             ) {
                 let read_start = read_identity.backing_offset;
                 if producer_start < read_end && read_start < producer_end {
-                    if read_start >= producer_start && read_end <= producer_end
+                    if read_start >= producer_start
+                        && read_end <= producer_end
                         && let Some(offset) =
                             version.offset.checked_add(read_start - producer_start)
-                            && offset
-                                .checked_add(byte_count)
-                                .is_some_and(|end| end <= version.buffer.length())
-                        {
-                            return QueuedWriteReadMatch::Buffer {
-                                offset,
-                                physical_identity: Some(read_identity),
-                            };
-                        }
+                        && offset
+                            .checked_add(byte_count)
+                            .is_some_and(|end| end <= version.buffer.length())
+                    {
+                        return QueuedWriteReadMatch::Buffer {
+                            offset,
+                            physical_identity: Some(read_identity),
+                        };
+                    }
                     return QueuedWriteReadMatch::Synchronize;
                 }
             }

@@ -18,8 +18,8 @@
 //! SIGSEGV storms or silent wrong-bytes reads. See NOTES.md Batch B4.
 
 use remu_memory::set_read_watch_materializer;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 /// Maximum simultaneously pre-staged host pages. Bounded so the signal handler never walks an
 /// unbounded table; overflow refuses new prestages loudly rather than reallocating under load.

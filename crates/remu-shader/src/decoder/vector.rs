@@ -191,7 +191,7 @@ pub(crate) fn decode_vop2(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x3c => Some("VPkFmacF16"),
         _ => None,
     };
-    let forced_literal = matches!(code, 0x20 | 0x21 | 0x2c | 0x2d);
+    let forced_literal = matches!(code, 0x20 | 0x21 | 0x2c | 0x2d | 0x37 | 0x38);
     Ok(frame_or_raw(
         ShaderEncoding::Vop2,
         RawOpcodeFamily::Vop2,

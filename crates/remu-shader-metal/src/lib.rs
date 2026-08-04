@@ -20,7 +20,7 @@ use compiler::vector::is_supported_dpp_control;
 #[cfg(test)]
 use remu_shader::{
     ExportControl, ImageBinding, ImageControl, InstructionControl, Operand, OperandKind,
-    PixelOutputKind, SdwaControl, ShaderEncoding,
+    PixelExportFormat, PixelOutputKind, SdwaControl, ShaderEncoding,
 };
 use remu_shader::{Opcode, PixelOutputBinding, Program, ShaderEvaluation, VertexInputBinding};
 
@@ -130,8 +130,8 @@ pub struct NggRegisters {
     pub pgm_rsrc1: u32,
     /// `VGT_GS_MAX_VERT_OUT`: the geometry stage's maximum output vertex count.
     pub gs_max_vert_out: u32,
-    /// `GE_NGG_SUBGRP_CNTL`: the per-subgroup output-vertex cap after amplification.
-    pub ge_ngg_subgrp_cntl: u32,
+    /// `GE_MAX_OUTPUT_PER_SUBGROUP`: the per-subgroup output-vertex cap after amplification.
+    pub ge_max_output_per_subgroup: u32,
 }
 
 impl NggRegisters {
@@ -161,7 +161,7 @@ impl NggRegisters {
     /// 10-bit field `value & 0x3ff`.
     #[must_use]
     pub const fn max_verts_per_subgroup(self) -> u32 {
-        self.ge_ngg_subgrp_cntl & 0x3ff
+        self.ge_max_output_per_subgroup & 0x3ff
     }
 }
 
@@ -218,6 +218,13 @@ pub struct MetalCompileOptions {
     /// guest allocations are rejected instead of being silently wrapped or spilled with different
     /// synchronization semantics.
     pub lds_size_bytes: u32,
+    /// Lane-private scratch allocation in bytes for one shader invocation.
+    ///
+    /// Compute callers derive this from `COMPUTE_TMPRING_SIZE.WAVESIZE`; graphics callers leave
+    /// it zero until their stage scratch allocation is plumbed.  A shader containing a SCRATCH
+    /// instruction is rejected when this is zero instead of being redirected into guest global
+    /// memory.
+    pub scratch_size_bytes: u32,
     /// Architectural lanes per guest compute wave. Apple executes SIMD32; wave64 shaders whose
     /// cross-lane operations are split-safe use this to place ballot masks in the correct half.
     pub wave_lane_count: u32,
@@ -257,6 +264,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
@@ -289,6 +297,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             lds_size_bytes: 0,
+            scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
@@ -317,6 +326,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             lds_size_bytes,
+            scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
@@ -345,6 +355,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             lds_size_bytes,
+            scratch_size_bytes: 0,
             wave_lane_count,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
@@ -387,6 +398,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count,
             mesh_threadgroup_size,
             lds_size_bytes,
+            scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,

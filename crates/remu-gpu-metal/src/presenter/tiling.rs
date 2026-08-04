@@ -9,12 +9,12 @@ mod blocks;
 mod descriptors;
 mod mode27;
 mod mode5;
-pub(crate) use self::blocks::{
-    tiled_block_byte_offsets, tiled_block_bytes, tiled_block_dimensions,
-};
 #[cfg(test)]
 pub(crate) use self::blocks::{
     mode9_within_block_byte_offset, mode24_within_block_byte_offset_for_format,
+};
+pub(crate) use self::blocks::{
+    tiled_block_byte_offsets, tiled_block_bytes, tiled_block_dimensions,
 };
 // B2 GPU tiler differential oracle needs the within-block equations outside cfg(test).
 pub(crate) use self::blocks::mode5_within_block_byte_offset;

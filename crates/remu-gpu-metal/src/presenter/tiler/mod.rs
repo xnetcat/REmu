@@ -17,9 +17,10 @@ mod end_state;
 mod equations;
 mod msl;
 
-#[allow(unused_imports)] // Public surface for residency/readback migration; exercised in submodule tests.
+#[allow(unused_imports)]
+// Public surface for residency/readback migration; exercised in submodule tests.
 pub(crate) use absolute_address::{
-    AbsoluteAddressPool, AbsoluteAddressPoolBind, ABSOLUTE_ADDRESS_POOL_BUFFER_SLOT,
+    ABSOLUTE_ADDRESS_POOL_BUFFER_SLOT, AbsoluteAddressPool, AbsoluteAddressPoolBind,
     absolute_address_pool_binding_ready, record_absolute_address_pool_bind,
 };
 #[allow(unused_imports)]
@@ -39,6 +40,5 @@ pub(crate) use equations::{
 };
 #[allow(unused_imports)]
 pub(crate) use msl::{
-    MODE5_TILER_MSL, MODE27_TILER_MSL, TilerKernelKind, compile_tiler_library,
-    tiler_kernel_source,
+    MODE5_TILER_MSL, MODE27_TILER_MSL, TilerKernelKind, compile_tiler_library, tiler_kernel_source,
 };

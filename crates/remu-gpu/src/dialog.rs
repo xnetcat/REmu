@@ -5,7 +5,8 @@
 //! The guest common-dialog ABIs (`sceMsgDialog*`, `sceSaveDataDialog*`, trophy unlock toasts) do
 //! not own a UI thread. They publish a request through [`GpuEvent`] and poll
 //! [`host_dialog_result`] until the presenter records a dismissal. Headless and unit-test runs
-//! without a live presenter auto-complete with a cancel result so titles never hang on the poll.
+//! without a live presenter auto-complete with the only available action, or conservatively
+//! decline a dialog that offers a choice, so titles never hang on the poll.
 
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
@@ -58,6 +59,20 @@ pub enum HostDialogResultCode {
     Cancel = 2,
     Yes = 3,
     No = 4,
+}
+
+/// Chooses a non-destructive result for unattended dialog dismissal.
+///
+/// A one-button dialog is not a choice: returning `Cancel` for an SDK `OK` notice changes guest
+/// control flow (notably the save-data `NO_DATA` notice). Dialogs that genuinely offer a choice
+/// still take their negative/cancel action when no user is present.
+#[must_use]
+pub const fn unattended_dialog_result(buttons: HostDialogButtons) -> HostDialogResultCode {
+    match buttons {
+        HostDialogButtons::Ok => HostDialogResultCode::Ok,
+        HostDialogButtons::OkCancel => HostDialogResultCode::Cancel,
+        HostDialogButtons::YesNo => HostDialogResultCode::No,
+    }
 }
 
 impl HostDialogResultCode {
@@ -184,5 +199,21 @@ mod tests {
         );
         assert!(host_dialog_result(sequence.wrapping_add(1)).is_none());
         reset_host_dialog_state();
+    }
+
+    #[test]
+    fn unattended_dialogs_accept_notices_but_decline_choices() {
+        assert_eq!(
+            unattended_dialog_result(HostDialogButtons::Ok),
+            HostDialogResultCode::Ok
+        );
+        assert_eq!(
+            unattended_dialog_result(HostDialogButtons::OkCancel),
+            HostDialogResultCode::Cancel
+        );
+        assert_eq!(
+            unattended_dialog_result(HostDialogButtons::YesNo),
+            HostDialogResultCode::No
+        );
     }
 }

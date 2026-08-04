@@ -483,7 +483,7 @@ fn decodes_every_vop3p_opcode_and_every_modifier_bit_pattern() {
 
 #[test]
 fn decodes_every_supported_ds_opcode_and_every_control_bit_pattern() {
-    const OPCODES: [(u32, &str, usize, usize); 39] = [
+    const OPCODES: [(u32, &str, usize, usize); 44] = [
         (0x00, "DsAddU32", 2, 0),
         (0x01, "DsSubU32", 2, 0),
         (0x03, "DsIncU32", 2, 0),
@@ -517,6 +517,11 @@ fn decodes_every_supported_ds_opcode_and_every_control_bit_pattern() {
         (0x37, "DsRead2B32", 1, 2),
         (0x38, "DsRead2St64B32", 1, 2),
         (0x4d, "DsWriteB64", 3, 0),
+        (0x4e, "DsWrite2B64", 5, 0),
+        (0x4f, "DsWrite2St64B64", 5, 0),
+        (0x76, "DsReadB64", 1, 2),
+        (0x77, "DsRead2B64", 1, 4),
+        (0x78, "DsRead2St64B64", 1, 4),
         (0xb0, "DsWriteAddtidB32", 1, 0),
         (0xb1, "DsReadAddtidB32", 0, 1),
         (0xde, "DsWriteB96", 4, 0),
@@ -1031,6 +1036,27 @@ fn decodes_clean_room_ps5_extension_regression_envelopes() {
     assert_eq!(vop2.instructions[2].sources.len(), 3);
     assert_eq!(vop2.instructions[3].pc, 20);
     assert_eq!(vop2.instructions[3].opcode, Opcode::END_PROGRAM);
+
+    let half = decode_program(
+        0x9800,
+        &[
+            0x6e00_0501, // v_fmamk_f16 v0, v1, 1.0h, v2
+            0x0000_3c00,
+            0x7000_0501, // v_fmaak_f16 v0, v1, v2, 1.0h
+            0x0000_3c00,
+            0xbf81_0000,
+        ],
+    )
+    .expect("synthetic half-float literal FMA envelopes");
+    assert!(half.instructions[0].opcode.is("VFmaMkF16"));
+    assert_eq!(half.instructions[0].words, [0x6e00_0501, 0x0000_3c00]);
+    assert_eq!(half.instructions[0].sources.len(), 3);
+    assert!(half.instructions[1].opcode.is("VFmaAkF16"));
+    assert_eq!(half.instructions[1].pc, 8);
+    assert_eq!(half.instructions[1].words, [0x7000_0501, 0x0000_3c00]);
+    assert_eq!(half.instructions[1].sources.len(), 3);
+    assert_eq!(half.instructions[2].pc, 16);
+    assert_eq!(half.instructions[2].opcode, Opcode::END_PROGRAM);
 
     let vop3 = decode_program(
         0xa000,

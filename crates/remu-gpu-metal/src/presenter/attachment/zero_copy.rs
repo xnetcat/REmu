@@ -22,10 +22,7 @@ use super::super::GuestTextureDescriptor;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AttachmentZeroCopyDecision {
     /// Linear tile mode, page-coverable live shared backing — safe to attempt no-copy.
-    Eligible {
-        address: u64,
-        byte_count: u64,
-    },
+    Eligible { address: u64, byte_count: u64 },
     /// Not proven safe; caller must not invent a snapshot "success".
     Refused {
         reason: &'static str,
@@ -97,9 +94,7 @@ pub(crate) fn attachment_zero_copy_decision(
 /// Returns `false` after rate-limited diagnostics so the existing resident path can continue
 /// without claiming a zero-copy bind.
 #[allow(dead_code)] // B1 seam API — unit-tested; production refuse sites land with the bind gate.
-pub(crate) fn refuse_unproven_attachment_zero_copy(
-    decision: &AttachmentZeroCopyDecision,
-) -> bool {
+pub(crate) fn refuse_unproven_attachment_zero_copy(decision: &AttachmentZeroCopyDecision) -> bool {
     let AttachmentZeroCopyDecision::Refused {
         reason,
         address,
@@ -149,8 +144,10 @@ mod tests {
 
     #[test]
     fn unaligned_attachment_refuses_zero_copy() {
-        let decision =
-            attachment_zero_copy_decision(linear_descriptor(GUEST_PAGE_SIZE + 0x100), GUEST_PAGE_SIZE);
+        let decision = attachment_zero_copy_decision(
+            linear_descriptor(GUEST_PAGE_SIZE + 0x100),
+            GUEST_PAGE_SIZE,
+        );
         assert!(matches!(
             decision,
             AttachmentZeroCopyDecision::Refused {

@@ -6,12 +6,13 @@
 //! Dialogs stay `RUNNING` until Cross/Enter (accept) or Circle/Escape (cancel). The presenter
 //! composites a PS5-like overlay rasterized by [`remu_gpu::rasterize_system_ui`] after the guest
 //! scanout — no AppKit / Swift panels. Headless and `REMU_AUTO_DISMISS_DIALOGS` skip drawing and
-//! auto-cancel so CI never blocks.
+//! auto-dismiss so CI never blocks. One-button notices are acknowledged; dialogs that offer a
+//! choice take their conservative negative/cancel action.
 
 use remu_gpu::{
     HostDialogButtons, HostDialogRequest, HostDialogResultCode, HostToastRequest,
     PAD_BUTTON_CIRCLE, PAD_BUTTON_CROSS, SystemUiFramebuffer, complete_host_dialog,
-    host_dialog_is_pending, host_pad_buttons_held, rasterize_system_ui,
+    host_dialog_is_pending, host_pad_buttons_held, rasterize_system_ui, unattended_dialog_result,
 };
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -82,7 +83,7 @@ pub(crate) fn present_host_dialog(request: &HostDialogRequest) {
         return;
     }
     if headless_metal_requested() || auto_dismiss_dialogs_requested() {
-        complete_host_dialog(request.sequence, HostDialogResultCode::Cancel);
+        complete_host_dialog(request.sequence, unattended_dialog_result(request.buttons));
         return;
     }
     let mut state = OVERLAY

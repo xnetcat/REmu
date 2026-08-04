@@ -6,8 +6,8 @@ use super::{
     DecodedRenderTarget, GuestTextureDescriptor, METAL_TEXTURE_BUFFER_ROW_ALIGNMENT,
     MetalPresenter, PendingTextureReadback, RESIDENT_WRITEBACK_DISCARDED,
     RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
-    RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidentGuestTexture, SpanQueryOrder,
-    TextureReadbackLayout, capture_interval, diagnostic_dump_glyph_draw,
+    RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidentGuestTexture, SpanQueryOrder, StaleSource,
+    TextureReadbackLayout, TextureWritebackOutcome, capture_interval, diagnostic_dump_glyph_draw,
     diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_index_count,
     diagnostic_dump_target_minimum_draw, diagnostic_scanout_writer,
     encode_mode27_mip_chain_into_raw, evaluation_samples_glyph_atlas, half_float_to_f32,
@@ -16,7 +16,7 @@ use super::{
     retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
     texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear, StaleSource, TextureWritebackOutcome,
+    write_watched_guest_texture_linear,
 };
 use metal::{
     Device, MTLBlitOption, MTLOrigin, MTLPixelFormat, MTLResourceOptions, MTLSize, MTLStorageMode,
@@ -128,7 +128,7 @@ impl MetalPresenter {
         ));
         let path = capture_guest_frame(&directory, &bgra, descriptor, fingerprint)?;
         eprintln!(
-            "[REMu][METAL][SCANOUT-AFTER] slot={slot} draw={} es={:#x} ps={:#x} target={:#x} {}x{} format={:?} fingerprint={fingerprint:016x} black={black}/{pixel_count} green={green}/{pixel_count} captured={}",
+            "[REMu][METAL][SCANOUT-AFTER] slot={slot} draw={} es={:#x} ps={:#x} target={:#x} {}x{} format={:?} blend={:#010x?} fingerprint={fingerprint:016x} black={black}/{pixel_count} green={green}/{pixel_count} captured={}",
             draw.sequence,
             draw.export_shader_address,
             draw.pixel_shader_address,
@@ -136,6 +136,9 @@ impl MetalPresenter {
             descriptor.width,
             descriptor.height,
             descriptor.pixel_format,
+            draw.context_registers
+                .iter()
+                .find_map(|register| (register.offset == 0x1e0).then_some(register.value)),
             path.display(),
         );
         Ok(())
@@ -468,7 +471,17 @@ impl PendingTextureReadback {
         texture: &Texture,
         descriptor: GuestTextureDescriptor,
     ) -> Result<Self, String> {
-        Self::encode_mip(device, queue, texture, descriptor, 0)
+        Self::encode_mip_after_event(device, queue, texture, descriptor, 0, None)
+    }
+
+    pub(super) fn encode_after_event(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        texture: &Texture,
+        descriptor: GuestTextureDescriptor,
+        ready: (&metal::SharedEvent, u64),
+    ) -> Result<Self, String> {
+        Self::encode_mip_after_event(device, queue, texture, descriptor, 0, Some(ready))
     }
 
     pub(super) fn encode_mip(
@@ -478,8 +491,19 @@ impl PendingTextureReadback {
         descriptor: GuestTextureDescriptor,
         mip_level: u32,
     ) -> Result<Self, String> {
+        Self::encode_mip_after_event(device, queue, texture, descriptor, mip_level, None)
+    }
+
+    fn encode_mip_after_event(
+        device: &Device,
+        queue: &metal::CommandQueue,
+        texture: &Texture,
+        descriptor: GuestTextureDescriptor,
+        mip_level: u32,
+        ready: Option<(&metal::SharedEvent, u64)>,
+    ) -> Result<Self, String> {
         validate_texture_readback_source(texture, descriptor)?;
-        Self::encode_mip_slice(device, queue, texture, descriptor, mip_level, 0)
+        Self::encode_mip_slice(device, queue, texture, descriptor, mip_level, 0, ready)
     }
 
     pub(super) fn encode_array_slice(
@@ -490,7 +514,7 @@ impl PendingTextureReadback {
         slice: u32,
     ) -> Result<Self, String> {
         validate_texture_array_readback_source(texture, descriptor, slice)?;
-        Self::encode_mip_slice(device, queue, texture, descriptor, 0, slice)
+        Self::encode_mip_slice(device, queue, texture, descriptor, 0, slice, None)
     }
 
     fn encode_mip_slice(
@@ -500,6 +524,7 @@ impl PendingTextureReadback {
         descriptor: GuestTextureDescriptor,
         mip_level: u32,
         slice: u32,
+        ready: Option<(&metal::SharedEvent, u64)>,
     ) -> Result<Self, String> {
         if u64::from(mip_level) >= texture.mipmap_level_count() {
             return Err(format!(
@@ -517,6 +542,9 @@ impl PendingTextureReadback {
         staging.set_label("REMu texture readback staging");
         let command_buffer = queue.new_command_buffer().to_owned();
         command_buffer.set_label("REMu texture readback");
+        if let Some((event, value)) = ready {
+            command_buffer.encode_wait_for_event(event, value);
+        }
         let encoder = command_buffer.new_blit_command_encoder();
         encoder.set_label("REMu texture-to-buffer readback blit");
         encoder.copy_from_texture_to_buffer(
@@ -1011,6 +1039,18 @@ pub(super) fn read_texture_linear(
     descriptor: GuestTextureDescriptor,
 ) -> Result<Vec<u8>, String> {
     PendingTextureReadback::encode(device, queue, texture, descriptor)?.finish()
+}
+
+pub(super) fn read_texture_linear_after_event(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    texture: &Texture,
+    descriptor: GuestTextureDescriptor,
+    event: &metal::SharedEvent,
+    value: u64,
+) -> Result<Vec<u8>, String> {
+    PendingTextureReadback::encode_after_event(device, queue, texture, descriptor, (event, value))?
+        .finish()
 }
 
 pub(super) fn read_texture_mip_linear(

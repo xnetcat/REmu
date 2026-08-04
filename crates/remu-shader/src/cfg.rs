@@ -147,17 +147,19 @@ pub fn build_control_flow_graph(program: &Program) -> ControlFlowGraph {
         let is_exit = is_terminal(instruction.opcode) || instruction.opcode.is("SSetpcB64");
         if is_branch {
             if let Some(target_pc) = branch_target_pc(program, index)
-                && let Some(&target_index) = pc_to_index.get(&target_pc) {
-                    leaders.insert(target_index);
-                }
+                && let Some(&target_index) = pc_to_index.get(&target_pc)
+            {
+                leaders.insert(target_index);
+            }
             if index + 1 < instructions.len() {
                 leaders.insert(index + 1);
             }
         } else if is_linked {
             if let Some(target_pc) = program.linked_transfer_target(instruction.pc)
-                && let Some(&target_index) = pc_to_index.get(&target_pc) {
-                    leaders.insert(target_index);
-                }
+                && let Some(&target_index) = pc_to_index.get(&target_pc)
+            {
+                leaders.insert(target_index);
+            }
             if index + 1 < instructions.len() {
                 leaders.insert(index + 1);
             }
