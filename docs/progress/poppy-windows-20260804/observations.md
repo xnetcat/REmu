@@ -58,6 +58,14 @@ sent Enter only to the focused `REMu | Direct3D 12` window.
     the host keyboard dialog during the release run that added physical-backing identity to D3D12
     target reuse and writeback invalidation. The readable overlay confirms host UI composition;
     it is not a title-menu or gameplay capture.
+19. [`21-compute-structural-resource-dialog.png`](21-compute-structural-resource-dialog.png) — the
+    keyboard dialog over a clean black underlay after adding a bounded structural resource pass for
+    compute shaders. The diagnostic trace proves that both previously-null image sites now retain
+    the live 2848x1600 descriptor and sampler across repeated dispatches.
+20. [`22-compute-structural-resource-post-dialog.png`](22-compute-structural-resource-post-dialog.png)
+    — the same run five seconds after one focused Enter press. The cyan striped frame remains, so
+    recovering those descriptors fixes a real evaluator defect but does not complete title-menu
+    rendering.
 
 ## Current boundary
 
@@ -94,3 +102,9 @@ none used the newly supported alternate-VA path. This rules out a missed physica
 cause of Poppy's current scene corruption while retaining the fix as a general D3D12 correctness
 requirement. The next trace boundary remains the first producer of the 2848x1600 format-26 scene
 texture consumed by the format-24 conversion pass.
+
+The structural-resource run removed the remaining snapshot-dependent null descriptors at image
+PCs `0x410` and `0x41c`. Six repeated 4,200-group invocations kept the same live 2848x1600 format-26
+resource and sampler before and after the dialog was dismissed. The post-dialog image is still
+corrupt, which narrows the next investigation to the actual contents produced for that texture or
+their tiled/DCC interpretation rather than missing resource-table bindings.
