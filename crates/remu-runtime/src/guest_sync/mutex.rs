@@ -259,25 +259,18 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(slot_value) = read_pthread_slot(address) else {
+    let Some(_) = read_pthread_slot(address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    // Canonical storage that already published a live control block may not be re-initialized.
-    // A slot that merely holds a *copy* of some other mutex's handle (Scream / middleware stack
-    // locals) is not that storage — init must overwrite it with a fresh control block. Treating
-    // every resolvable handle as "already initialized" is what left Demon's Souls with a NULL
-    // returned handle and a later unlock of `slot=Some(0)`.
-    if let PthreadSlotValue::ControlBlock(handle) = classify_mutex_slot_value(slot_value)
-        && let Some(entry) = lookup_mutex_by_handle(handle)
-        && entry.storage_address == address
-    {
-        eprintln!(
-            "[REMu][MUTEX] refused re-init of canonical storage thread={:?} slot={address:#x} \
-             handle={handle:#x}",
-            current_guest_thread_name(),
-        );
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
+    // Always publish a fresh control block into the slot. Identity is the handle value
+    // (`pthread_mutex_t` is a pointer typedef), not durable ownership of the slot address.
+    // Scream creates recursive mutexes in stack locals, returns the handle by value into a
+    // global, then reuses the same stack offset for a later CreateMutex while the leftover
+    // bits still name the prior live object (and our recorded `storage_address` still points
+    // here). Refusing that as "already initialized" returns failure, leaves the title with a
+    // NULL handle, and unlock later hits `slot=Some(0)`. POSIX re-init without destroy is UB;
+    // console libc overwrites, so we overwrite. The prior object stays reachable via any handle
+    // the guest still holds.
     let guest_object = match allocate_guest_mutex_object(attributes) {
         Ok(object) => object,
         Err(error) => return error,
@@ -329,7 +322,10 @@ fn destroy_resolved_mutex(entry: Arc<GuestMutexEntry>, passed_arg: u64) -> u64 {
         .remove(&guest_object)
         .expect("the mutex entry checked above remains in its shard");
     drop(shard);
-    if storage_address != 0 {
+    // Only clear publishing storage when it still holds this object's handle. Stack-init
+    // then return-by-value leaves `storage_address` pointing at a recycled frame; blanking
+    // unconditionally would corrupt whatever reused that slot.
+    if storage_address != 0 && read_pthread_slot(storage_address) == Some(guest_object) {
         write_guest_u64(storage_address, 0);
     }
     // Zero the slot the guest passed when it is a distinct handle-copy of the same object.

@@ -81,17 +81,10 @@ pub(crate) fn guest_condition_init(address: u64) -> u64 {
     if lookup_condition_by_handle(address).is_some() {
         return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
     }
-    let Some(slot_value) = read_pthread_slot(address) else {
+    let Some(_) = read_pthread_slot(address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    // Same pointer-typedef rule as mutexes: only canonical publishing storage is "busy".
-    // A stack slot holding a copied handle may be overwritten with a fresh condition.
-    if let PthreadSlotValue::ControlBlock(handle) = classify_pthread_slot_value(slot_value)
-        && let Some(entry) = lookup_condition_by_handle(handle)
-        && entry.storage_address == address
-    {
-        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
-    }
+    // Always overwrite the slot with a fresh control block (same pointer-typedef rule as mutexes).
     let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
     if guest_object == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
@@ -130,7 +123,7 @@ fn destroy_resolved_condition(entry: Arc<GuestConditionEntry>, passed_arg: u64) 
     }
     state.conditions.remove(&guest_object);
     drop(state);
-    if storage_address != 0 {
+    if storage_address != 0 && read_pthread_slot(storage_address) == Some(guest_object) {
         write_guest_u64(storage_address, 0);
     }
     if passed_arg != 0
