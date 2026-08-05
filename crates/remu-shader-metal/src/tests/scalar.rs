@@ -211,6 +211,68 @@ fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
 }
 
 #[test]
+fn s_brev_b32_leaves_the_scalar_condition_alone() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x40,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::Known("SBrevB32"),
+            words: vec![0],
+            sources: vec![Operand::scalar(10)],
+            destinations: vec![Operand::scalar(12)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+
+    assert!(shader.source.contains("reverse_bits(remu_s_10)"));
+    assert!(shader.source.contains("remu_s_12 = "));
+    assert_eq!(
+        shader.source.matches("scc = ").count(),
+        1,
+        "S_BREV_B32 must preserve the initialized SCC value:\n{}",
+        shader.source
+    );
+}
+
+#[test]
+fn lowers_shifted_scalar_add_with_its_unsigned_carry_out_condition() {
+    for (name, shift) in [
+        ("SLshl1AddU32", 1),
+        ("SLshl2AddU32", 2),
+        ("SLshl3AddU32", 3),
+        ("SLshl4AddU32", 4),
+    ] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x44,
+                encoding: ShaderEncoding::Sop2,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand::scalar(10), Operand::scalar(12)],
+                destinations: vec![Operand::scalar(14)],
+                control: None,
+            },
+            MetalShaderStage::Compute,
+        );
+
+        assert!(
+            shader.source.contains(&format!(
+                "((ulong)remu_s_10 << {shift}) + (ulong)remu_s_12"
+            )),
+            "{name} must form the sum at 64-bit width:\n{}",
+            shader.source
+        );
+        assert!(shader.source.contains("remu_s_14 = "));
+        assert!(
+            shader.source.contains(">> 32) != 0ul;"),
+            "{name} defines SCC as the unsigned carry-out:\n{}",
+            shader.source
+        );
+    }
+}
+
+#[test]
 fn lowers_unsigned_64_bit_scalar_compare_from_register_pairs() {
     let shader = compile_vector_instruction(
         Instruction {

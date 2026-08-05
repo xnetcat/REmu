@@ -184,6 +184,117 @@ fn lowers_each_unsigned_byte_to_f32_conversion_from_the_selected_source_bits() {
     }
 }
 
+const fn clamped_vop3() -> InstructionControl {
+    InstructionControl::Vop3(remu_shader::Vop3Control {
+        absolute_mask: 0,
+        negate_mask: 0,
+        output_modifier: 0,
+        clamp: true,
+        operand_select: 0,
+        scalar_destination: None,
+    })
+}
+
+#[test]
+fn signed_vector_bitfield_extract_replicates_the_field_sign() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x244,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VBfeI32"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(5), Operand::vector(6), Operand::vector(7)],
+            destinations: vec![Operand::vector(8)],
+            control: Some(unmodified_vop3()),
+        },
+        MetalShaderStage::Vertex,
+    );
+
+    assert!(shader.source.contains("as_type<int>(remu_v_5)"));
+    assert!(shader.source.contains("min(remu_v_7 & 31u, 32u - t"));
+    assert!(
+        shader.source.contains("as_type<uint>(extract_bits(t0,"),
+        "the signed extract must sign-extend the field:\n{}",
+        shader.source
+    );
+    assert!(
+        !shader.source.contains("1u << "),
+        "a width mask would zero-fill the sign bits the extract has to replicate:\n{}",
+        shader.source
+    );
+}
+
+#[test]
+fn clamp_saturates_the_carryless_integer_add_and_subtract() {
+    for (name, exact) in [
+        ("VAddI32", "(long)remu_v_1 + (long)remu_v_2"),
+        ("VSubI32", "(long)remu_v_1 - (long)remu_v_2"),
+        ("VSubrevI32", "(long)remu_v_2 - (long)remu_v_1"),
+    ] {
+        let instruction = |control| Instruction {
+            pc: 0x2c,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known(name),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2)],
+            destinations: vec![Operand::vector(8)],
+            control: Some(control),
+        };
+
+        let wrapping =
+            compile_vector_instruction(instruction(unmodified_vop3()), MetalShaderStage::Compute);
+        assert!(
+            wrapping
+                .source
+                .contains(&format!("remu_v_8 = (uint)({exact})")),
+            "{name} without CLAMP must keep the architectural wrapping result:\n{}",
+            wrapping.source
+        );
+        assert!(!wrapping.source.contains("4294967295l"));
+
+        let saturating =
+            compile_vector_instruction(instruction(clamped_vop3()), MetalShaderStage::Compute);
+        assert!(saturating.source.contains(&format!("long t0 = {exact};")));
+        assert!(
+            saturating.source.contains("t0 < 0l ? 0l")
+                && saturating.source.contains("t0 > 4294967295l ? 4294967295l"),
+            "{name} with CLAMP must saturate to the unsigned destination range:\n{}",
+            saturating.source
+        );
+    }
+}
+
+#[test]
+fn clamp_saturates_the_carry_producing_add_without_changing_its_carry_mask() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x30,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VAddCoU32"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2)],
+            destinations: vec![Operand::vector(8)],
+            control: Some(InstructionControl::Vop3(remu_shader::Vop3Control {
+                absolute_mask: 0,
+                negate_mask: 0,
+                output_modifier: 0,
+                clamp: true,
+                operand_select: 0,
+                scalar_destination: Some(20),
+            })),
+        },
+        MetalShaderStage::Compute,
+    );
+
+    assert!(shader.source.contains("? 0xFFFFFFFFu : ("));
+    assert!(shader.source.contains("remu_s_20 = "));
+    assert!(
+        shader.source.contains(">> 32) != 0ul"),
+        "the carry-out lane mask still reports the unsaturated carry:\n{}",
+        shader.source
+    );
+}
+
 #[test]
 fn lowers_vector_bitfield_insert_select_with_exact_mask_semantics() {
     let shader = compile_vector_instruction(

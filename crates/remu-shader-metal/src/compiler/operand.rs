@@ -264,6 +264,42 @@ impl Compiler<'_> {
         Ok(value)
     }
 
+    /// Applies VOP3/SDWA CLAMP to an integer ALU result.
+    ///
+    /// RDNA2 defines CLAMP on an integer operation as saturation to the destination type's
+    /// representable range rather than the [0.0, 1.0] clamp it means for a float result, so the
+    /// operation has to be evaluated wider than its destination before the modifier can be
+    /// honored: `expression` is that exact value at 64-bit (`long`) width. Without CLAMP the
+    /// architectural result is the same value truncated to 32 bits.
+    ///
+    /// Only the carryless add/sub encodings carry integer CLAMP on GFX10 — LLVM gives exactly
+    /// those a dedicated `VOP_I32_I32_I32_ARITH` profile and selects them with the bit set for
+    /// `uadd.sat`/`usub.sat`/`sadd.sat`/`ssub.sat`. Every other integer VALU opcode either leaves
+    /// the field without meaning or can only produce a representable result, which is why this is
+    /// applied per opcode instead of in one shared result path.
+    pub(crate) fn integer_result(
+        &mut self,
+        instruction: &Instruction,
+        expression: &str,
+        signed: bool,
+    ) -> String {
+        if !integer_clamp(instruction) {
+            return format!("(uint)({expression})");
+        }
+        // Written as comparisons rather than `clamp`, which the Metal standard library does not
+        // define over 64-bit integers.
+        let value = self.temp("long", expression);
+        if signed {
+            format!(
+                "as_type<uint>((int)({value} < -2147483648l ? -2147483648l : ({value} > 2147483647l ? 2147483647l : {value})))"
+            )
+        } else {
+            format!(
+                "(uint)({value} < 0l ? 0l : ({value} > 4294967295l ? 4294967295l : {value}))"
+            )
+        }
+    }
+
     #[allow(clippy::unused_self)]
     pub(crate) fn float_result(&self, instruction: &Instruction, expression: &str) -> String {
         let (output_modifier, clamp) = match instruction.control.as_ref() {
@@ -283,6 +319,15 @@ impl Compiler<'_> {
         format!("as_type<uint>({value})")
     }
 }
+/// Whether VOP3 or SDWA asked for the result modifier that saturates an integer result.
+pub(crate) fn integer_clamp(instruction: &Instruction) -> bool {
+    match instruction.control.as_ref() {
+        Some(InstructionControl::Vop3(control)) => control.clamp,
+        Some(InstructionControl::Sdwa(control)) => control.clamp,
+        _ => false,
+    }
+}
+
 pub(crate) fn format_u32(value: u32) -> String {
     if value <= 9 {
         format!("{value}u")

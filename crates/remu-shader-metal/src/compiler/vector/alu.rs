@@ -563,21 +563,35 @@ impl Compiler<'_> {
                 self.raw_source(instruction, 1)?
             ),
             "VNotB32" => format!("~{}", self.raw_source(instruction, 0)?),
-            "VAddI32" => format!(
-                "({} + {})",
-                self.raw_source(instruction, 0)?,
-                self.raw_source(instruction, 1)?
-            ),
-            "VSubI32" => format!(
-                "({} - {})",
-                self.raw_source(instruction, 0)?,
-                self.raw_source(instruction, 1)?
-            ),
-            "VSubrevI32" => format!(
-                "({} - {})",
-                self.raw_source(instruction, 1)?,
-                self.raw_source(instruction, 0)?
-            ),
+            // GFX10 encodes these as the carryless V_ADD_NC_U32 / V_SUB_NC_U32 /
+            // V_SUBREV_NC_U32, which is why the truncated result matches either signedness and
+            // the legacy I32 names survived. Their CLAMP bit is not decorative: it is how the
+            // hardware spells an unsigned saturating add or subtract, so the sum has to be
+            // formed at 64-bit width before it can be narrowed.
+            "VAddI32" => {
+                let expression = format!(
+                    "(long){} + (long){}",
+                    self.raw_source(instruction, 0)?,
+                    self.raw_source(instruction, 1)?
+                );
+                self.integer_result(instruction, &expression, false)
+            }
+            "VSubI32" => {
+                let expression = format!(
+                    "(long){} - (long){}",
+                    self.raw_source(instruction, 0)?,
+                    self.raw_source(instruction, 1)?
+                );
+                self.integer_result(instruction, &expression, false)
+            }
+            "VSubrevI32" => {
+                let expression = format!(
+                    "(long){} - (long){}",
+                    self.raw_source(instruction, 1)?,
+                    self.raw_source(instruction, 0)?
+                );
+                self.integer_result(instruction, &expression, false)
+            }
             "VMinI32" => format!(
                 "as_type<uint>(min(as_type<int>({}), as_type<int>({})))",
                 self.raw_source(instruction, 0)?,
@@ -646,6 +660,9 @@ impl Compiler<'_> {
                 format!("{width} == 0u ? 0u : extract_bits({value}, {offset}, {width})")
             }
             "VBfeI32" => {
+                // The signed extract replicates the extracted field's top bit through bit 31.
+                // Masking the shifted value instead zero-fills those bits, so every negative
+                // field (a packed signed offset, a sign-extended index) came out positive.
                 let value = self.temp(
                     "int",
                     &format!("as_type<int>({})", self.raw_source(instruction, 0)?),
@@ -656,13 +673,14 @@ impl Compiler<'_> {
                 );
                 let width = self.temp(
                     "uint",
-                    &format!("{} & 31u", self.raw_source(instruction, 2)?),
+                    &format!(
+                        "min({} & 31u, 32u - {offset})",
+                        self.raw_source(instruction, 2)?
+                    ),
                 );
-                let mask = self.temp(
-                    "uint",
-                    &format!("{width} == 0u ? 0u : ((1u << {width}) - 1u)"),
-                );
-                format!("(as_type<uint>({value} >> {offset}) & {mask})")
+                format!(
+                    "{width} == 0u ? 0u : as_type<uint>(extract_bits({value}, {offset}, {width}))"
+                )
             }
             "VBfiB32" => {
                 let mask = self.temp("uint", &self.raw_source(instruction, 0)?);

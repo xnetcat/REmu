@@ -6,6 +6,7 @@
 
 use remu_shader::{Instruction, InstructionControl};
 
+use crate::compiler::operand::integer_clamp;
 use crate::compiler::vector::destination_vector;
 use crate::{Compiler, SCALAR_REGISTER_COUNT, VCC_LO, VECTOR_REGISTER_COUNT};
 
@@ -148,6 +149,19 @@ impl Compiler<'_> {
                 )
             }
             _ => unreachable!("carry opcode was selected from a closed set"),
+        };
+        // CLAMP on a carry-producing add or subtract is the hardware's unsigned saturating form
+        // (LLVM selects these encodings with the bit set for `uadd.sat`/`usub.sat`). The carry-out
+        // lane mask still reports the unsaturated carry, so only the VGPR result is pinned.
+        let expression = if integer_clamp(instruction) {
+            let saturated = if name.starts_with("VAdd") {
+                "0xFFFFFFFFu"
+            } else {
+                "0u"
+            };
+            format!("({carry}) ? {saturated} : ({expression})")
+        } else {
+            expression
         };
         let result = self.temp("uint", &expression);
         let mut carry = self.temp("bool", &format!("exec && ({carry})"));

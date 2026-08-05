@@ -302,8 +302,7 @@ fn lowers_silent_hill_half_to_u16_and_signed_bitfield_extract() {
     assert!(signed_extract.source.contains("as_type<int>(remu_v_1)"));
     assert!(signed_extract.source.contains("remu_v_2 & 31u"));
     assert!(signed_extract.source.contains("remu_v_3 & 31u"));
-    assert!(signed_extract.source.contains(">>"));
-    assert!(signed_extract.source.contains("&"));
+    assert!(signed_extract.source.contains("as_type<uint>(extract_bits(t0,"));
 }
 
 #[test]

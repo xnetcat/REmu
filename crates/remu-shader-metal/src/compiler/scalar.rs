@@ -165,9 +165,11 @@ impl Compiler<'_> {
                 return Ok(());
             }
             "SBrevB32" => {
+                // S_BREV_B32 is one of the SOP1 operations that leaves SCC alone (RDNA2 ISA):
+                // only the bit counts and the logical operations define it. Writing SCC here
+                // destroyed the condition a preceding compare had set for a later branch.
                 let result = self.temp("uint", &format!("reverse_bits({left})"));
                 self.store_scalar(destination, &result);
-                self.line(3, &format!("scc = {result} != 0u;"));
                 return Ok(());
             }
             "SBcnt1I32B32" => {
@@ -286,8 +288,17 @@ impl Compiler<'_> {
                 )
             }
             "SLshl1AddU32" | "SLshl2AddU32" | "SLshl3AddU32" | "SLshl4AddU32" => {
+                // SCC is the unsigned carry-out of the shifted addition, so the sum has to be
+                // formed at 64-bit width; the shifted-out high bits participate in that carry.
                 let shift = name.as_bytes()[5] - b'0';
-                (format!("(({left} << {shift}) + {right})"), None)
+                let wide = self.temp(
+                    "ulong",
+                    &format!("((ulong){left} << {shift}) + (ulong){right}"),
+                );
+                let result = self.temp("uint", &format!("(uint){wide}"));
+                self.store_scalar(destination, &result);
+                self.line(3, &format!("scc = ({wide} >> 32) != 0ul;"));
+                return Ok(());
             }
             "SPackLlB32B16" => (
                 format!("(({left} & 0xFFFFu) | (({right} & 0xFFFFu) << 16))"),
