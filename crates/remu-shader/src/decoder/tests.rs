@@ -345,7 +345,7 @@ fn decodes_silent_hill_half_transcendentals_sdwa() {
 #[test]
 fn decodes_silent_hill_single_precision_division_fixup() {
     let sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
-    let program = decode_program(0x8009_c10000, &[0xd351_0008, sources, 0xbf81_0000])
+    let program = decode_program(0x8009_c10000, &[0xd15f_0008, sources, 0xbf81_0000])
         .expect("observed Silent Hill V_DIV_FIXUP_F32 stream");
 
     assert!(program.instructions[0].opcode.is("VDivFixupF32"));
@@ -355,6 +355,62 @@ fn decodes_silent_hill_single_precision_division_fixup() {
     );
     assert_eq!(program.instructions[0].destinations, [Operand::vector(8)]);
     assert_eq!(program.instructions[1].opcode, Opcode::END_PROGRAM);
+}
+
+#[test]
+fn decodes_the_precise_division_sequence_and_leaves_0x351_to_half_float_min3() {
+    // The whole GFX10 sequence is contiguous with the multiplies. V_DIV_FIXUP_F32 used to be
+    // read at 0x351, which belongs to the OPSEL block's V_MIN3_F16: a half-float three-operand
+    // minimum decoded as a single-precision division fixup, and the real sequence decoded raw.
+    let sources = 257_u32 | (258_u32 << 9) | (259_u32 << 18);
+    let program = decode_program(
+        0x1000,
+        &[
+            0xd15f_0008, // v_div_fixup_f32 v8, v1, v2, v3
+            sources,
+            0xd16d_6a09, // v_div_scale_f32 v9, vcc, v1, v2, v3
+            sources,
+            0xd16f_000a, // v_div_fmas_f32 v10, v1, v2, v3
+            sources,
+            0xd351_000b, // v_min3_f16 v11, v1, v2, v3
+            sources,
+            0xbf81_0000,
+        ],
+    )
+    .expect("precise-division sequence decodes");
+
+    for (index, name) in [
+        (0, "VDivFixupF32"),
+        (1, "VDivScaleF32"),
+        (2, "VDivFmasF32"),
+        (3, "VMin3F16"),
+    ] {
+        let instruction = &program.instructions[index];
+        assert!(
+            instruction.opcode.is(name),
+            "expected {name}, got {}",
+            instruction.opcode
+        );
+        assert_eq!(
+            instruction.sources,
+            [Operand::vector(1), Operand::vector(2), Operand::vector(3)]
+        );
+        assert_eq!(
+            instruction.destinations,
+            [Operand::vector(8 + u32::try_from(index).expect("small index"))]
+        );
+    }
+
+    // V_DIV_SCALE_F32 is VOP3B: its lane-mask output comes from SDST, not the OPSEL/ABS fields.
+    let scale = &program.instructions[1];
+    assert!(matches!(
+        scale.control,
+        Some(InstructionControl::Vop3(control))
+            if control.scalar_destination == Some(106)
+                && control.absolute_mask == 0
+                && control.operand_select == 0
+    ));
+    assert_eq!(program.instructions[4].opcode, Opcode::END_PROGRAM);
 }
 
 #[test]

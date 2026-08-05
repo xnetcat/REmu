@@ -375,6 +375,39 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
             scalar_destination: Some(20),
         })),
     });
+    // Saturating integer arithmetic, the signed bitfield extract and the precise-division
+    // sequence each emit MSL that the shared fixtures above never reach: 64-bit integer temps,
+    // `extract_bits` over a signed value, and the division prelude helpers.
+    for (index, (name, clamp)) in [
+        ("VAddI32", true),
+        ("VAddCoU32", true),
+        ("VBfeI32", false),
+        ("VDivFixupF32", false),
+        ("VDivFmasF32", false),
+        ("VMin3F16", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        instructions.push(Instruction {
+            pc: u32::try_from(instructions.len() * 8).expect("small arithmetic test program"),
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known(name),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+            destinations: vec![Operand::vector(
+                32 + u32::try_from(index).expect("small destination index"),
+            )],
+            control: Some(InstructionControl::Vop3(remu_shader::Vop3Control {
+                absolute_mask: 0,
+                negate_mask: 0,
+                output_modifier: 0,
+                clamp,
+                operand_select: 0,
+                scalar_destination: (name == "VAddCoU32").then_some(22),
+            })),
+        });
+    }
     for destination in [44, 45] {
         instructions.push(Instruction {
             pc: u32::try_from(instructions.len() * 8).expect("small readfirstlane test program"),

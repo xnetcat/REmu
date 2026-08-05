@@ -396,6 +396,19 @@ inline uint remu_div_fixup_f32_bits(uint quotient_bits, uint denominator_bits, u
     );
 }
 
+pub(crate) fn emit_div_fmas_f32_prelude(source: &mut String) {
+    source.push_str(
+        r"inline float remu_div_fmas_f32(float first, float second, float addend, bool scaled) {
+    // The last step of the precise division sequence. V_DIV_SCALE_F32 records in VCC whether it
+    // scaled the operands to keep the quotient in range, and this fused product-sum undoes that
+    // scaling by 2^32 for the lanes where it did.
+    return fma(first, second, addend) * (scaled ? 4294967296.0f : 1.0f);
+}
+
+",
+    );
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn emit_format_prelude(source: &mut String) {
     source.push_str("static constant uint remu_gfx10_formats[128] = {\n    ");

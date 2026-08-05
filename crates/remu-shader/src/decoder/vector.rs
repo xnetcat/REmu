@@ -383,6 +383,8 @@ pub(crate) fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x30f => Some("VAddCoU32"),
             0x310 => Some("VSubCoU32"),
             0x319 => Some("VSubrevCoU32"),
+            0x16d => Some("VDivScaleF32"),
+            0x16e => Some("VDivScaleF64"),
             0x176 => Some("VMadU64U32"),
             _ => None,
         }
@@ -421,10 +423,16 @@ pub(crate) fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x15c => Some("VSadU16"),
             0x15d => Some("VSadU32"),
             0x15e => Some("VCvtPkU8F32"),
+            // GFX10 keeps the precise-division sequence contiguous with the multiplies at
+            // 0x15F and 0x16D..0x170; the 0x340 OPSEL block that starts at V_FMA_F16 holds the
+            // half-float three-operand minima instead.
+            0x15f => Some("VDivFixupF32"),
             0x169 => Some("VMulLoU32"),
             0x16a => Some("VMulHiU32"),
             0x16b => Some("VMulLoI32"),
             0x16c => Some("VMulHiI32"),
+            0x16f => Some("VDivFmasF32"),
+            0x170 => Some("VDivFmasF64"),
             0x178 => Some("VXor3B32"),
             // VOP1 opcodes use their architectural opcode plus 0x180 in the VOP3/e64
             // encoding. V_CVT_FLR_I32_F32 is opcode 0x0d, hence 0x18d here.
@@ -435,7 +443,7 @@ pub(crate) fn decode_vop3(word: u32, extra: u32) -> Frame {
             0x346 => Some("VLshlAddU32"),
             0x347 => Some("VAddLshlU32"),
             0x34b => Some("VFmaF16"),
-            0x351 => Some("VDivFixupF32"),
+            0x351 => Some("VMin3F16"),
             0x360 => Some("VReadlaneB32"),
             0x361 => Some("VWritelaneB32"),
             0x362 => Some("VLdexpF32"),

@@ -561,6 +561,77 @@ fn lowers_observed_rdna2_half_rsqrt_compare_and_integer_folds() {
 }
 
 #[test]
+fn lowers_the_division_fmas_and_half_float_min3_that_share_the_division_opcode_block() {
+    let fmas = compile_vector_instruction(
+        Instruction {
+            pc: 0x9dc,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VDivFmasF32"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+            destinations: vec![Operand::vector(4)],
+            control: Some(unmodified_vop3()),
+        },
+        MetalShaderStage::Pixel,
+    );
+    assert!(fmas.source.contains("remu_div_fmas_f32(as_type<float>"));
+    assert!(
+        fmas.source.contains(", vcc)"),
+        "the scale decision comes from VCC, not an explicit operand:\n{}",
+        fmas.source
+    );
+    assert!(fmas.source.contains("4294967296.0f"));
+
+    let min3 = compile_vector_instruction(
+        Instruction {
+            pc: 0x9e4,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VMin3F16"),
+            words: vec![0, 0],
+            sources: vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+            destinations: vec![Operand::vector(4)],
+            control: Some(unmodified_vop3()),
+        },
+        MetalShaderStage::Pixel,
+    );
+    assert!(min3.source.contains("remu_f16_to_f32_bits"));
+    assert!(min3.source.contains("fmin(fmin("));
+    assert!(min3.source.contains("remu_f32_to_f16_bits"));
+}
+
+#[test]
+fn division_operand_scaling_refuses_instead_of_guessing_its_thresholds() {
+    let error = compile_msl(
+        &Program::new(
+            0x1000,
+            vec![Instruction {
+                pc: 0x1000,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known("VDivScaleF32"),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(1), Operand::vector(2), Operand::vector(3)],
+                destinations: vec![Operand::vector(4)],
+                control: Some(InstructionControl::Vop3(remu_shader::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: Some(106),
+                })),
+            }],
+        ),
+        &empty_evaluation(),
+        &MetalCompileOptions::vertex(0),
+    )
+    .expect_err("V_DIV_SCALE_F32 must refuse loudly");
+    assert!(
+        error.to_string().contains("V_DIV_SCALE_F32"),
+        "the refusal must name the operation: {error}"
+    );
+}
+
+#[test]
 fn lowers_exercised_rdna2_xor3_and_vector_shifts() {
     let xor = compile_vector_instruction(
         Instruction {

@@ -369,6 +369,16 @@ impl Compiler<'_> {
                     ),
                 )
             }
+            "VMin3F16" => {
+                let first = self.half_float_source(instruction, 0)?;
+                let second = self.half_float_source(instruction, 1)?;
+                let third = self.half_float_source(instruction, 2)?;
+                self.f16_result(
+                    instruction,
+                    destination,
+                    &format!("fmin(fmin({first}, {second}), {third})"),
+                )
+            }
             "VMin3I32" => format!(
                 "as_type<uint>(min(min(as_type<int>({}), as_type<int>({})), as_type<int>({})))",
                 self.raw_source(instruction, 0)?,
@@ -528,6 +538,25 @@ impl Compiler<'_> {
                     self.float_source(instruction, 2)?
                 ),
             ),
+            "VDivFmasF32" => self.float_result(
+                instruction,
+                &format!(
+                    "remu_div_fmas_f32({}, {}, {}, vcc)",
+                    self.float_source(instruction, 0)?,
+                    self.float_source(instruction, 1)?,
+                    self.float_source(instruction, 2)?
+                ),
+            ),
+            // V_DIV_SCALE_F32 is the entry point of the same sequence: it decides whether the
+            // numerator or denominator needs an exponent shift and publishes that decision in
+            // VCC. Its exponent thresholds and denormal tests are not settled here, and a scale
+            // that guesses them would corrupt the quotient rather than fail to build it.
+            "VDivScaleF32" => {
+                return Err(
+                    "V_DIV_SCALE_F32 operand-scaling thresholds are unproven; refusing to guess the precise-division preop"
+                        .to_owned(),
+                );
+            }
             "VSinF32" => self.float_result(
                 instruction,
                 &format!(

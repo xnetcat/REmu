@@ -14,8 +14,8 @@ use crate::compiler::memory::{
     is_format_buffer_memory, is_lds_memory_instruction, is_writable_memory,
 };
 use crate::compiler::prelude::{
-    emit_data_share_prelude, emit_div_fixup_f32_prelude, emit_format_prelude,
-    emit_global_memory_prelude, emit_vop3p_prelude,
+    emit_data_share_prelude, emit_div_fixup_f32_prelude, emit_div_fmas_f32_prelude,
+    emit_format_prelude, emit_global_memory_prelude, emit_vop3p_prelude,
 };
 use crate::{
     Compiler, EXEC_HI, EXEC_LO, MetalCompileError, MetalShaderStage, SCALAR_REGISTER_COUNT, VCC_HI,
@@ -97,6 +97,14 @@ impl Compiler<'_> {
             .any(|instruction| instruction.opcode.is("VDivFixupF32"))
         {
             emit_div_fixup_f32_prelude(&mut source);
+        }
+        if self
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| instruction.opcode.is("VDivFmasF32"))
+        {
+            emit_div_fmas_f32_prelude(&mut source);
         }
         let uses_lds_memory = self
             .program
