@@ -1,0 +1,50 @@
+[REMu] acquiring shared build lock: /Users/xnetcat/Documents/REmu/target/.remu-build.lock
+[REMu] held shared build lock
+[REMu] host vm.loadavg: { 3.49 3.31 2.69 }
+[REMu] launching PPSA01342-app0; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1a/20260805T204317Z-PPSA01342-app0
+[REMu] render resolution: 1920x1080 (presentation-only)
+[REMu] warning: no guest-native resolution hook was found; only presentation is 1920x1080
+[REMu] automatic shutdown after 45s (pass 0 to disable)
+[REMu] external launch watchdog after 50s
+[REMu] headless Metal presenter enabled
+[REMu][AUDIO2] queue level query=2 context=4 queued=0/8, available=8 outputs=0x30f8d5bcc,0x30f8d5bc8 result=0x0 args=0x0,0xffffffff00000000,0x0
+[REMu][AUDIO2] queue level query=3 context=4 queued=0/8, available=8 outputs=0x30f8d5bcc,0x30f8d5bc8 result=0x0 args=0x0,0x2,0x1
+[REMu][IMPORT] first_hit=69224 nid=MmpF1XsQiHw name=sceAjmBatchInitialize return=0x801f61d69 args=0x7001233950,0xb1d8,0x7001233928,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=69225 nid=3cAg7xN995U name=sceAjmBatchJobGetStatistics return=0x801f61de6 args=0x7001233928,0x70012338f8,0x0,0x1,0x300007faa905195b,0x7faa90500000
+[REMu][IMPORT] first_hit=69227 nid=5tOfnaClcqM name=sceAjmBatchStart return=0x801f61e0f args=0x1,0x7001233928,0x28,0x710868fab0,0x70012338f0,0x7faa43b1c9c0
+[REMu][AUDIO2] user create=3 handle=85 user_id=0x10000000
+[REMu][AUDIO2] queue level query=4 context=4 queued=0/8, available=8 outputs=0x30f8d5c4c,0x30f8d5c48 result=0x0 args=0x11901,0x34f269b0,0x1
+[REMu][AUDIO2] queue level query=5 context=4 queued=0/8, available=8 outputs=0x30f8d5bcc,0x30f8d5bc8 result=0x0 args=0x0,0xffffffff00000000,0x0
+[REMu][AUDIO2] queue level query=6 context=4 queued=0/8, available=8 outputs=0x710868fb1c,0x710868fb18 result=0x0 args=0x11901,0x34f300e5,0x1
+[REMu][MUTEX] rejected unlock of unknown mutex thread="main" handle=0x7faaa283c000 mutex=0x30b356e78 slot=Some(0)
+An assertion fired in: E:\dev\cp11\ScreamMain\wws_shared\sdk\7_53_BP\components\wws_scream\scream\src\ps4\snd_osfuncs.cpp @ line: 410
+Assertion failed: 0
+[REMu][IMPORT] first_hit=69300 nid=8fe55ktlNVo name=sceAcmBatchStartBuffers return=0x801f649d8 args=0x1,0x1,0x710868fb20,0x0,0x700128e320,0x1037c7255
+[REMu][IMPORT] unimplemented nid=8fe55ktlNVo name=sceAcmBatchStartBuffers args=0x1,0x1,0x710868fb20,0x0,0x700128e320,0x1037c7255
+[REMu][FAIL] nid=8fe55ktlNVo name=sceAcmBatchStartBuffers thread="BPE JobWorkerThread CPU8" result=0xffffffff8002004e args=0x1,0x1,0x710868fb20,0x0
+[REMu][IMPORT] first_hit=69301 nid=8XTArSPyWHk name=sceAudioOut2PortSetAttributes return=0x801f5c309 args=0x53,0x710868fa80,0x3,0x7112d749a0,0x0,0x7faa44300000
+[REMu][AUDIO2] attributes update=1 port=83 count=3 [id=0x5/reserved=0x0/data=0x7112d749ec/size=0x4/value=0x0,id=0x1/reserved=0x0/data=0x710868fa48/size=0x4/value=0x0,id=0x0/reserved=0x0/data=0x710868fa60/size=0x8/value=0x70012f02f0]
+[REMu][AUDIO2] attributes update=2 port=84 count=3 [id=0x5/reserved=0x0/data=0x7112d74a74/size=0x4/value=0x0,id=0x1/reserved=0x0/data=0x710868fa48/size=0x4/value=0x0,id=0x0/reserved=0x0/data=0x710868fa60/size=0x8/value=0x70012f06f0]
+[REMu][AUDIO2] attributes update=3 port=6 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012d5af0]
+[REMu][AUDIO2] attributes update=4 port=43 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012e0af0]
+[REMu][AUDIO2] attributes update=5 port=80 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012ebaf0]
+[REMu][AUDIO2] attributes update=6 port=81 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012edaf0]
+[REMu][AUDIO2] attributes update=7 port=86 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x8/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012f0af0]
+[REMu][AUDIO2] attributes update=8 port=87 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x4/value=0x0,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012f12f0]
+[REMu][IMPORT] first_hit=69311 nid=PE2zHMqLSHs name=sceAudioOut2ContextAdvance return=0x801f5a24d args=0x4,0x2,0x700129e8d8,0x400,0x0,0xfffffffffffffcd0
+[REMu][AUDIO2] context advance=1 handle=4 args=0x2,0x700129e8d8,0x400,0x0,0xfffffffffffffcd0
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x801f403a3 space=host reason=null-address; forwarding
+[REMu][WATCH] fault registers rax=0x1 rbx=0x7faa851dc900 rcx=0x0 rdx=0x803ae4338 rdi=0x1037c7c28 rsi=0x6 rbp=0x30b356e90 rsp=0x30b356e70 r8=0xffffffff00000000 r9=0x0 r10=0x0 r11=0x82e6deebfc5097b2 r12=0x0 r13=0x803582980 r14=0x71194b3520 r15=0x70014b7430
+[REMu][WATCH] fault stack rsp=0x30b356e70 words=0x0,0x0,0x9e3779b97f4a7c15,0x801f57970,0x30b356f70,0x801f1850c,0x49,0x7faa00000001,0x9e3779b97f4a7c15,0x7001372f10,0x30b356f00,0x801edc23b,0x7afbb662,0x80211b529,0x40,0x100,0x7afbb662,0x1,0x30b356f30,0x801ec36b2,0xb81006d2,0x0,0x700120cf18,0x80,0x30b356f70,0x801f36333,0x9e3779b97f4a7c15,0xfffffffa,0x71130e11b8,0x8031052a8,0x30b3571c0,0x7faa851dc900,0x30b356f90,0x801ec2a49,0x0,0x30b357120,0x30b357390,0x8008fc2b4,0x30b3572fc,0x802a4cc80,0x7faa851dc900,0x1,0x80206b0c6,0x8020a3858,0x30b3571d0,0x103000908,0x30b357200,0x0
+/Users/xnetcat/Documents/REmu/scripts/run-with-watchdog.sh: line 165: 84339 Segmentation fault: 11  "$@"
+revision=d3fc2f9
+game=/Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/eboot.bin
+timeout_seconds=45
+elapsed_seconds=11
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=1
+render_size=1920x1080
+render_policy=presentation-only
+[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1a/20260805T204317Z-PPSA01342-app0

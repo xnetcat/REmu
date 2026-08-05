@@ -1,0 +1,406 @@
+[REMu][PERF-STARTUP] milestone=cli-run-start elapsed_us=1
+[REMu][PTHREAD] guest thread-id source=darwin-pthread-tsd key=260
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x8017a2d74 offset=0x17a2d74 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] boundary-mismatch region=execute-region addr=0x801b97a59 offset=0x1b97a59 encoding=[64, 48, 8b, 04, 25, 00, 00, 00, 00] — byte-scan hit is not an instruction boundary under seeded decode; refusing silent rewrite
+[REMu][TLS][FS] decode-summary region=execute-region base=0x800000000 byte_scan_hits=3781 boundary_mismatches=2 decoder_confirmed_loads=3779
+[REMu][TLS][FS] boundary-mismatch total=2 — byte-scan hits rejected; only seeded-decode sites are rewritten
+[REMu][MODULE] loaded /Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/sce_module/libc.prx
+[REMu][MODULE] loaded /Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/sce_module/libSceNpCppWebApi.prx
+[REMu][MODULE] dependency graph: bundled=2 system/HLE=55 app_root=/Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0
+[REMu][PERF-STARTUP] milestone=process-image-linked elapsed_us=5460130
+[REMu][PERF-STARTUP] milestone=event-sink-installed elapsed_us=5460188
+[REMu][PERF-STARTUP] milestone=presenter-enter elapsed_us=5460253
+[REMu][METAL] starting headless Metal event loop
+[REMu][PERF-STARTUP] milestone=guest-probe-entry elapsed_us=5460276
+[REMu] file descriptor budget: 9223372036854775807 open files (hard limit unlimited)
+[REMu][CXX] registered 179097 guest unwind records from 3 sections in 0.004s
+[REMu][METAL] discovered bundled offline Metal compiler /Users/xnetcat/Documents/REmu/.remu/toolchains/Metal-27A5209h/Metal.xctoolchain/usr/bin/metal
+[REMu][METAL] loaded render pipeline archive /Users/xnetcat/Library/Caches/REMu/metal/render-bd83bdd9a166f22ffc7a9efd41cee95a79150d2c.metallibarchive
+[REMu][METAL] persistent compute pipelines share the render archive
+[REMu][METAL] compiler workers=4 sampled texture cache=2048 entries/1536 MiB resident texture cache=0 MiB exact-shared-event-readiness=true retired-fence-range-bookkeeping=false
+[REMu][METAL] headless presenter started on Apple M4
+[REMu][TIME] process counter source=CLOCK_UPTIME_RAW-nanoseconds
+[REMu][VFS] direct immutable app path routing enabled
+[REMu][VFS] legacy save slot "devlog" already present under savedata/; leaving "/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA01342/devlog"
+[REMu][SYSTEM] showing installed splash /Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/sce_sys/pic0.png (3840x2160)
+[REMu][PERF-STARTUP] milestone=guest-runtime-configured elapsed_us=5586382
+[REMu][MODULE] initializing runtime at 0x00000008039d0010 args=0x0/0x0
+[REMu][IMPORT] first_hit=1 nid=rNhWz+lvOMU name=_sceKernelSetThreadDtors return=0x8039d0110 args=0x803a08e20,0x0,0x0,0x7faab1f17540,0x2,0x1
+[REMu][IMPORT] first_hit=2 nid=pB-yGZ2nQ9o name=_sceKernelSetThreadAtexitCount return=0x8039d011c args=0x803a08fb0,0x2,0x0,0x1,0xa360fb5,0x1
+[REMu][IMPORT] first_hit=3 nid=WhCc1w3EhSI name=_sceKernelSetThreadAtexitReport return=0x8039d0128 args=0x803a091d0,0x2,0x0,0x1,0xa372490,0x1
+[REMu][IMPORT] first_hit=4 nid=959qrazPIrg name=sceKernelGetProcParam return=0x8039d5cb6 args=0x30b361370,0x2,0x0,0x1,0xa38173d,0x1
+[REMu][IMPORT] first_hit=5 nid=p5EcQeEeJAE name=_sceKernelRtldSetApplicationHeapAPI return=0x8039d5eca args=0x803ae4f48,0x80083d4f0,0x80083d5c0,0x80083d530,0x80083d250,0x80083d2d0
+[REMu][IMPORT] first_hit=6 nid=bnZxYgAFeA0 name=sceKernelGetSanitizerNewReplaceExternal return=0x8039e67d7 args=0x80083d800,0x80083d770,0x80083d650,0x0,0x80083d890,0x80083d910
+[REMu][IMPORT] first_hit=8 nid=NWtTN10cJzE name=sceLibcHeapGetTraceInfo return=0x8039dbac1 args=0x30b3613b0,0x2,0x0,0x80201,0xa3e323a,0x1
+[REMu][IMPORT] first_hit=9 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x803a0dec2 args=0x803ae9380,0x0,0x30b361410,0x9e3779b97f4a7c15,0x7faa851dc900,0x0
+[REMu][PTHREAD] mutex lookup cache enabled slots=16 identity=control-block-handle uncontended-wake-elision=true
+[REMu][MUTEX][ABI] op=init arg=0x803ae9380 slot=Some(140370838784528) object=0x7faaa1fb8a10 result=0x0
+[REMu][IMPORT] first_hit=12 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x8039d093b args=0x30b360b78,0x803aa1060,0x0,0x9e3779b97f4a7c15,0x7faa851dc900,0x0
+[REMu][IMPORT] first_hit=13 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x8039d0952 args=0x30b360b78,0x2,0x0,0x1,0xa565cea,0x1
+[REMu][MUTEX][ABI] op=init arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][IMPORT] first_hit=15 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x8039d097f args=0x30b360b78,0x1037c7c1f,0x0,0x1,0x2,0x1
+[REMu][MUTEX][ABI] op=init arg=0x803ae7bb8 slot=Some(140370356958224) object=0x7faa85437410 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae7bc0 slot=Some(140370357602384) object=0x7faa854d4850 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae7bc8 slot=Some(140370357239728) object=0x7faa8547bfb0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae7bd0 slot=Some(140370357448144) object=0x7faa854aedd0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae7bd8 slot=Some(140370356840736) object=0x7faa8541a920 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae7be0 slot=Some(140370357201744) object=0x7faa85472b50 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae7be8 slot=Some(140370357671760) object=0x7faa854e5750 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae4170 slot=Some(140370357357392) object=0x7faa85498b50 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae4338 slot=Some(140370357738016) object=0x7faa854f5a20 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x803ae4500 slot=Some(140370357257264) object=0x7faa85480430 result=0x0
+[REMu][PERF-DIRECT] thread-owned publication enabled stripes=256
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803aea368 slot=Some(140370357191712) object=0x7faa85470420 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803aea368 slot=Some(140370357191712) object=0x7faa85470420 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803aea368 slot=Some(140370357191712) object=0x7faa85470420 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803aea368 slot=Some(140370357191712) object=0x7faa85470420 result=0x0
+[REMu][IMPORT] first_hit=56 nid=mkx2fVhNMsg name=pthread_cond_broadcast return=0x803a536fc args=0x803aea370,0x1037c7c1f,0x0,0x7faab1f17540,0x2,0x1
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x803ae7bb0 slot=Some(140370356872608) object=0x7faa854225a0 result=0x0
+[REMu][IMPORT] first_hit=57 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x803a936f8 args=0x30b361448,0x803aeac10,0x803ae4000,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=58 nid=x1X76arYMxU name=scePthreadAttrGet return=0x803a93711 args=0x7faaa283c000,0x30b361448,0x103f196e0,0x1,0xa7ad7f2,0x1
+[REMu][IMPORT] first_hit=59 nid=8+s5BzZjxSg name=scePthreadAttrGetaffinity return=0x803a93722 args=0x30b361448,0x30b361440,0x0,0x1,0xa7bb111,0x1
+[REMu][IMPORT] first_hit=60 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x803a9372b args=0x30b361448,0x2,0x0,0x1,0xa7c69f6,0x1
+[REMu][MODULE] initializing runtime at 0x0000000803b18010 args=0x0/0x0
+[REMu][IMPORT] first_hit=64 nid=tsvEmnenz48 name=__cxa_atexit return=0x803b18074 args=0x803b5a6a0,0x803f313e0,0x803f30000,0x7faab1f17540,0x2,0x1
+[REMu][PERF-STARTUP] milestone=module-initializers-complete elapsed_us=5592924
+[REMu][PERF-STARTUP] milestone=guest-entry-begin elapsed_us=5592973
+[REMu][IMPORT] first_hit=210 nid=pO96TwzOm5E name=sceKernelGetDirectMemorySize return=0x80083eea3 args=0x800826820,0x0,0x8030b7e20,0x8030b7d78,0x80355cbe8,0x1
+[REMu][IMPORT] first_hit=212 nid=C0f7TJcbfac name=sceKernelAvailableDirectMemorySize return=0x80083eef6 args=0x0,0x400000000,0x10000,0x8030fbdf0,0x8030fbdc0,0x1
+[REMu][IMPORT] first_hit=214 nid=rTXw65xmLIA name=sceKernelAllocateDirectMemory return=0x80083ef5f args=0x3ffd90000,0x400000000,0x270000,0x10000,0xc,0x30b361180
+[REMu][IMPORT] first_hit=215 nid=L-Q3LEjIbgA name=sceKernelMapDirectMemory return=0x80083f01b args=0x8030fbe08,0x270000,0xf3,0x0,0x3ffd90000,0x10000
+[REMu][METAL] installed-title system splash ready 3840x2160
+[REMu][IMPORT] first_hit=217 nid=FxVZqBAA7ks name=_write return=0x8039e0969 args=0x1,0x803ae80d0,0x37,0x0,0xffffffff00000000,0x0
+[MSG-Init] PS5 Mode: Standard - Debug Memory: 4.00 GiB
+[MSG-Init] Total Direct Memory: 16384.00 MiB - 0x0000000400000000 Bytes
+[MSG-Init] Total Available Direct Memory: 16384.00 MiB - 0x0000000400000000 Bytes
+[MSG-Init] Total Available Allocator Memory: 16381.56 MiB - 0x00000003ffd90000 Bytes Memory Tracking Overhead: 2.44 MiB
+[REMu][IMPORT] first_hit=224 nid=aNz11fnnzi4 name=sceKernelAvailableFlexibleMemorySize return=0x80083fe5e args=0x700025ba70,0x1ffffff,0x40000,0x0,0xffffffffffffffff,0xffd9
+[REMu][IMPORT] first_hit=225 nid=7oxv3PPCumo name=sceKernelReserveVirtualRange return=0x80083ff53 args=0x700025ba68,0x1a200000,0x0,0x100000,0xb0b7d3e,0x1
+[REMu][IMPORT] first_hit=226 nid=IWIBBdTHit4 name=sceKernelMapFlexibleMemory return=0x80083ff79 args=0x700025ba68,0x1a200000,0xf3,0x10,0xb0c473a,0x1
+[REMu][IMPORT] first_hit=227 nid=BohYr-F7-is name=sceKernelSetPrtAperture return=0x80083fbdd args=0x0,0x1000000000,0xec00000000,0x1a20,0xb0dcbbc,0x1
+[REMu][IMPORT] first_hit=228 nid=4oXYe9Xmk0Q name=sceKernelGetGPI return=0x800878fec args=0x1037c7c28,0x6,0x803aea368,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=230 nid=1j3S3n-tTW4 name=sceKernelGetTscFrequency return=0x800863a48 args=0x30b3611f8,0x40000000,0x10000,0x0,0x30b361240,0x0
+[REMu][IMPORT] first_hit=231 nid=dQHWEsJtoE4 name=pthread_mutexattr_init return=0x8016fa138 args=0x30b3613d0,0x0,0x801799740,0x801799770,0x80354fb90,0x1
+[REMu][IMPORT] first_hit=232 nid=mDmgMOGVUqg name=pthread_mutexattr_settype return=0x8016fa14a args=0x30b3613d0,0x2,0x0,0x1,0xb3aca4a,0x1
+[REMu][IMPORT] first_hit=233 nid=ttHNfU+qDBU name=pthread_mutex_init return=0x8016fa15a args=0x80354fbc0,0x30b3613d0,0x0,0x1,0xb3b7da7,0x1
+[REMu][IMPORT] first_hit=234 nid=HF7lK46xzjY name=pthread_mutexattr_destroy return=0x8016fa16b args=0x30b3613d0,0x4,0x80354fbc0,0x1,0x2,0x0
+[REMu][IMPORT] first_hit=240 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x80120b72e args=0x30b361360,0x0,0x0,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=241 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x80120b73b args=0x30b361360,0x2,0x0,0x1,0xce07aed,0x1
+[REMu][IMPORT] first_hit=242 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x80120b749 args=0x8035196e0,0x30b361360,0x0,0x1,0xce13afc,0x1
+[REMu][IMPORT] first_hit=243 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x80120b753 args=0x30b361360,0x4,0x8035196e0,0x1,0x3,0x0
+[REMu][IMPORT] first_hit=245 nid=BNowx2l588E name=sceKernelGetProcessTimeCounterFrequency return=0x8012aed88 args=0x803519028,0x0,0x0,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=258 nid=g8cM39EUZ6o name=sceSysmoduleLoadModule return=0x8012a6d3e args=0x6,0x28b0,0x8030f9b00,0x9e3779b97f4a7c15,0x0,0x710017ffc8
+[REMu][IMPORT] first_hit=265 nid=6ULAa0fq4jA name=scePthreadRwlockInit return=0x80120bb14 args=0x803516a00,0x0,0x0,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=270 nid=mqdNorrB+gI name=scePthreadRwlockWrlock return=0x80120bc39 args=0x803516a00,0xffffffff,0x802a4ceb0,0x660000,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=271 nid=+L98PIbGttk name=scePthreadRwlockUnlock return=0x80120bde3 args=0x803516a00,0x0,0x0,0x802a4d018,0x8035169d0,0x0
+[REMu][IMPORT] first_hit=1767 nid=lLMT9vJAck0 name=clock_gettime return=0x803a41cda args=0xd,0x30b361308,0x8030f9b00,0x9e3779b97f4a7c15,0x0,0x710017ffc8
+[REMu][IMPORT] first_hit=1768 nid=-o5uEDpN+oY name=sceKernelConvertUtcToLocaltime return=0x803a41eac args=0x6a73a06b,0x30b3612f8,0x30b361300,0x0,0xfffffffffffffff1,0x30b15fa58
+[REMu][IMPORT] first_hit=1769 nid=0NTHN1NKONI name=sceKernelConvertLocaltimeToUtc return=0x803a41b97 args=0x6a73bc8b,0x0,0x30b3612e8,0x30b361300,0x30b3612dc,0xfffffffffffffe93
+[REMu][IMPORT] first_hit=1859 nid=Ox9i0c7L5w0 name=scePthreadRwlockRdlock return=0x80120bebb args=0x803516a00,0xffffffff,0x8030f9b00,0x9e3779b97f4a7c15,0x0,0x710017ffc8
+[REMu][IMPORT] first_hit=5939 nid=eV9wAD2riIA name=sceKernelStat return=0x800862dc6 args=0x802126fbc,0x30b359798,0x30b359900,0x30b35c718,0x0,0x710017ffc8
+[REMu][IMPORT] first_hit=5940 nid=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler return=0x800878b8c args=0x800878c30,0x4000,0x0,0x0,0x0,0x7000390390
+[REMu][IMPORT] first_hit=5941 nid=BpFoboUJoZU name=sceKernelCreateEventFlag return=0x800873c6e args=0x30b359808,0x802139de1,0x21,0x0,0x0,0x30b359780
+[REMu][IMPORT] first_hit=6499 nid=bt3CTBKmGyI name=scePthreadSetaffinity return=0x800ca8b16 args=0x7faaa283c000,0x1,0x103f196e0,0x2,0x1,0x0
+[REMu][IMPORT] first_hit=6515 nid=8aI7R7WaOlc name=sceAmprCommandBufferConstructor return=0x801eb55ee args=0x30b359038,0x803aa1060,0x0,0x30b35901c,0x7faa851dc900,0x0
+[REMu][IMPORT] first_hit=6516 nid=a8uLzYY--tM name=sceAmprAprCommandBufferConstructor return=0x800861f37 args=0x30b359038,0x30b359050,0x30b359058,0x30b01,0x1770b193,0x1
+[REMu][IMPORT] first_hit=6525 nid=1G3lF1Gg1k8 name=sceKernelOpen return=0x8008621fd args=0x8020f76a2,0x601,0x1ff,0x30b01,0x17718d76,0x1
+[REMu][VFS] miss=1 sceKernelOpen rejected guest="/hostapp/misc/findWriteRepository.txt"
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x8020f76a2,0x601,0x1ff,0x30b01
+[REMu][IMPORT] first_hit=6526 nid=Qs1xtplKo0U name=sceAmprAprCommandBufferDestructor return=0x801eb5626 args=0x30b359338,0x30b359350,0x30b359358,0x9,0x0,0x7faa85000000
+[REMu][IMPORT] first_hit=6527 nid=GuchCTefuZw name=sceAmprCommandBufferDestructor return=0x800862056 args=0x30b359338,0x0,0x0,0x1,0x17757288,0x1
+[MSG-Init] Repository path: $/ = /app0
+[MSG-Init] Repository write path: #/ = /devlog/app
+[REMu][VFS] miss=Some(2) sceKernelOpen failed guest="/devlog/app/logs/demonssoul_ps5_2026-08-05-22-43-23_0.log" host="/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA01342/devlog/app/logs/demonssoul_ps5_2026-08-05-22-43-23_0.log": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30b359410,0x601,0x1ff,0x9e3779b97f4a7c15
+[REMu][IMPORT] first_hit=6555 nid=2Of0f+3mhhE name=scePthreadMutexDestroy return=0x80086139e args=0x700039ebd0,0x7000000000000000,0x7c440,0x0,0x0,0x7faa85000000
+[REMu][IMPORT] first_hit=6577 nid=kBwCPsYX-m4 name=sceKernelFstat return=0x8008628e0 args=0x3,0x30b359358,0x70008,0x1,0x0,0x7faa85000000
+[REMu][IMPORT] first_hit=6578 nid=Cg4srZ6TKbU name=sceKernelRead return=0x800862811 args=0x3,0x700039a350,0x5c52,0x9df60,0x0,0x700039a350
+[REMu][IMPORT] first_hit=6579 nid=UK2Tl2DWUns name=sceKernelClose return=0x80086279b args=0x3,0x700039a350,0x0,0x1,0x0,0x0
+[MSG-Init] ParseBuildVersion: +BuildVersion=2020-12-09.781263
+[MSG-Init] Build Version: 2020-12-09.781263
+[REMu][VFS] miss=Some(3) sceKernelOpen failed guest="/devlog/app/commandlineargs.txt" host="/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA01342/devlog/app/commandlineargs.txt": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30b358d70,0x0,0x0,0x30b01
+[REMu][IMPORT] first_hit=6745 nid=asjUJJ+aa8s name=sceFiberOptParamInitialize return=0x800874822 args=0x30b359430,0x30b3594b0,0x7108600000,0x0,0x7108df9218,0x7faab1f25440
+[REMu][IMPORT] first_hit=6746 nid=hVYD7Ou2pCQ name=_sceFiberInitializeImpl return=0x80087487c args=0x7108d91c20,0x30b3594b0,0x8008748b0,0x7108d91c18,0x7108600000,0x10000
+[REMu][IMPORT] first_hit=6747 nid=uq2Y5BFz0PE name=sceFiberGetInfo return=0x800874a77 args=0x7108d91c20,0x30b359460,0x0,0x30b3596e8,0x7faa851dc900,0x0
+[REMu][IMPORT] first_hit=6748 nid=JzyT91ucGDc name=sceFiberRename return=0x800874ae0 args=0x7108d91c20,0x30b359420,0x0,0x9e3779b97f4a7c15,0x7faa851dc900,0x0
+[REMu][IMPORT] first_hit=6749 nid=a0LLrZWac0M name=sceFiberRun return=0x800874971 args=0x7108d91c20,0x0,0x30b3594f8,0x1,0x6,0x1037c7261
+[REMu][IMPORT] first_hit=6750 nid=B0ZX2hx9DMw name=sceFiberReturnToThread return=0x8008749ba args=0x0,0x710860ffb8,0x0,0x0,0x0,0x0
+[REMu][IMPORT] first_hit=7706 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x8008743a2 args=0x30b359488,0x30b3594b8,0x30b3596c8,0x0,0x1,0x1
+[REMu][IMPORT] first_hit=7707 nid=-Wreprtu0Qs name=scePthreadAttrSetdetachstate return=0x8008743b5 args=0x30b359488,0x0,0x0,0x1,0x1859b8d9,0x1
+[REMu][IMPORT] first_hit=7708 nid=UTXzJbWhhTE name=scePthreadAttrSetstacksize return=0x8008743d9 args=0x30b359488,0x4000,0x0,0x1,0x185a8f87,0x1
+[REMu][IMPORT] first_hit=7709 nid=eXbUSpEaTsA name=scePthreadAttrSetinheritsched return=0x8008743ea args=0x30b359488,0x0,0x0,0x1,0x185b4c7e,0x1
+[REMu][IMPORT] first_hit=7710 nid=4+h9EzwKF4I name=scePthreadAttrSetschedpolicy return=0x8008743f7 args=0x30b359488,0x3,0x0,0x1,0x185c2286,0x1
+[REMu][IMPORT] first_hit=7711 nid=DzES9hQF4f4 name=scePthreadAttrSetschedparam return=0x800874414 args=0x30b359488,0x30b359480,0x0,0x1,0x185cf576,0x1
+[REMu][IMPORT] first_hit=7712 nid=3qxgM4ezETA name=scePthreadAttrSetaffinity return=0x800874422 args=0x30b359488,0x1,0x0,0x1,0x185daf55,0x1
+[REMu][IMPORT] first_hit=7713 nid=6UgtwV+0zb4 name=scePthreadCreate return=0x80087445a args=0x30b3594b8,0x30b359488,0x8008744b0,0x7108a00050,0x7108a000cd,0x1
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU0" guest=0x4000 host=0x200000
+[REMu][IMPORT] first_hit=7714 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x800874462 args=0x30b359488,0x2,0x11364,0x1,0x18604dbe,0x1
+[REMu][IMPORT] first_hit=7715 nid=W0Hpm2X0uPE name=scePthreadSetprio return=0x80087446e args=0x7faab201be00,0x2bc,0x0,0x1,0x1861c635,0x1
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU1" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU2" guest=0x4000 host=0x200000
+[REMu][IMPORT] first_hit=7736 nid=1jfXLRVzisc name=sceKernelUsleep return=0x80086ebba args=0x1,0x8,0x65cd00000000,0x2711,0x10,0x1037c6d30
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU3" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU4" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU5" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU6" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU7" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU8" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU9" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU10" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU11" guest=0x4000 host=0x200000
+[REMu][THREAD] raised host stack name="BPE JobWorkerThread CPU12" guest=0x4000 host=0x200000
+[MSG-Init] Starting Initialization: 146.2516ms
+[REMu][IMPORT] first_hit=9705 nid=uoUpLGNkygk name=sceCommonDialogInitialize return=0x800bc316c args=0x7100349c50,0xec2,0x8030f9b00,0x100010000,0x0,0x710037ffc8
+[MSG-Init] CmdLine: +shaderTypeToLoad=Shipping +LoadCmdsFromFile=$/CoreData/EngineSupport/DebugMenu/DebugRenderMenu.txt +VSyncWindow=10% +TargetFramesPerSecond=60 +go_skipGameObjectCreationForXPR=true +physicsPerformShapeValidation=false +ResourceDependenciesFile=$/workspaces/****/cp11.cwks.****.dependencies +DebugMenuCreateItem=menu=Debug +DebugMenuCreateItem=convar=launchExecutable,params={binary=/app0/DemonsSoul_PROSPERO_Release.elf},caption="Launch Release Elf",menu=Debug +footIkEnablePhysicsRaycasts=true +renderStatsYOffsetPercent=0.1 +cp11_defaultLoadout=$/misc/loadouts/misc/goldenpath.txt +sound_screamEnableACVLR2=true +js_EnableDeadLockDetection=false +cp11_cutscenes_cinematicSkipMode=OnlyHost +cp11_callHomeLockDownEnabled=false +StartupScript=$/scripts/cp11/cp11main.script
+[REMu][IMPORT] first_hit=9767 nid=j3YMu1MVNNo name=sceUserServiceInitialize return=0x8008b7b7d args=0x30b357018,0x2f756e654d677562,0x6365537265507365,0x61657243756e654d,0x8030b7e20,0x7108efffc8
+[REMu][IMPORT] first_hit=9768 nid=m87BHxt-H60 name=sceNpGameIntentInitialize return=0x8008b7c35 args=0x30b3570a0,0x2,0x0,0x1,0x191e43a0,0x1
+[REMu][IMPORT] first_hit=9769 nid=R9lA82OraNs name=sceAppContentInitialize return=0x8008b7c63 args=0x30b357080,0x30b357040,0x0,0x1,0x19205e33,0x1
+[REMu][IMPORT] first_hit=9772 nid=-hJRce8wn1U name=sce::Json::MemAllocator::MemAllocator return=0x8008c2c4e args=0x71084ffd80,0x9d6,0x8030f9b00,0x9e3779b97f4a7c15,0x0,0x71084fffc8
+[REMu][IMPORT] first_hit=9773 nid=cK6bYHf-Q5E name=sce::Json::Initializer::Initializer return=0x8008c2c62 args=0x71084ffd88,0x71084ffd80,0x0,0x710801,0x8,0x0
+[REMu][IMPORT] first_hit=9774 nid=Cxwy7wHq4J0 name=sce::Json::Initializer::initialize(InitParameter) return=0x8008c2ce6 args=0x71084ffd88,0x30b356f90,0x0,0x710801,0x8,0x0
+[REMu][IMPORT] first_hit=9775 nid=dgJBaeJnGpo name=sceNetPoolCreate return=0x8008c2d01 args=0x80204f398,0x4000,0x0,0x1,0x19291bd4,0x1
+[REMu][IMPORT] first_hit=9776 nid=hdpVEUDFW3s name=sceSslInit return=0x8008c2d19 args=0x100000,0x30b356630,0x0,0x71084ffd10,0x16,0x0
+[REMu][IMPORT] first_hit=9777 nid=3JCe3lCbQ8A name=sceHttp2Init return=0x8008c2d3b args=0x1,0x1,0x100000,0x8,0x30b356660,0x0
+[REMu][IMPORT] first_hit=9778 nid=+o9816YQhqQ name=sceNpWebApi2Initialize return=0x8008c2d55 args=0x1,0x20000,0x0,0x71084ffd10,0x1,0x0
+[REMu][NP_WEB_API2] initialized context=1 http_context=1 pool_size=0x20000
+[REMu][IMPORT] first_hit=9779 nid=mL8NDH86iQI name=sceKernelMapNamedFlexibleMemory return=0x803b1a57a args=0x803f300d8,0x80000,0x2,0x0,0x30b356de0,0x1000
+[REMu][IMPORT] first_hit=9780 nid=-hn1tcVHq5Q name=sceLibcMspaceCreate return=0x803b1a58d args=0x30b356de0,0x7000270000,0x80000,0x0,0x1934cf99,0x1
+[REMu][MSPACE] created name="0x71084ffd78" base=0x7000270000 end=0x70002f0000
+[REMu][IMPORT] first_hit=9781 nid=OJjm-QOIHlI name=sceLibcMspaceMalloc return=0x803b1a5a8 args=0x7000270000,0x58,0x0,0x700001,0x19376ff6,0x1
+[REMu][IMPORT] first_hit=9784 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x803b1c54d args=0x30b356d50,0x803d9cc35,0x0,0x700001,0x193ac01b,0x1
+[REMu][IMPORT] first_hit=9785 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x803b1c55f args=0x30b356d50,0x2,0x0,0x1,0x193d2a6f,0x1
+[REMu][IMPORT] first_hit=9786 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x803b1c572 args=0x7000270170,0x30b356d50,0x803d9cc35,0x1,0x193ee7e8,0x1
+[REMu][IMPORT] first_hit=9789 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x803b1c57d args=0x30b356d50,0x4,0x7000270170,0x1,0x8,0x0
+[REMu][IMPORT] first_hit=9790 nid=2Tb92quprl0 name=scePthreadCondInit return=0x803b1baf8 args=0x7000270178,0x0,0x803d9d824,0x1,0x1947f3d3,0x1
+[REMu][IMPORT] first_hit=9792 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x803b1bc18 args=0x30b356d48,0x2,0x0,0x700001,0x19494ce1,0x1
+[REMu][IMPORT] first_hit=9793 nid=UTXzJbWhhTE name=scePthreadAttrSetstacksize return=0x803b1bc45 args=0x30b356d48,0x8000,0x0,0x1,0x194a87a8,0x1
+[REMu][IMPORT] first_hit=9794 nid=DzES9hQF4f4 name=scePthreadAttrSetschedparam return=0x803b1bc60 args=0x30b356d48,0x30b356d40,0x0,0x1,0x194b9bb3,0x1
+[REMu][IMPORT] first_hit=9798 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x803b1bd22 args=0x30b356d48,0x2,0x0,0x1,0x1985dbcf,0x1
+[REMu][IMPORT] first_hit=9817 nid=YJtKLttI9fM name=sceGameUpdateInitialize return=0x8008b6898 args=0x30b356ec0,0x2,0x0,0x1,0x198a1f71,0x1
+[REMu][IMPORT] first_hit=9818 nid=Xjoosiw+XPI name=sceKernelUuidCreate return=0x800876810 args=0x30b357080,0x8,0x4170,0x9e3779b97f4a7c15,0x0,0x101
+[REMu][IMPORT] first_hit=9827 nid=gky0+oaNM4k name=sceNetCtlInit return=0x8008aaca0 args=0x30b356f80,0x2,0x0,0x1,0x198ccb09,0x1
+[REMu][IMPORT] first_hit=9828 nid=JTvBflhYazQ name=sceKernelWaitEventFlag return=0x800873fd8 args=0x20,0x1,0x11,0x0,0x0,0x0
+[REMu][IMPORT] first_hit=9835 nid=PFT2S-tJ7Uk name=sceFiberSwitch return=0x800874a11 args=0x7108d91c20,0x0,0x7108817f28,0x0,0x0,0x3e8
+[REMu][IMPORT] first_hit=9916 nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes return=0x801eb571e args=0x710860d518,0x1,0x710860d50c,0x710860d510,0x710860d508,0x0
+[REMu][IMPORT] first_hit=9977 nid=baQO9ez2gL4 name=sceAmprCommandBufferReset return=0x800862b77 args=0x7108f80138,0x0,0x0,0x0,0x0,0x3e8
+[REMu][IMPORT] first_hit=10014 nid=ULvXMDz56po name=sceAmprCommandBufferClearBuffer return=0x800862b7f args=0x7108f80138,0x0,0x0,0x1,0x1a18b58f,0x1
+[REMu][IMPORT] first_hit=10015 nid=N-FSPA4S3nI name=sceAmprCommandBufferSetBuffer return=0x800862b94 args=0x7108f80138,0x7108f80170,0x80,0x1,0x1a9a3fd4,0x1
+[REMu][IMPORT] first_hit=10016 nid=mQ16-QdKv7k name=sceAmprAprCommandBufferReadFile return=0x801eb5664 args=0x7108f80138,0x7108f80150,0x7108f80158,0x1,0x7000472f20,0x5c52
+[REMu][IMPORT] first_hit=10020 nid=sJXyWHjP-F8 name=sceAmprCommandBufferWriteAddressOnCompletion return=0x800862be8 args=0x7108f80138,0x7108f80168,0x1,0x1,0x1a9befa2,0x1
+[REMu][IMPORT] first_hit=10021 nid=ASoW5WE-UPo name=sceKernelAprSubmitCommandBufferAndGetResult return=0x801eb587d args=0x7108f80138,0x3,0x7108f80160,0x7108f80130,0x1a9ccc2c,0x1
+[REMu][IMPORT] first_hit=10054 nid=IOnSvHzqu6A name=sceKernelSetEventFlag return=0x800873e06 args=0x20,0x1,0x71085ffba8,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=10084 nid=ts6GlZOKRrE name=scePlayGoInitialize return=0x8008b3135 args=0x30b356e90,0x700025e0b4,0x7000001158,0x9e3779b97f4a7c15,0x0,0x200000
+[REMu][IMPORT] first_hit=10088 nid=M1Gma1ocrGE name=scePlayGoOpen return=0x8008b31db args=0x80310da30,0x0,0x0,0x1,0x1b9a34e5,0x1
+[REMu][IMPORT] first_hit=10098 nid=rvBSfTimejE name=scePlayGoGetInstallSpeed return=0x8008b321b args=0x1,0x30b356e38,0x0,0x1,0x1b9cd789,0x1
+[REMu][IMPORT] first_hit=10099 nid=uWIYLFkkwqk name=scePlayGoGetLocus return=0x8008b3305 args=0x1,0x30b356f40,0x1,0x30b356e90,0x1c4470a6,0x1
+[REMu][IMPORT] first_hit=11102 nid=vSMAm3cxYTY name=sceKernelMprotect return=0x801de8bd1 args=0x802900000,0x3d28,0x12,0x1,0x0,0x7000472f20
+[REMu][IMPORT] first_hit=11104 nid=23LRUSvYu1M name=sceAgcInit return=0x801de8c12 args=0x80356b070,0x7,0x0,0x1,0x1cdc1bf5,0x1
+[REMu][IMPORT] first_hit=11105 nid=2JtWUUiYBXs name=sceAgcGetRegisterDefaults2 return=0x801de5be9 args=0x7,0x2,0x0,0x1,0x1cdce59e,0x1
+[REMu][AGC] register defaults internal=false version=7 groups=127 address=0x00007faab201f200
+[REMu][IMPORT] first_hit=11106 nid=wRbq6ZjNop4 name=sceAgcGetRegisterDefaults2Internal return=0x801de8c79 args=0x7,0x5f4,0x0,0x134,0x7f,0x1fc
+[REMu][AGC] register defaults internal=true version=7 groups=22 address=0x00007faa92018400
+[REMu][IMPORT] first_hit=11107 nid=f3dg2CSgRKY name=sceAgcCreateShader return=0x801df992e args=0x80356b138,0x802901e98,0x802933600,0x0,0x16,0x1
+[REMu][AGC] accepted shader registration type=0 program_low=0x20c count=10 block=[0x20c=0x0 0x20d=0x0 0x22a=0x210 0x22a=0x6f10c0a8 0x212=0x402c0040 0x213=0x94 0x228=0x0 0x207=0x40 0x208=0x1 0x209=0x1]
+[REMu][AGC] accepted shader registration type=1 program_low=0x8 count=6 block=[0x8=0x0 0x9=0x0 0x6=0x1000060 0x6=0x5a122180 0xa=0x22c0000 0xb=0x8]
+[REMu][AGC] accepted shader registration type=2 program_low=0xc8 count=6 block=[0xc8=0x0 0xc9=0x0 0x80=0x20000d0 0x80=0x1162f923 0x8a=0x622c0042 0x8b=0x30000]
+[REMu][AGC] accepted shader registration type=6 program_low=0xc8 count=10 block=[0xc8=0x0 0xc9=0x0 0x80=0x0 0x80=0x0 0x8a=0x622c0045 0x8b=0x9b0000 0x88=0x0 0x89=0x0 0x80=0x6000750 0x80=0xb745dd04]
+[REMu][AGC] accepted shader registration type=7 program_low=0x148 count=10 block=[0x148=0x0 0x149=0x0 0x100=0x0 0x100=0x0 0x10a=0x312c0081 0x10b=0x200084 0x108=0x0 0x109=0x0 0x100=0x70001d0 0x100=0x9addcca7]
+[REMu][IMPORT] first_hit=25816 nid=1n37q1Bvc5Y name=sceSystemServiceGetDisplaySafeAreaInfo return=0x80094c17b args=0x30b356220,0x7bb3,0x8030f9b00,0x9e3779b97f4a7c15,0x0,0x710837ffc8
+[REMu][IMPORT] first_hit=36772 nid=2Tb92quprl0 name=scePthreadCondInit return=0x801fee86f args=0x80358c7f8,0x0,0x0,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=36789 nid=rcrVFJsQWRY name=scePthreadGetaffinity return=0x801fee67e args=0x7faaa283c000,0x30b356f80,0x103f196e0,0x4,0x3,0x0
+[REMu][THREAD] raised host stack name="BinkAsy1" guest=0x18000 host=0x200000
+[REMu][IMPORT] first_hit=36812 nid=Xs9hdiD7sAA name=pthread_setschedparam return=0x801fee76c args=0x7faa6200c600,0x3,0x30dcabc68,0x1,0xa,0x44d6
+[REMu][THREAD] raised host stack name="BinkAsy2" guest=0x18000 host=0x200000
+[REMu][THREAD] raised host stack name="BinkAsy3" guest=0x18000 host=0x200000
+[REMu][IMPORT] first_hit=36836 nid=WKAXJ4XBPQ4 name=scePthreadCondWait return=0x801feed9b args=0x80358cf68,0x80358cf60,0x80358cf60,0x0,0xffffffff00000000,0x0
+[REMu][THREAD] raised host stack name="BinkAsy4" guest=0x18000 host=0x200000
+[REMu][IMPORT] first_hit=36863 nid=14bOACANTBo name=scePthreadOnce return=0x8009e0369 args=0x80314ec18,0x8009e0690,0x0,0x0,0x7048a63500,0x7048881110
+[REMu][IMPORT] first_hit=36876 nid=HV4j+E0MBHE name=sceAgcCreateInterpolantMapping return=0x801df31a3 args=0x30b356ef0,0x704f87e970,0x7048a6c820,0x704f87e970,0x7048a6c820,0x6
+[REMu][IMPORT] first_hit=36877 nid=D9sr1xGUriE name=sceAgcCreatePrimState return=0x8009e0405 args=0x30b356ff0,0x30b356ed8,0x0,0x704f87e970,0x6,0x30b15fa58
+[REMu][IMPORT] first_hit=38100 nid=Up36PTk687E name=sceVideoOutOpen return=0x800945269 args=0xff,0x0,0x0,0x0,0x0,0x70005f76f0
+[REMu][IMPORT] first_hit=38101 nid=DYhhWbJSeRg name=sceVideoOutColorSettingsSetGamma_ return=0x800945301 args=0x30b357080,0x10,0x0,0x1,0x31c8fd9d,0x1
+[REMu][IMPORT] first_hit=38102 nid=pv9CI5VC+R0 name=sceVideoOutAdjustColor_ return=0x800945314 args=0x1,0x30b357080,0x10,0x1,0x666e5d6f3f573f1f,0x1
+[REMu][IMPORT] first_hit=38103 nid=CBiu4mCE1DA name=sceVideoOutSetFlipRate return=0x800945321 args=0x1,0x0,0x0,0x1,0x31cd22f9,0x1
+[REMu][IMPORT] first_hit=38104 nid=utPrVdxio-8 name=sceVideoOutGetOutputStatus return=0x800945333 args=0x1,0x30b357080,0x0,0x1,0x31cefde8,0x1
+[REMu][IMPORT] first_hit=38406 nid=PjS5uASwcV8 name=sceVideoOutSetBufferAttribute2 return=0x800944d38 args=0x711277fee8,0x8100000022000000,0x0,0x780,0x438,0x0
+[REMu][IMPORT] first_hit=38481 nid=rKBUtgRrtbk name=sceVideoOutRegisterBuffers2 return=0x800944ec0 args=0x1,0x0,0x0,0x30b356fd0,0x2,0x711277fee8
+[REMu][VIDEO] registered 2 buffers at 1920x1080 format=0x8100000022000000 tiling=0 addresses=[7057f00000, 7059f00000]
+[REMu][PERF-GPU-PUBLICATION] exact runtime phase attribution enabled
+[REMu][METAL] display registered 1920x1080 pitch=1920 format=0x8100000022000000 tiling=0 buffers=[7057f00000, 7059f00000]
+[REMu][IMPORT] first_hit=38940 nid=2SKEx6bSq-4 name=sceKernelBatchMap return=0x800841e3e args=0x700025ec38,0x1,0x710868f0dc,0x0,0xffd9,0xffffffffffffffff
+[REMu][IMPORT] first_hit=39148 nid=hv1luiJrqQM name=scePadInit return=0x800c2422e args=0x71004ff818,0x4,0x30b357050,0x71004ff888,0x3863c287,0x1
+[REMu][IMPORT] first_hit=39149 nid=CdWp0oHWGr0 name=sceUserServiceGetInitialUser return=0x800c24244 args=0x30b35709c,0x2ed679,0x0,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=39150 nid=3pcAvmwKCvM name=sceSystemGestureInitializePrimitiveTouchRecognizer return=0x800c2424e args=0x0,0x57147f07196f2e19,0x1e3b3d5f2b3c0000,0x1,0x776e7f6a277d6a07,0x1
+[REMu][IMPORT] first_hit=39151 nid=xk0AcarP3V4 name=scePadOpen return=0x800c24ccb args=0x10000000,0x0,0x0,0x0,0x0,0x70007a3a20
+[REMu][IMPORT] first_hit=39152 nid=qpo-mEOwje0 name=sceSystemGestureOpen return=0x800c24cda args=0x0,0x0,0x1,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=39153 nid=FWF8zkhr854 name=sceSystemGestureCreateTouchRecognizer return=0x800c24266 args=0x0,0x70007a3bd8,0x20,0x0,0x0,0x0
+[REMu][IMPORT] first_hit=39154 nid=fPhymKNvK-A name=sceUserServiceGetLoginUserIdList return=0x800c24276 args=0x30b3570a0,0x30b3566f0,0x0,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=39164 nid=K-jXhbt2gn4 name=pthread_mutex_trylock return=0x8016fc918 args=0x80354a1a0,0x7fffffff,0x0,0x1,0x38a0de3e,0x1
+[REMu][IMPORT] first_hit=39227 nid=188x57JYp0g name=sceKernelCreateSema return=0x8017a3a53 args=0x70007c6eb8,0x8020f4532,0x1,0x0,0x1,0x0
+[REMu][IMPORT] first_hit=39246 nid=4J2sUJmuHZQ name=sceKernelGetProcessTime return=0x803a41969 args=0x0,0x6a73a06c,0x6,0x9e3779b97f4a7c15,0x18436d0,0x1
+[MSG-Init] Resource dependency file loaded: $/workspaces/****/cp11.cwks.****.dependencies
+[REMu][IMPORT] first_hit=39659 nid=99b82IKXpH4 name=sceAppContentAppParamGetInt return=0x8008b7d7e args=0x1,0x30b357194,0x6,0x6,0x0,0x71008fffc8
+[REMu][IMPORT] first_hit=39661 nid=Ec63y59l9tw name=sceNpSetNpTitleId return=0x8008b7f9c args=0x7108effd32,0x7108effd42,0x7108effdc1,0x100,0x80213e9db,0x8080808080808080
+[REMu][IMPORT] first_hit=39663 nid=nBDD66kiFW8 name=sceShareInitialize return=0x8008b817a args=0x20000,0x2bc,0x1fff,0x1,0x50dd19d,0x1
+[REMu][IMPORT] first_hit=39664 nid=7QZtURYnXG4 name=sceShareSetContentParam return=0x8008b81f5 args=0x80204a918,0x30b356750,0x0,0x1,0x1,0x0
+[MSG-Init] ResourcePool::RecordResourceDependencies() took 2.8745s
+[REMu][IMPORT] first_hit=66684 nid=6xVpy0Fdq+I name=_sigprocmask return=0x803a2815b args=0x1,0x0,0x30b356fb0,0x30b356f68,0x802180564,0x7000cfce90
+[REMu][THREAD] raised host stack name="HighGraphics" guest=0x10000 host=0x200000
+[REMu][THREAD] raised host stack name="Core.Res.Decompressor" guest=0x10000 host=0x200000
+[REMu][THREAD] raised host stack name="Core.Res.FileLoader" guest=0x10000 host=0x200000
+[REMu][THREAD] raised host stack name="Core.Res.TaskManager" guest=0x10000 host=0x200000
+[REMu][THREAD] raised host stack name="NexusRevolution Event" guest=0x4000 host=0x200000
+[REMu][IMPORT] first_hit=67136 nid=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback return=0x801512710 args=0x801512800,0x803529ed8,0x803529fd4,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=67137 nid=qQJfO8HAiaY name=sceNpRegisterStateCallbackA return=0x801512746 args=0x801512820,0x803529ed8,0x0,0x1,0x30b3562a0,0x0
+[REMu][IMPORT] first_hit=67138 nid=uBPlr0lbuiI name=sceNetCtlGetState return=0x801512760 args=0x30b356bc4,0x30b356220,0x0,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=67140 nid=eQH7nWPcAgc name=sceNpGetState return=0x8015129c1 args=0x10000000,0x30b356a90,0x1e3b3d5f2b3c0006,0x1,0x776e7f6a277d6a07,0x0
+[REMu][THREAD] raised host stack name="NexusRevolution Surveillance" guest=0x4000 host=0x200000
+[REMu][IMPORT] first_hit=67153 nid=iQw3iQPhvUQ name=sceNetCtlCheckCallback return=0x801512d2e args=0x1037c7c28,0x6,0x803529f80,0x0,0xffffffff00000000,0x0
+[REMu][NP_WEB_API2] initialized context=2 http_context=2 pool_size=0x100000
+[REMu][IMPORT] first_hit=67472 nid=ysmw6J-P8Ak name=sceNpSessionSignalingInitialize return=0x8014bd10a args=0x30b356ae0,0x2,0x0,0x1,0x129c5e63,0x1
+[REMu][IMPORT] first_hit=67488 nid=D-CzAxQL0XI name=sceUserServiceGetPlatformPrivacyWs1 return=0x800931b68 args=0x10000000,0x30b356f48,0x1e3b3d5f2b3c0006,0x1,0x776e7f6a277d6a07,0x8020c9c48
+[REMu][FAIL] nid=D-CzAxQL0XI name=sceUserServiceGetPlatformPrivacyWs1 thread="main" result=0xffffffff80960009 args=0x10000000,0x30b356f48,0x1e3b3d5f2b3c0006,0x1
+[REMu][IMPORT] first_hit=67495 nid=sjaobBgqeB4 name=sceNpUniversalDataSystemInitialize return=0x8008c1cdf args=0x30b3571b8,0x2,0x0,0x1,0x12cbb052,0x1
+[REMu][IMPORT] first_hit=67496 nid=5zBnau1uIEo name=sceNpUniversalDataSystemCreateContext return=0x8008c1d60 args=0x70cda73288,0x10000000,0x0,0x0,0x12cc7b72,0x1
+[REMu][IMPORT] first_hit=67497 nid=hT0IAEvN+M0 name=sceNpUniversalDataSystemCreateHandle return=0x8008c1dd9 args=0x70cda7328c,0x2,0x0,0x1,0x12cd5608,0x1
+[REMu][IMPORT] first_hit=67498 nid=tpFJ8LIKvPw name=sceNpUniversalDataSystemRegisterContext return=0x8008c1e53 args=0x1,0x1,0x0,0x1,0x12ce185e,0x1
+[REMu][IMPORT] first_hit=67532 nid=fZo48un7LK4 name=sceSystemServiceParamGetInt return=0x800897925 args=0x1,0x30b35738c,0x710038fac0,0x70007a5250,0x0,0x711a27ffc8
+[REMu][FAIL] nid=cmo1RIYva9o name=scePthreadMutexInit thread="main" result=0xffffffff80020016 args=0x30b356d78,0x30b356d80,0x802168b3a,0x1
+[REMu][IMPORT] first_hit=68952 nid=g2tViFIohHE name=sceAudioOut2Initialize return=0x801f5a530 args=0x30b356d8c,0x30b356d88,0x30b356d84,0x802997958,0x2cc91d80,0x1
+[REMu][AUDIO] opened host output at 48000 Hz with 2 channels
+[REMu][AUDIO2] initialized parameter=0x30b356d8c
+[REMu][IMPORT] first_hit=68965 nid=t5YrizufpQc name=sceAudioOut2ContextResetParam return=0x801f5a556 args=0x30b356c50,0x103da2a0d,0x0,0x1,0x2,0x9
+[REMu][IMPORT] first_hit=68966 nid=pDmme7Bgm6E name=sceAudioOut2ContextQueryMemory return=0x801f5a56e args=0x30b356c50,0x30b356be0,0x0,0x1,0xd00007faa43ce2a4,0x7faa43c00000
+[REMu][AUDIO2] context memory query parameter=0x30b356c50 queue_depth=4 size=0x11640
+[REMu][IMPORT] first_hit=68967 nid=0x6o1VVAYSY name=sceAudioOut2ContextCreate return=0x801f5a5bd args=0x30b356c50,0x700122e530,0x11640,0x30b356bf8,0x0,0x700122e520
+[REMu][AUDIO2] created context=1 memory=0x700122e530 size=0x11640 queue_depth=4 grain=512 parameter=SceAudioOut2ContextParam { max_ports: 256, max_object_ports: 256, guarantee_object_ports: 0, queue_depth: 4, num_grains: 512, flags: 1, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+[REMu][IMPORT] first_hit=68968 nid=xywYcRB7nbQ name=sceAudioOut2UserCreate return=0x801f5a5d4 args=0xff,0x30b356bf0,0x0,0x1,0x0,0x1
+[REMu][AUDIO2] user create=1 handle=2 user_id=0xff
+[REMu][IMPORT] first_hit=68969 nid=JK2wamZPzwM name=sceAudioOut2PortCreate return=0x801f5a619 args=0x1,0x30b356c00,0x30b356be8,0x1,0x2,0x2
+[REMu][AUDIO] opened sequence=1 port=1 user=0x0 type=0 frames=512 rate=48000 format=0x7 channels=8 encoding=Float32
+[REMu][AUDIO2] port create=1 handle=3 context=1 parameter_address=0x30b356c00 parameter=SceAudioOut2PortParam { port_type: 0, pad: 0, data_format: 2176, sampling_frequency: 48000, flags: 0, user_handle: 2, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=8 backend=Some(1) rate=48000
+[REMu][IMPORT] first_hit=68970 nid=DImz2Ft9E2g name=sceAudioOut2GetSpeakerInfo return=0x801f5a630 args=0x30b356c90,0x0,0x0,0x1,0x0,0x5
+[REMu][AUDIO2] speaker query=1 output=0x30b356c90 args=0x0,0x0,0x1,0x0,0x5
+[REMu][IMPORT] first_hit=68971 nid=gatEUKG+Ea4 name=sceAudioOut2PortGetState return=0x801f5a66b args=0x3,0x30b356ce0,0x0,0x1,0x2,0x1
+[REMu][AUDIO2] port state query=1 handle=3 exists=true output=0x30b356ce0 parameter=Some(SceAudioOut2PortParam { port_type: 0, pad: 0, data_format: 2176, sampling_frequency: 48000, flags: 0, user_handle: 2, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }) args=0x0,0x1,0x2,0x1
+[REMu][IMPORT] first_hit=68972 nid=cd+Rtw+D1x8 name=sceAudioOut2PortDestroy return=0x801f5a6b1 args=0x3,0x103da2b5a,0x0,0x8021d11e8,0x2,0x1
+[REMu][AUDIO2] port destroy=1 handle=3 existed=true parameter=Some(SceAudioOut2PortParam { port_type: 0, pad: 0, data_format: 2176, sampling_frequency: 48000, flags: 0, user_handle: 2, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] })
+[REMu][AUDIO] closed sequence=1 port=1 user=0x0 type=0 format=0x7
+[REMu][IMPORT] first_hit=68973 nid=IaZXJ9M79uo name=sceAudioOut2UserDestroy return=0x801f5a6c1 args=0x2,0x0,0x0,0x1,0x0,0x7faa43c00000
+[REMu][AUDIO2] user destroy=1 handle=2 existed=true
+[REMu][IMPORT] first_hit=68974 nid=on6ZH7Abo10 name=sceAudioOut2ContextDestroy return=0x801f5a6d1 args=0x1,0x1036fa4af,0x0,0x1,0x0,0x1
+[REMu][IMPORT] first_hit=69002 nid=dl+4eHSzUu4 name=sceAjmInitialize return=0x801f61825 args=0x0,0x70012338e8,0x0,0x70d5000000,0x800000,0x700129e9d0
+[REMu][AJM] initialized context=1 flag=0x0
+[REMu][IMPORT] first_hit=69003 nid=Q3dyFuwGn64 name=sceAjmModuleRegister return=0x801f6186a args=0x1,0x1,0x0,0xffffffff,0x2,0x1
+[REMu][AJM] registered codec=1 (ATRAC9 decoder) context=1 host_implementation=yes
+[REMu][AJM] registered codec=0 (MP3 decoder) context=1 host_implementation=yes
+[REMu][AJM] registered codec=2 (MPEG4-AAC decoder) context=1 host_implementation=yes
+[REMu][AJM] registered codec=24 (Opus decoder) context=1 host_implementation=NO - decode jobs for this codec will fail loudly
+[REMu][IMPORT] first_hit=69007 nid=bkRHEYG6lEM name=sceAjmMemoryRegister return=0x801f63108 args=0x1,0x70d5000000,0x4,0x0,0x7,0x30b356d30
+[REMu][IMPORT] first_hit=69009 nid=ZIXln2K3XMk name=sceAcmContextCreate return=0x801f646d4 args=0x700128c2f8,0x2,0x0,0x1,0x326f97d7,0x1
+[REMu][AUDIO2] initialized parameter=0x700129e8d8
+[REMu][AUDIO2] context memory query parameter=0x30b356cf0 queue_depth=8 size=0x12c80
+[REMu][AUDIO2] created context=4 memory=0x7001339320 size=0x12c80 queue_depth=8 grain=256 parameter=SceAudioOut2ContextParam { max_ports: 9, max_object_ports: 74, guarantee_object_ports: 0, queue_depth: 8, num_grains: 256, flags: 1, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }
+[REMu][AUDIO2] user create=2 handle=5 user_id=0xff
+[REMu][AUDIO] opened sequence=2 port=2 user=0x0 type=0 frames=256 rate=48000 format=0x7 channels=8 encoding=Float32
+[REMu][AUDIO2] port create=2 handle=6 context=4 parameter_address=0x70012d2f90 parameter=SceAudioOut2PortParam { port_type: 0, pad: 0, data_format: 2176, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=8 backend=Some(2) rate=48000
+[REMu][AUDIO] opened sequence=3 port=3 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=3 handle=7 context=4 parameter_address=0x70012d3480 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(3) rate=48000
+[REMu][AUDIO] opened sequence=4 port=4 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=4 handle=8 context=4 parameter_address=0x70012d3508 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(4) rate=48000
+[REMu][AUDIO] opened sequence=5 port=5 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=5 handle=9 context=4 parameter_address=0x70012d3590 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(5) rate=48000
+[REMu][AUDIO] opened sequence=6 port=6 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=6 handle=10 context=4 parameter_address=0x70012d3618 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(6) rate=48000
+[REMu][AUDIO] opened sequence=7 port=7 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=7 handle=11 context=4 parameter_address=0x70012d36a0 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(7) rate=48000
+[REMu][AUDIO] opened sequence=8 port=8 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=8 handle=12 context=4 parameter_address=0x70012d3728 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(8) rate=48000
+[REMu][AUDIO] opened sequence=16 port=16 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=16 handle=20 context=4 parameter_address=0x70012d3b68 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(16) rate=48000
+[REMu][AUDIO] opened sequence=32 port=32 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=32 handle=36 context=4 parameter_address=0x70012d43e8 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(32) rate=48000
+[REMu][AUDIO] opened sequence=64 port=64 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=64 handle=68 context=4 parameter_address=0x70012d5460 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 1, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(64) rate=48000
+[REMu][THREAD] raised host stack name="ncaPumpThread" guest=0x20000 host=0x200000
+[REMu][IMPORT] first_hit=69143 nid=-2IRUCO--PM name=sceKernelReadTsc return=0x801f5bcc3 args=0x30f8d5b40,0x3b9aca00,0x14580200000,0x7,0x3360cd5a,0x1
+[REMu][IMPORT] first_hit=69149 nid=R7d0F1g2qsU name=sceAudioOut2ContextGetQueueLevel return=0x801f5bce5 args=0x4,0x30f8d5c4c,0x30f8d5c48,0x11701,0x33638dc7,0x1
+[REMu][AUDIO2] queue level query=1 context=4 queued=0/8, available=8 outputs=0x30f8d5c4c,0x30f8d5c48 result=0x0 args=0x11701,0x33638dc7,0x1
+[REMu][AUDIO2] queue level query=2 context=4 queued=0/8, available=8 outputs=0x30f8d5bcc,0x30f8d5bc8 result=0x0 args=0x0,0xffffffff00000000,0x0
+[REMu][AUDIO2] queue level query=3 context=4 queued=0/8, available=8 outputs=0x30f8d5bcc,0x30f8d5bc8 result=0x0 args=0x0,0x2,0x1
+[REMu][IMPORT] first_hit=69224 nid=MmpF1XsQiHw name=sceAjmBatchInitialize return=0x801f61d69 args=0x7001233950,0xb1d8,0x7001233928,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=69225 nid=3cAg7xN995U name=sceAjmBatchJobGetStatistics return=0x801f61de6 args=0x7001233928,0x70012338f8,0x0,0x1,0x300007faa905195b,0x7faa90500000
+[REMu][IMPORT] first_hit=69227 nid=5tOfnaClcqM name=sceAjmBatchStart return=0x801f61e0f args=0x1,0x7001233928,0x28,0x710868fab0,0x70012338f0,0x7faa43b1c9c0
+[REMu][AUDIO2] user create=3 handle=85 user_id=0x10000000
+[REMu][AUDIO2] queue level query=4 context=4 queued=0/8, available=8 outputs=0x30f8d5c4c,0x30f8d5c48 result=0x0 args=0x11901,0x34f269b0,0x1
+[REMu][AUDIO2] queue level query=5 context=4 queued=0/8, available=8 outputs=0x30f8d5bcc,0x30f8d5bc8 result=0x0 args=0x0,0xffffffff00000000,0x0
+[REMu][AUDIO2] queue level query=6 context=4 queued=0/8, available=8 outputs=0x710868fb1c,0x710868fb18 result=0x0 args=0x11901,0x34f300e5,0x1
+[REMu][MUTEX] rejected unlock of unknown mutex thread="main" handle=0x7faaa283c000 mutex=0x30b356e78 slot=Some(0)
+An assertion fired in: E:\dev\cp11\ScreamMain\wws_shared\sdk\7_53_BP\components\wws_scream\scream\src\ps4\snd_osfuncs.cpp @ line: 410
+Assertion failed: 0
+[REMu][IMPORT] first_hit=69300 nid=8fe55ktlNVo name=sceAcmBatchStartBuffers return=0x801f649d8 args=0x1,0x1,0x710868fb20,0x0,0x700128e320,0x1037c7255
+[REMu][IMPORT] unimplemented nid=8fe55ktlNVo name=sceAcmBatchStartBuffers args=0x1,0x1,0x710868fb20,0x0,0x700128e320,0x1037c7255
+[REMu][FAIL] nid=8fe55ktlNVo name=sceAcmBatchStartBuffers thread="BPE JobWorkerThread CPU8" result=0xffffffff8002004e args=0x1,0x1,0x710868fb20,0x0
+[REMu][IMPORT] first_hit=69301 nid=8XTArSPyWHk name=sceAudioOut2PortSetAttributes return=0x801f5c309 args=0x53,0x710868fa80,0x3,0x7112d749a0,0x0,0x7faa44300000
+[REMu][AUDIO2] attributes update=1 port=83 count=3 [id=0x5/reserved=0x0/data=0x7112d749ec/size=0x4/value=0x0,id=0x1/reserved=0x0/data=0x710868fa48/size=0x4/value=0x0,id=0x0/reserved=0x0/data=0x710868fa60/size=0x8/value=0x70012f02f0]
+[REMu][AUDIO2] attributes update=2 port=84 count=3 [id=0x5/reserved=0x0/data=0x7112d74a74/size=0x4/value=0x0,id=0x1/reserved=0x0/data=0x710868fa48/size=0x4/value=0x0,id=0x0/reserved=0x0/data=0x710868fa60/size=0x8/value=0x70012f06f0]
+[REMu][AUDIO2] attributes update=3 port=6 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012d5af0]
+[REMu][AUDIO2] attributes update=4 port=43 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012e0af0]
+[REMu][AUDIO2] attributes update=5 port=80 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012ebaf0]
+[REMu][AUDIO2] attributes update=6 port=81 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x20/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012edaf0]
+[REMu][AUDIO2] attributes update=7 port=86 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x8/value=0x3f8000003f800000,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012f0af0]
+[REMu][AUDIO2] attributes update=8 port=87 count=2 [id=0x1/reserved=0x0/data=0x710868fa60/size=0x4/value=0x0,id=0x0/reserved=0x0/data=0x710868fa48/size=0x8/value=0x70012f12f0]
+[REMu][IMPORT] first_hit=69311 nid=PE2zHMqLSHs name=sceAudioOut2ContextAdvance return=0x801f5a24d args=0x4,0x2,0x700129e8d8,0x400,0x0,0xfffffffffffffcd0
+[REMu][AUDIO2] context advance=1 handle=4 args=0x2,0x700129e8d8,0x400,0x0,0xfffffffffffffcd0
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x801f403a3 space=host reason=null-address; forwarding
+[REMu][WATCH] fault registers rax=0x1 rbx=0x7faa851dc900 rcx=0x0 rdx=0x803ae4338 rdi=0x1037c7c28 rsi=0x6 rbp=0x30b356e90 rsp=0x30b356e70 r8=0xffffffff00000000 r9=0x0 r10=0x0 r11=0x82e6deebfc5097b2 r12=0x0 r13=0x803582980 r14=0x71194b3520 r15=0x70014b7430
+[REMu][WATCH] fault stack rsp=0x30b356e70 words=0x0,0x0,0x9e3779b97f4a7c15,0x801f57970,0x30b356f70,0x801f1850c,0x49,0x7faa00000001,0x9e3779b97f4a7c15,0x7001372f10,0x30b356f00,0x801edc23b,0x7afbb662,0x80211b529,0x40,0x100,0x7afbb662,0x1,0x30b356f30,0x801ec36b2,0xb81006d2,0x0,0x700120cf18,0x80,0x30b356f70,0x801f36333,0x9e3779b97f4a7c15,0xfffffffa,0x71130e11b8,0x8031052a8,0x30b3571c0,0x7faa851dc900,0x30b356f90,0x801ec2a49,0x0,0x30b357120,0x30b357390,0x8008fc2b4,0x30b3572fc,0x802a4cc80,0x7faa851dc900,0x1,0x80206b0c6,0x8020a3858,0x30b3571d0,0x103000908,0x30b357200,0x0
+/Users/xnetcat/Documents/REmu/scripts/run-with-watchdog.sh: line 165: 84339 Segmentation fault: 11  "$@"

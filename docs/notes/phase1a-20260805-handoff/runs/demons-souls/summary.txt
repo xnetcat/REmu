@@ -1,0 +1,10 @@
+revision=d3fc2f9
+game=/Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/eboot.bin
+timeout_seconds=45
+elapsed_seconds=11
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=1
+render_size=1920x1080
+render_policy=presentation-only

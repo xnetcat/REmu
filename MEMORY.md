@@ -17,10 +17,22 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Phase 1A — sync-object identity (landed 2026-08-05)
+
+- `pthread_mutex_t` / `cond_t` / `rwlock_t` are pointer typedefs (`sys/_pthreadtypes.h`). Registry
+  keys and resolve by the control-block handle written into the guest slot (`guest_sync/identity.rs`,
+  `mutex.rs`, `condition.rs`, `rwlock.rs`).
+- `SceKernelSema` create writes `write_guest_u64` (pointer-sized), not a 4-byte tear.
+- Lazily fabricated mutex path + counter **deleted** (obsoleted by handle identity).
+- Static `NULL` / adaptive mutex `1` still materialize on first use.
+- Optional `REMU_TRACE_MUTEX_ABI=1` (forwarded by `run-game.sh`).
+- Handoff: `docs/notes/phase1a-20260805-handoff/`.
+- **Not closed:** Demon's Souls / Scream still asserts (`snd_osfuncs.cpp:410` on `d3fc2f9`).
+
 ## Phase 0 counters (landed 2026-08-05)
 
 - `remu_gpu::note_inert(nid)` → FABRICATED_SUCCESS histogram; printed from `write_abi_gap_summary`.
-- Lazily fabricated mutex count in `guest_sync/mutex.rs` create branch; same report.
+- Lazily fabricated mutex counter: **removed in Phase 1A** (was `guest_sync/mutex.rs` create branch).
 - `REMU_TRACE_SHADER_OPCODES=1` histogram prints on the live ABI reporter (~15s) and clean exit
   (watchdog kill used to drop the end-of-run print).
 - Shader frequency backlog: `docs/notes/phase0-20260805-handoff/SHADER-REFUSAL-BACKLOG.md`.
@@ -29,3 +41,5 @@ registers/packets that state intent.
 
 - Void Terrarium "full diagnostic timeout" sustain (older `docs/status.md`): refuted 2026-08-05 on
   `663bc58` with ~1s SIGSEGV. Re-prove before repeating.
+- Demon's Souls "blocked on sceAcmBatchStartBuffers" was previously attributed away; on Phase 1A
+  evidence that NID is called and unimplemented — do not claim AJM/mutex alone without a fresh run.

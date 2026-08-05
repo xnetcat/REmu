@@ -4,13 +4,27 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+## Phase 1A (2026-08-05) — sync-object identity
+
+Mutex/condvar/rwlock identity follows the SDK pointer typedefs (`sys/_pthreadtypes.h`): init writes
+a real control-block handle into the guest slot; lock/unlock/wait resolve by that handle (including
+stack copies of the same handle). Kernel `SceKernelSema` create writes a full pointer-sized slot.
+Create-on-first-use mutex fabrication and its Phase 0 counter are deleted. Static `NULL` /
+adaptive-mutex `1` initializers still materialize. See `docs/notes/phase1a-20260805-handoff/`.
+
+**Anti-claim:** Demon's Souls / Scream does **not** pass yet. Clean evidence on `d3fc2f9` still
+asserts in `snd_osfuncs.cpp` (line moved 397→410) on unlock of a NULL slot; no prior HLE mutex
+init/lock was observed on that path, and `sceAcmBatchStartBuffers` remains unimplemented. Silent
+Hill no longer reports lazily fabricated mutexes (Phase 0 had 3).
+
 ## Phase 0 (2026-08-05) — instrumentation landed
 
-Hygiene/instrumentation only — see `docs/notes/phase0-20260805-handoff/`. Fabricated-success and
-lazily-fabricated-mutex counters print in the ABI gap summary; SIGSEGV/SIGBUS reporter + alt stacks
-are unconditional; `/devlog/app` is writable; evidence runs refuse dirty trees and record
-`vm.loadavg` / display mode in `run.json`. Shader opcode frequency backlog (before any shader-core
-behavior change): `docs/notes/phase0-20260805-handoff/SHADER-REFUSAL-BACKLOG.md`.
+Hygiene/instrumentation only — see `docs/notes/phase0-20260805-handoff/`. Fabricated-success
+counters print in the ABI gap summary; SIGSEGV/SIGBUS reporter + alt stacks are unconditional;
+`/devlog/app` is writable; evidence runs refuse dirty trees and record `vm.loadavg` / display mode
+in `run.json`. Shader opcode frequency backlog (before any shader-core behavior change):
+`docs/notes/phase0-20260805-handoff/SHADER-REFUSAL-BACKLOG.md`. The Phase 0 lazily-fabricated-mutex
+counter was removed by Phase 1A once identity-by-handle made that safeguard obsolete.
 
 **Live refutation:** `docs/status.md` previously said Void Terrarium sustains AGC submissions for a
 full diagnostic timeout. On revision `663bc58` (2026-08-05) it SIGSEGV'd at ~1s (`addr=0x0`). Treat
@@ -464,7 +478,7 @@ thread-local capture today, so the second option is new code, not a rewiring of 
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, `CB_COLOR_CONTROL` resolve/eliminate-fast-clear/FMASK-decompression command handling, and translated shader pipelines with cached construction. | Complete reusable blend, depth/stencil, rasterization, culling, remaining multisampling behavior, and full structural pipeline-cache identity. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, zero-copy global bindings, wave64 ballot handling on SIMD32, and observed compute geometry, with offline Metal compilation tests. | Complete the remaining RDNA2 instruction/resource/control-flow surface and eliminate residual per-draw Metal buffer churn without weakening guest-memory visibility. |
 | Presentation / frame capture | Guest display size independent of host drawable size; opt-in headless Metal; interactive runs as a regular app bundle; direct scanout without routine GPU-to-CPU round trips; asynchronous shader compilation with strict event ordering; on-disk Metal library and pipeline caches; live title-bar performance statistics. | Resolve early post-boot output into the first real scene and use completed-presentation and guest-flip rates to measure pacing. |
-| Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes and semaphores; per-thread TLS resolution; video-out attributes; save-data basics; NP service objects. | Complete opaque sync-object lifecycle, cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
+| Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes/condvars/rwlocks/semaphores keyed by SDK control-block handles (Phase 1A); per-thread TLS resolution; video-out attributes; save-data basics; NP service objects. | Close Demon's Souls / Scream beyond NULL-slot unlock (and `sceAcmBatchStartBuffers`); cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
 | Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Crackling from 15–17% audio underruns under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
 | Video / Bink | Initial AvPlayer MP4/H.264 and audio decode through ffmpeg pipes, stream enumeration, play/pause/resume/seek/loop/trick-speed state, media-clock frame gating, NV12 buffers, and deferred event callbacks, covered by generated fixtures. | Present the Unity title's intro frames and resolve its preparation/pause transition; Bink has no compatibility claim yet. |
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |
