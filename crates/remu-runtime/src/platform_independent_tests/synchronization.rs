@@ -810,6 +810,75 @@ fn mutex_stack_handle_copies_share_one_control_block() {
 }
 
 #[test]
+fn mutex_init_overwrites_a_stack_handle_copy_without_touching_canonical_storage() {
+    // Demon's Souls / Scream: CreateMutex inits into a stack local that may still hold a
+    // copied live handle from an earlier lock/unlock. Init must publish a *new* control block
+    // into that slot; refusing as "already initialized" returns a NULL handle and later unlock
+    // hits slot=Some(0).
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut storage = 0_u64;
+    let address = (&raw mut storage).addr() as u64;
+    assert_eq!(
+        crate::guest_mutex_init(
+            address,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
+        0
+    );
+    let original = storage;
+    assert_ne!(original, 0);
+
+    let mut stack_copy = original;
+    let stack_slot = (&raw mut stack_copy).addr() as u64;
+    assert_eq!(
+        crate::guest_mutex_init(
+            stack_slot,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
+        0,
+        "init into a handle-copy slot must succeed"
+    );
+    assert_ne!(stack_copy, 0);
+    assert_ne!(stack_copy, original, "overwrite publishes a distinct control block");
+    assert_eq!(storage, original, "canonical storage keeps the original handle");
+
+    assert_eq!(crate::guest_mutex_lock(stack_slot, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(stack_slot), 0);
+    assert_eq!(crate::guest_mutex_destroy(stack_slot), 0);
+    assert_eq!(stack_copy, 0);
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+    assert_eq!(storage, 0);
+}
+
+#[test]
+fn mutex_init_refuses_true_reinit_of_canonical_storage() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut storage = 0_u64;
+    let address = (&raw mut storage).addr() as u64;
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+    );
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+}
+
+#[test]
 fn mutex_static_initializer_materializes_a_control_block_on_first_lock() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
