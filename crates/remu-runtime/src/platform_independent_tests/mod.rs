@@ -382,20 +382,26 @@ fn targetless_barrier_acquire_flip_commands() -> (Vec<u32>, remu_gpu::GpuMemoryA
 fn wait_for_guest_condition_waiters(condition: u64, expected: usize) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
-        let waiting = super::guest_sync()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .conditions
-            .get(&condition)
-            .map_or(0, |entry| {
-                entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .waiters
-                    .len()
-            });
+        let waiting = {
+            let state = super::guest_sync()
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Registry is keyed by control-block handle; `condition` may be the slot address.
+            let handle = super::try_read_process_guest_u64(condition).unwrap_or(condition);
+            state
+                .conditions
+                .get(&handle)
+                .or_else(|| state.conditions.get(&condition))
+                .map_or(0, |entry| {
+                    entry
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .waiters
+                        .len()
+                })
+        };
         if waiting == expected {
             return;
         }

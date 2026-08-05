@@ -5,6 +5,14 @@ use super::{
     GUEST_CONDITION_TEST, ProbeDispatchState, sce_kernel_error, wait_for_guest_condition_waiters,
 };
 
+/// Heap-backed `pthread_*_t` slot. Sync-object identity is the control-block handle stored here
+/// (`sys/_pthreadtypes.h` pointer typedefs); synthetic absolute addresses are not mapped.
+fn pthread_slot() -> (u64, Box<u64>) {
+    let slot = Box::new(0_u64);
+    let address = (&raw const *slot).addr() as u64;
+    (address, slot)
+}
+
 #[test]
 fn semaphore_wait_honors_timeouts_and_rejects_impossible_counts() {
     let _guard = GUEST_CONDITION_TEST
@@ -168,7 +176,7 @@ fn rwlock_tracks_recursive_read_ownership_and_excludes_writers() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_0080;
+    let (address, _slot) = pthread_slot();
     assert_eq!(crate::guest_rwlock_init(address), 0);
     assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
     assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
@@ -196,7 +204,7 @@ fn rwlock_waiters_keep_the_object_live_and_reinitialization_is_fresh() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_00c0;
+    let (address, _slot) = pthread_slot();
     let invalid = u64::from(libc::EINVAL.cast_unsigned());
 
     assert_eq!(crate::guest_rwlock_init(0), invalid);
@@ -307,7 +315,7 @@ fn console_named_rwlock_entry_points_reach_the_same_lock() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_00c0;
+    let (address, _slot) = pthread_slot();
     let call = |nid: &str| dispatch_import_by_tier(nid, [address, 0, 0, 0, 0, 0]);
     assert_eq!(call("6ULAa0fq4jA"), 0);
     // The blocking acquires are the pair Dantelion2 uses; a missing one is an unimplemented
@@ -383,7 +391,7 @@ fn a_contended_console_named_write_lock_does_not_hold_the_dispatch_lock() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_01c0;
+    let (address, _slot) = pthread_slot();
     assert_eq!(
         dispatch_import_by_tier("6ULAa0fq4jA", [address, 0, 0, 0, 0, 0]),
         0
@@ -492,7 +500,7 @@ fn rwlock_keeps_reader_priority_while_a_writer_is_waiting() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_0180;
+    let (address, _slot) = pthread_slot();
     assert_eq!(crate::guest_rwlock_init(address), 0);
     assert_eq!(crate::guest_rwlock_lock(address, false, false), 0);
 
@@ -563,12 +571,11 @@ fn mutex_types_apply_gen5_same_thread_relock_semantics() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let cases = [
-        (0x7fff_0000_1100, 1, libc::EDEADLK),
-        (0x7fff_0000_1200, 3, libc::EBUSY),
-        (0x7fff_0000_1300, 4, libc::EDEADLK),
-    ];
-    for (address, mutex_type, expected) in cases {
+    let cases = [(1, libc::EDEADLK), (3, libc::EBUSY), (4, libc::EDEADLK)];
+    let mut slots = Vec::new();
+    for (mutex_type, expected) in cases {
+        let (address, slot) = pthread_slot();
+        slots.push(slot);
         assert_eq!(
             crate::guest_mutex_init(
                 address,
@@ -588,7 +595,7 @@ fn mutex_types_apply_gen5_same_thread_relock_semantics() {
         assert_eq!(crate::guest_mutex_destroy(address), 0);
     }
 
-    let recursive = 0x7fff_0000_1400;
+    let (recursive, _recursive_slot) = pthread_slot();
     assert_eq!(
         crate::guest_mutex_init(
             recursive,
@@ -615,7 +622,7 @@ fn mutex_lookup_cache_does_not_resurrect_a_destroyed_generation() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_1450;
+    let (address, _slot) = pthread_slot();
     assert_eq!(
         crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
         0
@@ -650,7 +657,7 @@ fn mutex_unlock_notifies_only_when_a_contender_is_waiting() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let address = 0x7fff_0000_1480;
+    let (address, _slot) = pthread_slot();
     assert_eq!(
         crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
         0
@@ -708,7 +715,7 @@ fn mutex_unlock_rejects_missing_and_non_owner_mutexes() {
         sce_kernel_error(crate::SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED)
     );
 
-    let mutex = 0x7fff_0000_1600;
+    let (mutex, _slot) = pthread_slot();
     assert_eq!(
         crate::guest_mutex_init(mutex, crate::PthreadMutexAttrState::default()),
         0
@@ -765,12 +772,105 @@ fn mutex_init_installs_the_guest_visible_object_libc_updates() {
 }
 
 #[test]
+fn mutex_stack_handle_copies_share_one_control_block() {
+    // Demon's Souls / Scream: init into a local, return the handle by value, then lock/unlock
+    // through pointers to distinct stack copies of that handle (SDK pointer-typedef ABI).
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut storage = 0_u64;
+    let address = (&raw mut storage).addr() as u64;
+    assert_eq!(
+        crate::guest_mutex_init(
+            address,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
+        0
+    );
+    let handle = storage;
+    assert_ne!(handle, 0);
+
+    let mut copy_a = handle;
+    let mut copy_b = handle;
+    let slot_a = (&raw mut copy_a).addr() as u64;
+    let slot_b = (&raw mut copy_b).addr() as u64;
+    assert_ne!(slot_a, slot_b);
+    assert_ne!(slot_a, address);
+
+    assert_eq!(crate::guest_mutex_lock(slot_a, false), 0);
+    assert_eq!(crate::guest_mutex_lock(slot_b, false), 0, "recursive via handle copy");
+    assert_eq!(crate::guest_mutex_unlock(slot_b), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(slot_a), 0);
+    assert_eq!(storage, 0);
+    assert_eq!(copy_a, 0);
+}
+
+#[test]
+fn mutex_static_initializer_materializes_a_control_block_on_first_lock() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut storage = 0_u64;
+    let address = (&raw mut storage).addr() as u64;
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_ne!(storage, 0, "PTHREAD_MUTEX_INITIALIZER publishes a real handle");
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+    assert_eq!(storage, 0);
+}
+
+#[test]
+fn condition_init_writes_a_control_block_handle() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut storage = 0_u64;
+    let address = (&raw mut storage).addr() as u64;
+    assert_eq!(crate::guest_condition_init(address), 0);
+    assert_ne!(storage, 0);
+    let handle = storage;
+    assert_eq!(crate::guest_condition_destroy(handle), 0);
+    assert_eq!(storage, 0);
+}
+
+#[test]
+fn kernel_semaphore_create_writes_a_pointer_sized_handle() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut storage = 0_u64;
+    let output = (&raw mut storage).addr() as u64;
+    // Leave upper bytes non-zero so a 4-byte write would leave a torn pointer-sized slot.
+    storage = 0xffff_ffff_ffff_ffff;
+    assert_eq!(
+        crate::dispatch_guest_sync_import(
+            "188x57JYp0g",
+            [output, 0, 0, 0, 1, 1],
+            None
+        ),
+        0
+    );
+    assert_ne!(storage, 0);
+    assert_eq!(storage >> 32, 0, "create must clear the full 8-byte SceKernelSema slot");
+    let handle = storage as u32;
+    assert_eq!(
+        crate::dispatch_guest_sync_import("R1Jvn8bSCW8", [storage, 0, 0, 0, 0, 0], None),
+        0
+    );
+    let _ = handle;
+}
+
+#[test]
 fn timed_condition_wait_reacquires_the_guest_mutex_before_returning() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let condition = 0x7fff_0000_0100;
-    let mutex = 0x7fff_0000_0200;
+    let (condition, _condition_slot) = pthread_slot();
+    let (mutex, _mutex_slot) = pthread_slot();
     assert_eq!(crate::guest_condition_init(condition), 0);
     assert_eq!(
         crate::guest_mutex_init(
@@ -801,7 +901,8 @@ fn timed_condition_wait_reacquires_the_guest_mutex_before_returning() {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(state.conditions.get(&condition).is_some_and(|entry| {
+        let handle = crate::try_read_process_guest_u64(condition).unwrap_or(condition);
+        assert!(state.conditions.get(&handle).is_some_and(|entry| {
             entry
                 .state
                 .lock()
@@ -822,8 +923,8 @@ fn condition_wait_delivers_interruption_before_reacquiring_guest_mutex() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     const THREAD: u64 = 0x7fff_3000;
-    let condition = 0x7fff_0000_0500;
-    let mutex = 0x7fff_0000_0600;
+    let (condition, _condition_slot) = pthread_slot();
+    let (mutex, _mutex_slot) = pthread_slot();
     assert_eq!(crate::guest_condition_init(condition), 0);
     assert_eq!(
         crate::guest_mutex_init(mutex, crate::PthreadMutexAttrState::default()),
@@ -902,8 +1003,8 @@ fn condition_wait_errors_use_the_selected_pthread_abi() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let condition = 0x7fff_0000_0900;
-    let mutex = 0x7fff_0000_0a00;
+    let (condition, _condition_slot) = pthread_slot();
+    let (mutex, _mutex_slot) = pthread_slot();
     assert_eq!(crate::guest_condition_init(condition), 0);
     assert_eq!(
         crate::guest_mutex_init(mutex, crate::PthreadMutexAttrState::default()),
@@ -926,8 +1027,8 @@ fn condition_signal_wakes_exactly_one_blocked_guest_thread() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let condition = 0x7fff_0000_1100;
-    let mutex = 0x7fff_0000_1200;
+    let (condition, _condition_slot) = pthread_slot();
+    let (mutex, _mutex_slot) = pthread_slot();
     assert_eq!(crate::guest_condition_init(condition), 0);
     assert_eq!(
         crate::guest_mutex_init(mutex, crate::PthreadMutexAttrState::default()),
@@ -946,31 +1047,7 @@ fn condition_signal_wakes_exactly_one_blocked_guest_thread() {
         })
         .collect::<Vec<_>>();
     drop(finished);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let waiting = crate::guest_sync()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .conditions
-            .get(&condition)
-            .map_or(0, |entry| {
-                entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .waiters
-                    .len()
-            });
-        if waiting == 2 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "guest waiters did not block"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_guest_condition_waiters(condition, 2);
 
     assert_eq!(
         crate::dispatch_guest_sync_import("kDh-NfxgMtE", [condition, 0, 0, 0, 0, 0], None),
@@ -1008,8 +1085,8 @@ fn condition_signal_allows_exactly_one_predicate_guarded_task_consumption() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let condition = 0x7fff_0000_1900;
-    let mutex = 0x7fff_0000_1a00;
+    let (condition, _condition_slot) = pthread_slot();
+    let (mutex, _mutex_slot) = pthread_slot();
     assert_eq!(crate::guest_condition_init(condition), 0);
     assert_eq!(
         crate::guest_mutex_init(mutex, crate::PthreadMutexAttrState::default()),
@@ -1077,8 +1154,8 @@ fn selected_condition_waiter_survives_legal_condition_destruction() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let condition = 0x7fff_0000_2100;
-    let mutex = 0x7fff_0000_2200;
+    let (condition, _condition_slot) = pthread_slot();
+    let (mutex, _mutex_slot) = pthread_slot();
     assert_eq!(crate::guest_condition_init(condition), 0);
     assert_eq!(
         crate::guest_mutex_init(mutex, crate::PthreadMutexAttrState::default()),
@@ -1098,31 +1175,7 @@ fn selected_condition_waiter_survives_legal_condition_destruction() {
             .expect("waiter acquired guest mutex"),
         "locked"
     );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let waiting = crate::guest_sync()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .conditions
-            .get(&condition)
-            .map_or(0, |entry| {
-                entry
-                    .state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .waiters
-                    .len()
-            });
-        if waiting == 1 {
-            break;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "guest waiter did not block"
-        );
-        std::thread::yield_now();
-    }
+    wait_for_guest_condition_waiters(condition, 1);
 
     assert_eq!(crate::guest_mutex_lock(mutex, false), 0);
     assert_eq!(
