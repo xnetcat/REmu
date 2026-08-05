@@ -17,8 +17,10 @@ use remu_gpu::{
     GpuWaitId,
 };
 use remu_memory::{
-    CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_shared_mapping_identity,
-    notify_guest_memory_written, read_guest_shared_backing, write_guest_shared_backing_if_identity,
+    CpuWriteWatch, GuestSharedMappingIdentity, GuestWriteSite, guest_publish_release_fence,
+    guest_shared_mapping_identity, load_guest_shared_u64, notify_guest_memory_written,
+    publish_guest_shared_u32_if_identity, publish_guest_shared_u64_if_identity,
+    store_guest_visible_u32, store_guest_visible_u64, write_guest_shared_backing_if_identity,
 };
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -1246,42 +1248,32 @@ fn apply_guest_memory_operation_direct(
     operation: &GuestMemoryWriteOperation,
 ) -> Result<(), String> {
     match operation {
-        GuestMemoryWriteOperation::Release(release) => {
-            // SAFETY: the caller pins the original mapping against replacement for the duration
-            // of this operation. Validation proves the destination alignment.
-            unsafe {
-                match release.value {
-                    GpuMemoryReleaseValue::Immediate32(value) => {
-                        std::ptr::write_volatile(release.address as *mut u32, value);
-                    }
-                    GpuMemoryReleaseValue::Immediate64(value) => {
-                        std::ptr::write_volatile(release.address as *mut u64, value);
-                    }
-                    GpuMemoryReleaseValue::Timestamp => {
-                        std::ptr::write_volatile(release.address as *mut u64, gpu_timestamp());
-                    }
-                }
+        GuestMemoryWriteOperation::Release(release) => match release.value {
+            GpuMemoryReleaseValue::Immediate32(value) => {
+                store_guest_visible_u32(release.address, value);
             }
-        }
+            GpuMemoryReleaseValue::Immediate64(value) => {
+                store_guest_visible_u64(release.address, value);
+            }
+            GpuMemoryReleaseValue::Timestamp => {
+                store_guest_visible_u64(release.address, gpu_timestamp());
+            }
+        },
         GuestMemoryWriteOperation::Write(write) => {
-            // SAFETY: the caller pins the original mapping against replacement for the duration
-            // of this operation. Validation proves every destination is aligned and bounded.
-            unsafe {
-                for (index, value) in write.values.iter().copied().enumerate() {
-                    let offset = if write.increment_address {
-                        u64::try_from(index)
-                            .map_err(|_| "WRITE_DATA index does not fit u64")?
-                            .checked_mul(4)
-                            .ok_or("WRITE_DATA destination offset overflowed")?
-                    } else {
-                        0
-                    };
-                    let address = write
-                        .address
-                        .checked_add(offset)
-                        .ok_or("WRITE_DATA destination range overflowed")?;
-                    std::ptr::write_volatile(address as *mut u32, value);
-                }
+            for (index, value) in write.values.iter().copied().enumerate() {
+                let offset = if write.increment_address {
+                    u64::try_from(index)
+                        .map_err(|_| "WRITE_DATA index does not fit u64")?
+                        .checked_mul(4)
+                        .ok_or("WRITE_DATA destination offset overflowed")?
+                } else {
+                    0
+                };
+                let address = write
+                    .address
+                    .checked_add(offset)
+                    .ok_or("WRITE_DATA destination range overflowed")?;
+                store_guest_visible_u32(address, value);
             }
         }
         GuestMemoryWriteOperation::Fill {
@@ -1310,26 +1302,57 @@ fn apply_guest_memory_operation_direct(
                     "DMA fill destination {address:#x}+{byte_count:#x} is not one live mapping"
                 ));
             }
-            // SAFETY: the range above resolved to one live shared mapping covering every byte,
-            // and the caller pins that mapping against replacement for the write.
-            unsafe {
-                for index in 0..*dword_count {
-                    let offset = index
-                        .checked_mul(4)
-                        .ok_or("DMA fill destination offset overflowed")?;
-                    std::ptr::write_volatile((*address + offset) as *mut u32, *value);
-                }
+            for index in 0..*dword_count {
+                let offset = index
+                    .checked_mul(4)
+                    .ok_or("DMA fill destination offset overflowed")?;
+                store_guest_visible_u32(*address + offset, *value);
             }
         }
         GuestMemoryWriteOperation::Copy { address, bytes } => {
-            // SAFETY: the caller pins the original mapping against replacement for the duration
-            // of this operation, and validation bounded the destination range.
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), *address as *mut u8, bytes.len());
+            if let Some(value) = label_word_from_bytes(*address, bytes) {
+                match value {
+                    LabelWord::U32(value) => store_guest_visible_u32(*address, value),
+                    LabelWord::U64(value) => store_guest_visible_u64(*address, value),
+                }
+            } else {
+                // SAFETY: the caller pins the original mapping against replacement for the duration
+                // of this operation, and validation bounded the destination range.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), *address as *mut u8, bytes.len());
+                }
             }
         }
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum LabelWord {
+    U32(u32),
+    U64(u64),
+}
+
+fn label_word_from_bytes(address: u64, bytes: &[u8]) -> Option<LabelWord> {
+    match bytes.len() {
+        4 if address.is_multiple_of(4) => {
+            Some(LabelWord::U32(u32::from_le_bytes(bytes.try_into().ok()?)))
+        }
+        8 if address.is_multiple_of(8) => {
+            Some(LabelWord::U64(u64::from_le_bytes(bytes.try_into().ok()?)))
+        }
+        _ => None,
+    }
+}
+
+fn is_ordered_label_publication(operation: &GuestMemoryWriteOperation) -> bool {
+    match operation {
+        GuestMemoryWriteOperation::Release(_) | GuestMemoryWriteOperation::Write(_) => true,
+        GuestMemoryWriteOperation::Copy { address, bytes } => {
+            label_word_from_bytes(*address, bytes).is_some()
+        }
+        GuestMemoryWriteOperation::Fill { .. } => false,
+    }
 }
 
 fn write_shared_identity_bytes(
@@ -1348,6 +1371,23 @@ fn write_shared_identity_bytes(
             .checked_add(offset)
             .ok_or("deferred guest memory backing offset overflowed")?,
     };
+    if let Some(value) = label_word_from_bytes(destination, bytes) {
+        let published = match value {
+            LabelWord::U32(value) => {
+                publish_guest_shared_u32_if_identity(destination, expected, value)
+            }
+            LabelWord::U64(value) => {
+                publish_guest_shared_u64_if_identity(destination, expected, value)
+            }
+        };
+        if published {
+            return Ok(());
+        }
+        return Err(format!(
+            "deferred guest memory mapping changed before completion address={destination:#x} bytes={}",
+            bytes.len()
+        ));
+    }
     if write_guest_shared_backing_if_identity(destination, expected, bytes) {
         Ok(())
     } else {
@@ -1358,33 +1398,73 @@ fn write_shared_identity_bytes(
     }
 }
 
+fn write_shared_identity_u32(
+    address: u64,
+    identity: GuestSharedMappingIdentity,
+    offset: u64,
+    value: u32,
+) -> Result<(), String> {
+    let destination = address
+        .checked_add(offset)
+        .ok_or("deferred guest memory destination overflowed")?;
+    let expected = GuestSharedMappingIdentity {
+        backing_id: identity.backing_id,
+        backing_offset: identity
+            .backing_offset
+            .checked_add(offset)
+            .ok_or("deferred guest memory backing offset overflowed")?,
+    };
+    if publish_guest_shared_u32_if_identity(destination, expected, value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "deferred guest memory mapping changed before completion address={destination:#x} bytes=4"
+        ))
+    }
+}
+
+fn write_shared_identity_u64(
+    address: u64,
+    identity: GuestSharedMappingIdentity,
+    value: u64,
+) -> Result<(), String> {
+    if publish_guest_shared_u64_if_identity(address, identity, value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "deferred guest memory mapping changed before completion address={address:#x} bytes=8"
+        ))
+    }
+}
+
 fn apply_guest_memory_operation_shared(
     operation: &GuestMemoryWriteOperation,
     identity: GuestSharedMappingIdentity,
 ) -> Result<(), String> {
     let (address, _) = operation.range();
     match operation {
-        GuestMemoryWriteOperation::Release(release) => {
-            let bytes = match release.value {
-                GpuMemoryReleaseValue::Immediate32(value) => value.to_le_bytes().to_vec(),
-                GpuMemoryReleaseValue::Immediate64(value) => value.to_le_bytes().to_vec(),
-                GpuMemoryReleaseValue::Timestamp => gpu_timestamp().to_le_bytes().to_vec(),
-            };
-            write_shared_identity_bytes(address, identity, 0, &bytes)
-        }
-        GuestMemoryWriteOperation::Write(write) if write.increment_address => {
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(write.values.len().saturating_mul(4))
-                .map_err(|error| format!("could not stage WRITE_DATA values: {error}"))?;
-            for value in &write.values {
-                bytes.extend_from_slice(&value.to_le_bytes());
+        GuestMemoryWriteOperation::Release(release) => match release.value {
+            GpuMemoryReleaseValue::Immediate32(value) => {
+                write_shared_identity_u32(address, identity, 0, value)
             }
-            write_shared_identity_bytes(address, identity, 0, &bytes)
-        }
+            GpuMemoryReleaseValue::Immediate64(value) => {
+                write_shared_identity_u64(address, identity, value)
+            }
+            GpuMemoryReleaseValue::Timestamp => {
+                write_shared_identity_u64(address, identity, gpu_timestamp())
+            }
+        },
         GuestMemoryWriteOperation::Write(write) => {
-            for value in &write.values {
-                write_shared_identity_bytes(address, identity, 0, &value.to_le_bytes())?;
+            for (index, value) in write.values.iter().copied().enumerate() {
+                let offset = if write.increment_address {
+                    u64::try_from(index)
+                        .map_err(|_| "WRITE_DATA index does not fit u64")?
+                        .checked_mul(4)
+                        .ok_or("WRITE_DATA destination offset overflowed")?
+                } else {
+                    0
+                };
+                write_shared_identity_u32(address, identity, offset, value)?;
             }
             Ok(())
         }
@@ -1423,6 +1503,7 @@ fn apply_guest_memory_operation_shared(
 pub(crate) fn apply_pending_guest_memory_writes(
     pending: &[PendingGuestMemoryWrite],
 ) -> Result<(), String> {
+    let mut published_unordered_payload = false;
     for pending_write in pending {
         validate_guest_memory_operation(&pending_write.operation)?;
         let (pixel_pipe_trace, query_completion_trace) = match pending_write.operation {
@@ -1437,6 +1518,13 @@ pub(crate) fn apply_pending_guest_memory_writes(
         let observed_before = (pixel_pipe_trace.is_some() || query_completion_trace.is_some())
             .then(|| observe_pending_guest_memory_release(pending_write))
             .flatten();
+        let label_publication = is_ordered_label_publication(&pending_write.operation);
+        if label_publication && published_unordered_payload {
+            // Payload bytes become guest-visible only when the following label publishes. The
+            // large memcpy path cannot carry a per-store release, so order it here explicitly.
+            guest_publish_release_fence();
+            published_unordered_payload = false;
+        }
         let result = if let Some(identity) = pending_write.mapping_identity {
             apply_guest_memory_operation_shared(&pending_write.operation, identity)
         } else if let Some(write_watch) = pending_write.write_watch.as_ref() {
@@ -1457,6 +1545,9 @@ pub(crate) fn apply_pending_guest_memory_writes(
                 "deferred guest memory write has no mapping lifetime guard address={address:#x} bytes={byte_count}"
             ))
         };
+        if result.is_ok() && !label_publication {
+            published_unordered_payload = true;
+        }
         if result.is_ok() {
             let (address, byte_count) = pending_write.range();
             let (payload, payload_length) = pending_write.operation.journal_payload();
@@ -1524,15 +1615,10 @@ fn observe_pending_guest_memory_release(pending: &PendingGuestMemoryWrite) -> Op
         return None;
     };
     if pending.mapping_identity.is_some() {
-        let mut bytes = [0_u8; 8];
-        return read_guest_shared_backing(address, &mut bytes).then(|| u64::from_le_bytes(bytes));
+        return load_guest_shared_u64(address);
     }
     let write_watch = pending.write_watch.as_ref()?;
     write_watch
-        .with_live_mapping(|| {
-            // SAFETY: the write watch pins this aligned eight-byte guest range against replacement
-            // for the complete diagnostic read.
-            unsafe { std::ptr::read_volatile(address as *const u64) }
-        })
+        .with_live_mapping(|| remu_memory::load_guest_visible_u64(address))
         .ok()
 }

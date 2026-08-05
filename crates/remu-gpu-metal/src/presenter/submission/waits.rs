@@ -360,14 +360,12 @@ impl GuestMemoryWaitTracker {
 }
 
 pub(crate) fn read_guest_memory_wait_value(wait: GpuMemoryWait) -> u64 {
-    // SAFETY: execute_guest_memory_wait validates the non-null address and required alignment
-    // before calling this helper. The runtime retains the guest mapping while its ordered GPU
-    // events are pending. Volatile access observes label writes from guest CPU threads.
-    unsafe {
-        if wait.is_64_bit {
-            std::ptr::read_volatile(wait.address as *const u64)
-        } else {
-            u64::from(std::ptr::read_volatile(wait.address as *const u32))
-        }
+    // execute_guest_memory_wait validates the non-null address and required alignment before
+    // calling this helper. Acquire loads pair with release label publication so a satisfied wait
+    // observes the payload that the label was ordered after.
+    if wait.is_64_bit {
+        remu_memory::load_guest_visible_u64(wait.address)
+    } else {
+        u64::from(remu_memory::load_guest_visible_u32(wait.address))
     }
 }

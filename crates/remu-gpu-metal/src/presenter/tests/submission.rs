@@ -3277,7 +3277,7 @@ fn ordered_guest_label_writes_publish_only_the_declared_values() {
     );
     apply_pending_guest_memory_writes(&[release, write, fill]).expect("ordered guest writes");
     assert_eq!(
-        unsafe { std::ptr::read_volatile(release_address as *const u64) },
+        remu_memory::load_guest_visible_u64(release_address),
         0x1122_3344_5566_7788
     );
     assert_eq!(
@@ -3287,6 +3287,35 @@ fn ordered_guest_label_writes_publish_only_the_declared_values() {
     assert_eq!(
         unsafe { std::slice::from_raw_parts(fill_address as *const u32, 3) },
         [0xaabb_ccdd; 3]
+    );
+}
+
+#[test]
+fn payload_then_label_publishes_with_release_ordering() {
+    let (_space, base) = mapped_test_pages(1);
+    let payload_address = base;
+    let label_address = base + 64;
+    let fill = pin_guest_memory_write(GuestMemoryWriteOperation::Fill {
+        address: payload_address,
+        value: 0x1111_2222,
+        dword_count: 8,
+    })
+    .expect("pin payload fill");
+    let release = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease {
+        address: label_address,
+        value: GpuMemoryReleaseValue::Immediate64(0xabcd_ef01_2345_6789),
+    }))
+    .expect("pin release label");
+    assert!(fill.mapping_identity.is_some());
+    assert!(release.mapping_identity.is_some());
+    apply_pending_guest_memory_writes(&[fill, release]).expect("payload then label");
+    assert_eq!(
+        unsafe { std::slice::from_raw_parts(payload_address as *const u32, 8) },
+        [0x1111_2222; 8]
+    );
+    assert_eq!(
+        remu_memory::load_guest_visible_u64(label_address),
+        0xabcd_ef01_2345_6789
     );
 }
 
