@@ -14,10 +14,17 @@ Any new `unsafe` block or `unsafe fn` **outside** `crates/remu-memory` must incl
 2. **Enforcer** — which code establishes and maintains that invariant (a validated
    `GuestAccessPin` / `GuestPtr` / `GuestSlice`, a Metal buffer length wrapper, a lock held across
    the borrow, a type that owns the allocation, an SDK-backed layout constant, …).
+3. **Ordering** — when the operation publishes or observes guest-visible shared state (GPU labels,
+   HLE sync words, sideband results, other cross-thread guest memory), name the memory-ordering
+   contract: release publication of payload before label, acquire observation of a label, or an
+   explicit `guest_publish_release_fence` between unordered payload stores and the label store.
+   Prefer the shared `remu-memory` word accessors (`store_guest_visible_u64` /
+   `publish_guest_shared_u64_if_identity` / `load_guest_visible_u64`) over ad-hoc `memcpy` or
+   un-ordered volatile stores of fence labels.
 
-If either half cannot be named, the change does not land as raw `unsafe`. Prefer a checked helper
-in `remu-memory` (guest pointers) or an existing length-checked wrapper (e.g. gpu-metal
-`MetalBytes`) over another one-off `from_raw_parts`.
+If either the invariant or enforcer half cannot be named, the change does not land as raw `unsafe`.
+Prefer a checked helper in `remu-memory` (guest pointers / ordered word publication) or an existing
+length-checked wrapper (e.g. gpu-metal `MetalBytes`) over another one-off `from_raw_parts`.
 
 ## Applies to
 
