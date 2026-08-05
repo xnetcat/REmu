@@ -7727,6 +7727,10 @@ fn guest_tls_get_addr(descriptor: u64) -> u64 {
 }
 
 fn write_guest_u64(address: u64, value: u64) {
+    if address.is_multiple_of(8) {
+        remu_memory::store_guest_visible_u64(address, value);
+        return;
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe {
         std::ptr::write_unaligned(address as *mut u64, value);
@@ -7762,6 +7766,9 @@ fn read_guest_u32(address: u64) -> u32 {
             return u32::from_le_bytes(bytes);
         }
     }
+    if address.is_multiple_of(4) {
+        return remu_memory::load_guest_visible_u32(address);
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u32) }
 }
@@ -7772,6 +7779,9 @@ fn read_guest_u64(address: u64) -> u64 {
         if ProcessGuestMemory.read(address, &mut bytes) {
             return u64::from_le_bytes(bytes);
         }
+    }
+    if address.is_multiple_of(8) {
+        return remu_memory::load_guest_visible_u64(address);
     }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe { std::ptr::read_unaligned(address as *const u64) }
@@ -7785,6 +7795,10 @@ fn write_guest_u8(address: u64, value: u8) {
 }
 
 fn write_guest_u32(address: u64, value: u32) {
+    if address.is_multiple_of(4) {
+        remu_memory::store_guest_visible_u32(address, value);
+        return;
+    }
     // SAFETY: HLE calls use guest pointers into the process's live mapped address space.
     unsafe {
         std::ptr::write_unaligned(address as *mut u32, value);
