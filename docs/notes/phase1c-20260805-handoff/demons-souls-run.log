@@ -1,0 +1,89 @@
+[REMu] acquiring shared build lock: /Users/xnetcat/Documents/REmu/target/.remu-build.lock
+[REMu] held shared build lock
+[REMu] host vm.loadavg: { 4.01 3.13 3.25 }
+[REMu] launching PPSA01342-app0; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1c/20260805T214009Z-PPSA01342-app0
+[REMu] render resolution: 1920x1080 (presentation-only)
+[REMu] warning: no guest-native resolution hook was found; only presentation is 1920x1080
+[REMu] automatic shutdown after 45s (pass 0 to disable)
+[REMu] external launch watchdog after 50s
+[REMu] headless Metal presenter enabled
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5013 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=0 deferred=0 published=0 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=0/0 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-TEXTURE] snapshot=0/0.0MiB/0.0ms/0unstable dirty_validate=0/0.0MiB/0.0ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=0/0MiB guest=0MiB metal=33/18187MiB watches=0 hit=0 miss=0 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=0 capacity_evict=0 depth_native=0 alias_writeback=0/0.0MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=0.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/0 layered-depth-alias=0/0 sampled-alias=0/0
+[REMu][PERF-TEXTURE-OWNED] live=0 stale=0 owned=0.0MiB/0 runs debt=0.0MiB survived=0 demoted=0 reclaim_discard=0 rematerialise=0/0/0/0 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=0/0.0MiB targets=0/0.0MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=0/0.0MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=0.0MiB other=33.0MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:0/0.0MiB,cpu:0/0.0MiB mapping=active:0/0.0MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:0/+0versions,spans:0/+0duplicates,unresolved:0/0.0MiB top=[]
+[REMu][PERF-GLOBAL-CACHE] captured=0/0.0MiB identity=0/0.0MiB
+[REMu][AUDIO2] speaker query=1024 output=0x710868f970 args=0x0,0x0,0x1,0xd00007fd6009b00c,0x7fd600900000
+[REMu][AUDIO2] context advance=2048 handle=4 args=0x2,0x700129ed58,0x400,0x0,0xfffffffffffffcd0
+[REMu][AUDIO2] context push=2048 handle=4 buffers=9 args=0x0,0x170000001700,0x700129ed58,0x2,0x10
+[REMu][FAIL] nid=u70oWo92SYQ name=sceAcm_ConvReverb_SharedInput thread="BPE JobWorkerThread CPU12" result=0xffffffff8002004e args=0x710867b230,0x1,0x711365f5b8,0x1
+[00:00:22.38 ERROR-General] DebugMenuCreateItem could not find concommand "cpuMarkerLevel"
+[00:00:22.38 ERROR-General] DebugMenuCreateItem could not find concommand "profileLoading_Print"
+[REMu][IMPORT] first_hit=695718 nid=Vo5V8KAwCmk name=sceSystemServiceHideSplashScreen return=0x800bc9d61 args=0x70e0800000,0x309d22970,0x309d22ac8,0x70e12160d8,0x71086cfb30,0x71154fffc8
+[REMu][SYSTEM] system splash hidden by guest
+[MSG-Init] Starting main loop: 22.4988s
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x303030303030303 pc=0x800891bcf space=host reason=no-watch-snapshot; forwarding
+[REMu][WATCH] fault registers rax=0x303030303030303 rbx=0x7109e7ee80 rcx=0x309d1ff38 rdx=0x4 rdi=0x803104fb8 rsi=0x0 rbp=0x710863fee0 rsp=0x710863fe70 r8=0x800870b80 r9=0x2 r10=0x5555555555555555 r11=0x2d00 r12=0x30 r13=0x7fd624d47980 r14=0x70e0800000 r15=0x0
+[REMu][WATCH] fault stack rsp=0x710863fe70 words=0x202,0x7fd6595d8000,0x0,0x1,0x7fd624d47980,0x2d00,0x5555555555555555,0x2,0x9e3779b97f4a7c15,0x70e1216248,0x30,0x7fd624d47980,0x70e0800000,0x0,0x710863ff10,0x800bb58ee,0x800bb5890,0x7108a00000,0x7108d7b4b8,0x3,0x710863ff80,0x80086f87e,0x7108dcc7b8,0x877359400,0x0,0x800864cf9,0x710863ff80,0x3,0x9e3779b97f4a7c15,0x7108a00000,0x7fd624d47980,0x1,0x710863ff98,0x7108d7b4b8,0x710863ffd0,0x80086e93b,0x7fd624d47980,0x7108d7b4b8,0x9e3779b97f4a7c15,0x7108d92530,0x0,0x0,0x0,0x0,0x710863fff0,0x800865046,0x800865010,0x0
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x303030303090beb pc=0x800a08fcc space=host reason=no-watch-snapshot; forwarding
+[REMu][WATCH] fault registers rax=0x7000bd1790 rbx=0x7108a00000 rcx=0x70e2c7dd80 rdx=0x303030303090be3 rdi=0x7000bd1790 rsi=0x0 rbp=0x710865ff10 rsp=0x710865fed8 r8=0x800870b80 r9=0x2 r10=0x5555555555555555 r11=0x3480 r12=0x40 r13=0x7fd624d47980 r14=0x7113080000 r15=0x4
+[REMu][WATCH] fault stack rsp=0x710865fed8 words=0x8008f3108,0x802109a65,0x28038000,0x7108a00000,0x40,0x7108d7b7d8,0x4,0x710865ff80,0x80086f899,0x7108dcc7b8,0x1077359400,0x0,0x800864cf9,0x710865ff80,0x4,0x9e3779b97f4a7c15,0x7108a00000,0x7fd624d47980,0x1,0x710865ff98,0x7108d7b7d8,0x710865ffd0,0x80086e93b,0x7fd624d47980,0x7108d7b7d8,0x9e3779b97f4a7c15,0x7108d92b40,0x0,0x0,0x0,0x0,0x710865fff0,0x800865046,0x800865010,0x0,0x0,0x10264e5ad,0x7149f2ca7149f2ca,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0
+/Users/xnetcat/Documents/REmu/scripts/run-with-watchdog.sh: line 165: 25770 Segmentation fault: 11  "$@"
+revision=1aa4d5b
+game=/Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/eboot.bin
+timeout_seconds=45
+elapsed_seconds=26
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=5
+render_size=1920x1080
+render_policy=presentation-only
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=25 total_calls=2343
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=1819
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=452
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=28
+[REMu][REPORT] fabricated success key=eQH7nWPcAgc name=sceNpGetState calls=10
+[REMu][REPORT] fabricated success key=6xVpy0Fdq+I name=_sigprocmask calls=5
+[REMu][REPORT] fabricated success key=Xs9hdiD7sAA name=pthread_setschedparam calls=4
+[REMu][REPORT] fabricated success key=gky0+oaNM4k name=sceNetCtlInit calls=3
+[REMu][REPORT] fabricated success key=3JCe3lCbQ8A name=sceHttp2Init calls=2
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=2
+[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=2
+[REMu][REPORT] fabricated success key=-hJRce8wn1U name=sce::Json::MemAllocator::MemAllocator calls=1
+[REMu][REPORT] fabricated success key=3pcAvmwKCvM name=sceSystemGestureInitializePrimitiveTouchRecognizer calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=99b82IKXpH4 name=sceAppContentAppParamGetInt calls=1
+[REMu][REPORT] fabricated success key=FWF8zkhr854 name=sceSystemGestureCreateTouchRecognizer calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=ZIXln2K3XMk name=sceAcmContextCreate calls=1
+[REMu][REPORT] fabricated success key=cK6bYHf-Q5E name=sce::Json::Initializer::Initializer calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=qQJfO8HAiaY name=sceNpRegisterStateCallbackA calls=1
+[REMu][REPORT] fabricated success key=qpo-mEOwje0 name=sceSystemGestureOpen calls=1
+[REMu][REPORT] fabricated success key=ysmw6J-P8Ak name=sceNpSessionSignalingInitialize calls=1
+[REMu][REPORT] unimplemented import nid=8fe55ktlNVo name=sceAcmBatchStartBuffers calls=1794
+[REMu][REPORT] unimplemented import nid=GgFMb22sbbI name=sceSystemGestureUpdatePrimitiveTouchRecognizer calls=1
+[REMu][REPORT] unimplemented import nid=h8uongcBNVs name=sceSystemGestureGetTouchEventsCount calls=1
+[REMu][REPORT] unimplemented import nid=j4h82CQWENo name=sceSystemGestureUpdateTouchRecognizer calls=1
+[REMu][REPORT] unimplemented import nid=u70oWo92SYQ name=sceAcm_ConvReverb_SharedInput calls=596
+[REMu][REPORT] failing import name=sceAcmBatchStartBuffers nid=8fe55ktlNVo failures=1794 calls=1794 results=0xffffffff8002004e:1794
+[REMu][REPORT] failing import name=sceAcm_ConvReverb_SharedInput nid=u70oWo92SYQ failures=596 calls=596 results=0xffffffff8002004e:596
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=3 calls=16 results=0xffffffff80020002:3
+[REMu][REPORT] failing import name=sceUserServiceGetPlatformPrivacyWs1 nid=D-CzAxQL0XI failures=1 calls=1 results=0xffffffff80960009:1
+[REMu][REPORT] failing import name=sceSystemGestureUpdatePrimitiveTouchRecognizer nid=GgFMb22sbbI failures=1 calls=1 results=0xffffffff8002004e:1
+[REMu][REPORT] failing import name=sceSystemGestureGetTouchEventsCount nid=h8uongcBNVs failures=1 calls=1 results=0xffffffff8002004e:1
+[REMu][REPORT] failing import name=sceSystemGestureUpdateTouchRecognizer nid=j4h82CQWENo failures=1 calls=1 results=0xffffffff8002004e:1
+[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1c/20260805T214009Z-PPSA01342-app0

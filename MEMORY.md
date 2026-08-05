@@ -17,6 +17,19 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Phase 1C — ordered publication (CLOSED 2026-08-05)
+
+- Labels: aligned `publish_guest_shared_u64_if_identity` / `store_guest_visible_u64` release stores
+  — not `write_guest_shared_backing` memcpy of 8 bytes (`submission/memory.rs` shared Release path).
+- Payload→label: `guest_publish_release_fence` before the next label-shaped publish in
+  `apply_pending_guest_memory_writes`.
+- Word baseline guard: `guarded_backing_write` CAS for 4/8-byte runs (`shared.rs`).
+- HLE: aligned `write_guest_u32/u64` / `read_guest_u32/u64` → same accessors (`lib.rs`).
+- `docs/review-unsafe.md` SAFETY checklist includes ordering.
+- Handoff: `docs/notes/phase1c-20260805-handoff/`. Head ~`1aa4d5b`.
+- **Not deleted here:** bulk texture writeback baseline compare (Phase 1G).
+- Next DeS blocker still ACM (`sceAcmBatchStartBuffers`), not publication.
+
 ## Phase 1B — TLS / `fs:` (CLOSED 2026-08-05)
 
 - Load helpers: red-zone skip inside thunk + XSAVE; undo with `add rsp,128` / plain `ret` (not
