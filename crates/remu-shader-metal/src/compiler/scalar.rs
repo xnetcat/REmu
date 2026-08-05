@@ -48,8 +48,24 @@ impl Compiler<'_> {
         self.line(3, &format!("s[{EXEC_HI}] = {high};"));
     }
 
-    pub(crate) fn ballot(condition: &str) -> String {
-        format!("(uint)(uint64_t)simd_ballot({condition})")
+    /// Wave ballot for packing EXEC/VCC lane masks.
+    ///
+    /// SharpEmu documents that Metal leaves simdgroup ops undefined inside a divergent
+    /// PC-dispatcher: real `simd_ballot` there corrupts EXEC/VCC and kills whole quads. Graphics
+    /// stages that fall back to the Dispatcher therefore use the single-lane model (bit 0 only).
+    /// Compute/mesh keep real ballots — the scalar PC keeps the wave in lockstep on that path.
+    pub(crate) fn ballot(&self, condition: &str) -> String {
+        if matches!(
+            self.options.stage,
+            crate::MetalShaderStage::Vertex | crate::MetalShaderStage::Pixel
+        ) && matches!(
+            self.control_flow,
+            crate::compiler::control_flow::ControlFlowLowering::Dispatcher
+        ) {
+            format!("({condition}) ? 1u : 0u")
+        } else {
+            format!("(uint)(uint64_t)simd_ballot({condition})")
+        }
     }
 
     pub(crate) fn mask_source(&self, operand: Operand) -> Result<String, String> {

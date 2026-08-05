@@ -206,7 +206,7 @@ impl Compiler<'_> {
     }
 
     fn ballot_words(&self, condition: &str) -> (String, String) {
-        let ballot = Self::ballot(condition);
+        let ballot = self.ballot(condition);
         if self.split_wave64() {
             (
                 format!("remu_wave_half == 0u ? {ballot} : 0u"),

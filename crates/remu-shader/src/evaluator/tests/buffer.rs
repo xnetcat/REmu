@@ -696,20 +696,12 @@ fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
             instruction(
                 8,
                 ShaderEncoding::Sopk,
-                "SGetregB32",
-                Vec::new(),
-                vec![Operand::scalar(5)],
-                None,
-            ),
-            instruction(
-                12,
-                ShaderEncoding::Sopk,
                 "SSetregB32",
                 vec![Operand::scalar(6)],
                 vec![Operand::scalar(6)],
                 None,
             ),
-            end(16),
+            end(12),
         ],
         user_data,
     );
@@ -719,15 +711,41 @@ fn benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader() {
         &shader,
         EvaluationOptions::default(),
     )
-    .expect("benign mode-control and hwreg opcodes must not drop the shader");
+    .expect("benign mode-control and setreg opcodes must not drop the shader");
 
-    assert_eq!(
-        evaluation.scalar_registers[5], 0,
-        "S_GETREG resolves to a conservative zero"
-    );
     assert_eq!(
         evaluation.scalar_registers[6], 0x1234_5678,
         "S_SETREG must not clobber its data-source SGPR"
+    );
+}
+
+#[test]
+fn getreg_refuses_instead_of_fabricating_hardware_state() {
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sopk,
+                "SGetregB32",
+                Vec::new(),
+                vec![Operand::scalar(5)],
+                None,
+            ),
+            end(4),
+        ],
+        vec![0; 8],
+    );
+
+    let error = evaluate_shader(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+    )
+    .expect_err("S_GETREG_B32 must refuse — its result is unmodeled hardware state");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("SGetregB32") || message.contains("GETREG") || message.contains("Getreg"),
+        "refusal must name the opcode: {message}"
     );
 }
 
