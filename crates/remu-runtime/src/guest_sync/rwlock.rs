@@ -82,10 +82,18 @@ pub(crate) fn guest_rwlock_init(address: u64) -> u64 {
     if address == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
     }
-    let Some(_) = read_pthread_slot(address) else {
+    // Init takes a slot pointer, never a bare control-block handle.
+    if lookup_rwlock_by_handle(address).is_some() {
+        return u64::from(libc::EBUSY.cast_unsigned());
+    }
+    let Some(slot_value) = read_pthread_slot(address) else {
         return u64::from(libc::EINVAL.cast_unsigned());
     };
-    if resolve_rwlock(address, false).is_some() {
+    // Same pointer-typedef rule as mutexes: only canonical publishing storage is busy.
+    if let PthreadSlotValue::ControlBlock(handle) = classify_pthread_slot_value(slot_value)
+        && let Some(entry) = lookup_rwlock_by_handle(handle)
+        && entry.storage_address == address
+    {
         return u64::from(libc::EBUSY.cast_unsigned());
     }
     let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);

@@ -77,10 +77,19 @@ pub(crate) fn guest_condition_init(address: u64) -> u64 {
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(_) = read_pthread_slot(address) else {
+    // Init takes a slot pointer, never a bare control-block handle.
+    if lookup_condition_by_handle(address).is_some() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
+    }
+    let Some(slot_value) = read_pthread_slot(address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    if resolve_condition(address, false).is_some() {
+    // Same pointer-typedef rule as mutexes: only canonical publishing storage is "busy".
+    // A stack slot holding a copied handle may be overwritten with a fresh condition.
+    if let PthreadSlotValue::ControlBlock(handle) = classify_pthread_slot_value(slot_value)
+        && let Some(entry) = lookup_condition_by_handle(handle)
+        && entry.storage_address == address
+    {
         return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
     }
     let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);

@@ -251,13 +251,31 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(_) = read_pthread_slot(address) else {
+    // Init takes a pointer to a slot (`ScePthreadMutex *`), never a bare control-block handle.
+    if lookup_mutex_by_handle(address).is_some() {
+        eprintln!(
+            "[REMu][MUTEX] refused init of bare control-block handle={address:#x} thread={:?}",
+            current_guest_thread_name(),
+        );
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(slot_value) = read_pthread_slot(address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
-    // Re-init of a live mutex is invalid. A slot still holding a static initializer, or one that
-    // already points at a destroyed/unknown handle, may be (re)initialized.
-    // An already-published control block may not be re-initialized in place.
-    if guest_mutex_entry(address, false).is_some() {
+    // Canonical storage that already published a live control block may not be re-initialized.
+    // A slot that merely holds a *copy* of some other mutex's handle (Scream / middleware stack
+    // locals) is not that storage — init must overwrite it with a fresh control block. Treating
+    // every resolvable handle as "already initialized" is what left Demon's Souls with a NULL
+    // returned handle and a later unlock of `slot=Some(0)`.
+    if let PthreadSlotValue::ControlBlock(handle) = classify_mutex_slot_value(slot_value)
+        && let Some(entry) = lookup_mutex_by_handle(handle)
+        && entry.storage_address == address
+    {
+        eprintln!(
+            "[REMu][MUTEX] refused re-init of canonical storage thread={:?} slot={address:#x} \
+             handle={handle:#x}",
+            current_guest_thread_name(),
+        );
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let guest_object = match allocate_guest_mutex_object(attributes) {
