@@ -600,8 +600,8 @@ fn lowers_the_division_fmas_and_half_float_min3_that_share_the_division_opcode_b
 }
 
 #[test]
-fn division_operand_scaling_refuses_instead_of_guessing_its_thresholds() {
-    let error = compile_msl(
+fn lowers_division_operand_scaling_with_vcc_lane() {
+    let scale = compile_msl(
         &Program::new(
             0x1000,
             vec![Instruction {
@@ -624,10 +624,16 @@ fn division_operand_scaling_refuses_instead_of_guessing_its_thresholds() {
         &empty_evaluation(),
         &MetalCompileOptions::vertex(0),
     )
-    .expect_err("V_DIV_SCALE_F32 must refuse loudly");
+    .expect("V_DIV_SCALE_F32 must lower");
     assert!(
-        error.to_string().contains("V_DIV_SCALE_F32"),
-        "the refusal must name the operation: {error}"
+        scale.source.contains("remu_div_scale_f32("),
+        "scale helper must be emitted:\n{}",
+        scale.source
+    );
+    assert!(
+        scale.source.contains("frexp") || scale.source.contains("remu_div_scale_f32"),
+        "scale must use the frexp-based prelude helper:\n{}",
+        scale.source
     );
 }
 

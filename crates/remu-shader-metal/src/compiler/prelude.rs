@@ -396,12 +396,45 @@ inline uint remu_div_fixup_f32_bits(uint quotient_bits, uint denominator_bits, u
     );
 }
 
+pub(crate) fn emit_div_scale_f32_prelude(source: &mut String) {
+    // Software model adapted from RPCSX's RDNA `v_div_scale_f32` (rdna.glsl), with the f32 scale
+    // factor set to ±32 so it pairs with LLVM/Remu `V_DIV_FMAS_F32` (`*= 2^32` when VCC is set).
+    // Exponents come from Metal `frexp`, matching RPCSX's `get_ieee_exponent`.
+    source.push_str(
+        r"inline float remu_div_scale_f32(float src0, float src1, float src2, thread bool& scaled) {
+    int e1 = 0;
+    int e2 = 0;
+    (void)frexp(src1, e1);
+    (void)frexp(src2, e2);
+    scaled = abs(e2 - e1) >= 96;
+    int e_scale = 0;
+    if (isnan(src1) || isinf(src1) || (e2 - e1) >= 96) {
+        e_scale = 32;
+    } else if (e1 >= 126) {
+        e_scale = -32;
+    } else if (e2 <= -103 || (e2 - e1) <= -96) {
+        e_scale = 32;
+    }
+    if (scaled && src0 != src1) {
+        int sign = (e2 > e1) ? 1 : ((e2 < e1) ? -1 : 0);
+        e_scale -= sign * 32;
+    }
+    if (src1 == 0.0f || src2 == 0.0f) {
+        return NAN;
+    }
+    return ldexp(src0, e_scale);
+}
+
+",
+    );
+}
+
 pub(crate) fn emit_div_fmas_f32_prelude(source: &mut String) {
     source.push_str(
         r"inline float remu_div_fmas_f32(float first, float second, float addend, bool scaled) {
     // The last step of the precise division sequence. V_DIV_SCALE_F32 records in VCC whether it
     // scaled the operands to keep the quotient in range, and this fused product-sum undoes that
-    // scaling by 2^32 for the lanes where it did.
+    // scaling by 2^32 for the lanes where it did (LLVM VOP3 `V_DIV_FMAS_F32` contract).
     return fma(first, second, addend) * (scaled ? 4294967296.0f : 1.0f);
 }
 

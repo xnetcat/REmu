@@ -585,15 +585,23 @@ impl Compiler<'_> {
                     self.float_source(instruction, 2)?
                 ),
             ),
-            // V_DIV_SCALE_F32 is the entry point of the same sequence: it decides whether the
-            // numerator or denominator needs an exponent shift and publishes that decision in
-            // VCC. Its exponent thresholds and denormal tests are not settled here, and a scale
-            // that guesses them would corrupt the quotient rather than fail to build it.
             "VDivScaleF32" => {
-                return Err(
-                    "V_DIV_SCALE_F32 operand-scaling thresholds are unproven; refusing to guess the precise-division preop"
-                        .to_owned(),
+                // VOP3B: VGPR result plus the VCC lane that later feeds V_DIV_FMAS_F32.
+                let Some(InstructionControl::Vop3(control)) = instruction.control.as_ref() else {
+                    return Err("V_DIV_SCALE_F32 requires VOP3B control".to_owned());
+                };
+                let scalar_destination = control.scalar_destination.unwrap_or(crate::VCC_LO);
+                let src0 = self.float_source(instruction, 0)?;
+                let src1 = self.float_source(instruction, 1)?;
+                let src2 = self.float_source(instruction, 2)?;
+                let scaled = self.temp("bool", "false");
+                let result = self.temp(
+                    "float",
+                    &format!("remu_div_scale_f32({src0}, {src1}, {src2}, {scaled})"),
                 );
+                self.store_lane_mask(scalar_destination, &format!("exec && {scaled}"));
+                self.store_vector(destination, &self.float_result(instruction, &result));
+                return Ok(());
             }
             "VSinF32" => self.float_result(
                 instruction,
