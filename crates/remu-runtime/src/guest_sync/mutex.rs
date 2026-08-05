@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 
 use crate::{
@@ -30,6 +28,42 @@ const GUEST_MUTEX_PROTOCOL_OFFSET: u64 = 0x3c;
 
 #[cfg(test)]
 pub(crate) static GUEST_MUTEX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// First-N mutex ABI trace when `REMU_TRACE_MUTEX_ABI=1` (Demon's Souls / Scream bring-up).
+static MUTEX_ABI_TRACE_REMAINING: AtomicU64 = AtomicU64::new(0);
+
+fn mutex_abi_trace_enabled() -> bool {
+    static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ONCE.get_or_init(|| {
+        let enabled = std::env::var_os("REMU_TRACE_MUTEX_ABI").is_some_and(|value| value != "0");
+        if enabled {
+            MUTEX_ABI_TRACE_REMAINING.store(64, Ordering::Relaxed);
+        }
+        enabled
+    })
+}
+
+fn trace_mutex_abi(op: &str, address: u64, result: u64) {
+    if !mutex_abi_trace_enabled() {
+        return;
+    }
+    if MUTEX_ABI_TRACE_REMAINING
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_sub(1)
+        })
+        .is_err()
+    {
+        return;
+    }
+    let slot = read_pthread_slot(address);
+    let object = lookup_mutex_by_handle(address)
+        .or_else(|| slot.and_then(|value| lookup_mutex_by_handle(value)))
+        .map(|entry| entry.guest_object)
+        .unwrap_or(0);
+    eprintln!(
+        "[REMu][MUTEX][ABI] op={op} arg={address:#x} slot={slot:?} object={object:#x} result={result:#x}"
+    );
+}
 
 thread_local! {
     /// Per-host-thread cache keyed by control-block handle (SDK identity), not by slot address.
@@ -232,6 +266,7 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
     };
     insert_mutex_entry(address, guest_object, attributes);
     write_guest_u64(address, guest_object);
+    trace_mutex_abi("init", address, 0);
     0
 }
 
@@ -298,10 +333,18 @@ pub(crate) fn guest_mutex_destroy(address: u64) -> u64 {
     let Some(entry) = guest_mutex_entry(address, false) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
-    destroy_resolved_mutex(entry, address)
+    let result = destroy_resolved_mutex(entry, address);
+    trace_mutex_abi("destroy", address, result);
+    result
 }
 
 pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
+    let result = guest_mutex_lock_inner(address, try_only);
+    trace_mutex_abi(if try_only { "trylock" } else { "lock" }, address, result);
+    result
+}
+
+fn guest_mutex_lock_inner(address: u64, try_only: bool) -> u64 {
     if address == 0 {
         return u64::MAX;
     }
@@ -400,6 +443,12 @@ pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
 }
 
 pub(crate) fn guest_mutex_unlock(address: u64) -> u64 {
+    let result = guest_mutex_unlock_inner(address);
+    trace_mutex_abi("unlock", address, result);
+    result
+}
+
+fn guest_mutex_unlock_inner(address: u64) -> u64 {
     let current = std::thread::current().id();
     loop {
         let Some(entry) = guest_mutex_entry(address, false) else {
