@@ -31,7 +31,7 @@ pub(crate) use self::event_flag::guest_event_flag_wait;
 pub(crate) use self::mutex::GUEST_MUTEX_WAKE_COUNT;
 pub(crate) use self::mutex::{
     guest_mutex_destroy, guest_mutex_entry, guest_mutex_init, guest_mutex_lock, guest_mutex_unlock,
-    guest_pthread_once,
+    guest_pthread_once, lazily_fabricated_mutex_count,
 };
 #[cfg(test)]
 pub(crate) use self::rwlock::guest_rwlock_waiter_counts;
@@ -1386,7 +1386,10 @@ pub(crate) fn dispatch_guest_sync_import_at_import(
         "9lvj5DjHZiA" => guest_event_flag_poll(arguments),
         "JTvBflhYazQ" => guest_event_flag_wait(arguments),
         "PZku4ZrXJqg" => guest_event_flag_cancel(arguments),
-        _ => 0,
+        _ => {
+            remu_gpu::note_inert("guest_sync:unmatched-predicate");
+            0
+        }
     }
 }
 

@@ -400,7 +400,14 @@ fn flush(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
             );
             0
         }
-        Ok(None) | Err(()) => {
+        Ok(None) => {
+            write_guest_u8(frame_buffer + 0x18, 0);
+            write_guest_u8(output + 0x08, 0);
+            0
+        }
+        Err(()) => {
+            // A libav receive error mapped to SCE_OK with isValid=0 — Group-8 fabricated success.
+            remu_gpu::note_inert("videodec2:Flush-error-as-ok");
             write_guest_u8(frame_buffer + 0x18, 0);
             write_guest_u8(output + 0x08, 0);
             0

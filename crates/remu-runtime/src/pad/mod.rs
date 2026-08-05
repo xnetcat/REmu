@@ -322,6 +322,7 @@ fn pad_set_angular_velocity_bias(arguments: [u64; 6]) -> u64 {
 }
 
 pub(crate) fn pad_set_vibration_mode(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("W2G-yoyMF5U");
     if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
@@ -335,6 +336,7 @@ pub(crate) fn pad_set_vibration_mode(arguments: [u64; 6]) -> u64 {
 }
 
 pub(crate) fn pad_handle_operation(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("pad:handle-operation-noop");
     validate_pad_handle(arguments[0]).map_or_else(|error| error, |()| 0)
 }
 
@@ -350,6 +352,7 @@ pub(crate) fn pad_pointer_operation(arguments: [u64; 6]) -> u64 {
 }
 
 pub(crate) fn pad_get_trigger_effect_state(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("znaWI0gpuo8");
     if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
@@ -361,6 +364,7 @@ pub(crate) fn pad_get_trigger_effect_state(arguments: [u64; 6]) -> u64 {
 }
 
 pub(crate) fn pad_device_class_parse_data(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("IHPqcbc0zCA");
     if let Err(error) = validate_pad_handle(arguments[0]) {
         return error;
     }
@@ -469,7 +473,8 @@ pub(crate) fn pad_read_state(arguments: [u64; 6]) -> u64 {
         write_guest_u32(output + 0x20, 1.0_f32.to_bits());
         write_guest_u32(output + 0x24, 0.0_f32.to_bits());
         // Angular velocity stays zero while stationary; deadband would also zero small values.
-        let _ = state.angular_velocity_deadband;
+        remu_gpu::note_inert("pad:fabricated-stationary-imu");
+    let _ = state.angular_velocity_deadband;
         let _ = state.tilt_correction;
         let _ = state.angular_velocity_bias_correction;
     }

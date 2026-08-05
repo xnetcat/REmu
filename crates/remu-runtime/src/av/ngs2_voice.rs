@@ -136,7 +136,7 @@ pub(super) fn ngs2_apply_voice_control(
             if level_array == 0 || !process_guest_range_is_readable(level_array, span) {
                 return Err(NGS2_ERROR_INVALID_MATRIX_LEVEL_ADDRESS);
             }
-            Ok(())
+            { remu_gpu::note_inert("ngs2:SET_MATRIX_LEVELS"); Ok(()) }
         }
         NGS2_VOICE_SET_PORT_VOLUME | NGS2_VOICE_SET_PORT_MATRIX | NGS2_VOICE_SET_PORT_DELAY => {
             ngs2_require_control_size(size, 16)?;
@@ -148,7 +148,7 @@ pub(super) fn ngs2_apply_voice_control(
             {
                 return Err(NGS2_ERROR_INVALID_VOICE_CONTROL_SIZE);
             }
-            Ok(())
+            { remu_gpu::note_inert("ngs2:SET_PORT_*"); Ok(()) }
         }
         NGS2_VOICE_PATCH => {
             ngs2_require_control_size(size, 24)?;
@@ -165,7 +165,7 @@ pub(super) fn ngs2_apply_voice_control(
             {
                 return Err(NGS2_ERROR_INVALID_HANDLE);
             }
-            Ok(())
+            { remu_gpu::note_inert("ngs2:PATCH"); Ok(()) }
         }
         NGS2_VOICE_KICK_EVENT => {
             ngs2_require_control_size(size, 12)?;
@@ -187,6 +187,8 @@ pub(super) fn ngs2_apply_voice_control(
                 .get_mut(&voice_handle)
                 .ok_or(NGS2_ERROR_INVALID_VOICE_HANDLE)?;
             voice.callback_handler = handler;
+            // Stored but never invoked — Group-8 fabricated success.
+            remu_gpu::note_inert("ngs2:SET_CALLBACK");
             Ok(())
         }
         unknown => {
@@ -205,6 +207,7 @@ pub(super) fn ngs2_apply_voice_control(
                     "[REMu][NGS2] accepting unhandled voice control id={unknown:#x} size={size} (no mixer)"
                 );
             }
+            remu_gpu::note_inert("ngs2:unhandled-voice-control");
             Ok(())
         }
     }
@@ -301,6 +304,7 @@ pub(super) fn ngs2_apply_voice_command(
     // A component below the reserved range names one of the rack's modules. This build has no
     // module graph to route such a parameter into, so it is accepted and dropped.
     if command.component != NGS2_COMPONENT_ID_VOICE {
+        remu_gpu::note_inert("ngs2:non-voice-component-drop");
         return Ok(());
     }
     match command.interface {
@@ -321,7 +325,7 @@ pub(super) fn ngs2_apply_voice_command(
             if low_u32(command.value) >= NGS2_MODULE_MAX_LOCATIONS {
                 return Err(NGS2_ERROR_INVALID_MODULE_LOCATION);
             }
-            Ok(())
+            { remu_gpu::note_inert("ngs2:COMMAND_SET_MODULE_LOCATION"); Ok(()) }
         }
         NGS2_VOICE_COMMAND_SET_MATRIX_LEVELS => {
             if command.unit >= limits.max_matrices {
@@ -359,12 +363,13 @@ pub(super) fn ngs2_apply_voice_command(
             if command.unit >= NGS2_RACK_MAX_MODULES {
                 return Err(NGS2_ERROR_INVALID_MODULE_INDEX);
             }
-            Ok(())
+            { remu_gpu::note_inert("ngs2:COMMAND_BYPASS_MODULE"); Ok(()) }
         }
         NGS2_VOICE_COMMAND_SET_CALLBACK => {
             if command.value == 0 {
                 return Err(NGS2_ERROR_INVALID_HANDLER_ADDRESS);
             }
+            remu_gpu::note_inert("ngs2:COMMAND_SET_CALLBACK");
             Ok(())
         }
         NGS2_VOICE_COMMAND_SET_AUTO_SUSPEND

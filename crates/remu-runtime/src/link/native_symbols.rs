@@ -462,6 +462,7 @@ extern "C" fn synthetic_data_noop(
     _argument4: u64,
     _argument5: u64,
 ) -> u64 {
+    remu_gpu::note_inert("cxx:synthetic_data_noop");
     0
 }
 

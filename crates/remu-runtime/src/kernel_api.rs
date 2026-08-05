@@ -198,7 +198,7 @@ fn dispatch_process(nid: &str, arguments: [u64; 6], state: &mut ProbeDispatchSta
         "g0VTBxfJyu0" => kernel_current_cpu(state),
         // Devkit indicator lines have no emulated hardware behind them: nothing observes the
         // outputs and nothing drives the inputs.
-        "ca7v6Cxulzs" => 0,
+        "ca7v6Cxulzs" => { remu_gpu::note_inert("ca7v6Cxulzs"); 0 },
         "4oXYe9Xmk0Q" => KERNEL_DEVKIT_INPUT_BITS,
         "tU5e3f9gSiU" => KERNEL_TRINITY_MODE,
         "IWIBBdTHit4" => kernel_map_flexible_memory(arguments, state),

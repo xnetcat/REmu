@@ -262,6 +262,7 @@ pub(super) fn ngs2_rack_option_size(option: u64) -> Result<u64, u32> {
 /// cleared float samples for the grain length and channel count the system was created with.
 /// Fabricating tone or copying waveform data would claim a mixer that does not exist.
 pub(super) fn ngs2_system_render(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("ngs2:SystemRender");
     let (system_handle, buffers, buffer_count) =
         (arguments[0], arguments[1], low_u32(arguments[2]));
     if buffer_count == 0 {
@@ -635,6 +636,8 @@ pub(super) fn ngs2_voice_get_state_flags(arguments: [u64; 6]) -> u64 {
 pub(super) fn ngs2_apply_voice_event(voice: &mut Ngs2Voice, event: u32) -> Result<(), u32> {
     voice.state_flags = match event {
         NGS2_VOICE_EVENT_PLAY | NGS2_VOICE_EVENT_RESUME => {
+            // PLAYING never clears on its own (no mixer progress) — Group-8 stall-shaped lie.
+            remu_gpu::note_inert("ngs2:PLAY-without-auto-complete");
             NGS2_VOICE_STATE_FLAG_IN_USE | NGS2_VOICE_STATE_FLAG_PLAYING
         }
         NGS2_VOICE_EVENT_STOP | NGS2_VOICE_EVENT_STOP_IMMEDIATE => {

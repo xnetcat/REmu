@@ -400,6 +400,7 @@ pub(crate) fn np_trophy_get_game_info(arguments: [u64; 6], state: &mut ProbeDisp
     if let Err(error) = state.np_trophy.require_registered(context, handle) {
         return np_error(Err(error));
     }
+    remu_gpu::note_inert("np:Trophy2GetGameInfo");
     guest_memset(game_info, 0, GAME_INFO_SIZE);
     crate::publish_host_toast(
         remu_gpu::HostDialogKind::Trophy,
@@ -431,6 +432,7 @@ pub(crate) fn np_trophy_get_trophy_info_array(
     if let Err(error) = state.np_trophy.require_registered(context, handle) {
         return np_error(Err(error));
     }
+    remu_gpu::note_inert("np:Trophy2GetTrophyInfoArray");
     let _ = (details, data, limit);
     if count != 0 {
         write_guest_u32(count, 0);

@@ -672,6 +672,7 @@ impl MetalPresenter {
                     trace_video_target_draw_consumer(&draw);
                     if noop_placeholder_cover_draw(&draw) {
                         super::stats::NOOP_DRAWS_COVER_PLACEHOLDER.fetch_add(1, Ordering::Relaxed);
+                        super::stats::note_noop_draw("gpu:noop-cover-placeholder");
                         continue;
                     }
                     let key = graphics_pipeline_key(&draw);

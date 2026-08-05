@@ -129,14 +129,14 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         // This host models no touchpad. Opening a recognizer succeeds and no touch is ever
         // reported, which is the same thing the guest observes from a pad nobody touches. The
         // recognizers that would report gestures stay unserved rather than reporting none.
-        "qpo-mEOwje0" | "3pcAvmwKCvM" | "FWF8zkhr854" => 0,
+        "qpo-mEOwje0" | "3pcAvmwKCvM" | "FWF8zkhr854" => { remu_gpu::note_inert(nid); 0 },
         // Likewise no network interface: initialization succeeds and the state query reports
         // disconnected, which is what this host is. Nothing here fabricates a link.
-        "gky0+oaNM4k" => 0,
+        "gky0+oaNM4k" => { remu_gpu::note_inert(nid); 0 },
         "uBPlr0lbuiI" => net_ctl_get_state(arguments[0]),
         // No signed-in network account exists to change state, so a registered state callback is
         // one that never fires. The queries that would report an account stay unserved.
-        "qQJfO8HAiaY" => 0,
+        "qQJfO8HAiaY" => { remu_gpu::note_inert(nid); 0 },
         // VoiceQoS is peer-to-peer chat over the console network. This host has no link, so
         // initialization only validates the caller-owned workspace; no QoS sessions are created.
         "U8IfNl6-Css" => voice_qos_init(arguments),
@@ -149,6 +149,7 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
 /// Accepts a non-empty caller-owned workspace. Session create and connect stay unserved so titles
 /// that probe for chat disable the feature rather than waiting on peers that never appear.
 fn voice_qos_init(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("U8IfNl6-Css");
     const VOICE_QOS_ERROR_INVALID_ARGUMENT: u32 = 0x8041_0401;
     let (mem_block, mem_size) = (arguments[0], arguments[1]);
     if mem_block == 0 || mem_size == 0 {

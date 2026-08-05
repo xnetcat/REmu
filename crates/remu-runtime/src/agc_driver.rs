@@ -157,7 +157,10 @@ fn dispatch_workload_stream(nid: &str, arguments: [u64; 6]) -> Option<u64> {
 /// entry points report the module's absence.
 fn dispatch_tooling(nid: &str) -> Option<u64> {
     Some(match nid {
-        "Ddwk4gLT5j0" | "+TN0oRTBxJQ" | "qspAL8bgcBY" | "HMnVBVUyajk" => 0,
+        "Ddwk4gLT5j0" | "+TN0oRTBxJQ" | "qspAL8bgcBY" | "HMnVBVUyajk" => {
+            remu_gpu::note_inert(nid);
+            0
+        },
         "rJUyMrDdxJg" => SHADER_DEBUGGING_NOT_AVAILABLE,
         "Xq5WmbwPTnQ" | "SAfhzJPcjuk" | "FOwvmNlFLjM" | "+iAOE3jCnkk" | "WHIOMbb+iIU"
         | "chJWZcNSzjk" | "ICaGtkEIXTk" | "8F5j7U-Bq6s" => AGC_ERROR_GPU_CAPTURE_NOT_AVAILABLE,
@@ -209,6 +212,7 @@ fn agr_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     // A caller that asked for no dwords asked the driver for no work, and the console has nothing
     // to reject; skipping the parse also keeps a zero-length range out of the readability check.
     if dword_count == 0 {
+        remu_gpu::note_inert("agc:SubmitDcb-zero-dwords");
         return 0;
     }
     submit_graphics(queue, command_address, dword_count, state)
@@ -224,6 +228,7 @@ fn agr_submit_multi_dcbs(arguments: [u64; 6], state: &mut ProbeDispatchState) ->
         return AGC_ERROR_INVALID_SUBMIT_QUEUE;
     }
     if count == 0 {
+        remu_gpu::note_inert("agc:SubmitMultiDcbs-zero-count");
         return 0;
     }
     if addresses == 0 || sizes == 0 {

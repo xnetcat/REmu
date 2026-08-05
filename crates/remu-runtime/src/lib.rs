@@ -1793,6 +1793,10 @@ fn spawn_guest_capable_thread(
         .name(trace_name.clone())
         .stack_size(HOST_PTHREAD_STACK_FLOOR)
         .spawn(move || {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = remu_memory::install_thread_signal_stack() {
+                eprintln!("[REMu][THREAD] sigaltstack unavailable: {error}");
+            }
             set_current_guest_thread_handle(handle);
             set_current_guest_thread_unique_id(unique_id);
             set_current_guest_thread_name(Some(trace_name));
@@ -3562,6 +3566,10 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         }
         let trace_name = thread_name.clone();
         let Ok(thread) = builder.spawn(move || {
+            #[cfg(target_os = "macos")]
+            if let Err(error) = remu_memory::install_thread_signal_stack() {
+                eprintln!("[REMu][THREAD] sigaltstack unavailable: {error}");
+            }
             if trace_guest_sync() {
                 eprintln!(
                     "[REMu][THREAD] start handle={handle} name={:?}",
@@ -4533,6 +4541,7 @@ fn guest_zeroed_constructor(address: u64, size: u64) -> u64 {
 /// this makes the audio engine keep its context instead of tearing its whole stack down at
 /// creation, and moves the loud gap to the calls that would actually have to do the work.
 fn acm_context_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("ZIXln2K3XMk");
     let output = arguments[0];
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -4637,8 +4646,8 @@ fn dispatch_stateless_import(
         "Qazy8LmXTvw" => guest_ftell(arguments[0]),
         "uodLYyUip20" => guest_fclose(arguments[0]),
         "lbB+UlZqVG0" => guest_fread(arguments[0], arguments[1], arguments[2], arguments[3]),
-        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => 0,
-        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
+        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => inert_ok(nid),
+        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => inert_value(nid, arguments[0]),
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
         "tcVi5SivF7Q" => guest_sprintf(arguments),
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
@@ -4651,14 +4660,14 @@ fn dispatch_stateless_import(
         "9BcDykPmo1I" => guest_errno_address(),
         "HQOwnfMGipQ" => guest_net_errno_address(),
         "Q4qBuN-c0ZM" => guest_net_unavailable(45),
-        "dgJBaeJnGpo" => NEXT_NET_POOL_HANDLE.fetch_add(1, Ordering::Relaxed) as u64,
-        "hdpVEUDFW3s" => NEXT_SSL_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64,
+        "dgJBaeJnGpo" => inert_value(nid, NEXT_NET_POOL_HANDLE.fetch_add(1, Ordering::Relaxed) as u64),
+        "hdpVEUDFW3s" => inert_value(nid, NEXT_SSL_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64),
         "3JCe3lCbQ8A" | "A9cVMUtEp4Y" | "0gYjPTR-6cY" => {
-            NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64
+            inert_value(nid, NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64)
         }
         "+o9816YQhqQ" => np_web_api2_initialize(arguments),
-        "cK6bYHf-Q5E" | "-hJRce8wn1U" => guest_zeroed_constructor(arguments[0], 8),
-        "WSOuge5IsCg" => guest_zeroed_constructor(arguments[0], 0x28),
+        "cK6bYHf-Q5E" | "-hJRce8wn1U" => { remu_gpu::note_inert(nid); guest_zeroed_constructor(arguments[0], 8) },
+        "WSOuge5IsCg" => { remu_gpu::note_inert(nid); guest_zeroed_constructor(arguments[0], 0x28) },
         "TRO721eVt4g" => agc_dcb_reset_queue(arguments),
         "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
         "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
@@ -4689,20 +4698,20 @@ fn dispatch_stateless_import(
         "3RQ5aQfnstU" => system_service_get_notice_screen_skip_flag(arguments[0]),
         "Xjoosiw+XPI" => guest_uuid_create(arguments[0]),
         "yDBwVAolDgg" => guest_kernel_is_stack(arguments),
-        "Qs0wWulgl7U" => 0,
-        "RaqxZIf6DvE" => 0,
-        "rbknaUjpqWo" => write_output_u64(arguments[1], 0),
+        "Qs0wWulgl7U" => inert_ok("Qs0wWulgl7U"),
+        "RaqxZIf6DvE" => inert_ok("RaqxZIf6DvE"),
+        "rbknaUjpqWo" => { remu_gpu::note_inert(nid); write_output_u64(arguments[1], 0) },
         "XDncXQIJUSk" => np_get_online_id(arguments),
         "JT+t00a3TxA" => np_get_account_country(arguments[1]),
-        "eQH7nWPcAgc" => write_output_i32(arguments[1], 1),
-        "e-ZuhGEoeC4" => write_output_i32(arguments[1], 0),
+        "eQH7nWPcAgc" => { remu_gpu::note_inert(nid); write_output_i32(arguments[1], 1) },
+        "e-ZuhGEoeC4" => { remu_gpu::note_inert(nid); write_output_i32(arguments[1], 0) },
         "1xxcMiGu2fo" => user_service_get_user_name(arguments),
         "woNpu+45RLk" => user_service_get_age_level(arguments),
         "-sD02mFDBh4" => user_service_get_game_presets(arguments),
         "R9lA82OraNs" => app_content_initialize(arguments),
         "99b82IKXpH4" => app_content_app_param_get_int(arguments),
         "eaFXjfJv3xs" => dialog::ime_keyboard_open(),
-        "-4GCfYdNF1s" => 0,
+        "-4GCfYdNF1s" => inert_ok("-4GCfYdNF1s"),
         "18B2NS1y9UU" => rtc_get_current_tick(arguments[0]),
         "ZPD1YOKI+Kw" => rtc_get_current_clock_local_time(arguments[0]),
         "8w-H19ip48I" => rtc_get_tick(arguments),
@@ -4716,18 +4725,18 @@ fn dispatch_stateless_import(
         // Network-state callbacks are accepted and never fire: an offline link never changes
         // state, so there is no notification to deliver and nothing pending to check.
         "UJ+Z7Q+4ck0" => net_ctl_register_callback(arguments),
-        "iQw3iQPhvUQ" => 0,
-        "nBDD66kiFW8" => 0,
+        "iQw3iQPhvUQ" => inert_ok("iQw3iQPhvUQ"),
+        "nBDD66kiFW8" => inert_ok("nBDD66kiFW8"),
         "zE-wXIZjLoM" => kernel_debug_raise_exception_on_release_mode(arguments),
         "j2AIqSqJP0w" | "2G6i6hMIUUY" => guest_kernel_getdents(arguments, false),
         "taRWhTJFTgE" | "sfKygSjIbI8" => guest_kernel_getdents(arguments, true),
         // Async I/O is initialized with tuning parameters only; REmu services the requests
         // synchronously through the same file paths, so there is no queue to size here.
-        "nu4a0-arQis" | "vYU8P9Td2Zo" => 0,
+        "nu4a0-arQis" | "vYU8P9Td2Zo" => inert_ok(nid),
         "EI-5-jlq2dE" => current_guest_thread_unique_id(),
         "dKadqZFgKKQ" => ime_keyboard_get_resource_ids(arguments),
         "VkqLPArfFdc" => ime_keyboard_get_info(arguments[1]),
-        "x8qnXqh-tiM" => 0,
+        "x8qnXqh-tiM" => inert_ok("x8qnXqh-tiM"),
         "rnEhHqG-4xo" | "ZKJtxdgvzwg" | "-3Y5GO+-i78" | "hD-H81EN9Vg" | "O6IW1-Dwm-w" => {
             user_service_get_setting(arguments, 0)
         }
@@ -4736,7 +4745,7 @@ fn dispatch_stateless_import(
         "fPhymKNvK-A" => user_service_get_login_user_id_list(arguments),
         "h9z6+0hEydk" => {
             std::thread::yield_now();
-            0
+            inert_ok(nid)
         }
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
         // The POSIX spelling shares the sleep and reports errno rather than an SCE code.
@@ -4810,7 +4819,7 @@ fn dispatch_probe_import(
         "WkwEd3N7w0Y" => kernel_install_exception_handler(arguments, state),
         "Qhv5ARAoOEc" => kernel_remove_exception_handler(arguments[0], state),
         "il03nluKfMk" => kernel_raise_exception(arguments, state),
-        "6xVpy0Fdq+I" => 0,
+        "6xVpy0Fdq+I" => inert_ok("6xVpy0Fdq+I"),
         "bnZxYgAFeA0" => sanitizer_new_replace_external(),
         "vNe1w4diLCs" => guest_tls_get_addr(arguments[0]),
         "NWtTN10cJzE" => libc_heap_get_trace_info(arguments[0], state),
@@ -5016,7 +5025,7 @@ fn dispatch_probe_import(
         // REmu does not instrument the guest address space with AddressSanitizer. Returning a
         // successful false result is ABI-observable: treating the missing import error as a
         // boolean true makes Unreal select ASan-only allocation and fault handling paths.
-        "jh+8XiK4LeE" => 0,
+        "jh+8XiK4LeE" => inert_ok("jh+8XiK4LeE"),
         // libc strlen
         "j4ViWNHEgww" => guest_strlen(arguments[0]),
         "Ovb2dSJOAuE" => guest_strcmp(arguments[0], arguments[1]),
@@ -5039,8 +5048,8 @@ fn dispatch_probe_import(
         "1uJgoVq3bQU" => guest_tolower_table(state),
         "rcQCUr0EaRU" => guest_toupper_table(state),
         "9rMML086SEE" | "hEQ2Yi4PJXA" => guest_global_locale(state),
-        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => 0,
-        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => arguments[0],
+        "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => inert_ok(nid),
+        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => inert_value(nid, arguments[0]),
         // libc time returns Unix seconds and optionally stores the same value through its pointer.
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
         // Preserve the SysV variadic register layout for the integer/pointer formats used by the
@@ -5145,7 +5154,7 @@ fn dispatch_probe_import(
         "Yw0jKSqop+E" => agc_dcb_draw_index_auto(arguments),
         "YUeqkyT7mEQ" => agc_dcb_set_flip(arguments),
         "w2rJhmD+dsE" => agc_driver_add_eq_event(arguments, state),
-        "XlNp7jzGiPo" | "MM4IZSEYytQ" => 0,
+        "XlNp7jzGiPo" | "MM4IZSEYytQ" => inert_ok(nid),
         "UglJIZjGssM" => agc_driver_submit_dcb(arguments, state),
         "6UzEidRZwkg" => agc_driver_submit_multi_dcbs(arguments, state),
         "gSRnr79F8tQ" => agc_driver_submit_acb(arguments, state),
@@ -5156,7 +5165,7 @@ fn dispatch_probe_import(
         "Xru92wHJRmg" => video_out_add_vblank_event(arguments, state),
         "w0hLuNarQxY" => {
             if low_i32(arguments[0]) == 1 {
-                0
+                inert_ok(nid)
             } else {
                 sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE)
             }
@@ -5175,7 +5184,7 @@ fn dispatch_probe_import(
         "SsC-m-S9JTA" => system_service_param_get_string(arguments),
         "RpQJJVKTiFM" | "4fU5yvOkVG4" => kernel_module_info_for_unwind(arguments, state),
         "f7KBOafysXo" => kernel_module_info_from_addr(arguments, state),
-        "crb5j7mkk1c" | "OMDRKKAZ8I4" => 0,
+        "crb5j7mkk1c" | "OMDRKKAZ8I4" => inert_ok(nid),
         "Vo5V8KAwCmk" => system_service_hide_splash(state),
         // REmu presents in standard dynamic range, so tone mapping reports the SDR reference
         // luminance rather than an HDR display's peak.
@@ -5225,6 +5234,7 @@ fn dispatch_probe_import(
         "73fF1MFU8hA" => play_go_get_chunk_id(arguments, state),
         "3OMbYZBaa50" => play_go_get_language_mask(arguments, state),
         "4AAcTU9R3XM" | "LosLlHOpNqQ" | "gUPGiOQ1tmQ" | "Nn7zKwnA5q0" | "-Q1-u1a7p0g" => {
+            remu_gpu::note_inert(nid);
             play_go_accept_request(arguments[0], state)
         }
         "lDqxaY1UbEo" => message_dialog_initialize(state),
@@ -5315,7 +5325,7 @@ fn dispatch_probe_import(
         "23LRUSvYu1M" => agc_initialize(arguments, state),
         "h9z6+0hEydk" => {
             std::thread::yield_now();
-            0
+            inert_ok(nid)
         }
         "vSMAm3cxYTY" => kernel_mprotect(arguments, state),
         // sceKernelUsleep
@@ -5415,6 +5425,7 @@ fn kernel_delete_equeue(handle: u64, state: &mut ProbeDispatchState) -> u64 {
 /// REmu presents a single fixed output mode, so no change is ever announced; the registration is
 /// still recorded so the queue reports the same shape the console would.
 fn video_out_add_output_mode_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("kmSe30JTs+E");
     let (equeue, handle, user_data) = (arguments[0], arguments[1], arguments[2]);
     if low_i32(handle) != 1 || !state.video_out.is_open {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
@@ -5424,6 +5435,7 @@ fn video_out_add_output_mode_event(arguments: [u64; 6], state: &mut ProbeDispatc
 
 /// Accepts window-mode margins. REmu scales presentation rather than insetting the guest surface.
 fn video_out_set_window_mode_margins(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("MTxxrOCeSig");
     if low_i32(arguments[0]) != 1 || !state.video_out.is_open {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
     }
@@ -5529,6 +5541,7 @@ fn kernel_get_event_data(event: u64) -> u64 {
 /// request is validated and accepted without changing host scheduling. Rejecting it would fail
 /// engine worker setup for a property the guest cannot observe directly.
 fn pthread_set_schedule_parameters(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("Xs9hdiD7sAA");
     let (thread, parameters) = (arguments[0], arguments[2]);
     if thread == 0 || parameters == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
@@ -6083,6 +6096,7 @@ fn run_all_guest_exit_callbacks() {
 }
 
 fn sysmodule_load(module: u64, state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("g8cM39EUZ6o");
     let module = low_i32(module);
     if module < 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -6132,6 +6146,7 @@ fn game_update_initialize(state: &mut ProbeDispatchState) -> u64 {
 }
 
 fn np_entitlement_access_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("jO8DM8oyego");
     if arguments[0] == 0 || arguments[1] == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -6140,6 +6155,7 @@ fn np_entitlement_access_initialize(arguments: [u64; 6], state: &mut ProbeDispat
 }
 
 fn np_session_signaling_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("ysmw6J-P8Ak");
     const PARAMETER_SIZE: usize = 0x28;
     if arguments[0] == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -6239,6 +6255,7 @@ fn np_web_api2_check_timeout(state: &mut ProbeDispatchState) -> u64 {
 }
 
 fn np_check_callback(state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("3Zl8BePTh9Y");
     state.services.np_callback_polls = state.services.np_callback_polls.saturating_add(1);
     0
 }
@@ -6267,6 +6284,7 @@ fn np_set_np_title_id(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u6
 }
 
 fn share_feature_permit(state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("YBiIdcDPrxs");
     state.services.share_feature_permitted = true;
     0
 }
@@ -6306,6 +6324,7 @@ fn share_set_content_parameter(address: u64, state: &mut ProbeDispatchState) -> 
 }
 
 fn ult_initialize(runtime: u64, state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("hZIg1EWGsHM");
     if runtime == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -6477,6 +6496,7 @@ fn user_service_get_login_user_id_list(arguments: [u64; 6]) -> u64 {
 }
 
 fn np_get_account_country(output: u64) -> u64 {
+    remu_gpu::note_inert("JT+t00a3TxA");
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -6493,6 +6513,7 @@ fn np_get_account_country(output: u64) -> u64 {
 /// `SceNpOnlineId` (16 data bytes including the terminator) so offline profile paths do not read
 /// uninitialized memory.
 fn np_get_online_id(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("XDncXQIJUSk");
     const ONLINE_ID_SIZE: usize = 16;
     const ONLINE_ID: &[u8; ONLINE_ID_SIZE] = b"REmuUser\0\0\0\0\0\0\0\0";
     if low_i32(arguments[0]) != 0x1000_0000 {
@@ -6506,6 +6527,7 @@ fn np_get_online_id(arguments: [u64; 6]) -> u64 {
 }
 
 fn system_service_get_status(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("rPo6tV8D9bM");
     let output = arguments[0];
     if output == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
@@ -6593,6 +6615,7 @@ fn guest_uuid_create(output: u64) -> u64 {
 }
 
 fn guest_kernel_is_stack(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("yDBwVAolDgg");
     if arguments[1] != 0 {
         write_guest_u64(arguments[1], 0);
     }
@@ -6603,6 +6626,7 @@ fn guest_kernel_is_stack(arguments: [u64; 6]) -> u64 {
 }
 
 fn user_service_get_user_name(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("1xxcMiGu2fo");
     const USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
     const USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
     const USER_SERVICE_ERROR_BUFFER_TOO_SHORT: u32 = 0x8096_000a;
@@ -6622,6 +6646,7 @@ fn user_service_get_user_name(arguments: [u64; 6]) -> u64 {
 }
 
 fn user_service_get_age_level(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("woNpu+45RLk");
     const USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
     const USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
     if low_i32(arguments[0]) != 0x1000_0000 {
@@ -6635,6 +6660,7 @@ fn user_service_get_age_level(arguments: [u64; 6]) -> u64 {
 }
 
 fn user_service_get_game_presets(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("-sD02mFDBh4");
     const USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
     const USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
     if low_i32(arguments[0]) != 0x1000_0000 {
@@ -6649,6 +6675,7 @@ fn user_service_get_game_presets(arguments: [u64; 6]) -> u64 {
 }
 
 fn user_service_get_setting(arguments: [u64; 6], value: u32) -> u64 {
+    remu_gpu::note_inert("user:GetSetting");
     const USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
     const USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
     if low_i32(arguments[0]) != 0x1000_0000 {
@@ -6662,6 +6689,7 @@ fn user_service_get_setting(arguments: [u64; 6], value: u32) -> u64 {
 }
 
 fn app_content_initialize(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("R9lA82OraNs");
     if arguments[0] == 0 || arguments[1] == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -6670,6 +6698,7 @@ fn app_content_initialize(arguments: [u64; 6]) -> u64 {
 }
 
 fn app_content_app_param_get_int(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("99b82IKXpH4");
     if arguments[1] == 0 || low_u32(arguments[0]) > 4 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -6723,6 +6752,7 @@ fn system_service_get_display_safe_area_info(output: u64) -> u64 {
 
 /// Records a network-state callback and reports its identifier.
 fn net_ctl_register_callback(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("UJ+Z7Q+4ck0");
     static NEXT_CALLBACK: AtomicU32 = AtomicU32::new(1);
     if arguments[0] == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -6887,6 +6917,7 @@ const COREDUMP_MAXIMUM_STACK_SIZE: u64 = 0x2000_0000;
 
 /// Records the guest's coredump handler so a later fault path can run it.
 fn coredump_register_handler(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("8zLSfEfW5AU");
     let (handler, stack_size) = (arguments[0], arguments[1]);
     if state.coredump_handler.is_some() {
         return sce_kernel_error(COREDUMP_ERROR_ALREADY_REGISTERED);
@@ -6967,6 +6998,7 @@ fn civil_from_unix_seconds(seconds: i64) -> (u16, u16, u16, u16, u16, u16) {
 }
 
 fn ime_keyboard_get_resource_ids(arguments: [u64; 6]) -> u64 {
+    remu_gpu::note_inert("dKadqZFgKKQ");
     let output = arguments[1];
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
@@ -6979,6 +7011,7 @@ fn ime_keyboard_get_resource_ids(arguments: [u64; 6]) -> u64 {
 }
 
 fn ime_keyboard_get_info(output: u64) -> u64 {
+    remu_gpu::note_inert("VkqLPArfFdc");
     if output == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
@@ -7089,6 +7122,7 @@ fn patch_agc_shader_program_registers(header: u64, code: u64) -> bool {
                     read_guest_u32(registers + 8)
                 ),
             );
+            remu_gpu::note_inert("agc:unmapped-shader-stage-accepted");
             None
         }
     };
@@ -7547,6 +7581,7 @@ pub(crate) fn process_guest_range_has_read_access(address: u64, length: usize) -
 }
 
 extern "C" fn guest_locale_virtual_noop(locale: u64) -> u64 {
+    remu_gpu::note_inert("cxx:guest_locale_virtual_noop");
     locale
 }
 
@@ -7888,6 +7923,7 @@ fn sanitizer_new_replace_external() -> u64 {
 }
 
 fn libc_heap_get_trace_info(info_address: u64, state: &mut ProbeDispatchState) -> u64 {
+    remu_gpu::note_inert("NWtTN10cJzE");
     const HEAP_TRACE_INFO_SIZE: u64 = 32;
     const HEAP_TRACE_STORAGE_WORDS: usize = 65;
     if info_address == 0 || read_guest_u64(info_address) != HEAP_TRACE_INFO_SIZE {
@@ -8278,6 +8314,22 @@ const SCE_KERNEL_ERROR_NAME_TOO_LONG: u32 = 0x8002_003f;
 const SCE_KERNEL_ERROR_TIMED_OUT: u32 = 0x8002_003c;
 const SCE_KERNEL_ERROR_NOT_IMPLEMENTED: u32 = 0x8002_004e;
 const SCE_KERNEL_STAT_SIZE: usize = 120;
+
+
+/// Returns success after recording that this NID/path did not perform the real work.
+///
+/// Phase 0 instrumentation for CORE-MECHANISMS Group 8: every fabricated-success arm calls
+/// [`remu_gpu::note_inert`] so [`write_abi_gap_summary`] can name it. Behavior is unchanged.
+pub(crate) fn inert_ok(key: &str) -> u64 {
+    remu_gpu::note_inert(key);
+    0
+}
+
+/// Like [`inert_ok`], but returns a fabricated non-zero value (handle, count, out-pointer write result).
+pub(crate) fn inert_value(key: &str, value: u64) -> u64 {
+    remu_gpu::note_inert(key);
+    value
+}
 
 fn sce_kernel_error(code: u32) -> u64 {
     signed_i32_return(i32::from_ne_bytes(code.to_ne_bytes()))
@@ -8816,6 +8868,18 @@ fn probe_entry(
     }
     configure_probe_dispatch(image, game_root, maximum_import_hits);
     remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::GuestRuntimeConfigured);
+    // Fault diagnostics must exist before any guest code runs. Previously the SIGSEGV/SIGBUS
+    // reporter installed only with the first CPU write-watch, so early crashes were silent and
+    // stack-overflow faults had no alternate stack (full-audit REPORT.md §0.4).
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(error) = remu_memory::install_thread_signal_stack() {
+            eprintln!("[REMu] warning: sigaltstack unavailable on main thread: {error}");
+        }
+        if let Err(error) = remu_memory::install_fault_handlers() {
+            eprintln!("[REMu] warning: SIGSEGV/SIGBUS reporter unavailable: {error}");
+        }
+    }
     if let Err(error) = sha_ni::install_sha_ni_sigill_recovery() {
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");
     }
@@ -8969,6 +9033,8 @@ fn abi_gap_fingerprint() -> u64 {
         .wrapping_add(failures)
         .wrapping_add(sha_ni::recovered_sse4a_count())
         .wrapping_add(sha_ni::recovered_sha_ni_count())
+        .wrapping_add(remu_gpu::fabricated_success_total())
+        .wrapping_add(guest_sync::lazily_fabricated_mutex_count())
 }
 
 fn write_abi_gap_summary() {
@@ -8990,6 +9056,43 @@ fn write_abi_gap_summary() {
         if count != 0 {
             eprintln!("[REMu][REPORT] declined shader registrations reason={reason} count={count}");
         }
+    }
+    // Group-8 fabricated successes: handlers that returned SCE_OK without doing the work.
+    // Invisible to the unimplemented/failure counters by construction — see CORE-MECHANISMS §2.
+    let fabricated = remu_gpu::fabricated_success_counts();
+    if !fabricated.is_empty() {
+        let total: u64 = fabricated.iter().map(|(_, count)| count).sum();
+        eprintln!(
+            "[REMu][REPORT] fabricated success keys={} total_calls={total}",
+            fabricated.len()
+        );
+        /// Cap so a hot mixer stub cannot bury every other report line.
+        const MAXIMUM_REPORTED_INERT: usize = 60;
+        let mut ranked = fabricated;
+        ranked.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        for (key, count) in ranked.iter().take(MAXIMUM_REPORTED_INERT) {
+            let name = nid_display_name(key).unwrap_or(if key.contains(':') {
+                "internal"
+            } else {
+                "unknown"
+            });
+            eprintln!(
+                "[REMu][REPORT] fabricated success key={key} name={name} calls={count}"
+            );
+        }
+        if ranked.len() > MAXIMUM_REPORTED_INERT {
+            eprintln!(
+                "[REMu][REPORT] {} more fabricated-success keys omitted from this summary",
+                ranked.len() - MAXIMUM_REPORTED_INERT
+            );
+        }
+    }
+    let lazy_mutexes = guest_sync::lazily_fabricated_mutex_count();
+    if lazy_mutexes != 0 {
+        eprintln!(
+            "[REMu][REPORT] lazily fabricated mutex entries count={lazy_mutexes} \
+             (create-on-first-use without scePthreadMutexInit — handle-copy detector)"
+        );
     }
     let recovered_sha_ni = sha_ni::recovered_sha_ni_count();
     let recovered_sse4a = sha_ni::recovered_sse4a_count();

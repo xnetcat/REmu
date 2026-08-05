@@ -485,6 +485,11 @@ pub(super) static NOOP_DRAWS_EMPTY_SCISSOR: AtomicU64 = AtomicU64::new(0);
 pub(super) static NOOP_DRAWS_MESH_DISPATCH_SKIPPED: AtomicU64 = AtomicU64::new(0);
 pub(super) static NOOP_DRAWS_FAST_CLEAR_NOT_PENDING: AtomicU64 = AtomicU64::new(0);
 
+/// Records a draw that reported success without rasterizing (Group-8 GPU surface).
+pub(super) fn note_noop_draw(kind: &'static str) {
+    remu_gpu::note_inert(kind);
+}
+
 pub(super) fn record_texture_work(
     count: &AtomicU64,
     bytes: &AtomicU64,

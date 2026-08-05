@@ -104,6 +104,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
                 "[REMu][AUDIO2] initialized mastering config={:#x} state={:#x}",
                 arguments[2], arguments[5]
             );
+            remu_gpu::note_inert(nid);
             0
         }
         // The host mixer consumes the already-mastered interleaved result. Accept graph parameter
@@ -117,6 +118,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
             {
                 state.mastering_parameters = arguments[0];
             }
+            remu_gpu::note_inert(nid);
             0
         }
         // The ABI has two optional u32 outputs. Initial setup supplies both, while Wwise's live
@@ -195,6 +197,7 @@ pub(crate) fn dispatch_audio_out2_import(nid: &str, arguments: [u64; 6]) -> u64 
             // Route 1 is the connected primary device, matching ordinary AudioOut. Route 0 means
             // disconnected: Wwise's device poll treats it as a removal and immediately rebuilds
             // every user and port, even though PortCreate and mastering both succeeded.
+            remu_gpu::note_inert(nid);
             write_audio_out2_port_state(
                 output,
                 SceAudioOut2PortState {

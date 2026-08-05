@@ -22,6 +22,7 @@ pub(crate) fn ces_ucs_profile_init_sjis1997_cp932(arguments: [u64; 6]) -> u64 {
     if profile == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    remu_gpu::note_inert("ZiDCxUUGbec");
     guest_memset(profile, 0, CES_UCS_PROFILE_SIZE);
     // Profile magic / version markers observed from the console initializer.
     crate::write_guest_u32(profile, 0x4353_0001);
@@ -37,6 +38,7 @@ pub(crate) fn ces_mbcs_ucs_context_init(arguments: [u64; 6]) -> u64 {
     if context == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    remu_gpu::note_inert("538bRGc6Zo8");
     guest_memset(context, 0, CES_MBCS_UCS_CONTEXT_SIZE);
     crate::write_guest_u64(context, profile);
     0

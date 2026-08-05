@@ -176,6 +176,7 @@ impl MetalPresenter {
             // programs for such trigger/no-op packets while leaving an unrelated pixel program
             // bound; executing that program would overwrite the target.
             super::stats::NOOP_DRAWS_RASTER_DISABLED.fetch_add(1, Ordering::Relaxed);
+            super::stats::note_noop_draw("gpu:noop-raster-disabled");
             return Ok(());
         }
         if matches!(
@@ -190,6 +191,7 @@ impl MetalPresenter {
             // MRT0 resident. Resolve transfers that resident to MRT1; EliminateFastClear
             // materializes the logical CMASK clear before later geometry loads the attachment.
             super::stats::NOOP_DRAWS_COLOR_OPERATION.fetch_add(1, Ordering::Relaxed);
+            super::stats::note_noop_draw("gpu:noop-color-operation");
             if self.active_open_guest_batch_mut().is_some_and(|batch| {
                 batch.end_compute_pass();
                 batch.end_render_pass()
@@ -1745,6 +1747,7 @@ impl MetalPresenter {
                     } else {
                         super::stats::NOOP_DRAWS_MESH_DISPATCH_SKIPPED
                             .fetch_add(1, Ordering::Relaxed);
+                        super::stats::note_noop_draw("gpu:noop-mesh-skip");
                     }
                 } else {
                     let indices = ngg_indices
@@ -1816,6 +1819,7 @@ impl MetalPresenter {
                         // all; without a count that whole draw disappears without a trace.
                         super::stats::NOOP_DRAWS_MESH_DISPATCH_SKIPPED
                             .fetch_add(1, Ordering::Relaxed);
+                        super::stats::note_noop_draw("gpu:noop-mesh-skip");
                     }
                 }
             } else if diagnostic_force_triangle {
@@ -1824,6 +1828,7 @@ impl MetalPresenter {
                 // Metal rejects an empty scissor, so a guest empty-scissor draw encodes no
                 // primitive while preserving command-stream ordering.
                 super::stats::NOOP_DRAWS_EMPTY_SCISSOR.fetch_add(1, Ordering::Relaxed);
+                super::stats::note_noop_draw("gpu:noop-empty-scissor");
             } else if let Some(arguments) = indirect_arguments.as_ref() {
                 if let Some((index_buffer, index_type)) = indirect_index_buffer.as_ref() {
                     encoder.draw_indexed_primitives_indirect(
@@ -3461,6 +3466,7 @@ impl MetalPresenter {
     ) -> Result<Option<GuestTextureDescriptor>, String> {
         let Some(target) = decode_color_eliminate_fast_clear_target(draw)? else {
             super::stats::NOOP_DRAWS_FAST_CLEAR_NOT_PENDING.fetch_add(1, Ordering::Relaxed);
+            super::stats::note_noop_draw("gpu:noop-fast-clear-idle");
             return Ok(None);
         };
         if !consume_color_metadata_clear(
@@ -3469,6 +3475,7 @@ impl MetalPresenter {
             target.base_layer,
         ) {
             super::stats::NOOP_DRAWS_FAST_CLEAR_NOT_PENDING.fetch_add(1, Ordering::Relaxed);
+            super::stats::note_noop_draw("gpu:noop-fast-clear-idle");
             return Ok(None);
         }
         let activity_stamp = ResidentTextureActivityStamp {
