@@ -19,7 +19,7 @@ mod page;
 use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_infallible};
 
 mod signal;
-pub use signal::GuestReadMaterializer;
+pub use signal::{GuestFsFaultHandler, GuestReadMaterializer};
 pub use signal::{install_fault_handlers, install_thread_signal_stack};
 
 /// Registers the process-global read-watch materializer used by [`CpuWriteWatch::new_read_materialized`].
@@ -32,6 +32,14 @@ pub fn set_read_watch_materializer(
     materializer: GuestReadMaterializer,
 ) -> Option<GuestReadMaterializer> {
     signal::set_read_watch_materializer(materializer)
+}
+
+/// Registers the process-global FS/`tls` fault backstop used when AOT `fs:` rewriting misses a site.
+///
+/// Returns the previously registered handler, if any. The handler runs in signal context and must
+/// be async-signal-safe (see [`GuestFsFaultHandler`]).
+pub fn set_fs_fault_handler(handler: GuestFsFaultHandler) -> Option<GuestFsFaultHandler> {
+    signal::set_fs_fault_handler(handler)
 }
 
 mod snapshot;

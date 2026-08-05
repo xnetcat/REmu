@@ -60,6 +60,7 @@ mod sha_ni;
 mod shader_cache;
 mod shader_eval;
 mod tls;
+mod tls_fault;
 mod unwind;
 mod vfs;
 mod video_out;
@@ -8879,6 +8880,8 @@ fn probe_entry(
         if let Err(error) = remu_memory::install_fault_handlers() {
             eprintln!("[REMu] warning: SIGSEGV/SIGBUS reporter unavailable: {error}");
         }
+        // Must follow fault-handler install: the backstop hooks the same SIGSEGV/SIGBUS path.
+        tls_fault::install_fs_fault_backstop();
     }
     if let Err(error) = sha_ni::install_sha_ni_sigill_recovery() {
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");

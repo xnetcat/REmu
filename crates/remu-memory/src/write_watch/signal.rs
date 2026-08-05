@@ -34,6 +34,17 @@ pub type GuestReadMaterializer = unsafe extern "C" fn(page_address: u64, page_si
 /// The process-global read-watch materializer, stored as a raw function-pointer address (0 = none).
 static READ_MATERIALIZER: AtomicUsize = AtomicUsize::new(0);
 
+/// Emulates an unpatched guest `fs:` access against the guest thread pointer.
+///
+/// Invoked from the SIGSEGV/SIGBUS handler before write-watch recovery (and before the null-address
+/// short-circuit). Must be async-signal-safe. Returning `true` means the fault was emulated and
+/// the interrupted context was advanced past the instruction; `false` leaves the fault unhandled.
+pub type GuestFsFaultHandler =
+    unsafe extern "C" fn(fault_address: u64, context: *mut c_void) -> bool;
+
+/// The process-global FS fault backstop, stored as a raw function-pointer address (0 = none).
+static FS_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
+
 /// Registers the read-watch materializer, returning the previously registered one if any.
 pub(super) fn set_read_watch_materializer(
     materializer: GuestReadMaterializer,
@@ -49,6 +60,19 @@ pub(super) fn read_watch_materializer() -> Option<GuestReadMaterializer> {
     let raw = READ_MATERIALIZER.load(Ordering::Acquire);
     // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestReadMaterializer`.
     (raw != 0).then(|| unsafe { std::mem::transmute::<usize, GuestReadMaterializer>(raw) })
+}
+
+/// Registers the FS fault backstop, returning the previously registered handler if any.
+pub(super) fn set_fs_fault_handler(handler: GuestFsFaultHandler) -> Option<GuestFsFaultHandler> {
+    let previous = FS_FAULT_HANDLER.swap(handler as usize, Ordering::AcqRel);
+    // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestFsFaultHandler`.
+    (previous != 0).then(|| unsafe { std::mem::transmute::<usize, GuestFsFaultHandler>(previous) })
+}
+
+fn fs_fault_handler() -> Option<GuestFsFaultHandler> {
+    let raw = FS_FAULT_HANDLER.load(Ordering::Acquire);
+    // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestFsFaultHandler`.
+    (raw != 0).then(|| unsafe { std::mem::transmute::<usize, GuestFsFaultHandler>(raw) })
 }
 
 /// Whether a delivered fault was a read, a write, or could not be classified from the context.
@@ -210,6 +234,16 @@ extern "C" fn write_fault_signal_handler(
             )
         }
     };
+    // Unpatched `fs:` accesses fault at absolute low addresses (Rosetta FS base is 0), including
+    // `fs:[0]`. Try the TLS backstop before write-watch recovery and before the null-address
+    // diagnostic so a missed AOT rewrite is loud-and-emulated rather than a silent death at 0.
+    if let Some(handler) = fs_fault_handler() {
+        // SAFETY: the registered handler is async-signal-safe and receives the live fault context.
+        if unsafe { handler(fault_address, context) } {
+            ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
+            return;
+        }
+    }
     // SAFETY: SA_SIGINFO supplies a live ucontext_t (or null) for the duration of this callback.
     let access = unsafe { fault_access(context) };
     let handled = try_handle_write_fault(fault_address, access, || {
