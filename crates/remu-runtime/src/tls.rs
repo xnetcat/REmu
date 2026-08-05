@@ -23,9 +23,11 @@ pub(crate) const GUEST_TLS_TCB_SIZE: u64 = 0x10_000;
 /// Counts TLS store-helper executions (plan C4). Nothing measured them before this counter.
 pub(crate) static TLS_STORE_THUNK_HITS: AtomicU64 = AtomicU64::new(0);
 
-const TLS_LOAD_HELPER_SIZE: u64 = 96;
+/// Load and store helpers share the store prologue (flags + GPRs + XSAVE) and the red-zone
+/// contract (`ret 128`). 96 bytes was only enough for the old flags/GPR-only load thunk.
+const TLS_LOAD_HELPER_SIZE: u64 = 192;
 
-const TLS_LOAD_HELPER_SIZE_USIZE: usize = 96;
+const TLS_LOAD_HELPER_SIZE_USIZE: usize = 192;
 
 const TLS_LOAD_HELPER_COUNT: u64 = 16;
 
@@ -482,30 +484,29 @@ fn encode_tls_load_helper(
     dispatcher: u64,
     destination: u8,
 ) -> Result<usize, LinkError> {
+    // The load patch is a plain `call` (sites are often only nine bytes). Skip the 128-byte red
+    // zone here — same contract as the store path's `lea rsp,[rsp-128]; call` / `ret 128` pair —
+    // then reuse the store helper's full flags + GPR + XSAVE prologue so a patched load cannot
+    // clobber live XMM/YMM or red-zone data.
+    let mut body = [0x90_u8; TLS_LOAD_HELPER_SIZE_USIZE];
     let mut cursor = 0;
-    // The replaced MOV does not change flags. The Darwin TLV resolver called by the Rust
-    // thread-local getter is an ordinary SysV callee and may change them.
-    slot[cursor] = 0x9c; // pushfq
-    cursor += 1;
-    for register in TLS_HELPER_SAVED_REGISTERS {
-        emit_push_register(slot, &mut cursor, register);
+    body[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x80]); // lea rsp,[rsp-128]
+    cursor += 5;
+    let mut prologue = [0x90_u8; TLS_LOAD_HELPER_SIZE_USIZE];
+    let prologue_len = emit_tls_store_helper_prologue(&mut prologue, dispatcher);
+    body[cursor..cursor + prologue_len].copy_from_slice(&prologue[..prologue_len]);
+    cursor += prologue_len;
+    // Publish the thread pointer into the destination register's saved stack slot. RSP is never a
+    // load destination — the decoder refuses destination 4.
+    if destination == 4 {
+        return Err(LinkError::AddressOverflow);
     }
-    // lea rsp, [rsp-8] — aligns the SysV call without changing flags.
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0xf8]);
-    cursor += 5;
-    slot[cursor..cursor + 2].copy_from_slice(&[0x48, 0xb8]);
-    slot[cursor + 2..cursor + 10].copy_from_slice(&dispatcher.to_le_bytes());
-    cursor += 10;
-    slot[cursor..cursor + 2].copy_from_slice(&[0xff, 0xd0]);
-    cursor += 2;
-    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x08]);
-    cursor += 5;
     let saved_index = TLS_HELPER_SAVED_REGISTERS
         .iter()
         .position(|register| *register == destination)
-        .unwrap_or(0);
+        .ok_or(LinkError::AddressOverflow)?;
     let saved_offset = (TLS_HELPER_SAVED_REGISTERS.len() - 1 - saved_index) * 8;
-    slot[cursor..cursor + 5].copy_from_slice(&[
+    body[cursor..cursor + 5].copy_from_slice(&[
         0x48,
         0x89,
         0x44,
@@ -513,13 +514,11 @@ fn encode_tls_load_helper(
         u8::try_from(saved_offset).map_err(|_| LinkError::AddressOverflow)?,
     ]);
     cursor += 5;
-    for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
-        emit_pop_register(slot, &mut cursor, register);
+    cursor = emit_tls_store_helper_epilogue(&mut body, cursor);
+    if cursor > slot.len() {
+        return Err(LinkError::AddressOverflow);
     }
-    slot[cursor] = 0x9d; // popfq
-    cursor += 1;
-    slot[cursor] = 0xc3;
-    cursor += 1;
+    slot[..cursor].copy_from_slice(&body[..cursor]);
     Ok(cursor)
 }
 
@@ -892,13 +891,22 @@ mod tests {
     }
 
     #[test]
-    fn tls_load_helper_preserves_guest_flags_around_the_tlv_call() {
+    fn tls_load_helper_preserves_guest_flags_vector_state_and_red_zone() {
         let mut slot = [0x90_u8; super::TLS_LOAD_HELPER_SIZE_USIZE];
         let encoded = encode_tls_load_helper(&mut slot, 0x1122_3344_5566_7788, 0).unwrap();
+        assert!(encoded <= super::TLS_LOAD_HELPER_SIZE_USIZE);
+        // Red-zone skip precedes the shared store prologue.
+        assert_eq!(&slot[..5], &[0x48, 0x8d, 0x64, 0x24, 0x80]);
         let mnemonics = decoded_mnemonics(&slot[..encoded]);
-        assert_eq!(mnemonics.first(), Some(&Mnemonic::Pushfq));
-        assert_eq!(mnemonics.last(), Some(&Mnemonic::Ret));
-        assert!(mnemonics.contains(&Mnemonic::Popfq));
+        assert_eq!(mnemonics.first(), Some(&Mnemonic::Lea));
+        assert!(
+            mnemonics.iter().any(|m| matches!(m, Mnemonic::Xsave64))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Xrstor64))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Pushfq))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Popfq)),
+            "load helper must match the store helper's ABI contract: {mnemonics:?}"
+        );
+        assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
     }
 
     #[test]
