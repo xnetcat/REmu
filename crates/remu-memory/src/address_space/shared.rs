@@ -778,6 +778,10 @@ pub enum GuardedBackingWrite {
 /// after the capture. Overwriting it would revert a store the owner has already relied on —
 /// the recorded MallocBinned3 0x40-poison corruption. The caller holds the registry lock, so
 /// the comparison and the write cannot interleave with a remap.
+///
+/// Aligned 4- and 8-byte runs use a single compare-exchange against the baseline word so a
+/// concurrent guest store cannot be silently reverted in the read-compare-write window that a
+/// bulk memcpy publication still has for larger texture writebacks.
 fn guarded_backing_write(
     backing: &GuestPhysicalBacking,
     offset: u64,
@@ -785,6 +789,24 @@ fn guarded_backing_write(
     source: &[u8],
 ) -> GuardedBackingWrite {
     debug_assert_eq!(baseline.len(), source.len());
+    if baseline.len() == 8 && offset.is_multiple_of(8) {
+        let expected = u64::from_le_bytes(baseline.try_into().expect("8-byte baseline"));
+        let desired = u64::from_le_bytes(source.try_into().expect("8-byte source"));
+        return match backing.compare_exchange_u64_at(offset, expected, desired) {
+            Some(true) => GuardedBackingWrite::Applied,
+            Some(false) => GuardedBackingWrite::GuestModified,
+            None => GuardedBackingWrite::Unavailable,
+        };
+    }
+    if baseline.len() == 4 && offset.is_multiple_of(4) {
+        let expected = u32::from_le_bytes(baseline.try_into().expect("4-byte baseline"));
+        let desired = u32::from_le_bytes(source.try_into().expect("4-byte source"));
+        return match backing.compare_exchange_u32_at(offset, expected, desired) {
+            Some(true) => GuardedBackingWrite::Applied,
+            Some(false) => GuardedBackingWrite::GuestModified,
+            None => GuardedBackingWrite::Unavailable,
+        };
+    }
     let mut current = vec![0_u8; baseline.len()];
     if !backing.read_exact_at(offset, &mut current) {
         return GuardedBackingWrite::Unavailable;
@@ -797,6 +819,128 @@ fn guarded_backing_write(
     } else {
         GuardedBackingWrite::Unavailable
     }
+}
+
+/// Release fence separating unordered payload stores from a subsequent label publication.
+///
+/// Call after writing DMA/fill payload bytes and before publishing the guest-visible label that
+/// makes those bytes architecturally observable. Label stores themselves also use release
+/// ordering; this fence covers the large memcpy path that cannot carry a per-store order.
+#[inline]
+pub fn guest_publish_release_fence() {
+    std::sync::atomic::fence(Ordering::Release);
+}
+
+/// Release-store an aligned 32-bit word through a live guest VA.
+///
+/// Shared by HLE and the direct (write-watch-pinned) GPU publication path. The guest address space
+/// is identity-mapped, so the VA names the same physical bytes as every shared alias.
+pub fn store_guest_visible_u32(address: u64, value: u32) {
+    debug_assert!(address.is_multiple_of(4));
+    // SAFETY: callers prove `address` is a live, 4-byte-aligned guest mapping retained for the
+    // store. Release ordering publishes prior host payload writes to guest observers.
+    unsafe {
+        std::sync::atomic::AtomicU32::from_ptr(address as *mut u32).store(value, Ordering::Release);
+    }
+}
+
+/// Release-store an aligned 64-bit word through a live guest VA.
+pub fn store_guest_visible_u64(address: u64, value: u64) {
+    debug_assert!(address.is_multiple_of(8));
+    // SAFETY: callers prove `address` is a live, 8-byte-aligned guest mapping retained for the
+    // store. Release ordering publishes prior host payload writes to guest observers.
+    unsafe {
+        AtomicU64::from_ptr(address as *mut u64).store(value, Ordering::Release);
+    }
+}
+
+/// Acquire-load an aligned 32-bit word through a live guest VA.
+#[must_use]
+pub fn load_guest_visible_u32(address: u64) -> u32 {
+    debug_assert!(address.is_multiple_of(4));
+    // SAFETY: callers prove `address` is a live, 4-byte-aligned guest mapping retained for the load.
+    unsafe {
+        std::sync::atomic::AtomicU32::from_ptr(address as *mut u32).load(Ordering::Acquire)
+    }
+}
+
+/// Acquire-load an aligned 64-bit word through a live guest VA.
+#[must_use]
+pub fn load_guest_visible_u64(address: u64) -> u64 {
+    debug_assert!(address.is_multiple_of(8));
+    // SAFETY: callers prove `address` is a live, 8-byte-aligned guest mapping retained for the load.
+    unsafe { AtomicU64::from_ptr(address as *mut u64).load(Ordering::Acquire) }
+}
+
+/// Publishes one aligned 32-bit label through shared backing while the identity still holds.
+pub fn publish_guest_shared_u32_if_identity(
+    address: u64,
+    expected: GuestSharedMappingIdentity,
+    value: u32,
+) -> bool {
+    if !address.is_multiple_of(4) {
+        return false;
+    }
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, 4) else {
+        return false;
+    };
+    if backing.id() != expected.backing_id || offset != expected.backing_offset {
+        return false;
+    }
+    backing.store_u32_release_at(offset, value)
+}
+
+/// Publishes one aligned 64-bit label through shared backing while the identity still holds.
+///
+/// This is the ordered replacement for publishing fence labels as a runtime-length memcpy: one
+/// aligned release store, not eight byte copies that can tear under a concurrent reader.
+pub fn publish_guest_shared_u64_if_identity(
+    address: u64,
+    expected: GuestSharedMappingIdentity,
+    value: u64,
+) -> bool {
+    if !address.is_multiple_of(8) {
+        return false;
+    }
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some((backing, offset, _)) = resolve_shared_backing_range(&mappings, address, 8) else {
+        return false;
+    };
+    if backing.id() != expected.backing_id || offset != expected.backing_offset {
+        return false;
+    }
+    backing.store_u64_release_at(offset, value)
+}
+
+/// Acquire-loads one aligned 32-bit word from shared backing at `address`.
+#[must_use]
+pub fn load_guest_shared_u32(address: u64) -> Option<u32> {
+    if !address.is_multiple_of(4) {
+        return None;
+    }
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backing, offset, _) = resolve_shared_backing_range(&mappings, address, 4)?;
+    backing.load_u32_acquire_at(offset)
+}
+
+/// Acquire-loads one aligned 64-bit word from shared backing at `address`.
+#[must_use]
+pub fn load_guest_shared_u64(address: u64) -> Option<u64> {
+    if !address.is_multiple_of(8) {
+        return None;
+    }
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (backing, offset, _) = resolve_shared_backing_range(&mappings, address, 8)?;
+    backing.load_u64_acquire_at(offset)
 }
 
 /// Baseline-guarded form of [`write_guest_shared_backing_if_identity`].

@@ -537,6 +537,69 @@ fn a_lease_yields_to_a_guest_store_after_capture() {
 }
 
 #[test]
+fn shared_64_bit_label_publishes_as_one_release_store() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let identity = guest_shared_mapping_identity(mapped.get(), 8).expect("label identity");
+    let label = 0x1122_3344_5566_7788_u64;
+    assert!(publish_guest_shared_u64_if_identity(
+        mapped.get(),
+        identity,
+        label
+    ));
+    assert_eq!(load_guest_shared_u64(mapped.get()), Some(label));
+    assert_eq!(load_guest_visible_u64(mapped.get()), label);
+}
+
+#[test]
+fn word_sized_baseline_guard_uses_compare_exchange() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    store_guest_visible_u64(mapped.get(), 0x1111_1111_1111_1111);
+    let identity = guest_shared_mapping_identity(mapped.get(), 8).expect("word identity");
+    assert_eq!(
+        write_guest_shared_backing_if_identity_and_baseline(
+            mapped.get(),
+            identity,
+            &0x1111_1111_1111_1111_u64.to_le_bytes(),
+            &0x5a5a_5a5a_5a5a_5a5a_u64.to_le_bytes(),
+        ),
+        GuardedBackingWrite::Applied
+    );
+    store_guest_visible_u64(mapped.get(), 0x7777_7777_7777_7777);
+    assert_eq!(
+        write_guest_shared_backing_if_identity_and_baseline(
+            mapped.get(),
+            identity,
+            &0x5a5a_5a5a_5a5a_5a5a_u64.to_le_bytes(),
+            &0xaaaa_aaaa_aaaa_aaaa_u64.to_le_bytes(),
+        ),
+        GuardedBackingWrite::GuestModified
+    );
+    assert_eq!(load_guest_visible_u64(mapped.get()), 0x7777_7777_7777_7777);
+}
+
+#[test]
 fn a_lease_follows_a_recycled_va_through_the_identity_licence() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

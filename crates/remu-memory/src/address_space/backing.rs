@@ -6,7 +6,7 @@ use std::ffi::CString;
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{
     AddressSpaceError, GUEST_PAGE_SIZE, align_up, host_page_size, host_size, require_aligned,
@@ -207,19 +207,12 @@ impl CachedWriteMapping {
         self.backing_offset <= offset && request_end <= mapping_end
     }
 
-    fn copy_from(&self, offset: u64, source: &[u8]) {
-        debug_assert!(self.contains(offset, source.len()));
+    fn pointer_at(&self, offset: u64, byte_count: usize) -> *mut u8 {
+        debug_assert!(self.contains(offset, byte_count));
         let in_mapping_offset =
             usize::try_from(offset - self.backing_offset).expect("contained offset fits usize");
-        // SAFETY: `contains` proves this writable mapping covers the requested physical range, and
-        // `source` provides an independently owned readable range of the same length.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                source.as_ptr(),
-                (self.address as *mut u8).add(in_mapping_offset),
-                source.len(),
-            );
-        }
+        // SAFETY: `contains` proves the returned address lies inside this live writable mapping.
+        unsafe { (self.address as *mut u8).add(in_mapping_offset) }
     }
 }
 
@@ -244,26 +237,25 @@ struct WriteMappingCache {
 }
 
 impl WriteMappingCache {
-    fn copy_if_present(&mut self, offset: u64, source: &[u8]) -> bool {
+    fn pointer_if_present(&mut self, offset: u64, byte_count: usize) -> Option<*mut u8> {
         let Some(index) = self
             .mappings
             .iter()
-            .position(|mapping| mapping.contains(offset, source.len()))
+            .position(|mapping| mapping.contains(offset, byte_count))
         else {
             #[cfg(test)]
             {
                 self.misses = self.misses.saturating_add(1);
             }
-            return false;
+            return None;
         };
         self.next_use = self.next_use.wrapping_add(1);
         self.mappings[index].last_use = self.next_use;
-        self.mappings[index].copy_from(offset, source);
         #[cfg(test)]
         {
             self.hits = self.hits.saturating_add(1);
         }
-        true
+        Some(self.mappings[index].pointer_at(offset, byte_count))
     }
 
     fn insert(&mut self, mut mapping: CachedWriteMapping) {
@@ -528,24 +520,147 @@ impl GuestPhysicalBacking {
     }
 
     pub(super) fn write_all_at(&self, offset: u64, source: &[u8]) -> bool {
-        let Some(end) = offset.checked_add(u64::try_from(source.len()).unwrap_or(u64::MAX)) else {
-            return false;
-        };
-        if end > self.size() {
+        self.with_write_pointer_at(offset, source.len(), |pointer| {
+            // SAFETY: `with_write_pointer_at` proves `pointer` covers `source.len()` writable bytes
+            // of this live backing, and `source` is valid for reads of the same length.
+            unsafe {
+                std::ptr::copy_nonoverlapping(source.as_ptr(), pointer, source.len());
+            }
+        })
+    }
+
+    /// Release-stores one aligned 32-bit guest-visible word through the shared backing window.
+    ///
+    /// Word stores go through the shm mapping (not a byte memcpy) so a concurrent reader cannot
+    /// observe a torn label, and release ordering publishes prior payload stores.
+    pub(super) fn store_u32_release_at(&self, offset: u64, value: u32) -> bool {
+        if !offset.is_multiple_of(4) {
             return false;
         }
-        let Ok(page_size) = host_page_size() else {
+        self.with_write_pointer_at(offset, 4, |pointer| {
+            // SAFETY: the window covers four aligned bytes of this live backing mapping.
+            unsafe {
+                AtomicU32::from_ptr(pointer.cast::<u32>()).store(value, Ordering::Release);
+            }
+        })
+    }
+
+    /// Release-stores one aligned 64-bit guest-visible word through the shared backing window.
+    pub(super) fn store_u64_release_at(&self, offset: u64, value: u64) -> bool {
+        if !offset.is_multiple_of(8) {
             return false;
-        };
+        }
+        self.with_write_pointer_at(offset, 8, |pointer| {
+            // SAFETY: the window covers eight aligned bytes of this live backing mapping.
+            unsafe {
+                AtomicU64::from_ptr(pointer.cast::<u64>()).store(value, Ordering::Release);
+            }
+        })
+    }
+
+    /// Acquire-loads one aligned 32-bit guest-visible word from the shared backing window.
+    pub(super) fn load_u32_acquire_at(&self, offset: u64) -> Option<u32> {
+        if !offset.is_multiple_of(4) {
+            return None;
+        }
+        let mut value = None;
+        if !self.with_write_pointer_at(offset, 4, |pointer| {
+            // SAFETY: the window covers four aligned bytes of this live backing mapping.
+            value = Some(unsafe {
+                AtomicU32::from_ptr(pointer.cast::<u32>()).load(Ordering::Acquire)
+            });
+        }) {
+            return None;
+        }
+        value
+    }
+
+    /// Acquire-loads one aligned 64-bit guest-visible word from the shared backing window.
+    pub(super) fn load_u64_acquire_at(&self, offset: u64) -> Option<u64> {
+        if !offset.is_multiple_of(8) {
+            return None;
+        }
+        let mut value = None;
+        if !self.with_write_pointer_at(offset, 8, |pointer| {
+            // SAFETY: the window covers eight aligned bytes of this live backing mapping.
+            value = Some(unsafe {
+                AtomicU64::from_ptr(pointer.cast::<u64>()).load(Ordering::Acquire)
+            });
+        }) {
+            return None;
+        }
+        value
+    }
+
+    /// Atomically publishes `desired` only while the word still equals `expected`.
+    ///
+    /// Returns `Some(true)` when the CAS applied, `Some(false)` when the guest (or another
+    /// publisher) already changed the word, and `None` when the range could not be mapped.
+    pub(super) fn compare_exchange_u32_at(
+        &self,
+        offset: u64,
+        expected: u32,
+        desired: u32,
+    ) -> Option<bool> {
+        if !offset.is_multiple_of(4) {
+            return None;
+        }
+        let mut outcome = None;
+        if !self.with_write_pointer_at(offset, 4, |pointer| {
+            // SAFETY: the window covers four aligned bytes of this live backing mapping.
+            let atomic = unsafe { AtomicU32::from_ptr(pointer.cast::<u32>()) };
+            outcome = Some(
+                atomic
+                    .compare_exchange(expected, desired, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok(),
+            );
+        }) {
+            return None;
+        }
+        outcome
+    }
+
+    /// Atomically publishes `desired` only while the 64-bit word still equals `expected`.
+    pub(super) fn compare_exchange_u64_at(
+        &self,
+        offset: u64,
+        expected: u64,
+        desired: u64,
+    ) -> Option<bool> {
+        if !offset.is_multiple_of(8) {
+            return None;
+        }
+        let mut outcome = None;
+        if !self.with_write_pointer_at(offset, 8, |pointer| {
+            // SAFETY: the window covers eight aligned bytes of this live backing mapping.
+            let atomic = unsafe { AtomicU64::from_ptr(pointer.cast::<u64>()) };
+            outcome = Some(
+                atomic
+                    .compare_exchange(expected, desired, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok(),
+            );
+        }) {
+            return None;
+        }
+        outcome
+    }
+
+    fn write_window(
+        &self,
+        offset: u64,
+        byte_count: usize,
+    ) -> Option<(u64 /* aligned_offset */, usize /* mapping_length */)> {
+        let end = offset.checked_add(u64::try_from(byte_count).ok()?)?;
+        if byte_count == 0 || end > self.size() {
+            return None;
+        }
+        let page_size = host_page_size().ok()?;
         let aligned_offset = offset - offset % page_size;
         let in_mapping_offset = offset - aligned_offset;
-        let Some(mapping_length) = in_mapping_offset
-            .checked_add(u64::try_from(source.len()).unwrap_or(u64::MAX))
+        let mapping_length = in_mapping_offset
+            .checked_add(u64::try_from(byte_count).ok()?)
             .and_then(|length| align_up(length, page_size).ok())
-            .and_then(|length| host_size(length).ok())
-        else {
-            return false;
-        };
+            .and_then(|length| host_size(length).ok())?;
         // Aligning the window end past the object is legal for mmap only up to the file size;
         // clamp so a final partial page still maps. `end <= size` and page-aligned object sizes
         // make the clamp a no-op except for objects smaller than one page window.
@@ -553,13 +668,26 @@ impl GuestPhysicalBacking {
             Ok(available) => mapping_length.min(available),
             Err(_) => mapping_length,
         };
+        Some((aligned_offset, mapping_length))
+    }
+
+    fn with_write_pointer_at<R>(
+        &self,
+        offset: u64,
+        byte_count: usize,
+        f: impl FnOnce(*mut u8) -> R,
+    ) -> bool {
+        let Some((aligned_offset, mapping_length)) = self.write_window(offset, byte_count) else {
+            return false;
+        };
         if mapping_length <= READ_MAPPING_CACHE_BYTE_CAPACITY {
             let mut cache = self
                 .inner
                 .write_mappings
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cache.copy_if_present(offset, source) {
+            if let Some(pointer) = cache.pointer_if_present(offset, byte_count) {
+                f(pointer);
                 return true;
             }
             let Some(mapping) =
@@ -567,7 +695,8 @@ impl GuestPhysicalBacking {
             else {
                 return false;
             };
-            mapping.copy_from(offset, source);
+            let pointer = mapping.pointer_at(offset, byte_count);
+            f(pointer);
             cache.insert(mapping);
             return true;
         }
@@ -576,7 +705,7 @@ impl GuestPhysicalBacking {
         else {
             return false;
         };
-        mapping.copy_from(offset, source);
+        f(mapping.pointer_at(offset, byte_count));
         true
     }
 
