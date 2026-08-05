@@ -15,7 +15,15 @@ From `sdk-1000/sdk/target/include/sys/_pthreadtypes.h` and `_pthread.h`:
 
 Identity is the published control-block handle (or zero-extended kernel sema id), never the
 address of the slot the guest passed. Resolve order: bare handle → `*slot` handle → static
-materialization for `NULL`/`1` (mutex only for `1`). Unknown non-initializer values refuse.
+materialization for `NULL`/`1` (mutex only for `1`). Unknown non-initializer values refuse on
+lock/unlock.
+
+Init always overwrites the slot with a fresh control block (except null / bare control-block
+arguments). Under the pointer-typedef ABI, Scream creates mutexes in stack locals, returns the
+handle by value, then reuses the same stack offset; leftover bits may still name a live object
+whose recorded `storage_address` points at that recycled frame. Refusing that as "already
+initialized" is wrong. Destroy blanks publishing storage only when it still holds this object's
+handle.
 
 `pthread_once` was already correct and is unchanged.
 
@@ -27,22 +35,24 @@ materialization for `NULL`/`1` (mutex only for `1`). Unknown non-initializer val
 
 Static-initializer materialization is **not** a safeguard — it is the SDK contract.
 
-## Live evidence (clean tree, revision `d3fc2f9`)
+## Acceptance follow-up (2026-08-05, revision `74aa06d`)
+
+Root cause of the remaining Scream unlock failure after identity landing: init refused a stack
+slot that still held a leftover live handle from a prior CreateMutex at the same stack offset
+(`refused re-init of canonical storage … slot=0x… handle=0x…`), so CreateMutex failed with
+`EINVAL`, the title kept a NULL handle, and unlock hit `slot=Some(0)` / `snd_osfuncs.cpp:410`.
 
 | Title | Outcome | Mutex note |
 | --- | --- | --- |
-| Silent Hill 60s headless | completed; `runs/silent-hill/` (`run.json` clean, rev `d3fc2f9`) | No `lazily fabricated mutex` line (counter removed). Phase 0 had `count=3`. Fabricated-success histogram still prints (unrelated Group-8 paths). |
-| Demon's Souls 45s | guest-failure / exit 139; `runs/demons-souls/` | Assert moved `snd_osfuncs.cpp:397` → `:410`. Unlock of slot with `*slot==0` refused (`rejected unlock ... slot=Some(0)`). No HLE mutex init/lock observed for that slot before unlock; `sceAcmBatchStartBuffers` unimplemented on a worker. **Loud refusal: Scream path not closed.** `run.json` missing after crash — see `runs/demons-souls/EVIDENCE.md` + wrapper log. |
+| Demon's Souls 45s | guest-failure / exit 139 after ~26s; `runs/demons-souls/` | **Scream mutex path PASSED** — no rejected unlock, no `snd_osfuncs` assert, `ncaPumpThread` + AudioOut2 advance/push run. Next loud blocker: `sceAcmBatchStartBuffers` unimplemented (1774 calls), then SIGSEGV `addr=0x303030303030303`. |
+| Silent Hill 45s headless | completed (watchdog); `runs/silent-hill/` (`run.json` clean, rev `74aa06d`) | No lazily-fabricated-mutex line (counter still deleted). No mutex unlock refusals. |
 
-Loadavg: Silent Hill launch 1-minute ~4.85; Demon's Souls launch ~3.49. No FPS claim.
+Loadavg: Demon's Souls launch 1-minute ~3.71; Silent Hill launch ~5.92 (no FPS claim).
 
 ## Checks
 
 - `cargo check --workspace --all-targets` — arm64 and `x86_64-apple-darwin` green.
-- `cargo test -p remu-runtime -- --test-threads=1 synchronization::` — 27/27 both arches.
-- Full `remu-runtime` suite: pre-existing hangers in `event_state::tests::*` (self-deadlock on
-  nested write lock) and unrelated failures (`nid_u64` catalog sample, filesystem temp mount,
-  ffmpeg golden when skipped). Sync module is green; full suite is not claimed green.
+- `cargo test -p remu-runtime -- --test-threads=1 synchronization::` — 29/29 both arches.
 
 ## Commits
 
@@ -50,7 +60,11 @@ Loadavg: Silent Hill launch 1-minute ~4.85; Demon's Souls launch ~3.49. No FPS c
 - `4e0e653` runtime: test sync-object identity via stack handle copies
 - `d3fc2f9` runtime: optional REMU_TRACE_MUTEX_ABI for sync-object bring-up
 - `636e1ba` tools: forward REMU_TRACE_MUTEX_ABI through run-game launch
-- (this commit) docs: Phase 1A handoff with status and MEMORY updates
+- `620d730` docs: Phase 1A sync-object identity handoff
+- `7a97f45` / `ad774be` interim init overwrite of non-canonical handle copies (+ tests)
+- `3016846` runtime: always overwrite pthread slots on init
+- `74aa06d` runtime: test recycled stack mutex publishing storage overwrite
+- (this commit) docs: Phase 1A acceptance closed for Scream mutex; ACM next
 
 ## Diagnostics
 
@@ -60,3 +74,8 @@ Forwarded through `scripts/run-game.sh` (survives the launch `env -u` wrapper).
 ## Phase 1B–H
 
 Not started.
+
+## Loud refusal (post-1A)
+
+`sceAcmBatchStartBuffers` (`8fe55ktlNVo`) is unimplemented and is the active Demon's Souls
+blocker after the Scream mutex path. Not Phase 1A scope.

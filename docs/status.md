@@ -4,18 +4,20 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Phase 1A (2026-08-05) — sync-object identity
+## Phase 1A (2026-08-05) — sync-object identity — CLOSED
 
 Mutex/condvar/rwlock identity follows the SDK pointer typedefs (`sys/_pthreadtypes.h`): init writes
 a real control-block handle into the guest slot; lock/unlock/wait resolve by that handle (including
-stack copies of the same handle). Kernel `SceKernelSema` create writes a full pointer-sized slot.
-Create-on-first-use mutex fabrication and its Phase 0 counter are deleted. Static `NULL` /
-adaptive-mutex `1` initializers still materialize. See `docs/notes/phase1a-20260805-handoff/`.
+stack copies of the same handle). Init always overwrites the slot (Scream stack CreateMutex reuse);
+destroy blanks publishing storage only when it still holds this object's handle. Kernel
+`SceKernelSema` create writes a full pointer-sized slot. Create-on-first-use mutex fabrication and
+its Phase 0 counter are deleted. Static `NULL` / adaptive-mutex `1` initializers still materialize.
+See `docs/notes/phase1a-20260805-handoff/`.
 
-**Anti-claim:** Demon's Souls / Scream does **not** pass yet. Clean evidence on `d3fc2f9` still
-asserts in `snd_osfuncs.cpp` (line moved 397→410) on unlock of a NULL slot; no prior HLE mutex
-init/lock was observed on that path, and `sceAcmBatchStartBuffers` remains unimplemented. Silent
-Hill no longer reports lazily fabricated mutexes (Phase 0 had 3).
+**Acceptance:** Demon's Souls Scream mutex path passes on `74aa06d` (no `snd_osfuncs` assert, no
+rejected unlock; AudioOut2 + `ncaPumpThread` proceed). Silent Hill still has zero lazily fabricated
+mutexes. **Next DeS blocker (not 1A):** `sceAcmBatchStartBuffers` unimplemented (1774 calls), then
+SIGSEGV at `addr=0x303030303030303`.
 
 ## Phase 0 (2026-08-05) — instrumentation landed
 

@@ -17,7 +17,7 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Phase 1A — sync-object identity (landed 2026-08-05)
+## Phase 1A — sync-object identity (CLOSED 2026-08-05)
 
 - `pthread_mutex_t` / `cond_t` / `rwlock_t` are pointer typedefs (`sys/_pthreadtypes.h`). Registry
   keys and resolve by the control-block handle written into the guest slot (`guest_sync/identity.rs`,
@@ -25,9 +25,12 @@ registers/packets that state intent.
 - `SceKernelSema` create writes `write_guest_u64` (pointer-sized), not a 4-byte tear.
 - Lazily fabricated mutex path + counter **deleted** (obsoleted by handle identity).
 - Static `NULL` / adaptive mutex `1` still materialize on first use.
+- Init always overwrites the slot with a fresh control block (Scream stack CreateMutex reuse).
+  Destroy blanks `storage_address` only when it still holds this object's handle.
 - Optional `REMU_TRACE_MUTEX_ABI=1` (forwarded by `run-game.sh`).
 - Handoff: `docs/notes/phase1a-20260805-handoff/`.
-- **Not closed:** Demon's Souls / Scream still asserts (`snd_osfuncs.cpp:410` on `d3fc2f9`).
+- **Scream mutex path CLOSED** on `74aa06d` (no `snd_osfuncs` assert / rejected unlock).
+- **Next DeS blocker (not 1A):** `sceAcmBatchStartBuffers` unimplemented (1774 calls on evidence run).
 
 ## Phase 0 counters (landed 2026-08-05)
 
@@ -41,5 +44,5 @@ registers/packets that state intent.
 
 - Void Terrarium "full diagnostic timeout" sustain (older `docs/status.md`): refuted 2026-08-05 on
   `663bc58` with ~1s SIGSEGV. Re-prove before repeating.
-- Demon's Souls "blocked on sceAcmBatchStartBuffers" was previously attributed away; on Phase 1A
-  evidence that NID is called and unimplemented — do not claim AJM/mutex alone without a fresh run.
+- Demon's Souls "Scream mutex / snd_osfuncs assert" is closed as of `74aa06d`; do not repeat that
+  anti-claim. Active audio gap is ACM (`sceAcmBatchStartBuffers`), proven with n≥1 clean evidence.

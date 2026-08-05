@@ -1,7 +1,7 @@
-revision=d3fc2f9
+revision=74aa06d
 game=/Volumes/Untitled/sharpemu/games/SILENT HILL The Short Message/PPSA10112-app/eboot.bin
-timeout_seconds=60
-elapsed_seconds=65
+timeout_seconds=45
+elapsed_seconds=50
 outcome=external-watchdog-timeout
 exit_status=124
 captured_frames=0
@@ -9,19 +9,19 @@ unimplemented_nids=0
 render_size=1920x1080
 render_policy=ue4-ps5-backbuffer
 [REMu][REPORT] --- ABI gap summary ---
-[REMu][REPORT] fabricated success keys=33 total_calls=2349
-[REMu][REPORT] fabricated success key=znaWI0gpuo8 name=scePadGetTriggerEffectState calls=1113
+[REMu][REPORT] fabricated success keys=33 total_calls=1743
+[REMu][REPORT] fabricated success key=znaWI0gpuo8 name=scePadGetTriggerEffectState calls=714
 [REMu][REPORT] fabricated success key=6xVpy0Fdq+I name=_sigprocmask calls=567
-[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=107
-[REMu][REPORT] fabricated success key=gpu:noop-raster-disabled name=internal calls=100
-[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=55
-[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=55
-[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=54
-[REMu][REPORT] fabricated success key=-4GCfYdNF1s name=sceImeUpdate calls=53
-[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=53
-[REMu][REPORT] fabricated success key=gpu:noop-color-operation name=internal calls=49
-[REMu][REPORT] fabricated success key=gpu:noop-fast-clear-idle name=internal calls=49
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=69
+[REMu][REPORT] fabricated success key=gpu:noop-raster-disabled name=internal calls=63
 [REMu][REPORT] fabricated success key=Xs9hdiD7sAA name=pthread_setschedparam calls=44
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=36
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=36
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=36
+[REMu][REPORT] fabricated success key=-4GCfYdNF1s name=sceImeUpdate calls=34
+[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=34
+[REMu][REPORT] fabricated success key=gpu:noop-color-operation name=internal calls=30
+[REMu][REPORT] fabricated success key=gpu:noop-fast-clear-idle name=internal calls=30
 [REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=26
 [REMu][REPORT] fabricated success key=v8iOE+j8a5o name=sceAudioOut2MasteringSetParam calls=3
 [REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
@@ -43,11 +43,11 @@ render_policy=ue4-ps5-backbuffer
 [REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
 [REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
 [REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
-[REMu][REPORT] failing import name=sceKernelWaitEventFlag nid=JTvBflhYazQ failures=8184724 calls=8184745 results=0xffffffff8002003c:8184724
-[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=6372 calls=6388 results=0xffffffff80020002:6372
-[REMu][REPORT] failing import name=scePadReadState nid=YndgXqQVV7c failures=159 calls=212 results=0xffffffff80920003:159
-[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=55 calls=56 results=0xffffffff80960007:55
-[REMu][REPORT] failing import name=sceKernelWaitEqueue nid=fzyMKs9kim0 failures=52 calls=6604 results=0xffffffff8002003c:52
+[REMu][REPORT] failing import name=sceKernelWaitEventFlag nid=JTvBflhYazQ failures=5492079 calls=5492101 results=0xffffffff8002003c:5492079
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=6372 calls=6390 results=0xffffffff80020002:6372
+[REMu][REPORT] failing import name=scePadReadState nid=YndgXqQVV7c failures=102 calls=136 results=0xffffffff80920003:102
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=36 calls=37 results=0xffffffff80960007:36
+[REMu][REPORT] failing import name=sceKernelWaitEqueue nid=fzyMKs9kim0 failures=33 calls=6535 results=0xffffffff8002003c:33
 [REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=27 calls=37 results=0xffffffff80020002:25,0xffffffff8002000d:2
 [REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
 [REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=14 calls=22 results=0xffffffffffffffff:14
@@ -56,4 +56,3 @@ render_policy=ue4-ps5-backbuffer
 [REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
 [REMu][REPORT] failing import name=sceNetResolverCreate nid=C4UgDHHPvdw failures=1 calls=1 results=0xffffffff80410132:1
 [REMu][REPORT] failing import name=sceSaveDataMount3 nid=ZP4e7rlzOUk failures=1 calls=1 results=0xffffffff809f0008:1
-[REMu][REPORT] failing import name=scePthreadMutexInit nid=cmo1RIYva9o failures=1 calls=3905 results=0xffffffff80020016:1
