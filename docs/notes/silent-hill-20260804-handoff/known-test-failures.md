@@ -51,15 +51,18 @@ above supersede it.
 Result: 145 passed, 3 failed.
 
 ```text
-decoder::tests::decodes_scratch_memory_without_treating_offsets_as_guest_pointers
-  actual sources: [v0, s5]
-  expected:       [s5]
-
-decoder::tests::unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the_shader
-  word 0x7DD80704 decoded as VCmpNleF16 instead of raw
-
 evaluator::tests::buffer::benign_mode_control_and_hwreg_opcodes_do_not_drop_the_shader
   SGetregB32 remains unsupported
+```
+
+Superseded by Phase 0 (`0f03b3d`, 2026-08-05) — do not re-open as failures without re-running:
+
+```text
+decoder::tests::decodes_scratch_memory_without_treating_offsets_as_guest_pointers
+  Fixed: SCRATCH VADDR when scalar_address_field == 0x7f (was a tautology).
+
+decoder::tests::unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the_shader
+  Fixed in the test row: VOPC 0xEC is VCmpNleF16 (SDK/decoder correct; test was wrong).
 ```
 
 `remu-gpu` passed 43/43 in the same serial command. The command stopped after the shader failures,

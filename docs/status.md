@@ -4,6 +4,19 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+## Phase 0 (2026-08-05) — instrumentation landed
+
+Hygiene/instrumentation only — see `docs/notes/phase0-20260805-handoff/`. Fabricated-success and
+lazily-fabricated-mutex counters print in the ABI gap summary; SIGSEGV/SIGBUS reporter + alt stacks
+are unconditional; `/devlog/app` is writable; evidence runs refuse dirty trees and record
+`vm.loadavg` / display mode in `run.json`. Shader opcode frequency backlog (before any shader-core
+behavior change): `docs/notes/phase0-20260805-handoff/SHADER-REFUSAL-BACKLOG.md`.
+
+**Live refutation:** `docs/status.md` previously said Void Terrarium sustains AGC submissions for a
+full diagnostic timeout. On revision `663bc58` (2026-08-05) it SIGSEGV'd at ~1s (`addr=0x0`). Treat
+sustained-run claims for that title as stale until re-proven at one revision with n≥1 clean evidence
+run (crash claims still need n≥5 before calling a crash "stable").
+
 Current overall state: the first small test title boots through resource loading, submits AGC
 draw streams, compiles observed RDNA2 shaders to Metal, and flips its display buffers. Early
 splash frames render correctly; full scene rendering and playability are still open. A second,

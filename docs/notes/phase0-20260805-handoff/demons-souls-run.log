@@ -1,0 +1,51 @@
+[REMu] acquiring shared build lock: /Users/xnetcat/Documents/REmu/target/.remu-build.lock
+[REMu] held shared build lock
+[REMu] host vm.loadavg: { 3.80 3.21 3.45 }
+[REMu] launching PPSA01342-app0; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase0/20260805T193432Z-PPSA01342-app0
+[REMu] render resolution: 1920x1080 (presentation-only)
+[REMu] warning: no guest-native resolution hook was found; only presentation is 1920x1080
+[REMu] automatic shutdown after 45s (pass 0 to disable)
+[REMu] external launch watchdog after 50s
+[REMu] headless Metal presenter enabled
+[REMu] shader opcode coverage tracing enabled (REMU_TRACE_SHADER_OPCODES=1)
+[REMu][AUDIO] opened sequence=3 port=3 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=3 handle=7 context=4 parameter_address=0x70012d36d0 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(3) rate=48000
+[REMu][AUDIO] opened sequence=4 port=4 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=4 handle=8 context=4 parameter_address=0x70012d3758 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(4) rate=48000
+[REMu][AUDIO] opened sequence=5 port=5 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=5 handle=9 context=4 parameter_address=0x70012d37e0 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(5) rate=48000
+[REMu][AUDIO] opened sequence=6 port=6 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=6 handle=10 context=4 parameter_address=0x70012d3868 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(6) rate=48000
+[REMu][AUDIO] opened sequence=7 port=7 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=7 handle=11 context=4 parameter_address=0x70012d38f0 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(7) rate=48000
+[REMu][AUDIO] opened sequence=8 port=8 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=8 handle=12 context=4 parameter_address=0x70012d3978 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(8) rate=48000
+[REMu][AUDIO] opened sequence=16 port=16 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=16 handle=20 context=4 parameter_address=0x70012d3db8 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(16) rate=48000
+[REMu][AUDIO] opened sequence=32 port=32 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=32 handle=36 context=4 parameter_address=0x70012d4638 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 0, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(32) rate=48000
+[REMu][AUDIO] opened sequence=64 port=64 user=0x0 type=0 frames=256 rate=48000 format=0x3 channels=1 encoding=Float32
+[REMu][AUDIO2] port create=64 handle=68 context=4 parameter_address=0x70012d56b0 parameter=SceAudioOut2PortParam { port_type: 256, pad: 0, data_format: 256, sampling_frequency: 48000, flags: 1, user_handle: 5, reserved: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] } channels=1 backend=Some(64) rate=48000
+[REMu][THREAD] raised host stack name="ncaPumpThread" guest=0x20000 host=0x200000
+[REMu][IMPORT] first_hit=102254 nid=-2IRUCO--PM name=sceKernelReadTsc return=0x801f5bcc3 args=0x30e4ecb40,0x3b9aca00,0x14580200000,0x7,0x28c69cab,0x1
+[REMu][IMPORT] first_hit=102255 nid=R7d0F1g2qsU name=sceAudioOut2ContextGetQueueLevel return=0x801f5bce5 args=0x4,0x30e4ecc4c,0x30e4ecc48,0x15301,0x28c87771,0x1
+[REMu][AUDIO2] queue level query=1 context=4 queued=0/8, available=8 outputs=0x30e4ecc4c,0x30e4ecc48 result=0x0 args=0x15301,0x28c87771,0x1
+[REMu][AUDIO2] queue level query=2 context=4 queued=0/8, available=8 outputs=0x30e4ecbcc,0x30e4ecbc8 result=0x0 args=0x7fa54a04af50,0xffffffff00000000,0x0
+[REMu][AUDIO2] queue level query=3 context=4 queued=0/8, available=8 outputs=0x30e4ecbcc,0x30e4ecbc8 result=0x0 args=0x0,0x2,0x1
+An assertion fired in: E:\dev\cp11\ScreamMain\wws_shared\sdk\7_53_BP\components\wws_scream\scream\src\ps4\snd_osfuncs.cpp @ line: 397
+Assertion failed: 0
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x801f40317 space=host reason=null-address; forwarding
+[REMu][WATCH] fault registers rax=0x1 rbx=0xb rcx=0x0 rdx=0x0 rdi=0x7fa58bd1b920 rsi=0x2d12fb rbp=0x309ee4f10 rsp=0x309ee4ef0 r8=0xffffffff00000000 r9=0x0 r10=0x0 r11=0x102449af0 r12=0x20 r13=0xc800 r14=0x7fa52e48ff70 r15=0x0
+[REMu][WATCH] fault stack rsp=0x309ee4ef0 words=0x7fa52fb3ef70,0x9e3779b97f4a7c15,0x700120cfb0,0x700120cfb0,0x309ee4f30,0x801eedebf,0xc00000000137d580,0x0,0x309ee4f70,0x801eedca9,0x1,0xfffffffc,0x71130e11b8,0x8031052a8,0x309ee51c0,0x7fa52e48ff70,0x309ee4f90,0x801ec29c4,0x0,0x309ee5120,0x309ee5390,0x8008fc2b4,0x309ee52fc,0x802a4cc80,0x7fa52e48ff70,0x1,0x80206b0c6,0x8020a3858,0x309ee51d0,0x102460b08,0x309ee5200,0x0,0x802a4cc80,0xffffffff,0x10000000030f9980,0x21fe610,0x1,0x7fa52e48ff70,0xd21597feb6612986,0x1b2e8d01cd71ff5b,0x0,0x75eb559bb192c176,0x1,0x0,0x0,0x7fa52e48ff70,0xffffffff,0x1025e3bb4
+/Users/xnetcat/Documents/REmu/scripts/run-with-watchdog.sh: line 165: 50862 Segmentation fault: 11  "$@"
+revision=663bc58
+game=/Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/eboot.bin
+timeout_seconds=45
+elapsed_seconds=12
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=presentation-only
+[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase0/20260805T193432Z-PPSA01342-app0
