@@ -73,7 +73,8 @@ use self::decode::{
     DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0,
     VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
     apply_transparent_premultiplied_fill_clear, common_render_target_array_length,
-    decode_fast_clear_color, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
+    decode_fast_clear_color, decode_graphics_wave_state, decode_ngg_registers_from_state,
+    decode_ngg_subgroup_limits,
     decode_ngg_subgroup_limits_with_uc, decode_render_targets_from_registers, decode_scanout_target,
     disabled_metal_blend_attachment,
     graphics_shader_resource_key, initial_depth_clear_value,
@@ -637,6 +638,35 @@ struct GraphicsDiagnosticPipelineState {
     capture_vertex_position: bool,
 }
 
+/// Live graphics temp-ring and wave-width state, decoded from AGC registers.
+///
+/// Scratch is one ring for the whole graphics pipe, so the per-lane extent is the per-wave
+/// allocation divided by the stage's wave width. `export_lane_count` is `None` when the draw never
+/// programmed `CxVgtShaderStagesEn`, which is not the same as knowing the stage runs wave32.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+struct GraphicsWaveState {
+    scratch_bytes_per_wave: u32,
+    export_lane_count: Option<u32>,
+}
+
+impl GraphicsWaveState {
+    /// Lane-private scratch bytes for a stage executing `lane_count` architectural lanes.
+    const fn scratch_bytes_per_lane(self, lane_count: u32) -> u32 {
+        self.scratch_bytes_per_wave / lane_count
+    }
+
+    /// Lane-private scratch bytes for the pixel stage, whose wave width no SDK register reports.
+    ///
+    /// The two candidate widths give per-lane extents that differ by a factor of two, and the
+    /// backend bounds-checks every SCRATCH access against this value. Dividing by the narrower
+    /// wave therefore yields an extent that is never smaller than the architectural one: a wave64
+    /// pixel shader over-allocates its private array but no in-range guest access is ever clamped
+    /// to zero. Halving it instead would silently zero the upper half of every spill.
+    const fn pixel_scratch_bytes_per_lane(self) -> u32 {
+        self.scratch_bytes_per_lane(32)
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct GraphicsPipelineKey {
     export_shader_address: u64,
@@ -661,6 +691,9 @@ struct GraphicsPipelineKey {
     /// The shader backend uses their presence to lower architectural empty-subgroup sequences;
     /// an incomplete command state remains a loud pipeline refusal.
     ngg_registers: Option<remu_shader_metal::NggRegisters>,
+    /// `SPI_TMPRING_SIZE` scratch allocation and `CxVgtShaderStagesEn` export wave width. Both
+    /// change the generated Metal function, so they belong in the pipeline cache key.
+    wave_state: GraphicsWaveState,
     /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`, gated by an active depth attachment.
     pixel_depth_export: bool,
     /// Diagnostic lowerings alter the generated Metal function body and interface. Keep the

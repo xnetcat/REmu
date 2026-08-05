@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND0_CONTROL, CB_TARGET_MASK, CX_VGT_SHADER_STAGES_EN, DB_SHADER_CONTROL,
-    DEFAULT_CB_BLEND_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState,
-    DecodedRenderTarget,
+    CB_BLEND0_CONTROL, CB_TARGET_MASK, CX_GRAPHICS_SCRATCH_RING_SIZE, CX_VGT_SHADER_STAGES_EN,
+    CX_VGT_SHADER_STAGES_EN_GS_WAVE32, DB_SHADER_CONTROL, DEFAULT_CB_BLEND_CONTROL,
+    DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState, DecodedRenderTarget,
     DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
-    MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
-    PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, SPI_SHADER_COL_FORMAT,
-    UC_GE_CNTL, VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
-    common_render_target_array_length, decode_depth_target, decode_render_targets,
-    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
-    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    GraphicsWaveState, MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits,
+    PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
+    SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT,
+    VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE, common_render_target_array_length,
+    decode_depth_target, decode_render_targets, diagnostic_capture_pixel_output,
+    diagnostic_capture_vertex_position, diagnostic_dump_gbuffer, diagnostic_dump_glyph_draw,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
     diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
     diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
@@ -462,6 +463,33 @@ pub(crate) fn decode_ngg_subgroup_limits_with_uc(
         programmed_instance_count,
     )
     .map(Some)
+}
+
+/// Decodes the graphics temp-ring allocation and the export stage's architectural wave width.
+///
+/// SDK 10 `registerstructs.h`:
+/// * `CxGraphicsScratchRingSize` (Cx 0x1ba) — `getWaveSize()` reads bits [24:12]; the gnmp interop
+///   helper `setGraphicsScratchSize(maxNumWaves, num1KByteChunksPerWave)` gives the unit as 1 KiB
+///   per architectural wave, the same encoding `ShComputeScratchRingSize` uses for compute.
+/// * `CxVgtShaderStagesEn` (Cx 0x2d5) — `GsWaveSize` (bit 22) and `HsWaveSize` (bit 21) are the only
+///   wave-width fields AGC exposes, both documented as `k32`/`k64` with a default of `k64`. There is
+///   no pixel-stage counterpart anywhere in the SDK, so the pixel wave width stays unproven.
+pub(crate) fn decode_graphics_wave_state(
+    context_registers: &[remu_gpu::GpuRegister],
+) -> GraphicsWaveState {
+    GraphicsWaveState {
+        scratch_bytes_per_wave: register_value(context_registers, CX_GRAPHICS_SCRATCH_RING_SIZE)
+            .map_or(0, |ring| ((ring >> 12) & 0x1fff) * 1024),
+        export_lane_count: register_value(context_registers, CX_VGT_SHADER_STAGES_EN).map(
+            |stages| {
+                if stages & CX_VGT_SHADER_STAGES_EN_GS_WAVE32 == 0 {
+                    64
+                } else {
+                    32
+                }
+            },
+        ),
+    }
 }
 
 /// Captures the raw SDK register state required to prove NGG mesh lowering.
@@ -1057,6 +1085,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         },
         ngg_subgroup_limits,
         ngg_registers,
+        wave_state: decode_graphics_wave_state(&draw.context_registers),
         pixel_depth_export: !fragmentless
             && pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         diagnostics: graphics_diagnostic_pipeline_state(

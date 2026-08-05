@@ -6,7 +6,7 @@
 
 use remu_shader::{Instruction, InstructionControl, OperandKind};
 
-use crate::{Compiler, format_u32};
+use crate::{Compiler, MetalShaderStage, format_u32};
 
 use super::buffer::{raw_load_shape, raw_store_shape};
 
@@ -127,9 +127,18 @@ impl Compiler<'_> {
         name: &str,
     ) -> Result<(), String> {
         if self.options.scratch_size_bytes == 0 {
-            return Err(
-                "SCRATCH instruction has no COMPUTE_TMPRING_SIZE lane allocation".to_owned(),
-            );
+            // The temp ring is sized by a different register per pipe: compute dispatches program
+            // `COMPUTE_TMPRING_SIZE` (`ShComputeScratchRingSize`) while every graphics stage shares
+            // `SPI_TMPRING_SIZE` (`CxGraphicsScratchRingSize`). Naming the compute register on a
+            // graphics stage sent the reader looking for state the draw never programs.
+            let register = if self.options.stage == MetalShaderStage::Compute {
+                "COMPUTE_TMPRING_SIZE"
+            } else {
+                "SPI_TMPRING_SIZE"
+            };
+            return Err(format!(
+                "SCRATCH instruction has no {register} lane allocation"
+            ));
         }
         if control.lds || name.contains("Atomic") {
             return Err(format!(

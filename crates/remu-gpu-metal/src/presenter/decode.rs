@@ -5,7 +5,8 @@ use super::{
     DecodedDepthBias, DecodedDepthTarget, DecodedImageDescriptor, DecodedRasterState,
     DecodedRenderTarget, DecodedStencilFace, DecodedStencilState,
     DepthTargetPipelineState, DisplayConfiguration, GraphicsDiagnosticPipelineState,
-    GraphicsPipelineKey, GraphicsShaderResourceKey, GuestScissor, GuestTextureDescriptor,
+    GraphicsPipelineKey, GraphicsShaderResourceKey, GraphicsWaveState, GuestScissor,
+    GuestTextureDescriptor,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
     RenderTargetFormat, RenderTargetPipelineState, ResourceSpan, decode_sampled_texture_format,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
@@ -45,8 +46,8 @@ pub(crate) use self::pipeline::{
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
-    apply_transparent_premultiplied_fill_clear, decode_ngg_registers_from_state,
-    decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc,
+    apply_transparent_premultiplied_fill_clear, decode_graphics_wave_state,
+    decode_ngg_registers_from_state, decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc,
     disabled_metal_blend_attachment, graphics_shader_resource_key,
     is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
     ngg_fullscreen_cover_draw,
@@ -101,6 +102,17 @@ pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
 
 /// AGC `CxVgtShaderStagesEn` (written by shader specials / state buffers).
 pub(super) const CX_VGT_SHADER_STAGES_EN: u32 = 0x2d5;
+
+/// `CxVgtShaderStagesEn::GsWaveSize` — set selects 32-wide wavefronts for the merged ES/GS
+/// (export) stage, clear selects 64-wide. SDK 10 `registerstructs.h` documents
+/// `GsWaveSize::k32 = 0x00400000` and `k64 = 0` with `kBitMask = 0x00400000`.
+pub(super) const CX_VGT_SHADER_STAGES_EN_GS_WAVE32: u32 = 0x0040_0000;
+
+/// AGC `CxGraphicsScratchRingSize` (Cx 0x1ba, GFX10 `SPI_TMPRING_SIZE`) — the temp ring shared by
+/// every graphics stage. `WaveSize[24:12]` is the per-wave allocation; SDK 10
+/// `setGraphicsScratchSize(maxNumWaves, num1KByteChunksPerWave)` gives the unit as 1 KiB
+/// (256 dwords), matching `ShComputeScratchRingSize` at 0x218.
+pub(super) const CX_GRAPHICS_SCRATCH_RING_SIZE: u32 = 0x1ba;
 
 /// AGC `UcGeCntl` — NGG primitive/vertex group sizing (Uc 0x25b).
 pub(super) const UC_GE_CNTL: u32 = 0x25b;

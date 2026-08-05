@@ -525,8 +525,58 @@ fn scratch_spills_use_the_tmpring_sized_lane_private_byte_array() {
 }
 
 #[test]
-fn scratch_without_a_tmpring_allocation_fails_loudly() {
-    let program = Program::new(
+fn scratch_without_a_tmpring_allocation_fails_loudly_naming_the_stage_register() {
+    let program = scratch_load_program();
+    let error = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect_err("missing lane allocation must not guess a scratch extent");
+    assert!(error.to_string().contains("COMPUTE_TMPRING_SIZE"));
+
+    // Graphics stages share SPI_TMPRING_SIZE (CxGraphicsScratchRingSize); pointing a graphics
+    // refusal at the compute register sends the reader after state the draw never programs.
+    for options in [
+        MetalCompileOptions::vertex(0),
+        MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    ] {
+        let error = compile_msl(&program, &empty_evaluation(), &options)
+            .expect_err("graphics scratch also requires its architectural allocation");
+        let message = error.to_string();
+        assert!(
+            message.contains("SPI_TMPRING_SIZE"),
+            "graphics refusal must name the graphics temp-ring register: {message}"
+        );
+        assert!(
+            !message.contains("COMPUTE_TMPRING_SIZE"),
+            "graphics refusal must not name a compute register: {message}"
+        );
+    }
+}
+
+#[test]
+fn graphics_stages_lower_scratch_from_their_own_tmpring_allocation() {
+    let program = scratch_load_program();
+    for stage_options in [
+        MetalCompileOptions::vertex(0),
+        MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    ] {
+        let mut options = stage_options;
+        options.scratch_size_bytes = 128;
+        let shader = compile_msl(&program, &empty_evaluation(), &options)
+            .expect("graphics scratch should lower once its lane allocation is known");
+        assert!(shader.source.contains("thread uchar remu_scratch[128];"));
+        assert!(shader.source.contains("remu_range_valid("));
+        assert!(
+            !shader.source.contains("device uchar* b0"),
+            "graphics SCRATCH must not fabricate a guest-global binding"
+        );
+    }
+}
+
+fn scratch_load_program() -> Program {
+    Program::new(
         0x1000,
         vec![Instruction {
             pc: 0x1000,
@@ -550,14 +600,7 @@ fn scratch_without_a_tmpring_allocation_fails_loudly() {
                 },
             )),
         }],
-    );
-    let error = compile_msl(
-        &program,
-        &empty_evaluation(),
-        &MetalCompileOptions::compute(0),
     )
-    .expect_err("missing lane allocation must not guess a scratch extent");
-    assert!(error.to_string().contains("COMPUTE_TMPRING_SIZE"));
 }
 
 #[test]

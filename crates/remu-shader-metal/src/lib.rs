@@ -220,13 +220,18 @@ pub struct MetalCompileOptions {
     pub lds_size_bytes: u32,
     /// Lane-private scratch allocation in bytes for one shader invocation.
     ///
-    /// Compute callers derive this from `COMPUTE_TMPRING_SIZE.WAVESIZE`; graphics callers leave
-    /// it zero until their stage scratch allocation is plumbed.  A shader containing a SCRATCH
-    /// instruction is rejected when this is zero instead of being redirected into guest global
-    /// memory.
+    /// Compute callers derive this from `COMPUTE_TMPRING_SIZE.WAVESIZE`; graphics callers from
+    /// `SPI_TMPRING_SIZE.WAVESIZE` (`CxGraphicsScratchRingSize`, one temp ring for the whole
+    /// graphics pipe). Both registers count 1 KiB per architectural wave, so the per-lane value is
+    /// that quotient over the stage's wave width. A shader containing a SCRATCH instruction is
+    /// rejected when this is zero instead of being redirected into guest global memory.
     pub scratch_size_bytes: u32,
-    /// Architectural lanes per guest compute wave. Apple executes SIMD32; wave64 shaders whose
-    /// cross-lane operations are split-safe use this to place ballot masks in the correct half.
+    /// Architectural lanes per guest wave. Apple executes SIMD32; wave64 shaders whose cross-lane
+    /// operations are split-safe use this to place ballot masks in the correct half.
+    ///
+    /// Only threadgroup stages (compute, mesh) can host a split 64-lane wave. Graphics callers
+    /// therefore leave this at 32 and must refuse a wave64 program whose result depends on the
+    /// wave width rather than lowering half of it.
     pub wave_lane_count: u32,
     /// Number of vector registers allocated by the guest stage's `PGM_RSRC1` state.
     ///

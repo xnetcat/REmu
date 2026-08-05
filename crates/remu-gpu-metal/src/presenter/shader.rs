@@ -448,6 +448,7 @@ impl MetalPresenter {
             register_value(&draw.context_registers, 0x1b4).unwrap_or_default(),
         );
         pixel_options.allocated_vector_register_count = key.pixel_allocated_vector_register_count;
+        pixel_options.scratch_size_bytes = key.wave_state.pixel_scratch_bytes_per_lane();
         pixel_options.render_target_array_length = key.render_target_array_length;
         pixel_options.pixel_depth_export = key.pixel_depth_export;
         pixel_options.pixel_input_controls = key
@@ -537,35 +538,58 @@ impl MetalPresenter {
                 limits.threadgroup_threads,
                 registers,
             );
-            if ngg_export_uses_wave64_exec(&export.program) {
-                // Wave64 NGG exports (Poppy Playtime UI/LUT quads) gate their exports on
-                // 64-bit EXEC masks and compute meshlet thread indices as
-                // `s3[27:24] * 64 + v_mbcnt`. Splitting the guest wave across two SIMD32
-                // halves keeps those indices equal to the Metal thread index; compiling
-                // them as wave32 skipped every thread past the first 32 and left their
-                // vertices unexported (letter-count white boxes instead of glyphs).
+            // Wave64 NGG exports (Poppy Playtime UI/LUT quads) gate their exports on
+            // 64-bit EXEC masks and compute meshlet thread indices as
+            // `s3[27:24] * 64 + v_mbcnt`. Splitting the guest wave across two SIMD32
+            // halves keeps those indices equal to the Metal thread index; compiling
+            // them as wave32 skipped every thread past the first 32 and left their
+            // vertices unexported (letter-count white boxes instead of glyphs).
+            //
+            // `CxVgtShaderStagesEn.GsWaveSize` states the merged stage's architectural width
+            // outright. A draw that never programmed the register still falls back to the export
+            // program's own 64-bit EXEC use, which is how the width was inferred before the
+            // register was decoded.
+            if key.wave_state.export_lane_count == Some(64)
+                || (key.wave_state.export_lane_count.is_none()
+                    && ngg_export_uses_wave64_exec(&export.program))
+            {
                 let blockers = wave64_split_blockers(&export.program);
-                if blockers.is_empty() {
-                    mesh_options.wave_lane_count = 64;
-                    // SDK PGM_RSRC1 reports VGPRs in wave32 units and explicitly requires
-                    // dividing by two for wave64 execution.
-                    mesh_options.allocated_vector_register_count =
-                        key.export_allocated_vector_register_count;
-                } else {
-                    eprintln!(
-                        "[REMu][METAL] wave64 NGG mesh export {:#x} cannot split across SIMD32 halves: {blockers:?}",
-                        export.program.address,
-                    );
+                if !blockers.is_empty() {
+                    return Err(format!(
+                        "wave64 NGG mesh export {:#x} cannot split across Metal SIMD32 groups: {blockers:?}",
+                        export.program.address
+                    ));
                 }
+                mesh_options.wave_lane_count = 64;
+                // SDK PGM_RSRC1 reports VGPRs in wave32 units and explicitly requires
+                // dividing by two for wave64 execution.
+                mesh_options.allocated_vector_register_count =
+                    key.export_allocated_vector_register_count;
             }
             mesh_options
         } else {
+            // A Metal vertex function runs one guest lane per invocation and the split-wave64
+            // lowering exists only for threadgroup stages, so a wave64 export can only be lowered
+            // here when nothing in it observes the wave width. Anything that does would execute
+            // against a 32-lane mask and silently drop the guest wave's upper half.
+            if key.wave_state.export_lane_count == Some(64) {
+                let blockers = wave64_split_blockers(&export.program);
+                if !blockers.is_empty() {
+                    return Err(format!(
+                        "CxVgtShaderStagesEn.GsWaveSize selects wave64 for export shader {:#x}, whose wave-width-dependent operations a Metal vertex stage cannot represent: {blockers:?}",
+                        export.program.address
+                    ));
+                }
+            }
             remu_shader_metal::MetalCompileOptions::vertex(pixel_msl.interpolated_attribute_count)
         };
         if !uses_mesh_stage {
             vertex_options.allocated_vector_register_count =
                 key.export_allocated_vector_register_count;
         }
+        vertex_options.scratch_size_bytes = key
+            .wave_state
+            .scratch_bytes_per_lane(vertex_options.wave_lane_count);
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.diagnostic_force_visible_clip_depth =

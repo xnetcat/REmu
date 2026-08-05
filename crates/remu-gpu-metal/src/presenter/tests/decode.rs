@@ -17,18 +17,18 @@ use super::{
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
     DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthBias, DecodedDepthTarget, DecodedRasterState,
-    DecodedStencilState, GuestScissor,
-    GuestTextureDescriptor, MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType,
-    NggSubgroupLimits, PA_SU_SC_MODE_CNTL, RenderTargetPipelineState, SPI_PS_INPUT_CNTL_0,
-    append_color_target_registers, append_depth_target_registers,
-    apply_transparent_premultiplied_fill_clear, color_operation_is_raster_noop,
-    common_render_target_array_length, consume_color_metadata_clear, consume_depth_metadata_clear,
+    DecodedStencilState, GuestScissor, GuestTextureDescriptor, MetalPresenter,
+    NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType, NggSubgroupLimits, PA_SU_SC_MODE_CNTL,
+    RenderTargetPipelineState, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
+    append_depth_target_registers, apply_transparent_premultiplied_fill_clear,
+    color_operation_is_raster_noop, common_render_target_array_length,
+    consume_color_metadata_clear, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
-    decode_metal_blend_attachment, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
-    decode_ngg_subgroup_limits_with_uc, decode_raster_state, decode_render_target_format,
-    decode_render_targets_from_registers,
-    decode_scissor, decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch,
+    decode_graphics_wave_state, decode_metal_blend_attachment, decode_ngg_registers_from_state,
+    decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc, decode_raster_state,
+    decode_render_target_format, decode_render_targets_from_registers, decode_scissor,
+    decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch,
     fragmentless_pixel_program, graphics_pipeline_key, guest_texture_byte_count,
     guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
@@ -707,6 +707,49 @@ fn derives_ngg_subgroup_limits_from_uc_ge_cntl_when_cx_sizing_absent() {
 }
 
 #[test]
+fn decodes_graphics_scratch_ring_and_export_wave_width_from_agc_registers() {
+    // SDK 10 CxGraphicsScratchRingSize (Cx 0x1ba): WaveSize[24:12] counts 1 KiB per wave, so two
+    // chunks is 2 KiB per architectural wave — 64 bytes per lane at wave32, 32 at wave64.
+    // CxVgtShaderStagesEn (Cx 0x2d5) GsWaveSize is bit 22: clear = k64, set = k32.
+    let wave64 = decode_graphics_wave_state(&[
+        GpuRegister {
+            offset: 0x1ba,
+            value: 2 << 12,
+        },
+        GpuRegister {
+            offset: 0x2d5,
+            value: 0x2000,
+        },
+    ]);
+    assert_eq!(wave64.scratch_bytes_per_wave, 2048);
+    assert_eq!(wave64.export_lane_count, Some(64));
+    assert_eq!(wave64.scratch_bytes_per_lane(64), 32);
+
+    let wave32 = decode_graphics_wave_state(&[
+        GpuRegister {
+            offset: 0x1ba,
+            value: 2 << 12,
+        },
+        GpuRegister {
+            offset: 0x2d5,
+            value: 0x2000 | 0x0040_0000,
+        },
+    ]);
+    assert_eq!(wave32.export_lane_count, Some(32));
+    assert_eq!(wave32.scratch_bytes_per_lane(32), 64);
+
+    // The pixel wave width has no SDK register. Dividing by the narrower wave can only
+    // over-allocate the lane-private array; halving it would clamp real spills to zero.
+    assert_eq!(wave64.pixel_scratch_bytes_per_lane(), 64);
+
+    // An unprogrammed CxVgtShaderStagesEn is not a wave32 claim, and an unprogrammed temp ring
+    // must stay zero so a SCRATCH instruction refuses instead of guessing an extent.
+    let absent = decode_graphics_wave_state(&[]);
+    assert_eq!(absent.scratch_bytes_per_wave, 0);
+    assert_eq!(absent.export_lane_count, None);
+}
+
+#[test]
 fn decodes_observed_clockwise_back_face_culling() {
     let mut draw = indexed_draw(0, 0, 0);
     draw.context_registers.push(GpuRegister {
@@ -759,7 +802,7 @@ fn negative_height_viewport_keeps_sdk_front_face_for_metal() {
             cull_mode: MTLCullMode::Back,
             front_winding: MTLWinding::Clockwise,
             fill_mode: MTLTriangleFillMode::Fill,
-                    depth_bias: DecodedDepthBias::default(),
+            depth_bias: DecodedDepthBias::default(),
         }
     );
     let viewport = decode_viewport(&draw, 1_920, 1_080, GuestScissor::Full);
@@ -840,7 +883,7 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
         clear_enabled: false,
         clear_depth: 1.0,
         sample_count: 1,
-            stencil: DecodedStencilState::default(),
+        stencil: DecodedStencilState::default(),
     };
 
     let promoted = presenter
@@ -913,7 +956,7 @@ fn promotes_layered_depth_target_without_collapsing_its_slices() {
         clear_enabled: false,
         clear_depth: 1.0,
         sample_count: 1,
-            stencil: DecodedStencilState::default(),
+        stencil: DecodedStencilState::default(),
     };
 
     let promoted = presenter
