@@ -413,6 +413,12 @@ fi
 if [ "${REMU_HEADLESS_METAL:-0}" = 1 ]; then
     echo "[REMu] headless Metal presenter enabled"
 fi
+# Opcode coverage / refusal ranking must be an explicit opt-in that survives the launch `env -u`
+# wrapper. Echo so a missing histogram in guest.log is diagnosable as "never requested".
+if [ "${REMU_TRACE_SHADER_OPCODES:-0}" = 1 ]; then
+    export REMU_TRACE_SHADER_OPCODES=1
+    echo "[REMu] shader opcode coverage tracing enabled (REMU_TRACE_SHADER_OPCODES=1)"
+fi
 set +e
 # Ordered scanout-writer diagnostics also emit post-draw images through the presenter's capture
 # root. They do not enable periodic frame capture, but they still need the run-local directory;
@@ -426,6 +432,7 @@ if [ "$capture_frames" = 1 ] || [ -n "${REMU_DIAGNOSTIC_SCANOUT_WRITERS:-}" ]; t
             env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME \
                 REMU_AUTO_CROSS="$auto_cross" REMU_AUTO_OPTIONS="$auto_options" \
                 REMU_CAPTURE_DIR="$frame_dir" \
+                REMU_TRACE_SHADER_OPCODES="${REMU_TRACE_SHADER_OPCODES:-}" \
                 arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 else
@@ -435,6 +442,7 @@ else
             "$watchdog_timeout_seconds" "$watchdog_termination_grace_seconds" -- \
             env -u LaunchInstanceID -u XPC_FLAGS -u XPC_SERVICE_NAME -u REMU_CAPTURE_DIR \
                 REMU_AUTO_CROSS="$auto_cross" REMU_AUTO_OPTIONS="$auto_options" \
+                REMU_TRACE_SHADER_OPCODES="${REMU_TRACE_SHADER_OPCODES:-}" \
                 arch -x86_64 "$binary" run --timeout-seconds "$timeout_seconds" "$game_path"
     ) > "$run_dir/guest.log" 2>&1 &
 fi
