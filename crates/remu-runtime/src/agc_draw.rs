@@ -463,20 +463,16 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         .unwrap_or_default();
     let export_shader = agc_shader_snapshot(shaders, export_shader_address);
     let pixel_shader = agc_shader_snapshot(shaders, pixel_shader_address);
-    // A zero CB_TARGET_MASK explicitly disables every color write. With no active depth surface
-    // or shader memory side effect, the hardware draw is observably a no-op. Unity emits many of
-    // these while preparing command buffers; evaluating both shaders and sending them through the
-    // Metal presenter consumed substantial CPU despite every pipeline being rejected there.
-    if graphics
+    // AGC default CB_TARGET_MASK is 0. With no depth and no memory side effects the color path is
+    // a hardware no-op, but the command processor still retires the draw — emit the event for
+    // queue ordering and skip only the expensive shader evaluation (Unity prep streams hit this).
+    let skip_shader_evaluation = graphics
         .context_registers
         .get(&AGC_CB_TARGET_MASK)
         .is_some_and(|&mask| mask == 0)
         && !agc_has_active_depth_state(&graphics.context_registers)
         && !agc_shader_has_memory_side_effects(export_shader.as_ref())
-        && !agc_shader_has_memory_side_effects(pixel_shader.as_ref())
-    {
-        return;
-    }
+        && !agc_shader_has_memory_side_effects(pixel_shader.as_ref());
     let mut draw = remu_gpu::IndexedDraw {
         sequence: graphics.emitted_draws,
         indexed,
@@ -491,9 +487,11 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         index_buffer_count: graphics.index_buffer_count,
         index_size: graphics.index_size,
         index_offset: element_offset,
+        // SDK `UcIndexOffset` (0x24a) — GFX10 VGT_INDEX_OFFSET. Never Cx 0x102
+        // (that offset is ShUserDataAddressHs in the AGC register file).
         base_vertex: graphics
-            .context_registers
-            .get(&0x102)
+            .user_config_registers
+            .get(&0x24a)
             .copied()
             .unwrap_or_default() as i32,
         index_count: element_count,
@@ -518,113 +516,115 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         draw.index_snapshot = snapshot_draw_indices(&draw);
     }
     let export_user_data_base = export_user_data_register(&draw);
-    // An indirect count observed while parsing can precede the GPU producer that owns the
-    // argument buffer. Do not size vertex snapshots from that stale hint; the Metal backend
-    // consumes the live argument dwords at the ordered execution point.
-    let required_vertex_record_count = indirect_arguments_address
-        .is_none()
-        .then(|| draw_required_vertex_record_count(&draw))
-        .flatten();
-    let export_request = draw.export_shader.as_ref().map(|snapshot| {
-        shader_evaluation_worker_request(
-            &graphics.shader_registers,
-            snapshot,
-            export_user_data_base,
-            8,
-            required_vertex_record_count,
-        )
-    });
-    let pixel_request = draw.pixel_shader.as_ref().map(|snapshot| {
-        shader_evaluation_worker_request(&graphics.shader_registers, snapshot, 0x00c, 0, None)
-    });
-    if graphics.shader_evaluation_workers.is_none() {
-        match ShaderEvaluationWorkers::new() {
-            Ok(workers) => graphics.shader_evaluation_workers = Some(workers),
-            Err(error) => {
-                eprintln!("[REMu][AGC] parallel shader evaluation unavailable: {error}");
+    if !skip_shader_evaluation {
+        // An indirect count observed while parsing can precede the GPU producer that owns the
+        // argument buffer. Do not size vertex snapshots from that stale hint; the Metal backend
+        // consumes the live argument dwords at the ordered execution point.
+        let required_vertex_record_count = indirect_arguments_address
+            .is_none()
+            .then(|| draw_required_vertex_record_count(&draw))
+            .flatten();
+        let export_request = draw.export_shader.as_ref().map(|snapshot| {
+            shader_evaluation_worker_request(
+                &graphics.shader_registers,
+                snapshot,
+                export_user_data_base,
+                8,
+                required_vertex_record_count,
+            )
+        });
+        let pixel_request = draw.pixel_shader.as_ref().map(|snapshot| {
+            shader_evaluation_worker_request(&graphics.shader_registers, snapshot, 0x00c, 0, None)
+        });
+        if graphics.shader_evaluation_workers.is_none() {
+            match ShaderEvaluationWorkers::new() {
+                Ok(workers) => graphics.shader_evaluation_workers = Some(workers),
+                Err(error) => {
+                    eprintln!("[REMu][AGC] parallel shader evaluation unavailable: {error}");
+                }
             }
         }
-    }
-    let (export_evaluation, pixel_evaluation) =
-        if let Some(workers) = graphics.shader_evaluation_workers.as_mut() {
-            evaluate_draw_shader_requests_parallel(
-                workers,
-                &mut graphics.shader_evaluation_cache,
-                export_request,
-                pixel_request,
-            )
-        } else {
-            let export = export_request.map(|request| {
-                request.and_then(|request| {
-                    graphics
-                        .shader_evaluation_cache
-                        .evaluate(&request.state, request.options)
+        let (export_evaluation, pixel_evaluation) =
+            if let Some(workers) = graphics.shader_evaluation_workers.as_mut() {
+                evaluate_draw_shader_requests_parallel(
+                    workers,
+                    &mut graphics.shader_evaluation_cache,
+                    export_request,
+                    pixel_request,
+                )
+            } else {
+                let export = export_request.map(|request| {
+                    request.and_then(|request| {
+                        graphics
+                            .shader_evaluation_cache
+                            .evaluate(&request.state, request.options)
+                    })
+                });
+                let pixel = pixel_request.map(|request| {
+                    request.and_then(|request| {
+                        graphics
+                            .shader_evaluation_cache
+                            .evaluate(&request.state, request.options)
+                    })
+                });
+                (export, pixel)
+            };
+        if let Some(evaluation) = export_evaluation {
+            draw.export_shader_evaluation = evaluation
+                .and_then(snapshot_small_readonly_global_bindings)
+                .map_err(|error| {
+                    if graphics
+                        .failed_shader_evaluations
+                        .insert((0, draw.export_shader_address))
+                    {
+                        dump_draw_shader_ir(&draw);
+                        let resource2_register = export_user_data_base.saturating_sub(1);
+                        let resource2 = graphics.shader_registers.get(&resource2_register).copied();
+                        let user_sgpr_count = resource2
+                            .map(|value| ((value >> 1) & 0x1f) | (((value >> 27) & 1) << 5));
+                        let required_inputs = draw
+                            .export_shader
+                            .as_ref()
+                            .map(|snapshot| {
+                                snapshot
+                                    .program
+                                    .input_scalar_registers()
+                                    .iter()
+                                    .copied()
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[REMu][AGC][SHADER] export evaluation failed at {:#x}: {error}; \
+                             user_base={export_user_data_base:#x} resource2={resource2:#x?} \
+                             user_sgprs={user_sgpr_count:?} required_inputs={required_inputs:x?}",
+                            draw.export_shader_address,
+                        );
+                    }
                 })
-            });
-            let pixel = pixel_request.map(|request| {
-                request.and_then(|request| {
-                    graphics
-                        .shader_evaluation_cache
-                        .evaluate(&request.state, request.options)
+                .ok();
+        }
+        if let Some(evaluation) = pixel_evaluation {
+            draw.pixel_shader_evaluation = evaluation
+                .and_then(snapshot_small_readonly_global_bindings)
+                .map_err(|error| {
+                    if graphics
+                        .failed_shader_evaluations
+                        .insert((1, draw.pixel_shader_address))
+                    {
+                        dump_draw_shader_ir(&draw);
+                        let control_flow = draw.pixel_shader.as_ref().map_or_else(
+                            || "missing shader".to_owned(),
+                            |snapshot| shader_control_flow_summary(&snapshot.program),
+                        );
+                        eprintln!(
+                            "[REMu][AGC][SHADER] pixel evaluation failed at {:#x}: {error}; {}",
+                            draw.pixel_shader_address, control_flow,
+                        );
+                    }
                 })
-            });
-            (export, pixel)
-        };
-    if let Some(evaluation) = export_evaluation {
-        draw.export_shader_evaluation = evaluation
-            .and_then(snapshot_small_readonly_global_bindings)
-            .map_err(|error| {
-                if graphics
-                    .failed_shader_evaluations
-                    .insert((0, draw.export_shader_address))
-                {
-                    dump_draw_shader_ir(&draw);
-                    let resource2_register = export_user_data_base.saturating_sub(1);
-                    let resource2 = graphics.shader_registers.get(&resource2_register).copied();
-                    let user_sgpr_count =
-                        resource2.map(|value| ((value >> 1) & 0x1f) | (((value >> 27) & 1) << 5));
-                    let required_inputs = draw
-                        .export_shader
-                        .as_ref()
-                        .map(|snapshot| {
-                            snapshot
-                                .program
-                                .input_scalar_registers()
-                                .iter()
-                                .copied()
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    eprintln!(
-                        "[REMu][AGC][SHADER] export evaluation failed at {:#x}: {error}; \
-                         user_base={export_user_data_base:#x} resource2={resource2:#x?} \
-                         user_sgprs={user_sgpr_count:?} required_inputs={required_inputs:x?}",
-                        draw.export_shader_address,
-                    );
-                }
-            })
-            .ok();
-    }
-    if let Some(evaluation) = pixel_evaluation {
-        draw.pixel_shader_evaluation = evaluation
-            .and_then(snapshot_small_readonly_global_bindings)
-            .map_err(|error| {
-                if graphics
-                    .failed_shader_evaluations
-                    .insert((1, draw.pixel_shader_address))
-                {
-                    dump_draw_shader_ir(&draw);
-                    let control_flow = draw.pixel_shader.as_ref().map_or_else(
-                        || "missing shader".to_owned(),
-                        |snapshot| shader_control_flow_summary(&snapshot.program),
-                    );
-                    eprintln!(
-                        "[REMu][AGC][SHADER] pixel evaluation failed at {:#x}: {error}; {}",
-                        draw.pixel_shader_address, control_flow,
-                    );
-                }
-            })
-            .ok();
+                .ok();
+        }
     }
     if trace_logarithmic_sequence(draw.sequence, 8) {
         let mut cache_stats = graphics.shader_evaluation_cache.stats();

@@ -308,8 +308,9 @@ fn executes_nonindexed_indirect_draw_from_a_compute_typed_set_base() {
             .map(|register| register.value),
         Some(0)
     );
-    assert_eq!(graphics.shader_registers.get(&0x08c), None);
-    assert_eq!(graphics.shader_registers.get(&0x08d), None);
+    // Neutralized SH remaps restore the seeded AGC defaults (0), not an empty map.
+    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&0));
+    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&0));
 
     arguments.0[..4].fill(0);
     let (result, events) = crate::capture_agc_gpu_events(|| {
@@ -372,6 +373,9 @@ fn executes_indexed_indirect_draw_with_all_five_argument_fields() {
         index_size: 1,
         ..AgcGraphicsState::default()
     };
+    graphics
+        .context_registers
+        .insert(crate::AGC_CB_TARGET_MASK, 0xf);
     let mut shaders = AgcShaderRegistry::default();
     let mut flips = Vec::new();
     let mut event_writes = Vec::new();
@@ -417,9 +421,10 @@ fn executes_indexed_indirect_draw_with_all_five_argument_fields() {
             .map(|register| register.value),
         Some(0)
     );
-    assert_eq!(graphics.shader_registers.get(&0x08c), None);
-    assert_eq!(graphics.shader_registers.get(&0x08d), None);
-    assert_eq!(graphics.shader_registers.get(&0x08e), None);
+    // Neutralized SH remaps restore the seeded AGC defaults (0), not an empty map.
+    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&0));
+    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&0));
+    assert_eq!(graphics.shader_registers.get(&0x08e), Some(&0));
 }
 
 #[test]
@@ -714,10 +719,15 @@ fn submits_descriptor_wrapped_acb_work_on_an_owner_scoped_compute_queue() {
         remu_gpu::ComputeGrid::Threadgroups([3, 2, 1])
     );
     assert_eq!(dispatch.shader_address, program_address);
-    assert!(crate::agc_dispatch_state::with_agc(|agc| agc
-        .graphics
-        .shader_registers
-        .is_empty()));
+    // Graphics SH is seeded from AGC defaults; ACB work must not publish compute PGM into it.
+    assert_ne!(
+        crate::agc_dispatch_state::with_agc(|agc| agc
+            .graphics
+            .shader_registers
+            .get(&remu_gpu::COMPUTE_PGM_LO_REGISTER)
+            .copied()),
+        Some(low_u32(program_address >> 8))
+    );
     assert_eq!(
         crate::agc_dispatch_state::with_agc(|agc| {
             agc.compute_queues.get(&7).and_then(|queue| {

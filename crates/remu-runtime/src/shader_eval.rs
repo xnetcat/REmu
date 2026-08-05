@@ -545,11 +545,12 @@ fn trace_msl_pair(draw: &remu_gpu::IndexedDraw, export_user_data_base: u32) -> S
     pixel_options.pixel_input_controls = std::array::from_fn(|index| {
         let offset = AGC_SPI_PS_INPUT_CNTL_0
             + u32::try_from(index).expect("PS input-control index fits u32");
+        // AGC default for every SPI_PS_INPUT_CNTL_n is 0 — never the logical index.
         let value = draw
             .context_registers
             .iter()
             .find(|register| register.offset == offset)
-            .map_or(offset - AGC_SPI_PS_INPUT_CNTL_0, |register| register.value);
+            .map_or(0, |register| register.value);
         remu_shader_metal::PixelInputControl::from_register(value)
     });
     let pixel = match remu_shader_metal::compile_msl(
