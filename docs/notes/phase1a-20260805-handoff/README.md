@@ -74,7 +74,7 @@ Forwarded through `scripts/run-game.sh` (survives the launch `env -u` wrapper).
 ## Phase 1B–H
 
 Phase 1B (TLS) closed — see `docs/notes/phase1b-20260805-handoff/`. Phase 1C
-(ordered publication) closed — see `docs/notes/phase1c-20260805-handoff/`. Phase 1D–H not started.
+(ordered publication) closed — see `docs/notes/phase1c-20260805-handoff/`. Phase 1D closed — see `docs/notes/phase1d-20260805-handoff/`. Phase 1E–H not started.
 
 ## Loud refusal (post-1A)
 

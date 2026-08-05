@@ -1,6 +1,7 @@
 # Phase 1C handoff — ordered publication (2026-08-05)
 
-Architectural data flow only. Phase 1D–H not started.
+Architectural data flow only. Phase 1D closed — see `docs/notes/phase1d-20260805-handoff/`.
+Phase 1E–H not started.
 
 ## Design
 
@@ -83,4 +84,4 @@ Loadavg at SH launch 1-minute ~3.94; DeS ~4.01 (no FPS/timing claim).
   model that removes host→guest writebacks.
 - AJM sideband / pad / audio ring ordering called out in CORE-MECHANISMS are outside this phase's
   listed publication data flow.
-- Phase 1D–H not started.
+- Phase 1D closed — see `docs/notes/phase1d-20260805-handoff/`. Phase 1E–H not started.

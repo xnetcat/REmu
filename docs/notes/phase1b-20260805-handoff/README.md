@@ -1,7 +1,7 @@
 # Phase 1B handoff — TLS / `fs:` architectural data flow (2026-08-05)
 
 Architectural data flow only. Phase 1C closed — see `docs/notes/phase1c-20260805-handoff/`.
-Phase 1D–H not started.
+Phase 1D closed — see `docs/notes/phase1d-20260805-handoff/`. Phase 1E–H not started.
 
 ## Design
 
@@ -84,4 +84,4 @@ Loadavg at DeS launch 1-minute ~3.85 (no FPS claim). Silent Hill launch ~5.65 (n
 - A 64Ki per-site helper cushion was chasing `AddressOverflow` from `i32::try_from` on zero-extended
   Immediate32; that is refuted — keep Imm32 bits and pack lea-first instead.
 - Void Terrarium / Dreaming Sarah still null-fault early; do not claim TLS closed those titles' crashes.
-- Phase 1C closed — see `docs/notes/phase1c-20260805-handoff/`. Phase 1D–H not started.
+- Phase 1C closed — see `docs/notes/phase1c-20260805-handoff/`. Phase 1D closed — see `docs/notes/phase1d-20260805-handoff/`. Phase 1E–H not started.

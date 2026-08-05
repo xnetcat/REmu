@@ -17,6 +17,18 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Phase 1D — register model (CLOSED 2026-08-05)
+
+- Seed Cx/Sh/Uc from `agc_register_defaults` on `AgcGraphicsState::default` and selective
+  `apply_reset_queue_op` (`lib.rs`); never empty maps.
+- Wrong fallbacks deleted: CW `PA_SU_SC_MODE_CNTL`, identity `SPI_PS_INPUT_CNTL`, full-target
+  viewport, COL_FORMAT invent (`presenter/decode*.rs`).
+- Decoded: stencil, depth bias (`set_depth_bias`), `CB_COLOR_INFO` blend bypass, Uc `0x24a`
+  index offset, `CxVgtShaderStagesEn` + `UcGeCntl` NGG.
+- `6a082b1` kept: absolute viewport height, no winding re-flip.
+- Handoff: `docs/notes/phase1d-20260805-handoff/`. Head ~`1273aab`.
+- Phase 1E–H not started.
+
 ## Phase 1C — ordered publication (CLOSED 2026-08-05)
 
 - Labels: aligned `publish_guest_shared_u64_if_identity` / `store_guest_visible_u64` release stores
