@@ -212,10 +212,9 @@ fn rwlock_waiters_keep_the_object_live_and_reinitialization_is_fresh() {
     assert_eq!(crate::guest_rwlock_destroy(0), invalid);
     assert_eq!(crate::guest_rwlock_unlock(0), invalid);
     assert_eq!(crate::guest_rwlock_init(address), 0);
-    assert_eq!(
-        crate::guest_rwlock_init(address),
-        u64::from(libc::EBUSY.cast_unsigned())
-    );
+    // Pointer-typedef ABI: re-init overwrites the slot with a fresh control block (same as
+    // mutex/cond). POSIX double-init without destroy is UB; we match console overwrite.
+    assert_eq!(crate::guest_rwlock_init(address), 0);
     assert_eq!(crate::guest_rwlock_lock(address, true, false), 0);
     assert_eq!(
         crate::guest_rwlock_lock(address, true, true),
@@ -861,21 +860,51 @@ fn mutex_init_overwrites_a_stack_handle_copy_without_touching_canonical_storage(
 }
 
 #[test]
-fn mutex_init_refuses_true_reinit_of_canonical_storage() {
+fn mutex_init_overwrites_recycled_stack_publishing_storage() {
+    // Scream: CreateMutex inits into a stack local (storage_address recorded), returns the
+    // handle by value, then a later CreateMutex reuses the same stack offset while the
+    // leftover bits still name the prior live object. Init must overwrite, not EINVAL.
     let _guard = GUEST_CONDITION_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut storage = 0_u64;
     let address = (&raw mut storage).addr() as u64;
     assert_eq!(
-        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        crate::guest_mutex_init(
+            address,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
         0
     );
+    let first = storage;
+    assert_ne!(first, 0);
     assert_eq!(
-        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
-        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        crate::guest_mutex_init(
+            address,
+            crate::PthreadMutexAttrState {
+                mutex_type: 2,
+                ..crate::PthreadMutexAttrState::default()
+            }
+        ),
+        0,
+        "recycled publishing storage must accept a fresh control block"
     );
+    let second = storage;
+    assert_ne!(second, 0);
+    assert_ne!(second, first);
+    // Prior object remains reachable via its handle (guest globals keep the returned value).
+    assert_eq!(crate::guest_mutex_lock(first, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(first), 0);
+    assert_eq!(crate::guest_mutex_destroy(first), 0);
+    // Destroy must not blank `address` — it no longer holds `first`.
+    assert_eq!(storage, second);
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
     assert_eq!(crate::guest_mutex_destroy(address), 0);
+    assert_eq!(storage, 0);
 }
 
 #[test]
