@@ -843,3 +843,40 @@ fn reports_bounded_codegen_footprint_for_a_long_straight_line_shader() {
     assert!(!shader.source.contains("case 0u"));
     assert!(!shader.source.contains("steps"));
 }
+
+#[test]
+fn barrier_lowers_on_straight_line_and_structured_compute() {
+    let barrier = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::Known("SBarrier"),
+        words: vec![0],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    };
+    let end = Instruction {
+        pc: 4,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::END_PROGRAM,
+        words: vec![0xbf81_0000],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    };
+    let direct = compile_msl(
+        &Program::new(0x1000, vec![barrier, end]),
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("straight-line S_BARRIER must lower");
+    assert!(
+        direct
+            .source
+            .contains("threadgroup_barrier(mem_flags::mem_threadgroup)"),
+        "direct/structured CF must emit the Metal workgroup barrier"
+    );
+    // Step-capped Dispatcher + S_BARRIER remains a loud refuse in driver.rs (SharpEmu
+    // divergent-barrier class). Irreducible fixtures that still demote to Dispatcher are
+    // covered by the pre-existing control_flow regressions when they regain that shape.
+}

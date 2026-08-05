@@ -472,18 +472,17 @@ impl<'a> Compiler<'a> {
                             .to_owned(),
                     );
                 }
-                // Metal requires uniform control flow for threadgroup_barrier. Structured if/while
-                // and the PC dispatcher can place this under divergent EXEC; SharpEmu documents
-                // that class of failure (whole-quad death). Only straight-line lowerings prove
-                // every lane reaches the barrier together.
-                if !matches!(
+                // SharpEmu refuses cross-lane ops under the divergent PC dispatcher (whole-quad
+                // death). Structured if/while is the proven reducible path and still needs
+                // architectural workgroup barriers for NGG/LDS; only the step-capped Dispatcher
+                // is refused here. Graphics Dispatcher ballots already use the single-lane model.
+                if matches!(
                     self.control_flow,
-                    crate::compiler::control_flow::ControlFlowLowering::Direct(_)
-                        | crate::compiler::control_flow::ControlFlowLowering::Forward
+                    crate::compiler::control_flow::ControlFlowLowering::Dispatcher
                 ) {
                     return Err(
-                        "S_BARRIER requires converged straight-line control flow; refusing \
-                         barrier under structured or dispatcher divergence"
+                        "S_BARRIER under step-capped dispatcher control flow is undefined on \
+                         Metal simdgroups; refusing rather than emitting a divergent barrier"
                             .to_owned(),
                     );
                 }
