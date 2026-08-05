@@ -17,6 +17,18 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Phase 1B — TLS / `fs:` (CLOSED 2026-08-05)
+
+- Load helpers: red-zone skip inside thunk + XSAVE; undo with `add rsp,128` / plain `ret` (not
+  `ret 128`). Store sites keep site-side `lea` + `ret 128`. RSP dest slot is `ud2`.
+- Discovery: seeded prefix-aware decode (`link/fs_decode.rs`) — not byte-scan. AOT shared zero-disp
+  loads; per-site lea (first) / store-imm / load-disp; overflow + Other → SIGSEGV backstop
+  (`tls_fault.rs`, before write-watch / null short-circuit).
+- Store-imm AOT keeps Imm32 bits (`immediate as i32`); iced zero-extends Immediate32 into i64.
+- Handoff: `docs/notes/phase1b-20260805-handoff/`. Head ~`4e0357f`.
+- **Refuted:** sizing a huge per-site cushion to fix `AddressOverflow` — that was Imm32 `try_from`.
+- Next DeS blocker still ACM (`sceAcmBatchStartBuffers`), not TLS.
+
 ## Phase 1A — sync-object identity (CLOSED 2026-08-05)
 
 - `pthread_mutex_t` / `cond_t` / `rwlock_t` are pointer typedefs (`sys/_pthreadtypes.h`). Registry
