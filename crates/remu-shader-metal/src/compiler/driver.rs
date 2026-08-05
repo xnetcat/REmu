@@ -188,11 +188,16 @@ impl<'a> Compiler<'a> {
             }
         }
         let control_flow = analyze_control_flow(program)?;
-        // J3: compacted-vertex EXP staging and the GFX10 empty-workaround snapshot/restore are
-        // deleted. Detecting either pattern without proven Q5 NggRegisters is a loud refuse —
-        // never a silent title-specific rewrite. With proven registers the guest sequence lowers
-        // as-is (GS_ALLOC_REQ still honours M0; EXP publishes by remu_thread_index). Remaining
-        // seams: s2 wave-id vs empty-check ABI, and compacted vertex-id → set_vertex mapping.
+        // Compacted-vertex EXP staging is architectural NGG export layout (PRIM indices name
+        // compacted slots). It still requires proven Q5 NggRegisters so an unproven mesh ABI
+        // cannot invent capacity. The GFX10 empty-workaround count rewrite stays deleted:
+        // detecting that pattern without proven registers is a loud refuse; with proof the
+        // guest GS_ALLOC_REQ / M0 sequence lowers as-is.
+        let mesh_export_vertex_vgpr = if options.stage == MetalShaderStage::Mesh {
+            mesh_export_vertex_vgpr(program)
+        } else {
+            None
+        };
         if options.stage == MetalShaderStage::Mesh && !options.ngg_registers_proven {
             if mesh_ngg_packed_export_sgpr(program).is_some() {
                 return Err(MetalCompileError::InvalidInterface(
@@ -200,9 +205,9 @@ impl<'a> Compiler<'a> {
                         .into(),
                 ));
             }
-            if mesh_export_vertex_vgpr(program).is_some() {
+            if mesh_export_vertex_vgpr.is_some() {
                 return Err(MetalCompileError::InvalidInterface(
-                    "NGG compacted-vertex EXP gate requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing the title-specific staged-vertex peephole"
+                    "NGG compacted-vertex EXP gate requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing compacted-record staging without SDK sizing"
                         .into(),
                 ));
             }
@@ -220,6 +225,10 @@ impl<'a> Compiler<'a> {
             image_kinds,
             image_slots,
             control_flow,
+            mesh_export_vertex_vgpr: options
+                .ngg_registers_proven
+                .then_some(mesh_export_vertex_vgpr)
+                .flatten(),
         })
     }
 

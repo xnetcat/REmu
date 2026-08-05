@@ -540,7 +540,7 @@ fn compacted_vertex_exp_gate_refuses_without_proven_ngg_registers() {
 }
 
 #[test]
-fn proven_ngg_registers_lower_compacted_vertex_exp_without_staging_peephole() {
+fn proven_ngg_registers_stage_compacted_vertex_exports_by_compacted_id() {
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh_from_ngg_registers(
         2,
@@ -554,16 +554,22 @@ fn proven_ngg_registers_lower_compacted_vertex_exp_without_staging_peephole() {
     );
     options.wave_lane_count = 64;
     let shader = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("proven NggRegisters may lower compacted EXP as-is");
+        .expect("proven NggRegisters lower compacted EXP through staged records");
     assert!(
-        !shader.source.contains("remu_mesh_staged_vertices"),
-        "J3 deleted the staged-vertex peephole"
+        shader
+            .source
+            .contains("remu_mesh_staged_vertices[remu_v_18] = remu_out")
+            || shader
+                .source
+                .contains("remu_mesh_staged_vertices[v[18]] = remu_out"),
+        "EXP must stage remu_out under the compacted vertex VGPR: {}",
+        shader.source
     );
     assert!(
         shader.source.contains(
-            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out)"
+            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index])"
         ),
-        "epilogue publishes remu_out by thread index without staging"
+        "epilogue must publish staged compacted records, not per-thread remu_out"
     );
 }
 

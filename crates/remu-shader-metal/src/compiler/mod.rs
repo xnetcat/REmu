@@ -46,6 +46,12 @@ pub(crate) struct Compiler<'a> {
     image_kinds: Vec<ImageKind>,
     image_slots: ImageBindingSlotMap,
     control_flow: ControlFlowLowering,
+    /// VGPR holding the NGG compacted output vertex id that gates EXP (the `vM` in
+    /// `V_CMPX_* sN, vM` immediately before `EXP POS`). When set under proven
+    /// `NggRegisters`, mesh exports stage `remu_out` into
+    /// `remu_mesh_staged_vertices[vM]` so the epilogue publishes by compacted index —
+    /// the architectural slot PRIM indices name — instead of `remu_thread_index`.
+    mesh_export_vertex_vgpr: Option<u32>,
 }
 
 impl Compiler<'_> {

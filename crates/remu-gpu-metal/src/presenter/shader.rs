@@ -470,9 +470,10 @@ impl MetalPresenter {
             );
             if !missing.is_empty() {
                 // Procedural rectangle covers synthesize their UV/parameter interface in the
-                // host rectangle vertex stage. Every other missing SPI_PS_INPUT_CNTL → PARAM
-                // link is an unfinished NGG attribute path (LDS / compacted records / EXP PARAM):
-                // refuse loudly instead of declaring RemuVsOut slots and leaving them zero.
+                // host rectangle vertex stage. Every other missing SPI_PS_INPUT_CNTL → EXP PARAM
+                // link has no architectural producer in the export program (compacted-record
+                // staging only relocates payloads that EXP already wrote): refuse loudly instead
+                // of declaring RemuVsOut slots and leaving them zero.
                 let rectangle_covers_missing = uses_procedural_rectangle_stage
                     && rectangle_coordinate_parameter_mask(
                         pixel_program,

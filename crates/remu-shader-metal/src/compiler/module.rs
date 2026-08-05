@@ -361,6 +361,24 @@ impl Compiler<'_> {
                 "    threadgroup atomic_uint remu_mesh_output_vertex_count;\n\
                  \x20   threadgroup atomic_uint remu_mesh_output_primitive_count;\n",
             );
+            if self.mesh_export_vertex_vgpr.is_some() {
+                let _ = writeln!(
+                    source,
+                    "    threadgroup RemuVsOut remu_mesh_staged_vertices[{}];",
+                    self.options.mesh_max_vertex_count
+                );
+                let _ = writeln!(
+                    source,
+                    "    if (remu_thread_index < {}u) {{",
+                    self.options.mesh_max_vertex_count
+                );
+                source.push_str(
+                    "        remu_mesh_staged_vertices[remu_thread_index] = {};\n\
+                     \x20       remu_mesh_staged_vertices[remu_thread_index].position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
+                     \x20   }\n\
+                     \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+                );
+            }
         }
         if self.split_wave64() {
             source.push_str(
@@ -778,12 +796,24 @@ impl Compiler<'_> {
                 }
                 // Metal mesh has no set_vertex_count; only set_primitive_count exists.
                 // Vertex occupancy comes from set_vertex + index references.
-                source.push_str(
-                    "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                     \x20   if (remu_thread_index == 0u) {\n\
-                     \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
-                     \x20   }\n",
-                );
+                // When EXP is gated by a compacted vertex VGPR, publish staged payloads by that
+                // index — remu_out lives on the exporting thread, which is usually not the same
+                // as remu_thread_index == vertex_id.
+                if self.mesh_export_vertex_vgpr.is_some() {
+                    source.push_str(
+                        "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index]);\n\
+                         \x20   if (remu_thread_index == 0u) {\n\
+                         \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
+                         \x20   }\n",
+                    );
+                } else {
+                    source.push_str(
+                        "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                         \x20   if (remu_thread_index == 0u) {\n\
+                         \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
+                         \x20   }\n",
+                    );
+                }
             }
         }
         source.push_str("}\n");
