@@ -892,3 +892,105 @@ fn vop3_v_cndmask_b32_applies_floating_point_source_modifiers() {
         "the selected true source must retain its VOP3 NEG modifier"
     );
 }
+
+#[test]
+fn signed_and_unsigned_low_multiplies_share_one_lowering() {
+    for name in ["VMulLoU32", "VMulLoI32"] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x2c0,
+                encoding: ShaderEncoding::Vop3,
+                opcode: Opcode::Known(name),
+                words: vec![0, 0],
+                sources: vec![Operand::vector(5), Operand::vector(6)],
+                destinations: vec![Operand::vector(8)],
+                control: Some(unmodified_vop3()),
+            },
+            MetalShaderStage::Compute,
+        );
+
+        assert!(
+            shader.source.contains("(remu_v_5 * remu_v_6)"),
+            "{name} keeps the low half of the product:\n{}",
+            shader.source
+        );
+    }
+}
+
+#[test]
+fn lowers_the_vector_bit_scans_with_their_no_bit_result() {
+    for (name, expected) in [
+        ("VFfbhU32", "clz(t0)"),
+        ("VFfblB32", "ctz(t0)"),
+        ("VFfbhI32", "clz(t1)"),
+    ] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x2c8,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand::vector(5)],
+                destinations: vec![Operand::vector(8)],
+                control: None,
+            },
+            MetalShaderStage::Compute,
+        );
+
+        assert!(
+            shader.source.contains(expected),
+            "{name} counts from the end the hardware scans:\n{}",
+            shader.source
+        );
+        assert!(
+            shader.source.contains("0xFFFFFFFFu :"),
+            "{name} reports 0xFFFFFFFF when no bit matches:\n{}",
+            shader.source
+        );
+    }
+
+    // The signed scan finds the highest bit that differs from the sign, so a negative input is
+    // inverted before the count. Scanning the value itself would answer 0 for every negative
+    // number, which is a plausible-looking shift amount rather than an obvious failure.
+    let signed = compile_vector_instruction(
+        Instruction {
+            pc: 0x2c8,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VFfbhI32"),
+            words: vec![0],
+            sources: vec![Operand::vector(5)],
+            destinations: vec![Operand::vector(8)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+    assert!(
+        signed.source.contains("as_type<int>(t0) < 0 ? ~t0 : t0"),
+        "V_FFBH_I32 inverts a negative value before scanning:\n{}",
+        signed.source
+    );
+}
+
+#[test]
+fn the_legacy_multiply_keeps_a_zero_operand_from_producing_a_nan() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x2d0,
+            encoding: ShaderEncoding::Vop2,
+            opcode: Opcode::Known("VMulLegacyF32"),
+            words: vec![0],
+            sources: vec![Operand::vector(5), Operand::vector(6)],
+            destinations: vec![Operand::vector(8)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+
+    assert!(
+        shader
+            .source
+            .contains("t0 == 0.0f || t1 == 0.0f) ? 0.0f : t0 * t1"),
+        "the DX9 multiply answers zero for a zero operand instead of the IEEE NaN:\n{}",
+        shader.source
+    );
+}

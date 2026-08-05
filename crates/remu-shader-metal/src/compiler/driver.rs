@@ -438,6 +438,18 @@ impl<'a> Compiler<'a> {
             // in program order, so they require no separate host instruction.
             "SNop" | "SWaitcnt" | "SWaitcntDepctr" | "SInstPrefetch" | "STtraceData"
             | "SClause" | "VNop" => {}
+            // Per-wave hardware state that Metal neither exposes nor needs: the remaining wait
+            // counters, the scheduling, cache and performance-counter hints, and the rounding and
+            // denormal mode registers, whose behaviour the host GPU fixes for us. S_VERSION is a
+            // toolchain declaration, and S_SETREG writes an opaque hardware register from a field
+            // the decoder parks in the scalar-destination slot, so it produces no register value
+            // either. The evaluator already runs all of these as benign; refusing them here threw
+            // away an entire draw over a scheduling hint. S_GETREG_B32 stays a loud refusal,
+            // because its result is unmodeled hardware state a later address could depend on.
+            "SWaitcntVscnt" | "SWaitcntVmcnt" | "SWaitcntExpcnt" | "SWaitcntLgkmcnt"
+            | "SSetprio" | "SIcacheInv" | "SSleep" | "SWakeup" | "SSethalt" | "SIncperflevel"
+            | "SDecperflevel" | "STtracedataImm" | "SWaitIdle" | "SRoundMode" | "SDenormMode"
+            | "SVersion" | "SSetregB32" | "SSetregImm32B32" => {}
             "SBarrier" => {
                 if !self.is_threadgroup_stage() {
                     return Err(

@@ -76,6 +76,75 @@ fn hardware_register_writes_do_not_fabricate_an_sgpr_destination() {
 }
 
 #[test]
+fn wave_mode_and_scheduling_hints_lower_to_nothing_but_reading_one_refuses() {
+    for name in [
+        "SRoundMode",
+        "SDenormMode",
+        "SSetprio",
+        "SIcacheInv",
+        "SSleep",
+        "SWakeup",
+        "SSethalt",
+        "SIncperflevel",
+        "SDecperflevel",
+        "STtracedataImm",
+        "SWaitIdle",
+        "SWaitcntVscnt",
+        "SWaitcntVmcnt",
+        "SWaitcntExpcnt",
+        "SWaitcntLgkmcnt",
+    ] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x30,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 0,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            MetalShaderStage::Compute,
+        );
+        assert!(
+            shader.source.contains("kernel void remu_main"),
+            "{name} adjusts wave state Metal fixes for us and must not fail the translation"
+        );
+    }
+
+    // Reading a hardware register is different in kind: the value is unmodeled state, and a
+    // shader that goes on to compute an address from it would read the wrong memory.
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0x1000,
+            encoding: ShaderEncoding::Sopk,
+            opcode: Opcode::Known("SGetregB32"),
+            words: vec![0xb805_f801],
+            sources: vec![Operand {
+                kind: OperandKind::EncodedConstant,
+                value: 0xf801,
+            }],
+            destinations: vec![Operand::scalar(5)],
+            control: None,
+        }],
+    );
+    let error = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect_err("reading an unmodeled hardware register must refuse");
+    assert!(
+        error.to_string().contains("SGetregB32"),
+        "the refusal must name the hardware register read: {error}"
+    );
+}
+
+#[test]
 fn lowers_s_bcnt1_i32_b64_to_one_uint_destination_and_scc() {
     let shader = compile_vector_instruction(
         Instruction {
@@ -257,9 +326,9 @@ fn lowers_shifted_scalar_add_with_its_unsigned_carry_out_condition() {
         );
 
         assert!(
-            shader.source.contains(&format!(
-                "((ulong)remu_s_10 << {shift}) + (ulong)remu_s_12"
-            )),
+            shader
+                .source
+                .contains(&format!("((ulong)remu_s_10 << {shift}) + (ulong)remu_s_12")),
             "{name} must form the sum at 64-bit width:\n{}",
             shader.source
         );

@@ -385,6 +385,10 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
         ("VDivFixupF32", false),
         ("VDivFmasF32", false),
         ("VMin3F16", false),
+        ("VMulLegacyF32", false),
+        ("VFfbhU32", false),
+        ("VFfblB32", false),
+        ("VFfbhI32", false),
     ]
     .into_iter()
     .enumerate()

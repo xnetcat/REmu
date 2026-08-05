@@ -37,7 +37,7 @@ fn accepts_exactly_the_architectural_dpp16_control_space() {
 
 #[test]
 fn lowers_dpp_and_dpp8_for_every_otherwise_supported_vector_alu() {
-    const ALU: [(&str, usize); 75] = [
+    const ALU: [(&str, usize); 80] = [
         ("VCndmaskB32", 2),
         ("VMovB32", 1),
         ("VAddF32", 2),
@@ -113,6 +113,11 @@ fn lowers_dpp_and_dpp8_for_every_otherwise_supported_vector_alu() {
         ("VMadMkF32", 3),
         ("VFmaAkF32", 3),
         ("VFmaMkF32", 3),
+        ("VMulLegacyF32", 2),
+        ("VMulLoI32", 2),
+        ("VFfbhU32", 1),
+        ("VFfblB32", 1),
+        ("VFfbhI32", 1),
     ];
     const DPP_FAMILIES: [u32; 8] = [0xe4, 0x101, 0x111, 0x121, 0x140, 0x141, 0x150, 0x160];
     for (name, source_count) in ALU {

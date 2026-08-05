@@ -397,7 +397,9 @@ fn decodes_the_precise_division_sequence_and_leaves_0x351_to_half_float_min3() {
         );
         assert_eq!(
             instruction.destinations,
-            [Operand::vector(8 + u32::try_from(index).expect("small index"))]
+            [Operand::vector(
+                8 + u32::try_from(index).expect("small index")
+            )]
         );
     }
 

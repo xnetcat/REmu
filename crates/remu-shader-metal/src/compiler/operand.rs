@@ -294,9 +294,7 @@ impl Compiler<'_> {
                 "as_type<uint>((int)({value} < -2147483648l ? -2147483648l : ({value} > 2147483647l ? 2147483647l : {value})))"
             )
         } else {
-            format!(
-                "(uint)({value} < 0l ? 0l : ({value} > 4294967295l ? 4294967295l : {value}))"
-            )
+            format!("(uint)({value} < 0l ? 0l : ({value} > 4294967295l ? 4294967295l : {value}))")
         }
     }
 

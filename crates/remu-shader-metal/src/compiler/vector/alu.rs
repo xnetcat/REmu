@@ -277,6 +277,44 @@ impl Compiler<'_> {
                     self.float_source(instruction, 1)?
                 ),
             ),
+            "VMulLegacyF32" => {
+                // The DX9 multiply: a zero operand forces a zero result, where IEEE would return
+                // NaN for zero times infinity. Shaders reach for it exactly when they rely on that
+                // difference, so lowering it as a plain multiply would turn a masked-off term into
+                // a NaN that then poisons everything it is added to.
+                let first_source = self.float_source(instruction, 0)?;
+                let second_source = self.float_source(instruction, 1)?;
+                let first = self.temp("float", &first_source);
+                let second = self.temp("float", &second_source);
+                self.float_result(
+                    instruction,
+                    &format!(
+                        "({first} == 0.0f || {second} == 0.0f) ? 0.0f : {first} * {second}"
+                    ),
+                )
+            }
+            "VFfbhU32" | "VFfblB32" | "VFfbhI32" => {
+                let raw = self.raw_source(instruction, 0)?;
+                let source = self.temp("uint", &raw);
+                // The signed scan looks for the highest bit that differs from the sign bit, which
+                // is the highest set bit of the inverted value when the input is negative. All
+                // three forms report 0xFFFFFFFF when there is no such bit, so a caller that
+                // divides by the count has a value it can test.
+                let scanned = if name == "VFfbhI32" {
+                    self.temp(
+                        "uint",
+                        &format!("as_type<int>({source}) < 0 ? ~{source} : {source}"),
+                    )
+                } else {
+                    source
+                };
+                let count = if name == "VFfblB32" {
+                    format!("ctz({scanned})")
+                } else {
+                    format!("clz({scanned})")
+                };
+                format!("{scanned} == 0u ? 0xFFFFFFFFu : {count}")
+            }
             "VAddF16" | "VSubF16" | "VSubrevF16" | "VMulF16" | "VMaxF16" | "VMinF16" => {
                 let first = self.half_float_source(instruction, 0)?;
                 let second = self.half_float_source(instruction, 1)?;
@@ -801,7 +839,9 @@ impl Compiler<'_> {
                 self.raw_source(instruction, 0)?,
                 self.raw_source(instruction, 1)?
             ),
-            "VMulLoU32" => format!(
+            // The low half of the product is the same bit pattern for either signedness, so the
+            // signed and unsigned low multiplies share one lowering.
+            "VMulLoU32" | "VMulLoI32" => format!(
                 "({} * {})",
                 self.raw_source(instruction, 0)?,
                 self.raw_source(instruction, 1)?
