@@ -9058,7 +9058,6 @@ fn abi_gap_fingerprint() -> u64 {
         .wrapping_add(sha_ni::recovered_sse4a_count())
         .wrapping_add(sha_ni::recovered_sha_ni_count())
         .wrapping_add(remu_gpu::fabricated_success_total())
-        .wrapping_add(guest_sync::lazily_fabricated_mutex_count())
 }
 
 fn write_abi_gap_summary() {
@@ -9110,13 +9109,6 @@ fn write_abi_gap_summary() {
                 ranked.len() - MAXIMUM_REPORTED_INERT
             );
         }
-    }
-    let lazy_mutexes = guest_sync::lazily_fabricated_mutex_count();
-    if lazy_mutexes != 0 {
-        eprintln!(
-            "[REMu][REPORT] lazily fabricated mutex entries count={lazy_mutexes} \
-             (create-on-first-use without scePthreadMutexInit — handle-copy detector)"
-        );
     }
     let recovered_sha_ni = sha_ni::recovered_sha_ni_count();
     let recovered_sse4a = sha_ni::recovered_sse4a_count();

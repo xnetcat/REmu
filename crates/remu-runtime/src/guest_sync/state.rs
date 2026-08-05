@@ -90,22 +90,33 @@ pub(crate) struct GuestConditionWaiterState {
 }
 
 impl GuestSyncState {
-    pub(crate) fn condition_entry(&mut self, condition: u64) -> Arc<GuestConditionEntry> {
-        self.conditions
-            .entry(condition)
-            .or_insert_with(GuestConditionEntry::new)
-            .clone()
+    pub(crate) fn condition_by_handle(&self, handle: u64) -> Option<Arc<GuestConditionEntry>> {
+        self.conditions.get(&handle).cloned()
     }
 
-    pub(crate) fn register_condition_waiter(&mut self, condition: u64, mutex: u64) -> Option<u64> {
-        let entry = self.condition_entry(condition);
+    pub(crate) fn insert_condition(
+        &mut self,
+        handle: u64,
+        storage_address: u64,
+    ) -> Arc<GuestConditionEntry> {
+        let entry = GuestConditionEntry::new(handle, storage_address);
+        self.conditions.insert(handle, entry.clone());
+        entry
+    }
+
+    pub(crate) fn register_condition_waiter(
+        &mut self,
+        condition_handle: u64,
+        mutex_identity: u64,
+    ) -> Option<u64> {
+        let entry = self.condition_by_handle(condition_handle)?;
         let mut condition_state = entry
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if condition_state
             .bound_mutex
-            .is_some_and(|bound| bound != mutex)
+            .is_some_and(|bound| bound != mutex_identity)
         {
             return None;
         }
@@ -119,7 +130,7 @@ impl GuestSyncState {
             }
         };
         assert!(
-            condition_state.register_waiter(waiter, mutex),
+            condition_state.register_waiter(waiter, mutex_identity),
             "condition mutex binding was validated under the synchronization lock"
         );
         drop(condition_state);
@@ -179,12 +190,12 @@ pub(crate) struct GuestMutexEntry {
     /// Thread-local lookup caches may keep the `Arc` alive after destruction, so every operation
     /// rechecks this bit under `state` before observing or changing ownership.
     pub(crate) active: AtomicBool,
+    /// Slot that originally published this control block (zeroed on destroy).
     pub(crate) storage_address: u64,
-    /// Opaque object installed in the guest's `ScePthreadMutex` storage by the init ABI.
+    /// Control-block pointer written into every `ScePthreadMutex` slot for this object.
     ///
-    /// The bundled libc writes bookkeeping fields in this object immediately after
-    /// `scePthreadMutexInit` succeeds, even though lock ownership itself is modeled by REmu.
-    /// Synthetic unit-test addresses are deliberately allowed to leave this zero.
+    /// This is the SDK identity (`pthread_mutex_t` is a pointer typedef). Registry shards are
+    /// keyed by this value. Libc may write bookkeeping fields into the object after init.
     pub(crate) guest_object: u64,
 }
 
@@ -250,29 +261,37 @@ pub(crate) struct GuestEventFlagEntry {
 pub(crate) struct GuestConditionEntry {
     pub(crate) state: Mutex<GuestConditionState>,
     pub(crate) wake: Condvar,
+    pub(crate) guest_object: u64,
+    pub(crate) storage_address: u64,
 }
 
 impl GuestConditionEntry {
-    pub(crate) fn new() -> Arc<Self> {
+    pub(crate) fn new(guest_object: u64, storage_address: u64) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(GuestConditionState::default()),
             wake: Condvar::new(),
+            guest_object,
+            storage_address,
         })
     }
 }
 
-/// Per-object rwlock entry (plan C3 / B16): shard map is a registry; wake is not shared.
+/// Per-object rwlock entry (plan C3 / B16): shard map is a registry keyed by control-block handle.
 #[derive(Debug)]
 pub(crate) struct GuestRwlockEntry {
     pub(crate) state: Mutex<GuestRwlockState>,
     pub(crate) wake: Condvar,
+    pub(crate) guest_object: u64,
+    pub(crate) storage_address: u64,
 }
 
-impl Default for GuestRwlockEntry {
-    fn default() -> Self {
+impl GuestRwlockEntry {
+    pub(crate) fn new(guest_object: u64, storage_address: u64) -> Self {
         Self {
             state: Mutex::new(GuestRwlockState::default()),
             wake: Condvar::new(),
+            guest_object,
+            storage_address,
         }
     }
 }
@@ -296,8 +315,6 @@ pub(super) static GUEST_MUTEX_SHARDS: OnceLock<
 pub(super) static GUEST_RWLOCK_SHARDS: OnceLock<[GuestRwlockShard; GUEST_RWLOCK_SHARD_COUNT]> =
     OnceLock::new();
 
-pub(super) static GUEST_MUTEX_BY_OBJECT: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
-
 pub(crate) fn guest_sync() -> &'static (Mutex<GuestSyncState>, Condvar) {
     GUEST_SYNC.get_or_init(|| (Mutex::new(GuestSyncState::default()), Condvar::new()))
 }
@@ -307,14 +324,9 @@ pub(super) fn guest_mutex_shards()
     GUEST_MUTEX_SHARDS.get_or_init(|| std::array::from_fn(|_| Mutex::new(HashMap::new())))
 }
 
-pub(super) fn guest_mutex_object_index() -> &'static Mutex<HashMap<u64, u64>> {
-    GUEST_MUTEX_BY_OBJECT.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub(super) fn guest_mutex_shard(address: u64) -> usize {
-    // Multiplicative hash (Knuth/Fibonacci): 0x100-byte mutex arrays previously collapsed
-    // `(address >> 4) & 63` onto a handful of shards (plan C3 / B16).
-    let hash = address.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+pub(super) fn guest_mutex_shard(handle: u64) -> usize {
+    // Multiplicative hash (Knuth/Fibonacci) over the control-block handle — SDK identity.
+    let hash = handle.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     usize::try_from(hash >> (64 - 6)).unwrap_or_default()
 }
 

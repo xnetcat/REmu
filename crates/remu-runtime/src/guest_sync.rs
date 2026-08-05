@@ -11,6 +11,7 @@ use std::time::Instant;
 
 mod condition;
 mod event_flag;
+mod identity;
 mod mutex;
 mod rwlock;
 mod semaphore;
@@ -31,7 +32,7 @@ pub(crate) use self::event_flag::guest_event_flag_wait;
 pub(crate) use self::mutex::GUEST_MUTEX_WAKE_COUNT;
 pub(crate) use self::mutex::{
     guest_mutex_destroy, guest_mutex_entry, guest_mutex_init, guest_mutex_lock, guest_mutex_unlock,
-    guest_pthread_once, lazily_fabricated_mutex_count,
+    guest_pthread_once,
 };
 #[cfg(test)]
 pub(crate) use self::rwlock::guest_rwlock_waiter_counts;
@@ -53,10 +54,6 @@ use self::event_flag::{
 };
 use self::semaphore::{
     guest_semaphore_create, guest_semaphore_delete, guest_semaphore_poll, guest_semaphore_signal,
-};
-use self::state::{
-    GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
-    guest_mutex_shards,
 };
 
 static MAIN_TIMED_CONDITION_TRACE_SEQUENCE: AtomicU64 = AtomicU64::new(0);

@@ -3,66 +3,130 @@
 
 use std::sync::Arc;
 
+use super::identity::{
+    GUEST_PTHREAD_OBJECT_SIZE, PthreadSlotValue, classify_pthread_slot_value, read_pthread_slot,
+};
 use super::state::{GuestRwlockEntry, GuestRwlockShard, guest_rwlock_shard, guest_rwlock_shards};
 use crate::{
-    assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle, current_guest_thread_name,
-    stall_report_interval,
+    SCE_KERNEL_ERROR_TRY_AGAIN, assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle,
+    current_guest_thread_name, guest_calloc, guest_free, stall_report_interval, write_guest_u64,
 };
 
-fn rwlock_shard(address: u64) -> &'static GuestRwlockShard {
-    &guest_rwlock_shards()[guest_rwlock_shard(address)]
+fn rwlock_shard(handle: u64) -> &'static GuestRwlockShard {
+    &guest_rwlock_shards()[guest_rwlock_shard(handle)]
 }
 
-fn lookup_or_insert_rwlock(address: u64) -> Arc<GuestRwlockEntry> {
-    let shard = rwlock_shard(address);
-    let mut locks = shard
-        .locks
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    locks
-        .entry(address)
-        .or_insert_with(|| Arc::new(GuestRwlockEntry::default()))
-        .clone()
-}
-
-fn lookup_rwlock(address: u64) -> Option<Arc<GuestRwlockEntry>> {
-    let shard = rwlock_shard(address);
+fn lookup_rwlock_by_handle(handle: u64) -> Option<Arc<GuestRwlockEntry>> {
+    if handle == 0 {
+        return None;
+    }
+    let shard = rwlock_shard(handle);
     let locks = shard
         .locks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    locks.get(&address).cloned()
+    locks.get(&handle).cloned()
+}
+
+fn resolve_rwlock(address: u64, allow_static_init: bool) -> Option<Arc<GuestRwlockEntry>> {
+    if address == 0 {
+        return None;
+    }
+    if let Some(entry) = lookup_rwlock_by_handle(address) {
+        return Some(entry);
+    }
+    let slot_value = read_pthread_slot(address)?;
+    match classify_pthread_slot_value(slot_value) {
+        PthreadSlotValue::ControlBlock(handle) => lookup_rwlock_by_handle(handle),
+        PthreadSlotValue::StaticDefault if allow_static_init => materialize_static_rwlock(address),
+        PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => None,
+    }
+}
+
+fn materialize_static_rwlock(slot: u64) -> Option<Arc<GuestRwlockEntry>> {
+    // Re-check under a process-wide gate so two first-lock threads share one object.
+    let sync = super::guest_sync();
+    let _init_gate = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = lookup_rwlock_by_handle(slot) {
+        return Some(entry);
+    }
+    let slot_value = read_pthread_slot(slot)?;
+    match classify_pthread_slot_value(slot_value) {
+        PthreadSlotValue::ControlBlock(handle) => lookup_rwlock_by_handle(handle),
+        PthreadSlotValue::StaticDefault => {
+            let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
+            if guest_object == 0 {
+                return None;
+            }
+            let entry = Arc::new(GuestRwlockEntry::new(guest_object, slot));
+            let shard = rwlock_shard(guest_object);
+            let mut locks = shard
+                .locks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.insert(guest_object, entry.clone());
+            drop(locks);
+            write_guest_u64(slot, guest_object);
+            Some(entry)
+        }
+        PthreadSlotValue::StaticAdaptiveMutex => {
+            unreachable!("rwlock slots do not use adaptive init")
+        }
+    }
 }
 
 pub(crate) fn guest_rwlock_init(address: u64) -> u64 {
     if address == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
     }
-    let shard = rwlock_shard(address);
+    let Some(_) = read_pthread_slot(address) else {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    };
+    if resolve_rwlock(address, false).is_some() {
+        return u64::from(libc::EBUSY.cast_unsigned());
+    }
+    let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
+    if guest_object == 0 {
+        return sce_kernel_try_again();
+    }
+    let shard = rwlock_shard(guest_object);
     let mut locks = shard
         .locks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if locks.contains_key(&address) {
-        return u64::from(libc::EBUSY.cast_unsigned());
-    }
-    locks.insert(address, Arc::new(GuestRwlockEntry::default()));
+    locks.insert(
+        guest_object,
+        Arc::new(GuestRwlockEntry::new(guest_object, address)),
+    );
+    drop(locks);
+    write_guest_u64(address, guest_object);
     0
 }
 
-pub(crate) fn guest_rwlock_destroy(address: u64) -> u64 {
-    if address == 0 {
-        return u64::from(libc::EINVAL.cast_unsigned());
-    }
-    let shard = rwlock_shard(address);
+fn sce_kernel_try_again() -> u64 {
+    // Keep rwlock errno style (raw errno) consistent with the rest of this module.
+    let _ = SCE_KERNEL_ERROR_TRY_AGAIN;
+    u64::from(libc::EAGAIN.cast_unsigned())
+}
+
+fn destroy_resolved_rwlock(entry: Arc<GuestRwlockEntry>, passed_arg: u64) -> u64 {
+    let guest_object = entry.guest_object;
+    let storage_address = entry.storage_address;
+    let shard = rwlock_shard(guest_object);
     let mut locks = shard
         .locks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(entry) = locks.get(&address).cloned() else {
+    let Some(stored) = locks.get(&guest_object).cloned() else {
         return u64::from(libc::EINVAL.cast_unsigned());
     };
-    let lock = entry
+    if !Arc::ptr_eq(&entry, &stored) {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    let lock = stored
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -74,15 +138,39 @@ pub(crate) fn guest_rwlock_destroy(address: u64) -> u64 {
         return u64::from(libc::EBUSY.cast_unsigned());
     }
     drop(lock);
-    locks.remove(&address);
+    locks.remove(&guest_object);
+    drop(locks);
+    if storage_address != 0 {
+        write_guest_u64(storage_address, 0);
+    }
+    if passed_arg != 0
+        && passed_arg != guest_object
+        && passed_arg != storage_address
+        && read_pthread_slot(passed_arg) == Some(guest_object)
+    {
+        write_guest_u64(passed_arg, 0);
+    }
+    guest_free(guest_object);
     0
+}
+
+pub(crate) fn guest_rwlock_destroy(address: u64) -> u64 {
+    if address == 0 {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    }
+    let Some(entry) = resolve_rwlock(address, false) else {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    };
+    destroy_resolved_rwlock(entry, address)
 }
 
 pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u64 {
     if address == 0 {
         return u64::from(libc::EINVAL.cast_unsigned());
     }
-    let entry = lookup_or_insert_rwlock(address);
+    let Some(entry) = resolve_rwlock(address, true) else {
+        return u64::from(libc::EINVAL.cast_unsigned());
+    };
     let current = std::thread::current().id();
     let mut lock = entry
         .state
@@ -119,10 +207,11 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
                 if wait_result.timed_out() && !stall_reported {
                     stall_reported = true;
                     eprintln!(
-                        "[REMu][STALL] rwlock write wait exceeded {}s thread={:?} handle={:#x} rwlock={address:#x} writer={:?} readers={} reader_threads={} waiting_readers={} waiting_writers={}",
+                        "[REMu][STALL] rwlock write wait exceeded {}s thread={:?} handle={:#x} rwlock={address:#x} object={:#x} writer={:?} readers={} reader_threads={} waiting_readers={} waiting_writers={}",
                         report_after.as_secs(),
                         current_guest_thread_name(),
                         current_guest_thread_handle(),
+                        entry.guest_object,
                         lock.writer,
                         lock.reader_total,
                         lock.readers.len(),
@@ -169,10 +258,11 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
             if wait_result.timed_out() && !stall_reported {
                 stall_reported = true;
                 eprintln!(
-                    "[REMu][STALL] rwlock read wait exceeded {}s thread={:?} handle={:#x} rwlock={address:#x} writer={:?} readers={} reader_threads={} waiting_readers={} waiting_writers={}",
+                    "[REMu][STALL] rwlock read wait exceeded {}s thread={:?} handle={:#x} rwlock={address:#x} object={:#x} writer={:?} readers={} reader_threads={} waiting_readers={} waiting_writers={}",
                     report_after.as_secs(),
                     current_guest_thread_name(),
                     current_guest_thread_handle(),
+                    entry.guest_object,
                     lock.writer,
                     lock.reader_total,
                     lock.readers.len(),
@@ -190,7 +280,7 @@ pub(crate) fn guest_rwlock_lock(address: u64, write: bool, try_only: bool) -> u6
 }
 
 pub(crate) fn guest_rwlock_unlock(address: u64) -> u64 {
-    let Some(entry) = lookup_rwlock(address) else {
+    let Some(entry) = resolve_rwlock(address, false) else {
         return u64::from(libc::EINVAL.cast_unsigned());
     };
     let current = std::thread::current().id();
@@ -222,7 +312,7 @@ pub(crate) fn guest_rwlock_unlock(address: u64) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn guest_rwlock_waiter_counts(address: u64) -> Option<(u32, u32)> {
-    let entry = lookup_rwlock(address)?;
+    let entry = resolve_rwlock(address, false)?;
     let lock = entry
         .state
         .lock()

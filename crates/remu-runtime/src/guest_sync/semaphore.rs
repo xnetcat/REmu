@@ -9,7 +9,7 @@ use crate::{
     SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_TIMED_OUT, assert_wait_is_off_the_dispatch_lock,
     current_guest_thread_handle, guest_exception_is_pending, low_i32, low_u32, read_guest_cstring,
     read_guest_u32, sce_kernel_error, trace_guest_sync, trace_logarithmic_sequence,
-    write_guest_u32,
+    write_guest_u32, write_guest_u64,
 };
 
 use super::guest_sync;
@@ -57,7 +57,9 @@ pub(super) fn guest_semaphore_create(arguments: [u64; 6]) -> u64 {
             wake: Condvar::new(),
         }),
     );
-    write_guest_u32(output, handle);
+    // `SceKernelSema` is a pointer typedef (`struct _SceKernelSema*`); create writes the full
+    // pointer-sized slot. The host id is a zero-extended u32 handle value.
+    write_guest_u64(output, u64::from(handle));
     if trace_guest_sync() {
         eprintln!(
             "[REMu][SEMA] create handle={handle} name={:?} initial={initial} maximum={maximum}",

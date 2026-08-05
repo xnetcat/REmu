@@ -2,132 +2,167 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, Once};
 
-use remu_shader::GuestMemoryReader;
-
 use crate::{
-    ProcessGuestMemory, PthreadMutexAttrState, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
-    SCE_KERNEL_ERROR_NOT_FOUND, SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED,
-    SCE_KERNEL_ERROR_TRY_AGAIN, assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle,
-    current_guest_thread_name, guest_calloc, guest_free, read_guest_u32, sce_kernel_error,
-    stall_report_interval, trace_guest_sync, trace_logarithmic_sequence, write_guest_u32,
-    write_guest_u64,
+    PthreadMutexAttrState, SCE_KERNEL_ERROR_INVALID_ARGUMENT, SCE_KERNEL_ERROR_NOT_FOUND,
+    SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED, SCE_KERNEL_ERROR_TRY_AGAIN,
+    assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle, current_guest_thread_name,
+    guest_calloc, guest_free, read_guest_u32, sce_kernel_error, stall_report_interval,
+    trace_guest_sync, trace_logarithmic_sequence, write_guest_u32, write_guest_u64,
 };
 
-use super::state::guest_mutex_object_index;
-use super::{
+use super::identity::{
+    GUEST_PTHREAD_OBJECT_SIZE, PTHREAD_ADAPTIVE_MUTEX_INITIALIZER, PthreadSlotValue,
+    classify_mutex_slot_value, read_pthread_slot,
+};
+use super::state::{
     GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
     guest_mutex_shards, guest_sync,
 };
 
 const GUEST_MUTEX_ENTRY_CACHE_SIZE: usize = 16;
+const GUEST_MUTEX_TYPE_OFFSET: u64 = 0x20;
+const GUEST_MUTEX_PROTOCOL_OFFSET: u64 = 0x3c;
 
 #[cfg(test)]
 pub(crate) static GUEST_MUTEX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// How many host mutex entries were created on first lock/trylock without a prior
-/// `scePthreadMutexInit` — the handle-copy detector from CORE-MECHANISMS §3.
-static LAZILY_FABRICATED_MUTEXES: AtomicU64 = AtomicU64::new(0);
-
-/// Returns the number of lazily fabricated mutex entries this process has created.
-pub(crate) fn lazily_fabricated_mutex_count() -> u64 {
-    LAZILY_FABRICATED_MUTEXES.load(Ordering::Relaxed)
-}
-
 thread_local! {
-    /// Per-host-thread cache for the guest mutexes that thread is actively using.
-    ///
-    /// Unreal's lock/unlock leaf imports otherwise acquire a shard mutex and hash the address on
-    /// every uncontended operation. Entries carry an independently synchronized lifecycle bit,
-    /// so retaining an `Arc` here cannot keep a destroyed generation logically alive.
+    /// Per-host-thread cache keyed by control-block handle (SDK identity), not by slot address.
     static GUEST_MUTEX_ENTRY_CACHE: RefCell<
         [Option<(u64, Arc<GuestMutexEntry>)>; GUEST_MUTEX_ENTRY_CACHE_SIZE]
     > = const { RefCell::new([const { None }; GUEST_MUTEX_ENTRY_CACHE_SIZE]) };
 }
 
-fn guest_mutex_cache_index(address: u64) -> usize {
-    usize::try_from(address >> 4).unwrap_or_default() & (GUEST_MUTEX_ENTRY_CACHE_SIZE - 1)
+fn guest_mutex_cache_index(handle: u64) -> usize {
+    usize::try_from(handle >> 4).unwrap_or_default() & (GUEST_MUTEX_ENTRY_CACHE_SIZE - 1)
 }
 
-fn cached_guest_mutex_entry(address: u64) -> Option<Arc<GuestMutexEntry>> {
+fn cached_guest_mutex_entry(handle: u64) -> Option<Arc<GuestMutexEntry>> {
     GUEST_MUTEX_ENTRY_CACHE.with_borrow(|cache| {
-        cache[guest_mutex_cache_index(address)]
+        cache[guest_mutex_cache_index(handle)]
             .as_ref()
-            .filter(|(cached_address, entry)| {
-                *cached_address == address && entry.active.load(Ordering::Acquire)
+            .filter(|(cached_handle, entry)| {
+                *cached_handle == handle && entry.active.load(Ordering::Acquire)
             })
             .map(|(_, entry)| entry.clone())
     })
 }
 
-fn cache_guest_mutex_entry(address: u64, entry: &Arc<GuestMutexEntry>) {
+fn cache_guest_mutex_entry(handle: u64, entry: &Arc<GuestMutexEntry>) {
     static LOGGED: Once = Once::new();
     LOGGED.call_once(|| {
         eprintln!(
             "[REMu][PTHREAD] mutex lookup cache enabled slots={GUEST_MUTEX_ENTRY_CACHE_SIZE} \
-             uncontended-wake-elision=true"
+             identity=control-block-handle uncontended-wake-elision=true"
         );
     });
     GUEST_MUTEX_ENTRY_CACHE.with_borrow_mut(|cache| {
-        cache[guest_mutex_cache_index(address)] = Some((address, entry.clone()));
+        cache[guest_mutex_cache_index(handle)] = Some((handle, entry.clone()));
     });
 }
 
-pub(crate) fn guest_mutex_entry(address: u64, create: bool) -> Option<Arc<GuestMutexEntry>> {
-    if let Some(entry) = cached_guest_mutex_entry(address) {
-        return Some(entry);
-    }
-    let shard = guest_mutex_shards()[guest_mutex_shard(address)]
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = shard.get(&address) {
-        let entry = entry.clone();
-        cache_guest_mutex_entry(address, &entry);
-        return Some(entry);
-    }
-    drop(shard);
-    // Secondary index: guest_object → storage address (plan C3). Replaces the 64-shard linear scan.
-    if let Some(storage) = guest_mutex_object_index()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&address)
-        .copied()
-    {
-        let shard = guest_mutex_shards()[guest_mutex_shard(storage)]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = shard.get(&storage) {
-            let entry = entry.clone();
-            cache_guest_mutex_entry(address, &entry);
-            return Some(entry);
-        }
-    }
-    if !create {
+fn lookup_mutex_by_handle(handle: u64) -> Option<Arc<GuestMutexEntry>> {
+    if handle == 0 || handle == PTHREAD_ADAPTIVE_MUTEX_INITIALIZER {
         return None;
     }
-    let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(entry) = shard.get(&address) {
-        let entry = entry.clone();
-        cache_guest_mutex_entry(address, &entry);
+    if let Some(entry) = cached_guest_mutex_entry(handle) {
         return Some(entry);
     }
-    create.then(|| {
-        LAZILY_FABRICATED_MUTEXES.fetch_add(1, Ordering::Relaxed);
-        let entry = Arc::new(GuestMutexEntry {
-            state: Mutex::new(GuestMutexState::default()),
-            wake: Condvar::new(),
-            active: AtomicBool::new(true),
-            storage_address: address,
-            guest_object: 0,
-        });
-        shard.insert(address, entry.clone());
-        cache_guest_mutex_entry(address, &entry);
-        entry
-    })
+    let shard = guest_mutex_shards()[guest_mutex_shard(handle)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = shard.get(&handle)?.clone();
+    cache_guest_mutex_entry(handle, &entry);
+    Some(entry)
+}
+
+/// Resolve a `ScePthreadMutex *` argument to its host entry via the SDK pointer-typedef ABI.
+///
+/// Order (matches libc / stack-copy titles):
+/// 1. `arg` is itself a published control-block handle (bare-handle call sites).
+/// 2. `*arg` is a published control-block handle (normal slot or stack copy of the handle).
+/// 3. `*arg` is a static initializer → materialize a control block into the slot.
+///
+/// Unknown non-initializer values refuse; there is no create-on-first-use fabrication.
+pub(crate) fn guest_mutex_entry(address: u64, allow_static_init: bool) -> Option<Arc<GuestMutexEntry>> {
+    if address == 0 {
+        return None;
+    }
+    if let Some(entry) = lookup_mutex_by_handle(address) {
+        return Some(entry);
+    }
+    let slot_value = read_pthread_slot(address)?;
+    match classify_mutex_slot_value(slot_value) {
+        PthreadSlotValue::ControlBlock(handle) => lookup_mutex_by_handle(handle),
+        PthreadSlotValue::StaticDefault if allow_static_init => {
+            materialize_static_mutex(address, PthreadMutexAttrState::default())
+        }
+        PthreadSlotValue::StaticAdaptiveMutex if allow_static_init => {
+            materialize_static_mutex(
+                address,
+                PthreadMutexAttrState {
+                    mutex_type: 4,
+                    ..PthreadMutexAttrState::default()
+                },
+            )
+        }
+        PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => None,
+    }
+}
+
+/// Publish a control block for a static-initializer slot. Races re-read the slot and adopt the
+/// winner's handle rather than fabricating a second object for the same guest mutex.
+fn materialize_static_mutex(
+    slot: u64,
+    attributes: PthreadMutexAttrState,
+) -> Option<Arc<GuestMutexEntry>> {
+    // Serialize static materialization so two first-lock threads cannot both publish.
+    let sync = guest_sync();
+    let _init_gate = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = lookup_mutex_by_handle(slot) {
+        return Some(entry);
+    }
+    let slot_value = read_pthread_slot(slot)?;
+    match classify_mutex_slot_value(slot_value) {
+        PthreadSlotValue::ControlBlock(handle) => lookup_mutex_by_handle(handle),
+        PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => {
+            let guest_object = allocate_guest_mutex_object(attributes).ok()?;
+            let entry = insert_mutex_entry(slot, guest_object, attributes);
+            write_guest_u64(slot, guest_object);
+            Some(entry)
+        }
+    }
+}
+
+fn insert_mutex_entry(
+    storage_address: u64,
+    guest_object: u64,
+    attributes: PthreadMutexAttrState,
+) -> Arc<GuestMutexEntry> {
+    let entry = Arc::new(GuestMutexEntry {
+        state: Mutex::new(GuestMutexState {
+            mutex_type: attributes.mutex_type,
+            ..GuestMutexState::default()
+        }),
+        wake: Condvar::new(),
+        active: AtomicBool::new(true),
+        storage_address,
+        guest_object,
+    });
+    let mut shard = guest_mutex_shards()[guest_mutex_shard(guest_object)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shard.insert(guest_object, entry.clone());
+    cache_guest_mutex_entry(guest_object, &entry);
+    entry
 }
 
 pub(crate) fn guest_pthread_once(control: u64, routine: u64) -> u64 {
@@ -182,71 +217,26 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let guest_object = match allocate_guest_mutex_object(address, attributes) {
+    let Some(_) = read_pthread_slot(address) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    // Re-init of a live mutex is invalid. A slot still holding a static initializer, or one that
+    // already points at a destroyed/unknown handle, may be (re)initialized.
+    // An already-published control block may not be re-initialized in place.
+    if guest_mutex_entry(address, false).is_some() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let guest_object = match allocate_guest_mutex_object(attributes) {
         Ok(object) => object,
         Err(error) => return error,
     };
-    let mut shard = guest_mutex_shards()[guest_mutex_shard(address)]
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = shard.get(&address).cloned() {
-        let mutex = existing
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A prior lock/trylock can auto-create the host entry before scePthreadMutexInit runs.
-        // Replace that placeholder when it is idle; reject a live mutex the way Orbis does.
-        if mutex.owner.is_some() || mutex.waiters != 0 {
-            if guest_object != 0 {
-                guest_free(guest_object);
-            }
-            return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-        }
-        existing.active.store(false, Ordering::Release);
-        drop(mutex);
-        if let Some(removed) = shard.remove(&address)
-            && removed.guest_object != 0
-        {
-            guest_free(removed.guest_object);
-        }
-    }
-    let entry = Arc::new(GuestMutexEntry {
-        state: Mutex::new(GuestMutexState {
-            mutex_type: attributes.mutex_type,
-            ..GuestMutexState::default()
-        }),
-        wake: Condvar::new(),
-        active: AtomicBool::new(true),
-        storage_address: address,
-        guest_object,
-    });
-    shard.insert(address, entry.clone());
-    cache_guest_mutex_entry(address, &entry);
-    if guest_object != 0 {
-        write_guest_u64(address, guest_object);
-        guest_mutex_object_index()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(guest_object, address);
-    }
+    insert_mutex_entry(address, guest_object, attributes);
+    write_guest_u64(address, guest_object);
     0
 }
 
-pub(super) fn allocate_guest_mutex_object(
-    storage: u64,
-    attributes: PthreadMutexAttrState,
-) -> Result<u64, u64> {
-    let mut existing = [0_u8; 8];
-    if !ProcessGuestMemory.read(storage, &mut existing) {
-        // Synchronization unit tests also exercise deliberately synthetic, non-dereferenceable
-        // addresses. They only require the host-side ownership model; a real mapped guest mutex
-        // must always take the object-backed path above.
-        return Ok(0);
-    }
-    const GUEST_MUTEX_OBJECT_SIZE: u64 = 0x100;
-    const GUEST_MUTEX_TYPE_OFFSET: u64 = 0x20;
-    const GUEST_MUTEX_PROTOCOL_OFFSET: u64 = 0x3c;
-    let object = guest_calloc(1, GUEST_MUTEX_OBJECT_SIZE);
+fn allocate_guest_mutex_object(attributes: PthreadMutexAttrState) -> Result<u64, u64> {
+    let object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
     if object == 0 {
         return Err(sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN));
     }
@@ -261,18 +251,13 @@ pub(super) fn allocate_guest_mutex_object(
     Ok(object)
 }
 
-pub(crate) fn guest_mutex_destroy(address: u64) -> u64 {
-    if address == 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
-    let Some(entry) = guest_mutex_entry(address, false) else {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    };
+fn destroy_resolved_mutex(entry: Arc<GuestMutexEntry>, passed_arg: u64) -> u64 {
+    let guest_object = entry.guest_object;
     let storage_address = entry.storage_address;
-    let mut shard = guest_mutex_shards()[guest_mutex_shard(storage_address)]
+    let mut shard = guest_mutex_shards()[guest_mutex_shard(guest_object)]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(stored_entry) = shard.get(&storage_address).cloned() else {
+    let Some(stored_entry) = shard.get(&guest_object).cloned() else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     };
     if !Arc::ptr_eq(&entry, &stored_entry) {
@@ -288,19 +273,32 @@ pub(crate) fn guest_mutex_destroy(address: u64) -> u64 {
     stored_entry.active.store(false, Ordering::Release);
     drop(mutex);
     let entry = shard
-        .remove(&storage_address)
+        .remove(&guest_object)
         .expect("the mutex entry checked above remains in its shard");
-    let guest_object = entry.guest_object;
     drop(shard);
-    if guest_object != 0 {
-        guest_mutex_object_index()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&guest_object);
+    if storage_address != 0 {
         write_guest_u64(storage_address, 0);
-        guest_free(guest_object);
     }
+    // Zero the slot the guest passed when it is a distinct handle-copy of the same object.
+    if passed_arg != 0
+        && passed_arg != guest_object
+        && passed_arg != storage_address
+        && read_pthread_slot(passed_arg) == Some(guest_object)
+    {
+        write_guest_u64(passed_arg, 0);
+    }
+    guest_free(entry.guest_object);
     0
+}
+
+pub(crate) fn guest_mutex_destroy(address: u64) -> u64 {
+    if address == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let Some(entry) = guest_mutex_entry(address, false) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    };
+    destroy_resolved_mutex(entry, address)
 }
 
 pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
@@ -310,8 +308,15 @@ pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
     let current = std::thread::current().id();
     let guest_thread = current_guest_thread_handle();
     'resolve: loop {
+        // Static initializers materialize here; unknown handles refuse (no phantom entries).
         let Some(entry) = guest_mutex_entry(address, true) else {
-            return u64::MAX;
+            eprintln!(
+                "[REMu][MUTEX] refused lock of unknown mutex thread={:?} handle={guest_thread:#x} \
+                 mutex={address:#x} slot={:?}",
+                current_guest_thread_name(),
+                read_pthread_slot(address),
+            );
+            return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
         };
         let mut mutex = entry
             .state
@@ -351,9 +356,10 @@ pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
                     if trace_guest_sync() && trace_logarithmic_sequence(contention_sequence, 8) {
                         eprintln!(
                             "[REMu][MUTEX] contention sequence={contention_sequence} thread={:?} \
-                         handle={guest_thread:#x} mutex={address:#x} type={} owner={:#x} \
+                         handle={guest_thread:#x} mutex={address:#x} object={:#x} type={} owner={:#x} \
                          recursion={} waiters={}",
                             current_guest_thread_name(),
+                            entry.guest_object,
                             mutex.mutex_type,
                             mutex.owner_guest_thread,
                             mutex.recursion,
@@ -370,10 +376,11 @@ pub(crate) fn guest_mutex_lock(address: u64, try_only: bool) -> u64 {
                             reported_stall = true;
                             eprintln!(
                                 "[REMu][STALL] mutex lock exceeded {}s thread={:?} \
-                             handle={guest_thread:#x} mutex={address:#x} \
+                             handle={guest_thread:#x} mutex={address:#x} object={:#x} \
                              owner={:#x} recursion={} waiters={}",
                                 report_after.as_secs(),
                                 current_guest_thread_name(),
+                                entry.guest_object,
                                 mutex.owner_guest_thread,
                                 mutex.recursion,
                                 mutex.waiters,
@@ -397,9 +404,10 @@ pub(crate) fn guest_mutex_unlock(address: u64) -> u64 {
     loop {
         let Some(entry) = guest_mutex_entry(address, false) else {
             eprintln!(
-                "[REMu][MUTEX] rejected unlock of unknown mutex thread={:?} handle={:#x} mutex={address:#x}",
+                "[REMu][MUTEX] rejected unlock of unknown mutex thread={:?} handle={:#x} mutex={address:#x} slot={:?}",
                 current_guest_thread_name(),
                 current_guest_thread_handle(),
+                read_pthread_slot(address),
             );
             return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
         };
@@ -412,9 +420,10 @@ pub(crate) fn guest_mutex_unlock(address: u64) -> u64 {
         }
         if !mutex.owner.as_ref().is_some_and(|owner| *owner == current) {
             eprintln!(
-                "[REMu][MUTEX] rejected non-owner unlock thread={:?} handle={:#x} mutex={address:#x} owner={:#x}",
+                "[REMu][MUTEX] rejected non-owner unlock thread={:?} handle={:#x} mutex={address:#x} object={:#x} owner={:#x}",
                 current_guest_thread_name(),
                 current_guest_thread_handle(),
+                entry.guest_object,
                 mutex.owner_guest_thread,
             );
             return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);

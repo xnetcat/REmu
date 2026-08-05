@@ -7,24 +7,131 @@ use std::time::{Duration, Instant};
 
 use crate::{
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
-    SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED, SCE_KERNEL_ERROR_TIMED_OUT, STALL_SNAPSHOT_EMITTED,
-    assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle, current_guest_thread_name,
-    guest_exception_is_pending, report_kernel_event_registrations, sce_kernel_error,
-    stall_break_enabled, stall_report_interval, trace_guest_sync, trace_logarithmic_sequence,
+    SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED, SCE_KERNEL_ERROR_TIMED_OUT, SCE_KERNEL_ERROR_TRY_AGAIN,
+    STALL_SNAPSHOT_EMITTED, assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle,
+    current_guest_thread_name, guest_calloc, guest_exception_is_pending, guest_free,
+    report_kernel_event_registrations, sce_kernel_error, stall_break_enabled,
+    stall_report_interval, trace_guest_sync, trace_logarithmic_sequence, write_guest_u64,
 };
 
+use super::identity::{
+    GUEST_PTHREAD_OBJECT_SIZE, PthreadSlotValue, classify_pthread_slot_value, read_pthread_slot,
+};
 use super::state::GuestConditionEntry;
 use super::{guest_mutex_entry, guest_sync};
+
+fn lookup_condition_by_handle(handle: u64) -> Option<Arc<GuestConditionEntry>> {
+    if handle == 0 {
+        return None;
+    }
+    let sync = guest_sync();
+    let state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.condition_by_handle(handle)
+}
+
+/// Resolve a `ScePthreadCond *` argument to its host entry (SDK pointer-typedef identity).
+fn resolve_condition(address: u64, allow_static_init: bool) -> Option<Arc<GuestConditionEntry>> {
+    if address == 0 {
+        return None;
+    }
+    if let Some(entry) = lookup_condition_by_handle(address) {
+        return Some(entry);
+    }
+    let slot_value = read_pthread_slot(address)?;
+    match classify_pthread_slot_value(slot_value) {
+        PthreadSlotValue::ControlBlock(handle) => lookup_condition_by_handle(handle),
+        PthreadSlotValue::StaticDefault if allow_static_init => materialize_static_condition(address),
+        PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => None,
+    }
+}
+
+fn materialize_static_condition(slot: u64) -> Option<Arc<GuestConditionEntry>> {
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = state.condition_by_handle(slot) {
+        return Some(entry);
+    }
+    let slot_value = read_pthread_slot(slot)?;
+    match classify_pthread_slot_value(slot_value) {
+        PthreadSlotValue::ControlBlock(handle) => state.condition_by_handle(handle),
+        PthreadSlotValue::StaticDefault => {
+            let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
+            if guest_object == 0 {
+                return None;
+            }
+            let entry = state.insert_condition(guest_object, slot);
+            write_guest_u64(slot, guest_object);
+            Some(entry)
+        }
+        PthreadSlotValue::StaticAdaptiveMutex => unreachable!("cond slots do not use adaptive init"),
+    }
+}
 
 pub(crate) fn guest_condition_init(address: u64) -> u64 {
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    let Some(_) = read_pthread_slot(address) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if resolve_condition(address, false).is_some() {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
+    }
+    let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
+    if guest_object == 0 {
+        return sce_kernel_error(SCE_KERNEL_ERROR_TRY_AGAIN);
+    }
     let sync = guest_sync();
-    sync.0
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.insert_condition(guest_object, address);
+    write_guest_u64(address, guest_object);
+    0
+}
+
+fn destroy_resolved_condition(entry: Arc<GuestConditionEntry>, passed_arg: u64) -> u64 {
+    let guest_object = entry.guest_object;
+    let storage_address = entry.storage_address;
+    let sync = guest_sync();
+    let mut state = sync
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(stored) = state.conditions.get(&guest_object).cloned() else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    if !Arc::ptr_eq(&entry, &stored) {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    }
+    let idle = stored
+        .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .condition_entry(address);
+        .is_idle();
+    if !idle {
+        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
+    }
+    state.conditions.remove(&guest_object);
+    drop(state);
+    if storage_address != 0 {
+        write_guest_u64(storage_address, 0);
+    }
+    if passed_arg != 0
+        && passed_arg != guest_object
+        && passed_arg != storage_address
+        && read_pthread_slot(passed_arg) == Some(guest_object)
+    {
+        write_guest_u64(passed_arg, 0);
+    }
+    guest_free(guest_object);
     0
 }
 
@@ -32,26 +139,10 @@ pub(crate) fn guest_condition_destroy(address: u64) -> u64 {
     if address == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let sync = guest_sync();
-    let mut state = sync
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match state.conditions.get(&address) {
-        Some(entry) => {
-            let idle = entry
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_idle();
-            if !idle {
-                return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
-            }
-            state.conditions.remove(&address);
-            0
-        }
-        None => sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT),
-    }
+    let Some(entry) = resolve_condition(address, false) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    destroy_resolved_condition(entry, address)
 }
 
 #[cfg(test)]
@@ -80,6 +171,7 @@ where
     let Some(mutex_entry) = guest_mutex_entry(mutex_address, false) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
     };
+    let mutex_identity = mutex_entry.guest_object;
     let mut mutex = mutex_entry
         .state
         .lock()
@@ -89,22 +181,24 @@ where
     } else {
         return sce_kernel_error(SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
     };
+    let Some(cond_entry) = resolve_condition(condition, true) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
+    let condition_handle = cond_entry.guest_object;
     let (waiter, entry) = {
         let mut state = sync
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(waiter) = state.register_condition_waiter(condition, mutex_address) else {
+        let Some(waiter) = state.register_condition_waiter(condition_handle, mutex_identity) else {
             return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
         };
         let entry = state
-            .conditions
-            .get(&condition)
-            .cloned()
-            .expect("register_condition_waiter inserts the condition entry");
+            .condition_by_handle(condition_handle)
+            .expect("register_condition_waiter requires a live condition entry");
         if trace_guest_sync() && trace_logarithmic_sequence(waiter, 8) {
             eprintln!(
-                "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} mutex={mutex_address:#x} recursion={released_recursion} timeout_usec={timeout_usec:?}",
+                "[REMu][COND] wait ticket={waiter} thread={} condition={condition:#x} object={condition_handle:#x} mutex={mutex_address:#x} mutex_object={mutex_identity:#x} recursion={released_recursion} timeout_usec={timeout_usec:?}",
                 current_guest_thread_handle(),
             );
         }
@@ -266,7 +360,7 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.finish_condition_wait(
-            condition,
+            condition_handle,
             waiter,
             timed_out || interrupted || released_spuriously,
         );
@@ -315,13 +409,13 @@ fn emit_condition_stall_snapshot() {
     let mut summary: Vec<_> = state
         .conditions
         .iter()
-        .map(|(address, entry)| {
+        .map(|(handle, entry)| {
             let guest_condition = entry
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             (
-                *address,
+                *handle,
                 guest_condition.waiters.len(),
                 guest_condition.notifies,
                 guest_condition.timeouts,
@@ -335,9 +429,9 @@ fn emit_condition_stall_snapshot() {
             *notifies,
         )
     });
-    for (address, waiters, notifies, timeouts) in summary.iter().take(24) {
+    for (handle, waiters, notifies, timeouts) in summary.iter().take(24) {
         eprintln!(
-            "[REMu][STALL] condition={address:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}"
+            "[REMu][STALL] condition_object={handle:#x} waiters={waiters} notifies={notifies} timeouts={timeouts}"
         );
     }
     drop(state);
@@ -348,15 +442,17 @@ pub(crate) fn guest_condition_notify(condition: u64, broadcast: bool) -> u64 {
     if condition == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    let Some(entry) = resolve_condition(condition, true) else {
+        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    };
     let sync = guest_sync();
-    let (entry, selected, notify_sequence, pending_before) = {
+    let (selected, notify_sequence, pending_before) = {
         let mut state = sync
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.condition_notify_count = state.condition_notify_count.saturating_add(1);
         let notify_sequence = state.condition_notify_count;
-        let entry = state.condition_entry(condition);
         let mut guest_condition = entry
             .state
             .lock()
@@ -374,11 +470,12 @@ pub(crate) fn guest_condition_notify(condition: u64, broadcast: bool) -> u64 {
             }
         }
         drop(guest_condition);
-        (entry, selected, notify_sequence, pending_before)
+        (selected, notify_sequence, pending_before)
     };
     if trace_guest_sync() && trace_logarithmic_sequence(notify_sequence, 8) {
         eprintln!(
-            "[REMu][COND] notify sequence={notify_sequence} condition={condition:#x} broadcast={broadcast} pending={pending_before} selected={selected:?}"
+            "[REMu][COND] notify sequence={notify_sequence} condition={condition:#x} object={:#x} broadcast={broadcast} pending={pending_before} selected={selected:?}",
+            entry.guest_object
         );
     }
     if !selected.is_empty() {
