@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+mod fabricated_success;
+pub use fabricated_success::{
+    fabricated_success_counts, fabricated_success_total, note_inert,
+};
+
 mod channel;
 pub use channel::clear_thread_local_event_sink;
 pub use channel::{
@@ -14,7 +19,8 @@ pub use startup::{StartupMilestone, begin_startup_timeline, record_startup_miles
 
 mod display_timebase;
 pub use display_timebase::{
-    DisplayVblankSample, display_vblank_sample, monotonic_nanos, record_display_vblank,
+    DisplayMode, DisplayVblankSample, display_mode_label, display_vblank_sample, monotonic_nanos,
+    record_display_vblank, set_display_mode,
 };
 
 mod compute;
