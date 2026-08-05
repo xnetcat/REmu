@@ -1,14 +1,13 @@
-use iced_x86::{Decoder, DecoderOptions, FlowControl};
 use remu_core::GuestAddress;
 use remu_loader::LoadedExecutable;
 use remu_memory::{GUEST_EXECUTE, GUEST_READ, GUEST_WRITE, GuestImage};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::link::collect_initializer_array;
 use crate::link::fs_decode::{
-    collect_fs_decode_seed_addresses, report_fs_load_boundary_mismatches, seed_offsets_in_region,
-    seeded_fs_load_sites,
+    FsAccessKind, FsAccessSite, collect_fs_decode_seed_addresses, seed_offsets_in_region,
+    seeded_fs_access_sites,
 };
 use crate::unwind::collect_eh_frame_function_starts;
 use crate::{
@@ -43,13 +42,6 @@ const TLS_STORE_HELPER_SIZE_USIZE: usize = 192;
 const TLS_HELPER_SAVED_REGISTERS: [u8; 15] = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
 const TLS_IMMEDIATE_STORE_SIZE: usize = 12;
-
-#[derive(Clone, Copy)]
-struct TlsImmediateStore {
-    address: GuestAddress,
-    displacement: [u8; 4],
-    immediate: [u8; 4],
-}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct TlsImmediateStoreOffset {
@@ -89,12 +81,20 @@ pub(crate) fn install_tls_support(
     images: &[TlsImageInput<'_>],
     store_plan: &TlsStoreScanPlan,
 ) -> Result<GuestTls, LinkError> {
-    let tls_stores = collect_tls_immediate_stores(memory, images, store_plan)?;
     // Keep helpers beside the image so every rewritten load can use a five-byte rel32 call.
     let helper_base =
         memory.allocate_staging(TLS_HELPER_REGION_SIZE, 16, GUEST_READ | GUEST_EXECUTE)?;
-    let store_helper_size = u64::try_from(tls_stores.len())
-        .map_err(|_| LinkError::AddressOverflow)?
+    // Store-helper staging is sized from the preflight plan (upper bound). Seeded decode may find
+    // fewer sites; it must never find more than the reserved region.
+    let store_helper_capacity = store_plan
+        .images
+        .iter()
+        .try_fold(0_u64, |count, image| {
+            count
+                .checked_add(u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?)
+                .ok_or(LinkError::AddressOverflow)
+        })?;
+    let store_helper_size = store_helper_capacity
         .checked_mul(TLS_STORE_HELPER_SIZE)
         .ok_or(LinkError::AddressOverflow)?;
     let store_helper_base = if store_helper_size == 0 {
@@ -179,13 +179,13 @@ pub(crate) fn install_tls_support(
 
     write_tls_helpers(memory, helper_base)?;
     let decode_seeds = collect_tls_fs_decode_seeds(memory, images)?;
-    let patched_loads = patch_tls_loads_with_seeds(memory, helper_base, &decode_seeds)?;
-    let patched_stores = if let Some(store_helper_base) = store_helper_base {
-        write_tls_store_helpers(memory, store_helper_base, &tls_stores)?;
-        patch_tls_immediate_stores(memory, store_helper_base, &tls_stores)?
-    } else {
-        0
-    };
+    let (patched_loads, patched_stores) = patch_fs_accesses(
+        memory,
+        helper_base,
+        store_helper_base,
+        store_helper_capacity,
+        &decode_seeds,
+    )?;
     Ok(GuestTls {
         thread_pointer,
         static_block_size,
@@ -239,58 +239,40 @@ pub(crate) fn static_tls_offsets(
     Ok(offsets)
 }
 
+/// Preflight upper bound for per-site FS helper staging.
+///
+/// Counts executable-segment offsets that match the absolute `fs:[disp32]` forms the installer may
+/// emit per-site helpers for (`mov dword fs:[disp],imm32`, `mov r64,fs:[disp]`, `lea r64,fs:[disp]`).
+/// Install rediscovers sites via seeded decode and refuses if the seeded count exceeds this reserve.
 pub(crate) fn scan_tls_immediate_stores<'a>(
     executables: impl IntoIterator<Item = &'a LoadedExecutable>,
 ) -> Result<TlsStoreScanPlan, LinkError> {
     let mut images = Vec::new();
     for executable in executables {
-        let dynamic = executable
-            .info
-            .elf
-            .as_ref()
-            .and_then(|elf| elf.dynamic.as_ref())
-            .ok_or(LinkError::MissingDynamicMetadata)?;
         let mut image_stores = BTreeSet::new();
-        for symbol in dynamic.symbols.iter().filter(|symbol| {
-            !symbol.is_undefined() && symbol.symbol_type() == 2 && symbol.size != 0
-        }) {
-            let symbol_start = symbol.value.get();
-            let Some(symbol_end) = symbol_start.checked_add(symbol.size) else {
+        for (segment_index, segment) in executable.load_segments.iter().enumerate() {
+            if segment.flags & GUEST_EXECUTE == 0 {
                 continue;
-            };
-            let Some((segment_index, segment)) =
-                executable
-                    .load_segments
-                    .iter()
-                    .enumerate()
-                    .find(|(_, segment)| {
-                        if segment.flags & GUEST_EXECUTE == 0 {
-                            return false;
-                        }
-                        let segment_start = segment.virtual_address.get();
-                        let Ok(data_size) = u64::try_from(segment.data.len()) else {
-                            return false;
-                        };
-                        let Some(segment_end) = segment_start.checked_add(data_size) else {
-                            return false;
-                        };
-                        segment_start <= symbol_start && symbol_end <= segment_end
-                    })
-            else {
+            }
+            let data = &segment.data;
+            if data.len() < 9 {
                 continue;
-            };
-            let function_offset = usize::try_from(symbol_start - segment.virtual_address.get())
-                .map_err(|_| LinkError::ExecutableRegionTooLarge)?;
-            let function_size =
-                usize::try_from(symbol.size).map_err(|_| LinkError::ExecutableRegionTooLarge)?;
-            let function = &segment.data[function_offset..function_offset + function_size];
-            for relative_offset in reachable_tls_immediate_store_offsets(function, symbol_start) {
-                image_stores.insert(TlsImmediateStoreOffset {
-                    segment_index,
-                    byte_offset: function_offset
-                        .checked_add(relative_offset)
-                        .ok_or(LinkError::AddressOverflow)?,
-                });
+            }
+            for byte_offset in 0..data.len() {
+                let remaining = &data[byte_offset..];
+                if remaining.len() >= TLS_IMMEDIATE_STORE_SIZE
+                    && is_tls_immediate_store_encoding(&remaining[..TLS_IMMEDIATE_STORE_SIZE])
+                {
+                    image_stores.insert(TlsImmediateStoreOffset {
+                        segment_index,
+                        byte_offset,
+                    });
+                } else if remaining.len() >= 9 && is_absolute_fs_gpr_form(&remaining[..9]) {
+                    image_stores.insert(TlsImmediateStoreOffset {
+                        segment_index,
+                        byte_offset,
+                    });
+                }
             }
         }
         images.push(image_stores.into_iter().collect());
@@ -298,111 +280,38 @@ pub(crate) fn scan_tls_immediate_stores<'a>(
     Ok(TlsStoreScanPlan { images })
 }
 
-fn collect_tls_immediate_stores(
-    memory: &GuestImage,
-    images: &[TlsImageInput<'_>],
-    store_plan: &TlsStoreScanPlan,
-) -> Result<Vec<TlsImmediateStore>, LinkError> {
-    debug_assert_eq!(images.len(), store_plan.images.len());
-    let mut stores = Vec::new();
-    for (image, image_plan) in images.iter().zip(&store_plan.images) {
-        for store in image_plan {
-            let segment = &image.executable.load_segments[store.segment_index];
-            let address = add_address(
-                add_address(image.base, segment.virtual_address.get())?,
-                u64::try_from(store.byte_offset).map_err(|_| LinkError::AddressOverflow)?,
-            )?;
-            let mut encoding = [0_u8; TLS_IMMEDIATE_STORE_SIZE];
-            memory.read(address, &mut encoding)?;
-            if !is_tls_immediate_store_encoding(&encoding) {
-                continue;
-            }
-            stores.push(TlsImmediateStore {
-                address,
-                displacement: encoding[4..8]
-                    .try_into()
-                    .expect("fixed-width TLS displacement"),
-                immediate: encoding[8..12]
-                    .try_into()
-                    .expect("fixed-width TLS immediate"),
-            });
-        }
-    }
-    Ok(stores)
-}
-
-fn reachable_tls_immediate_store_offsets(bytes: &[u8], virtual_address: u64) -> Vec<usize> {
-    let mut pending = VecDeque::from([0_usize]);
-    let mut visited = BTreeSet::new();
-    let mut stores = Vec::new();
-    while let Some(mut offset) = pending.pop_front() {
-        while offset < bytes.len() && visited.insert(offset) {
-            let instruction_address =
-                virtual_address.saturating_add(u64::try_from(offset).unwrap_or(u64::MAX));
-            let mut decoder = Decoder::with_ip(
-                64,
-                &bytes[offset..],
-                instruction_address,
-                DecoderOptions::NONE,
-            );
-            let instruction = decoder.decode();
-            if instruction.is_invalid() || instruction.len() == 0 {
-                break;
-            }
-            let next = offset.saturating_add(instruction.len());
-            if next > bytes.len() {
-                break;
-            }
-            if instruction.len() == TLS_IMMEDIATE_STORE_SIZE
-                && is_tls_immediate_store_encoding(&bytes[offset..next])
-            {
-                stores.push(offset);
-            }
-            match instruction.flow_control() {
-                FlowControl::Next | FlowControl::Call | FlowControl::IndirectCall => {
-                    offset = next;
-                }
-                FlowControl::ConditionalBranch => {
-                    if let Some(target) = function_relative_target(
-                        instruction.near_branch_target(),
-                        virtual_address,
-                        bytes.len(),
-                    ) {
-                        pending.push_back(target);
-                    }
-                    offset = next;
-                }
-                FlowControl::UnconditionalBranch => {
-                    if let Some(target) = function_relative_target(
-                        instruction.near_branch_target(),
-                        virtual_address,
-                        bytes.len(),
-                    ) {
-                        pending.push_back(target);
-                    }
-                    break;
-                }
-                FlowControl::Return
-                | FlowControl::IndirectBranch
-                | FlowControl::Interrupt
-                | FlowControl::XbeginXabortXend
-                | FlowControl::Exception => break,
-            }
-        }
-    }
-    stores.sort_unstable();
-    stores.dedup();
-    stores
+/// `64 rex.w 8b/8d /r 25 disp32` — absolute `mov`/`lea` with an FS override.
+fn is_absolute_fs_gpr_form(bytes: &[u8]) -> bool {
+    bytes.len() >= 9
+        && bytes[0] == 0x64
+        && (0x48..=0x4f).contains(&bytes[1])
+        && bytes[1] & 0x08 != 0
+        && (bytes[2] == 0x8b || bytes[2] == 0x8d)
+        && bytes[3] & 0xc7 == 0x04
+        && bytes[4] == 0x25
 }
 
 fn is_tls_immediate_store_encoding(bytes: &[u8]) -> bool {
     bytes.len() == TLS_IMMEDIATE_STORE_SIZE && bytes[..4] == [0x64, 0xc7, 0x04, 0x25]
 }
 
-fn function_relative_target(target: u64, function_start: u64, length: usize) -> Option<usize> {
-    let offset = target.checked_sub(function_start)?;
-    let offset = usize::try_from(offset).ok()?;
-    (offset < length).then_some(offset)
+#[derive(Clone, Copy)]
+enum PerSiteFsHelper {
+    StoreImm {
+        displacement: [u8; 4],
+        immediate: [u8; 4],
+    },
+    /// `mov r64, fs:[disp]` with nonzero displacement — load `*(TP+disp)` into destination.
+    LoadDisp { destination: u8, displacement: i32 },
+    /// `lea rN, fs:[disp]` — write `TP+disp` into destination (never faults; must be AOT).
+    Lea { destination: u8, displacement: i32 },
+}
+
+#[derive(Clone, Copy)]
+struct SharedLoadPatch {
+    address: GuestAddress,
+    instruction_length: usize,
+    destination: u8,
 }
 
 fn seed_tls_thread_control(
@@ -522,28 +431,6 @@ fn encode_tls_load_helper(
     Ok(cursor)
 }
 
-fn write_tls_store_helpers(
-    memory: &mut GuestImage,
-    helper_base: GuestAddress,
-    stores: &[TlsImmediateStore],
-) -> Result<(), LinkError> {
-    let byte_count = stores
-        .len()
-        .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
-        .ok_or(LinkError::AddressOverflow)?;
-    let mut helpers = vec![0x90_u8; byte_count];
-    let dispatcher = tls_store_thread_pointer as *const () as usize as u64;
-    for (index, store) in stores.iter().enumerate() {
-        let offset = index
-            .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
-            .ok_or(LinkError::AddressOverflow)?;
-        let slot = &mut helpers[offset..offset + TLS_STORE_HELPER_SIZE_USIZE];
-        encode_tls_store_helper(slot, dispatcher, store.displacement, store.immediate);
-    }
-    memory.write(helper_base, &helpers)?;
-    Ok(())
-}
-
 /// Store-thunk entry: counts the hit then returns the guest TLS pointer (plan C4 measure-first).
 extern "C" fn tls_store_thread_pointer() -> u64 {
     TLS_STORE_THUNK_HITS.fetch_add(1, Ordering::Relaxed);
@@ -563,6 +450,74 @@ fn encode_tls_store_helper(
     slot[cursor + 6..cursor + 10].copy_from_slice(&immediate);
     cursor += 10;
     emit_tls_store_helper_epilogue(slot, cursor)
+}
+
+fn encode_per_site_fs_helper(slot: &mut [u8], dispatcher: u64, kind: PerSiteFsHelper) -> usize {
+    match kind {
+        PerSiteFsHelper::StoreImm {
+            displacement,
+            immediate,
+        } => encode_tls_store_helper(slot, dispatcher, displacement, immediate),
+        PerSiteFsHelper::LoadDisp {
+            destination,
+            displacement,
+        }
+        | PerSiteFsHelper::Lea {
+            destination,
+            displacement,
+        } => {
+            // Nine-byte `mov`/`lea` sites cannot fit a call-site red-zone lea; skip inside the
+            // helper (same contract as the shared load thunk) and return with `ret 128`.
+            let mut body = [0x90_u8; TLS_STORE_HELPER_SIZE_USIZE];
+            let mut cursor = 0;
+            body[cursor..cursor + 5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x80]);
+            cursor += 5;
+            let mut prologue = [0x90_u8; TLS_STORE_HELPER_SIZE_USIZE];
+            let prologue_len = emit_tls_store_helper_prologue(&mut prologue, dispatcher);
+            body[cursor..cursor + prologue_len].copy_from_slice(&prologue[..prologue_len]);
+            cursor += prologue_len;
+            match kind {
+                PerSiteFsHelper::LoadDisp { .. } => {
+                    // mov rax, qword ptr [rax+disp]
+                    body[cursor..cursor + 2].copy_from_slice(&[0x48, 0x8b]);
+                }
+                PerSiteFsHelper::Lea { .. } => {
+                    // lea rax, [rax+disp]
+                    body[cursor..cursor + 2].copy_from_slice(&[0x48, 0x8d]);
+                }
+                PerSiteFsHelper::StoreImm { .. } => unreachable!(),
+            }
+            body[cursor + 2] = 0x80;
+            body[cursor + 3..cursor + 7].copy_from_slice(&displacement.to_le_bytes());
+            cursor += 7;
+            cursor = write_destination_slot(&mut body, cursor, destination);
+            cursor = emit_tls_store_helper_epilogue(&mut body, cursor);
+            slot[..cursor].copy_from_slice(&body[..cursor]);
+            cursor
+        }
+    }
+}
+
+fn write_destination_slot(slot: &mut [u8], mut cursor: usize, destination: u8) -> usize {
+    if destination == 4 {
+        return cursor;
+    }
+    let Some(saved_index) = TLS_HELPER_SAVED_REGISTERS
+        .iter()
+        .position(|register| *register == destination)
+    else {
+        return cursor;
+    };
+    let saved_offset = (TLS_HELPER_SAVED_REGISTERS.len() - 1 - saved_index) * 8;
+    slot[cursor..cursor + 5].copy_from_slice(&[
+        0x48,
+        0x89,
+        0x44,
+        0x24,
+        saved_offset as u8,
+    ]);
+    cursor += 5;
+    cursor
 }
 
 fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
@@ -714,66 +669,212 @@ fn collect_tls_fs_decode_seeds(
     Ok(seeds.into_iter().collect())
 }
 
-fn patch_tls_loads_with_seeds(
+fn patch_fs_accesses(
     memory: &mut GuestImage,
-    helper_base: GuestAddress,
+    shared_helper_base: GuestAddress,
+    per_site_helper_base: Option<GuestAddress>,
+    per_site_capacity: u64,
     seeds: &[GuestAddress],
-) -> Result<usize, LinkError> {
+) -> Result<(usize, usize), LinkError> {
+    let sites = collect_seeded_fs_sites(memory, seeds)?;
+    let mut shared_loads = Vec::new();
+    let mut per_site = Vec::new();
+    let mut deferred = 0_usize;
+    for (address, site) in sites {
+        match site.kind {
+            FsAccessKind::LoadGpr {
+                destination,
+                width_bytes: 8,
+                displacement: 0,
+            } if destination != 4 && site.length >= 5 => {
+                shared_loads.push(SharedLoadPatch {
+                    address,
+                    instruction_length: site.length,
+                    destination,
+                });
+            }
+            FsAccessKind::LoadGpr {
+                destination,
+                width_bytes: 8,
+                displacement,
+            } if destination != 4 && displacement != 0 && site.length >= 5 => {
+                per_site.push((
+                    address,
+                    site.length,
+                    PerSiteFsHelper::LoadDisp {
+                        destination,
+                        displacement,
+                    },
+                ));
+            }
+            FsAccessKind::LeaGpr {
+                destination,
+                displacement,
+            } if destination != 4 && site.length >= 5 => {
+                per_site.push((
+                    address,
+                    site.length,
+                    PerSiteFsHelper::Lea {
+                        destination,
+                        displacement,
+                    },
+                ));
+            }
+            FsAccessKind::StoreImm {
+                width_bytes: 4,
+                displacement,
+                immediate,
+            } if site.length >= 10 => {
+                per_site.push((
+                    address,
+                    site.length,
+                    PerSiteFsHelper::StoreImm {
+                        displacement: displacement.to_le_bytes(),
+                        immediate: i32::try_from(immediate)
+                            .map_err(|_| LinkError::AddressOverflow)?
+                            .to_le_bytes(),
+                    },
+                ));
+            }
+            _ => deferred += 1,
+        }
+    }
+
+    let per_site_count = u64::try_from(per_site.len()).map_err(|_| LinkError::AddressOverflow)?;
+    if per_site_count > per_site_capacity {
+        return Err(LinkError::AddressOverflow);
+    }
+
+    for patch in &shared_loads {
+        let helper = add_address(
+            shared_helper_base,
+            u64::from(patch.destination) * TLS_LOAD_HELPER_SIZE,
+        )?;
+        patch_call_site(memory, patch.address, patch.instruction_length, helper)?;
+    }
+
+    let mut patched_stores = 0_usize;
+    if let Some(per_site_base) = per_site_helper_base {
+        let dispatcher = tls_store_thread_pointer as *const () as usize as u64;
+        let byte_count = per_site
+            .len()
+            .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
+            .ok_or(LinkError::AddressOverflow)?;
+        let mut helpers = vec![0x90_u8; byte_count];
+        for (index, (_address, _length, kind)) in per_site.iter().enumerate() {
+            let offset = index
+                .checked_mul(TLS_STORE_HELPER_SIZE_USIZE)
+                .ok_or(LinkError::AddressOverflow)?;
+            let slot = &mut helpers[offset..offset + TLS_STORE_HELPER_SIZE_USIZE];
+            encode_per_site_fs_helper(slot, dispatcher, *kind);
+        }
+        memory.write(per_site_base, &helpers)?;
+        for (index, (address, length, kind)) in per_site.iter().enumerate() {
+            let helper = add_address(
+                per_site_base,
+                u64::try_from(index)
+                    .map_err(|_| LinkError::AddressOverflow)?
+                    .checked_mul(TLS_STORE_HELPER_SIZE)
+                    .ok_or(LinkError::AddressOverflow)?,
+            )?;
+            match kind {
+                PerSiteFsHelper::StoreImm { .. } => {
+                    patch_red_zone_call_site(memory, *address, *length, helper)?;
+                    patched_stores += 1;
+                }
+                PerSiteFsHelper::LoadDisp { .. } | PerSiteFsHelper::Lea { .. } => {
+                    // Red-zone skip lives inside the helper; the site is a plain call.
+                    patch_call_site(memory, *address, *length, helper)?;
+                }
+            }
+        }
+    } else if !per_site.is_empty() {
+        return Err(LinkError::AddressOverflow);
+    }
+
+    let patched_loads = shared_loads.len()
+        + per_site
+            .iter()
+            .filter(|(_, _, kind)| {
+                matches!(
+                    kind,
+                    PerSiteFsHelper::LoadDisp { .. } | PerSiteFsHelper::Lea { .. }
+                )
+            })
+            .count();
+    eprintln!(
+        "[REMu][TLS][FS] decode-summary aot_loads={patched_loads} aot_stores={patched_stores} fault_backstop_sites={deferred}"
+    );
+    Ok((patched_loads, patched_stores))
+}
+
+fn collect_seeded_fs_sites(
+    memory: &GuestImage,
+    seeds: &[GuestAddress],
+) -> Result<Vec<(GuestAddress, FsAccessSite)>, LinkError> {
     let executable_regions = memory
         .regions()
         .iter()
-        .filter(|region| region.flags & GUEST_EXECUTE != 0 && region.file_size >= 9)
+        .filter(|region| region.flags & GUEST_EXECUTE != 0 && region.file_size >= 5)
         .copied()
         .collect::<Vec<_>>();
-    let mut patches = Vec::new();
-    let mut mismatch_total = 0_usize;
+    let mut sites = Vec::new();
     for region in executable_regions {
         let length =
             usize::try_from(region.file_size).map_err(|_| LinkError::ExecutableRegionTooLarge)?;
         let mut bytes = vec![0_u8; length];
         memory.read(region.start, &mut bytes)?;
         let region_seeds = seed_offsets_in_region(seeds, region.start, length);
-        let report = report_fs_load_boundary_mismatches(
-            "execute-region",
-            region.start.get(),
-            &bytes,
-            &region_seeds,
-        );
-        mismatch_total = mismatch_total.saturating_add(report.boundary_mismatches);
-        let (_boundaries, loads) = seeded_fs_load_sites(&bytes, &region_seeds);
-        for site in loads {
-            patches.push((
-                add_address(
-                    region.start,
-                    u64::try_from(site.offset).map_err(|_| LinkError::AddressOverflow)?,
-                )?,
-                site.destination,
-                site.length,
-            ));
+        let (_boundaries, decoded) = seeded_fs_access_sites(&bytes, &region_seeds);
+        for site in decoded {
+            let address = add_address(
+                region.start,
+                u64::try_from(site.offset).map_err(|_| LinkError::AddressOverflow)?,
+            )?;
+            sites.push((address, site));
         }
     }
-    if mismatch_total != 0 {
-        eprintln!(
-            "[REMu][TLS][FS] boundary-mismatch total={mismatch_total} — byte-scan hits rejected; only seeded-decode sites are rewritten"
-        );
-    }
+    Ok(sites)
+}
 
-    for (address, destination, instruction_length) in &patches {
-        let helper = add_address(helper_base, u64::from(*destination) * TLS_LOAD_HELPER_SIZE)?;
-        let next = address
-            .get()
-            .checked_add(5)
-            .ok_or(LinkError::AddressOverflow)?;
-        let displacement = i128::from(helper.get()) - i128::from(next);
-        let displacement =
-            i32::try_from(displacement).map_err(|_| LinkError::TlsHelperOutOfRange {
-                instruction: *address,
-                helper,
-            })?;
-        let replacement = encode_tls_load_patch(*instruction_length, displacement);
-        memory.write(*address, &replacement)?;
-    }
-    Ok(patches.len())
+fn patch_call_site(
+    memory: &mut GuestImage,
+    address: GuestAddress,
+    instruction_length: usize,
+    helper: GuestAddress,
+) -> Result<(), LinkError> {
+    let next = address
+        .get()
+        .checked_add(5)
+        .ok_or(LinkError::AddressOverflow)?;
+    let displacement = i128::from(helper.get()) - i128::from(next);
+    let displacement = i32::try_from(displacement).map_err(|_| LinkError::TlsHelperOutOfRange {
+        instruction: address,
+        helper,
+    })?;
+    let replacement = encode_tls_load_patch(instruction_length, displacement);
+    memory.write(address, &replacement)?;
+    Ok(())
+}
+
+fn patch_red_zone_call_site(
+    memory: &mut GuestImage,
+    address: GuestAddress,
+    instruction_length: usize,
+    helper: GuestAddress,
+) -> Result<(), LinkError> {
+    let next = address
+        .get()
+        .checked_add(10)
+        .ok_or(LinkError::AddressOverflow)?;
+    let displacement = i128::from(helper.get()) - i128::from(next);
+    let displacement = i32::try_from(displacement).map_err(|_| LinkError::TlsHelperOutOfRange {
+        instruction: address,
+        helper,
+    })?;
+    let replacement = encode_tls_store_patch(instruction_length, displacement);
+    memory.write(address, &replacement)?;
+    Ok(())
 }
 
 fn encode_tls_load_patch(instruction_length: usize, displacement: i32) -> Vec<u8> {
@@ -784,41 +885,9 @@ fn encode_tls_load_patch(instruction_length: usize, displacement: i32) -> Vec<u8
     replacement
 }
 
-fn patch_tls_immediate_stores(
-    memory: &mut GuestImage,
-    helper_base: GuestAddress,
-    stores: &[TlsImmediateStore],
-) -> Result<usize, LinkError> {
-    for (index, store) in stores.iter().enumerate() {
-        let helper = add_address(
-            helper_base,
-            u64::try_from(index)
-                .map_err(|_| LinkError::AddressOverflow)?
-                .checked_mul(TLS_STORE_HELPER_SIZE)
-                .ok_or(LinkError::AddressOverflow)?,
-        )?;
-        // Preserve leaf-function red-zone contents: move the guest stack below its 128-byte
-        // red zone without changing flags, then let RET 128 in the per-site helper restore RSP.
-        // The call ends at byte ten, leaving two bytes for padding in the original instruction.
-        let next = store
-            .address
-            .get()
-            .checked_add(10)
-            .ok_or(LinkError::AddressOverflow)?;
-        let displacement = i128::from(helper.get()) - i128::from(next);
-        let displacement =
-            i32::try_from(displacement).map_err(|_| LinkError::TlsHelperOutOfRange {
-                instruction: store.address,
-                helper,
-            })?;
-        let replacement = encode_tls_store_patch(displacement);
-        memory.write(store.address, &replacement)?;
-    }
-    Ok(stores.len())
-}
-
-fn encode_tls_store_patch(displacement: i32) -> [u8; TLS_IMMEDIATE_STORE_SIZE] {
-    let mut replacement = [0x90_u8; TLS_IMMEDIATE_STORE_SIZE];
+fn encode_tls_store_patch(instruction_length: usize, displacement: i32) -> Vec<u8> {
+    debug_assert!(instruction_length >= 10);
+    let mut replacement = vec![0x90_u8; instruction_length];
     replacement[..5].copy_from_slice(&[0x48, 0x8d, 0x64, 0x24, 0x80]); // lea rsp, [rsp-128]
     replacement[5] = 0xe8;
     replacement[6..10].copy_from_slice(&displacement.to_le_bytes());
@@ -832,34 +901,38 @@ mod tests {
     use super::{
         TLS_STORE_HELPER_SIZE_USIZE, TLS_STORE_THUNK_HITS, encode_tls_load_helper,
         encode_tls_load_patch, encode_tls_store_helper, encode_tls_store_patch,
-        reachable_tls_immediate_store_offsets,
+        is_tls_immediate_store_encoding,
     };
+    use crate::link::fs_decode::{FsAccessKind, seeded_fs_access_sites};
     use std::sync::atomic::Ordering;
 
     const STORE: [u8; 12] = [0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0];
 
     #[test]
-    fn tls_store_scanner_requires_reachable_function_code() {
+    fn seeded_decode_finds_reachable_fs_stores_and_rejects_embedded_data() {
         let mut reachable = vec![0x55, 0x48, 0x89, 0xe5];
         reachable.extend_from_slice(&STORE);
         reachable.push(0xc3);
-        assert_eq!(
-            reachable_tls_immediate_store_offsets(&reachable, 0x1000),
-            vec![4]
-        );
+        let stores = seeded_fs_access_sites(&reachable, &[0])
+            .1
+            .into_iter()
+            .filter(|site| matches!(site.kind, FsAccessKind::StoreImm { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(stores.len(), 1);
+        assert_eq!(stores[0].offset, 4);
 
+        // Branch over twelve bytes of store-shaped data: not an instruction boundary.
         let mut branch_over_embedded_data = vec![0xeb, 0x0c];
         branch_over_embedded_data.extend_from_slice(&STORE);
         branch_over_embedded_data.push(0xc3);
         assert!(
-            reachable_tls_immediate_store_offsets(&branch_over_embedded_data, 0x1000).is_empty()
+            seeded_fs_access_sites(&branch_over_embedded_data, &[0])
+                .1
+                .iter()
+                .all(|site| !matches!(site.kind, FsAccessKind::StoreImm { .. }))
         );
 
-        let mut redundant_prefix_instruction = vec![0x2e, 0x3e, 0x26];
-        redundant_prefix_instruction.extend_from_slice(&STORE);
-        assert!(
-            reachable_tls_immediate_store_offsets(&redundant_prefix_instruction, 0x1000).is_empty()
-        );
+        assert!(is_tls_immediate_store_encoding(&STORE));
     }
 
     #[test]
@@ -918,7 +991,7 @@ mod tests {
     #[test]
     fn tls_store_patch_preserves_the_guest_red_zone_without_changing_flags() {
         assert_eq!(
-            encode_tls_store_patch(0x1234_5678),
+            encode_tls_store_patch(12, 0x1234_5678),
             [
                 0x48, 0x8d, 0x64, 0x24, 0x80, 0xe8, 0x78, 0x56, 0x34, 0x12, 0x90, 0x90
             ]
