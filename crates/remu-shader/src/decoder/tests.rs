@@ -1774,6 +1774,9 @@ fn decodes_f64_and_16_bit_vector_compares_and_the_class_family() {
         (0xb8, "VCmpxClassF64"),
         (0xb9, "VCmpxLtU16"),
         (0xbe, "VCmpxGeU16"),
+        // SDK ISA: VOPC 0xEC is v_cmp_nle_f16 (not reserved). The 08-03 mega-batch committed a
+        // failing "raw" expectation for this word; fix the test, not the decoder.
+        (0xec, "VCmpNleF16"),
     ];
     for &(code, name) in cases {
         let word = 0x7c00_0000 | (code << 17) | (3 << 9) | 0x100 | 2;
@@ -1792,6 +1795,7 @@ fn decodes_f64_and_16_bit_vector_compares_and_the_class_family() {
 fn unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the_shader() {
     // Every family whose framing is fully determined by the encoding word keeps unknown opcodes
     // as typed Raw values: the whole-shader decode kill becomes a per-opcode backend gap.
+    // One-word encodings: the following dword is S_ENDPGM.
     let raw_words: &[(u32, RawOpcodeFamily, u16)] = &[
         (0xbe85_6903, RawOpcodeFamily::Sop1, 0x69), // reserved SOP1
         (0x9f94_0c0a, RawOpcodeFamily::Sop2, 0x3f), // reserved SOP2
@@ -1799,16 +1803,32 @@ fn unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the
         (0xbfaa_0000, RawOpcodeFamily::Sopp, 0x2a), // reserved SOPP hint space
         (0xbd85_0007, RawOpcodeFamily::Sopk, 0x1b), // reserved SOPK
         (0x7e00_d504, RawOpcodeFamily::Vop1, 0x6a), // reserved VOP1
-        (0x7dd8_0704, RawOpcodeFamily::Vopc, 0xec), // reserved VOPC
         (0x1a08_0704, RawOpcodeFamily::Vop2, 0x0d), // VOP2 space beyond the table
-        (0xd8f4_0000, RawOpcodeFamily::Ds, 0x3d),   // DS code outside the table
-        (0xdd04_8000, RawOpcodeFamily::Flat, 0x41), // GLOBAL code outside the table
     ];
     for &(word, family, code) in raw_words {
         let program = decode_program(0x1000, &[word, 0xbf81_0000])
             .unwrap_or_else(|error| panic!("raw fallback for {family:?}: {error}"));
         let instruction = &program.instructions[0];
         match instruction.opcode {
+            Opcode::Raw {
+                family: decoded_family,
+                code: decoded_code,
+            } => {
+                assert_eq!(decoded_family, family, "word 0x{word:08X}");
+                assert_eq!(decoded_code, code, "word 0x{word:08X}");
+            }
+            other => panic!("word 0x{word:08X} decoded as {other} instead of a raw opcode"),
+        }
+    }
+    // Two-word encodings need a payload dword before S_ENDPGM (0xEC was wrongly listed here as
+    // reserved VOPC; it is v_cmp_nle_f16 and is covered by the compare batch above).
+    for &(word, family, code) in &[
+        (0xd8f4_0000_u32, RawOpcodeFamily::Ds, 0x3d_u16), // DS code outside the table
+        (0xdd04_8000, RawOpcodeFamily::Flat, 0x41),       // GLOBAL code outside the table
+    ] {
+        let program = decode_program(0x1000, &[word, 0, 0xbf81_0000])
+            .unwrap_or_else(|error| panic!("raw fallback for {family:?}: {error}"));
+        match program.instructions[0].opcode {
             Opcode::Raw {
                 family: decoded_family,
                 code: decoded_code,

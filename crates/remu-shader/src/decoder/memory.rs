@@ -530,9 +530,13 @@ pub(crate) fn decode_global_memory(
     let scratch = opcode.starts_with("Scratch");
     let addtid = opcode.contains("Addtid");
     // ADDTID addressing carries no VADDR at all, and SCRATCH addresses are a single 32-bit
-    // offset (VADDR or the scalar offset register, never a pair). Only GLOBAL/FLAT with a null
-    // SADDR consume a 64-bit VADDR pair.
-    if !addtid && (!scratch || scalar_address.is_none()) {
+    // offset (VADDR when SADDR is NULL/0x7f, otherwise the scalar offset register — never both,
+    // never a pair). Only GLOBAL/FLAT with a null SADDR consume a 64-bit VADDR pair.
+    //
+    // The previous `(!scratch || scalar_address.is_none())` was a tautology for SCRATCH:
+    // `scalar_address` is only populated for GLOBAL, so SCRATCH always pushed VADDR even when
+    // SADDR named the offset register.
+    if !addtid && (!scratch || scalar_address_field == 0x7f) {
         sources.push(Operand::vector(vector_address));
     }
     if let Some(scalar_address) = scalar_address {
