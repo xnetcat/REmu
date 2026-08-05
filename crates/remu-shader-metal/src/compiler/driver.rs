@@ -142,7 +142,13 @@ impl<'a> Compiler<'a> {
             options.stage,
             MetalShaderStage::Vertex | MetalShaderStage::Mesh
         ) {
-            vertex_outputs.extend(0..options.required_vertex_output_count);
+            // Guest EXP PARAM targets already populated `vertex_outputs` above. Only a host-
+            // synthesized interface (procedural rectangle, layered cover) passes a required count
+            // without those exports — never pad missing NGG attributes with zero-initialized
+            // RemuVsOut fields.
+            if vertex_outputs.is_empty() && options.required_vertex_output_count > 0 {
+                vertex_outputs.extend(0..options.required_vertex_output_count);
+            }
         }
 
         let image_slots = evaluation.image_binding_slots();
@@ -454,6 +460,21 @@ impl<'a> Compiler<'a> {
                 if !self.is_threadgroup_stage() {
                     return Err(
                         "workgroup barriers cannot be represented by a Metal graphics stage"
+                            .to_owned(),
+                    );
+                }
+                // Metal requires uniform control flow for threadgroup_barrier. Structured if/while
+                // and the PC dispatcher can place this under divergent EXEC; SharpEmu documents
+                // that class of failure (whole-quad death). Only straight-line lowerings prove
+                // every lane reaches the barrier together.
+                if !matches!(
+                    self.control_flow,
+                    crate::compiler::control_flow::ControlFlowLowering::Direct(_)
+                        | crate::compiler::control_flow::ControlFlowLowering::Forward
+                ) {
+                    return Err(
+                        "S_BARRIER requires converged straight-line control flow; refusing \
+                         barrier under structured or dispatcher divergence"
                             .to_owned(),
                     );
                 }

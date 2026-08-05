@@ -689,7 +689,8 @@ pub(crate) fn procedural_rectangle_export_stage(program: &Program) -> bool {
 ///
 /// Real binaries are often a short live prefix (sometimes without a position EXP) followed by
 /// padded/undecoded tails. Rejecting on `Opcode::known_name() == None` missed every Poppy cover
-/// and left INTERFACE-FILL zeroes on scanout (mid-band noise).
+/// and previously left INTERFACE-FILL zeroes on scanout (mid-band noise). Phase 1E deletes that
+/// zero-fill; these covers must take the synthesized rectangle vertex path instead.
 pub(crate) fn truncated_memoryless_ngg_rectangle_cover(program: &Program) -> bool {
     let mut allocation_message = false;
     let mut primitive_export = false;

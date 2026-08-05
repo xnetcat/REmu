@@ -469,47 +469,33 @@ impl MetalPresenter {
                 &key.pixel_input_controls,
             );
             if !missing.is_empty() {
-                let samples = pixel_evaluation
-                    .image_bindings
-                    .iter()
-                    .filter(|binding| {
-                        binding.opcode.starts_with("ImageSample")
-                            || binding.opcode.starts_with("ImageGather")
-                    })
-                    .map(|binding| {
-                        (
-                            binding.pc,
-                            binding.opcode,
-                            binding.resource_descriptor.clone(),
-                            binding.sampler_descriptor.clone(),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let rectangle_coordinate_mask = uses_procedural_rectangle_stage.then(|| {
-                    rectangle_coordinate_parameter_mask(pixel_program, &key.pixel_input_controls)
-                });
-                // NGG shaders may stage parameter exports through LDS/primitive export rather
-                // than exposing a conventional EXP PARAM instruction in the decoded program.
-                // Metal still requires the vertex and fragment interfaces to match exactly.
-                // `required_vertex_output_count` below declares those physical locations and the
-                // zero-initialized RemuVsOut supplies deterministic values until NGG staging is
-                // lowered. Rejecting the pair here prevented even final scanout/composite draws
-                // from executing and guaranteed a permanently black display. This matches the
-                // other backend's established required-output behavior while keeping the missing
-                // semantics explicit in the trace.
-                eprintln!(
-                    "[REMu][METAL][INTERFACE-FILL] draw={} indexed={} count={} instances={} primitive={:#x} target={:#x} es={:#x} exports={exported_parameters:#010x} ps={:#x} interpolates={interpolated_attributes:#010x} missing logical/physical/control={missing:08x?} procedural={} coordinate_mask={rectangle_coordinate_mask:08x?} vertex_inputs={:x?} samples={samples:08x?}",
-                    draw.sequence,
-                    draw.indexed,
-                    draw.index_count,
-                    draw.instance_count,
-                    draw.primitive_type,
-                    draw.color_target_address,
-                    draw.export_shader_address,
-                    draw.pixel_shader_address,
-                    uses_procedural_rectangle_stage,
-                    export_evaluation.vertex_inputs,
-                );
+                // Procedural rectangle covers synthesize their UV/parameter interface in the
+                // host rectangle vertex stage. Every other missing SPI_PS_INPUT_CNTL → PARAM
+                // link is an unfinished NGG attribute path (LDS / compacted records / EXP PARAM):
+                // refuse loudly instead of declaring RemuVsOut slots and leaving them zero.
+                let rectangle_covers_missing = uses_procedural_rectangle_stage
+                    && rectangle_coordinate_parameter_mask(
+                        pixel_program,
+                        &key.pixel_input_controls,
+                    )
+                    .is_some_and(|mask| {
+                        missing
+                            .iter()
+                            .all(|&(_, physical, _)| mask & (1 << physical) != 0)
+                    });
+                if !rectangle_covers_missing && !uses_procedural_rectangle_stage {
+                    return Err(format!(
+                        "pixel shader {:#x} interpolates SPI_PS_INPUT_CNTL slots without a matching \
+                         EXP PARAM / proven NGG attribute staging from export {:#x} \
+                         (missing logical/physical/control={missing:08x?}; exports={exported_parameters:#010x})",
+                        draw.pixel_shader_address, draw.export_shader_address,
+                    ));
+                }
+                if !rectangle_covers_missing && uses_procedural_rectangle_stage {
+                    // Procedural stage with incomplete ImageSample provenance still synthesizes
+                    // every live parameter as UV (see compile path below); that is an explicit
+                    // rectangle ABI, not a silent NGG zero-fill.
+                }
             }
         }
         let uses_mesh_stage = key.uses_mesh_stage;
