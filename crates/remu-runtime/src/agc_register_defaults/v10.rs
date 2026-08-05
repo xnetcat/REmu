@@ -797,6 +797,26 @@ pub(super) const PUBLIC: CompactRegisterDefaults = CompactRegisterDefaults::new(
     PUBLIC_TYPES,
 );
 
+/// Version-10 public Cx / Sh / Uc default `(offset, value)` pairs used to seed the shadow file.
+///
+/// Table 0 is context, table 1 shader, table 2 user-config. Later duplicate offsets in a table
+/// win (the public Cx blend-control row is listed twice with the same value).
+pub(super) const fn public_register_defaults(file: super::RegisterFile) -> &'static [(u32, u32)] {
+    match file {
+        super::RegisterFile::Context => PUBLIC_TABLE0_REGISTERS,
+        super::RegisterFile::Shader => PUBLIC_TABLE1_REGISTERS,
+        super::RegisterFile::UserConfig => PUBLIC_TABLE2_REGISTERS,
+    }
+}
+
+/// Internal Cx defaults that titles never see through the public defaults blob, but that the
+/// decoder still consults (NGG sizing / VS-out control). Seeded so "absent" cannot mean unknown.
+pub(super) const INTERNAL_CONTEXT_REGISTER_DEFAULTS: &[(u32, u32)] = INTERNAL_TABLE0_REGISTERS;
+
+/// GFX10 `SPI_SHADER_COL_FORMAT` (`R_028714` → Cx offset `0x1c5`). The AGC public defaults blob
+/// omits this MMIO-normalized offset; AMD/AGC clear state leaves it at zero (no color exports).
+pub(super) const SPI_SHADER_COL_FORMAT_DEFAULT: (u32, u32) = (0x01c5, 0x0000_0000);
+
 const INTERNAL_TABLE0_REGISTERS: &[(u32, u32)] = &[
     (0x000e, 0x00000002),
     (0x02af, 0x00040000),

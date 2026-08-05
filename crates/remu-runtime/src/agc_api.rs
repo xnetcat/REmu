@@ -344,15 +344,17 @@ pub(crate) fn agc_allocate_command_dwords(command_buffer: u64, size_dwords: u32)
 }
 
 pub(crate) fn agc_dcb_reset_queue(arguments: [u64; 6]) -> u64 {
+    // Fallback NID path (command ABI normally wins). Preserve the 12-bit `ResetQueueOp` mask.
     let command_buffer = arguments[0];
-    if low_u32(arguments[1]) != 0x3ff || low_u32(arguments[2]) != 0 {
+    let ops = low_u32(arguments[1]);
+    if ops & !crate::agc_reset_queue_op::ALL_ACCESSIBLE != 0 || low_u32(arguments[2]) != 0 {
         return 0;
     }
     let Some(command) = agc_allocate_command_dwords(command_buffer, 2) else {
         return 0;
     };
-    write_guest_u32(command, agc_pm4(2, AGC_IT_NOP, AGC_R_DRAW_RESET));
-    write_guest_u32(command + 4, 0);
+    write_guest_u32(command, agc_pm4(2, AGC_IT_CLEAR_STATE, 0));
+    write_guest_u32(command + 4, ops);
     command
 }
 

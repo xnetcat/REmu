@@ -27,7 +27,12 @@ fn append_native_memory_dma(
 }
 
 fn append_native_indexed_draw(commands: &mut Vec<u32>, index_address: u64, index_count: u32) {
+    // AGC default CB_TARGET_MASK is 0 (no color writes). Tests that expect a draw event must
+    // program a non-zero mask; otherwise the decoder correctly treats the draw as a no-op.
     commands.extend([
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        crate::AGC_CB_TARGET_MASK,
+        0xf,
         agc_pm4(6, crate::AGC_IT_DRAW_INDEX_2, 0),
         index_count,
         low_u32(index_address),
@@ -470,6 +475,9 @@ fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early()
         index_size: 1,
         ..AgcGraphicsState::default()
     };
+    graphics
+        .context_registers
+        .insert(crate::AGC_CB_TARGET_MASK, 0xf);
     let mut commands = Vec::new();
     append_native_memory_dma(
         &mut commands,
@@ -512,9 +520,10 @@ fn dma_shadow_reaches_indirect_draw_arguments_without_executing_the_copy_early()
             .map(|register| register.value),
         Some(0)
     );
-    assert_eq!(graphics.shader_registers.get(&0x08c), None);
-    assert_eq!(graphics.shader_registers.get(&0x08d), None);
-    assert_eq!(graphics.shader_registers.get(&0x08e), None);
+    // Neutralized SH remaps restore the seeded AGC defaults (0), not an empty map.
+    assert_eq!(graphics.shader_registers.get(&0x08c), Some(&0));
+    assert_eq!(graphics.shader_registers.get(&0x08d), Some(&0));
+    assert_eq!(graphics.shader_registers.get(&0x08e), Some(&0));
 }
 
 #[test]
@@ -1078,7 +1087,8 @@ fn skips_predicated_packets_when_boolean_predication_is_false() {
     .expect("predicated submission");
 
     assert!(graphics.predicate_skip);
-    assert!(!graphics.shader_registers.contains_key(&0x00c));
+    // Seeded AGC defaults already contain every SH slot; a skipped write must leave the default.
+    assert_eq!(graphics.shader_registers.get(&0x00c), Some(&0));
     assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0x1234_5678));
 }
 
@@ -1194,7 +1204,8 @@ fn cond_exec_skips_exactly_its_zero_guarded_dword_range() {
     )
     .expect("conditional submission");
 
-    assert!(!graphics.shader_registers.contains_key(&0x00c));
+    // Seeded AGC defaults already contain every SH slot; a skipped write must leave the default.
+    assert_eq!(graphics.shader_registers.get(&0x00c), Some(&0));
     assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0x1234_5678));
 }
 
@@ -1243,7 +1254,8 @@ fn native_gen5_branch_executes_only_the_selected_indirect_buffer() {
     .expect("branched submission");
 
     assert_eq!(graphics.shader_registers.get(&0x00c), Some(&0x1111_1111));
-    assert!(!graphics.shader_registers.contains_key(&0x00d));
+    // Else buffer was not taken — SH 0x00d stays at the seeded AGC default.
+    assert_eq!(graphics.shader_registers.get(&0x00d), Some(&0));
     assert_eq!(
         crate::agc_command_abi::take_recorded_graphics_prefix(then_address + 12),
         None,
@@ -1397,7 +1409,10 @@ fn clear_state_resets_complete_queue_state_without_discarding_residency() {
         attrib2: ((1_280 - 1) << 14) | (720 - 1),
         attrib3: (27 << 14) | (1 << 24),
     };
-    let packet = [agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0), 0x0f];
+    let packet = [
+        agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0),
+        crate::agc_reset_queue_op::ALL_ACCESSIBLE,
+    ];
     let mut graphics = AgcGraphicsState::default();
     graphics.context_registers.insert(0x318, 1);
     graphics.shader_registers.insert(0x20c, 2);
@@ -1429,9 +1444,29 @@ fn clear_state_resets_complete_queue_state_without_discarding_residency() {
     )
     .expect("valid CLEAR_STATE packet");
 
-    assert!(graphics.context_registers.is_empty());
-    assert!(graphics.shader_registers.is_empty());
-    assert!(graphics.user_config_registers.is_empty());
+    // Absent means default: CLEAR_STATE reseeds the AGC register files, never empties them.
+    assert_eq!(
+        graphics.context_registers.get(&0x205),
+        Some(&0x240),
+        "PA_SU_SC_MODE_CNTL must reseed to the SDK CCW default"
+    );
+    assert_eq!(
+        graphics.context_registers.get(&0x191),
+        Some(&0),
+        "SPI_PS_INPUT_CNTL_0 must reseed to 0"
+    );
+    assert_eq!(graphics.context_registers.get(&0x1c5), Some(&0));
+    assert_eq!(graphics.user_config_registers.get(&0x24a), Some(&0));
+    assert_eq!(graphics.user_config_registers.get(&0x25b), Some(&0));
+    assert_eq!(graphics.context_registers.get(&0x2d5), Some(&0x2000));
+    assert!(!graphics.context_registers.is_empty());
+    assert!(!graphics.shader_registers.is_empty());
+    assert!(!graphics.user_config_registers.is_empty());
+    assert_eq!(
+        graphics.context_registers.get(&0x318),
+        Some(&0),
+        "guest-written CB_COLOR0_BASE must revert to the AGC default on clear"
+    );
     assert_eq!(graphics.index_buffer_address, 0);
     assert_eq!(graphics.index_resource_address, 0);
     assert_eq!(graphics.index_buffer_count, 0);
@@ -1445,7 +1480,7 @@ fn clear_state_resets_complete_queue_state_without_discarding_residency() {
 
 #[test]
 fn clear_state_rejects_non_native_layouts() {
-    let invalid_control = [agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0), 0x10];
+    let invalid_control = [agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0), 0x1_000];
     let mut graphics = AgcGraphicsState::default();
     let mut shaders = AgcShaderRegistry::default();
     let video_out = VideoOutState::default();
@@ -1472,13 +1507,50 @@ fn clear_state_rejects_non_native_layouts() {
     assert!(matches!(
         invoke(invalid_control.as_ptr().addr() as u64, 2, &mut graphics),
         Err(crate::AgcSubmissionError::UnsupportedClearStateControl(
-            0x10
+            0x1_000
         ))
     ));
     assert!(matches!(
         invoke(invalid_control.as_ptr().addr() as u64, 3, &mut graphics),
         Err(crate::AgcSubmissionError::ClearStatePacketLength { actual: 3 })
     ));
+}
+
+#[test]
+fn reset_queue_applies_selective_mask() {
+    let packet = [
+        agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0),
+        crate::agc_reset_queue_op::CX_STATE | crate::agc_reset_queue_op::INSTANCE_COUNT,
+    ];
+    let mut graphics = AgcGraphicsState::default();
+    graphics.context_registers.insert(0x205, 0x246);
+    graphics.shader_registers.insert(0x20c, 0x99);
+    graphics.user_config_registers.insert(0x24a, 7);
+    graphics.instance_count = 4;
+    graphics.index_buffer_address = 0x1000;
+
+    crate::agc_handle_submission_packet(
+        crate::AgcSubmissionPacket {
+            address: packet.as_ptr().addr() as u64,
+            length: 2,
+            opcode: crate::AGC_IT_CLEAR_STATE,
+            register: 0,
+            predicated: false,
+        },
+        &mut graphics,
+        &mut AgcShaderRegistry::default(),
+        &VideoOutState::default(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+        None,
+    )
+    .expect("selective resetQueue");
+
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x240));
+    assert_eq!(graphics.shader_registers.get(&0x20c), Some(&0x99));
+    assert_eq!(graphics.user_config_registers.get(&0x24a), Some(&7));
+    assert_eq!(graphics.instance_count, 1);
+    assert_eq!(graphics.index_buffer_address, 0x1000);
 }
 
 #[test]

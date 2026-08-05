@@ -177,9 +177,10 @@ fn agc_emit_indirect_draw(
 
     let previous_instance_count =
         std::mem::replace(&mut graphics.instance_count, arguments.instance_count);
-    let previous_base_vertex = graphics
-        .context_registers
-        .insert(0x102, arguments.base_vertex as u32);
+    // Indirect `startVertexLocation` programs UcIndexOffset for the duration of the draw.
+    let previous_index_offset = graphics
+        .user_config_registers
+        .insert(0x24a, arguments.base_vertex as u32);
     agc_emit_draw_with_indirect_arguments(
         packet_address,
         graphics,
@@ -193,11 +194,9 @@ fn agc_emit_indirect_draw(
         Some(arguments_address),
     );
     graphics.instance_count = previous_instance_count;
-    if let Some(value) = previous_base_vertex {
-        graphics.context_registers.insert(0x102, value);
-    } else {
-        graphics.context_registers.remove(&0x102);
-    }
+    graphics
+        .user_config_registers
+        .insert(0x24a, previous_index_offset.unwrap_or(0));
     for (register, value) in neutralized_registers {
         if let Some(value) = value {
             graphics.shader_registers.insert(register, value);
@@ -274,13 +273,11 @@ fn agc_apply_clear_state(
         return Err(AgcSubmissionError::ClearStatePacketLength { actual: length });
     }
     let control = read_guest_u32(packet_address + 4);
-    if control & !0x0f != 0 {
+    // SDK `ResetQueueOp` is a 12-bit selective mask (`kNone` = 0 is a deliberate no-op).
+    if control & !crate::agc_reset_queue_op::ALL_ACCESSIBLE != 0 {
         return Err(AgcSubmissionError::UnsupportedClearStateControl(control));
     }
-    // Gen5's DcbResetQueue emits CLEAR_STATE with a four-bit state selector. KytyPS5's command
-    // processor validates that selector and resets the complete context, shader, user-config,
-    // index, instance and indirect-argument state regardless of its admitted value. Resource
-    // residency and telemetry are host bookkeeping, not register state.
+    let ops = control;
     if trace_agc_blend_provenance() {
         let values = std::array::from_fn::<_, 8, _>(|slot| {
             graphics
@@ -290,20 +287,20 @@ fn agc_apply_clear_state(
         });
         eprintln!(
             "[REMu][AGC][BLEND-PROVENANCE] phase=reset source=clear-state \
-             packet={packet_address:#x} control={control:#x} values={values:#010x?} \
+             packet={packet_address:#x} control={control:#x} ops={ops:#x} values={values:#010x?} \
              provenance={:#x?}",
             graphics.blend_register_provenance,
         );
     }
     if trace_agc_registers() {
         eprintln!(
-            "[REMu][AGC][REG] clear state packet={packet_address:#x} control={control:#x} cx={} sh={} uc={}",
+            "[REMu][AGC][REG] clear state packet={packet_address:#x} control={control:#x} ops={ops:#x} cx={} sh={} uc={}",
             graphics.context_registers.len(),
             graphics.shader_registers.len(),
             graphics.user_config_registers.len(),
         );
     }
-    graphics.reset_pipeline();
+    graphics.apply_reset_queue_op(ops);
     Ok(())
 }
 
@@ -328,6 +325,10 @@ pub(crate) fn agc_handle_submission_packet(
     }
     if opcode == AGC_IT_NOP && matches!(register, AGC_R_DRAW_RESET | AGC_R_ACB_RESET) && length >= 2
     {
+        let ops = read_guest_u32(packet_address + 4);
+        if ops & !crate::agc_reset_queue_op::ALL_ACCESSIBLE != 0 {
+            return Err(AgcSubmissionError::UnsupportedClearStateControl(ops));
+        }
         if trace_agc_blend_provenance() {
             let values = std::array::from_fn::<_, 8, _>(|slot| {
                 graphics
@@ -337,20 +338,20 @@ pub(crate) fn agc_handle_submission_packet(
             });
             eprintln!(
                 "[REMu][AGC][BLEND-PROVENANCE] phase=reset source=queue-reset \
-                 packet={packet_address:#x} register={register:#x} values={values:#010x?} \
+                 packet={packet_address:#x} register={register:#x} ops={ops:#x} values={values:#010x?} \
                  provenance={:#x?}",
                 graphics.blend_register_provenance,
             );
         }
         if trace_agc_registers() {
             eprintln!(
-                "[REMu][AGC][REG] queue reset packet={packet_address:#x} register={register:#x} cx={} sh={} uc={}",
+                "[REMu][AGC][REG] queue reset packet={packet_address:#x} register={register:#x} ops={ops:#x} cx={} sh={} uc={}",
                 graphics.context_registers.len(),
                 graphics.shader_registers.len(),
                 graphics.user_config_registers.len(),
             );
         }
-        graphics.reset_pipeline();
+        graphics.apply_reset_queue_op(ops);
     }
     agc_apply_submission_registers(packet_address, length, opcode, register, graphics)?;
     if opcode == AGC_IT_SET_BASE {

@@ -1124,7 +1124,7 @@ pub(crate) struct PendingVideoOutFlip {
 // unnecessary here and is costly because the hot miss path hashes up to 64 user-data words in as
 // many as three cache tables. This small Fx-style mixer retains full equality checks in HashMap
 // while making those repeated fixed-width writes substantially cheaper.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct AgcGraphicsState {
     context_registers: BTreeMap<u32, u32>,
     shader_registers: BTreeMap<u32, u32>,
@@ -1166,6 +1166,44 @@ pub(crate) struct AgcGraphicsState {
     shader_evaluation_workers: Option<ShaderEvaluationWorkers>,
 }
 
+impl Default for AgcGraphicsState {
+    fn default() -> Self {
+        Self {
+            context_registers: agc_register_defaults::seed_register_defaults(
+                agc_register_defaults::RegisterFile::Context,
+            ),
+            shader_registers: agc_register_defaults::seed_register_defaults(
+                agc_register_defaults::RegisterFile::Shader,
+            ),
+            user_config_registers: agc_register_defaults::seed_register_defaults(
+                agc_register_defaults::RegisterFile::UserConfig,
+            ),
+            blend_register_provenance: [None; 8],
+            register_write_sequence: 0,
+            predicate_skip: false,
+            index_buffer_address: 0,
+            index_resource_address: 0,
+            index_buffer_count: 0,
+            index_size: 0,
+            instance_count: 1,
+            draw_index_offset: 0,
+            indirect_args_address: 0,
+            emitted_draws: 0,
+            emitted_compute_dispatches: 0,
+            traced_shader_pairs: BTreeSet::new(),
+            traced_scanout_shader_pairs: BTreeSet::new(),
+            traced_target_shader_pairs: BTreeSet::new(),
+            traced_sampled_target_shader_pairs: BTreeSet::new(),
+            traced_sampled_compute_shaders: BTreeSet::new(),
+            sampled_texture_addresses: BTreeSet::new(),
+            failed_shader_evaluations: BTreeSet::new(),
+            known_color_targets: BTreeMap::new(),
+            shader_evaluation_cache: ShaderEvaluationCache::default(),
+            shader_evaluation_workers: None,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct AgcShaderRegistry {
     headers: BTreeMap<u64, u64>,
@@ -1191,20 +1229,73 @@ pub(crate) struct AgcFusedShaderContinuation {
     back_code_size: u32,
 }
 
+/// SDK `sce::Agc::ResetQueueOp` bits (`drawcommandbuffer.h`).
+pub(crate) mod agc_reset_queue_op {
+    pub(crate) const CX_STATE: u32 = 1 << 0;
+    pub(crate) const SH_STATE: u32 = 1 << 1;
+    pub(crate) const UC_STATE: u32 = 1 << 2;
+    pub(crate) const INSTANCE_COUNT: u32 = 1 << 3;
+    pub(crate) const INDEX_ATTRIBUTES: u32 = 1 << 4;
+    pub(crate) const BASE_INDIRECT_POINTERS: u32 = 1 << 5;
+    pub(crate) const FLUSH_CACHES: u32 = 1 << 6;
+    pub(crate) const DRAIN_COMPUTE: u32 = 1 << 7;
+    pub(crate) const DRAIN_GRAPHICS: u32 = 1 << 8;
+    pub(crate) const OCCLUSION_QUERY: u32 = 1 << 9;
+    pub(crate) const CONTEXT_OP_PUSH: u32 = 1 << 10;
+    pub(crate) const MEMORY_MAPPING_MASK: u32 = 1 << 11;
+    pub(crate) const ALL_ACCESSIBLE: u32 = (1 << 12) - 1;
+}
+
 impl AgcGraphicsState {
-    pub(crate) fn reset_pipeline(&mut self) {
-        self.context_registers.clear();
-        self.shader_registers.clear();
-        self.user_config_registers.clear();
-        self.blend_register_provenance = [None; 8];
+    /// Apply a selective `ResetQueueOp` mask. Register files reseed from
+    /// `agc_register_defaults`; they are never left empty.
+    pub(crate) fn apply_reset_queue_op(&mut self, ops: u32) {
+        if ops & agc_reset_queue_op::CX_STATE != 0 {
+            self.context_registers = agc_register_defaults::seed_register_defaults(
+                agc_register_defaults::RegisterFile::Context,
+            );
+            self.blend_register_provenance = [None; 8];
+        }
+        if ops & agc_reset_queue_op::SH_STATE != 0 {
+            self.shader_registers = agc_register_defaults::seed_register_defaults(
+                agc_register_defaults::RegisterFile::Shader,
+            );
+        }
+        if ops & agc_reset_queue_op::UC_STATE != 0 {
+            self.user_config_registers = agc_register_defaults::seed_register_defaults(
+                agc_register_defaults::RegisterFile::UserConfig,
+            );
+        } else if ops & agc_reset_queue_op::MEMORY_MAPPING_MASK != 0 {
+            // SDK: kMemoryMappingMask resets only UcMemoryMappingMask (0x35..0x3c).
+            for offset in 0x35..=0x3c {
+                self.user_config_registers.insert(offset, 0);
+            }
+        }
+        if ops & agc_reset_queue_op::INSTANCE_COUNT != 0 {
+            self.instance_count = 1;
+        }
+        if ops & agc_reset_queue_op::INDEX_ATTRIBUTES != 0 {
+            self.index_buffer_address = 0;
+            self.index_resource_address = 0;
+            self.index_buffer_count = 0;
+            self.index_size = 0;
+            self.draw_index_offset = 0;
+        }
+        if ops & agc_reset_queue_op::BASE_INDIRECT_POINTERS != 0 {
+            self.indirect_args_address = 0;
+        }
+        // Flush/drain/occlusion/context-op-push are GPU timeline effects. Flush and drain are
+        // host no-ops here (completion already serializes submissions). Context-op push/pop is
+        // tracked only when the guest emits those packets; a reset that asks to pop while we
+        // have no push stack is intentionally ignored.
+        let _ = (
+            ops & agc_reset_queue_op::FLUSH_CACHES,
+            ops & agc_reset_queue_op::DRAIN_COMPUTE,
+            ops & agc_reset_queue_op::DRAIN_GRAPHICS,
+            ops & agc_reset_queue_op::OCCLUSION_QUERY,
+            ops & agc_reset_queue_op::CONTEXT_OP_PUSH,
+        );
         self.predicate_skip = false;
-        self.index_buffer_address = 0;
-        self.index_resource_address = 0;
-        self.index_buffer_count = 0;
-        self.index_size = 0;
-        self.instance_count = 1;
-        self.draw_index_offset = 0;
-        self.indirect_args_address = 0;
     }
 }
 

@@ -6,10 +6,65 @@
 // The Gen5 register-default layout and values are derived from SharpEmu/Kyty's GPL-compatible
 // AGC tables. Keeping the serialization isolated makes the guest-facing pointer graph testable.
 
+use std::collections::BTreeMap;
+
 const DESCRIPTOR_SIZE: usize = 0x40;
 const REGISTER_BLOCK_SIZE: usize = 16 * 8;
 
 mod v10;
+
+/// Which AGC register file a default belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RegisterFile {
+    Context,
+    Shader,
+    UserConfig,
+}
+
+/// Build a complete shadow register map for one file from the version-10 AGC defaults.
+///
+/// Absent means default: callers seed on init/reset instead of leaving maps empty and inventing
+/// per-site fallbacks. Public table values win over internal supplements when both define an
+/// offset.
+pub(crate) fn seed_register_defaults(file: RegisterFile) -> BTreeMap<u32, u32> {
+    let mut map = BTreeMap::new();
+    if file == RegisterFile::Context {
+        for &(offset, value) in v10::INTERNAL_CONTEXT_REGISTER_DEFAULTS {
+            map.insert(offset, value);
+        }
+        let (offset, value) = v10::SPI_SHADER_COL_FORMAT_DEFAULT;
+        map.insert(offset, value);
+    }
+    for &(offset, value) in v10::public_register_defaults(file) {
+        map.insert(offset, value);
+    }
+    map
+}
+
+/// Look up one version-10 default. Distinguishes known zero from an offset the tables do not
+/// represent (so callers can refuse instead of inventing a substitute).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn lookup_register_default(file: RegisterFile, offset: u32) -> Option<u32> {
+    if file == RegisterFile::Context && offset == v10::SPI_SHADER_COL_FORMAT_DEFAULT.0 {
+        return Some(v10::SPI_SHADER_COL_FORMAT_DEFAULT.1);
+    }
+    let public = v10::public_register_defaults(file)
+        .iter()
+        .rev()
+        .find(|(candidate, _)| *candidate == offset)
+        .map(|(_, value)| *value);
+    if public.is_some() {
+        return public;
+    }
+    if file == RegisterFile::Context {
+        return v10::INTERNAL_CONTEXT_REGISTER_DEFAULTS
+            .iter()
+            .rev()
+            .find(|(candidate, _)| *candidate == offset)
+            .map(|(_, value)| *value);
+    }
+    None
+}
 
 #[derive(Clone, Copy)]
 struct CompactRegisterDefaultTable {
@@ -744,6 +799,28 @@ mod tests {
         bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
             (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
         })
+    }
+
+    #[test]
+    fn seeds_agc_v10_shadow_defaults_for_register_files() {
+        use super::{RegisterFile, lookup_register_default, seed_register_defaults};
+
+        let cx = seed_register_defaults(RegisterFile::Context);
+        assert_eq!(cx.get(&0x205), Some(&0x240));
+        assert_eq!(cx.get(&0x191), Some(&0));
+        assert_eq!(cx.get(&0x1b0), Some(&0));
+        assert_eq!(cx.get(&0x1c5), Some(&0));
+        assert_eq!(cx.get(&0x10f), Some(&0x3f80_0000));
+        assert_eq!(cx.get(&0x0b4), Some(&0));
+        assert_eq!(cx.get(&0x0b5), Some(&0));
+        assert_eq!(cx.get(&0x2d5), Some(&0x2000));
+        assert_eq!(cx.get(&0x202), Some(&0x00cc_0010));
+        assert_eq!(lookup_register_default(RegisterFile::Context, 0x205), Some(0x240));
+        assert_eq!(lookup_register_default(RegisterFile::Context, 0x1c5), Some(0));
+
+        let uc = seed_register_defaults(RegisterFile::UserConfig);
+        assert_eq!(uc.get(&0x24a), Some(&0));
+        assert_eq!(uc.get(&0x25b), Some(&0));
     }
 
     #[test]

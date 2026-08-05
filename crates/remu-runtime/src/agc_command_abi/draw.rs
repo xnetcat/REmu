@@ -10,16 +10,15 @@ use super::{
 };
 
 pub(super) fn dcb_reset_queue(arguments: [u64; 6]) -> u64 {
-    if low_u32(arguments[1]) & !0x0fff != 0 || low_u32(arguments[2]) > 0x0f {
+    // SDK: `DrawCommandBuffer::resetQueue(ResetQueueOp ops)` — 12-bit selective mask in arg1.
+    let ops = low_u32(arguments[1]);
+    if ops & !crate::agc_reset_queue_op::ALL_ACCESSIBLE != 0 || low_u32(arguments[2]) != 0 {
         return 0;
     }
     let Some(command) = allocate_dwords(arguments[0], 2) else {
         return 0;
     };
-    write_words(
-        command,
-        &[pm4(2, IT_CLEAR_STATE, 0), low_u32(arguments[2]) & 0x0f],
-    );
+    write_words(command, &[pm4(2, IT_CLEAR_STATE, 0), ops]);
     command
 }
 
