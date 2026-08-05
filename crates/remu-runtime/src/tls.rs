@@ -422,7 +422,9 @@ fn encode_tls_load_helper(
         u8::try_from(saved_offset).map_err(|_| LinkError::AddressOverflow)?,
     ]);
     cursor += 5;
-    cursor = emit_tls_store_helper_epilogue(&mut body, cursor);
+    // Red-zone skip is inside this helper (call sites are often only nine bytes), so undo it
+    // with `add rsp,128` / plain `ret`. The store path keeps site-side `lea` + `ret 128`.
+    cursor = emit_tls_load_helper_epilogue(&mut body, cursor);
     if cursor > slot.len() {
         return Err(LinkError::AddressOverflow);
     }
@@ -490,7 +492,7 @@ fn encode_per_site_fs_helper(slot: &mut [u8], dispatcher: u64, kind: PerSiteFsHe
             body[cursor + 3..cursor + 7].copy_from_slice(&displacement.to_le_bytes());
             cursor += 7;
             cursor = write_destination_slot(&mut body, cursor, destination);
-            cursor = emit_tls_store_helper_epilogue(&mut body, cursor);
+            cursor = emit_tls_load_helper_epilogue(&mut body, cursor);
             slot[..cursor].copy_from_slice(&body[..cursor]);
             cursor
         }
@@ -596,14 +598,29 @@ fn emit_tls_store_helper_prologue(slot: &mut [u8], dispatcher: u64) -> usize {
 }
 
 fn emit_tls_store_helper_epilogue(slot: &mut [u8], mut cursor: usize) -> usize {
+    cursor = emit_tls_helper_gpr_flag_restore(slot, cursor);
+    // The patched store moves RSP below the 128-byte guest red zone before calling us.
+    slot[cursor..cursor + 3].copy_from_slice(&[0xc2, 0x80, 0]); // ret 128
+    cursor += 3;
+    cursor
+}
+
+fn emit_tls_load_helper_epilogue(slot: &mut [u8], mut cursor: usize) -> usize {
+    cursor = emit_tls_helper_gpr_flag_restore(slot, cursor);
+    // Undo the helper-local `lea rsp,[rsp-128]` so `[rsp]` is the return address again.
+    slot[cursor..cursor + 7].copy_from_slice(&[0x48, 0x81, 0xc4, 0x80, 0, 0, 0]); // add rsp, 128
+    cursor += 7;
+    slot[cursor] = 0xc3; // ret
+    cursor += 1;
+    cursor
+}
+
+fn emit_tls_helper_gpr_flag_restore(slot: &mut [u8], mut cursor: usize) -> usize {
     for register in TLS_HELPER_SAVED_REGISTERS.into_iter().rev() {
         emit_pop_register(slot, &mut cursor, register);
     }
     slot[cursor] = 0x9d; // popfq
     cursor += 1;
-    // The patched store moves RSP below the 128-byte guest red zone before calling us.
-    slot[cursor..cursor + 3].copy_from_slice(&[0xc2, 0x80, 0]); // ret 128
-    cursor += 3;
     cursor
 }
 
@@ -998,10 +1015,12 @@ mod tests {
             mnemonics.iter().any(|m| matches!(m, Mnemonic::Xsave64))
                 && mnemonics.iter().any(|m| matches!(m, Mnemonic::Xrstor64))
                 && mnemonics.iter().any(|m| matches!(m, Mnemonic::Pushfq))
-                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Popfq)),
-            "load helper must match the store helper's ABI contract: {mnemonics:?}"
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Popfq))
+                && mnemonics.iter().any(|m| matches!(m, Mnemonic::Add)),
+            "load helper must preserve vector/flags and undo its own red-zone skip: {mnemonics:?}"
         );
-        assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
+        // Plain ret after `add rsp,128` — not `ret 128` (that contract is site-side lea only).
+        assert_eq!(&slot[encoded - 8..encoded], &[0x48, 0x81, 0xc4, 0x80, 0, 0, 0, 0xc3]);
     }
 
     #[test]
