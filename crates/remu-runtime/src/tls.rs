@@ -59,7 +59,7 @@ pub(crate) struct TlsStoreScanPlan {
 /// decode needs FDE starts). A raw whole-image byte scan of those encodings false-positives in
 /// immediates and blew the auxiliary reserve (`AddressOverflow` at link). This cushion covers the
 /// seeded AOT set; install refuses loudly if seeded sites exceed it.
-const PER_SITE_FS_HELPER_CUSHION: u64 = 16_384;
+const PER_SITE_FS_HELPER_CUSHION: u64 = 65_536;
 
 impl TlsStoreScanPlan {
     pub(crate) fn helper_region_size(&self) -> Result<u64, LinkError> {
