@@ -418,7 +418,8 @@ mod tests {
                 FsAccessKind::StoreImm {
                     width_bytes: 4,
                     displacement: 0x28,
-                    ..
+                    // iced_x86 zero-extends the Immediate32; AOT must keep the low 32 bits.
+                    immediate: 0x0000_0000_a002_000b,
                 }
             )
         }));

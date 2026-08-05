@@ -55,11 +55,12 @@ pub(crate) struct TlsStoreScanPlan {
 
 /// Extra per-site helper slots reserved beyond the store-imm pattern ceiling.
 ///
-/// Displaced `mov`/`lea fs:[disp]` sites are discovered only after the image is mapped (seeded
-/// decode needs FDE starts). A raw whole-image byte scan of those encodings false-positives in
-/// immediates and blew the auxiliary reserve (`AddressOverflow` at link). This cushion covers the
-/// seeded AOT set; install refuses loudly if seeded sites exceed it.
-const PER_SITE_FS_HELPER_CUSHION: u64 = 65_536;
+/// Seeded decode may discover `lea fs:[disp]` (must AOT — it never faults) and displaced loads
+/// after the image is mapped. Those consume slots from this cushion first; store-imm and load-disp
+/// that still do not fit defer to the SIGSEGV backstop. A raw whole-image byte scan of displaced
+/// forms false-positives in immediates and must not size the reserve. Install refuses only when
+/// authenticated `lea` sites exceed `store-imm ceiling + cushion`.
+const PER_SITE_FS_HELPER_CUSHION: u64 = 0;
 
 impl TlsStoreScanPlan {
     pub(crate) fn helper_region_size(&self) -> Result<u64, LinkError> {
@@ -676,7 +677,9 @@ fn patch_fs_accesses(
 ) -> Result<(usize, usize), LinkError> {
     let sites = collect_seeded_fs_sites(memory, seeds)?;
     let mut shared_loads = Vec::new();
-    let mut per_site = Vec::new();
+    let mut leas = Vec::new();
+    let mut stores = Vec::new();
+    let mut load_disps = Vec::new();
     let mut deferred = 0_usize;
     for (address, site) in sites {
         match site.kind {
@@ -696,7 +699,7 @@ fn patch_fs_accesses(
                 width_bytes: 8,
                 displacement,
             } if destination != 4 && displacement != 0 && site.length >= 5 => {
-                per_site.push((
+                load_disps.push((
                     address,
                     site.length,
                     PerSiteFsHelper::LoadDisp {
@@ -709,7 +712,7 @@ fn patch_fs_accesses(
                 destination,
                 displacement,
             } if destination != 4 && site.length >= 5 => {
-                per_site.push((
+                leas.push((
                     address,
                     site.length,
                     PerSiteFsHelper::Lea {
@@ -723,14 +726,14 @@ fn patch_fs_accesses(
                 displacement,
                 immediate,
             } if site.length >= 10 => {
-                per_site.push((
+                // iced_x86 zero-extends Immediate32 into i64; the AOT helper stores the low
+                // 32 bits of the instruction encoding, not a saturating signed conversion.
+                stores.push((
                     address,
                     site.length,
                     PerSiteFsHelper::StoreImm {
                         displacement: displacement.to_le_bytes(),
-                        immediate: i32::try_from(immediate)
-                            .map_err(|_| LinkError::AddressOverflow)?
-                            .to_le_bytes(),
+                        immediate: (immediate as i32).to_le_bytes(),
                     },
                 ));
             }
@@ -738,12 +741,30 @@ fn patch_fs_accesses(
         }
     }
 
-    let per_site_count = u64::try_from(per_site.len()).map_err(|_| LinkError::AddressOverflow)?;
-    if per_site_count > per_site_capacity {
+    let lea_count = u64::try_from(leas.len()).map_err(|_| LinkError::AddressOverflow)?;
+    if lea_count > per_site_capacity {
         eprintln!(
-            "[REMu][TLS][FS] LOUD REFUSAL: seeded per-site helpers ({per_site_count}) exceed reserve ({per_site_capacity}); raise PER_SITE_FS_HELPER_CUSHION"
+            "[REMu][TLS][FS] LOUD REFUSAL: seeded lea fs: helpers ({lea_count}) exceed reserve ({per_site_capacity}); lea never faults so it cannot defer — raise PER_SITE_FS_HELPER_CUSHION"
         );
         return Err(LinkError::AddressOverflow);
+    }
+
+    // lea must AOT; store-imm / displaced loads fill remaining slots; overflow defers to fault.
+    let mut per_site = leas;
+    let capacity = usize::try_from(per_site_capacity).map_err(|_| LinkError::AddressOverflow)?;
+    for site in stores {
+        if per_site.len() < capacity {
+            per_site.push(site);
+        } else {
+            deferred += 1;
+        }
+    }
+    for site in load_disps {
+        if per_site.len() < capacity {
+            per_site.push(site);
+        } else {
+            deferred += 1;
+        }
     }
 
     for patch in &shared_loads {
@@ -987,6 +1008,14 @@ mod tests {
     fn tls_load_helper_refuses_rsp_destination() {
         let mut slot = [0x90_u8; super::TLS_LOAD_HELPER_SIZE_USIZE];
         assert!(encode_tls_load_helper(&mut slot, 0x1122_3344_5566_7788, 4).is_err());
+    }
+
+    #[test]
+    fn store_imm_aot_keeps_high_bit_immediate32_bits() {
+        // Matches FS_STORE_IMM in fs_decode tests: imm32 bytes 0b 00 02 a0.
+        let immediate = 0x0000_0000_a002_000b_i64;
+        assert!(i32::try_from(immediate).is_err());
+        assert_eq!((immediate as i32).to_le_bytes(), [0x0b, 0x00, 0x02, 0xa0]);
     }
 
     #[test]
