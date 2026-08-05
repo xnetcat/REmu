@@ -25,6 +25,9 @@ pub(crate) enum VfsMountKind {
     Download,
     /// A live save-data slot (`/savedataN`).
     SaveData,
+    /// Console application log directory (`/devlog/app`) — writable so titles can leave their
+    /// own error logs for the end-of-run artifact.
+    DevLog,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -99,7 +102,8 @@ impl VfsState {
             .find(|mount| mount.guest_prefix == guest_prefix)
     }
 
-    /// Rebuild the static mounts that exist for every title: `/app0` and `/download0`.
+    /// Rebuild the static mounts that exist for every title: `/app0`, `/download0`, and
+    /// `/devlog/app`.
     ///
     /// `/temp0` is registered only when `sceAppContentTemporaryDataMount2` creates it — titles that
     /// never ask for temporary data must not see a phantom writable root.
@@ -118,6 +122,10 @@ impl VfsState {
             },
         });
         self.register(download_mount(save_root));
+        let devlog = devlog_mount(save_root);
+        // Titles open log files under /devlog/app without creating the directory first.
+        let _ = std::fs::create_dir_all(&devlog.host_root);
+        self.register(devlog);
     }
 
     pub(crate) fn register_temp0(&mut self, save_root: &Path) -> PathBuf {
@@ -179,6 +187,20 @@ fn download_mount(save_root: &Path) -> VfsMount {
     }
 }
 
+fn devlog_mount(save_root: &Path) -> VfsMount {
+    VfsMount {
+        guest_prefix: "/devlog/app".to_owned(),
+        host_root: save_root.join("devlog").join("app"),
+        policy: MountPolicy {
+            writable: true,
+            case_insensitive: true,
+            enumerable_as_savedata: false,
+            quota: None,
+            kind: VfsMountKind::DevLog,
+        },
+    }
+}
+
 /// Resolve a normalized guest path against the mount table.
 ///
 /// Immutable `/app0` keeps the specialized presence-aware resolver (cache + known-absent). Other
@@ -197,7 +219,10 @@ pub(crate) fn resolve_via_vfs_mount(
                 },
             )
         }
-        VfsMountKind::Scratch | VfsMountKind::Download | VfsMountKind::SaveData => {
+        VfsMountKind::Scratch
+        | VfsMountKind::Download
+        | VfsMountKind::SaveData
+        | VfsMountKind::DevLog => {
             if normalized == mount.guest_prefix {
                 return Some(ResolvedProbeGuestPath {
                     path: mount.host_root.clone(),
@@ -335,6 +360,27 @@ mod tests {
         assert!(!download.policy.enumerable_as_savedata);
         assert!(download.policy.writable);
         assert_eq!(download.host_root, temporary.join("download0"));
+        let _ = std::fs::remove_dir_all(temporary);
+    }
+
+    #[test]
+    fn devlog_app_is_writable_and_created_on_static_mount_rebuild() {
+        let temporary = scratch_root("devlog-app");
+        let mut vfs = VfsState::default();
+        vfs.rebuild_static_mounts(Path::new("/game"), &temporary);
+        let mount = vfs
+            .find_mount("/devlog/app")
+            .expect("/devlog/app must be registered for every title");
+        assert_eq!(mount.policy.kind, VfsMountKind::DevLog);
+        assert!(mount.policy.writable);
+        assert!(!mount.policy.enumerable_as_savedata);
+        assert_eq!(mount.host_root, temporary.join("devlog").join("app"));
+        assert!(
+            mount.host_root.is_dir(),
+            "host directory must exist so titles can open log files without mkdir"
+        );
+        let resolved = resolve_via_vfs_mount(mount, "/devlog/app/error.log").unwrap();
+        assert!(resolved.writable);
         let _ = std::fs::remove_dir_all(temporary);
     }
 
