@@ -53,19 +53,36 @@ pub(crate) struct TlsStoreScanPlan {
     images: Vec<Vec<TlsImmediateStoreOffset>>,
 }
 
+/// Extra per-site helper slots reserved beyond the store-imm pattern ceiling.
+///
+/// Displaced `mov`/`lea fs:[disp]` sites are discovered only after the image is mapped (seeded
+/// decode needs FDE starts). A raw whole-image byte scan of those encodings false-positives in
+/// immediates and blew the auxiliary reserve (`AddressOverflow` at link). This cushion covers the
+/// seeded AOT set; install refuses loudly if seeded sites exceed it.
+const PER_SITE_FS_HELPER_CUSHION: u64 = 262_144;
+
 impl TlsStoreScanPlan {
     pub(crate) fn helper_region_size(&self) -> Result<u64, LinkError> {
-        self.images
-            .iter()
-            .try_fold(0_u64, |count, image| {
-                count
-                    .checked_add(
-                        u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?,
-                    )
-                    .ok_or(LinkError::AddressOverflow)
-            })?
+        let store_slots = self.images.iter().try_fold(0_u64, |count, image| {
+            count
+                .checked_add(u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?)
+                .ok_or(LinkError::AddressOverflow)
+        })?;
+        store_slots
+            .checked_add(PER_SITE_FS_HELPER_CUSHION)
+            .ok_or(LinkError::AddressOverflow)?
             .checked_mul(TLS_STORE_HELPER_SIZE)
             .ok_or(LinkError::AddressOverflow)
+    }
+
+    fn slot_capacity(&self) -> Result<u64, LinkError> {
+        self.images.iter().try_fold(0_u64, |count, image| {
+            count
+                .checked_add(u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?)
+                .ok_or(LinkError::AddressOverflow)
+        })?
+        .checked_add(PER_SITE_FS_HELPER_CUSHION)
+        .ok_or(LinkError::AddressOverflow)
     }
 }
 
@@ -84,16 +101,8 @@ pub(crate) fn install_tls_support(
     // Keep helpers beside the image so every rewritten load can use a five-byte rel32 call.
     let helper_base =
         memory.allocate_staging(TLS_HELPER_REGION_SIZE, 16, GUEST_READ | GUEST_EXECUTE)?;
-    // Store-helper staging is sized from the preflight plan (upper bound). Seeded decode may find
-    // fewer sites; it must never find more than the reserved region.
-    let store_helper_capacity = store_plan
-        .images
-        .iter()
-        .try_fold(0_u64, |count, image| {
-            count
-                .checked_add(u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?)
-                .ok_or(LinkError::AddressOverflow)
-        })?;
+    // Per-site helper staging: store-imm pattern ceiling + displaced load/lea cushion.
+    let store_helper_capacity = store_plan.slot_capacity()?;
     let store_helper_size = store_helper_capacity
         .checked_mul(TLS_STORE_HELPER_SIZE)
         .ok_or(LinkError::AddressOverflow)?;
@@ -239,11 +248,10 @@ pub(crate) fn static_tls_offsets(
     Ok(offsets)
 }
 
-/// Preflight upper bound for per-site FS helper staging.
+/// Preflight ceiling for store-imm helper slots (byte-pattern count only).
 ///
-/// Counts executable-segment offsets that match the absolute `fs:[disp32]` forms the installer may
-/// emit per-site helpers for (`mov dword fs:[disp],imm32`, `mov r64,fs:[disp]`, `lea r64,fs:[disp]`).
-/// Install rediscovers sites via seeded decode and refuses if the seeded count exceeds this reserve.
+/// Displaced load/lea capacity is the separate [`PER_SITE_FS_HELPER_CUSHION`] added in
+/// [`TlsStoreScanPlan::helper_region_size`]. Install rediscovers every site via seeded decode.
 pub(crate) fn scan_tls_immediate_stores<'a>(
     executables: impl IntoIterator<Item = &'a LoadedExecutable>,
 ) -> Result<TlsStoreScanPlan, LinkError> {
@@ -255,19 +263,13 @@ pub(crate) fn scan_tls_immediate_stores<'a>(
                 continue;
             }
             let data = &segment.data;
-            if data.len() < 9 {
+            if data.len() < TLS_IMMEDIATE_STORE_SIZE {
                 continue;
             }
-            for byte_offset in 0..data.len() {
-                let remaining = &data[byte_offset..];
-                if remaining.len() >= TLS_IMMEDIATE_STORE_SIZE
-                    && is_tls_immediate_store_encoding(&remaining[..TLS_IMMEDIATE_STORE_SIZE])
-                {
-                    image_stores.insert(TlsImmediateStoreOffset {
-                        segment_index,
-                        byte_offset,
-                    });
-                } else if remaining.len() >= 9 && is_absolute_fs_gpr_form(&remaining[..9]) {
+            for byte_offset in 0..=data.len() - TLS_IMMEDIATE_STORE_SIZE {
+                if is_tls_immediate_store_encoding(
+                    &data[byte_offset..byte_offset + TLS_IMMEDIATE_STORE_SIZE],
+                ) {
                     image_stores.insert(TlsImmediateStoreOffset {
                         segment_index,
                         byte_offset,
@@ -278,17 +280,6 @@ pub(crate) fn scan_tls_immediate_stores<'a>(
         images.push(image_stores.into_iter().collect());
     }
     Ok(TlsStoreScanPlan { images })
-}
-
-/// `64 rex.w 8b/8d /r 25 disp32` — absolute `mov`/`lea` with an FS override.
-fn is_absolute_fs_gpr_form(bytes: &[u8]) -> bool {
-    bytes.len() >= 9
-        && bytes[0] == 0x64
-        && (0x48..=0x4f).contains(&bytes[1])
-        && bytes[1] & 0x08 != 0
-        && (bytes[2] == 0x8b || bytes[2] == 0x8d)
-        && bytes[3] & 0xc7 == 0x04
-        && bytes[4] == 0x25
 }
 
 fn is_tls_immediate_store_encoding(bytes: &[u8]) -> bool {
@@ -742,6 +733,9 @@ fn patch_fs_accesses(
 
     let per_site_count = u64::try_from(per_site.len()).map_err(|_| LinkError::AddressOverflow)?;
     if per_site_count > per_site_capacity {
+        eprintln!(
+            "[REMu][TLS][FS] LOUD REFUSAL: seeded per-site helpers ({per_site_count}) exceed reserve ({per_site_capacity}); raise PER_SITE_FS_HELPER_CUSHION"
+        );
         return Err(LinkError::AddressOverflow);
     }
 
