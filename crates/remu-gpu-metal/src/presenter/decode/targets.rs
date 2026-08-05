@@ -6,13 +6,14 @@ use super::{
     CB_COLOR0_BASE, CB_COLOR0_BASE_EXT, CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1,
     CB_COLOR0_CMASK, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK, COLOR_TARGET_COUNT,
     DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_SIZE, DB_DEPTH_SIZE_XY, DB_DEPTH_SLICE,
-    DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_INFO, DB_Z_READ_BASE,
-    DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, DecodedDepthTarget,
-    DecodedRenderTarget, GuestTextureDescriptor, RenderTargetFormat, ResourceSpan,
+    DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_STENCIL_CONTROL, DB_STENCILREFMASK,
+    DB_STENCILREFMASK_BF, DB_Z_INFO, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE,
+    DB_Z_WRITE_BASE_HI, DecodedDepthTarget, DecodedRenderTarget, DecodedStencilFace,
+    DecodedStencilState, GuestTextureDescriptor, RenderTargetFormat, ResourceSpan,
     decode_scanout_target, effective_linear_pitch, guest_texture_byte_count, half_float_to_f32,
     register_value, tiled_block_dimensions, trace_target_sampling, unsigned_float_to_f32,
 };
-use metal::{MTLClearColor, MTLCompareFunction, MTLPixelFormat};
+use metal::{MTLClearColor, MTLCompareFunction, MTLPixelFormat, MTLStencilOperation};
 use remu_gpu::{GpuRegister, IndexedDraw};
 use remu_shader::PixelOutputKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -344,6 +345,8 @@ pub(crate) fn decode_render_target_state(
     let endian = info & 0x3;
     let fast_clear = (info >> 13) & 1;
     let fmask_compression = (info >> 14) & 1;
+    // SDK CxRenderTarget::BlendBypass — when set, CB_BLEND_CONTROL must not blend.
+    let blend_bypass = (info >> 16) & 1 != 0;
     let dcc_enable = (info >> 28) & 1;
     if endian != 0 || fmask_compression != 0 {
         return Err(format!(
@@ -459,6 +462,7 @@ pub(crate) fn decode_render_target_state(
         mip_level_count: max_mip + 1,
         dcc_enabled: dcc_enable != 0,
         fast_clear_enabled: fast_clear != 0,
+        blend_bypass,
     })
 }
 
@@ -622,6 +626,76 @@ pub(crate) fn decode_depth_target_without_diagnostics(
     decode_depth_target_impl(draw, false)
 }
 
+fn metal_compare_function(value: u32) -> MTLCompareFunction {
+    match value & 0x7 {
+        0 => MTLCompareFunction::Never,
+        1 => MTLCompareFunction::Less,
+        2 => MTLCompareFunction::Equal,
+        3 => MTLCompareFunction::LessEqual,
+        4 => MTLCompareFunction::Greater,
+        5 => MTLCompareFunction::NotEqual,
+        6 => MTLCompareFunction::GreaterEqual,
+        _ => MTLCompareFunction::Always,
+    }
+}
+
+fn metal_stencil_operation(value: u32, field: &str) -> Result<MTLStencilOperation, String> {
+    // SDK CxStencilOpControl ops. Metal covers Keep/Zero/Replace/Inc/Dec/Invert only.
+    match value & 0xf {
+        0 => Ok(MTLStencilOperation::Keep),
+        1 => Ok(MTLStencilOperation::Zero),
+        3 | 4 => Ok(MTLStencilOperation::Replace),
+        5 => Ok(MTLStencilOperation::IncrementClamp),
+        6 => Ok(MTLStencilOperation::DecrementClamp),
+        7 => Ok(MTLStencilOperation::Invert),
+        8 => Ok(MTLStencilOperation::IncrementWrap),
+        9 => Ok(MTLStencilOperation::DecrementWrap),
+        other => Err(format!(
+            "stencil {field} operation {other:#x} has no Metal equivalent"
+        )),
+    }
+}
+
+fn decode_stencil_state(
+    context_registers: &[GpuRegister],
+    control: u32,
+) -> Result<DecodedStencilState, String> {
+    let enabled = control & 1 != 0;
+    let separate_back = control & 0x80 != 0;
+    let op_control = register_value(context_registers, DB_STENCIL_CONTROL).unwrap_or(0);
+    let front_ref_mask = register_value(context_registers, DB_STENCILREFMASK).unwrap_or(0);
+    let back_ref_mask = register_value(context_registers, DB_STENCILREFMASK_BF)
+        .unwrap_or(front_ref_mask);
+    let front = DecodedStencilFace {
+        compare: metal_compare_function((control >> 8) & 0x7),
+        stencil_fail: metal_stencil_operation(op_control, "fail")?,
+        depth_pass: metal_stencil_operation(op_control >> 4, "zpass")?,
+        depth_fail: metal_stencil_operation(op_control >> 8, "zfail")?,
+        read_mask: (front_ref_mask >> 8) & 0xff,
+        write_mask: (front_ref_mask >> 16) & 0xff,
+    };
+    let back = if separate_back {
+        DecodedStencilFace {
+            compare: metal_compare_function((control >> 20) & 0x7),
+            stencil_fail: metal_stencil_operation(op_control >> 12, "fail-back")?,
+            depth_pass: metal_stencil_operation(op_control >> 16, "zpass-back")?,
+            depth_fail: metal_stencil_operation(op_control >> 20, "zfail-back")?,
+            read_mask: (back_ref_mask >> 8) & 0xff,
+            write_mask: (back_ref_mask >> 16) & 0xff,
+        }
+    } else {
+        front
+    };
+    Ok(DecodedStencilState {
+        enabled,
+        separate_back,
+        front,
+        back,
+        front_reference: front_ref_mask & 0xff,
+        back_reference: back_ref_mask & 0xff,
+    })
+}
+
 fn decode_depth_target_impl(
     draw: &IndexedDraw,
     emit_diagnostics: bool,
@@ -630,9 +704,17 @@ fn decode_depth_target_impl(
     let render_control =
         register_value(&draw.context_registers, DB_RENDER_CONTROL).unwrap_or_default();
     let depth_enabled = control & (1 << 1) != 0;
-    let write_enabled = control & (1 << 2) != 0;
+    let mut write_enabled = control & (1 << 2) != 0;
     let clear_enabled = render_control & 1 != 0;
+    let stencil = decode_stencil_state(&draw.context_registers, control)?;
     if !depth_enabled && !write_enabled && !clear_enabled {
+        if stencil.enabled {
+            return Err(
+                "stencil is enabled without an active depth/stencil surface; \
+                 stencil-only targets are not implemented"
+                    .to_owned(),
+            );
+        }
         return Ok(None);
     }
 
@@ -745,17 +827,11 @@ fn decode_depth_target_impl(
         .checked_mul(block_width)
         .and_then(|pitch| u32::try_from(pitch).ok())
         .ok_or("depth-target pitch overflows")?;
-    let compare = match (control >> 4) & 0x7 {
-        0 => MTLCompareFunction::Never,
-        1 => MTLCompareFunction::Less,
-        2 => MTLCompareFunction::Equal,
-        3 => MTLCompareFunction::LessEqual,
-        4 => MTLCompareFunction::Greater,
-        5 => MTLCompareFunction::NotEqual,
-        6 => MTLCompareFunction::GreaterEqual,
-        7 => MTLCompareFunction::Always,
-        _ => unreachable!("three-bit compare function"),
-    };
+    // SDK CxDepthRenderTarget::DepthWrite::kDisable lives in DB_Z_INFO bit 24.
+    if z_info & 0x0100_0000 != 0 {
+        write_enabled = false;
+    }
+    let compare = metal_compare_function((control >> 4) & 0x7);
     let clear_depth = register_value(&draw.context_registers, DB_DEPTH_CLEAR)
         .map(f32::from_bits)
         .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
@@ -807,6 +883,7 @@ fn decode_depth_target_impl(
         clear_enabled,
         clear_depth: f64::from(clear_depth),
         sample_count,
+        stencil,
     }))
 }
 

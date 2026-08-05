@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND0_CONTROL, CB_TARGET_MASK, DB_SHADER_CONTROL, DecodedRasterState, DecodedRenderTarget,
+    CB_BLEND0_CONTROL, CB_TARGET_MASK, CX_VGT_SHADER_STAGES_EN, DB_SHADER_CONTROL,
+    DEFAULT_CB_BLEND_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState,
+    DecodedRenderTarget,
     DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, PA_CL_VS_OUT_CNTL,
     PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState, SPI_SHADER_COL_FORMAT,
-    VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
+    UC_GE_CNTL, VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
@@ -366,8 +368,18 @@ impl NggSubgroupLimits {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn decode_ngg_subgroup_limits(
     context_registers: &[remu_gpu::GpuRegister],
+) -> Result<Option<NggSubgroupLimits>, String> {
+    decode_ngg_subgroup_limits_with_uc(context_registers, &[])
+}
+
+/// Decode NGG subgroup limits from Cx state, falling back to SDK `UcGeCntl` sizing when the
+/// AGC-invisible Cx offsets (0x291 / 0x2d3 / 0x2e4) were never written.
+pub(crate) fn decode_ngg_subgroup_limits_with_uc(
+    context_registers: &[remu_gpu::GpuRegister],
+    user_config_registers: &[remu_gpu::GpuRegister],
 ) -> Result<Option<NggSubgroupLimits>, String> {
     let onchip = register_value(context_registers, VGT_GS_ONCHIP_CNTL);
     let max_vert_out = register_value(context_registers, VGT_GS_MAX_VERT_OUT);
@@ -375,15 +387,32 @@ pub(crate) fn decode_ngg_subgroup_limits(
     let subgroup_control = register_value(context_registers, GE_NGG_SUBGRP_CNTL);
     let output_primitive = register_value(context_registers, VGT_GS_OUT_PRIM_TYPE);
     let instance_control = register_value(context_registers, VGT_GS_INSTANCE_CNT);
-    // AGC's ordinary graphics defaults include zero GE_MAX_OUTPUT and VGT_GS_MAX_VERT_OUT state.
-    // Only the on-chip/subgroup controls identify a programmed NGG subgroup.
-    if onchip.is_none() && subgroup_control.is_none() {
+    let stages = register_value(context_registers, CX_VGT_SHADER_STAGES_EN).unwrap_or(0x2000);
+    let ge_cntl = register_value(user_config_registers, UC_GE_CNTL).unwrap_or(0);
+    let ge_prim_group = ge_cntl & 0x1ff;
+    let ge_vert_group = (ge_cntl >> 9) & 0x1ff;
+    let gs_enabled = stages & 0x20 != 0;
+    let passthrough = stages & 0x0200_0000 != 0;
+
+    // Pure AGC statebuffers never program Cx 0x291/0x2d3/0x2e4. Derive sizing from UcGeCntl and
+    // CxVgtShaderStagesEn when those legacy Cx knobs are absent.
+    let derived_from_ge = onchip.is_none()
+        && subgroup_control.is_none()
+        && (ge_prim_group != 0 || ge_vert_group != 0 || gs_enabled || passthrough);
+    if onchip.is_none() && subgroup_control.is_none() && !derived_from_ge {
         return Ok(None);
     }
-    let onchip = onchip.ok_or("NGG state is missing VGT_GS_ONCHIP_CNTL")?;
-    let max_vert_out = max_vert_out.ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
-    let max_output = max_output.ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
-    let subgroup_control = subgroup_control.ok_or("NGG state is missing GE_NGG_SUBGRP_CNTL")?;
+    let onchip = onchip.unwrap_or_else(|| {
+        // Pack UcGeCntl group sizes into the VGT_GS_ONCHIP_CNTL field layout the limits builder
+        // already understands: ES_VERTS | GS_PRIMS<<11 | GS_INST_PRIMS<<22. With no programmed
+        // GS instance count, instance primitives equal the prim group (one invocation).
+        let prims = ge_prim_group.max(1);
+        let verts = ge_vert_group.max(1);
+        verts | (prims << 11) | (prims << 22)
+    });
+    let max_vert_out = max_vert_out.unwrap_or(ge_vert_group.max(1));
+    let max_output = max_output.unwrap_or(ge_vert_group.max(1));
+    let subgroup_control = subgroup_control.unwrap_or(ge_vert_group.max(1));
     if subgroup_control >> 9 != 0 {
         return Err(format!(
             "non-zero GE_NGG_SUBGRP_CNTL.THDS_PER_SUBGRP is not represented: {subgroup_control:#010x}"
@@ -721,8 +750,10 @@ pub(crate) const fn metal_nonindexed_vertex_count(
 }
 
 pub(crate) fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterState, String> {
-    // GFX10's reset value has FACE set and all culling/polygon-mode bits clear.
-    let control = register_value(&draw.context_registers, PA_SU_SC_MODE_CNTL).unwrap_or(1 << 2);
+    // AGC / SDK default is 0x240 (CCW front face). The old `1 << 2` (CW) fallback inverted
+    // winding for every draw whose FilteredStateBuffer suppressed a default write.
+    let control = register_value(&draw.context_registers, PA_SU_SC_MODE_CNTL)
+        .unwrap_or(DEFAULT_PA_SU_SC_MODE_CNTL);
     let cull_front = control & 1 != 0;
     let cull_back = control & 2 != 0;
     let cull_mode = match (cull_front, cull_back) {
@@ -772,10 +803,45 @@ pub(crate) fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterSta
         value => return Err(format!("reserved GFX10 polygon mode {value}")),
     };
 
+    let front_scale = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_FRONT_SCALE)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let front_offset = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_FRONT_OFFSET)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let back_scale = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_BACK_SCALE)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(front_scale);
+    let back_offset = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_BACK_OFFSET)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(front_offset);
+    let clamp = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_CLAMP)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    if front_scale != back_scale || front_offset != back_offset {
+        return Err(format!(
+            "different front/back polygon offsets have no exact Metal depth-bias state \
+             (front_scale={front_scale}, front_offset={front_offset}, \
+             back_scale={back_scale}, back_offset={back_offset})"
+        ));
+    }
+    // SDK documents scale in 1/16th units (pass 16.0 for a scale of 1.0).
+    let depth_bias = DecodedDepthBias {
+        slope_scale: front_scale / 16.0,
+        constant: front_offset,
+        clamp,
+    };
+
     Ok(DecodedRasterState {
         cull_mode,
         front_winding,
         fill_mode,
+        depth_bias,
     })
 }
 
@@ -944,7 +1010,10 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                 .any(|register| register.offset == base - 1)
         })
         .unwrap_or(0x0cc);
-    let ngg_subgroup_limits = decode_ngg_subgroup_limits(&draw.context_registers)?;
+    let ngg_subgroup_limits = decode_ngg_subgroup_limits_with_uc(
+        &draw.context_registers,
+        &draw.user_config_registers,
+    )?;
     let ngg_registers = ngg_subgroup_limits
         .map(|_| {
             decode_ngg_registers_from_state(
@@ -998,8 +1067,10 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             sample_count,
         ),
         targets: {
+            // Seeded AGC default for SPI_SHADER_COL_FORMAT is 0 (no exports). Missing after a
+            // sparse test draw also resolves to 0 — never invent a non-zero writemask format.
             let shader_color_formats =
-                register_value(&draw.context_registers, SPI_SHADER_COL_FORMAT).unwrap_or_default();
+                register_value(&draw.context_registers, SPI_SHADER_COL_FORMAT).unwrap_or(0);
             let mut targets = targets
                 .iter()
                 .map(|target| {
@@ -1016,7 +1087,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                         &draw.context_registers,
                         CB_BLEND0_CONTROL + target.guest_slot,
                     )
-                    .unwrap_or(0x2001_0001);
+                    .unwrap_or(DEFAULT_CB_BLEND_CONTROL);
                     Ok(RenderTargetPipelineState {
                         guest_slot: target.guest_slot,
                         pixel_format: target.texture.pixel_format,
@@ -1029,12 +1100,16 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                         } else {
                             target.write_mask
                         },
-                        blend: decode_metal_blend_attachment(control).map_err(|error| {
-                            format!(
-                                "color target {} has invalid CB_BLEND_CONTROL={control:#010x}: {error}",
-                                target.guest_slot
-                            )
-                        })?,
+                        blend: if target.blend_bypass {
+                            disabled_metal_blend_attachment()
+                        } else {
+                            decode_metal_blend_attachment(control).map_err(|error| {
+                                format!(
+                                    "color target {} has invalid CB_BLEND_CONTROL={control:#010x}: {error}",
+                                    target.guest_slot
+                                )
+                            })?
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;

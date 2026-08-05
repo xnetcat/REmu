@@ -15,7 +15,7 @@ use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
 use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
-    MTLResourceOptions, SamplerState,
+    MTLResourceOptions, SamplerState, StencilDescriptor,
 };
 use remu_memory::{
     GuestSharedBackingRange, GuestSharedMappingIdentity, guest_shared_backing_identity,
@@ -315,13 +315,49 @@ impl MetalPresenter {
             MTLCompareFunction::Always
         };
         let write_enabled = depth.write_enabled && !depth.clear_enabled;
-        let key = (compare as u64, write_enabled);
+        let stencil = depth.stencil;
+        let key = super::DepthStencilCacheKey {
+            compare: compare as u64,
+            write_enabled,
+            stencil_enabled: stencil.enabled,
+            separate_back: stencil.separate_back,
+            front_compare: stencil.front.compare as u64,
+            front_fail: stencil.front.stencil_fail as u64,
+            front_depth_fail: stencil.front.depth_fail as u64,
+            front_depth_pass: stencil.front.depth_pass as u64,
+            front_read_mask: stencil.front.read_mask,
+            front_write_mask: stencil.front.write_mask,
+            back_compare: stencil.back.compare as u64,
+            back_fail: stencil.back.stencil_fail as u64,
+            back_depth_fail: stencil.back.depth_fail as u64,
+            back_depth_pass: stencil.back.depth_pass as u64,
+            back_read_mask: stencil.back.read_mask,
+            back_write_mask: stencil.back.write_mask,
+        };
         if let Some(state) = self.depth_stencil_cache.get(&key) {
             return state.clone();
         }
         let descriptor = DepthStencilDescriptor::new();
         descriptor.set_depth_compare_function(compare);
         descriptor.set_depth_write_enabled(write_enabled);
+        if stencil.enabled {
+            let front = StencilDescriptor::new();
+            front.set_stencil_compare_function(stencil.front.compare);
+            front.set_stencil_failure_operation(stencil.front.stencil_fail);
+            front.set_depth_failure_operation(stencil.front.depth_fail);
+            front.set_depth_stencil_pass_operation(stencil.front.depth_pass);
+            front.set_read_mask(stencil.front.read_mask);
+            front.set_write_mask(stencil.front.write_mask);
+            descriptor.set_front_face_stencil(Some(&front));
+            let back = StencilDescriptor::new();
+            back.set_stencil_compare_function(stencil.back.compare);
+            back.set_stencil_failure_operation(stencil.back.stencil_fail);
+            back.set_depth_failure_operation(stencil.back.depth_fail);
+            back.set_depth_stencil_pass_operation(stencil.back.depth_pass);
+            back.set_read_mask(stencil.back.read_mask);
+            back.set_write_mask(stencil.back.write_mask);
+            descriptor.set_back_face_stencil(Some(&back));
+        }
         let state = device.new_depth_stencil_state(&descriptor);
         self.depth_stencil_cache.insert(key, state.clone());
         state

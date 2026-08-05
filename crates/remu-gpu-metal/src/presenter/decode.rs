@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    DecodedDepthTarget, DecodedImageDescriptor, DecodedRasterState, DecodedRenderTarget,
+    DecodedDepthBias, DecodedDepthTarget, DecodedImageDescriptor, DecodedRasterState,
+    DecodedRenderTarget, DecodedStencilFace, DecodedStencilState,
     DepthTargetPipelineState, DisplayConfiguration, GraphicsDiagnosticPipelineState,
     GraphicsPipelineKey, GraphicsShaderResourceKey, GuestScissor, GuestTextureDescriptor,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
@@ -45,7 +46,8 @@ pub(crate) use self::pipeline::{
 #[cfg(test)]
 pub(crate) use self::pipeline::{
     apply_transparent_premultiplied_fill_clear, decode_ngg_registers_from_state,
-    decode_ngg_subgroup_limits, disabled_metal_blend_attachment, graphics_shader_resource_key,
+    decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc,
+    disabled_metal_blend_attachment, graphics_shader_resource_key,
     is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
     ngg_fullscreen_cover_draw,
 };
@@ -92,7 +94,37 @@ pub(super) const DB_SHADER_CONTROL: u32 = 0x203;
 
 pub(super) const PA_SU_SC_MODE_CNTL: u32 = 0x205;
 
+/// SDK / AGC v10 default for `PA_SU_SC_MODE_CNTL`: FACE clear → CCW front face (`0x240`).
+pub(super) const DEFAULT_PA_SU_SC_MODE_CNTL: u32 = 0x240;
+
 pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
+
+/// AGC `CxVgtShaderStagesEn` (written by shader specials / state buffers).
+pub(super) const CX_VGT_SHADER_STAGES_EN: u32 = 0x2d5;
+
+/// AGC `UcGeCntl` — NGG primitive/vertex group sizing (Uc 0x25b).
+pub(super) const UC_GE_CNTL: u32 = 0x25b;
+
+/// AGC `UcIndexOffset` — GFX10 `VGT_INDEX_OFFSET` (Uc 0x24a). Applied in the runtime draw
+/// snapshot (`base_vertex`); kept here so the Metal decoder and docs share one offset table.
+#[allow(dead_code)]
+pub(super) const UC_INDEX_OFFSET: u32 = 0x24a;
+
+/// Polygon-offset / depth-bias registers (`CxPolygonOffset*`).
+#[allow(dead_code)]
+pub(super) const PA_SU_POLY_OFFSET_DB_FMT_CNTL: u32 = 0x2de;
+pub(super) const PA_SU_POLY_OFFSET_CLAMP: u32 = 0x2df;
+pub(super) const PA_SU_POLY_OFFSET_FRONT_SCALE: u32 = 0x2e0;
+pub(super) const PA_SU_POLY_OFFSET_FRONT_OFFSET: u32 = 0x2e1;
+pub(super) const PA_SU_POLY_OFFSET_BACK_SCALE: u32 = 0x2e2;
+pub(super) const PA_SU_POLY_OFFSET_BACK_OFFSET: u32 = 0x2e3;
+
+/// Stencil control registers.
+pub(super) const DB_STENCIL_CONTROL: u32 = 0x10b;
+pub(super) const DB_STENCILREFMASK: u32 = 0x10c;
+pub(super) const DB_STENCILREFMASK_BF: u32 = 0x10d;
+
+pub(super) const DEFAULT_CB_BLEND_CONTROL: u32 = 0x2001_0001;
 
 /// GFX10 `GE_MAX_OUTPUT_PER_SUBGROUP`.
 pub(super) const GE_MAX_OUTPUT_PER_SUBGROUP: u32 = 0x1ff;
@@ -271,66 +303,59 @@ pub(super) fn intersect_scissor_pair(
 
 pub(super) fn decode_viewport(
     draw: &IndexedDraw,
-    target_width: u32,
-    target_height: u32,
-    scissor: GuestScissor,
+    _target_width: u32,
+    _target_height: u32,
+    _scissor: GuestScissor,
 ) -> MTLViewport {
-    let mut minimum_depth = 0.0_f32;
-    let mut maximum_depth = 1.0_f32;
-    if let (Some(minimum), Some(maximum)) = (
-        register_value(&draw.context_registers, 0x0b4).map(f32::from_bits),
-        register_value(&draw.context_registers, 0x0b5).map(f32::from_bits),
-    ) && minimum.is_finite()
-        && maximum.is_finite()
-        && maximum > minimum
-    {
-        minimum_depth = minimum;
-        maximum_depth = maximum;
-    }
-    let programmed = [0x10f, 0x110, 0x111, 0x112]
-        .map(|register| register_value(&draw.context_registers, register).map(f32::from_bits));
-    if let [Some(x_scale), Some(x_offset), Some(y_scale), Some(y_offset)] = programmed
-        && [x_scale, x_offset, y_scale, y_offset]
-            .into_iter()
-            .all(f32::is_finite)
-        && x_scale > 0.0
-        && y_scale != 0.0
-    {
-        let mut origin_y = y_offset - y_scale;
-        let mut height = y_scale * 2.0;
-        // Metal only accepts a positive viewport height. Its upper-left framebuffer coordinates
-        // already retain the guest's screen-space winding for a negative VPORT_YSCALE, so the
-        // PA_SU_SC_MODE_CNTL front-face value must be passed through unchanged. Flipping both the
-        // height and front-face state double-inverts UE fullscreen geometry and culls every
-        // fragment when back-face culling is enabled.
-        if height < 0.0 {
-            origin_y += height;
-            height = -height;
-        }
-        return MTLViewport {
-            originX: f64::from(x_offset - x_scale),
-            originY: f64::from(origin_y),
-            width: f64::from(x_scale * 2.0),
-            height: f64::from(height),
-            znear: f64::from(minimum_depth),
-            zfar: f64::from(maximum_depth),
-        };
-    }
-    let (x, y, width, height) = match scissor {
-        GuestScissor::Rect(rect) => (rect.x, rect.y, rect.width, rect.height),
-        GuestScissor::Full | GuestScissor::Empty => {
-            (0, 0, u64::from(target_width), u64::from(target_height))
-        }
+    // AGC defaults: VPORT_ZMIN/ZMAX = 0/0. Do not expand that to 0/1.
+    let minimum_depth = register_value(&draw.context_registers, 0x0b4)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let maximum_depth = register_value(&draw.context_registers, 0x0b5)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let maximum_depth = if maximum_depth < minimum_depth {
+        minimum_depth
+    } else {
+        maximum_depth
     };
+    // AGC defaults: XSCALE/YSCALE = 1.0, offsets = 0. Never invent a full-target viewport.
+    const DEFAULT_SCALE: f32 = 1.0;
+    let x_scale = register_value(&draw.context_registers, 0x10f)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite() && *value != 0.0)
+        .unwrap_or(DEFAULT_SCALE);
+    let x_offset = register_value(&draw.context_registers, 0x110)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let y_scale = register_value(&draw.context_registers, 0x111)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite() && *value != 0.0)
+        .unwrap_or(DEFAULT_SCALE);
+    let y_offset = register_value(&draw.context_registers, 0x112)
+        .map(f32::from_bits)
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0);
+    let mut origin_y = y_offset - y_scale;
+    let mut height = y_scale * 2.0;
+    // Metal only accepts a positive viewport height. Its upper-left framebuffer coordinates
+    // already retain the guest's screen-space winding for a negative VPORT_YSCALE, so the
+    // PA_SU_SC_MODE_CNTL front-face value must be passed through unchanged. Flipping both the
+    // height and front-face state double-inverts UE fullscreen geometry and culls every
+    // fragment when back-face culling is enabled. (Verified: do not reintroduce the
+    // pre-6a082b1 winding compensation.)
+    if height < 0.0 {
+        origin_y += height;
+        height = -height;
+    }
     MTLViewport {
-        #[allow(clippy::cast_precision_loss)]
-        originX: x as f64,
-        #[allow(clippy::cast_precision_loss)]
-        originY: y as f64,
-        #[allow(clippy::cast_precision_loss)]
-        width: width as f64,
-        #[allow(clippy::cast_precision_loss)]
-        height: height as f64,
+        originX: f64::from(x_offset - x_scale.abs()),
+        originY: f64::from(origin_y),
+        width: f64::from(x_scale.abs() * 2.0),
+        height: f64::from(height),
         znear: f64::from(minimum_depth),
         zfar: f64::from(maximum_depth),
     }
@@ -344,9 +369,11 @@ pub(super) fn register_value(registers: &[GpuRegister], offset: u32) -> Option<u
 }
 
 pub(super) fn pixel_input_controls(registers: &[GpuRegister]) -> [u32; 32] {
+    // AGC default for every `SPI_PS_INPUT_CNTL_n` / `CxPsShaderUsage` slot is 0 — never the
+    // logical index. Identity remaps were a wrong absence fallback that scrambled interpolants.
     std::array::from_fn(|index| {
         let index = u32::try_from(index).expect("PS input-control index fits u32");
-        register_value(registers, SPI_PS_INPUT_CNTL_0 + index).unwrap_or(index)
+        register_value(registers, SPI_PS_INPUT_CNTL_0 + index).unwrap_or(0)
     })
 }
 

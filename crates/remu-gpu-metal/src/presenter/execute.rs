@@ -6,6 +6,7 @@ use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
     DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO, DEFAULT_CB_COLOR_CONTROL,
+    DEFAULT_PA_SU_SC_MODE_CNTL,
     DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
@@ -1136,7 +1137,8 @@ impl MetalPresenter {
                     register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default(),
                     register_value(&draw.context_registers, DB_Z_INFO).unwrap_or_default(),
                     register_value(&draw.context_registers, DB_DEPTH_SIZE_XY).unwrap_or_default(),
-                    register_value(&draw.context_registers, PA_SU_SC_MODE_CNTL).unwrap_or(1 << 2),
+                    register_value(&draw.context_registers, PA_SU_SC_MODE_CNTL)
+                        .unwrap_or(DEFAULT_PA_SU_SC_MODE_CNTL),
                 );
                 let global_bindings = export_evaluation
                     .global_memory_bindings
@@ -1317,8 +1319,17 @@ impl MetalPresenter {
             pixel_evaluation,
             &mut pending_guest_write_ranges,
         )?;
-        let depth_stencil_state =
-            depth.map(|depth| self.cached_depth_stencil_state(&device, depth));
+        let stencil_references = depth.as_ref().map(|target| {
+            (
+                target.stencil.enabled,
+                target.stencil.front_reference,
+                target.stencil.back_reference,
+            )
+        });
+        let depth_stencil_state = depth
+            .as_ref()
+            .copied()
+            .map(|depth| self.cached_depth_stencil_state(&device, depth));
         let diagnostic_vertex_position_buffer = if diagnostic_capture_vertex_position() {
             if self.diagnostic_vertex_position_buffer.is_none() {
                 let byte_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
@@ -1570,6 +1581,13 @@ impl MetalPresenter {
                 && let Some(depth_stencil_state) = depth_stencil_state.as_ref()
             {
                 encoder.set_depth_stencil_state(depth_stencil_state);
+                if let Some((true, front_reference, back_reference)) = stencil_references {
+                    encoder.set_stencil_front_back_reference_value(front_reference, back_reference);
+                }
+            }
+            let bias = raster.depth_bias;
+            if bias.slope_scale != 0.0 || bias.constant != 0.0 || bias.clamp != 0.0 {
+                encoder.set_depth_bias(bias.constant, bias.slope_scale, bias.clamp);
             }
             encoder.set_blend_color(
                 f32::from_bits(

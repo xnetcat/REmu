@@ -71,6 +71,7 @@ pub(crate) fn decode_scanout_target(
         mip_level_count: 1,
         dcc_enabled: false,
         fast_clear_enabled: false,
+        blend_bypass: false,
     })
 }
 

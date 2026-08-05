@@ -16,7 +16,8 @@ use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
-    DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthTarget, DecodedRasterState, GuestScissor,
+    DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthBias, DecodedDepthTarget, DecodedRasterState,
+    DecodedStencilState, GuestScissor,
     GuestTextureDescriptor, MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType,
     NggSubgroupLimits, PA_SU_SC_MODE_CNTL, RenderTargetPipelineState, SPI_PS_INPUT_CNTL_0,
     append_color_target_registers, append_depth_target_registers,
@@ -25,7 +26,8 @@ use super::{
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
     decode_metal_blend_attachment, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
-    decode_raster_state, decode_render_target_format, decode_render_targets_from_registers,
+    decode_ngg_subgroup_limits_with_uc, decode_raster_state, decode_render_target_format,
+    decode_render_targets_from_registers,
     decode_scissor, decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch,
     fragmentless_pixel_program, graphics_pipeline_key, guest_texture_byte_count,
     guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
@@ -314,11 +316,8 @@ fn fast_clear_elimination_decodes_mrt0_without_a_target_mask_or_shader_export() 
 }
 
 #[test]
-fn pixel_input_controls_default_to_identity_and_preserve_programmed_remaps() {
-    assert_eq!(
-        pixel_input_controls(&[]),
-        std::array::from_fn(|index| u32::try_from(index).expect("index fits u32"))
-    );
+fn pixel_input_controls_default_to_zero_and_preserve_programmed_remaps() {
+    assert_eq!(pixel_input_controls(&[]), [0; 32]);
     let registers = [
         GpuRegister {
             offset: SPI_PS_INPUT_CNTL_0,
@@ -332,7 +331,7 @@ fn pixel_input_controls_default_to_identity_and_preserve_programmed_remaps() {
     let controls = pixel_input_controls(&registers);
     assert_eq!(controls[0], 4);
     assert_eq!(controls[1], 0x220);
-    assert_eq!(controls[2], 2);
+    assert_eq!(controls[2], 0);
 }
 
 #[test]
@@ -537,9 +536,10 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
         .find(|register| register.offset == DB_DEPTH_CONTROL)
         .expect("depth control")
         .value = 0x771;
-    assert_eq!(
-        decode_depth_target(&draw).expect("stencil-only state is valid"),
-        None
+    assert!(
+        decode_depth_target(&draw)
+            .expect_err("stencil-only without a depth/stencil surface must refuse")
+            .contains("stencil is enabled without an active depth/stencil surface")
     );
 
     draw.context_registers
@@ -617,6 +617,96 @@ fn initializes_depth_to_the_far_value_for_the_active_comparison() {
 }
 
 #[test]
+fn absent_pa_su_sc_mode_cntl_uses_sdk_ccw_default() {
+    let draw = indexed_draw(0, 0, 0);
+    assert_eq!(
+        decode_raster_state(&draw).expect("default raster state"),
+        DecodedRasterState {
+            cull_mode: MTLCullMode::None,
+            front_winding: MTLWinding::CounterClockwise,
+            fill_mode: MTLTriangleFillMode::Fill,
+            depth_bias: DecodedDepthBias::default(),
+        }
+    );
+}
+
+#[test]
+fn absent_viewport_registers_use_agc_unit_scale_and_zero_depth_range() {
+    let draw = indexed_draw(0, 0, 0);
+    let viewport = decode_viewport(&draw, 1_920, 1_080, GuestScissor::Full);
+    assert_eq!(viewport.originX, -1.0);
+    assert_eq!(viewport.originY, -1.0);
+    assert_eq!(viewport.width, 2.0);
+    assert_eq!(viewport.height, 2.0);
+    assert_eq!(viewport.znear, 0.0);
+    assert_eq!(viewport.zfar, 0.0);
+}
+
+#[test]
+fn decodes_polygon_offset_depth_bias_in_sdk_sixteenth_units() {
+    let mut draw = indexed_draw(0, 0, 0);
+    draw.context_registers.extend([
+        GpuRegister {
+            offset: 0x2e0,
+            value: f32::to_bits(16.0),
+        },
+        GpuRegister {
+            offset: 0x2e1,
+            value: f32::to_bits(2.0),
+        },
+        GpuRegister {
+            offset: 0x2df,
+            value: f32::to_bits(0.25),
+        },
+    ]);
+    draw.context_registers
+        .sort_unstable_by_key(|register| register.offset);
+    let raster = decode_raster_state(&draw).expect("polygon offset raster state");
+    assert_eq!(raster.depth_bias.slope_scale, 1.0);
+    assert_eq!(raster.depth_bias.constant, 2.0);
+    assert_eq!(raster.depth_bias.clamp, 0.25);
+}
+
+#[test]
+fn blend_bypass_in_cb_color_info_disables_metal_blend() {
+    let mut registers = Vec::new();
+    append_color_target_registers(&mut registers, 0, 0x0070_1000_0000, 64, 64, 10, 0, 27);
+    registers.push(GpuRegister {
+        offset: CB_TARGET_MASK,
+        value: 0xf,
+    });
+    // CB_COLOR_INFO bit 16 = BlendBypass.
+    registers
+        .iter_mut()
+        .find(|register| register.offset == CB_COLOR0_INFO)
+        .expect("MRT0 info")
+        .value |= 1 << 16;
+    registers.sort_unstable_by_key(|register| register.offset);
+    let targets = decode_render_targets_from_registers(&registers, 0xf)
+        .expect("blend-bypass color target");
+    assert!(targets[0].blend_bypass);
+}
+
+#[test]
+fn derives_ngg_subgroup_limits_from_uc_ge_cntl_when_cx_sizing_absent() {
+    // UcGeCntl: PRIM_GRP_SIZE=8, VERT_GRP_SIZE=16 → packed fields used by the limits builder.
+    let limits = decode_ngg_subgroup_limits_with_uc(
+        &[GpuRegister {
+            offset: 0x2d5,
+            value: 0x2000,
+        }],
+        &[GpuRegister {
+            offset: 0x25b,
+            value: 8 | (16 << 9),
+        }],
+    )
+    .expect("UcGeCntl-derived NGG is representable")
+    .expect("UcGeCntl-derived NGG is present");
+    assert_eq!(limits.es_vertices_per_subgroup, 16);
+    assert_eq!(limits.gs_primitives_per_subgroup, 8);
+}
+
+#[test]
 fn decodes_observed_clockwise_back_face_culling() {
     let mut draw = indexed_draw(0, 0, 0);
     draw.context_registers.push(GpuRegister {
@@ -630,6 +720,7 @@ fn decodes_observed_clockwise_back_face_culling() {
             cull_mode: MTLCullMode::Back,
             front_winding: MTLWinding::Clockwise,
             fill_mode: MTLTriangleFillMode::Fill,
+            depth_bias: DecodedDepthBias::default(),
         }
     );
 }
@@ -668,6 +759,7 @@ fn negative_height_viewport_keeps_sdk_front_face_for_metal() {
             cull_mode: MTLCullMode::Back,
             front_winding: MTLWinding::Clockwise,
             fill_mode: MTLTriangleFillMode::Fill,
+                    depth_bias: DecodedDepthBias::default(),
         }
     );
     let viewport = decode_viewport(&draw, 1_920, 1_080, GuestScissor::Full);
@@ -748,6 +840,7 @@ fn promotes_small_depth_target_to_the_color_framebuffer_extent() {
         clear_enabled: false,
         clear_depth: 1.0,
         sample_count: 1,
+            stencil: DecodedStencilState::default(),
     };
 
     let promoted = presenter
@@ -820,6 +913,7 @@ fn promotes_layered_depth_target_without_collapsing_its_slices() {
         clear_enabled: false,
         clear_depth: 1.0,
         sample_count: 1,
+            stencil: DecodedStencilState::default(),
     };
 
     let promoted = presenter

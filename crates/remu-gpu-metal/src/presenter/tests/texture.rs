@@ -3827,6 +3827,7 @@ fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
         mip_level_count: 1,
         dcc_enabled: false,
         fast_clear_enabled: false,
+            blend_bypass: false,
     };
 
     let (_sender, receiver) = std::sync::mpsc::channel();

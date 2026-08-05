@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use metal::{
     BinaryArchive, Buffer, CommandBuffer, ComputeCommandEncoder, ComputePipelineState,
     DepthStencilState, Device, Function, MTLBlendFactor, MTLBlendOperation, MTLCompareFunction,
-    MTLCullMode, MTLPixelFormat, MTLPrimitiveTopologyClass, MTLScissorRect, MTLTriangleFillMode,
-    MTLWinding, MetalLayer, RenderCommandEncoder, RenderPipelineState, SamplerState, Texture,
+    MTLCullMode, MTLPixelFormat, MTLPrimitiveTopologyClass, MTLScissorRect, MTLStencilOperation,
+    MTLTriangleFillMode, MTLWinding, MetalLayer, RenderCommandEncoder, RenderPipelineState,
+    SamplerState, Texture,
 };
 use remu_gpu::{
     ComputeDispatch, GpuEvent, GpuFlipWait, GpuMemoryRelease, GpuMemoryWait, GpuMemoryWrite,
@@ -48,8 +49,9 @@ use self::decode::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_BLEND0_CONTROL,
     CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
     CB_TARGET_MASK, ColorOperationMode, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
-    DEFAULT_CB_COLOR_CONTROL, NGG_MESHLET_WORDS_PER_GROUP, PA_SC_AA_MASK_X0Y0_X1Y0,
-    PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, color_operation_is_raster_noop,
+    DEFAULT_CB_COLOR_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, NGG_MESHLET_WORDS_PER_GROUP,
+    PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
+    color_operation_is_raster_noop,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
     decode_image_descriptor, decode_image_descriptor_without_diagnostics,
@@ -72,7 +74,8 @@ use self::decode::{
     VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
     apply_transparent_premultiplied_fill_clear, common_render_target_array_length,
     decode_fast_clear_color, decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
-    decode_render_targets_from_registers, decode_scanout_target, disabled_metal_blend_attachment,
+    decode_ngg_subgroup_limits_with_uc, decode_render_targets_from_registers, decode_scanout_target,
+    disabled_metal_blend_attachment,
     graphics_shader_resource_key, initial_depth_clear_value,
     is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
     ngg_fullscreen_cover_draw, pixel_input_controls, raw_video_out_layout_is_linear,
@@ -704,6 +707,8 @@ struct DecodedRenderTarget {
     mip_level_count: u32,
     dcc_enabled: bool,
     fast_clear_enabled: bool,
+    /// `CB_COLOR_INFO.BLEND_BYPASS` — SDK requires this for integer targets.
+    blend_bypass: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -712,6 +717,47 @@ struct DiagnosticScanoutWriter {
     export_shader: u64,
     pixel_shader: u64,
     queue_id: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DecodedStencilFace {
+    compare: MTLCompareFunction,
+    stencil_fail: MTLStencilOperation,
+    depth_fail: MTLStencilOperation,
+    depth_pass: MTLStencilOperation,
+    read_mask: u32,
+    write_mask: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DecodedStencilState {
+    enabled: bool,
+    separate_back: bool,
+    front: DecodedStencilFace,
+    back: DecodedStencilFace,
+    front_reference: u32,
+    back_reference: u32,
+}
+
+impl Default for DecodedStencilState {
+    fn default() -> Self {
+        let face = DecodedStencilFace {
+            compare: MTLCompareFunction::Never,
+            stencil_fail: MTLStencilOperation::Keep,
+            depth_fail: MTLStencilOperation::Keep,
+            depth_pass: MTLStencilOperation::Keep,
+            read_mask: 0,
+            write_mask: 0,
+        };
+        Self {
+            enabled: false,
+            separate_back: false,
+            front: face,
+            back: face,
+            front_reference: 0,
+            back_reference: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -726,6 +772,44 @@ struct DecodedDepthTarget {
     clear_enabled: bool,
     clear_depth: f64,
     sample_count: u32,
+    stencil: DecodedStencilState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DecodedDepthBias {
+    slope_scale: f32,
+    constant: f32,
+    clamp: f32,
+}
+
+impl Default for DecodedDepthBias {
+    fn default() -> Self {
+        Self {
+            slope_scale: 0.0,
+            constant: 0.0,
+            clamp: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct DepthStencilCacheKey {
+    compare: u64,
+    write_enabled: bool,
+    stencil_enabled: bool,
+    separate_back: bool,
+    front_compare: u64,
+    front_fail: u64,
+    front_depth_fail: u64,
+    front_depth_pass: u64,
+    front_read_mask: u32,
+    front_write_mask: u32,
+    back_compare: u64,
+    back_fail: u64,
+    back_depth_fail: u64,
+    back_depth_pass: u64,
+    back_read_mask: u32,
+    back_write_mask: u32,
 }
 
 fn consume_depth_metadata_clear(states: &mut HashMap<u64, bool>, address: Option<u64>) -> bool {
@@ -774,11 +858,12 @@ fn rearm_color_metadata_clear(states: &mut HashMap<u64, u32>, address: u64) -> b
     true
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct DecodedRasterState {
     cull_mode: MTLCullMode,
     front_winding: MTLWinding,
     fill_mode: MTLTriangleFillMode,
+    depth_bias: DecodedDepthBias,
 }
 
 struct DirectScanoutTexture {
@@ -2330,7 +2415,7 @@ struct MetalPresenter {
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
     next_sampled_texture_use: u64,
     sampler_argument_cache: HashMap<SamplerArgumentCacheKey, CachedSamplerArguments>,
-    depth_stencil_cache: HashMap<(u64, bool), DepthStencilState>,
+    depth_stencil_cache: HashMap<DepthStencilCacheKey, DepthStencilState>,
     global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
     transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
     guest_global_buffer_cache: HashMap<(GuestSharedMappingIdentity, usize), Buffer>,
