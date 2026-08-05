@@ -81,17 +81,20 @@ pub(super) fn start_display_link(waker: winit::event_loop::EventLoopProxy<()>) {
     // context, and a start on the created link, all checked for CoreVideo's kCVReturnSuccess.
     unsafe {
         if CVDisplayLinkCreateWithActiveCGDisplays(&raw mut link) != 0 || link.is_null() {
+            remu_gpu::set_display_mode(remu_gpu::DisplayMode::Synthetic);
             eprintln!("[REMu][METAL] display link unavailable; vblank timebase stays synthetic");
             return;
         }
         if CVDisplayLinkSetOutputCallback(link, display_link_fired, context) != 0
             || CVDisplayLinkStart(link) != 0
         {
+            remu_gpu::set_display_mode(remu_gpu::DisplayMode::Synthetic);
             eprintln!(
                 "[REMu][METAL] display link refused to start; vblank timebase stays synthetic"
             );
             return;
         }
     }
+    remu_gpu::set_display_mode(remu_gpu::DisplayMode::CvDisplayLink);
     eprintln!("[REMu][METAL] display link started; presentation paces on the vblank timebase");
 }

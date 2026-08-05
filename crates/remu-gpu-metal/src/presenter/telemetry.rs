@@ -209,6 +209,9 @@ fn write_run_json(directory: &Path, device_name: &str) -> std::io::Result<()> {
     let executable = std::env::current_exe()
         .map(|path| path.display().to_string())
         .unwrap_or_else(|_| "unknown".to_owned());
+    let loadavg = host_loadavg_string();
+    let display_mode = remu_gpu::display_mode_label();
+    let dirty_tree = revision.contains("-dirty");
     let record = telemetry_record_json(&[
         ("schema", TelemetryValue::from(RUN_SCHEMA)),
         ("pid", TelemetryValue::from(u64::from(std::process::id()))),
@@ -219,8 +222,43 @@ fn write_run_json(directory: &Path, device_name: &str) -> std::io::Result<()> {
         ("revision", TelemetryValue::from(revision.as_str())),
         ("executable", TelemetryValue::from(executable.as_str())),
         ("device", TelemetryValue::from(device_name)),
+        ("vm_loadavg", TelemetryValue::from(loadavg.as_str())),
+        ("display_mode", TelemetryValue::from(display_mode)),
+        (
+            "dirty_tree",
+            TelemetryValue::from(if dirty_tree { 1_u64 } else { 0 }),
+        ),
+        (
+            "evidence_status",
+            TelemetryValue::from(if dirty_tree {
+                "dirty-tree-not-evidence"
+            } else {
+                "clean"
+            }),
+        ),
     ]);
     std::fs::write(directory.join("run.json"), format!("{record}\n"))
+}
+
+/// Host load average for the run record (evidence hygiene). Prefer the value `run-game.sh`
+/// already sampled into `REMU_HOST_LOADAVG`; otherwise ask the kernel via `getloadavg`.
+fn host_loadavg_string() -> String {
+    if let Ok(value) = std::env::var("REMU_HOST_LOADAVG")
+        && !value.is_empty()
+        && value != "unknown"
+    {
+        return value;
+    }
+    #[cfg(unix)]
+    {
+        let mut loads = [0.0_f64; 3];
+        // SAFETY: `loads` is a valid three-element buffer for getloadavg.
+        let count = unsafe { libc::getloadavg(loads.as_mut_ptr(), 3) };
+        if count == 3 {
+            return format!("{:.2} {:.2} {:.2}", loads[0], loads[1], loads[2]);
+        }
+    }
+    "unknown".to_owned()
 }
 
 /// Numeric and text payloads for the eighteen non-title audit PERF channels (plan K3).

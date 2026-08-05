@@ -345,9 +345,26 @@ if [ "${REMU_METAL_HUD_LOG:-0}" = 1 ]; then
 fi
 revision=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo unknown)
 # A commit name for a tree with uncommitted changes describes a build that was never committed.
+dirty_tree=0
 if [ "$revision" != unknown ] && ! git -C "$repo_dir" diff-index --quiet HEAD -- 2>/dev/null; then
     revision="$revision-dirty"
+    dirty_tree=1
 fi
+# Evidence runs (FPS, crash n>=5, shader-opcode backlog) require a clean tree. Dirty launches are
+# still allowed for interactive debugging when REMU_ALLOW_DIRTY_EVIDENCE=1, but they are tagged.
+if [ "$dirty_tree" = 1 ]; then
+    if [ "${REMU_ALLOW_DIRTY_EVIDENCE:-0}" != 1 ]; then
+        echo "error: refusing evidence run on a dirty tree (revision=$revision)." >&2
+        echo "commit or stash changes first, or set REMU_ALLOW_DIRTY_EVIDENCE=1 to launch with a loud non-evidence tag." >&2
+        exit 78
+    fi
+    echo "[REMu] WARNING: dirty-tree launch — this run is NOT evidence (revision=$revision)" >&2
+    echo "dirty-tree-not-evidence" > "$run_dir/EVIDENCE-REFUSED.txt"
+fi
+host_loadavg=$(sysctl -n vm.loadavg 2>/dev/null || echo unknown)
+echo "[REMu] host vm.loadavg: $host_loadavg"
+REMU_HOST_LOADAVG=$host_loadavg
+export REMU_HOST_LOADAVG
 # The runner appends structured per-window records (telemetry.jsonl) and a run description
 # (run.json) into the run directory when these are exported (plan E4).
 REMU_RUN_DIR=$run_dir

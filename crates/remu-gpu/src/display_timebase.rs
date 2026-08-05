@@ -9,7 +9,7 @@
 //! consumer keeps its synthetic fallback, so publishing here is strictly additive.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::time::Instant;
 
 static VBLANK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -22,6 +22,34 @@ pub fn monotonic_nanos() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
     u64::try_from(epoch.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Display pacing source stamped into `run.json` (Phase 0 evidence hygiene).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum DisplayMode {
+    /// No link has reported a mode yet.
+    Unknown = 0,
+    /// CoreVideo `CVDisplayLink` is driving the vblank timebase.
+    CvDisplayLink = 1,
+    /// Link unavailable or refused; pacing falls back to a synthetic period.
+    Synthetic = 2,
+}
+
+static DISPLAY_MODE: AtomicU8 = AtomicU8::new(DisplayMode::Unknown as u8);
+
+/// Records how presentation is paced for this process.
+pub fn set_display_mode(mode: DisplayMode) {
+    DISPLAY_MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// Returns the current display pacing mode label for `run.json`.
+pub fn display_mode_label() -> &'static str {
+    match DISPLAY_MODE.load(Ordering::Relaxed) {
+        x if x == DisplayMode::CvDisplayLink as u8 => "cvdisplaylink",
+        x if x == DisplayMode::Synthetic as u8 => "synthetic",
+        _ => "unknown",
+    }
 }
 
 /// Records one hardware vblank observed by the display link.
