@@ -20,7 +20,7 @@ use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_
 
 mod signal;
 pub use signal::GuestReadMaterializer;
-use signal::install_fault_handlers;
+pub use signal::{install_fault_handlers, install_thread_signal_stack};
 
 /// Registers the process-global read-watch materializer used by [`CpuWriteWatch::new_read_materialized`].
 ///

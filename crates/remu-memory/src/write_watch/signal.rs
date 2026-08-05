@@ -90,7 +90,12 @@ static PREVIOUS_SIGBUS: PreviousAction = PreviousAction::new();
 
 static PREVIOUS_SIGSEGV: PreviousAction = PreviousAction::new();
 
-pub(super) fn install_fault_handlers() -> io::Result<()> {
+/// Installs the process SIGSEGV/SIGBUS reporter (and write-watch recovery) once.
+///
+/// Safe to call before any CPU write-watch is armed: unwatched faults are diagnosed and
+/// forwarded. Must also be paired with [`install_thread_signal_stack`] on every thread that
+/// may take a guest fault, because the handler runs with `SA_ONSTACK`.
+pub fn install_fault_handlers() -> io::Result<()> {
     // Resolve the journal's enable flag here so the handler never reads the environment.
     let _ = crate::guest_write_journal_enabled();
     let result = HANDLER_RESULT.get_or_init(|| {
@@ -101,6 +106,39 @@ pub(super) fn install_fault_handlers() -> io::Result<()> {
     result.map_err(io::Error::from_raw_os_error)
 }
 
+/// Bytes reserved for the alternate signal stack on each host thread.
+///
+/// Large enough for the allocation-free fault reporter plus a deep Metal/Rosetta frame; the
+/// kernel delivers SIGSEGV/SIGBUS here when the main stack is exhausted or corrupted.
+const SIGNAL_STACK_BYTES: usize = 256 * 1024;
+
+/// Installs an alternate signal stack for the calling thread so `SA_ONSTACK` handlers can run.
+pub fn install_thread_signal_stack() -> io::Result<()> {
+    thread_local! {
+        static SIGNAL_STACK: std::cell::RefCell<Option<Box<[u8]>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    SIGNAL_STACK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return Ok(());
+        }
+        let mut memory = vec![0_u8; SIGNAL_STACK_BYTES].into_boxed_slice();
+        // SAFETY: `memory` is uniquely owned for the life of the thread; the kernel only uses it
+        // while a signal is delivered on this thread.
+        let stack = libc::stack_t {
+            ss_sp: memory.as_mut_ptr().cast(),
+            ss_size: SIGNAL_STACK_BYTES,
+            ss_flags: 0,
+        };
+        if unsafe { libc::sigaltstack(&raw const stack, std::ptr::null_mut()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        *slot = Some(memory);
+        Ok(())
+    })
+}
+
 /// # Safety
 ///
 /// Must run exactly once (enforced by the `HANDLER_RESULT` `OnceLock` in `install_fault_handlers`)
@@ -109,7 +147,9 @@ unsafe fn install_fault_handlers_once() -> Result<(), i32> {
     // SAFETY: a zeroed sigaction is a valid base before its mask, callback and flags are set.
     let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
     action.sa_sigaction = write_fault_signal_handler as *const () as usize;
-    action.sa_flags = libc::SA_SIGINFO;
+    // SA_ONSTACK is mandatory: a stack-overflow SIGSEGV cannot be reported from the exhausted
+    // stack, and the audit found no sigaltstack anywhere in the tree before Phase 0.
+    action.sa_flags = libc::SA_SIGINFO | libc::SA_ONSTACK;
     // SAFETY: action.sa_mask is live writable storage.
     unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
     // SAFETY: both actions are valid and PREVIOUS_SIGBUS is uninitialized writable storage.
