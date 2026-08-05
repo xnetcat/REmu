@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::cell::RefCell;
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Once};
 
 use remu_shader::GuestMemoryReader;
@@ -28,6 +26,15 @@ const GUEST_MUTEX_ENTRY_CACHE_SIZE: usize = 16;
 
 #[cfg(test)]
 pub(crate) static GUEST_MUTEX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// How many host mutex entries were created on first lock/trylock without a prior
+/// `scePthreadMutexInit` — the handle-copy detector from CORE-MECHANISMS §3.
+static LAZILY_FABRICATED_MUTEXES: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the number of lazily fabricated mutex entries this process has created.
+pub(crate) fn lazily_fabricated_mutex_count() -> u64 {
+    LAZILY_FABRICATED_MUTEXES.load(Ordering::Relaxed)
+}
 
 thread_local! {
     /// Per-host-thread cache for the guest mutexes that thread is actively using.
@@ -109,6 +116,7 @@ pub(crate) fn guest_mutex_entry(address: u64, create: bool) -> Option<Arc<GuestM
         return Some(entry);
     }
     create.then(|| {
+        LAZILY_FABRICATED_MUTEXES.fetch_add(1, Ordering::Relaxed);
         let entry = Arc::new(GuestMutexEntry {
             state: Mutex::new(GuestMutexState::default()),
             wake: Condvar::new(),
