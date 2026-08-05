@@ -1326,6 +1326,45 @@ fn decodes_the_full_gfx10_image_sample_gather_lattice() {
     }
 }
 
+/// Depth comparison must follow the MIMG opcode number, not the mnemonic spelling.
+///
+/// `ImageSampleCl` (0x21, LOD clamp), `ImageSampleCd` (0x68, coarse derivatives) and
+/// `ImageGather4Cl` (0x41) all contain `SampleC`/`Gather4C` while comparing nothing, so a
+/// substring test bound a depth texture, consumed a phantom reference VGPR ahead of the
+/// coordinates and emitted a compare fetch for all three families.
+#[test]
+fn image_compare_classification_follows_the_mimg_opcode_lattice() {
+    use crate::ir::{image_is_comparison, image_sample_modifiers};
+
+    const COMPARE: &[u32] = &[
+        // IMAGE_SAMPLE_C* and IMAGE_SAMPLE_C*_O.
+        0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e,
+        0x3f, // IMAGE_GATHER4_C*.
+        0x48, 0x49, 0x4c, 0x4d, 0x4e, 0x4f, 0x58, 0x5f,
+        // IMAGE_SAMPLE_C_CD*, the compare forms of the coarse-derivative block.
+        0x6a, 0x6b, 0x6e, 0x6f,
+    ];
+    for opcode in 0x20..=0x6f_u32 {
+        let word = 0xf000_0000 | (opcode << 18);
+        let frame = decode_frame(0, &[word, 0]).expect("MIMG sample frame");
+        let Some(name) = frame.opcode.known_name() else {
+            continue;
+        };
+        if !name.starts_with("ImageSample") && !name.starts_with("ImageGather4") {
+            continue;
+        }
+        assert!(
+            image_sample_modifiers(frame.opcode).is_some(),
+            "MIMG 0x{opcode:02x} ({name}) has no address-operand lattice entry"
+        );
+        assert_eq!(
+            image_is_comparison(frame.opcode),
+            COMPARE.contains(&opcode),
+            "MIMG 0x{opcode:02x} ({name}) comparison classification"
+        );
+    }
+}
+
 #[test]
 fn decodes_benign_sopp_hint_opcodes_as_known_non_branches() {
     // SOPP hints adjust hardware wait/mode/priority state only. Every one of them previously
@@ -1862,4 +1901,61 @@ fn unknown_deterministically_framed_opcodes_decode_as_raw_instead_of_killing_the
     assert!(instruction.sources.is_empty());
     assert!(instruction.destinations.is_empty());
     assert!(instruction.control.is_none());
+}
+
+#[test]
+fn raw_vector_and_memory_opcodes_expose_no_fabricated_operands_or_control() {
+    // Framing an unknown opcode keeps the rest of the shader decodable, but its operand and
+    // modifier fields carry no meaning. Reading them would hand liveness, draw footprints and
+    // resource discovery register uses and descriptors the shader never named, which is a silent
+    // wrong answer instead of the per-opcode backend gap the raw opcode is supposed to report.
+    let cases: &[(&[u32], RawOpcodeFamily, u16)] = &[
+        // VOP3 opcode 0 with every source, destination and modifier field populated.
+        (&[0xd000_8f08, 0xe00c_0401], RawOpcodeFamily::Vop3, 0x000),
+        (&[0xcc00_8f08, 0xe00c_0401], RawOpcodeFamily::Vop3p, 0x00),
+        // DS opcode 0x3d with ADDR/DATA0/DATA1/VDST and both offsets populated.
+        (&[0xd8f4_1234, 0x0803_0201], RawOpcodeFamily::Ds, 0x3d),
+        // MUBUF opcode 0x2f with VADDR/VDATA/SRSRC/SOFFSET populated.
+        (&[0xe0bc_0000, 0x0002_0301], RawOpcodeFamily::Mubuf, 0x2f),
+        // MIMG opcode 0x80 with VADDR/VDATA/SRSRC/SSAMP and DMASK populated.
+        (&[0xf000_0f01, 0x0042_0301], RawOpcodeFamily::Mimg, 0x80),
+    ];
+    for &(words, family, code) in cases {
+        let mut stream = words.to_vec();
+        stream.push(0xbf81_0000);
+        let program = decode_program(0x1000, &stream)
+            .unwrap_or_else(|error| panic!("raw {family:?} must stay framed: {error}"));
+        let instruction = &program.instructions[0];
+        assert_eq!(
+            instruction.opcode,
+            Opcode::Raw { family, code },
+            "word 0x{:08X}",
+            words[0]
+        );
+        assert_eq!(
+            instruction.words.len(),
+            words.len(),
+            "raw {family:?} framing must stay exact"
+        );
+        assert!(
+            instruction.sources.is_empty(),
+            "raw {family:?} fabricated sources {:?}",
+            instruction.sources
+        );
+        assert!(
+            instruction.destinations.is_empty(),
+            "raw {family:?} fabricated destinations {:?}",
+            instruction.destinations
+        );
+        assert!(
+            instruction.control.is_none(),
+            "raw {family:?} fabricated control {:?}",
+            instruction.control
+        );
+        assert_eq!(
+            program.instructions[1].pc,
+            u32::try_from(words.len() * 4).expect("small raw test program"),
+            "the instruction after a raw {family:?} must stay correctly framed"
+        );
+    }
 }

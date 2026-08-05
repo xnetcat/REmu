@@ -359,6 +359,12 @@ fn create_instruction(
                 &mut control,
             );
         }
+        ShaderEncoding::Vop3 | ShaderEncoding::Vop3p if opcode.known_name().is_none() => {
+            // Same rule as raw SMRD/SMEM/FLAT: the framing is exact (`decode_vop3`/`decode_vop3p`
+            // size the instruction from the encoding word alone, including its literal), but the
+            // source, destination and modifier fields of an unknown operation mean nothing. Reading
+            // them would invent register uses that liveness, footprints and lowering then trust.
+        }
         ShaderEncoding::Vop3 => {
             let extra = words[1];
             sources.extend([
@@ -403,6 +409,10 @@ fn create_instruction(
                 clamp: word >> 15 & 1 != 0,
             }));
         }
+        ShaderEncoding::Ds if opcode.known_name().is_none() => {
+            // An unknown data-share operation has unknown ADDR/DATA/VDST roles and an unknown
+            // offset layout; fabricating them would claim LDS traffic that may not exist.
+        }
         ShaderEncoding::Ds => {
             decode_data_share(word, words[1], opcode, &mut sources, &mut destinations);
             control = Some(InstructionControl::DataShare(DataShareControl {
@@ -431,6 +441,13 @@ fn create_instruction(
                 &mut sources,
                 &mut destinations,
             ));
+        }
+        ShaderEncoding::Mubuf | ShaderEncoding::Mtbuf | ShaderEncoding::Mimg
+            if opcode.known_name().is_none() =>
+        {
+            // Buffer and image operations name a resource descriptor. Deriving one from an unknown
+            // opcode's SRSRC/SSAMP fields would hand resource discovery a binding the shader never
+            // asked for, and `memory_dword_count` returns 0 for a raw opcode anyway.
         }
         ShaderEncoding::Mubuf | ShaderEncoding::Mtbuf => {
             control = Some(decode_buffer_memory(
