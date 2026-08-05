@@ -54,6 +54,21 @@ inline uint remu_ds_smax(threadgroup atomic_uint* location, uint value) {
     }
 }
 
+inline void remu_ds_insert(threadgroup atomic_uint* location, uint offset, uint bits,
+                           uint value) {
+    // DS_WRITE_B8/B16 replace one field of a dword. Two lanes may target different fields of the
+    // same dword, so a plain load/modify/store would drop the other lane's bytes.
+    uint observed = atomic_load_explicit(location, memory_order_relaxed);
+    while (true) {
+        uint desired = insert_bits(observed, value, offset, bits);
+        uint expected = observed;
+        if (atomic_compare_exchange_weak_explicit(location, &expected, desired,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) return;
+        observed = expected;
+    }
+}
+
 inline uint remu_ds_cmpst(threadgroup atomic_uint* location, uint comparator,
                          uint replacement) {
     uint observed = atomic_load_explicit(location, memory_order_relaxed);

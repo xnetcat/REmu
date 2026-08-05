@@ -67,6 +67,12 @@ impl Compiler<'_> {
             "DsWrite2St64B32" => self.emit_ds_write_pair(instruction, control, true, 1),
             "DsWrite2B64" => self.emit_ds_write_pair(instruction, control, false, 2),
             "DsWrite2St64B64" => self.emit_ds_write_pair(instruction, control, true, 2),
+            "DsWriteB8" => self.emit_ds_write_narrow(instruction, control, 8),
+            "DsWriteB16" => self.emit_ds_write_narrow(instruction, control, 16),
+            "DsReadU8" => self.emit_ds_read_narrow(instruction, control, 8, false),
+            "DsReadI8" => self.emit_ds_read_narrow(instruction, control, 8, true),
+            "DsReadU16" => self.emit_ds_read_narrow(instruction, control, 16, false),
+            "DsReadI16" => self.emit_ds_read_narrow(instruction, control, 16, true),
             "DsReadB32" => self.emit_ds_read(instruction, control, 1),
             "DsReadB64" => self.emit_ds_read(instruction, control, 2),
             "DsReadB96" => self.emit_ds_read(instruction, control, 3),
@@ -104,6 +110,72 @@ impl Compiler<'_> {
             self.emit_ds_store_index(&index, value);
         }
         Ok(())
+    }
+
+    /// Lowers `DS_WRITE_B8` / `DS_WRITE_B16`.
+    ///
+    /// LDS is a dword-indexed `atomic_uint` array, so a sub-dword write becomes a read/insert/write
+    /// of the containing dword. The insert runs through a compare-exchange loop because lanes of the
+    /// same wave routinely pack neighbouring bytes into one dword.
+    fn emit_ds_write_narrow(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        bit_width: u32,
+    ) -> Result<(), String> {
+        if instruction.sources.len() < 2 {
+            return Err(format!("LDS {bit_width}-bit write requires ADDR and DATA0"));
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let value = self.temp("uint", &self.raw_source(instruction, 1)?);
+        let address = self.ds_address(&base, ds_combined_offset(control));
+        let index = self.temp("uint", &format!("{address} >> 2"));
+        let offset = self.narrow_bit_offset(&address, bit_width);
+        self.line(
+            3,
+            &format!(
+                "if (exec && {index} < {}u) remu_ds_insert(remu_lds + {index}, {offset}, {bit_width}u, {value});",
+                self.options.lds_size_bytes / 4
+            ),
+        );
+        Ok(())
+    }
+
+    /// Lowers `DS_READ_{I8,U8,I16,U16}` by extracting the addressed field from its dword and
+    /// extending it to the full 32-bit VGPR the ISA writes.
+    fn emit_ds_read_narrow(
+        &mut self,
+        instruction: &Instruction,
+        control: &DataShareControl,
+        bit_width: u32,
+        signed: bool,
+    ) -> Result<(), String> {
+        if instruction.sources.is_empty() || instruction.destinations.len() != 1 {
+            return Err(format!(
+                "LDS {bit_width}-bit read requires ADDR and one destination"
+            ));
+        }
+        let base = self.temp("uint", &self.raw_source(instruction, 0)?);
+        let address = self.ds_address(&base, ds_combined_offset(control));
+        let index = self.temp("uint", &format!("{address} >> 2"));
+        let offset = self.narrow_bit_offset(&address, bit_width);
+        let dword = self.emit_ds_load_index(&index);
+        let extended = if signed {
+            format!("as_type<uint>(extract_bits(as_type<int>({dword}), {offset}, {bit_width}u))")
+        } else {
+            format!("extract_bits({dword}, {offset}, {bit_width}u)")
+        };
+        self.store_vector(vector_operand(instruction.destinations[0])?, &extended);
+        Ok(())
+    }
+
+    /// Bit position of a sub-dword field inside its containing dword.
+    ///
+    /// The byte address selects the field; a 16-bit access is two-byte aligned, so its low address
+    /// bit never contributes and masking it off keeps the field from straddling the dword boundary.
+    fn narrow_bit_offset(&mut self, address: &str, bit_width: u32) -> String {
+        let byte_mask = if bit_width == 8 { 3 } else { 2 };
+        self.temp("uint", &format!("({address} & {byte_mask}u) * 8u"))
     }
 
     fn emit_ds_write_addtid(

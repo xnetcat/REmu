@@ -69,6 +69,79 @@ fn lowers_every_decoded_ds_operation_with_architectural_offsets_and_atomics() {
 }
 
 #[test]
+fn lowers_sub_dword_lds_accesses_as_field_inserts_and_extending_extracts() {
+    // DS_WRITE_B8/B16 and DS_READ_{I8,U8,I16,U16} address bytes inside the dword-indexed
+    // threadgroup array, so lowering must insert and extract the addressed field rather than
+    // overwrite or return the whole dword.
+    let mut words = Vec::new();
+    for opcode in [0x1e, 0x1f, 0x39, 0x3a, 0x3b, 0x3c] {
+        words.push(0xd800_0000 | (opcode << 18) | 0x1234);
+        words.push(1u32 | (2u32 << 8) | (3u32 << 16) | (8u32 << 24));
+    }
+    words.extend([0xbf8a_0000, 0xbf81_0000]);
+    let program = decode_program(0x1000, &words).expect("sub-dword DS program");
+    for (instruction, name) in program.instructions.iter().zip([
+        "DsWriteB8",
+        "DsWriteB16",
+        "DsReadI8",
+        "DsReadU8",
+        "DsReadI16",
+        "DsReadU16",
+    ]) {
+        assert!(instruction.opcode.is(name), "decoder must name {name}");
+    }
+
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(32 * 1024),
+    )
+    .expect("sub-dword LDS accesses should lower");
+
+    assert!(
+        shader.source.contains("remu_ds_insert(remu_lds +"),
+        "byte and half writes must insert into the containing dword"
+    );
+    assert!(
+        shader
+            .source
+            .contains("insert_bits(observed, value, offset, bits)"),
+        "the insert must be a compare-exchange so neighbouring lanes keep their bytes"
+    );
+    assert_eq!(
+        shader.source.matches("& 3u) * 8u").count(),
+        3,
+        "byte accesses select the field from the low two address bits"
+    );
+    assert_eq!(
+        shader.source.matches("& 2u) * 8u").count(),
+        3,
+        "half accesses ignore the low address bit so the field cannot straddle the dword"
+    );
+    assert_eq!(
+        shader.source.matches("remu_ds_insert(remu_lds +").count(),
+        2,
+        "one insert per sub-dword write"
+    );
+    assert!(
+        shader.source.contains(", 8u, ") && shader.source.contains(", 16u, "),
+        "field width must reach the insert helper"
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("as_type<uint>(extract_bits(as_type<int>(t")
+            .count(),
+        2,
+        "DS_READ_I8 and DS_READ_I16 must sign-extend their field"
+    );
+    assert!(
+        shader.source.contains("= extract_bits(t"),
+        "unsigned reads must zero-extend the field"
+    );
+}
+
+#[test]
 fn ds_rejects_unrepresentable_resources_instead_of_wrapping_or_privatizing_memory() {
     let memory_program = Program::new(
         0x1000,

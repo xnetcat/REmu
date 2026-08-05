@@ -95,7 +95,7 @@ fn vop3p_instruction(name: &'static str, control: Vop3pControl) -> Instruction {
     }
 }
 
-const DS_OPCODES: [(u32, &str); 44] = [
+const DS_OPCODES: [(u32, &str); 50] = [
     (0x00, "DsAddU32"),
     (0x01, "DsSubU32"),
     (0x03, "DsIncU32"),
@@ -111,6 +111,8 @@ const DS_OPCODES: [(u32, &str); 44] = [
     (0x0e, "DsWrite2B32"),
     (0x0f, "DsWrite2St64B32"),
     (0x10, "DsCmpstB32"),
+    (0x1e, "DsWriteB8"),
+    (0x1f, "DsWriteB16"),
     (0x20, "DsAddRtnU32"),
     (0x21, "DsSubRtnU32"),
     (0x23, "DsIncRtnU32"),
@@ -128,6 +130,10 @@ const DS_OPCODES: [(u32, &str); 44] = [
     (0x36, "DsReadB32"),
     (0x37, "DsRead2B32"),
     (0x38, "DsRead2St64B32"),
+    (0x39, "DsReadI8"),
+    (0x3a, "DsReadU8"),
+    (0x3b, "DsReadI16"),
+    (0x3c, "DsReadU16"),
     (0x4d, "DsWriteB64"),
     (0x4e, "DsWrite2B64"),
     (0x4f, "DsWrite2St64B64"),
