@@ -373,6 +373,13 @@ fn write_tls_helpers(memory: &mut GuestImage, helper_base: GuestAddress) -> Resu
     for destination in 0_u8..16 {
         let offset = usize::from(destination) * TLS_LOAD_HELPER_SIZE_USIZE;
         let slot = &mut helpers[offset..offset + TLS_LOAD_HELPER_SIZE_USIZE];
+        if destination == 4 {
+            // RSP is never a patched TLS load destination; leave an explicit trap in the unused
+            // slot so a bad rel32 cannot silently execute NOPs.
+            slot[0] = 0x0f;
+            slot[1] = 0x0b; // ud2
+            continue;
+        }
         encode_tls_load_helper(slot, dispatcher, destination)?;
     }
     memory.write(helper_base, &helpers)?;
@@ -974,6 +981,12 @@ mod tests {
             "load helper must match the store helper's ABI contract: {mnemonics:?}"
         );
         assert_eq!(&slot[encoded - 3..encoded], &[0xc2, 0x80, 0]);
+    }
+
+    #[test]
+    fn tls_load_helper_refuses_rsp_destination() {
+        let mut slot = [0x90_u8; super::TLS_LOAD_HELPER_SIZE_USIZE];
+        assert!(encode_tls_load_helper(&mut slot, 0x1122_3344_5566_7788, 4).is_err());
     }
 
     #[test]
