@@ -12,9 +12,9 @@ mod controls;
 mod liveness;
 
 pub use bindings::{
-    GlobalMemoryBinding, ImageBinding, ImageBindingSlotMap, ImageSignatureClass,
-    ImageViewReinterpretation, ShaderEvaluation, TextureDescriptorType, VertexInputBinding,
-    image_is_comparison,
+    GlobalMemoryBinding, ImageBinding, ImageBindingSlotMap, ImageSampleModifiers,
+    ImageSignatureClass, ImageViewReinterpretation, ShaderEvaluation, TextureDescriptorType,
+    VertexInputBinding, image_is_comparison, image_sample_modifiers,
 };
 pub use controls::{
     BufferMemoryControl, DataShareControl, Dpp8Control, DppControl, ExportControl,

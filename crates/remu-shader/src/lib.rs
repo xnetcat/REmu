@@ -30,12 +30,13 @@ pub use inline_constant::{decode_inline_constant, decode_v2f16_inline_constant};
 pub use ir::{
     BufferMemoryControl, ComputeSystemRegisters, ComputeSystemValue, DataShareControl, Dpp8Control,
     DppControl, ExportControl, GlobalMemoryBinding, GlobalMemoryControl, ImageBinding,
-    ImageBindingSlotMap, ImageControl, ImageSignatureClass, ImageViewReinterpretation, Instruction,
-    InstructionControl, InterpolationControl, Opcode, Operand, OperandKind, PixelExportFormat,
-    PixelOutputBinding, PixelOutputKind, Program, ProgramLinkError, RawOpcodeFamily, ResourceKind,
-    ResourceMapping, ScalarMemoryControl, SdwaControl, ShaderEncoding, ShaderEvaluation,
-    ShaderMetadata, ShaderState, TextureDescriptorType, VertexInputBinding, Vop3Control,
-    Vop3pControl, image_is_comparison, link_program_continuation,
+    ImageBindingSlotMap, ImageControl, ImageSampleModifiers, ImageSignatureClass,
+    ImageViewReinterpretation, Instruction, InstructionControl, InterpolationControl, Opcode,
+    Operand, OperandKind, PixelExportFormat, PixelOutputBinding, PixelOutputKind, Program,
+    ProgramLinkError, RawOpcodeFamily, ResourceKind, ResourceMapping, ScalarMemoryControl,
+    SdwaControl, ShaderEncoding, ShaderEvaluation, ShaderMetadata, ShaderState,
+    TextureDescriptorType, VertexInputBinding, Vop3Control, Vop3pControl, image_is_comparison,
+    image_sample_modifiers, link_program_continuation,
 };
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};
 pub use state::{ShaderStateError, build_shader_state};

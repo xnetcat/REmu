@@ -437,6 +437,123 @@ fn refuses_to_infer_a_continuation_without_an_explicit_setpc() {
     );
 }
 
+#[test]
+fn image_is_comparison_matches_the_exact_compare_opcode_lattice() {
+    // The GFX10 mnemonics alias under substring tests. `Cl` is a minimum-LOD clamp and `Cd` is a
+    // coarse derivative; neither compares, yet both contain `SampleC`/`Gather4C`. Reporting a
+    // comparison for them binds a depth texture, shifts every coordinate VGPR by the phantom
+    // reference operand, and emits a compare fetch.
+    for name in [
+        "ImageSampleCl",
+        "ImageSampleClO",
+        "ImageSampleCd",
+        "ImageSampleCdCl",
+        "ImageSampleCdO",
+        "ImageSampleCdClO",
+        "ImageGather4Cl",
+        "ImageGather4ClO",
+    ] {
+        assert!(
+            !image_is_comparison(Opcode::from_static(name)),
+            "{name} carries no depth comparison"
+        );
+    }
+    for name in [
+        "ImageSampleC",
+        "ImageSampleCCl",
+        "ImageSampleCD",
+        "ImageSampleCL",
+        "ImageSampleCLz",
+        "ImageSampleCBClO",
+        "ImageSampleCCd",
+        "ImageSampleCCdClO",
+        "ImageGather4C",
+        "ImageGather4CCl",
+        "ImageGather4CLzO",
+    ] {
+        assert!(
+            image_is_comparison(Opcode::from_static(name)),
+            "{name} compares against a depth reference"
+        );
+    }
+    // Non-sampled image operations and undecoded opcodes name no comparison either.
+    assert!(!image_is_comparison(Opcode::from_static("ImageLoad")));
+    assert!(!image_is_comparison(Opcode::from_static("ImageGetLod")));
+    assert!(!image_is_comparison(Opcode::raw(
+        RawOpcodeFamily::Mimg,
+        0x28
+    )));
+}
+
+#[test]
+fn image_sample_modifiers_separate_the_clamp_lod_and_derivative_families() {
+    let modifiers = |name| image_sample_modifiers(Opcode::from_static(name)).expect("known opcode");
+
+    // `Cl` is the trailing minimum-LOD clamp operand: no comparison, no explicit LOD.
+    assert_eq!(
+        modifiers("ImageSampleCl"),
+        ImageSampleModifiers {
+            lod_clamp: true,
+            ..ImageSampleModifiers::default()
+        }
+    );
+    // `CL` is a comparison plus an explicit LOD.
+    assert_eq!(
+        modifiers("ImageSampleCL"),
+        ImageSampleModifiers {
+            compare: true,
+            lod: true,
+            ..ImageSampleModifiers::default()
+        }
+    );
+    // `Cd` is a coarse derivative, `CD` a comparison plus fine derivatives.
+    assert_eq!(
+        modifiers("ImageSampleCd"),
+        ImageSampleModifiers {
+            gradients: true,
+            ..ImageSampleModifiers::default()
+        }
+    );
+    assert_eq!(
+        modifiers("ImageSampleCD"),
+        ImageSampleModifiers {
+            compare: true,
+            gradients: true,
+            ..ImageSampleModifiers::default()
+        }
+    );
+    // `Lz` needs no address operand, and `O` prepends the packed texel offset.
+    assert_eq!(
+        modifiers("ImageSampleCLzO"),
+        ImageSampleModifiers {
+            offset: true,
+            compare: true,
+            zero_lod: true,
+            ..ImageSampleModifiers::default()
+        }
+    );
+    // The full four-modifier form still separates bias from clamp.
+    assert_eq!(
+        modifiers("ImageSampleCBClO"),
+        ImageSampleModifiers {
+            offset: true,
+            bias: true,
+            compare: true,
+            lod_clamp: true,
+            ..ImageSampleModifiers::default()
+        }
+    );
+
+    assert_eq!(
+        image_sample_modifiers(Opcode::from_static("ImageLoad")),
+        None
+    );
+    assert_eq!(
+        image_sample_modifiers(Opcode::from_static("ImageGetLod")),
+        None
+    );
+}
+
 fn image_binding(dimension: u32, is_array: bool, opcode: &'static str, word3: u32) -> ImageBinding {
     let mut resource_descriptor = smallvec::SmallVec::from_slice(&[0_u32; 8]);
     resource_descriptor[0] = 0x1000; // non-null base so the descriptor is live

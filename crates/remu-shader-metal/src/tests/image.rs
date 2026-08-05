@@ -4,6 +4,8 @@
 //! Image lowering tests: sampled and storage textures, descriptor component
 //! selection, gathers and depth comparison sampling.
 
+use remu_shader::image_sample_modifiers;
+
 use super::*;
 
 #[test]
@@ -206,9 +208,31 @@ fn zero_lod_gather_returns_four_neighbor_values_from_the_selected_component() {
 }
 
 fn compile_offset_sample(name: &'static str, dimension: u32, texture_type: u32) -> MetalShader {
-    let comparison = name.contains("SampleC") || name.contains("Gather4C");
+    try_compile_sample(name, dimension, texture_type)
+        .unwrap_or_else(|error| panic!("{name} should lower: {error}"))
+}
+
+/// Builds a MIMG sample whose VADDR window matches the opcode's exact operand lattice: offset,
+/// bias, depth reference, gradients, coordinates, then the trailing LOD-or-clamp dword.
+fn try_compile_sample(
+    name: &'static str,
+    dimension: u32,
+    texture_type: u32,
+) -> Result<MetalShader, MetalCompileError> {
+    let modifiers = image_sample_modifiers(Opcode::Known(name)).expect("known sample opcode");
     let coordinate_count = if matches!(dimension, 2 | 3 | 5) { 3 } else { 2 };
-    let address_count = 1 + usize::from(comparison) + coordinate_count;
+    // Volume and cube gradients carry a third derivative lane; a 2D-array address does not.
+    let gradient_count = if modifiers.gradients {
+        if matches!(dimension, 2 | 3) { 6 } else { 4 }
+    } else {
+        0
+    };
+    let address_count = usize::from(modifiers.offset)
+        + usize::from(modifiers.bias)
+        + usize::from(modifiers.compare)
+        + gradient_count
+        + coordinate_count
+        + usize::from(modifiers.lod || modifiers.lod_clamp);
     let control = ImageControl {
         dmask: 1,
         vector_address: 0,
@@ -253,7 +277,79 @@ fn compile_offset_sample(name: &'static str, dimension: u32, texture_type: u32) 
         &evaluation,
         &MetalCompileOptions::compute(0),
     )
-    .unwrap_or_else(|error| panic!("{name} should lower: {error}"))
+}
+
+#[test]
+fn lod_clamp_samples_are_not_depth_comparisons() {
+    // IMAGE_SAMPLE_CL (OP 0x21) carries a trailing minimum-LOD clamp, the operand SPIR-V spells
+    // MinLod. Reading its mnemonic as a comparison declared a depth texture, consumed the first
+    // coordinate dword as a depth reference and emitted sample_compare.
+    let shader = compile_offset_sample("ImageSampleCl", 1, 9);
+
+    assert!(shader.source.contains("texture2d<float> tex0"));
+    assert!(!shader.source.contains("depth2d"));
+    assert!(!shader.source.contains("sample_compare"));
+    assert!(shader.source.contains("min_lod_clamp("));
+    // Two coordinate dwords then the clamp: the coordinates keep v0/v1.
+    assert!(
+        shader
+            .source
+            .contains("float2(as_type<float>(remu_v_0), as_type<float>(remu_v_1))")
+    );
+    assert!(shader.source.contains("min_lod_clamp(t"));
+}
+
+#[test]
+fn coarse_derivative_samples_lower_as_gradients_not_comparisons() {
+    // IMAGE_SAMPLE_CD (OP 0x68) is a coarse-derivative gradient sample. Only the `CCd` forms
+    // compare.
+    let ordinary = compile_offset_sample("ImageSampleCd", 1, 9);
+    assert!(ordinary.source.contains("texture2d<float> tex0"));
+    assert!(!ordinary.source.contains("sample_compare"));
+    assert!(ordinary.source.contains("gradient2d("));
+
+    let comparison = compile_offset_sample("ImageSampleCCd", 1, 9);
+    assert!(comparison.source.contains("depth2d<float> tex0"));
+    assert!(comparison.source.contains("sample_compare("));
+    assert!(comparison.source.contains("gradient2d("));
+}
+
+#[test]
+fn comparison_samples_keep_their_bias_lod_and_gradient_operands() {
+    // The compare-plus-modifier forms previously lost their modifier entirely, so each parsed its
+    // coordinates out of the bias, LOD or gradient dwords.
+    let explicit_lod = compile_offset_sample("ImageSampleCL", 1, 9);
+    assert!(explicit_lod.source.contains("sample_compare("));
+    // A temporary, not the `level(0.0f)` an `Lz` opcode would emit.
+    assert!(explicit_lod.source.contains("level(t"));
+
+    let bias = compile_offset_sample("ImageSampleCB", 1, 9);
+    assert!(bias.source.contains("sample_compare("));
+    assert!(bias.source.contains("bias(t"));
+
+    let gradients = compile_offset_sample("ImageSampleCD", 1, 9);
+    assert!(gradients.source.contains("sample_compare("));
+    assert!(gradients.source.contains("gradient2d("));
+}
+
+#[test]
+fn refuses_the_lod_clamp_forms_metal_cannot_express() {
+    // A Metal gather takes no LOD options at all, and sample_compare takes exactly one, so these
+    // clamps have no lowering. Refusing names the missing operand instead of silently dropping it.
+    for name in ["ImageGather4Cl", "ImageGather4ClO", "ImageGather4CCl"] {
+        let error = try_compile_sample(name, 1, 9).expect_err("clamped gather has no lowering");
+        assert!(
+            format!("{error}").contains("minimum-LOD clamp"),
+            "{name} refused with {error}"
+        );
+    }
+    for name in ["ImageSampleCBCl", "ImageSampleCDCl", "ImageSampleCCdClO"] {
+        let error = try_compile_sample(name, 1, 9).expect_err("clamped comparison has no lowering");
+        assert!(
+            format!("{error}").contains("minimum-LOD clamp"),
+            "{name} refused with {error}"
+        );
+    }
 }
 
 #[test]
@@ -414,6 +510,28 @@ fn generated_offset_image_msl_compiles_with_apple_metal() {
         (
             "gather-compare-2d-array",
             compile_offset_sample("ImageGather4CLzO", 5, 13),
+        ),
+        // The minimum-LOD clamp overloads, which accept a bias or gradient beside them and sit
+        // between the LOD option and the texel offset.
+        (
+            "sample-lod-clamp-2d",
+            compile_offset_sample("ImageSampleClO", 1, 9),
+        ),
+        (
+            "sample-bias-lod-clamp-2d",
+            compile_offset_sample("ImageSampleBClO", 1, 9),
+        ),
+        (
+            "sample-gradient-lod-clamp-2d",
+            compile_offset_sample("ImageSampleDClO", 1, 9),
+        ),
+        (
+            "sample-compare-lod-clamp-2d",
+            compile_offset_sample("ImageSampleCClO", 1, 9),
+        ),
+        (
+            "sample-lod-clamp-2d-array",
+            compile_offset_sample("ImageSampleClO", 5, 13),
         ),
     ];
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);

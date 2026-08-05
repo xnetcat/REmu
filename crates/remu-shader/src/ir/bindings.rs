@@ -175,13 +175,134 @@ impl ImageBinding {
     }
 }
 
+/// The address-operand modifiers a MIMG sample or gather opcode names.
+///
+/// GFX10 spells the modifier lattice into the mnemonic, and the spelling is case-significant in a
+/// way that defeats substring matching: `Cl` is a LOD clamp, `CL` is a comparison plus an explicit
+/// LOD, `Cd` is a coarse derivative and `CD` is a comparison plus fine derivatives. Only an exact
+/// name decides which operands an instruction carries.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct ImageSampleModifiers {
+    /// `O`: a packed signed texel offset dword ahead of every other address operand.
+    pub offset: bool,
+    /// `B`: a LOD bias float.
+    pub bias: bool,
+    /// `C`: a depth comparison reference float.
+    pub compare: bool,
+    /// `D` (fine) or `Cd` (coarse) derivatives: a pair of gradient vectors.
+    pub gradients: bool,
+    /// `Cl`: the trailing minimum-LOD clamp float, never a comparison.
+    pub lod_clamp: bool,
+    /// `L`: the trailing explicit LOD float.
+    pub lod: bool,
+    /// `Lz`: LOD zero, which carries no address operand at all.
+    pub zero_lod: bool,
+}
+
+/// Returns the address-operand modifiers of a sampled-image opcode, or `None` for any opcode
+/// that is not a MIMG sample or gather.
+///
+/// The table is exact because the GFX10 mnemonics alias under prefix or substring tests:
+/// `ImageSampleCl` (LOD clamp), `ImageSampleCL` (compare plus LOD), `ImageSampleCd` (coarse
+/// derivatives) and `ImageSampleCD` (compare plus derivatives) all contain `SampleC`, yet only
+/// two of them compare. Opcode numbers are the public RDNA2 MIMG lattice decoded in
+/// `decoder::memory`; the operand set of each is the LLVM `AMDGPUDimProfile` address list
+/// (offset, bias, zcompare, gradients, coordinates, then one trailing LOD-or-clamp dword).
+#[must_use]
+pub fn image_sample_modifiers(opcode: Opcode) -> Option<ImageSampleModifiers> {
+    const OFFSET: u8 = 1 << 0;
+    const BIAS: u8 = 1 << 1;
+    const COMPARE: u8 = 1 << 2;
+    const GRADIENTS: u8 = 1 << 3;
+    const LOD_CLAMP: u8 = 1 << 4;
+    const LOD: u8 = 1 << 5;
+    const ZERO_LOD: u8 = 1 << 6;
+
+    let flags = match opcode.known_name()? {
+        // IMAGE_SAMPLE, OP 0x20-0x2f.
+        "ImageSample" => 0,
+        "ImageSampleCl" => LOD_CLAMP,
+        "ImageSampleD" => GRADIENTS,
+        "ImageSampleDCl" => GRADIENTS | LOD_CLAMP,
+        "ImageSampleL" => LOD,
+        "ImageSampleB" => BIAS,
+        "ImageSampleBCl" => BIAS | LOD_CLAMP,
+        "ImageSampleLz" => ZERO_LOD,
+        "ImageSampleC" => COMPARE,
+        "ImageSampleCCl" => COMPARE | LOD_CLAMP,
+        "ImageSampleCD" => COMPARE | GRADIENTS,
+        "ImageSampleCDCl" => COMPARE | GRADIENTS | LOD_CLAMP,
+        "ImageSampleCL" => COMPARE | LOD,
+        "ImageSampleCB" => COMPARE | BIAS,
+        "ImageSampleCBCl" => COMPARE | BIAS | LOD_CLAMP,
+        "ImageSampleCLz" => COMPARE | ZERO_LOD,
+        // The same lattice with a packed texel offset, OP 0x30-0x3f.
+        "ImageSampleO" => OFFSET,
+        "ImageSampleClO" => OFFSET | LOD_CLAMP,
+        "ImageSampleDO" => OFFSET | GRADIENTS,
+        "ImageSampleDClO" => OFFSET | GRADIENTS | LOD_CLAMP,
+        "ImageSampleLO" => OFFSET | LOD,
+        "ImageSampleBO" => OFFSET | BIAS,
+        "ImageSampleBClO" => OFFSET | BIAS | LOD_CLAMP,
+        "ImageSampleLzO" => OFFSET | ZERO_LOD,
+        "ImageSampleCO" => OFFSET | COMPARE,
+        "ImageSampleCClO" => OFFSET | COMPARE | LOD_CLAMP,
+        "ImageSampleCDO" => OFFSET | COMPARE | GRADIENTS,
+        "ImageSampleCDClO" => OFFSET | COMPARE | GRADIENTS | LOD_CLAMP,
+        "ImageSampleCLO" => OFFSET | COMPARE | LOD,
+        "ImageSampleCBO" => OFFSET | COMPARE | BIAS,
+        "ImageSampleCBClO" => OFFSET | COMPARE | BIAS | LOD_CLAMP,
+        "ImageSampleCLzO" => OFFSET | COMPARE | ZERO_LOD,
+        // Coarse-derivative samples, OP 0x68-0x6f. `Cd` is a gradient modifier: only the `CCd`
+        // forms compare.
+        "ImageSampleCd" => GRADIENTS,
+        "ImageSampleCdCl" => GRADIENTS | LOD_CLAMP,
+        "ImageSampleCCd" => COMPARE | GRADIENTS,
+        "ImageSampleCCdCl" => COMPARE | GRADIENTS | LOD_CLAMP,
+        "ImageSampleCdO" => OFFSET | GRADIENTS,
+        "ImageSampleCdClO" => OFFSET | GRADIENTS | LOD_CLAMP,
+        "ImageSampleCCdO" => OFFSET | COMPARE | GRADIENTS,
+        "ImageSampleCCdClO" => OFFSET | COMPARE | GRADIENTS | LOD_CLAMP,
+        // IMAGE_GATHER4, OP 0x40-0x5f. Gathers have no derivative forms.
+        "ImageGather4" => 0,
+        "ImageGather4Cl" => LOD_CLAMP,
+        "ImageGather4L" => LOD,
+        "ImageGather4B" => BIAS,
+        "ImageGather4BCl" => BIAS | LOD_CLAMP,
+        "ImageGather4Lz" => ZERO_LOD,
+        "ImageGather4C" => COMPARE,
+        "ImageGather4CCl" => COMPARE | LOD_CLAMP,
+        "ImageGather4CL" => COMPARE | LOD,
+        "ImageGather4CB" => COMPARE | BIAS,
+        "ImageGather4CBCl" => COMPARE | BIAS | LOD_CLAMP,
+        "ImageGather4CLz" => COMPARE | ZERO_LOD,
+        "ImageGather4O" => OFFSET,
+        "ImageGather4ClO" => OFFSET | LOD_CLAMP,
+        "ImageGather4LzO" => OFFSET | ZERO_LOD,
+        "ImageGather4CO" => OFFSET | COMPARE,
+        "ImageGather4CLzO" => OFFSET | COMPARE | ZERO_LOD,
+        _ => return None,
+    };
+    Some(ImageSampleModifiers {
+        offset: flags & OFFSET != 0,
+        bias: flags & BIAS != 0,
+        compare: flags & COMPARE != 0,
+        gradients: flags & GRADIENTS != 0,
+        lod_clamp: flags & LOD_CLAMP != 0,
+        lod: flags & LOD != 0,
+        zero_lod: flags & ZERO_LOD != 0,
+    })
+}
+
 /// Returns whether an image instruction performs a depth comparison.
 ///
-/// RDNA2 names comparison samples and comparison gathers differently, so checking only the
-/// `ImageSampleC*` family silently misclassifies the known `ImageGather4C*` opcodes.
+/// A depth comparison decides the native texture declaration and the address layout, so it is
+/// answered from the exact opcode lattice rather than a `SampleC`/`Gather4C` substring: the
+/// LOD-clamp (`ImageSampleCl`, `ImageGather4Cl`) and coarse-derivative (`ImageSampleCd`) families
+/// contain that substring while comparing nothing.
 #[must_use]
 pub fn image_is_comparison(opcode: Opcode) -> bool {
-    opcode.contains("SampleC") || opcode.contains("Gather4C")
+    image_sample_modifiers(opcode).is_some_and(|modifiers| modifiers.compare)
 }
 
 fn image_access_class(opcode: Opcode) -> u8 {

@@ -5,7 +5,7 @@
 
 use remu_shader::{
     ImageBinding, ImageControl, Instruction, InstructionControl, Opcode, decode_unified_format,
-    image_is_comparison,
+    image_sample_modifiers,
 };
 
 use crate::Compiler;
@@ -490,12 +490,32 @@ impl Compiler<'_> {
                 image.dmask
             ));
         }
-        let has_offset = name.ends_with('O');
-        let has_compare = image_is_comparison(opcode);
-        let has_gradients = name.contains("SampleD");
-        let has_zero_lod = name.contains("Lz");
-        let has_lod = !has_zero_lod && name.contains("SampleL");
-        let has_bias = name.contains("SampleB");
+        // The address layout follows the exact opcode. Substring tests conflated `Cl` (a
+        // minimum-LOD clamp) with `C` (a depth reference) and missed every compare-plus-modifier
+        // form, so `ImageSampleCD` parsed its coordinates out of the gradient dwords.
+        let modifiers = image_sample_modifiers(opcode)
+            .ok_or_else(|| format!("image opcode {name} has no sample address lattice"))?;
+        let has_offset = modifiers.offset;
+        let has_compare = modifiers.compare;
+        let has_gradients = modifiers.gradients;
+        let has_zero_lod = modifiers.zero_lod;
+        let has_lod = modifiers.lod;
+        let has_bias = modifiers.bias;
+        // GFX10 places the minimum-LOD clamp in the same trailing address dword as an explicit
+        // LOD, and the two never co-occur. Metal spells it `min_lod_clamp` (MSL 6.13, Metal 2.2
+        // and later), which accepts a bias or gradient alongside it but nothing else.
+        if modifiers.lod_clamp {
+            if is_gather {
+                return Err(format!(
+                    "{name}: a Metal gather takes no LOD options, so its minimum-LOD clamp has no lowering"
+                ));
+            }
+            if has_compare && (has_bias || has_gradients) {
+                return Err(format!(
+                    "{name}: Metal sample_compare takes a single LOD option, so a minimum-LOD clamp cannot accompany a bias or gradient"
+                ));
+            }
+        }
         let mut cursor = 0_usize;
         let mut offset_x = "0".to_owned();
         let mut offset_y = "0".to_owned();
@@ -579,14 +599,19 @@ impl Compiler<'_> {
             );
             cursor += gradient_components * 2;
         }
-        let coordinate_kind = if matches!(image.dimension, 2 | 3 | 5) {
+        let coordinate_count = if matches!(image.dimension, 2 | 3 | 5) {
+            3
+        } else {
+            2
+        };
+        let coordinate_kind = if coordinate_count == 3 {
             "float3"
         } else {
             "float2"
         };
         let mut coordinates = self.temp(
             coordinate_kind,
-            &if matches!(image.dimension, 2 | 3 | 5) {
+            &if coordinate_count == 3 {
                 format!(
                     "float3({}, {}, {})",
                     self.image_float_address(image, cursor),
@@ -601,23 +626,23 @@ impl Compiler<'_> {
                 )
             },
         );
+        // The explicit LOD and the minimum-LOD clamp share the one address dword that trails the
+        // coordinates; `Lz` occupies neither.
+        let trailing_address = cursor + coordinate_count;
         let lod = if has_zero_lod {
             "0.0f".to_owned()
         } else if has_lod {
-            self.temp(
-                "float",
-                &self.image_float_address(
-                    image,
-                    cursor
-                        + if matches!(image.dimension, 2 | 3 | 5) {
-                            3
-                        } else {
-                            2
-                        },
-                ),
-            )
+            self.temp("float", &self.image_float_address(image, trailing_address))
         } else {
             bias.clone()
+        };
+        let lod_clamp = if modifiers.lod_clamp {
+            format!(
+                ", min_lod_clamp({})",
+                self.temp("float", &self.image_float_address(image, trailing_address))
+            )
+        } else {
+            String::new()
         };
         if has_offset && metal_dim == 2 {
             if image.dimension == 3 {
@@ -738,6 +763,8 @@ impl Compiler<'_> {
         } else {
             String::new()
         };
+        // MSL orders the clamp after the other LOD option and before the texel offset.
+        let extra = format!("{extra}{lod_clamp}");
         let kind = self.image_kinds[binding_index];
         let vector_kind = format!("vec<{}, 4>", kind.component);
         let global_count = self.evaluation.global_memory_bindings.len();
