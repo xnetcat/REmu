@@ -144,7 +144,15 @@ pub(crate) fn record_program(program: &Program) {
 
 fn enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os(COVERAGE_VARIABLE).is_some_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var_os(COVERAGE_VARIABLE).is_some_and(|value| value == "1");
+        if enabled {
+            // Loud once so a missing end-of-run histogram is diagnosable as "armed but empty"
+            // rather than "env never reached the process".
+            eprintln!("[REMu][SHADER-OPCODES] coverage recording armed");
+        }
+        enabled
+    })
 }
 
 fn program_fingerprint(program: &Program) -> u64 {

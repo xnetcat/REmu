@@ -8942,7 +8942,18 @@ extern "C" fn guest_exit(code: i32) {
 /// The report is empty unless `REMU_TRACE_SHADER_OPCODES=1` was set for the process, so every path
 /// that ends a run can call this unconditionally.
 pub fn report_shader_opcode_coverage() {
-    for line in remu_shader::opcode_coverage_report() {
+    let lines = remu_shader::opcode_coverage_report();
+    if lines.is_empty() {
+        // Distinguish "tracing off" from "tracing on but no program decoded" — both used to
+        // print nothing, which made Phase 0 refusal ranking look like a missing env forward.
+        if std::env::var_os("REMU_TRACE_SHADER_OPCODES").is_some_and(|value| value == "1") {
+            eprintln!(
+                "[REMu][SHADER-OPCODES] tracing enabled but histogram empty (no program decoded)"
+            );
+        }
+        return;
+    }
+    for line in lines {
         eprintln!("[REMu][SHADER-OPCODES] {line}");
     }
 }
@@ -8996,8 +9007,21 @@ fn start_abi_gap_reporter() {
         .name("remu-abi-report".to_owned())
         .spawn(|| {
             let mut previous = 0_u64;
+            let mut previous_opcode_header = String::new();
             loop {
                 std::thread::sleep(REPORT_INTERVAL);
+                // External watchdogs SIGTERM/SIGKILL before [`report_end_of_run_diagnostics`]
+                // runs, so the histogram must leave the process on this live path too. Reprint
+                // only when the header (shader/opcode counts) changes.
+                let opcode_lines = remu_shader::opcode_coverage_report();
+                if let Some(header) = opcode_lines.first() {
+                    if header != &previous_opcode_header {
+                        previous_opcode_header = header.clone();
+                        for line in &opcode_lines {
+                            eprintln!("[REMu][SHADER-OPCODES] {line}");
+                        }
+                    }
+                }
                 // Reprinting an unchanged summary would bury the run's other output, and the
                 // fingerprint is exactly what a reader would compare the snapshots by anyway.
                 let fingerprint = abi_gap_fingerprint();
