@@ -4,7 +4,7 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5853fa7`)
+## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5bb169b`)
 
 Exact image compare lattice; VALU sign/saturate/SCC; precise `V_DIV_SCALE/FMAS_F32`; sub-dword
 LDS; graphics scratch + GS wave width; no raw VOP3/DS/MUBUF/MIMG operand fabrication; `0x351` =

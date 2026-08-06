@@ -1,7 +1,7 @@
 # Phase 1E handoff — SHADER CORE (2026-08-06)
 
-Merged onto `main` at `5853fa7` (Phase 1E tip `2e82fd2` + PARAM follow-up). Phase 1F–H **not**
-started.
+Merged onto `main` at `5bb169b` (Phase 1E tip `2e82fd2` + PARAM follow-up `5853fa7` +
+docs). Phase 1F–H **not** started.
 
 ## Design (what landed)
 

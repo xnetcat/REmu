@@ -17,7 +17,7 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5853fa7`)
+## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5bb169b`)
 
 - Exact `image_is_comparison` lattice; VALU BFE/CLAMP/SCC; `V_DIV_SCALE/FMAS_F32`; sub-dword LDS;
   graphics scratch + GS wave; no raw VOP3/DS/MUBUF/MIMG operand fabrication; `0x351`=`V_MIN3_F16`.
