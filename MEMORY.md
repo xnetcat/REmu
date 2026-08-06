@@ -17,6 +17,17 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Silent Hill present — sampled tiler ownership (2026-08-06; partial)
+
+- **Root cause of `captured_frames=0`:** compositor `es=0x800d55…/ps=0x800802…` → VideoOut failed
+  on Phase 1G sampled upload refuse for tile 1/5/9 (RGBA8→BC7), not present/flip.
+- **Fix:** GPU-tiler own mode-1/9 uncompressed + mode-1/5/9 BC element grids (detile in elements,
+  Metal blit in pixels). Commits on `sh-present-mode19-tiler` → merge.
+- **Live:** tiler refuses gone; compositor encodes to `0xefc…`; **still black** / frames=0.
+- Handoff: `docs/notes/sh-present-20260806-handoff/`.
+- **Next:** BC detile oracle vs live SRD; then DeS ACM / Unity null-SIGSEGV if SH stays black.
+- **Anti-claim:** not UI/3D closure.
+
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 
 - `guest_signal.rs`: Orbis ucontext (0x500 / mcontext +0x40 / rsp @ 0xf8); RaiseException →

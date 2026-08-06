@@ -4,6 +4,15 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+## Silent Hill present / sampled tiler (2026-08-06) — partial (on tip → merge)
+
+Root cause of post–Phase-1 `captured_frames=0`: VideoOut compositor draws failed every frame
+because Phase 1G refused sampled GPU upload for `tile ∈ {1,5,9}` (RGBA8 then BC7) — “no tiler
+ownership”. GPU-tiler ownership + mode-1/9 MSL + mode-1/5/9 BC element-grid upload landed
+(`docs/notes/sh-present-20260806-handoff/`). Live SH @ tip: compositor tiler refuses **gone**;
+mesh compositor encodes into `0xefc…`; **still** `captured_frames=0` (fully black readback) —
+**not** UI/3D closure. Next: prove BC detile bytes / compositor sampling, not flip plumbing.
+
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
 Guest exception delivery with Orbis `ucontext_t` (mcontext at `+0x40`); interruptive
