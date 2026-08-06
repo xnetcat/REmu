@@ -1,85 +1,94 @@
 # Phase 1G handoff — MEMORY MODEL (2026-08-06) — **MID-STOP / LOUD REFUSAL**
 
-**Branch:** `phase1g-memory-model` @ `a1618a1` (worktree `/Users/xnetcat/Documents/REmu-phase1g`)  
+**Branch:** `phase1g-memory-model` @ `5b920ab` (worktree `/Users/xnetcat/Documents/REmu-phase1g`)  
 **Base:** `main` @ `9397f11`  
 **NOT merged to main.** Phase 1H **not** started.
 
 ## LOUD REFUSAL — Phase 1G is NOT closed
 
-Architectural data flow is only **partially** landed. The following remain before
-definition-of-done:
+Architectural guest-backed + GPU-tiler data flow for tiler-owned textures is landed.
+The **live title matrix gate is not closed** — every matrix title finished with
+`captured_frames=0` on tip `5b920ab`. Silent Hill (primary UI-garbage gate) guest-faults
+before a presentable frame; UI garbage cannot be assessed. Do **not** merge to main.
 
-1. **Sampled-texture CPU upload still live** — `upload.rs` / `create_sampled_guest_texture`
-   still snapshot + CPU-detile + `replaceRegion`. Must route through
-   `tiler::encode_gpu_upload_from_guest` (or equivalent) with an open/settle CB.
-2. **`ensure_resident_texture_in_map` free function** still refuses CPU upload but is
-   called from `upload.rs` storage path — must take presenter/batch context.
-3. **Fingerprints** (`texture/watch.rs` content fingerprints / dirty chunk compare) not
-   deleted — still used by sampled-cache dirty reload.
-4. **Persistent `gpu_authored` debt ledger** still exists (used as ephemeral run list for
-   GPU publish + rematerialisation overlay). Not collapsed to encode-then-clear-only.
-5. **`gpu_write_watch_generations` / self-readback generations** not deleted.
-6. **WritebackTrigger refusal policy** still gates bookkeeping triggers (PressureEviction
-   etc.) — keep or delete only after GPU publish is default for all guest-observable
-   paths and debt is gone.
-7. **D5 prestaging materializer** (`texture/read_watch.rs`) still installed / dead-armed —
-   must **delete** (GPU→guest retile replaces prestaged Metal→fault materialize).
-8. **Dead tiler scaffolding** (`tiler/deferred.rs`, `tiler/end_state.rs`,
-   `tiler/absolute_address.rs` Q4) still `dead_code` seams — wire or delete.
-9. **Mip-chain / layered / mode-5 sampled** GPU upload+publish coverage incomplete
-   (single-level 2D tiler-owned path is what landed).
-10. **Per-hit byte compares** in global/binding cache not audited/deleted.
-11. **Live title matrix** not run (Silent Hill UI garbage gate, DeS, Dreaming Sarah,
-    Void Terrarium, Oregon, Poppy). No FPS claims.
-12. **Full package tests** not green end-to-end after remaining deletions; only targeted
-    rematerialisation + writeback-settle + tiler + `remu-memory` + dual-arch
-    `cargo check` proven so far.
-13. **docs/status.md / MEMORY.md / anti-claim** not updated to CLOSED (correct — not closed).
+### Exact remainder
 
-Do **not** treat this branch as Phase 1G complete. Do **not** merge to main until the
-list above is empty without stubs.
+1. **Live title matrix** — Silent Hill UI garbage/corruption primary gate (need frames);
+   then DeS, Dreaming Sarah, Void Terrarium, Oregon Trail; Poppy last; crash claims n≥5.
+   Current tip evidence under `runs/` (all `captured_frames=0`):
+   - Silent Hill: `guest-failure` / exit 139 (~14–15s); IMAGE-FALLBACK + SIGSEGV
+   - Dreaming Sarah: null-SIGSEGV (~1s) — known pre-`InstallExceptionHandler` shape
+   - Void Terrarium: `guest-failure` / 139 (~2s)
+   - Oregon Trail: external-watchdog (~36s)
+   - Demon's Souls: timeout (~34s) — ACM-blocked shape unchanged
+   - Poppy: external-watchdog (~35s); loadavg rose to ~6.8 during run
+2. **Optional cleanup:** delete or rewrite ignored fingerprint-era unit tests (5 ignored)
+   once the live matrix proves coarse-watch invalidation is enough.
 
-## What landed (commits on `phase1g-memory-model`)
+### Loud refusals that remain by design (not silent seams)
+
+- Sampled comparison uploads refuse formats other than R16Unorm/R32Float reinterpret-as-depth
+- Compressed / non-tiler-owned sampled uploads refuse (no GPU tiler ownership)
+- Mode-24 mip chains refuse (no SDK mip layout wired)
+- `WritebackTrigger::PressureEviction` is RemuBookkeeping — clears authored runs without publish
+
+## What landed (commits on `phase1g-memory-model` after mid-stop `e0c582c`)
 
 | Commit | Concern |
 | --- | --- |
-| `53b97ba` | memory: route `map_anonymous` through committed backing; delete `VmaKind::Anonymous` |
-| `7d691ce` | gpu-metal: wire S2 tiler MSL into mode-27 rematerialisation; delete inline duplicate |
-| `b312be0` | gpu-metal: GPU-timeline upload + guest publish encode helpers; resident create upload; settle via GPU retile |
-| `1753158` | gpu-metal: standalone publish CB when no active guest queue |
-| `a1618a1` | gpu-metal: delete CPU `write_resident_texture_contents_to_guest` publish path |
+| `f9c11d3` | gpu-metal: sampled/storage GPU upload via tiler (mips/layers/mode-5); coarse dirty reload |
+| `56f7737` | gpu-metal: delete fingerprints, self-readback gens, D5 prestaging, dead tiler scaffolding; end-state settle |
+| `e731ce5` | gpu-metal: drop orphan derive after fingerprint deletion |
+| `5745cf1` | gpu-metal: packet globals without byte-compare cache; ignore obsolete fingerprint tests |
+| `5b920ab` | gpu-metal: remaps must not obsolete GPU-authored residents |
+
+Earlier (pre mid-stop handoff):
+
+| Commit | Concern |
+| --- | --- |
+| `53b97ba` | memory: anonymous → committed backing |
+| `7d691ce` | gpu-metal: S2 tiler MSL into mode-27 rematerialisation |
+| `b312be0` | gpu-metal: GPU upload + guest publish helpers; resident create |
+| `1753158` | gpu-metal: standalone publish without active guest queue |
+| `a1618a1` | gpu-metal: delete CPU resident writeback publish path |
 
 ## Wired vs deleted
 
 **Wired**
-- Anonymous → committed shared backing (Metal-backable)
-- S2 `tiler/msl.rs` is the rematerialisation library (mode-24/27); mode-5 pipelines ready
-- `tiler/encode.rs`: `encode_gpu_upload_from_guest` / `encode_gpu_publish_to_guest`
-- Resident exact-key create (presenter path) uses GPU upload for tiler-owned descriptors
-- `settle_resident_texture_writeback` publishes via GPU retile (not CPU readback)
+- Anonymous → committed shared backing
+- S2 tiler MSL for rematerialisation + `encode_gpu_upload_from_guest(_view)` /
+  `encode_gpu_publish_to_guest(_view)` (mode 0/5/24/27; mode-5 layered; mode-27 mips)
+- Sampled cache create/reload via settle GPU upload (no CPU snapshot/detile/`replaceRegion`)
+- Storage `ensure_resident_texture_in_map` / mipmapped storage via GPU upload + queue
+- End-state classification drives settle (guest-observable / lease-validated publish; bookkeeping clear)
+- Packet global uploads without per-hit full byte compares
 
 **Deleted**
 - Host-private anonymous VMA kind
 - Duplicate inline rematerialisation MSL
 - CPU `write_resident_texture_contents_to_guest` stage
+- Content fingerprints / dirty chunk compares
+- Self-readback `gpu_write_watch_generations`
+- D5 `texture/read_watch.rs` prestaging materializer
+- Dead tiler `deferred.rs` / `absolute_address.rs` seams + presenter fields
+- Persistent debt fiction on bookkeeping triggers (encode-then-clear / clear-without-publish)
+- VA-keyed host byte-compare global buffer cache
 
-**Kept (still present; some still required)**
-- Leases (lifetime)
-- Coarse write-watches
+**Kept**
+- Leases (lifetime-only)
+- Coarse write-watches for derived invalidation
 - Alias canonicalization
 - CP-effect writes
-- `gpu_authored` (still ledger-shaped)
-- Fingerprints / self-readback generations
-- D5 prestaging (dead seam — delete pending)
-- WritebackTrigger refusal policy
+- Phase 1C ordered publication
+- `gpu_authored` as ephemeral authored-run list for GPU publish encode
 
 ## Checks proven at tip
 
-- `cargo test -p remu-memory --lib -- --test-threads=1` — green (after anonymous commit)
-- Targeted `remu-gpu-metal` rematerialisation + GPU publish settle tests — green
-- `cargo check --workspace --all-targets` — arm64 + `x86_64-apple-darwin` green @ `a1618a1`
-- Live titles — **not run**
-- `vm.loadavg` at check time ~`{ 3.94 2.95 2.84 }` (no FPS claim)
+- `cargo test -p remu-gpu-metal --lib -- --test-threads=1` — 476 passed, 5 ignored
+- `cargo test -p remu-memory --lib -- --test-threads=1` — green
+- `cargo check --workspace --all-targets` — arm64 + `x86_64-apple-darwin` green @ `5b920ab`
+- Live titles — **run; all `captured_frames=0`** (see remainder)
+- No FPS claims
 
 ## Phase 1H
 

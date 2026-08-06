@@ -25,7 +25,16 @@ registers/packets that state intent.
 - `usleep(0)` → yield; nanosleep/sleep/sched_yield wired; QoS from Setprio/setschedparam.
 - Handoff: `docs/notes/phase1f-20260806-handoff/`.
 - **Anti-claim:** Unity GC STW not live-closed (Dreaming Sarah dies before InstallExceptionHandler).
-- Phase 1G–H not started.
+
+## Phase 1G — memory model (MID-STOP 2026-08-06; branch `phase1g-memory-model` @ `5b920ab`)
+
+- Guest-backed GPU tiler upload/publish for tiler-owned textures; sampled/storage CPU
+  snapshot+detile+`replaceRegion` deleted on that path. Fingerprints, self-readback generations,
+  D5 prestaging, dead tiler deferred/absolute-address seams deleted. End-state settle wired.
+- **Not closed / not on `main`:** live title matrix all `captured_frames=0` (Silent Hill UI-garbage
+  gate unassessable — guest-fault before present). Handoff:
+  `docs/notes/phase1g-20260806-handoff/`.
+- Phase 1H not started.
 
 ## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5bb169b`)
 

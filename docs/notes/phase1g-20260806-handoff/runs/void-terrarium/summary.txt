@@ -1,0 +1,10 @@
+revision=5b920ab
+game=/Volumes/Untitled/sharpemu/games/void tRrLM Void Terrarium/eboot.bin
+timeout_seconds=30
+elapsed_seconds=2
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=presentation-only

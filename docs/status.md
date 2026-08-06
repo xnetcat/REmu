@@ -15,7 +15,15 @@ refusal); `_sigprocmask` writes oldset. See `docs/notes/phase1f-20260806-handoff
 **Acceptance:** architectural data flow + unit tests + both-arch `cargo check` green. Silent Hill /
 Oregon / Poppy watchdog-timeout clean; `pthread_setschedparam` no longer fabricated success. Unity
 GC STW **not** live-proven — Dreaming Sarah still null-SIGSEGV before `InstallExceptionHandler`.
-Demon's Souls still ACM-blocked. Phase 1G–H not started.
+Demon's Souls still ACM-blocked.
+
+## Phase 1G (2026-08-06) — memory model — MID-STOP (branch `phase1g-memory-model` @ `5b920ab`)
+
+Architectural GPU-timeline tiling + guest-backed upload/publish for tiler-owned textures landed
+on the branch (fingerprints / self-readback gens / D5 prestaging / CPU sampled snapshot path
+deleted). **Not merged to `main`.** Live matrix at tip: all titles `captured_frames=0`; Silent Hill
+guest-faults before UI (primary UI-garbage gate unassessable). See
+`docs/notes/phase1g-20260806-handoff/`. Phase 1H not started.
 
 ## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5bb169b`)
 
