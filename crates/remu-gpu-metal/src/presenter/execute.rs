@@ -2526,6 +2526,39 @@ impl MetalPresenter {
                     "[REMu][METAL][TARGET-DRAW-TEXTURES] draw={} tex0_3={texture_summaries:x?}",
                     draw.sequence,
                 );
+                // GBuffer attribution: lighting samples large textures that were never COLOR
+                // write targets (BasePass absent). Bound the first hits so title-BG runs stay
+                // readable while still proving "no writer" vs "writer left zeros".
+                {
+                    static UNWRITTEN: AtomicUsize = AtomicUsize::new(0);
+                    for summary in &texture_summaries {
+                        let guest = summary.5.guest;
+                        if guest.width < 64 || guest.height < 64 {
+                            continue;
+                        }
+                        let metal_nz = summary.7.as_ref().ok().map_or(0, |v| v.1);
+                        let guest_nz = summary.8.as_ref().ok().map_or(0, |v| v.1);
+                        if metal_nz != 0 || guest_nz != 0 {
+                            continue;
+                        }
+                        if diagnostic_texture_writer(guest).is_some() {
+                            continue;
+                        }
+                        let n = UNWRITTEN.fetch_add(1, Ordering::Relaxed);
+                        if n < 32 {
+                            eprintln!(
+                                "[REMu][METAL][GBUFFER-UNWRITTEN] draw={} sample_slot={} address={:#x} {}x{} format={:?} metal_nz=0 guest_nz=0 no_color_writer (occurrence={})",
+                                draw.sequence,
+                                summary.0,
+                                guest.address,
+                                guest.width,
+                                guest.height,
+                                guest.pixel_format,
+                                n.saturating_add(1),
+                            );
+                        }
+                    }
+                }
                 let bytes = match texture.texture_type() {
                     MTLTextureType::D3 => {
                         read_texture_volume_linear(&device, &queue, &texture, descriptor)?

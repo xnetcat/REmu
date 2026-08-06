@@ -4,9 +4,10 @@ use std::sync::{Mutex, OnceLock};
 use remu_shader::GuestMemoryReader;
 
 use crate::{
-    AGC_CB_SHADER_MASK, AGC_CB_TARGET_MASK, AGC_COLOR_TARGET_COUNT, AGC_COMPUTE_USER_DATA_0,
-    AGC_IT_DISPATCH_DIRECT, AGC_SPI_SHADER_PGM_HI_ES, AGC_SPI_SHADER_PGM_HI_PS,
-    AGC_SPI_SHADER_PGM_LO_ES, AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_PRIMITIVE_TYPE,
+    AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_COLOR_REGISTER_STRIDE, AGC_CB_SHADER_MASK,
+    AGC_CB_TARGET_MASK, AGC_COLOR_TARGET_COUNT, AGC_COMPUTE_USER_DATA_0, AGC_IT_DISPATCH_DIRECT,
+    AGC_SPI_SHADER_PGM_HI_ES, AGC_SPI_SHADER_PGM_HI_PS, AGC_SPI_SHADER_PGM_LO_ES,
+    AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_PRIMITIVE_TYPE,
     AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
     AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory, ShaderEvaluationWorkers,
     VideoOutState, agc_color_target_state, agc_has_active_depth_state, agc_program_address,
@@ -172,19 +173,127 @@ pub(crate) fn agc_prepare_draw_color_targets(
         AgcColorTargetState::Disabled => (Vec::new(), false),
         AgcColorTargetState::Programmed(targets) => (targets, false),
         AgcColorTargetState::Malformed { slot } => {
-            if trace_logarithmic_sequence(graphics.emitted_draws, 8) {
+            // BasePass multi-MRT streams that leave one slot incomplete used to be easy to miss
+            // under logarithmic sampling; keep the first failures loud for GBuffer attribution.
+            static MALFORMED_LOGGED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let n = MALFORMED_LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if n < 64 || trace_logarithmic_sequence(graphics.emitted_draws, 8) {
+                let mask = graphics.context_registers.get(&AGC_CB_TARGET_MASK).copied();
+                let slots = agc_color_base_snapshot(&graphics.context_registers);
                 eprintln!(
-                    "[REMu][AGC] draw={} has incomplete enabled CB_COLOR{slot} state",
-                    graphics.emitted_draws
+                    "[REMu][AGC][COLOR-MALFORMED] draw={} incomplete enabled CB_COLOR{slot} \
+                     mask={mask:x?} bases={slots:x?} (occurrence={})",
+                    graphics.emitted_draws,
+                    n.saturating_add(1),
                 );
             }
             (Vec::new(), false)
         }
     };
+    agc_trace_color_target_emit(
+        graphics.emitted_draws,
+        &targets,
+        &graphics.context_registers,
+    );
     for target in &targets {
         graphics.known_color_targets.insert(target.address, *target);
     }
     (targets, absent)
+}
+
+fn agc_color_base_snapshot(
+    registers: &std::collections::BTreeMap<u32, u32>,
+) -> Vec<(u32, Option<u64>)> {
+    (0..AGC_COLOR_TARGET_COUNT)
+        .map(|slot| {
+            let primary = slot * AGC_CB_COLOR_REGISTER_STRIDE;
+            let base = registers.get(&(AGC_CB_COLOR0_BASE + primary)).copied();
+            let base_ext = registers.get(&(AGC_CB_COLOR0_BASE_EXT + slot)).copied();
+            let address = base.zip(base_ext).map(|(low, high)| {
+                (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
+            });
+            (slot, address)
+        })
+        .collect()
+}
+
+fn agc_enabled_color_slot_count(registers: &std::collections::BTreeMap<u32, u32>) -> u32 {
+    let Some(mask) = registers.get(&AGC_CB_TARGET_MASK).copied() else {
+        return 0;
+    };
+    (0..AGC_COLOR_TARGET_COUNT).fold(0, |count, slot| {
+        count + u32::from(((mask >> (slot * 4)) & 0xf) != 0)
+    })
+}
+
+/// Loud, bounded attribution for deferred BasePass: multi-MRT color emits vs single-MRT only.
+///
+/// Silent Hill title lighting samples GBuffer VAs that never appear as COLOR0 in PERF batches.
+/// Counting programmed CB slots at emit time distinguishes "game never submitted BasePass" from
+/// "Metal dropped BasePass after emit". UE deferred BasePass is typically ≥3 color slots;
+/// 2-slot emits are usually shadow/post MRTs.
+fn agc_trace_color_target_emit(
+    draw_sequence: u64,
+    targets: &[remu_gpu::GpuColorTarget],
+    registers: &std::collections::BTreeMap<u32, u32>,
+) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SINGLE: AtomicU64 = AtomicU64::new(0);
+    static MULTI: AtomicU64 = AtomicU64::new(0);
+    static BASEPASS_MRT: AtomicU64 = AtomicU64::new(0);
+    static LOGGED_MULTI: AtomicU64 = AtomicU64::new(0);
+    static LOGGED_MASK_MRT: AtomicU64 = AtomicU64::new(0);
+    let enabled_slots = agc_enabled_color_slot_count(registers);
+    // Mask says ≥3 slots even when decode produced fewer/empty targets (Malformed path).
+    if enabled_slots >= 3 {
+        let total = BASEPASS_MRT.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let logged = LOGGED_MASK_MRT.fetch_add(1, Ordering::Relaxed);
+        if logged < 64 {
+            eprintln!(
+                "[REMu][AGC][COLOR-EMIT] draw={draw_sequence} mask_mrt={enabled_slots} \
+                 decoded_mrt={} total_mask_mrt3plus={total} bases={:x?}",
+                targets.len(),
+                agc_color_base_snapshot(registers),
+            );
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let multi = targets.len() >= 2;
+    if multi {
+        let total = MULTI.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let logged = LOGGED_MULTI.fetch_add(1, Ordering::Relaxed);
+        if logged < 64 || targets.len() >= 3 {
+            let slots = targets
+                .iter()
+                .map(|target| {
+                    // CB_COLORn_ATTRIB2: bits 0..15 = width-1, 16..31 = height-1 (GFX10).
+                    let width = (target.attrib2 & 0xffff).saturating_add(1);
+                    let height = ((target.attrib2 >> 16) & 0xffff).saturating_add(1);
+                    (target.slot, target.address, width, height)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[REMu][AGC][COLOR-EMIT] draw={draw_sequence} mrt={} total_multi={total} \
+                 total_mask_mrt3plus={} slots={slots:x?}",
+                targets.len(),
+                BASEPASS_MRT.load(Ordering::Relaxed),
+            );
+        }
+    } else {
+        let total = SINGLE.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if total.is_power_of_two() {
+            eprintln!(
+                "[REMu][AGC][COLOR-EMIT] draw={draw_sequence} mrt=1 total_single={total} \
+                 total_multi={} total_mask_mrt3plus={} color0={:#x}",
+                MULTI.load(Ordering::Relaxed),
+                BASEPASS_MRT.load(Ordering::Relaxed),
+                targets[0].address,
+            );
+        }
+    }
 }
 
 fn agc_draw_writes_image(draw: &remu_gpu::IndexedDraw) -> bool {
