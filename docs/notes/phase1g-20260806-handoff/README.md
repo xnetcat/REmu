@@ -1,6 +1,6 @@
 # Phase 1G handoff — MEMORY MODEL (2026-08-06) — **MID-STOP / LOUD REFUSAL**
 
-**Branch:** `phase1g-memory-model` @ `5b920ab` (worktree `/Users/xnetcat/Documents/REmu-phase1g`)  
+**Branch:** `phase1g-memory-model` @ `9ae4001` (worktree `/Users/xnetcat/Documents/REmu-phase1g`)  
 **Base:** `main` @ `9397f11`  
 **NOT merged to main.** Phase 1H **not** started.
 

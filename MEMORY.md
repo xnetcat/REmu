@@ -26,7 +26,7 @@ registers/packets that state intent.
 - Handoff: `docs/notes/phase1f-20260806-handoff/`.
 - **Anti-claim:** Unity GC STW not live-closed (Dreaming Sarah dies before InstallExceptionHandler).
 
-## Phase 1G — memory model (MID-STOP 2026-08-06; branch `phase1g-memory-model` @ `5b920ab`)
+## Phase 1G — memory model (MID-STOP 2026-08-06; branch `phase1g-memory-model` @ `9ae4001`)
 
 - Guest-backed GPU tiler upload/publish for tiler-owned textures; sampled/storage CPU
   snapshot+detile+`replaceRegion` deleted on that path. Fingerprints, self-readback generations,

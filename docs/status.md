@@ -17,7 +17,7 @@ Oregon / Poppy watchdog-timeout clean; `pthread_setschedparam` no longer fabrica
 GC STW **not** live-proven — Dreaming Sarah still null-SIGSEGV before `InstallExceptionHandler`.
 Demon's Souls still ACM-blocked.
 
-## Phase 1G (2026-08-06) — memory model — MID-STOP (branch `phase1g-memory-model` @ `5b920ab`)
+## Phase 1G (2026-08-06) — memory model — MID-STOP (branch `phase1g-memory-model` @ `9ae4001`)
 
 Architectural GPU-timeline tiling + guest-backed upload/publish for tiler-owned textures landed
 on the branch (fingerprints / self-readback gens / D5 prestaging / CPU sampled snapshot path
