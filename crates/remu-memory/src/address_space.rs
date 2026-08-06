@@ -158,8 +158,14 @@ impl GuestAddressSpace {
         Ok(GuestAddress::new(start))
     }
 
-    /// Maps zero-filled private memory. A fixed map may commit free or reserved pages, but never
-    /// replaces an existing anonymous or shared mapping.
+    /// Maps zero-filled memory that behaves like anonymous for the CPU while remaining
+    /// GPU-referencable.
+    ///
+    /// Phase 1G: host-private anonymous pages cannot back Metal (`newBufferWithBytesNoCopy`
+    /// requires a shared physical identity). Route every former anonymous map through the
+    /// committed-backing path so residency and the GPU tiler resolve the same way as flexible
+    /// / commit-on-protect memory. A fixed map may commit free or reserved pages, but never
+    /// replaces an existing committed or shared mapping.
     pub fn map_anonymous(
         &mut self,
         placement: GuestMapPlacement,
@@ -167,25 +173,7 @@ impl GuestAddressSpace {
         alignment: u64,
         protection: GuestProtection,
     ) -> Result<GuestAddress, AddressSpaceError> {
-        Self::validate_allocation(size, alignment)?;
-        let start = self.resolve_mapping_placement(placement, size, alignment)?;
-        let end = checked_end(start, size)?;
-        self.map_host_anonymous(start, size, protection)?;
-        self.remove_metadata_range(start, end);
-        self.vmas.insert(
-            start,
-            Vma {
-                start,
-                end,
-                protection,
-                kind: VmaKind::Anonymous,
-                backing_offset: 0,
-                metadata: 0,
-                mapping_id: 0,
-            },
-        );
-        self.normalize();
-        Ok(GuestAddress::new(start))
+        self.map_committed(placement, size, alignment, protection)
     }
 
     /// Maps a slice of physical backing. Mapping the same slice more than once creates coherent

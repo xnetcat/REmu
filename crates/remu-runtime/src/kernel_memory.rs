@@ -373,7 +373,7 @@ impl KernelMemory {
         for mapping in self.virtual_memory.vmas().into_iter().filter(|mapping| {
             matches!(
                 mapping.state,
-                GuestVmaState::Anonymous | GuestVmaState::Committed | GuestVmaState::Shared
+                GuestVmaState::Committed | GuestVmaState::Shared
             ) && mapping.protection.contains(GuestProtection::READ)
         }) {
             let Some(end) = mapping.start.get().checked_add(mapping.size) else {

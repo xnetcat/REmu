@@ -88,7 +88,7 @@ fn fixed_mapping_commits_a_reservation_but_rejects_live_mapping_overlap() {
     assert!(matches!(
         error,
         AddressSpaceError::Overlap {
-            state: GuestVmaState::Anonymous,
+            state: GuestVmaState::Committed,
             ..
         }
     ));

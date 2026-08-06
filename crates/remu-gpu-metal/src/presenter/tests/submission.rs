@@ -7313,21 +7313,23 @@ fn same_queue_immediate_fill_rejects_every_unproven_shape() {
         SameQueueDmaFillReject::IncompleteDependency,
     );
 
-    let mut anonymous_space =
-        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("anonymous address space");
-    let anonymous = anonymous_space
-        .map_anonymous(
+    // Phase 1G: former anonymous maps are committed and Metal-backable. MissingIdentity
+    // requires a range with no shared-backing registry entry — a reservation that has not
+    // been protect-committed.
+    let mut reserved_space =
+        GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("reserved address space");
+    let reserved = reserved_space
+        .reserve(
             GuestMapPlacement::Anywhere,
             GUEST_PAGE_SIZE,
             GUEST_PAGE_SIZE,
-            GuestProtection::READ_WRITE,
         )
-        .expect("anonymous destination");
+        .expect("reserved destination without committed backing");
     assert_reject(
         &mut presenter,
         0,
         &exact,
-        &immediate_dma_fill(anonymous.get(), 0),
+        &immediate_dma_fill(reserved.get(), 0),
         SameQueueDmaFillReject::MissingIdentity,
     );
 
