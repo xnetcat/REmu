@@ -40,14 +40,19 @@ registers/packets that state intent.
   loads are magnitude-zero because lighting `800a69` exports all-zero with full coverage;
   sampled GBuffer `8023b9` is Metal+guest all-zero. 1×1 `80106d`/`8010ad` are optional
   sampled dummies, not the sole inputs (sampled-only writer lineage hid the ImageLoads).
-- **Live:** hallway 3D + title UI; title BG still black (`runs/silent-hill-title-bg-cs800c7e/`).
-- **Remaining:** why GBuffer sources (`8023b9`/friends) stay empty at title (geometry writer /
-  drop / clear); null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC mips; NGG `0x7`.
+- **No BasePass emit (`736d540` clean gbuffer run):** `COLOR-EMIT` `total_mask_mrt3plus=0`
+  for the whole session; only 2-slot shadow MRTs; `COLOR-MALFORMED=0`; GBuffer VAs never
+  appear as COLOR targets; depth `801ac2` stays `gpufalse/v0`. Not a Metal post-emit drop.
+- **Live:** hallway 3D assessable; title BG still black. Handoff evidence:
+  `runs/silent-hill-title-bg-gbuffer/` (+ prior `cs800c7e`).
+- **Remaining:** why Unreal never submits deferred BasePass (≥3-slot MRT) that would fill
+  `8023b9`/friends (cull / empty draw list / assets / depth-prepass / indirect count);
+  null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC mips; NGG `0x7`.
 - Handoff: `docs/notes/sh-present-20260806-handoff/`.
 - **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate /
-  VTE coverage-without-content / byte-nz-of-±0 / “800c7e only binds 1×1 dummies” ≠ title-BG
-  3D closure.
-- **Next:** empty GBuffer sources feeding `800a69`/`8009c4`/`800ae7`; else DeS ACM.
+  VTE coverage-without-content / byte-nz-of-±0 / “800c7e only binds 1×1 dummies” /
+  “Metal dropped BasePass” ≠ title-BG 3D closure.
+- **Next:** emit-side BasePass absence root (CPU/asset/cull) before `800a69`; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

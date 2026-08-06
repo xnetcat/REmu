@@ -31,15 +31,20 @@ float-`±0` (byte-nz from sign bits only); PS exports match.
 
 **`800c7e` ±0 (`32b445d` clean `runs/silent-hill-title-bg-cs800c7e/`):** CS `ImageLoad`s
 full-res zero `803d6e` (not SRD-missing). Upstream `800a69` full coverage + zero exports;
-GBuffer sample `8023b9` Metal+guest all-zero. Next: empty GBuffer sources.
+GBuffer sample `8023b9` Metal+guest all-zero.
+
+**No BasePass emit (`736d540` clean `runs/silent-hill-title-bg-gbuffer/`):**
+`total_mask_mrt3plus=0`; multi-MRT is only 2-slot shadows; GBuffer COLOR writers absent;
+depth `801ac2` `gpufalse/v0`. Not Metal-dropped BasePass / not Malformed CB.
 
 **Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void.
 
-**Remaining title-3D blockers:** empty GBuffer sources → zero lighting → ±0 scene color;
-null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 compressed mips; NGG `0x7` if
-critical. See `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI /
-mode-5 / stencil / type-0+alias / black-intermediate / VTE coverage-without-content /
-byte-nz-of-±0 / “CS only binds 1×1 dummies” ≠ title-background 3D closure.
+**Remaining title-3D blockers:** why Unreal never emits deferred BasePass for
+`8023b9`/friends → empty lighting → ±0 scene color; null IMAGE-FALLBACK; no-attachment if
+on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
+`docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 / stencil /
+type-0+alias / black-intermediate / VTE coverage-without-content / byte-nz-of-±0 /
+“CS only binds 1×1 dummies” / “Metal dropped BasePass” ≠ title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
