@@ -4,6 +4,23 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+## Phase 1E (2026-08-06) — shader core — CLOSED (with loud remaining NGG attr seam)
+
+Exact image compare lattice; VALU sign/saturate/SCC; precise `V_DIV_SCALE/FMAS_F32`; sub-dword
+LDS; graphics scratch + GS wave width; no raw VOP3/DS/MUBUF/MIMG operand fabrication; `0x351` =
+`V_MIN3_F16`; graphics-Dispatcher single-lane ballots; `S_BARRIER` allowed on structured CF and
+refused under Dispatcher; compacted-vertex EXP staging under proven `NggRegisters`;
+**`INTERFACE-FILL` deleted**. Missing non-procedural `SPI_PS_INPUT_CNTL` ↔ `EXP PARAM` links
+loud-refuse (Silent Hill PARAM-less NGG still refuses — no UV invent). See
+`docs/notes/phase1e-20260806-handoff/`.
+
+**Acceptance (`71d259e`):** package tests + both-arch workspace check green (2 pre-existing
+irreducible CF unit fails unchanged from `0a8212a`). Silent Hill watchdog-times out with
+`INTERFACE-FILL=0` and loud missing-PARAM refuses — **not** a 3D-scene closure. Dreaming Sarah /
+Void Terrarium host null SIGSEGV also reproduces on Phase 1D tip `0a8212a` (not a 1E
+introduction); `bf50225` DS control same hour was ~30 FPS (not 60) so no FPS claims. Phase 1F–H
+not started.
+
 ## Phase 1D (2026-08-05) — register model — CLOSED
 
 AGC shadow Cx/Sh/Uc files seed from `agc_register_defaults` on init and selective `resetQueue`
@@ -15,7 +32,7 @@ writemasks are deleted. Stencil, depth bias, `CB_COLOR_INFO` blend bypass, `UcIn
 `docs/notes/phase1d-20260805-handoff/`.
 
 **Acceptance (`1273aab`):** Silent Hill watchdog-times out clean with seeded defaults and CCW NGG
-mesh winding in logs. Not a 3D-scene closure. Phase 1E–H not started.
+mesh winding in logs. Not a 3D-scene closure. Phase 1E closed separately above.
 
 ## Phase 1C (2026-08-05) — ordered publication — CLOSED
 

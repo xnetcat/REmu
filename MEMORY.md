@@ -17,6 +17,16 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Phase 1E — shader core (CLOSED 2026-08-06)
+
+- Exact `image_is_comparison` lattice; VALU BFE/CLAMP/SCC; `V_DIV_SCALE/FMAS_F32`; sub-dword LDS;
+  graphics scratch + GS wave; no raw VOP3/DS/MUBUF/MIMG operand fabrication; `0x351`=`V_MIN3_F16`.
+- NGG: compacted EXP staging under proven `NggRegisters`; **`INTERFACE-FILL` deleted**; missing
+  non-procedural PARAM links loud-refuse. PARAM-less SH NGG attrs still refused (no UV invent).
+- Barriers: structured OK; Dispatcher refuse. Graphics Dispatcher ballots = single-lane.
+- Handoff: `docs/notes/phase1e-20260806-handoff/`. Head ~`71d259e`.
+- Phase 1F–H not started.
+
 ## Phase 1D — register model (CLOSED 2026-08-05)
 
 - Seed Cx/Sh/Uc from `agc_register_defaults` on `AgcGraphicsState::default` and selective
@@ -27,7 +37,6 @@ registers/packets that state intent.
   index offset, `CxVgtShaderStagesEn` + `UcGeCntl` NGG.
 - `6a082b1` kept: absolute viewport height, no winding re-flip.
 - Handoff: `docs/notes/phase1d-20260805-handoff/`. Head ~`1273aab`.
-- Phase 1E–H not started.
 
 ## Phase 1C — ordered publication (CLOSED 2026-08-05)
 
