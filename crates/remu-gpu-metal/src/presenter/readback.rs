@@ -144,12 +144,12 @@ impl MetalPresenter {
         Ok(())
     }
 
-    /// Settles a resident's publication debt for `trigger`, and reports whether guest memory
-    /// was written.
+    /// Settles authored Metal bytes for `trigger` via GPU publish (encode-then-clear).
     ///
-    /// A refused trigger keeps the debt: the bytes still exist only in Metal, and saying otherwise
-    /// would let a later guest-observable read believe guest RAM already agrees. Authority is not
-    /// handed to guest RAM either, so the resident keeps serving reads from its own texels.
+    /// Guest-observable / lease-validated triggers encode GPU retile then clear. Bookkeeping
+    /// triggers must refuse and **keep** the debt: clearing `gpu_authored` without publishing
+    /// lies that guest RAM already agrees with Metal (Silent Hill guest-fault regression after
+    /// `56f7737`; live refutation — believe the run).
     pub(super) fn settle_resident_texture_writeback(
         &mut self,
         descriptor: GuestTextureDescriptor,
@@ -161,12 +161,26 @@ impl MetalPresenter {
         if !resident.gpu_written() {
             return Ok(false);
         }
-        if let Some(refusal) = trigger.refusal() {
+        let has_live_lease = resident.write_watch.retirement().is_none();
+        let class = trigger.end_state_class(has_live_lease);
+        if class == crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping {
             RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
             RESIDENT_WRITEBACK_DISCARDED_BYTES
                 .fetch_add(resident.gpu_authored.byte_count(), Ordering::Relaxed);
-            trace_discarded_resident_writeback(resident, trigger, refusal);
+            trace_discarded_resident_writeback(
+                resident,
+                trigger,
+                "RemuBookkeeping — refuse publish; keep Metal debt",
+            );
             return Ok(false);
+        }
+        crate::presenter::tiler::refuse_bookkeeping_writeback(class)?;
+        if !crate::presenter::tiler::gpu_tiler_owns_descriptor(resident.descriptor) {
+            return Err(format!(
+                "Phase 1G: refusing CPU texture writeback for tile={} format={:?} — GPU tiler does not own this descriptor",
+                resident.descriptor.tile_mode,
+                resident.descriptor.pixel_format
+            ));
         }
         let alias_ranges = resident.write_watch.alias_ranges();
         // A sampled or multisample view of the same storage would shadow the bytes about to be
@@ -185,39 +199,70 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
+        let resident = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .ok_or("resident texture disappeared before its writeback")?;
+        let published_bytes = resident.gpu_authored.byte_count();
+        let authored: Vec<(u64, u64)> = resident.gpu_authored.runs().to_vec();
+        let texture = resident.texture.clone();
+        let guest_descriptor = resident.descriptor;
+        // Lease lifetime: require the watch's mapping still covers the descriptor before encode.
+        if resident.write_watch.retirement().is_some() {
+            let resident = self
+                .resident_guest_textures
+                .get_mut(&descriptor)
+                .ok_or("resident disappeared during revoked publish")?;
+            RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
+            RESIDENT_WRITEBACK_DISCARDED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
+            eprintln!(
+                "[REMu][METAL] demoting resident after revoked texture publish lease address={:#x} trigger={}",
+                resident.descriptor.address,
+                trigger.label(),
+            );
+            resident.demote(StaleSource::GuestMemory);
+            return Ok(false);
+        }
         let queue = self
             .command_queue
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
+        // Prefer the open guest batch when a submit owns a queue. Standalone settles (tests /
+        // out-of-submit DMA/flip paths without an active queue) use a dedicated publish CB.
+        let command_buffer = if self.active_open_guest_batch().is_some()
+            || self.ensure_active_open_guest_batch().is_ok()
+        {
+            let batch = self
+                .active_open_guest_batch_mut()
+                .expect("guest batch opened for Phase 1G publish");
+            batch.close_active_pass_encoders();
+            batch.command_buffer.clone()
+        } else {
+            let buffer = queue.new_command_buffer().to_owned();
+            buffer.set_label("REMu Phase 1G standalone GPU publish");
+            buffer
+        };
+        let standalone = self.active_open_guest_batch().is_none();
+        crate::presenter::tiler::encode_gpu_publish_to_guest(
+            &device,
+            &command_buffer,
+            guest_descriptor,
+            &texture,
+            &authored,
+        )?;
+        if standalone {
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        }
         let resident = self
             .resident_guest_textures
             .get_mut(&descriptor)
-            .ok_or("resident texture disappeared before its writeback")?;
-        let published_bytes = resident.gpu_authored.byte_count();
-        let outcome = write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-        match outcome {
-            TextureWritebackOutcome::Applied => {
-                // Guest RAM and the Metal allocation are identical now: the allocation stays in
-                // place, still the authority for its bytes and owing none of them.
-                resident.clear_gpu_authored();
-                RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
-                RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
-                Ok(true)
-            }
-            TextureWritebackOutcome::DiscardedStale => {
-                // D4-texture: a revoked lease must demote loudly, never silently rebuild.
-                RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
-                RESIDENT_WRITEBACK_DISCARDED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
-                eprintln!(
-                    "[REMu][METAL] demoting resident after revoked texture writeback lease address={:#x} trigger={}",
-                    resident.descriptor.address,
-                    trigger.label(),
-                );
-                resident.demote(StaleSource::GuestMemory);
-                Ok(false)
-            }
-        }
+            .ok_or("resident texture disappeared after GPU publish encode")?;
+        resident.clear_gpu_authored();
+        RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
+        RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
+        Ok(true)
     }
 
     pub(super) fn direct_scanout_needs_initial_clear(&self, address: u64) -> bool {
@@ -1113,10 +1158,11 @@ fn texture_writeback_disabled() -> bool {
     })
 }
 
-/// Restores publication for the triggers only REmu's own residency bookkeeping raises.
+/// Restores publication for residency-bookkeeping triggers (alias / sampled / pressure).
 ///
-/// Those publications are off by default because nothing in the guest asked for them. The switch
-/// exists so a run can be compared against the old behaviour without rebuilding.
+/// Off by default: a live lease does not prove the guest will read these bytes from RAM, and
+/// publishing into a recycled heap corrupted Silent Hill (stable SIGSEGV after `56f7737` classified
+/// alias/sampled as lease-validated). Opt in only for differential diagnosis.
 fn internal_writeback_publication_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1124,14 +1170,9 @@ fn internal_writeback_publication_enabled() -> bool {
     })
 }
 
-/// What made REmu consider copying a resident's Metal pixels into guest memory.
-///
-/// Hardware never performs this copy: a GPU write lands in unified memory at draw time, and memory
-/// the guest recycles simply loses its old contents. Every publication here is REmu re-staging
-/// bytes on its own timeline into a range whose tenancy it cannot verify, because a guest `free()`
-/// touches no mapping and raises no GPU event. A trigger therefore admits a publication only when
-/// it names a guest-observable read of those exact bytes; a trigger raised by residency
-/// bookkeeping has no such reader and drops the pixels instead.
+/// Names why a GPU publish encode was requested. Phase 1G classifies through
+/// [`crate::presenter::tiler::classify_end_state_write`]. Guest-observable DMA/flip paths encode
+/// then clear. Bookkeeping triggers refuse and keep Metal debt unless explicitly opted in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WritebackTrigger {
     /// A guest DMA_DATA packet reads this range, so the packet itself proves it is live.
@@ -1176,26 +1217,39 @@ impl WritebackTrigger {
         }
     }
 
-    /// Why this trigger may not write guest memory, or `None` when it may.
-    fn refusal(self) -> Option<&'static str> {
+    /// End-state classification for this trigger given whether the resident's lease is live.
+    pub(crate) fn end_state_class(
+        self,
+        has_live_lease: bool,
+    ) -> crate::presenter::tiler::EndStateWriteClass {
         if texture_writeback_disabled() {
-            return Some("REMU_DISABLE_TEXTURE_WRITEBACK=1");
+            return crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping;
         }
         match self {
-            Self::DmaSource | Self::FlipTarget => None,
-            Self::PressureEviction
-            | Self::AliasRebuild
-            | Self::LayeredDepthAlias
-            | Self::SampledAlias => (!internal_writeback_publication_enabled())
-                .then_some("residency bookkeeping, no guest read of these bytes"),
+            Self::DmaSource | Self::FlipTarget => {
+                crate::presenter::tiler::classify_end_state_write(true, has_live_lease, true)
+            }
+            Self::AliasRebuild | Self::LayeredDepthAlias | Self::SampledAlias => {
+                // Live lease ≠ guest will read from RAM. Default refuse (keep Metal debt); opt-in
+                // via REMU_PUBLISH_INTERNAL_WRITEBACKS restores pre-1G differential publishing.
+                if internal_writeback_publication_enabled() {
+                    crate::presenter::tiler::classify_end_state_write(true, has_live_lease, false)
+                } else {
+                    crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping
+                }
+            }
+            Self::PressureEviction => crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping,
         }
     }
 
     /// Whether a publication for this trigger would reach guest memory at all.
     ///
-    /// Call sites use this to skip the pipeline flush and readback ordering a publication needs.
+    /// Call sites use this to skip the pipeline flush a publication needs.
     pub(crate) fn publishes_to_guest(self) -> bool {
-        self.refusal().is_none()
+        !matches!(
+            self.end_state_class(true),
+            crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping
+        )
     }
 }
 
@@ -1235,159 +1289,9 @@ fn trace_discarded_resident_writeback(
     );
 }
 
-/// Publishes a resident's Metal pixels back into the guest bytes it owes them for.
-///
-/// This is the mechanism only; [`MetalPresenter::settle_resident_texture_writeback`] decides
-/// whether a publication is admissible at all. Only `gpu_authored` is published: everything else
-/// in the declared range is either padding the GPU never wrote or bytes another allocation — or
-/// the guest heap, once the render target was freed — answers for, and a whole-span
-/// read-modify-write republishes all of it.
-pub(super) fn write_resident_texture_contents_to_guest(
-    device: &Device,
-    queue: &metal::CommandQueue,
-    resident: &ResidentGuestTexture,
-) -> Result<TextureWritebackOutcome, String> {
-    if !resident.gpu_written() {
-        return Ok(TextureWritebackOutcome::Applied);
-    }
-    let authored = resident.gpu_authored_offsets();
-    if resident.mip_level_count == 1 {
-        match resident.texture.texture_type() {
-            MTLTextureType::D2 => {
-                let linear =
-                    read_texture_linear(device, queue, &resident.texture, resident.descriptor)?;
-                return write_watched_guest_texture_linear(
-                    resident.descriptor,
-                    &linear,
-                    authored.as_deref(),
-                    &resident.write_watch,
-                );
-            }
-            MTLTextureType::D2Array => {
-                let linear = read_texture_array_linear(
-                    device,
-                    queue,
-                    &resident.texture,
-                    resident.descriptor,
-                )?;
-                return write_layered_resident_texture_contents_to_guest(
-                    resident,
-                    &linear,
-                    authored.as_deref(),
-                );
-            }
-            MTLTextureType::D3 => {
-                let linear = read_texture_volume_linear(
-                    device,
-                    queue,
-                    &resident.texture,
-                    resident.descriptor,
-                )?;
-                return write_layered_resident_texture_contents_to_guest(
-                    resident,
-                    &linear,
-                    authored.as_deref(),
-                );
-            }
-            texture_type => {
-                return Err(format!(
-                    "resident texture writeback does not support Metal type {texture_type:?}"
-                ));
-            }
-        }
-    }
-    if resident.texture_type != 9 || resident.layer_count != 1 {
-        return Err(format!(
-            "mip writeback requires a 2D single-layer resident, got type={} layers={}",
-            resident.texture_type, resident.layer_count
-        ));
-    }
-    let layout = mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
-    // The chain snapshot below seeds the published bytes; a guest store between it and the
-    // publish would be reverted. Capture the fault generations here so the publish can abort.
-    let entry_generations = resident.write_watch.generations();
-    let baseline = snapshot_watched_guest_range(
-        resident.descriptor.address,
-        layout.byte_count,
-        &resident.write_watch,
-    )?;
-    let mut raw = baseline.clone();
-    let mut levels = Vec::with_capacity(layout.levels.len());
-    for mip_level in 0..resident.mip_level_count {
-        levels.push(read_texture_mip_linear(
-            device,
-            queue,
-            &resident.texture,
-            resident.descriptor,
-            mip_level,
-        )?);
-    }
-    encode_mode27_mip_chain_into_raw(&layout, &levels, &mut raw)?;
-    write_watched_guest_range(
-        resident.descriptor.address,
-        &raw,
-        authored.as_deref(),
-        Some(&baseline),
-        &resident.write_watch,
-        Some(&entry_generations),
-    )
-}
-
-fn write_layered_resident_texture_contents_to_guest(
-    resident: &ResidentGuestTexture,
-    linear: &[u8],
-    authored: Option<&[(u64, u64)]>,
-) -> Result<TextureWritebackOutcome, String> {
-    let face_raw_bytes = usize::try_from(
-        super::guest_texture_byte_count(resident.descriptor)
-            .ok_or("layered guest texture face byte count overflows")?,
-    )
-    .map_err(|_| "layered guest texture face byte count does not fit usize")?;
-    let (width, height, _, bytes_per_element) = texture_element_layout(resident.descriptor)?;
-    let face_linear_bytes = width
-        .checked_mul(height)
-        .and_then(|elements| elements.checked_mul(bytes_per_element))
-        .ok_or("layered guest texture linear face size overflows")?;
-    let layer_count = usize::try_from(resident.layer_count)
-        .map_err(|_| "layered guest texture layer count does not fit usize")?;
-    let expected_linear_bytes = face_linear_bytes
-        .checked_mul(layer_count)
-        .ok_or("layered guest texture linear size overflows")?;
-    if linear.len() != expected_linear_bytes {
-        return Err(format!(
-            "layered guest texture readback has {} bytes, expected {expected_linear_bytes}",
-            linear.len()
-        ));
-    }
-    let raw_bytes = face_raw_bytes
-        .checked_mul(layer_count)
-        .ok_or("layered guest texture raw size overflows")?;
-    let entry_generations = resident.write_watch.generations();
-    let baseline = snapshot_watched_guest_range(
-        resident.descriptor.address,
-        raw_bytes,
-        &resident.write_watch,
-    )?;
-    let mut raw = baseline.clone();
-    for layer in 0..layer_count {
-        let linear_start = layer * face_linear_bytes;
-        let raw_start = layer * face_raw_bytes;
-        write_guest_texture_linear_into_raw_at_z(
-            resident.descriptor,
-            &linear[linear_start..linear_start + face_linear_bytes],
-            &mut raw[raw_start..raw_start + face_raw_bytes],
-            layer,
-        )?;
-    }
-    write_watched_guest_range(
-        resident.descriptor.address,
-        &raw,
-        authored,
-        Some(&baseline),
-        &resident.write_watch,
-        Some(&entry_generations),
-    )
-}
+// Phase 1G: CPU `write_resident_texture_contents_to_guest` (readback→CPU retile→guarded
+// publish) is deleted. Guest-observable publication goes through
+// `tiler::encode_gpu_publish_to_guest` on the GPU timeline.
 
 pub(super) fn read_texture_volume_linear(
     device: &Device,

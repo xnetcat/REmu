@@ -288,7 +288,7 @@ fn resolve_shared_backing_range(
 /// Resolves a live shared guest range to its backing object and byte offset.
 ///
 /// Adjacent virtual mappings are accepted when they name contiguous slices of the same backing.
-/// Anonymous and guard mappings intentionally return `None` because they cannot alias another VA.
+/// Reserved/guard mappings intentionally return `None` because they have no physical backing.
 #[must_use]
 pub fn guest_shared_mapping_identity(
     address: u64,

@@ -217,7 +217,7 @@ use self::submission::{
 use self::texture::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
     SpanQueryOrder, TextureWritebackOutcome, WrittenRegion, decode_guest_texture_linear_from_raw,
-    ensure_read_watch_materializer_registered, refresh_resident_texture_write_watch,
+    refresh_resident_texture_write_watch,
     resident_color_view_sample_is_eligible, resident_declared_span,
     resident_depth_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
@@ -1226,10 +1226,6 @@ enum QueueBlockReason {
     FlipSafetyWait(GpuFlipWait),
     GraphicsPipeline(GraphicsPipelineKey),
     ComputePipeline(ComputePipelineKey),
-    /// B3: deferred in-batch guest texture readback. The queue stays blocked until the
-    /// continuation is completed; encoding must not commit for the value (see `tiler::deferred`).
-    #[allow(dead_code)] // Constructed when open-batch resolve wires QueueBlockReason.
-    GuestReadback(tiler::DeferredGuestReadId),
 }
 
 enum PipelineCompileCandidate {
@@ -1310,16 +1306,16 @@ struct ResidentGuestTexture {
     /// Subset of `owned` whose current value exists only in Metal.
     ///
     /// This is the publication debt the guest is owed, and it is what `gpu_written()` reports.
+    /// Bookkeeping settles must not clear it without publishing — that lies that guest RAM agrees.
     gpu_authored: RangeSet,
     /// `Live` unless every owned byte was taken by another writer or by the CPU.
     state: ResidencyState,
     content_version: u64,
     /// CPU-write generations observed when Metal most recently became authoritative.
     ///
-    /// Guest heaps routinely reuse image allocations as indirect command buffers. A plain dirty
-    /// bit cannot distinguish a later guest write from the presenter's own earlier readback,
-    /// because both touch the same watched host pages. The monotonically increasing generations
-    /// establish the ownership boundary at the actual GPU write.
+    /// Guest heaps reuse image allocations as ICBs. A plain dirty bit cannot distinguish a later
+    /// guest write from presenter-side watch renewal; generations establish the ownership boundary
+    /// at the actual GPU write (kept after fingerprint deletion for the Active false-positive path).
     gpu_write_watch_generations: Vec<u64>,
     /// Most recent ordered guest work/flip that read or wrote this Metal allocation.
     ///
@@ -1526,21 +1522,26 @@ impl ResidentGuestTexture {
         &mut self,
         refresh: WriteWatchRefresh,
     ) -> Result<bool, String> {
-        let possibly_changed = matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
-            || self.write_watch.content_validation_pending()
-            || self.write_watch.is_dirty()
-            || self.write_watch.generations() != self.gpu_write_watch_generations;
-        if !possibly_changed {
-            return Ok(false);
+        // Mapping renewal can report dirty without a guest store — remaps must not steal Metal
+        // authority (`5b920ab`). On Active watches, generations still filter false-positive dirt
+        // after fingerprint deletion: unchanged content re-anchors the GPU ownership boundary.
+        match refresh {
+            WriteWatchRefresh::Replaced => Ok(true),
+            WriteWatchRefresh::Reprotecting | WriteWatchRefresh::Renewed { .. } => Ok(false),
+            WriteWatchRefresh::Active => {
+                let possibly_changed = self.write_watch.content_validation_pending()
+                    || self.write_watch.is_dirty()
+                    || self.write_watch.generations() != self.gpu_write_watch_generations;
+                if !possibly_changed {
+                    return Ok(false);
+                }
+                if self.write_watch.content_has_changed()? {
+                    return Ok(true);
+                }
+                self.note_gpu_write();
+                Ok(false)
+            }
         }
-        if self.write_watch.content_has_changed()? {
-            return Ok(true);
-        }
-        // False-positive page dirtiness and permission-only watch renewal do not transfer
-        // ownership back to the CPU. Keep the GPU-current image and establish its boundary in the
-        // current watch generation domain.
-        self.note_gpu_write();
-        Ok(false)
     }
 
     fn note_read(&mut self, stamp: ResidentTextureActivityStamp) {
@@ -1612,8 +1613,6 @@ struct GuestTextureWatchRange {
 }
 
 struct GuestTextureContentState {
-    chunk_fingerprints: Vec<u64>,
-    initialized_chunks: Vec<bool>,
     pending_dirty_ranges: Vec<(u64, u64)>,
 }
 
@@ -1913,8 +1912,6 @@ struct SharedEventResidentTextureVersion {
     layer_count: u32,
     mip_level_count: u32,
     content_version: u64,
-    /// CPU-write generations at the exact GPU ownership boundary for this version.
-    gpu_write_watch_generations: Vec<u64>,
     span: ResourceSpan,
     /// Which write recorded this version: a guest render-target write
     /// (`ResidentDestination`) or an internal relayout (`InternalResidentDestination`,
@@ -2414,13 +2411,6 @@ struct MetalPresenter {
     ngg_indirect_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_scatter_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_gather_pipeline: Option<ComputePipelineState>,
-    /// B3: deferred in-batch readbacks. Encoding records here; never invents bytes.
-    #[allow(dead_code)]
-    // Wired for QueueBlockReason::GuestReadback; open-batch resolve is next.
-    deferred_guest_reads: tiler::DeferredGuestReadTracker,
-    /// Q4: absolute-address pool bind (gpu-metal half). None until a live shared backing proves.
-    #[allow(dead_code)] // Bind surface until shader-metal agrees on slot + lowering.
-    absolute_address_pool: Option<tiler::AbsoluteAddressPool>,
     failed_compute_pipelines: HashSet<ComputePipelineKey>,
     failed_compute_execution: HashSet<u64>,
     /// Compute dispatches whose execution failed, keyed by shader address; same contract as
@@ -2478,9 +2468,6 @@ impl MetalPresenter {
     fn new(receiver: Receiver<GpuEvent>) -> Result<Self, String> {
         // D5: register the read-watch materializer before any resident can arm a read-watch.
         // Without a materializer, `CpuWriteWatch::new_read_materialized` loudly refuses.
-        // Production residents still use write-watches until prestaged host buffers are wired
-        // (NOTES Batch B4 seam); this only installs the signal-safe memcpy path.
-        ensure_read_watch_materializer_registered();
         let device = Device::system_default().ok_or("no Metal device is available")?;
         let command_queue = device.new_command_queue();
         command_queue.set_label("REmu guest command queue");
@@ -2665,8 +2652,6 @@ impl MetalPresenter {
             ngg_indirect_pipeline: None,
             mode27_rematerialisation_scatter_pipeline: None,
             mode27_rematerialisation_gather_pipeline: None,
-            deferred_guest_reads: tiler::DeferredGuestReadTracker::new(),
-            absolute_address_pool: None,
             failed_compute_pipelines: HashSet::new(),
             failed_compute_execution: HashSet::new(),
             dropped_compute_executions: HashMap::new(),

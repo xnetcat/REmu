@@ -575,105 +575,13 @@ impl MetalPresenter {
             trace_global_coherence(binding, "packet-copy-fallback");
             return self.upload_fresh_global_buffer(device, binding);
         }
-        let key = GlobalBufferCacheKey {
-            base_address: binding.base_address,
-            byte_count: binding.data.len(),
-        };
-        if binding.data.len() > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY {
-            if let Some(cached) = self.active_transient_global_buffer_cache().get(&key)
-                && cached.bytes == binding.data
-            {
-                return Ok(UploadedGlobalBuffer {
-                    buffer: cached.buffer.clone(),
-                    offset: cached.offset,
-                    guest_memory: false,
-                    physical_identity: None,
-                    original_version: None,
-                });
-            }
-            let (buffer, offset) = self
-                .active_open_guest_batch_mut()
-                .ok_or("captured global upload has no open guest batch")?
-                .upload_global_bytes(device, &binding.data)?;
-            self.active_transient_global_buffer_cache_mut().insert(
-                key,
-                CachedGlobalBuffer {
-                    bytes: binding.data.clone(),
-                    buffer: buffer.clone(),
-                    offset,
-                },
-            );
-            return Ok(UploadedGlobalBuffer {
-                buffer,
-                offset,
-                guest_memory: false,
-                physical_identity: None,
-                original_version: None,
-            });
-        }
-        if let Some(cached) = self.global_buffer_cache.get(&key)
-            && cached.bytes == binding.data
-        {
-            return Ok(UploadedGlobalBuffer {
-                buffer: cached.buffer.clone(),
-                offset: cached.offset,
-                guest_memory: false,
-                physical_identity: None,
-                original_version: None,
-            });
-        }
-        // A stable guest address whose packet-time bytes keep changing is a transient constant
-        // stream. Keep its first immutable cache entry as a possible exact hit, but place later
-        // variants in the current command batch's arena instead of allocating and destroying an
-        // MTLBuffer for every draw.
-        if self.global_buffer_cache.contains_key(&key) {
-            let (buffer, offset) = self
-                .active_open_guest_batch_mut()
-                .ok_or("captured global upload has no open guest batch")?
-                .upload_global_bytes(device, &binding.data)?;
-            return Ok(UploadedGlobalBuffer {
-                buffer,
-                offset,
-                guest_memory: false,
-                physical_identity: None,
-                original_version: None,
-            });
-        }
-        if self.global_buffer_cache.len() >= GLOBAL_BUFFER_CACHE_CAPACITY
-            || self
-                .global_buffer_cache_bytes
-                .saturating_add(binding.data.len())
-                > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY
-        {
-            let (buffer, offset) = self
-                .active_open_guest_batch_mut()
-                .ok_or("captured global upload has no open guest batch")?
-                .upload_global_bytes(device, &binding.data)?;
-            return Ok(UploadedGlobalBuffer {
-                buffer,
-                offset,
-                guest_memory: false,
-                physical_identity: None,
-                original_version: None,
-            });
-        }
-        let buffer = metal_buffer_with_bytes(device, &binding.data)?;
-        let offset = 0;
-        if let Some(replaced) = self.global_buffer_cache.insert(
-            key,
-            CachedGlobalBuffer {
-                bytes: binding.data.clone(),
-                buffer: buffer.clone(),
-                offset,
-            },
-        ) {
-            self.global_buffer_cache_bytes = self
-                .global_buffer_cache_bytes
-                .saturating_sub(replaced.bytes.len());
-        }
-        self.global_buffer_cache_bytes = self
-            .global_buffer_cache_bytes
-            .saturating_add(binding.data.len());
+        // Full packet snapshot must win over live guest identity (producer may have recycled the
+        // VA). Phase 1G deletes the host byte-compare cache: upload the packet snapshot fresh
+        // into the open batch every time instead of retaining VA-keyed host copies.
+        let (buffer, offset) = self
+            .active_open_guest_batch_mut()
+            .ok_or("captured global upload has no open guest batch")?
+            .upload_global_bytes(device, &binding.data)?;
         Ok(UploadedGlobalBuffer {
             buffer,
             offset,

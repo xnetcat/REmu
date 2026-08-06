@@ -115,8 +115,7 @@ impl MetalPresenter {
                         || self.failed_compute_pipelines.contains(key)
                 }
                 QueueBlockReason::GuestMemoryWait(_)
-                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
-                | QueueBlockReason::GuestReadback(_) => false,
+                | QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
                 QueueBlockReason::GuestSharedEventHostEffect {
                     consumer_queue_id,
                     consumer_ack,
@@ -937,13 +936,15 @@ impl MetalPresenter {
     ) -> bool {
         struct WatchedResource<'a> {
             watch: &'a super::GuestTextureWriteWatch,
-            gpu_write_generations: Option<&'a [u64]>,
             footprint: PhysicalFootprintRange,
+            /// GPU-authored residents are never ACQUIRE no-ops: Metal still owns unpublished
+            /// bytes, so an invalidating acquire must run the ordinary path.
+            gpu_authored: bool,
         }
 
         fn watched_resource<'a>(
             watch: &'a super::GuestTextureWriteWatch,
-            gpu_write_generations: Option<&'a [u64]>,
+            gpu_authored: bool,
         ) -> Option<WatchedResource<'a>> {
             let (address, byte_count) = watch.range();
             let span = ResourceSpan::new(address, byte_count);
@@ -955,8 +956,8 @@ impl MetalPresenter {
             )?;
             Some(WatchedResource {
                 watch,
-                gpu_write_generations,
                 footprint,
+                gpu_authored,
             })
         }
 
@@ -966,12 +967,8 @@ impl MetalPresenter {
             if !acquire.overlaps(address, byte_count) {
                 continue;
             }
-            let Some(resource) = watched_resource(
-                &resident.write_watch,
-                resident
-                    .gpu_written()
-                    .then_some(resident.gpu_write_watch_generations.as_slice()),
-            ) else {
+            let Some(resource) = watched_resource(&resident.write_watch, resident.gpu_written())
+            else {
                 return false;
             };
             watched.push(resource);
@@ -981,7 +978,7 @@ impl MetalPresenter {
             if !acquire.overlaps(address, byte_count) {
                 continue;
             }
-            let Some(resource) = watched_resource(&cached.write_watch, None) else {
+            let Some(resource) = watched_resource(&cached.write_watch, false) else {
                 return false;
             };
             watched.push(resource);
@@ -1031,11 +1028,7 @@ impl MetalPresenter {
             .collect::<Vec<_>>();
         first == second
             && second.iter().all(|token| token.is_clean())
-            && watched.iter().zip(&second).all(|(resource, token)| {
-                resource
-                    .gpu_write_generations
-                    .is_none_or(|generations| generations == token.generations())
-            })
+            && watched.iter().all(|resource| !resource.gpu_authored)
     }
 
     pub(super) fn record_shared_event_direct_draw_outcome(

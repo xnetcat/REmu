@@ -10,10 +10,9 @@ use super::{
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
     SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey, SpanQueryOrder,
     UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
-    create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
-    create_sampled_guest_texture, decode_image_descriptor, decode_sampled_texture_linear_from_raw,
-    ensure_mipmapped_resident_texture_in_map, ensure_resident_texture_in_map,
-    fallback_image_descriptor, guest_texture_byte_count,
+    create_sampled_guest_texture, create_sampled_guest_texture_from_guest_gpu,
+    decode_image_descriptor, ensure_mipmapped_resident_texture_in_map,
+    ensure_resident_texture_in_map, fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     is_storage_image_opcode, is_writable_image_opcode, persistent_sampled_texture_write_watch,
@@ -21,11 +20,9 @@ use super::{
     render_resolve_candidate_matches, resident_color_view_sample_is_eligible,
     resident_depth_sample_is_eligible, resident_texture_for_sample, retire_sampled_texture,
     sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_supports_access,
-    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
-    sampler_uses_normalized_coordinates, snapshot_watched_sampled_texture_raw,
-    storage_image_requires_mip_hierarchy, texture_element_layout,
-    trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
-    trace_target_sampling,
+    sampler_uses_normalized_coordinates, storage_image_requires_mip_hierarchy,
+    texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
+    trace_resident_texture_removal, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -274,6 +271,28 @@ pub(crate) fn comparison_depth32_upload(
         depth.extend_from_slice(&value.to_ne_bytes());
     }
     Ok(Some(depth))
+}
+
+/// Settles a dedicated Phase 1G guest→texture upload on `queue`.
+fn settle_gpu_sampled_upload(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    descriptor: super::DecodedImageDescriptor,
+    comparison: bool,
+    writable: bool,
+) -> Result<Texture, String> {
+    let upload_buffer = queue.new_command_buffer().to_owned();
+    upload_buffer.set_label("REMu Phase 1G sampled GPU upload");
+    let texture = create_sampled_guest_texture_from_guest_gpu(
+        device,
+        &upload_buffer,
+        descriptor,
+        comparison,
+        writable,
+    )?;
+    upload_buffer.commit();
+    upload_buffer.wait_until_completed();
+    Ok(texture)
 }
 
 pub(crate) fn upload_image_textures(
@@ -772,6 +791,7 @@ pub(crate) fn upload_image_textures(
                     selected_resident = Some(descriptor.guest);
                     ensure_mipmapped_resident_texture_in_map(
                         device,
+                        Some(queue),
                         None,
                         descriptor,
                         resident_guest_textures,
@@ -781,6 +801,7 @@ pub(crate) fn upload_image_textures(
                     selected_resident = Some(descriptor.guest);
                     ensure_resident_texture_in_map(
                         device,
+                        Some(queue),
                         descriptor.guest,
                         resident_guest_textures,
                         true,
@@ -824,12 +845,8 @@ pub(crate) fn upload_image_textures(
                     false
                 };
                 if reload {
-                    // CPU-produced images such as AvPlayer's rotating NV12 frames can be updated
-                    // immediately before a draw without an intervening ACQUIRE_MEM packet. The
-                    // write watch has already observed that store, so retaining the Metal cache
-                    // here would sample the zero-filled/predecessor frame forever. Rebuild from a
-                    // stable watched snapshot; the persistent watch is shared with the new entry
-                    // and is rearmed by snapshot_watched_sampled_texture_raw.
+                    // Coarse write-watch dirty means guest RAM changed; rebuild from guest via
+                    // the GPU tiler. No fingerprint compare and no CPU snapshot/detile.
                     if let Some(retired) = sampled_texture_cache.remove(&key) {
                         SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS.fetch_add(1, Ordering::Relaxed);
                         retire_sampled_texture(retired);
@@ -848,51 +865,16 @@ pub(crate) fn upload_image_textures(
                         sampled_texture_write_watches,
                     )
                         .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let raw = snapshot_watched_sampled_texture_raw(descriptor, &write_watch)
-                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
-                    let texture = if sampled_texture_uses_exact_mode5_mips(descriptor) {
-                        create_exact_mode5_sampled_mip_view(
-                            device,
-                            descriptor,
-                            &raw,
-                            comparison,
-                            requires_shader_write,
-                        )
-                        .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?
-                    } else if sampled_texture_uses_exact_mode27_mips(descriptor) {
-                            create_exact_mode27_sampled_mip_view(
-                                device,
-                                descriptor,
-                                &raw,
-                                comparison,
-                            )
-                            .map_err(|error| {
-                                format!("image at PC {:#x}: {error}", binding.pc)
-                            })?
-                        } else {
-                            let linear =
-                                decode_sampled_texture_linear_from_raw(descriptor, &raw).map_err(
-                                    |error| format!("image at PC {:#x}: {error}", binding.pc),
-                                )?;
-                            trace_glyph_atlas_linear(
-                                descriptor.guest,
-                                descriptor.destination_select,
-                                &raw,
-                                &linear,
-                            );
-                            create_sampled_guest_texture(
-                                device,
-                                queue,
-                                descriptor.guest,
-                                &linear,
-                                descriptor.base_mip_level,
-                                descriptor.mip_level_count,
-                                descriptor.texture_type,
-                                descriptor.layer_count,
-                                comparison,
-                                requires_shader_write,
-                            )?
-                        };
+                    // Rearm after observing dirty so the next guest store faults again.
+                    let _ = write_watch.content_has_changed();
+                    let texture = settle_gpu_sampled_upload(
+                        device,
+                        queue,
+                        descriptor,
+                        comparison,
+                        requires_shader_write,
+                    )
+                    .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
                     texture.set_label(&format!(
                         "REMu sampled guest image {:#x}",
                         descriptor.guest.address

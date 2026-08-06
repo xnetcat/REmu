@@ -976,12 +976,12 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
         bytes_per_pixel: 4,
     };
     let mut residents = ResidentTextureMap::new();
-    ensure_resident_texture_in_map(&device, descriptor, &mut residents, true)
+    let queue = device.new_command_queue();
+    ensure_resident_texture_in_map(&device, Some(&queue), descriptor, &mut residents, true)
         .expect("resident with initialized content baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
         resident.note_gpu_authored_whole_span();
-        resident.note_gpu_write();
     }
 
     let alias_address = base
@@ -1009,7 +1009,6 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
 
     // A following draw establishes a new GPU generation boundary before eviction. The inherited
     // dirty range must remain authoritative even though the new watch itself is clean.
-    resident.note_gpu_write();
     let eviction_refresh =
         refresh_resident_texture_write_watch(resident).expect("refresh at eviction");
     assert_eq!(eviction_refresh, WriteWatchRefresh::Active);
@@ -1054,12 +1053,11 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
         bytes_per_pixel: 4,
     };
     let mut residents = ResidentTextureMap::new();
-    ensure_resident_texture_in_map(&device, descriptor, &mut residents, false)
+    ensure_resident_texture_in_map(&device, None, descriptor, &mut residents, false)
         .expect("discarded render target with a CPU baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
         resident.note_gpu_authored_whole_span();
-        resident.note_gpu_write();
     }
 
     let alias_address = base
@@ -1080,7 +1078,6 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
     let refresh =
         refresh_resident_texture_write_watch(resident).expect("renew complete physical watch");
     assert_eq!(refresh, WriteWatchRefresh::Renewed { was_dirty: true });
-    resident.note_gpu_write();
     assert!(
         !resident
             .cpu_write_obsoletes_gpu_writeback(refresh)
@@ -1134,6 +1131,7 @@ fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn texture_content_validation_avoids_clean_whole_resource_reloads() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1171,14 +1169,10 @@ fn texture_content_validation_avoids_clean_whole_resource_reloads() {
         .write(unrelated, &[0x7a])
         .expect("unrelated same-page store faults the texture watch");
     assert!(
-        !watch
+        watch
             .content_has_changed()
             .expect("validate unrelated dirty page"),
-        "same-page writes outside the resource must retain the resident texture"
-    );
-    assert!(
-        !watch.is_dirty(),
-        "validation rearms and consumes the watch"
+        "Phase 1G coarse watches invalidate on any fault in the watched pages"
     );
 
     memory
@@ -1353,6 +1347,7 @@ fn a_continuously_written_resource_still_completes_content_validation() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn live_content_baseline_skips_full_host_snapshot_copy() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1395,7 +1390,7 @@ fn live_content_baseline_skips_full_host_snapshot_copy() {
         !watch
             .content_has_changed()
             .expect("validate identical rewrite"),
-        "in-place baseline must treat unchanged guest bytes as clean"
+        "Phase 1G coarse dirty: a store that faulted the watch invalidates even if bytes match"
     );
 
     memory
@@ -1410,6 +1405,7 @@ fn live_content_baseline_skips_full_host_snapshot_copy() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn texture_content_validation_survives_write_watch_renewal() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -2605,11 +2601,11 @@ fn resident_writeback_publishes_only_the_bytes_the_gpu_authored() {
 }
 
 #[test]
-fn writeback_triggers_admit_only_guest_observable_reads() {
+fn writeback_triggers_follow_end_state_classification() {
     for trigger in [WritebackTrigger::DmaSource, WritebackTrigger::FlipTarget] {
         assert!(
             trigger.publishes_to_guest(),
-            "{} names guest bytes the guest itself is about to read",
+            "{} is guest-observable and publishes",
             trigger.label()
         );
     }
@@ -2621,14 +2617,14 @@ fn writeback_triggers_admit_only_guest_observable_reads() {
     ] {
         assert!(
             !trigger.publishes_to_guest(),
-            "{} is residency bookkeeping and may not stage pixels in guest memory",
+            "{} is RemuBookkeeping by default and must not publish into recycled heaps",
             trigger.label()
         );
     }
 }
 
 #[test]
-fn residency_trigger_keeps_the_debt_until_a_guest_read_asks_for_the_pixels() {
+fn bookkeeping_trigger_refuses_publish_and_keeps_debt() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -2688,30 +2684,38 @@ fn residency_trigger_keeps_the_debt_until_a_guest_read_asks_for_the_pixels() {
         ResidentTextureActivityStamp { work: 10, flip: 1 },
     );
 
-    let discarded_before = RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::SampledAlias.index()]
+    let discarded_before = RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
         .load(AtomicOrdering::Relaxed);
-    let untouched = snapshot_guest_texture_raw(descriptor).expect("guest bytes before the refusal");
+    let untouched =
+        snapshot_guest_texture_raw(descriptor).expect("guest bytes before bookkeeping refuse");
     assert!(
         !presenter
-            .settle_resident_texture_writeback(descriptor, WritebackTrigger::SampledAlias)
-            .expect("refused sampled-alias writeback")
+            .settle_resident_texture_writeback(descriptor, WritebackTrigger::PressureEviction)
+            .expect("bookkeeping refuse")
     );
     assert_eq!(
-        RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::SampledAlias.index()]
+        RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
             .load(AtomicOrdering::Relaxed),
         discarded_before + 1
     );
     assert_eq!(
-        snapshot_guest_texture_raw(descriptor).expect("guest bytes after the refusal"),
+        snapshot_guest_texture_raw(descriptor).expect("guest bytes after bookkeeping refuse"),
         untouched,
-        "a refused writeback must leave guest memory exactly as the guest left it"
+        "bookkeeping must leave guest memory exactly as the guest left it"
     );
     let resident = &presenter.resident_guest_textures[&descriptor];
     assert!(
         resident.gpu_written() && resident.is_live(),
-        "a refused writeback keeps the debt: those bytes still exist only in Metal"
+        "bookkeeping must keep Metal debt — clearing without publish lies that RAM agrees"
     );
 
+    presenter.mark_resident_texture_written_at(
+        descriptor,
+        ResourceSpan::for_texture(descriptor),
+        None,
+        WrittenRegion::whole_resource(),
+        ResidentTextureActivityStamp { work: 11, flip: 1 },
+    );
     let published_before = RESIDENT_WRITEBACK_PUBLISHED[WritebackTrigger::FlipTarget.index()]
         .load(AtomicOrdering::Relaxed);
     assert!(
@@ -2729,7 +2733,7 @@ fn residency_trigger_keeps_the_debt_until_a_guest_read_asks_for_the_pixels() {
         decode_guest_texture_linear_from_raw(descriptor, &guest_raw).expect("detiled writeback");
     assert_eq!(
         guest_linear, rendered,
-        "the debt the refusal preserved must publish byte-exactly for a guest read"
+        "guest-observable publish must land Metal bytes into guest RAM"
     );
     assert!(!presenter.resident_guest_textures[&descriptor].gpu_written());
 }
@@ -2787,6 +2791,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
 
     let error = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         descriptor,
         &mut presenter.resident_guest_textures,
@@ -2802,6 +2807,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
     let command_buffer = queue.new_command_buffer().to_owned();
     let view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         Some(&command_buffer),
         descriptor,
         &mut presenter.resident_guest_textures,
@@ -2824,7 +2830,6 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
         !resident.gpu_written(),
         "copying clean guest-derived levels must not invent GPU ownership"
     );
-    assert!(resident.gpu_write_watch_generations.is_empty());
     command_buffer.commit();
     command_buffer.wait_until_completed();
     assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
@@ -3221,6 +3226,7 @@ fn a_typed_alias_is_rematerialised_as_a_zero_copy_view() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn guest_memory_stale_state_takes_the_counted_snapshot_fallback() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -4287,8 +4293,10 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     };
     // Residency comes from the hierarchy the guest declares. A single-level descriptor is
     // never promoted into a larger one on the presenter's own initiative.
+    let queue = device.new_command_queue();
     let original = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         complete,
         &mut presenter.resident_guest_textures,
@@ -4299,6 +4307,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
 
     let complete_view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         complete,
         &mut presenter.resident_guest_textures,
@@ -4326,6 +4335,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     };
     let view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         sampled,
         &mut presenter.resident_guest_textures,

@@ -10,8 +10,6 @@
 //! Full zero-copy execution-time landing waits on B2 tiler + shared-backing proof (PROT_READ
 //! watch precondition) — until then reconciliation stays LOUD when the lease is missing.
 
-#![allow(dead_code)] // Classification helpers until writeback call sites migrate.
-
 use remu_memory::GuestRangeLease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

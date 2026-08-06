@@ -3,9 +3,12 @@
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::completion::commit_and_settle;
+use super::super::tiler::{
+    encode_gpu_upload_from_guest, gpu_tiler_owns_descriptor, mode27_tiler_pipelines,
+};
 use super::super::{
     FlushPolicy, GuestBatchFlushReason, SharedEventResidentTextureVersion, SharedEventWriteKind,
-    WritebackTrigger, compile_metal_compute_library,
+    WritebackTrigger,
 };
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
@@ -102,147 +105,6 @@ fn record_rematerialisation_failure(kind: RematerialisationFailureKind) {
         }
     }
 }
-
-const MODE27_REMATERIALISATION_SOURCE: &str = r"
-#include <metal_stdlib>
-using namespace metal;
-
-// All fields are ulong so the host ABI is an unambiguous array of 64-bit words.
-enum RemuMode27Parameter {
-    kWidth = 0, kHeight = 1, kLinearRowBytes = 2, kLinearOffset = 3,
-    kResourceBase = 4, kTargetBase = 5, kLevelOffset = 6, kPitch = 7,
-    kBytesPerElement = 8, kBlockWidth = 9, kBlockHeight = 10,
-    kTailX = 11, kTailY = 12, kSurfaceZXor = 13, kInTail = 14,
-    kTargetLength = 15, kRunCount = 16, kTileMode = 17
-};
-
-static uint remu_mode27_within_block(uint x, uint y, uint log2_bytes) {
-    switch (log2_bytes) {
-        case 0:
-            return ((y << 2) & 0x0008u) ^ ((y << 4) & 0x0010u)
-                ^ ((y << 3) & 0x00a0u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u)
-                ^ (x & 0x0007u) ^ ((x << 3) & 0x0040u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 4) & 0x0400u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
-                ^ ((x << 8) & 0x8000u);
-        case 1:
-            return ((y << 4) & 0x0070u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 8) & 0x5000u) ^ ((x << 1) & 0x000eu)
-                ^ ((x << 4) & 0x0480u) ^ ((x << 5) & 0x0300u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
-                ^ ((x << 8) & 0x8000u);
-        case 2:
-            return ((y << 4) & 0x0070u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 9) & 0x1000u) ^ ((y << 8) & 0x4000u)
-                ^ ((x << 2) & 0x000cu) ^ ((x << 5) & 0x0380u)
-                ^ ((x << 4) & 0x0400u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 9) & 0xa000u);
-        case 3:
-            return ((y << 4) & 0x0010u) ^ ((y << 6) & 0x0080u)
-                ^ ((y << 5) & 0x0f00u) ^ ((y << 10) & 0x5000u)
-                ^ ((x << 3) & 0x0008u) ^ ((x << 4) & 0x0460u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 10) & 0x2000u) ^ ((x << 9) & 0x8000u);
-        default:
-            return ((x << 4) & 0x0410u) ^ ((x << 5) & 0x0340u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 11) & 0xa000u)
-                ^ ((y << 5) & 0x0f20u) ^ ((y << 6) & 0x0080u)
-                ^ ((y << 10) & 0x1000u) ^ ((y << 11) & 0x4000u);
-    }
-}
-
-static uint remu_mode24_within_block(uint x, uint y, uint log2_bytes) {
-    switch (log2_bytes) {
-        case 0:
-            return (x & 0x0001u) ^ ((x << 1) & 0x0004u)
-                ^ ((x << 2) & 0x0010u) ^ ((x << 3) & 0x0040u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 4) & 0x0400u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
-                ^ ((x << 8) & 0x8000u) ^ ((y << 1) & 0x0002u)
-                ^ ((y << 2) & 0x0008u) ^ ((y << 3) & 0x00a0u)
-                ^ ((y << 5) & 0x0f00u) ^ ((y << 6) & 0x1000u)
-                ^ ((y << 7) & 0x4000u);
-        case 1:
-            return ((x << 1) & 0x0002u) ^ ((x << 2) & 0x0008u)
-                ^ ((x << 3) & 0x0020u) ^ ((x << 4) & 0x0480u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u)
-                ^ ((y << 2) & 0x0004u) ^ ((y << 3) & 0x0010u)
-                ^ ((y << 4) & 0x0040u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 8) & 0x5000u);
-        case 2:
-            return ((x << 2) & 0x0004u) ^ ((x << 3) & 0x0010u)
-                ^ ((x << 4) & 0x0440u) ^ ((x << 5) & 0x0300u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 9) & 0xa000u)
-                ^ ((y << 3) & 0x0008u) ^ ((y << 4) & 0x0020u)
-                ^ ((y << 5) & 0x0f80u) ^ ((y << 9) & 0x1000u)
-                ^ ((y << 8) & 0x4000u);
-        default:
-            return ((x << 3) & 0x0008u) ^ ((x << 4) & 0x0420u)
-                ^ ((x << 5) & 0x0380u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 10) & 0x2000u) ^ ((x << 9) & 0x8000u)
-                ^ ((y << 4) & 0x0010u) ^ ((y << 5) & 0x0f40u)
-                ^ ((y << 10) & 0x5000u);
-    }
-}
-
-static ulong remu_tiled_physical(constant ulong* p, uint2 gid) {
-    const uint block_width = uint(p[kBlockWidth]);
-    const uint block_height = uint(p[kBlockHeight]);
-    const bool tail = p[kInTail] != 0;
-    const uint x = tail ? uint(p[kTailX]) + gid.x : gid.x;
-    const uint y = tail ? uint(p[kTailY]) + gid.y : gid.y;
-    const uint block_x = tail ? 0u : gid.x / block_width;
-    const uint block_y = tail ? 0u : gid.y / block_height;
-    const ulong blocks_per_row = (p[kPitch] + block_width - 1u) / block_width;
-    const ulong block = tail ? 0ul : ulong(block_y) * blocks_per_row + block_x;
-    const uint log2_bytes = ctz(uint(p[kBytesPerElement]));
-    const uint within = p[kTileMode] == 24ul
-        ? remu_mode24_within_block(x, y, log2_bytes)
-        : remu_mode27_within_block(x, y, log2_bytes) ^ uint(p[kSurfaceZXor]);
-    return p[kResourceBase] + p[kLevelOffset] + block * 65536ul + within;
-}
-
-static bool remu_in_debt(device const ulong2* runs, ulong count, ulong address) {
-    for (ulong index = 0; index < count; ++index) {
-        if (runs[index].x <= address && address < runs[index].y) return true;
-    }
-    return false;
-}
-
-kernel void remu_mode27_scatter(
-    device const uchar* linear [[buffer(0)]], device uchar* tiled [[buffer(1)]],
-    device const ulong2* debt [[buffer(2)]], constant ulong* p [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
-    const ulong physical = remu_tiled_physical(p, gid);
-    const ulong source = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
-        + ulong(gid.x) * p[kBytesPerElement];
-    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
-        const ulong address = physical + byte;
-        if (address >= p[kTargetBase]
-            && address - p[kTargetBase] < p[kTargetLength]
-            && remu_in_debt(debt, p[kRunCount], address)) {
-            tiled[address - p[kTargetBase]] = linear[source + byte];
-        }
-    }
-}
-
-kernel void remu_mode27_gather(
-    device const uchar* tiled [[buffer(0)]], device uchar* linear [[buffer(1)]],
-    constant ulong* p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
-    const ulong physical = remu_tiled_physical(p, gid);
-    const ulong destination = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
-        + ulong(gid.x) * p[kBytesPerElement];
-    if (physical < p[kTargetBase]
-        || physical - p[kTargetBase] + p[kBytesPerElement] > p[kTargetLength]) return;
-    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
-        linear[destination + byte] = tiled[physical - p[kTargetBase] + byte];
-    }
-}
-";
 
 #[derive(Clone, Copy, Debug)]
 struct Mode27RematerialisationSubresource {
@@ -486,24 +348,13 @@ fn mode27_rematerialisation_parameters(
     ])
 }
 
+/// Returns `(retile/scatter, detile/gather)` pipelines from the S2 tiler module.
 fn compile_mode27_rematerialisation_pipelines(
     device: &Device,
 ) -> Result<(ComputePipelineState, ComputePipelineState), String> {
-    let library = compile_metal_compute_library(device, MODE27_REMATERIALISATION_SOURCE)?;
-    let scatter = library
-        .get_function("remu_mode27_scatter", None)
-        .map_err(|error| format!("Metal mode-27 scatter function: {error}"))?;
-    let gather = library
-        .get_function("remu_mode27_gather", None)
-        .map_err(|error| format!("Metal mode-27 gather function: {error}"))?;
-    Ok((
-        device
-            .new_compute_pipeline_state_with_function(&scatter)
-            .map_err(|error| format!("Metal mode-27 scatter pipeline: {error}"))?,
-        device
-            .new_compute_pipeline_state_with_function(&gather)
-            .map_err(|error| format!("Metal mode-27 gather pipeline: {error}"))?,
-    ))
+    let (detile, retile) = mode27_tiler_pipelines(device)?;
+    // Historical rematerialisation field order: scatter (=retile) then gather (=detile).
+    Ok((retile, detile))
 }
 
 fn encode_texture_to_linear_buffer(
@@ -923,7 +774,6 @@ impl MetalPresenter {
                     layer_count: resident.layer_count,
                     mip_level_count: resident.mip_level_count,
                     content_version: resident.content_version,
-                    gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
                     span: resident.span?,
                     kind: SharedEventWriteKind::InternalResidentDestination,
                 })
@@ -1518,8 +1368,10 @@ impl MetalPresenter {
         } else {
             None
         };
+        let queue = self.command_queue.as_ref();
         let texture = super::ensure_mipmapped_resident_texture_in_map(
             device,
+            queue,
             promotion_command_buffer.as_deref(),
             descriptor,
             &mut self.resident_guest_textures,
@@ -1749,14 +1601,102 @@ impl MetalPresenter {
         }
         // The map path only ever adopts, reuses or creates under the exact key.
         Ok(SelectedResidentTexture {
-            texture: ensure_resident_texture_in_map(
+            texture: self.ensure_resident_texture_in_map_phase1g(
                 device,
                 descriptor,
-                &mut self.resident_guest_textures,
                 upload_guest_contents,
             )?,
             descriptor,
         })
+    }
+
+    /// Phase 1G: create/adopt a resident under the exact key using GPU-timeline upload when
+    /// the descriptor is tiler-owned. Never CPU-snapshots guest RAM for those modes.
+    fn ensure_resident_texture_in_map_phase1g(
+        &mut self,
+        device: &Device,
+        descriptor: GuestTextureDescriptor,
+        upload_guest_contents: bool,
+    ) -> Result<Texture, String> {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .get_mut(&descriptor)
+            .filter(|resident| {
+                resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count >= 1
+            })
+        {
+            match refresh_resident_texture_write_watch(resident)? {
+                WriteWatchRefresh::Active
+                | WriteWatchRefresh::Reprotecting
+                | WriteWatchRefresh::Renewed { .. } => {
+                    if resident.reclaim_for_bind(!upload_guest_contents) {
+                        return Ok(resident.texture.clone());
+                    }
+                }
+                WriteWatchRefresh::Replaced => {}
+            }
+        }
+        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+            trace_resident_texture_removal("ensure-exact-resident-replaced-phase1g", &resident);
+        }
+        let write_watch = watch_guest_texture(descriptor)?;
+        let usage = MTLTextureUsage::RenderTarget
+            | MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
+            | MTLTextureUsage::PixelFormatView;
+        let texture = if upload_guest_contents {
+            if !gpu_tiler_owns_descriptor(descriptor) {
+                return Err(format!(
+                    "Phase 1G: refusing CPU snapshot upload for tile={} format={:?} bpe={} — no GPU tiler ownership",
+                    descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
+                ));
+            }
+            let texture = create_uninitialized_guest_texture(device, descriptor, usage)?;
+            // Create-time upload uses a dedicated command buffer that settles before return so
+            // a later CPU `replace_region` (tests) or GPU draw cannot race a deferred zero
+            // upload still pending in the open guest batch. Steady-state publication stays on
+            // the open guest batch via `encode_gpu_publish_to_guest`.
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable for Phase 1G upload")?
+                .clone();
+            let upload_buffer = queue.new_command_buffer().to_owned();
+            upload_buffer.set_label("REMu Phase 1G create-time GPU upload");
+            encode_gpu_upload_from_guest(device, &upload_buffer, descriptor, &texture)?;
+            upload_buffer.commit();
+            upload_buffer.wait_until_completed();
+            texture
+        } else {
+            // Discarded targets still need a coarse watch; content baseline fingerprints are
+            // deleted with the CPU upload path — the watch itself invalidates on guest writes.
+            create_uninitialized_guest_texture(device, descriptor, usage)?
+        };
+        texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
+        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
+        self.resident_guest_textures.insert(
+            descriptor,
+            ResidentGuestTexture {
+                texture: texture.clone(),
+                component_reorder_view: None,
+                descriptor,
+                texture_type: 9,
+                layer_count: 1,
+                mip_level_count: 1,
+                write_watch,
+                span,
+                owned,
+                gpu_authored: RangeSet::default(),
+                state: ResidencyState::Live,
+                content_version: 0,
+                gpu_write_watch_generations: Vec::new(),
+                last_use: ResidentTextureActivityStamp::default(),
+                activity: super::super::ResidentTextureActivity::enabled(),
+            },
+        );
+        Ok(texture)
     }
 
     pub(crate) fn ensure_mipmapped_render_target_texture(
@@ -2569,7 +2509,6 @@ impl MetalPresenter {
                         layer_count: resident.layer_count,
                         mip_level_count: resident.mip_level_count,
                         content_version: resident.content_version,
-                        gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
                         span: writer_span,
                         kind: SharedEventWriteKind::ResidentDestination,
                     });
@@ -2720,6 +2659,7 @@ impl MetalPresenter {
 
 pub(crate) fn ensure_resident_texture_in_map(
     device: &Device,
+    queue: Option<&metal::CommandQueue>,
     descriptor: GuestTextureDescriptor,
     resident_guest_textures: &mut ResidentTextureMap,
     upload_guest_contents: bool,
@@ -2761,15 +2701,26 @@ pub(crate) fn ensure_resident_texture_in_map(
         | MTLTextureUsage::ShaderWrite
         | MTLTextureUsage::PixelFormatView;
     let texture = if upload_guest_contents {
-        let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
-        let linear = decode_guest_texture_linear_from_raw(descriptor, &raw)?;
-        create_guest_texture(device, descriptor, usage, &linear)?
+        if !gpu_tiler_owns_descriptor(descriptor) {
+            return Err(format!(
+                "Phase 1G: refusing CPU snapshot upload for tile={} format={:?} bpe={} — no GPU tiler ownership",
+                descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
+            ));
+        }
+        let queue = queue.ok_or_else(|| {
+            format!(
+                "Phase 1G: ensure_resident_texture_in_map needs a Metal queue for GPU upload of tile={} at {:#x}",
+                descriptor.tile_mode, descriptor.address
+            )
+        })?;
+        let texture = create_uninitialized_guest_texture(device, descriptor, usage)?;
+        let upload_buffer = queue.new_command_buffer().to_owned();
+        upload_buffer.set_label("REMu Phase 1G ensure-map GPU upload");
+        encode_gpu_upload_from_guest(device, &upload_buffer, descriptor, &texture)?;
+        upload_buffer.commit();
+        upload_buffer.wait_until_completed();
+        texture
     } else {
-        // A discarded render target still needs a CPU-content baseline. Mapping a later coherent
-        // alias retires this watch and requests validation; without initialized fingerprints an
-        // unchanged guest allocation would look CPU-modified and could discard newer GPU output.
-        // Fingerprint the live mapping in place — a full host snapshot Vec was pure overhead here.
-        write_watch.record_live_content_baseline()?;
         create_uninitialized_guest_texture(device, descriptor, usage)?
     };
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));

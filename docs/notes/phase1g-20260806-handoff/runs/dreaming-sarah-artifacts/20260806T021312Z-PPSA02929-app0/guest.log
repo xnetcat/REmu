@@ -1,0 +1,352 @@
+[REMu][PERF-STARTUP] milestone=cli-run-start elapsed_us=0
+[REMu][TLS][FS] decode-summary aot_loads=692 aot_stores=161 fault_backstop_sites=0
+[REMu][MODULE] loaded /Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/sce_module/libc.prx
+[REMu][MODULE] dependency graph: bundled=1 system/HLE=22 app_root=/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0
+[REMu][PERF-STARTUP] milestone=process-image-linked elapsed_us=207570
+[REMu][PERF-STARTUP] milestone=event-sink-installed elapsed_us=207619
+[REMu][PERF-STARTUP] milestone=presenter-enter elapsed_us=207678
+[REMu][PERF-STARTUP] milestone=guest-probe-entry elapsed_us=207697
+[REMu] file descriptor budget: 9223372036854775807 open files (hard limit unlimited)
+[REMu][CXX] registered 10548 guest unwind records from 2 sections in 0.000s
+[REMu][METAL] starting AppKit event loop
+[REMu][METAL] no offline Metal compiler found; compiling in-process without a persistent metallib cache
+[REMu][METAL] compiler workers=4 sampled texture cache=2048 entries/1536 MiB resident texture cache=0 MiB exact-shared-event-readiness=true retired-fence-range-bookkeeping=false
+[REMu][PERF-STARTUP] milestone=presenter-resources-ready elapsed_us=252138
+[REMu][METAL] display link started; presentation paces on the vblank timebase
+[REMu][METAL] guest-batch completion wakeups enabled
+[REMu][METAL] experimental disjoint/fence-versioned/resident-versioned direct-draw SharedEvent admission enabled
+[REMu][TIME] process counter source=CLOCK_UPTIME_RAW-nanoseconds
+[REMu][VFS] direct immutable app path routing enabled
+[REMu][VFS] legacy save slot "devlog" already present under savedata/; leaving "/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929/devlog"
+[REMu][VFS] legacy save slot "SAVEDATA00" already present under savedata/; leaving "/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929/SAVEDATA00"
+[REMu][PTHREAD] guest thread-id source=darwin-pthread-tsd key=273
+[REMu][SYSTEM] showing installed splash /Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/sce_sys/pic0.png (3840x2160)
+[REMu][PERF-STARTUP] milestone=guest-runtime-configured elapsed_us=276779
+[REMu][MODULE] initializing runtime at 0x0000000800794010 args=0x0/0x0
+[REMu][IMPORT] first_hit=1 nid=rNhWz+lvOMU name=_sceKernelSetThreadDtors return=0x800794110 args=0x8007cc0b0,0x0,0x0,0x7fab2ac04af0,0x2,0x1
+[REMu][IMPORT] first_hit=2 nid=pB-yGZ2nQ9o name=_sceKernelSetThreadAtexitCount return=0x80079411c args=0x8007cc390,0x2,0x0,0x1,0xa490bbc,0x1
+[REMu][IMPORT] first_hit=3 nid=WhCc1w3EhSI name=_sceKernelSetThreadAtexitReport return=0x800794128 args=0x8007cc5c0,0x2,0x0,0x1,0xa4b7881,0x1
+[REMu][IMPORT] first_hit=4 nid=959qrazPIrg name=sceKernelGetProcParam return=0x800799c96 args=0x30ecbf370,0x2,0x0,0x1,0xa4c93b5,0x1
+[REMu][IMPORT] first_hit=5 nid=p5EcQeEeJAE name=_sceKernelRtldSetApplicationHeapAPI return=0x800799eaa args=0x8008a4f48,0x8002e1db0,0x8002e1860,0x8002e1820,0x8002e1b60,0x8002e1b70
+[REMu][IMPORT] first_hit=6 nid=bnZxYgAFeA0 name=sceKernelGetSanitizerNewReplaceExternal return=0x8007aa0e4 args=0x800374168,0x2,0x0,0x0,0xa4f6fcd,0x1
+[REMu][IMPORT] first_hit=9 nid=NWtTN10cJzE name=sceLibcHeapGetTraceInfo return=0x80079f771 args=0x30ecbf3b0,0x2,0x0,0x80001,0xa520b9c,0x1
+[REMu][IMPORT] first_hit=10 nid=pO96TwzOm5E name=sceKernelGetDirectMemorySize return=0x8002e13f2 args=0x0,0x100000,0x0,0x8002e14c0,0xa530b4e,0x1
+[REMu][IMPORT] first_hit=11 nid=rTXw65xmLIA name=sceKernelAllocateDirectMemory return=0x8002e140c args=0x0,0x400000000,0x100000,0x0,0xc,0x30ecbf3b8
+[REMu][IMPORT] first_hit=12 nid=L-Q3LEjIbgA name=sceKernelMapDirectMemory return=0x8002e1435 args=0x30ecbf3b0,0x100000,0x33,0x400000,0x0,0x0
+[REMu][IMPORT] first_hit=13 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x8007d11d2 args=0x8008a9380,0x0,0x30ecbf410,0x9e3779b97f4a7c15,0x7fab2aa7bc70,0x0
+[REMu][PTHREAD] mutex lookup cache enabled slots=16 identity=control-block-handle uncontended-wake-elision=true
+[REMu][MUTEX][ABI] op=init arg=0x8008a9380 slot=Some(140373133879984) object=0x7fab2ac7eab0 result=0x0
+[REMu][IMPORT] first_hit=17 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x80079493b args=0x30ecbeb78,0x800865040,0x0,0x9e3779b97f4a7c15,0x7fab2aa7bc70,0x0
+[REMu][IMPORT] first_hit=18 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x800794952 args=0x30ecbeb78,0x2,0x0,0x1,0xa72cd30,0x1
+[REMu][MUTEX][ABI] op=init arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][IMPORT] first_hit=20 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x80079497f args=0x30ecbeb78,0x105396cef,0x0,0x1,0x2,0x1
+[REMu][MUTEX][ABI] op=init arg=0x8008a7bb8 slot=Some(140373133881408) object=0x7fab2ac7f040 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a7bc0 slot=Some(140373133882000) object=0x7fab2ac7f290 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a7bc8 slot=Some(140373133882592) object=0x7fab2ac7f4e0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a7bd0 slot=Some(140373133883184) object=0x7fab2ac7f730 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a7bd8 slot=Some(140373133883776) object=0x7fab2ac7f980 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a7be0 slot=Some(140373133884368) object=0x7fab2ac7fbd0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a7be8 slot=Some(140373133884960) object=0x7fab2ac7fe20 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a4170 slot=Some(140373133885488) object=0x7fab2ac80030 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a4338 slot=Some(140373133886016) object=0x7fab2ac80240 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8008a4500 slot=Some(140373133886544) object=0x7fab2ac80450 result=0x0
+[REMu][PERF-DIRECT] thread-owned publication enabled stripes=256
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008aa368 slot=Some(140373133887136) object=0x7fab2ac806a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008aa368 slot=Some(140373133887136) object=0x7fab2ac806a0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008aa368 slot=Some(140373133887136) object=0x7fab2ac806a0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008aa368 slot=Some(140373133887136) object=0x7fab2ac806a0 result=0x0
+[REMu][IMPORT] first_hit=61 nid=mkx2fVhNMsg name=pthread_cond_broadcast return=0x80081699c args=0x8008aa370,0x105396cef,0x0,0x7fab2ac04af0,0x2,0x1
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8008a7bb0 slot=Some(140373133880816) object=0x7fab2ac7edf0 result=0x0
+[REMu][IMPORT] first_hit=62 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x800856668 args=0x30ecbf448,0x8008aac10,0x8008a4000,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=63 nid=x1X76arYMxU name=scePthreadAttrGet return=0x800856681 args=0x7fab2a00e800,0x30ecbf448,0x105aeb3a8,0x1,0xa9a61d6,0x1
+[REMu][IMPORT] first_hit=64 nid=8+s5BzZjxSg name=scePthreadAttrGetaffinity return=0x800856692 args=0x30ecbf448,0x30ecbf440,0x0,0x1,0xa9b6c47,0x1
+[REMu][IMPORT] first_hit=65 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x80085669b args=0x30ecbf448,0x2,0x0,0x1,0xa9c3208,0x1
+[REMu][PERF-STARTUP] milestone=module-initializers-complete elapsed_us=283184
+[REMu][PERF-STARTUP] milestone=guest-entry-begin elapsed_us=283214
+[REMu][IMPORT] first_hit=165 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x8002e0e70 args=0x30ecbf408,0x30ecbf4c0,0x0,0x7000100150,0x7000124900,0xaaaaaaaaaaaaaaab
+[REMu][IMPORT] first_hit=166 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x8002e0e7d args=0x30ecbf408,0x2,0x0,0x1,0xb1afa69,0x1
+[REMu][IMPORT] first_hit=167 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x8002e0e8a args=0x7000100148,0x30ecbf408,0x0,0x1,0xb1d30fb,0x1
+[REMu][IMPORT] first_hit=168 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x8002e0e92 args=0x30ecbf408,0x4,0x7000100148,0x1,0x3,0x0
+[REMu][IMPORT] first_hit=169 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x8002e5301 args=0x30ecbf3b8,0x0,0x2bd,0x7000181180,0xb1eec03,0x1
+[REMu][IMPORT] first_hit=170 nid=-Wreprtu0Qs name=scePthreadAttrSetdetachstate return=0x8002e530b args=0x30ecbf3b8,0x0,0x0,0x1,0xb20d887,0x1
+[REMu][IMPORT] first_hit=171 nid=UTXzJbWhhTE name=scePthreadAttrSetstacksize return=0x8002e5318 args=0x30ecbf3b8,0x80000,0x0,0x1,0xb21ca10,0x1
+[REMu][IMPORT] first_hit=172 nid=DzES9hQF4f4 name=scePthreadAttrSetschedparam return=0x8002e532f args=0x30ecbf3b8,0x30ecbf3b0,0x0,0x1,0xb22911e,0x1
+[REMu][IMPORT] first_hit=173 nid=6UgtwV+0zb4 name=scePthreadCreate return=0x8002e534a args=0x7000181160,0x30ecbf3b8,0x8002e53f0,0x7000181150,0x8002f579b,0x1
+[REMu][THREAD] raised host stack name="spi_main_thread" guest=0x80000 host=0x200000
+[REMu][IMPORT] first_hit=174 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x8002e535b args=0x30ecbf3b8,0x2,0x1c3a9,0x1,0xb2713be,0x1
+[REMu][IMPORT] first_hit=176 nid=x1X76arYMxU name=scePthreadAttrGet return=0x8002e5439 args=0x7fab2a00f800,0x30fdfac68,0x0,0x1,0xb281ddb,0x1
+[REMu][IMPORT] first_hit=177 nid=onNY9Byn-W8 name=scePthreadJoin return=0x8002e0ec4 args=0x7fab2a00f800,0x0,0x0,0x1,0xb280fb2,0x1
+[REMu][IMPORT] first_hit=178 nid=-quPa4SEJUw name=scePthreadAttrGetstack return=0x8002e5449 args=0x30fdfac68,0x7000181168,0x7000181170,0x1,0xb2922c2,0x1
+[REMu][IMPORT] first_hit=180 nid=g8cM39EUZ6o name=sceSysmoduleLoadModule return=0x8002e0f89 args=0x96,0x2,0x0,0x1,0xb2a8a9f,0x1
+[REMu][IMPORT] first_hit=184 nid=hZIg1EWGsHM name=sceUltInitialize return=0x8002e0fac args=0x30fdfaaf0,0x2,0x0,0x1,0xb2d1d7a,0x1
+[REMu][IMPORT] first_hit=186 nid=Vo5V8KAwCmk name=sceSystemServiceHideSplashScreen return=0x8002e0fbb args=0x30fdfaaf0,0x2,0x0,0x1,0xb2e0bc2,0x1
+[REMu][SYSTEM] system splash hidden by guest
+[REMu][PERF-GPU-PUBLICATION] exact runtime phase attribution enabled
+[REMu][IMPORT] first_hit=187 nid=j3YMu1MVNNo name=sceUserServiceInitialize return=0x8002e0fc5 args=0x0,0x2,0x0,0x1,0xffffffff00000000,0x20000000200
+[REMu][IMPORT] first_hit=188 nid=hv1luiJrqQM name=scePadInit return=0x8002e0fca args=0x30fdfaaf0,0x2,0x0,0x1,0xb30383c,0x1
+[REMu][IMPORT] first_hit=189 nid=CdWp0oHWGr0 name=sceUserServiceGetInitialUser return=0x8002e0fd3 args=0x30fdfabe8,0x39ec83,0x0,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=190 nid=xk0AcarP3V4 name=scePadOpen return=0x8002e0ff7 args=0x10000000,0x0,0x0,0x0,0x4,0x8004c19c0
+[REMu][IMPORT] first_hit=191 nid=clVvL4ZDntw name=scePadSetMotionSensorState return=0x8002e1015 args=0x1,0x1,0x1,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=192 nid=gjP9-KQzoUk name=scePadGetControllerInformation return=0x8002e1029 args=0x1,0x30fdfac00,0x0,0x1,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=193 nid=fPhymKNvK-A name=sceUserServiceGetLoginUserIdList return=0x8002e1071 args=0x30fdfabf0,0x39ec83,0x1,0x8004a00e0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=194 nid=TywrFKCoLGY name=sceSaveDataInitialize3 return=0x8002df588 args=0x0,0x7000100944,0xffffffff,0x7000100944,0x47377b572e7f1f2e,0x1
+[REMu][VFS] legacy save slot "devlog" already present under savedata/; leaving "/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929/devlog"
+[REMu][VFS] legacy save slot "SAVEDATA00" already present under savedata/; leaving "/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929/SAVEDATA00"
+[REMu][SAVEDATA] initialized root="/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929" slots="/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929/savedata"
+[REMu][IMPORT] first_hit=196 nid=gjRZNnw0JPE name=sceSaveDataCreateTransactionResource return=0x8002df5d0 args=0xc0000,0x0,0x1f,0x8002f4eae,0x776e7f6a277d6a07,0x1
+[REMu][SAVEDATA] transaction resource=1 memory_size=0xc0000
+[REMu][IMPORT] first_hit=200 nid=dyIhnXq-0SM name=sceSaveDataDirNameSearch return=0x8002df6be args=0x30fdfab40,0x30fdfab00,0x8004c2984,0x7000248000,0x8000,0x1
+[REMu][SAVEDATA] search user=268435456 pattern="" sort=0/0 hits=2 set=2
+2026-08-06 04:13:14.310 remu[88729:3796020] ApplePersistenceIgnoreState: Existing state will not be touched. New state will be written to /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/org.remu.emulator.savedState
+[REMu][IMPORT] first_hit=201 nid=FxVZqBAA7ks name=_write return=0x8007a4459 args=0x1,0x8008a80d0,0x14,0x0,0xffffffff00000000,0x0
+Mount requested: 0
+[REMu][IMPORT] first_hit=202 nid=ZP4e7rlzOUk name=sceSaveDataMount3 return=0x8002dff1a args=0x8004c6a80,0x8004c6ad0,0x8004c6a44,0x1,0xffffffff00000000,0x0
+[REMu][SAVEDATA] mount3 user=268435456 dir="SAVEDATA00" blocks=0x38 system_blocks=0x0 mount_mode=0x20 resource=1 mode=0x0 mount="/savedata0" host="/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA02929/savedata/SAVEDATA00"
+UnMount requested: 0
+[REMu][IMPORT] first_hit=204 nid=uW4vfTwMQVo name=sceSaveDataUmount2 return=0x8002df89b args=0x0,0x8004c6ad0,0x8008a4338,0x0,0xffffffff00000000,0x0
+[REMu][SAVEDATA] unmounted "/savedata0" mode=0x0
+[REMu][IMPORT] first_hit=205 nid=uoUpLGNkygk name=sceCommonDialogInitialize return=0x8002e12bc args=0x0,0x2,0x0,0x1,0xb5e37f4,0x1
+[REMu][IMPORT] first_hit=208 nid=ERKzksauAJA name=sceSaveDataDialogGetStatus return=0x8002e12e1 args=0x30fdfaaf0,0x2,0x0,0x1,0xb6033ed,0x1
+[REMu][IMPORT] first_hit=212 nid=lLMT9vJAck0 name=clock_gettime return=0x800804f9a args=0xd,0x30fdfa548,0x676e696d61657244,0x61726153,0x80,0x1
+[REMu][IMPORT] first_hit=213 nid=vSMAm3cxYTY name=sceKernelMprotect return=0x800000111 args=0x800498000,0x3940,0x12,0x1,0xfffffffffffffff1,0x30eabda10
+[REMu][IMPORT] first_hit=215 nid=23LRUSvYu1M name=sceAgcInit return=0x800000152 args=0x8004a0200,0x8,0x0,0x1,0xb662c16,0x1
+[REMu][IMPORT] first_hit=216 nid=2JtWUUiYBXs name=sceAgcGetRegisterDefaults2 return=0x8000001b9 args=0x8,0x2,0x0,0x1,0xb670f76,0x1
+[REMu][AGC] register defaults internal=false version=8 groups=127 address=0x00007fab2b83e000
+[REMu][IMPORT] first_hit=217 nid=wRbq6ZjNop4 name=sceAgcGetRegisterDefaults2Internal return=0x8000031d9 args=0x8,0x5f4,0x0,0x134,0x7f,0x1fc
+[REMu][AGC] register defaults internal=true version=8 groups=22 address=0x00007fab2a01ba00
+[REMu][IMPORT] first_hit=218 nid=f3dg2CSgRKY name=sceAgcCreateShader return=0x8000143ae args=0x8004a0968,0x800498410,0x80049c300,0x0,0x16,0x1
+[REMu][AGC] accepted shader registration type=0 program_low=0x20c count=10 block=[0x20c=0x0 0x20d=0x0 0x22a=0x210 0x22a=0xbecdcce3 0x212=0x402c0040 0x213=0x94 0x228=0x0 0x207=0x40 0x208=0x1 0x209=0x1]
+[REMu][AGC] accepted shader registration type=2 program_low=0xc8 count=6 block=[0xc8=0x0 0xc9=0x0 0x80=0x20000d0 0x80=0x87196b0b 0x8a=0x622c0042 0x8b=0x30000]
+[REMu][AGC] accepted shader registration type=1 program_low=0x8 count=6 block=[0x8=0x0 0x9=0x0 0x6=0x1000050 0x6=0x3468660c 0xa=0x22c0000 0xb=0x0]
+[REMu][IMPORT] first_hit=264 nid=Up36PTk687E name=sceVideoOutOpen return=0x8000e0458 args=0xff,0x0,0x0,0x0,0xb7c68f5,0x1
+[REMu][IMPORT] first_hit=274 nid=PjS5uASwcV8 name=sceVideoOutSetBufferAttribute2 return=0x8000e06e3 args=0x30fdfa5f0,0x8000000022000000,0x0,0xf00,0x870,0x0
+[REMu][IMPORT] first_hit=275 nid=rKBUtgRrtbk name=sceVideoOutRegisterBuffers2 return=0x8000e075a args=0x1,0x0,0x0,0x30fdfa5a0,0x2,0x30fdfa5f0
+[REMu][VIDEO] registered 2 buffers at 3840x2160 format=0x8000000022000000 tiling=0 addresses=[7001260000, 7003240000]
+[REMu][IMPORT] first_hit=276 nid=D0OdFMjp46I name=sceKernelCreateEqueue return=0x8000e0771 args=0x8004c6498,0x8002fd15d,0x0,0x1,0xb91c826,0x1
+[REMu][IMPORT] first_hit=280 nid=JfEPXVxhFqA name=sceAudioOutInit return=0x8000e0aac args=0x0,0x7000210000,0x1,0x7005220000,0x8004a01c0,0x7000220060
+[REMu][METAL] presenter started on Apple M4 at 1920x1080 (Fixed(1920, 1080))
+[REMu][PERF-STARTUP] milestone=window-ready elapsed_us=361866
+[REMu][AUDIO] opened host output at 48000 Hz with 2 channels
+[REMu][THREAD] raised host stack name="AudioOutThread" guest=0x20000 host=0x200000
+[REMu][IMPORT] first_hit=288 nid=ekNvsT22rsY name=sceAudioOutOpen return=0x8002e29eb args=0xff,0x0,0x0,0x100,0xbb80,0x4
+[REMu][AUDIO] opened sequence=1 port=1 user=0xff type=0 frames=256 rate=48000 format=0x4 channels=2 encoding=Float32
+Audio out started (port#1,256[samples],48000[Hz],2[ch])
+  Buffer[0] : 310591c60
+  Buffer[1] : 310592460
+[REMu][IMPORT] first_hit=295 nid=b+uAV89IlxE name=sceAudioOutSetVolume return=0x8002e2af8 args=0x1,0x3,0x310591c58,0x2,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=299 nid=QOQtbeDqsT4 name=sceAudioOutOutput return=0x8002e2b3d args=0x1,0x310591c60,0x100,0x0,0x0,0x7005220000
+Initializing Achievements
+[REMu][IMPORT] first_hit=355 nid=sjaobBgqeB4 name=sceNpUniversalDataSystemInitialize return=0x8000e229f args=0x30fdfab40,0x2,0x0,0x1,0x1263903b,0x1
+[REMu][IMPORT] first_hit=356 nid=m87BHxt-H60 name=sceNpGameIntentInitialize return=0x8000e22bc args=0x30fdfa5f0,0x2,0x0,0x1,0x1264b587,0x1
+[REMu][IMPORT] first_hit=376 nid=188x57JYp0g name=sceKernelCreateSema return=0x8000e2512 args=0x70054c0a38,0x8002fc591,0x1,0x0,0x40,0x0
+[REMu][THREAD] raised host stack name="TrophyManager thread" guest=0x100000 host=0x200000
+[REMu][IMPORT] first_hit=378 nid=4czppHBiriw name=sceKernelSignalSema return=0x8002da141 args=0x1,0x1,0x0,0x1,0x0,0x0
+[REMu][IMPORT] first_hit=383 nid=Zxa0VhQVTsk name=sceKernelWaitSema return=0x8002da2b3 args=0x1,0x1,0x0,0x310795d20,0x2,0x310795c88
+[REMu][THREAD] raised host stack name="saveThreadProc" guest=0x80000 host=0x200000
+[REMu][IMPORT] first_hit=388 nid=hT0IAEvN+M0 name=sceNpUniversalDataSystemCreateHandle return=0x8002da4ea args=0x310795b80,0x4,0x70054c0420,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=394 nid=5zBnau1uIEo name=sceNpUniversalDataSystemCreateContext return=0x8002da500 args=0x70054d0114,0x10000000,0x0,0x0,0x126c19f1,0x1
+[REMu][IMPORT] first_hit=395 nid=1jfXLRVzisc name=sceKernelUsleep return=0x8002b8441 args=0x3e8,0x2,0x0,0x8004a0e58,0x126c38de,0x1
+[REMu][IMPORT] first_hit=396 nid=tpFJ8LIKvPw name=sceNpUniversalDataSystemRegisterContext return=0x8002da512 args=0x1,0x1,0x0,0x1,0x1272133d,0x1
+[REMu][IMPORT] first_hit=400 nid=AUIHb7jUX3I name=sceNpUniversalDataSystemDestroyHandle return=0x8002da522 args=0x1,0x2,0x0,0x1,0x12766f20,0x1
+[REMu][IMPORT] first_hit=401 nid=6c3rCVE-fTU name=_open return=0x8007a4527 args=0x30fdf20f0,0x0,0x0,0x1b6,0x800864f40,0x1
+[REMu][IMPORT] first_hit=402 nid=sUXGfNMalIo name=sceNpTrophy2RegisterUnlockCallback return=0x8002da551 args=0x8002d9d80,0x0,0x70054c0420,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=407 nid=Bagshr7OQ6Q name=sceNpTrophy2CreateContext return=0x8002da568 args=0x70054d0118,0x10000000,0x0,0x0,0x12807fc9,0x1
+[REMu][IMPORT] first_hit=408 nid=Oy6IpwgtYOk name=lseek return=0x8007a4569 args=0x3,0x0,0x2,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=432 nid=DRuBt2pvICk name=_read return=0x8007a4449 args=0x3,0x7005540000,0x10000,0x7005550000,0x70002200d8,0x7000220100
+[REMu][IMPORT] first_hit=440 nid=rVjRvHJ0X6c name=sceKernelVirtualQuery return=0x8002c60a2 args=0x7005540000,0x0,0x30fdf2418,0x48,0x70002200d8,0x0
+[REMu][IMPORT] first_hit=441 nid=cQke9UuBQOk name=sceKernelMunmap return=0x8002c60bd args=0x7005540000,0x10000,0x0,0x1,0x1294851c,0x1
+[REMu][VM] unmapped address=0x7005540000 length=0x10000
+[REMu][IMPORT] first_hit=442 nid=MBuItvba6z8 name=sceKernelReleaseDirectMemory return=0x8002c60c9 args=0x5540000,0x10000,0x0,0x1,0x129701aa,0x1
+[REMu][VM] released direct start=0x5540000 length=0x10000 released=true
+[REMu][IMPORT] first_hit=443 nid=NNtFaKJbPt0 name=_close return=0x8007a4559 args=0x3,0x2,0x0,0x1,0x1298049e,0x1
+[REMu][IMPORT] first_hit=444 nid=2Of0f+3mhhE name=scePthreadMutexDestroy return=0x8007949b9 args=0x70054e0280,0x7fab28577ef8,0x0,0x8008a4650,0x0,0x0
+[REMu][IMPORT] first_hit=475 nid=m5-2bsNfv7s name=scePthreadCondattrInit return=0x8002e3363 args=0x30fdfa530,0x700011a108,0x0,0x1,0x12f080cc,0x1
+[REMu][IMPORT] first_hit=476 nid=2Tb92quprl0 name=scePthreadCondInit return=0x8002e3370 args=0x700011a110,0x30fdfa530,0x0,0x1,0x12f2a18f,0x1
+[REMu][IMPORT] first_hit=477 nid=waPcxYiR3WA name=scePthreadCondattrDestroy return=0x8002e3378 args=0x30fdfa530,0x0,0x0,0x1,0x0,0x0
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][IMPORT] first_hit=489 nid=4qGrR6eoP9Y name=scePthreadDetach return=0x8000e3d19 args=0x7fab2a0bee00,0x4,0x7000100148,0x0,0xffffffff00000000,0x0
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][IMPORT] first_hit=506 nid=BmMjYxmew1w name=scePthreadCondTimedwait return=0x8002c1e44 args=0x700011a110,0x700011a108,0xfffffc18,0x0,0xffffffff00000000,0x0
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+[REMu][THREAD] raised host stack name="ratamedia streamer" guest=0x80000 host=0x200000
+SpriteMachine LoadShader `shaders/SpriteMachine.vert` + `shaders/SpriteMachine.frag`
+[REMu][VM] unmapped address=0x7005600000 length=0x10000
+[REMu][VM] released direct start=0x5600000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x7005600000 length=0x10000
+[REMu][VM] released direct start=0x5600000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x7005670000 length=0x10000
+[REMu][VM] released direct start=0x5670000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x7005670000 length=0x10000
+[REMu][VM] released direct start=0x5670000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x7005680000 length=0x10000
+[REMu][VM] released direct start=0x5680000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x7005690000 length=0x10000
+[REMu][VM] released direct start=0x5690000 length=0x10000 released=true
+[REMu][VFS] miss=Some(1) sceKernelOpen failed guest="/app0/shaders/builtin_default.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/builtin_default.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+[REMu][IMPORT] first_hit=816 nid=9BcDykPmo1I name=__error return=0x8007ec1b4 args=0x30fde9bd0,0x2,0x0,0x1,0x13a03b74,0x1
+Could not open file /app0/shaders/builtin_default.vert.
+[REMu][VM] unmapped address=0x7005690000 length=0x10000
+[REMu][VM] released direct start=0x5690000 length=0x10000 released=true
+[REMu][VFS] miss=Some(2) sceKernelOpen failed guest="/app0/shaders/builtin_default.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/builtin_default.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/builtin_default.vert.
+[REMu][VM] unmapped address=0x7005690000 length=0x10000
+[REMu][VM] released direct start=0x5690000 length=0x10000 released=true
+[REMu][VFS] miss=Some(3) sceKernelOpen failed guest="/app0/shaders/builtin_earlyz.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/builtin_earlyz.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/builtin_earlyz.vert.
+[REMu][VM] unmapped address=0x7005690000 length=0x10000
+[REMu][VM] released direct start=0x5690000 length=0x10000 released=true
+[REMu][VFS] miss=Some(4) sceKernelOpen failed guest="/app0/shaders/builtin_fill.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/builtin_fill.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/builtin_fill.vert.
+[REMu][VM] unmapped address=0x70056a0000 length=0x10000
+[REMu][VM] released direct start=0x56a0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(5) sceKernelOpen failed guest="/app0/shaders/builtin_default_nopacity.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/builtin_default_nopacity.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/builtin_default_nopacity.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(6) sceKernelOpen failed guest="/app0/shaders/glass.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/glass.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/glass.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(7) sceKernelOpen failed guest="/app0/shaders/glowhorizontal.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/glowhorizontal.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/glowhorizontal.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(8) sceKernelOpen failed guest="/app0/shaders/glowvertical.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/glowvertical.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+[REMu][METAL] installed-title system splash ready 3840x2160
+Could not open file /app0/shaders/glowvertical.vert.
+[REMu][METAL] servicing finalized redraw before further GPU ingress
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(9) sceKernelOpen failed guest="/app0/shaders/grayscale.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/grayscale.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/grayscale.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(10) sceKernelOpen failed guest="/app0/shaders/hsladjust.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/hsladjust.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/hsladjust.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(11) sceKernelOpen failed guest="/app0/shaders/inverse.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/inverse.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/inverse.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(12) sceKernelOpen failed guest="/app0/shaders/noise.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/noise.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/noise.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(13) sceKernelOpen failed guest="/app0/shaders/outline.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/outline.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/outline.vert.
+[REMu][METAL] hiding installed-title system splash
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][METAL] display registered 3840x2160 pitch=3840 format=0x8000000022000000 tiling=0 buffers=[7001260000, 7003240000]
+[REMu][VFS] miss=Some(14) sceKernelOpen failed guest="/app0/shaders/radialblur.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/radialblur.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/radialblur.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(15) sceKernelOpen failed guest="/app0/shaders/replacecolor.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/replacecolor.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/replacecolor.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(16) sceKernelOpen failed guest="/app0/shaders/tint.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/tint.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/tint.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(17) sceKernelOpen failed guest="/app0/shaders/vhs.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/vhs.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/vhs.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(18) sceKernelOpen failed guest="/app0/shaders/vignette.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/vignette.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/vignette.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(19) sceKernelOpen failed guest="/app0/shaders/water.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/water.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/water.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(20) sceKernelOpen failed guest="/app0/shaders/waterbg.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/waterbg.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/waterbg.vert.
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x8000e5c57 space=host reason=null-address; forwarding
+[REMu][WATCH] fault registers rax=0x8000e5c57 rbx=0x7000250080 rcx=0x8002eeddc rdx=0x6e rdi=0x8002fb72e rsi=0x8002fcfe0 rbp=0x30fdfa570 rsp=0x30fdea420 r8=0x101010101010101 r9=0x8080808080808080 r10=0x46000001d0 r11=0x1b r12=0x30fdf24f0 r13=0x30fdea490 r14=0x30fdfa5a0 r15=0x30fdfab40
+[REMu][WATCH] fault stack rsp=0x30fdea420 words=0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0
+/Users/xnetcat/Documents/REmu-phase1g/scripts/run-with-watchdog.sh: line 165: 88729 Segmentation fault: 11  "$@"

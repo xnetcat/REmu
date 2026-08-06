@@ -31,7 +31,6 @@ use std::time::Instant;
 /// This is deliberately smaller than the 16 KiB guest page and independent of the host page
 /// size. A false-positive protection fault therefore hashes only the touched neighborhood rather
 /// than copying and decoding a complete multi-megabyte image.
-const CONTENT_FINGERPRINT_CHUNK_BYTES: u64 = 4 * 1024;
 
 /// Outcome of a leased texture publication into guest memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,7 +122,6 @@ impl MetalPresenter {
                     resident.write_watch.precise_tracking(),
                     resident.write_watch.dirty_page_ranges(),
                     resident.write_watch.generations(),
-                    resident.gpu_write_watch_generations.clone(),
                 )
             });
             let trace_acquire = |resident: &ResidentGuestTexture,
@@ -139,7 +137,6 @@ impl MetalPresenter {
                         precise,
                         dirty_pages,
                         watch_generations_before,
-                        gpu_write_generations_before,
                     )),
                 ) = (alias_trace.as_ref(), alias_trace_state.as_ref())
                 else {
@@ -156,8 +153,8 @@ impl MetalPresenter {
                     dirty_pages,
                     watch_generations_before,
                     &resident.write_watch.generations(),
-                    gpu_write_generations_before,
-                    &resident.gpu_write_watch_generations,
+                    &[],
+                    &[],
                     content_changed,
                     outcome,
                 );
@@ -210,7 +207,6 @@ impl MetalPresenter {
                     // A permission-only renewal resets watch generations. Once sparse content
                     // validation proves that guest bytes did not change, move the GPU ownership
                     // boundary into the new generation domain instead of retiring it later.
-                    resident.note_gpu_write();
                 }
                 trace_acquire(
                     resident,
@@ -315,7 +311,6 @@ impl MetalPresenter {
             ) && let Some(resident) = self.resident_guest_textures.get_mut(&resident_descriptor)
                 && !resident.write_watch.content_has_changed()?
             {
-                resident.note_gpu_write();
                 continue;
             }
             if !self
@@ -418,15 +413,11 @@ impl GuestTextureWriteWatch {
                     })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let chunk_count = usize::try_from(byte_count.div_ceil(CONTENT_FINGERPRINT_CHUNK_BYTES))
-            .map_err(|_| "guest texture fingerprint chunk count does not fit usize")?;
         Ok(Self {
             address,
             byte_count,
             ranges,
             content_state: Arc::new(std::sync::Mutex::new(GuestTextureContentState {
-                chunk_fingerprints: vec![0; chunk_count],
-                initialized_chunks: vec![false; chunk_count],
                 pending_dirty_ranges: Vec::new(),
             })),
         })
@@ -698,61 +689,19 @@ impl GuestTextureWriteWatch {
         Ok(())
     }
 
+    /// Coarse write-watch invalidation: any observed guest store retires derived Metal objects.
+    ///
+    /// Phase 1G deletes content fingerprints / dirty chunk compares. Self-readback generations
+    /// are gone with CPU writeback, so a fault means a real guest write.
     pub(crate) fn content_has_changed(&self) -> Result<bool, String> {
-        let mut dirty_ranges = self
-            .content_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_dirty_ranges
-            .clone();
-        dirty_ranges.extend(self.dirty_page_ranges());
-        if self.is_dirty() && dirty_ranges.is_empty() {
-            dirty_ranges.push(self.range());
-        }
-        let dirty_ranges = normalize_content_ranges(self, dirty_ranges);
-        if dirty_ranges.is_empty() {
-            return Ok(false);
-        }
-        if !self.precise_tracking() {
-            return Ok(true);
-        }
-
-        let started = Instant::now();
-        let (chunks, stable) = snapshot_dirty_content_fingerprints(self, dirty_ranges)?;
-        let validated_bytes = chunks
-            .iter()
-            .fold(0_u64, |total, chunk| total.saturating_add(chunk.byte_count));
         let mut state = self
             .content_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let changed = !stable
-            || chunks.iter().any(|chunk| {
-                !state
-                    .initialized_chunks
-                    .get(chunk.index)
-                    .copied()
-                    .unwrap_or(false)
-                    || state
-                        .chunk_fingerprints
-                        .get(chunk.index)
-                        .copied()
-                        .unwrap_or_default()
-                        != chunk.fingerprint
-            });
+        let pending = !state.pending_dirty_ranges.is_empty();
         state.pending_dirty_ranges.clear();
         drop(state);
-
-        TEXTURE_DIRTY_VALIDATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        TEXTURE_DIRTY_VALIDATION_BYTES.fetch_add(validated_bytes, Ordering::Relaxed);
-        TEXTURE_DIRTY_VALIDATION_NANOSECONDS.fetch_add(
-            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        if !changed {
-            TEXTURE_DIRTY_VALIDATION_UNCHANGED.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(changed)
+        Ok(pending || self.is_dirty() || !self.dirty_page_ranges().is_empty())
     }
 
     pub(crate) fn content_validation_pending(&self) -> bool {
@@ -764,122 +713,22 @@ impl GuestTextureWriteWatch {
             .is_empty()
     }
 
-    pub(crate) fn record_content_snapshot(&self, address: u64, bytes: &[u8]) {
-        let Ok(byte_count) = u64::try_from(bytes.len()) else {
-            return;
-        };
-        let Some(snapshot_end) = address.checked_add(byte_count) else {
-            return;
-        };
-        let watch_end = self.address.saturating_add(self.byte_count);
-        if address < self.address || snapshot_end > watch_end {
-            return;
-        }
-        let mut partial_indices = Vec::new();
-        {
-            let mut state = self
-                .content_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for index in 0..state.chunk_fingerprints.len() {
-                let Some((chunk_address, chunk_bytes)) = content_chunk_range(self, index) else {
-                    continue;
-                };
-                let chunk_end = chunk_address.saturating_add(chunk_bytes);
-                // No overlap with the published run.
-                if snapshot_end <= chunk_address || address >= chunk_end {
-                    continue;
-                }
-                // Fully covered: fingerprint directly from the published bytes.
-                if address <= chunk_address && chunk_end <= snapshot_end {
-                    let Ok(start) = usize::try_from(chunk_address - address) else {
-                        continue;
-                    };
-                    let Ok(length) = usize::try_from(chunk_bytes) else {
-                        continue;
-                    };
-                    let Some(chunk) = bytes.get(start..start.saturating_add(length)) else {
-                        continue;
-                    };
-                    state.chunk_fingerprints[index] = content_fingerprint(chunk);
-                    state.initialized_chunks[index] = true;
-                    continue;
-                }
-                // Partial coverage: must re-fingerprint from the live guest mapping. Leaving the
-                // chunk stale (pre-D3) false-positives a later content validation as a CPU rewrite
-                // when only a sub-chunk publish landed (MASTER-PLAN D3 precondition).
-                partial_indices.push(index);
-            }
-            state.pending_dirty_ranges.clear();
-        }
-        if partial_indices.is_empty() {
-            return;
-        }
-        let live_fingerprints = self
-            .with_live_backing(|| {
-                let mut fingerprints = Vec::with_capacity(partial_indices.len());
-                for &index in &partial_indices {
-                    let (chunk_address, chunk_bytes) = content_chunk_range(self, index)
-                        .ok_or("partial content snapshot chunk is out of range")?;
-                    let length = usize::try_from(chunk_bytes)
-                        .map_err(|_| "partial content snapshot chunk is too large")?;
-                    let mut chunk = vec![0_u8; length];
-                    // SAFETY: with_live_backing pins every covering alias for this copy.
-                    unsafe {
-                        self.copy_from_live_aliases(chunk_address, &mut chunk)?;
-                    }
-                    fingerprints.push((index, content_fingerprint(&chunk)));
-                }
-                Ok::<_, String>(fingerprints)
-            })
-            .and_then(|result| result);
-        let mut state = self
-            .content_state
+    /// Phase 1G: fingerprints deleted. Clears pending dirty after a GPU publish settled.
+    pub(crate) fn record_content_snapshot(&self, _address: u64, _bytes: &[u8]) {
+        self.content_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match live_fingerprints {
-            Ok(fingerprints) => {
-                for (index, fingerprint) in fingerprints {
-                    if let Some(slot) = state.chunk_fingerprints.get_mut(index) {
-                        *slot = fingerprint;
-                    }
-                    if let Some(initialized) = state.initialized_chunks.get_mut(index) {
-                        *initialized = true;
-                    }
-                }
-            }
-            Err(_) => {
-                // Could not pin/read: mark partials uninitialized so the next validation
-                // re-examines them instead of trusting a stale fingerprint.
-                for index in partial_indices {
-                    if let Some(initialized) = state.initialized_chunks.get_mut(index) {
-                        *initialized = false;
-                    }
-                }
-            }
-        }
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_dirty_ranges
+            .clear();
     }
 
-    /// Fingerprint the live guest mapping in place without allocating a full host snapshot.
-    ///
-    /// Discarded render targets need an initialized CPU-content baseline so a later coherent
-    /// alias renewal does not look like a CPU rewrite. Copying multi-megabyte Unreal surfaces
-    /// into a throwaway `Vec` dominated texture snapshot time on title screens.
+    /// Phase 1G: no content fingerprint baseline — coarse dirty invalidation only.
     pub(crate) fn record_live_content_baseline(&self) -> Result<(), String> {
-        let (chunks, _stable) = snapshot_dirty_content_fingerprints(self, vec![self.range()])?;
-        let mut state = self
-            .content_state
+        self.content_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for chunk in chunks {
-            if let Some(slot) = state.chunk_fingerprints.get_mut(chunk.index) {
-                *slot = chunk.fingerprint;
-            }
-            if let Some(initialized) = state.initialized_chunks.get_mut(chunk.index) {
-                *initialized = true;
-            }
-        }
-        state.pending_dirty_ranges.clear();
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_dirty_ranges
+            .clear();
         Ok(())
     }
 
@@ -909,228 +758,6 @@ impl GuestTextureWriteWatch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct DirtyContentFingerprint {
-    index: usize,
-    byte_count: u64,
-    fingerprint: u64,
-}
-
-fn normalize_content_ranges(
-    write_watch: &GuestTextureWriteWatch,
-    ranges: Vec<(u64, u64)>,
-) -> Vec<(u64, u64)> {
-    let watch_end = write_watch.address.saturating_add(write_watch.byte_count);
-    let mut ranges = ranges
-        .into_iter()
-        .filter_map(|(address, byte_count)| {
-            let end = address.checked_add(byte_count)?;
-            let clipped_start = address.max(write_watch.address);
-            let clipped_end = end.min(watch_end);
-            (clipped_start < clipped_end).then_some((clipped_start, clipped_end - clipped_start))
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_unstable_by_key(|&(address, _)| address);
-    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
-    for (address, byte_count) in ranges {
-        if let Some((last_address, last_bytes)) = merged.last_mut() {
-            let last_end = last_address.saturating_add(*last_bytes);
-            if address <= last_end {
-                *last_bytes = last_end
-                    .max(address.saturating_add(byte_count))
-                    .saturating_sub(*last_address);
-                continue;
-            }
-        }
-        merged.push((address, byte_count));
-    }
-    merged
-}
-
-fn content_chunk_range(write_watch: &GuestTextureWriteWatch, index: usize) -> Option<(u64, u64)> {
-    let offset = u64::try_from(index)
-        .ok()?
-        .checked_mul(CONTENT_FINGERPRINT_CHUNK_BYTES)?;
-    if offset >= write_watch.byte_count {
-        return None;
-    }
-    Some((
-        write_watch.address.checked_add(offset)?,
-        CONTENT_FINGERPRINT_CHUNK_BYTES.min(write_watch.byte_count - offset),
-    ))
-}
-
-fn dirty_content_chunk_indices(
-    write_watch: &GuestTextureWriteWatch,
-    ranges: &[(u64, u64)],
-) -> Vec<usize> {
-    let mut indices = Vec::new();
-    for &(address, byte_count) in ranges {
-        let start = (address - write_watch.address) / CONTENT_FINGERPRINT_CHUNK_BYTES;
-        let end = (address - write_watch.address)
-            .saturating_add(byte_count)
-            .div_ceil(CONTENT_FINGERPRINT_CHUNK_BYTES);
-        for index in start..end {
-            if let Ok(index) = usize::try_from(index) {
-                indices.push(index);
-            }
-        }
-    }
-    indices.sort_unstable();
-    indices.dedup();
-    indices
-}
-
-fn contiguous_dirty_chunk_runs(indices: &[usize]) -> Vec<(usize, usize)> {
-    let mut runs: Vec<(usize, usize)> = Vec::new();
-    for &index in indices {
-        if let Some((start, count)) = runs.last_mut()
-            && start
-                .checked_add(*count)
-                .is_some_and(|run_end| run_end == index)
-        {
-            *count += 1;
-        } else {
-            runs.push((index, 1));
-        }
-    }
-    runs
-}
-
-fn fingerprint_dirty_chunk_run(
-    write_watch: &GuestTextureWriteWatch,
-    start_index: usize,
-    chunk_count: usize,
-) -> Result<Vec<DirtyContentFingerprint>, String> {
-    let (address, _) = content_chunk_range(write_watch, start_index)
-        .ok_or("dirty texture fingerprint run starts out of range")?;
-    let last_index = start_index
-        .checked_add(chunk_count)
-        .and_then(|end| end.checked_sub(1))
-        .ok_or("dirty texture fingerprint run is empty or overflows")?;
-    let (last_address, last_byte_count) = content_chunk_range(write_watch, last_index)
-        .ok_or("dirty texture fingerprint run ends out of range")?;
-    let byte_count = last_address
-        .checked_add(last_byte_count)
-        .and_then(|end| end.checked_sub(address))
-        .ok_or("dirty texture fingerprint run byte count overflows")?;
-    let length =
-        usize::try_from(byte_count).map_err(|_| "dirty texture fingerprint run is too large")?;
-
-    let fingerprint = |bytes: &[u8]| {
-        let mut chunks = Vec::with_capacity(chunk_count);
-        for index in start_index..start_index + chunk_count {
-            let (chunk_address, chunk_byte_count) = content_chunk_range(write_watch, index)
-                .ok_or("dirty texture fingerprint chunk is out of range")?;
-            let offset = usize::try_from(chunk_address - address)
-                .map_err(|_| "dirty texture fingerprint chunk offset is too large")?;
-            let chunk_length = usize::try_from(chunk_byte_count)
-                .map_err(|_| "dirty texture fingerprint chunk is too large")?;
-            let chunk = bytes
-                .get(offset..offset.saturating_add(chunk_length))
-                .ok_or("dirty texture fingerprint chunk exceeds its stable run")?;
-            chunks.push(DirtyContentFingerprint {
-                index,
-                byte_count: chunk_byte_count,
-                fingerprint: content_fingerprint(chunk),
-            });
-        }
-        Ok(chunks)
-    };
-
-    if let Some(alias_address) = write_watch.alias_address_for_canonical_range(address, byte_count)
-    {
-        let source_address = usize::try_from(alias_address)
-            .map_err(|_| "dirty texture fingerprint address does not fit usize")?;
-        // SAFETY: the caller holds `with_live_backing`, and this exact canonical range has one
-        // covering live alias. A racing CPU store faults after rearm and is rejected by the
-        // generation/dirty check before these fingerprints can become authoritative.
-        let bytes = unsafe { std::slice::from_raw_parts(source_address as *const u8, length) };
-        fingerprint(bytes)
-    } else if chunk_count > 1 {
-        // A canonical run can cross a seam between unrelated CPU virtual aliases. Split only at
-        // that seam; each half normally becomes a zero-copy direct hash, while preserving physical
-        // chunk order in the returned fingerprints.
-        let left_count = chunk_count / 2;
-        let mut chunks = fingerprint_dirty_chunk_run(write_watch, start_index, left_count)?;
-        chunks.extend(fingerprint_dirty_chunk_run(
-            write_watch,
-            start_index + left_count,
-            chunk_count - left_count,
-        )?);
-        Ok(chunks)
-    } else {
-        // A single fingerprint chunk can straddle an alias seam when the texture base is not
-        // chunk-aligned. Assemble only that 4 KiB neighborhood through the pinned aliases.
-        let mut bytes = vec![0; length];
-        // SAFETY: snapshot_dirty_content_fingerprints holds with_live_backing around this call.
-        unsafe {
-            write_watch.copy_from_live_aliases(address, &mut bytes)?;
-        }
-        fingerprint(&bytes)
-    }
-}
-
-fn snapshot_dirty_content_fingerprints(
-    write_watch: &GuestTextureWriteWatch,
-    mut dirty_ranges: Vec<(u64, u64)>,
-) -> Result<(Vec<DirtyContentFingerprint>, bool), String> {
-    let mut attempts = 0_u32;
-    loop {
-        dirty_ranges.extend(write_watch.dirty_page_ranges());
-        dirty_ranges = normalize_content_ranges(write_watch, dirty_ranges);
-        let chunk_indices = dirty_content_chunk_indices(write_watch, &dirty_ranges);
-        let chunk_runs = contiguous_dirty_chunk_runs(&chunk_indices);
-        let _ = write_watch.consume_dirty();
-        write_watch.rearm()?;
-        let generations = write_watch.generations();
-        let chunks = write_watch
-            .with_live_backing(|| {
-                chunk_runs.iter().try_fold(
-                    Vec::with_capacity(chunk_indices.len()),
-                    |mut chunks, run| {
-                        chunks.extend(fingerprint_dirty_chunk_run(write_watch, run.0, run.1)?);
-                        Ok::<_, String>(chunks)
-                    },
-                )
-            })
-            .and_then(|result| result)?;
-        if write_watch.generations() == generations && !write_watch.is_dirty() {
-            return Ok((chunks, true));
-        }
-        attempts += 1;
-        if attempts >= MAX_STABLE_SNAPSHOT_ATTEMPTS {
-            // A guest thread can legally keep writing an image while the renderer is deciding
-            // whether a cached copy remains authoritative. Never monopolize the presenter trying
-            // to observe a quiescent instant that does not exist. The caller treats this unstable
-            // snapshot as changed, while the latest protection fault leaves the watch dirty for
-            // the subsequent reload/snapshot path.
-            return Ok((chunks, false));
-        }
-    }
-}
-
-fn content_fingerprint(bytes: &[u8]) -> u64 {
-    let mut hash = 0x9e37_79b1_85eb_ca87_u64
-        ^ u64::try_from(bytes.len())
-            .unwrap_or(u64::MAX)
-            .rotate_left(17);
-    let mut words = bytes.chunks_exact(8);
-    for word in &mut words {
-        let value = u64::from_le_bytes(word.try_into().expect("eight-byte content word"));
-        hash ^= value.wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
-        hash = hash.rotate_left(31).wrapping_mul(0x9e37_79b1_85eb_ca87);
-    }
-    for &byte in words.remainder() {
-        hash ^= u64::from(byte).wrapping_mul(0x1656_67b1_9e37_79f9);
-        hash = hash.rotate_left(11).wrapping_mul(0x9e37_79b1_85eb_ca87);
-    }
-    hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    hash ^= hash >> 33;
-    hash.wrapping_mul(0xc4ce_b9fe_1a85_ec53) ^ (hash >> 33)
-}
-
 pub(crate) fn refresh_resident_texture_write_watch(
     resident: &mut ResidentGuestTexture,
 ) -> Result<WriteWatchRefresh, String> {
@@ -1151,7 +778,6 @@ pub(crate) fn refresh_resident_texture_write_watch(
                 // Reprotection replaced the watch objects but not the shared backing. Preserve
                 // the ownership boundary in the new generation domain when no CPU store was
                 // observed during the transition.
-                resident.note_gpu_write();
             }
             Ok(WriteWatchRefresh::Renewed { was_dirty })
         }
@@ -1730,149 +1356,3 @@ pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(
         .collect()
 }
 
-#[cfg(test)]
-mod content_validation_tests {
-    use super::{
-        CONTENT_FINGERPRINT_CHUNK_BYTES, TextureWritebackOutcome, content_fingerprint,
-        contiguous_dirty_chunk_runs, write_watched_guest_range,
-    };
-    use remu_memory::{
-        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
-        GuestProtection, GuestRangeLease, LeasePublishOutcome,
-    };
-
-    #[test]
-    fn coalesces_only_adjacent_dirty_fingerprint_chunks() {
-        assert_eq!(contiguous_dirty_chunk_runs(&[]), Vec::new());
-        assert_eq!(
-            contiguous_dirty_chunk_runs(&[1, 2, 3, 7, 9, 10]),
-            vec![(1, 3), (7, 1), (9, 2)]
-        );
-    }
-
-    #[test]
-    fn partial_chunk_publish_refingerprints_from_live_guest() {
-        // D3 precondition: a sub-chunk publish must not leave the chunk fingerprint stale.
-        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
-        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
-        let address = memory
-            .map_shared(
-                GuestMapPlacement::Anywhere,
-                GUEST_PAGE_SIZE,
-                GUEST_PAGE_SIZE,
-                GuestProtection::READ_WRITE,
-                &backing,
-                0,
-            )
-            .expect("mapping");
-        let watch_bytes = CONTENT_FINGERPRINT_CHUNK_BYTES * 2;
-        // SAFETY: the mapping stays live for the watch's lifetime.
-        let cpu_watch =
-            unsafe { remu_memory::CpuWriteWatch::new(address.get(), watch_bytes).expect("watch") };
-        let watch = super::GuestTextureWriteWatch {
-            address: address.get(),
-            byte_count: watch_bytes,
-            ranges: vec![super::GuestTextureWatchRange {
-                watch: cpu_watch,
-                canonical_address: address.get(),
-            }],
-            content_state: std::sync::Arc::new(std::sync::Mutex::new(
-                super::GuestTextureContentState {
-                    chunk_fingerprints: vec![0; 2],
-                    initialized_chunks: vec![false; 2],
-                    pending_dirty_ranges: Vec::new(),
-                },
-            )),
-        };
-        let mut live = vec![0x11_u8; CONTENT_FINGERPRINT_CHUNK_BYTES as usize];
-        memory.write(address, &live).expect("seed first chunk");
-        let half = CONTENT_FINGERPRINT_CHUNK_BYTES as usize / 2;
-        let published = vec![0xaa_u8; half];
-        // Land the partial publish into guest, then record — the live re-fingerprint path must
-        // see published||remainder and initialize the chunk.
-        memory
-            .write(address, &published)
-            .expect("land published half");
-        live[..half].copy_from_slice(&published);
-        watch.record_content_snapshot(address.get(), &published);
-        let state = watch
-            .content_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(
-            state.initialized_chunks[0],
-            "partial publish must initialize the overlapped chunk"
-        );
-        assert_eq!(
-            state.chunk_fingerprints[0],
-            content_fingerprint(&live),
-            "partial chunk must fingerprint the live mapping, not stay stale"
-        );
-        assert!(
-            !state.initialized_chunks[1],
-            "untouched chunk stays uninitialized"
-        );
-    }
-
-    #[test]
-    fn revoked_texture_lease_publish_is_discarded_stale() {
-        let mut memory = GuestAddressSpace::new(4 * GUEST_PAGE_SIZE).expect("guest address space");
-        let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest physical backing");
-        let address = memory
-            .map_shared(
-                GuestMapPlacement::Anywhere,
-                GUEST_PAGE_SIZE,
-                GUEST_PAGE_SIZE,
-                GuestProtection::READ_WRITE,
-                &backing,
-                0,
-            )
-            .expect("mapping");
-        let lease = GuestRangeLease::acquire(address.get(), 64).expect("lease while mapped");
-        let identity = lease.identity();
-        drop(lease);
-        memory
-            .unmap(address, GUEST_PAGE_SIZE)
-            .expect("unmap texture range");
-        let revoked = GuestRangeLease::adopt(address.get(), 64, identity);
-        assert_eq!(
-            revoked.publish_run_if_baseline(0, &[0_u8; 64], &[0x5a_u8; 64]),
-            LeasePublishOutcome::Revoked,
-            "D4: a lease whose backing is gone must revoke, never silent-publish"
-        );
-
-        // Remap and prove the leased writeback path applies when the VA is live.
-        let address = memory
-            .map_shared(
-                GuestMapPlacement::Anywhere,
-                GUEST_PAGE_SIZE,
-                GUEST_PAGE_SIZE,
-                GuestProtection::READ_WRITE,
-                &backing,
-                0,
-            )
-            .expect("remap");
-        // SAFETY: mapping live until watch drops.
-        let cpu_watch =
-            unsafe { remu_memory::CpuWriteWatch::new(address.get(), 64).expect("watch") };
-        let watch = super::GuestTextureWriteWatch {
-            address: address.get(),
-            byte_count: 64,
-            ranges: vec![super::GuestTextureWatchRange {
-                watch: cpu_watch,
-                canonical_address: address.get(),
-            }],
-            content_state: std::sync::Arc::new(std::sync::Mutex::new(
-                super::GuestTextureContentState {
-                    chunk_fingerprints: vec![0; 1],
-                    initialized_chunks: vec![false; 1],
-                    pending_dirty_ranges: Vec::new(),
-                },
-            )),
-        };
-        let raw = [0x5a_u8; 64];
-        let outcome = write_watched_guest_range(address.get(), &raw, None, None, &watch, None)
-            .expect("publish");
-        assert_eq!(outcome, TextureWritebackOutcome::Applied);
-    }
-}

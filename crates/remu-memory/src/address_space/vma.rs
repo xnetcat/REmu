@@ -9,8 +9,8 @@ use super::{GuestPhysicalBacking, GuestProtection, GuestVmaInfo, GuestVmaState};
 #[derive(Clone, Debug)]
 pub(super) enum VmaKind {
     Reserved,
-    Anonymous,
-    /// Commit-on-protect or flexible memory backed by the space's virtually-keyed backing.
+    /// Commit-on-protect, flexible, or former-anonymous memory backed by the space's
+    /// virtually-keyed backing (Phase 1G: every CPU-private map must remain Metal-backable).
     Committed(GuestPhysicalBacking),
     Shared(GuestPhysicalBacking),
 }
@@ -19,7 +19,6 @@ impl VmaKind {
     pub(super) const fn state(&self) -> GuestVmaState {
         match self {
             Self::Reserved => GuestVmaState::Reserved,
-            Self::Anonymous => GuestVmaState::Anonymous,
             Self::Committed(_) => GuestVmaState::Committed,
             Self::Shared(_) => GuestVmaState::Shared,
         }
@@ -43,7 +42,7 @@ impl Vma {
             VmaKind::Shared(backing) | VmaKind::Committed(backing) => {
                 (Some(backing.inner.id), self.backing_offset)
             }
-            VmaKind::Reserved | VmaKind::Anonymous => (None, 0),
+            VmaKind::Reserved => (None, 0),
         };
         GuestVmaInfo {
             start: GuestAddress::new(self.start),
@@ -65,9 +64,7 @@ impl Vma {
             return false;
         }
         match (&self.kind, &next.kind) {
-            (VmaKind::Reserved, VmaKind::Reserved) | (VmaKind::Anonymous, VmaKind::Anonymous) => {
-                true
-            }
+            (VmaKind::Reserved, VmaKind::Reserved) => true,
             (VmaKind::Shared(left), VmaKind::Shared(right))
             | (VmaKind::Committed(left), VmaKind::Committed(right)) => {
                 left.id() == right.id()

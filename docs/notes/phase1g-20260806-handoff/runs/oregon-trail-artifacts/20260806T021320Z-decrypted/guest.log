@@ -1,0 +1,758 @@
+[REMu][PERF-STARTUP] milestone=cli-run-start elapsed_us=0
+[REMu][PTHREAD] guest thread-id source=darwin-pthread-tsd key=260
+[REMu][TLS][FS] decode-summary aot_loads=12 aot_stores=164 fault_backstop_sites=0
+[REMu][MODULE] loaded /Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/decrypted/sce_module/libc.prx
+[REMu][MODULE] loaded /Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/decrypted/sce_module/libSceNpCppWebApi.prx
+[REMu][MODULE] dependency graph: bundled=2 system/HLE=59 app_root=/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0
+[REMu][PERF-STARTUP] milestone=process-image-linked elapsed_us=6145970
+[REMu][PERF-STARTUP] milestone=event-sink-installed elapsed_us=6146030
+[REMu][PERF-STARTUP] milestone=presenter-enter elapsed_us=6146091
+[REMu][PERF-STARTUP] milestone=guest-probe-entry elapsed_us=6146107
+[REMu] file descriptor budget: 9223372036854775807 open files (hard limit unlimited)
+[REMu][METAL] starting AppKit event loop
+[REMu][CXX] registered 507251 guest unwind records from 3 sections in 0.013s
+[REMu][METAL] no offline Metal compiler found; compiling in-process without a persistent metallib cache
+[REMu][METAL] compiler workers=4 sampled texture cache=2048 entries/1536 MiB resident texture cache=0 MiB exact-shared-event-readiness=true retired-fence-range-bookkeeping=false
+[REMu][PERF-STARTUP] milestone=presenter-resources-ready elapsed_us=6190609
+[REMu][METAL] display link started; presentation paces on the vblank timebase
+[REMu][METAL] guest-batch completion wakeups enabled
+[REMu][METAL] experimental disjoint/fence-versioned/resident-versioned direct-draw SharedEvent admission enabled
+2026-08-06 04:13:28.724 remu[88920:3796778] ApplePersistenceIgnoreState: Existing state will not be touched. New state will be written to /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/org.remu.emulator.savedState
+[REMu][TIME] process counter source=CLOCK_UPTIME_RAW-nanoseconds
+[REMu][VFS] direct immutable app path routing enabled
+[REMu][VFS] legacy save slot "devlog" already present under savedata/; leaving "/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA19244/devlog"
+[REMu][SYSTEM] showing installed splash /Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/sce_sys/pic0.png (3840x2160)
+[REMu][PERF-STARTUP] milestone=guest-runtime-configured elapsed_us=6274319
+[REMu][MODULE] initializing runtime at 0x00000008099c8010 args=0x0/0x0
+[REMu][IMPORT] first_hit=1 nid=rNhWz+lvOMU name=_sceKernelSetThreadDtors return=0x8099c8110 args=0x8099fdf50,0x0,0x0,0x7f77bea04be0,0x2,0x1
+[REMu][IMPORT] first_hit=2 nid=pB-yGZ2nQ9o name=_sceKernelSetThreadAtexitCount return=0x8099c811c args=0x8099fe230,0x2,0x0,0x1,0x26baceeb,0x1
+[REMu][IMPORT] first_hit=3 nid=WhCc1w3EhSI name=_sceKernelSetThreadAtexitReport return=0x8099c8128 args=0x8099fe460,0x2,0x0,0x1,0x26bbd162,0x1
+[REMu][IMPORT] first_hit=4 nid=959qrazPIrg name=sceKernelGetProcParam return=0x8099ce146 args=0x30eb63370,0x2,0x0,0x1,0x26bce27f,0x1
+[REMu][IMPORT] first_hit=5 nid=p5EcQeEeJAE name=_sceKernelRtldSetApplicationHeapAPI return=0x8099ce351 args=0x809adcf48,0x8013c8500,0x8013c8570,0x8013c8540,0x8013c83a0,0x8013c8460
+[REMu][IMPORT] first_hit=6 nid=bnZxYgAFeA0 name=sceKernelGetSanitizerNewReplaceExternal return=0x8099e03dd args=0x8013c8640,0x8013c8620,0x8013c85e0,0x0,0x8013c8660,0x8013c8690
+[REMu][IMPORT] first_hit=8 nid=NWtTN10cJzE name=sceLibcHeapGetTraceInfo return=0x8099d2841 args=0x30eb633b0,0x2,0x0,0x80801,0x26c47cf2,0x1
+[REMu][IMPORT] first_hit=9 nid=7oxv3PPCumo name=sceKernelReserveVirtualRange return=0x8013c5e77 args=0x30eb63348,0x8000000000,0x0,0x200000,0x26c59974,0x1
+[REMu][IMPORT] first_hit=10 nid=pO96TwzOm5E name=sceKernelGetDirectMemorySize return=0x8013c5f02 args=0x30eb63250,0x2,0x0,0xefc0000000,0x26d491cf,0x1
+[REMu][PERF-DIRECT] thread-owned publication enabled stripes=256
+[REMu][PTHREAD] mutex lookup cache enabled slots=16 identity=control-block-handle uncontended-wake-elision=true
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][IMPORT] first_hit=12 nid=mkx2fVhNMsg name=pthread_cond_broadcast return=0x809a4b1ec args=0x809ae26c8,0x1052b6cef,0x0,0x7f77bea04be0,0x2,0x1
+[REMu][IMPORT] first_hit=13 nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory return=0x8013c636c args=0xc000,0x4000,0xc,0x30eb632f8,0x8,0x0
+[REMu][IMPORT] first_hit=14 nid=L-Q3LEjIbgA name=sceKernelMapDirectMemory return=0x8013c63bc args=0x30eb632f0,0xc000,0xc2,0x400010,0x0,0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x400000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x200000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x100000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x80000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x40000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x20000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x10000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x8000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x4000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x2000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x1000000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x800000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x400000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x200000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x100000,0x10000,0xc,0x30eb63340
+[REMu][FAIL] nid=B+vc2AO2Zrc name=sceKernelAllocateMainDirectMemory thread="main" result=0xffffffff80020023 args=0x80000,0x10000,0xc,0x30eb63340
+[REMu][IMPORT] first_hit=52 nid=MBuItvba6z8 name=sceKernelReleaseDirectMemory return=0x8013c5fc3 args=0x10000,0x12c00000,0x0,0x7f779773d920,0xffffffff00000000,0x7f7797742180
+[REMu][VM] released direct start=0x10000 length=0x12c00000 released=true
+[REMu][IMPORT] first_hit=53 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x8099c891b args=0x30eb631a8,0x809ac3290,0x0,0x9e3779b97f4a7c15,0x2000000000,0x1
+[REMu][IMPORT] first_hit=54 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x8099c8932 args=0x30eb631a8,0x2,0x0,0x1,0x270b896c,0x1
+[REMu][IMPORT] first_hit=55 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x8099c8954 args=0x809adfbd0,0x30eb631a8,0x30eb631b0,0x1,0x270c68e5,0x1
+[REMu][MUTEX][ABI] op=init arg=0x809adfbd0 slot=Some(140151618808320) object=0x7f7797742a00 result=0x0
+[REMu][IMPORT] first_hit=56 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x8099c895f args=0x30eb631a8,0x1052b6cef,0x0,0x1,0x2,0x1
+[REMu][MUTEX][ABI] op=init arg=0x809adfbd8 slot=Some(140151618808576) object=0x7f7797742b00 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adfbe0 slot=Some(140151618808992) object=0x7f7797742ca0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adfbe8 slot=Some(140151618809584) object=0x7f7797742ef0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adfbf0 slot=Some(140151618810176) object=0x7f7797743140 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adfbf8 slot=Some(140151618810768) object=0x7f7797743390 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adfc00 slot=Some(140151618811360) object=0x7f77977435e0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adfc08 slot=Some(140151618811952) object=0x7f7797743830 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adc170 slot=Some(140151618812544) object=0x7f7797743a80 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x809adc500 slot=Some(140151618813600) object=0x7f7797743ea0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][IMPORT] first_hit=97 nid=FxVZqBAA7ks name=_write return=0x8099d87c9 args=0x1,0x809ae00f0,0x28,0x0,0x2,0x1
+Memory va range 7000000000 - efc0000000
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+Frame Buffer va range efc0000000 - f000000000
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809adc338 slot=Some(140151618813072) object=0x7f7797743c90 result=0x0
+[REMu][IMPORT] first_hit=99 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x80145782f args=0x30eb630b0,0x1052b6cef,0x0,0x0,0x2,0x1
+[REMu][IMPORT] first_hit=100 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x80145783c args=0x30eb630b0,0x4,0x0,0x1,0x272b5c3c,0x1
+[REMu][IMPORT] first_hit=101 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x80145784c args=0x8085fcbf0,0x30eb630b0,0x0,0x1,0x272c1c74,0x1
+[REMu][MUTEX][ABI] op=init arg=0x8085fcbf0 slot=Some(140151628808176) object=0x7f77980cbff0 result=0x0
+[REMu][IMPORT] first_hit=102 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x801457854 args=0x30eb630b0,0x1052b6cef,0x0,0x1,0x2,0x1
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x8085fdfa8 slot=Some(140151628808432) object=0x7f77980cc0f0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x8085fdfa8 slot=Some(140151628808432) object=0x7f77980cc0f0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x8085fdfa8 slot=Some(140151628808432) object=0x7f77980cc0f0 result=0x0
+[REMu][MUTEX][ABI] op=lock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=unlock arg=0x809ae26c0 slot=Some(140151628807920) object=0x7f77980cbef0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x808602ca0 slot=Some(140151618814160) object=0x7f77977440d0 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x808602cd0 slot=Some(140151618814592) object=0x7f7797744280 result=0x0
+[REMu][MUTEX][ABI] op=init arg=0x808602d68 slot=Some(140151618815056) object=0x7f7797744450 result=0x0
+[REMu][IMPORT] first_hit=128 nid=2SKEx6bSq-4 name=sceKernelBatchMap return=0x8013c7ca1 args=0x8085fec90,0x1,0x30eb62e34,0x9e3779b97f4a7c15,0x10000,0x0
+FBootAllocator used 2198056 out of 2211840 bytes of memory, wasting 13784 bytes.
+[REMu][IMPORT] first_hit=353 nid=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler return=0x8013c6075 args=0x8013cc550,0x4000,0x0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=359 nid=vNe1w4diLCs name=__tls_get_addr return=0x809a04145 args=0x809adb880,0x0,0x0,0x809ac7381,0x8,0x0
+[REMu][IMPORT] first_hit=386 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x809a8c328 args=0x30eb63448,0x809ae2780,0x809adc000,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=387 nid=x1X76arYMxU name=scePthreadAttrGet return=0x809a8c341 args=0x7f77be067800,0x30eb63448,0x105a0b3a8,0x384,0x27b7a869,0x1
+[REMu][IMPORT] first_hit=388 nid=8+s5BzZjxSg name=scePthreadAttrGetaffinity return=0x809a8c352 args=0x30eb63448,0x30eb63440,0x0,0x1,0x27b9be6e,0x1
+[REMu][IMPORT] first_hit=389 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x809a8c35b args=0x30eb63448,0x2,0x0,0x1,0x27bad031,0x1
+[REMu][MODULE] initializing runtime at 0x0000000809b10010 args=0x0/0x0
+[REMu][IMPORT] first_hit=393 nid=tsvEmnenz48 name=__cxa_atexit return=0x809efaa2b args=0x809b21280,0x80a099938,0x80a098000,0x7f77bea04be0,0x2,0x1
+[REMu][IMPORT] first_hit=583 nid=F8bUHwAG284 name=scePthreadMutexattrInit return=0x809b149ad args=0x30eb63470,0x80a08f30b,0x0,0x1,0x27cb3575,0x1
+[REMu][IMPORT] first_hit=584 nid=iMp8QpE+XO4 name=scePthreadMutexattrSettype return=0x809b149bf args=0x30eb63470,0x2,0x0,0x1,0x27ccc62c,0x1
+[REMu][IMPORT] first_hit=585 nid=cmo1RIYva9o name=scePthreadMutexInit return=0x809b149d2 args=0x80a098100,0x30eb63470,0x80a08f30b,0x1,0x27ce3c5c,0x1
+[REMu][IMPORT] first_hit=586 nid=smWEktiyyG0 name=scePthreadMutexattrDestroy return=0x809b149dd args=0x30eb63470,0x4,0x80a098100,0x1,0x3,0x0
+[REMu][PERF-STARTUP] milestone=module-initializers-complete elapsed_us=6293131
+[REMu][PERF-STARTUP] milestone=guest-entry-begin elapsed_us=6293183
+[REMu][METAL] presenter started on Apple M4 at 1920x1080 (Fixed(1920, 1080))
+[REMu][PERF-STARTUP] milestone=window-ready elapsed_us=6295281
+[REMu][IMPORT] first_hit=590 nid=dQHWEsJtoE4 name=pthread_mutexattr_init return=0x80583ee2a args=0x30eb63308,0x6,0x8085fcbf0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=591 nid=mDmgMOGVUqg name=pthread_mutexattr_settype return=0x80583ee37 args=0x30eb63308,0x2,0x0,0x1,0x28014e94,0x1
+[REMu][IMPORT] first_hit=592 nid=5txKfcMUAok name=pthread_mutexattr_setprotocol return=0x80583ee44 args=0x30eb63308,0x1,0x0,0x1,0x28025f87,0x1
+[REMu][IMPORT] first_hit=593 nid=ttHNfU+qDBU name=pthread_mutex_init return=0x80583ee4f args=0x7000dffff0,0x30eb63308,0x0,0x1,0x28097143,0x1
+[REMu][IMPORT] first_hit=594 nid=HF7lK46xzjY name=pthread_mutexattr_destroy return=0x80583ee57 args=0x30eb63308,0x4,0x7000dffff0,0x1,0x3,0x0
+Used memory before allocating anything was 22.19MB
+[REMu][IMPORT] first_hit=813 nid=ytQULN-nhL4 name=pthread_rwlock_init return=0x801653859 args=0x808694dc0,0x0,0x1,0x0,0x13,0x74
+[REMu][METAL] installed-title system splash ready 3840x2160
+[REMu][METAL] servicing finalized redraw before further GPU ingress
+[REMu][IMPORT] first_hit=1279 nid=ZPD1YOKI+Kw name=sceRtcGetCurrentClockLocalTime return=0x8013d0ea4 args=0x30eb63300,0x30eb633a0,0x30eb63398,0x30eb6339c,0x30eb63394,0x30eb63390
+[REMu][IMPORT] first_hit=1290 nid=iGjsr1WAtI0 name=pthread_rwlock_rdlock return=0x80405c94c args=0x808849810,0x0,0x0,0x1,0x8,0x0
+[REMu][IMPORT] first_hit=1351 nid=8w-H19ip48I name=sceRtcGetTick return=0x803014495 args=0x30eb633d8,0x30eb633d0,0x8085fcbf0,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=1882 nid=geDaqgH9lTg name=scePthreadKeyCreate return=0x801da03a2 args=0x30eb633a0,0x0,0x0,0x1,0x2caa150,0x1
+[REMu][IMPORT] first_hit=2020 nid=BNowx2l588E name=sceKernelGetProcessTimeCounterFrequency return=0x8013d0dd9 args=0x1052b6d43,0x6,0x8085fcbf0,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2107 nid=2Tb92quprl0 name=scePthreadCondInit return=0x8099cd60c args=0x8085b46c8,0x0,0x30eb633b0,0x9e3779b97f4a7c15,0x2000000000,0x0
+[REMu][IMPORT] first_hit=2126 nid=18B2NS1y9UU name=sceRtcGetCurrentTick return=0x8013d0f9f args=0x30eb63310,0x30eb633a0,0x30eb63398,0x30eb6339c,0x30eb63394,0x30eb63390
+[REMu][IMPORT] first_hit=2127 nid=ueega6v3GUw name=sceRtcSetTick return=0x8013d0fab args=0x30eb63300,0x30eb63310,0x0,0x1,0xeef0368,0x1
+[REMu][IMPORT] first_hit=2128 nid=6c3rCVE-fTU name=_open return=0x8099d8897 args=0x80755b2ae,0x0,0x0,0x809ac30f0,0x0,0x0
+[REMu][IMPORT] first_hit=2135 nid=DRuBt2pvICk name=_read return=0x8099d87b9 args=0x3,0x7720df0000,0x10000,0x7720e00000,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2137 nid=NNtFaKJbPt0 name=_close return=0x8099d88c9 args=0x3,0x6,0x8085fcbf0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2138 nid=2Of0f+3mhhE name=scePthreadMutexDestroy return=0x8099c8999 args=0x7220df4a80,0x7f7764389ac8,0x0,0x809adc650,0x0,0x0
+File root is /app0/
+Final commandline = ../../../TheOregonTrail/TheOregonTrail.uproject 
+[REMu][IMPORT] first_hit=2172 nid=nu4a0-arQis name=sceKernelAioInitializeParam return=0x8013bb839 args=0x30eb62e70,0x6,0x809ae26c0,0x807e2bdb8,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2173 nid=vYU8P9Td2Zo name=sceKernelAioInitializeImpl return=0x8013bb846 args=0x30eb62e70,0x3c,0x0,0x1,0x30eb62550,0x0
+[REMu][IMPORT] first_hit=2174 nid=g8cM39EUZ6o name=sceSysmoduleLoadModule return=0x8013e6421 args=0xb4,0x6,0x809ae26c0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2175 nid=R9lA82OraNs name=sceAppContentInitialize return=0x8013e6469 args=0x30eb62e20,0x30eb62df0,0x0,0x1,0x854ad7f,0x1
+[REMu][IMPORT] first_hit=2177 nid=buYbeLOGWmA name=sceAppContentTemporaryDataMount2 return=0x8013bba27 args=0x0,0x8085fae98,0x0,0x1,0x8,0x0
+[REMu][VFS] temporary data mounted guest=/temp0 host="/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-savedata/PPSA19244/temp0"
+[REMu][IMPORT] first_hit=2178 nid=1G3lF1Gg1k8 name=sceKernelOpen return=0x8013bc9d0 args=0x30eb62d00,0x20000,0x16d,0x1,0x1,0x0
+[REMu][VFS] miss=Some(1) sceKernelOpen failed guest="/app0/deepfiles" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/deepfiles": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62d00,0x20000,0x16d,0x1
+[REMu][IMPORT] first_hit=2183 nid=eV9wAD2riIA name=sceKernelStat return=0x8013beed8 args=0x30eb62e80,0x30eb62e08,0x30eb62d5c,0x1,0x1,0x0
+[REMu][VFS] miss=2 sceKernelStat known absent guest="/app0/theoregontrail/theoregontrail.uproject" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/theoregontrail.uproject"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62e80,0x30eb62e08,0x30eb62d5c,0x1
+Project file not found: ../../../TheOregonTrail/TheOregonTrail.uproject
+[REMu][VFS] miss=3 sceKernelOpen rejected guest="/app0/.."
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62ba0,0x20000,0x16d,0x1
+[REMu][IMPORT] first_hit=2209 nid=ts6GlZOKRrE name=scePlayGoInitialize return=0x8013c9aac args=0x30eb62d30,0x6,0x8085fcbf0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2210 nid=M1Gma1ocrGE name=scePlayGoOpen return=0x8013c9ac1 args=0x8085fd00c,0x0,0x0,0x1,0x8b5736c,0x1
+[REMu][IMPORT] first_hit=2218 nid=kBwCPsYX-m4 name=sceKernelFstat return=0x8013c35df args=0x4,0x30eb62a28,0xe,0x0,0x8076633a0,0x61
+[REMu][IMPORT] first_hit=2219 nid=j2AIqSqJP0w name=sceKernelGetdents return=0x8013c3608 args=0x4,0x7420df0000,0x1000,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2221 nid=UK2Tl2DWUns name=sceKernelClose return=0x8013c3af3 args=0x4,0x9,0x420,0x8001a70420,0x808649890,0x4
+[REMu][IMPORT] first_hit=2222 nid=1471ajPzxh0 name=pthread_rwlock_destroy return=0x801429b66 args=0x30eb62d60,0x14,0x60,0x8001a70060,0x808649890,0x0
+[REMu][VFS] miss=Some(4) sceKernelOpen failed guest="/app0/theoregontrail/saved/paks" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/saved/paks": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62ac0,0x20000,0x16d,0x1
+[REMu][VFS] miss=Some(5) sceKernelOpen failed guest="/app0/engine/content/paks" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/paks": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62ac0,0x20000,0x16d,0x1
+[REMu][VFS] miss=6 sceKernelStat known absent guest="/app0/theoregontrail/content/paks/global.utoc" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/content/paks/global.utoc"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62920,0x30eb628a8,0x30eb627fc,0x1
+[REMu][VFS] miss=Some(7) sceKernelOpen failed guest="/app0/theoregontrail/saved/paks" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/saved/paks": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb627b0,0x20000,0x16d,0x1
+[REMu][VFS] miss=Some(8) sceKernelOpen failed guest="/app0/engine/content/paks" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/paks": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb627b0,0x20000,0x16d,0x1
+[REMu][IMPORT] first_hit=2244 nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes return=0x804b5bfae args=0x30eb62830,0x1,0x30eb62824,0x30eb62828,0x30eb6280c,0x0
+[REMu][IMPORT] first_hit=2256 nid=8aI7R7WaOlc name=sceAmprCommandBufferConstructor return=0x804b5be4e args=0x30eb62788,0x60,0x8001a70060,0x7060e0bc40,0x808649890,0x7f7764600000
+[REMu][IMPORT] first_hit=2257 nid=a8uLzYY--tM name=sceAmprAprCommandBufferConstructor return=0x8013e9715 args=0x30eb62788,0x30eb627a0,0x30eb627a8,0x30e01,0x8ec6caa,0x1
+[REMu][IMPORT] first_hit=2258 nid=N-FSPA4S3nI name=sceAmprCommandBufferSetBuffer return=0x8013e972a args=0x30eb62788,0x7060e0bc40,0x40,0x30e01,0x8ed3fc4,0x1
+[REMu][IMPORT] first_hit=2259 nid=mQ16-QdKv7k name=sceAmprAprCommandBufferReadFile return=0x804b5bec4 args=0x30eb62788,0x30eb627a0,0x30eb627a8,0x1,0x80018e0000,0xdd
+[REMu][IMPORT] first_hit=2260 nid=ASoW5WE-UPo name=sceKernelAprSubmitCommandBufferAndGetResult return=0x804b5c1d9 args=0x30eb62788,0x6,0x30eb627b0,0x30eb627b8,0x8eeed9d,0x1
+[REMu][IMPORT] first_hit=2261 nid=rqwFKI4PAiM name=sceKernelAprWaitCommandBuffer return=0x804b5c209 args=0x1,0x1,0x0,0x1,0x8f65767,0x1
+[REMu][IMPORT] first_hit=2262 nid=baQO9ez2gL4 name=sceAmprCommandBufferReset return=0x8013ba8e8 args=0x30eb62788,0x0,0x0,0x0,0x8f7615a,0x1
+[REMu][IMPORT] first_hit=2263 nid=ULvXMDz56po name=sceAmprCommandBufferClearBuffer return=0x8013e97e0 args=0x30eb62788,0x0,0x0,0x1,0x8f83eb5,0x1
+[REMu][IMPORT] first_hit=2264 nid=Qs1xtplKo0U name=sceAmprAprCommandBufferDestructor return=0x804b5be86 args=0x30eb62788,0x30eb627a0,0x30eb627a8,0x8001a70060,0x808649890,0x1
+[REMu][IMPORT] first_hit=2265 nid=GuchCTefuZw name=sceAmprCommandBufferDestructor return=0x8013e97f0 args=0x30eb62788,0x0,0x0,0x1,0x8fa0f10,0x1
+[REMu][IMPORT] first_hit=2423 nid=0TyVk4MSLt0 name=pthread_cond_init return=0x80143ea88 args=0x7040e9c0e8,0x0,0x7040e9c0e0,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=2441 nid=D0OdFMjp46I name=sceKernelCreateEqueue return=0x8013e82bd args=0x8085fddd0,0x80761f0b1,0x0,0x1,0xccba3a4,0x1
+[REMu][IMPORT] first_hit=2442 nid=bBfz7kMF2Ho name=sceKernelAddAmprEvent return=0x8013e82f1 args=0x1,0x74fe,0x0,0x1,0xcccd5a1,0x1
+[REMu][IMPORT] first_hit=2451 nid=wtkt-teR1so name=pthread_attr_init return=0x8013ec447 args=0x30eb629a0,0x0,0x0,0x0,0x0,0x0
+[REMu][IMPORT] first_hit=2452 nid=2Q0z6rnBrTE name=pthread_attr_setstacksize return=0x8013ec46c args=0x30eb629a0,0x40000,0x0,0x1,0xcd0d2f4,0x1
+[REMu][IMPORT] first_hit=2453 nid=Jmi+9w9u0E4 name=pthread_create_name_np return=0x8013ec3b7 args=0x70a0e21b48,0x30eb629a0,0x8013ec930,0x70a0e21b00,0x30eb62930,0x30eb629a8
+[REMu][THREAD] raised host stack name="FAPREventQueueListener" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=2454 nid=zHchY8ft5pk name=pthread_attr_destroy return=0x8013ec8fd args=0x30eb629a0,0x2,0x146d3,0x9e3779b97f4a7c15,0xcd4bfac,0x1
+[REMu][IMPORT] first_hit=2460 nid=bt3CTBKmGyI name=scePthreadSetaffinity return=0x8013ec95d args=0x7f77bf0c1400,0x1fff,0x105a0b3a8,0x3,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2461 nid=mkx2fVhNMsg name=pthread_cond_broadcast return=0x80143eaf3 args=0x7040e9c148,0x4,0x7040e9c140,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2462 nid=fzyMKs9kim0 name=sceKernelWaitEqueue return=0x8013bb10a args=0x1,0x30ffcea10,0xf,0x30ffcec14,0x0,0x7f7797c50000
+[REMu][KERNEL][EQUEUE] wait sequence=1 equeue=0x1 events=0x30ffcea10 capacity=15 out_count=0x30ffcec14 timeout_ptr=0x0 timeout_us=None thread="FAPREventQueueListener"/0x7f77bf0c1400
+[REMu][IMPORT] first_hit=2464 nid=Xs9hdiD7sAA name=pthread_setschedparam return=0x8013ec338 args=0x7f77bf0c1400,0x1,0x30eb62a50,0x807663160,0xcdef889,0x1
+[REMu][IMPORT] first_hit=2467 nid=vWU-odnS+fU name=sceAmprMeasureCommandSizeReadFile return=0x8013e7dd3 args=0x1,0x80022f0000,0x749d7f,0x825786e,0x825786e,0x4
+[REMu][IMPORT] first_hit=2468 nid=sSAUCCU1dv4 name=sceAmprMeasureCommandSizeWriteKernelEventQueue_04_00 return=0x8013e7deb args=0x1,0x7502,0x0,0x0,0xce57d7b,0x1
+[REMu][IMPORT] first_hit=2472 nid=tZDDEo2tE5k name=sceAmprCommandBufferGetSize return=0x8013e8ac5 args=0x7060e0bb88,0x0,0x0,0x1,0xce7121a,0x1
+[REMu][IMPORT] first_hit=2473 nid=GnxKOHEawhk name=sceAmprCommandBufferGetCurrentOffset return=0x8013e8ad0 args=0x7060e0bb88,0x0,0x0,0x1,0xce81b67,0x1
+[REMu][IMPORT] first_hit=2475 nid=H896Pt-yB4I name=sceAmprCommandBufferWriteKernelEventQueue_04_00 return=0x8013e7ea4 args=0x7060e0bb88,0x1,0x7502,0x10000000000003e8,0x0,0x1
+[REMu][KERNEL][EQUEUE] woke sequence=1 equeue=0x1 delivered=1
+[REMu][IMPORT] first_hit=2477 nid=kwGyyjohI50 name=sceKernelGetEventData return=0x8013bb17b args=0x30ffcea10,0x1052ab6ec,0x10000000100,0x1,0x0,0x1
+[REMu][IMPORT] first_hit=2485 nid=2MOy+rUfuhQ name=pthread_cond_signal return=0x80143eb02 args=0x7040e9c0e8,0x4,0x7040e9c0e0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=2486 nid=2Of0f+3mhhE name=scePthreadMutexDestroy return=0x8013e71d2 args=0x70c0f9ae00,0x6,0x7040e9c0e0,0x0,0xffffffff00000000,0x0
+[REMu][KERNEL][EQUEUE] wait sequence=2 equeue=0x1 events=0x30ffcea10 capacity=15 out_count=0x30ffcec14 timeout_ptr=0x0 timeout_us=None thread="FAPREventQueueListener"/0x7f77bf0c1400
+[REMu][VFS] miss=9 sceKernelStat known absent guest="/app0/theoregontrail/platforms" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/platforms"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62ab0,0x30eb62a38,0x30eb6298c,0x1
+[REMu][VFS] miss=10 sceKernelStat known absent guest="/app0/engine/config" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/config"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62690,0x30eb62618,0x30eb6256c,0x1
+[REMu][VFS] miss=11 sceKernelStat known absent guest="/app0/engine/config" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/config"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62690,0x30eb62618,0x30eb6256c,0x1
+[REMu][VFS] miss=12 sceKernelStat known absent guest="/app0/engine/config/layouts" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/config/layouts"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb625c0,0x30eb62548,0x30eb6249c,0x1
+[REMu][VFS] miss=13 sceKernelStat known absent guest="/app0/engine/config/layouts" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/config/layouts"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb625c0,0x30eb62548,0x30eb6249c,0x1
+[REMu][VFS] miss=14 sceKernelStat known absent guest="/app0/engine/platforms" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/platforms"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62760,0x30eb626e8,0x30eb6263c,0x1
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 0" guest=0x60000 host=0x200000
+[REMu][IMPORT] first_hit=2679 nid=Op8TBGY5KHg name=pthread_cond_wait return=0x8014349db args=0x7040e9c148,0x7040e9c140,0x7040e9c140,0x0,0xffffffff00000000,0x0
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 1" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 2" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 3" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 4" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 5" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadNP 6" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 7" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 8" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 9" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 10" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 11" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 12" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadHP 13" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 14" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 15" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 16" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 17" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 18" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 19" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TaskGraphThreadBP 20" guest=0x60000 host=0x200000
+[REMu][THREAD] raised host stack name="TAsync 0" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=2930 nid=h9CcP3J0oVM name=pthread_join return=0x8013ec0c9 args=0x7f77ae080a00,0x0,0x4,0x807c59938,0xffffffff00000000,0x0
+[REMu][VFS] miss=15 sceKernelStat known absent guest="/app0/theoregontrail/plugins" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/plugins"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62990,0x30eb62918,0x30eb6286c,0x1
+[REMu][VFS] miss=16 sceKernelStat known absent guest="/app0/theoregontrail/mods" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/mods"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62950,0x30eb628d8,0x30eb6282c,0x1
+[REMu][VFS] miss=17 sceKernelStat known absent guest="/app0/enterprise/plugins" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/enterprise/plugins"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62aa0,0x30eb62a28,0x30eb6297c,0x1
+[REMu][THREAD] raised host stack name="PoolThread 0" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 1" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 2" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 3" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 4" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 5" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 6" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 7" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 8" guest=0x40000 host=0x200000
+[REMu][VFS] miss=18 sceKernelStat known absent guest="/app0/theoregontrail/content/internationalization" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/content/internationalization"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62c30,0x30eb62bb8,0x30eb62b0c,0x1
+[REMu][IMPORT] first_hit=15022 nid=JGgj7Uvrl+A name=scePthreadCondBroadcast return=0x8099cd729 args=0x8088bd5f0,0x0,0x10000000100,0x1,0x8,0x0
+[REMu][AMPR] resolve absent guest="/app0/engine/content/internationalization/icudt64l/lang/en_us_posix.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/lang/en_us_posix.res" index=0 of 1
+[REMu][FAIL] nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes thread="main" result=0xffffffffffffffff args=0x30eb61b40,0x1,0x30eb61b34,0x30eb61b38
+[REMu][IMPORT] first_hit=15124 nid=9BcDykPmo1I name=__error return=0x804b5bfc0 args=0x10f1a3080,0x6000000000000000,0x61fe0,0x0,0x0,0x7f7764600000
+[REMu][VFS] miss=Some(19) sceKernelOpen failed guest="/app0/engine/content/internationalization/icudt64l/lang/en_us_posix.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/lang/en_us_posix.res": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb61b50,0x0,0x0,0x1
+[REMu][AMPR] resolve absent guest="/app0/engine/content/internationalization/icudt64l/lang/en_us.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/lang/en_us.res" index=0 of 1
+[REMu][FAIL] nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes thread="main" result=0xffffffffffffffff args=0x30eb61b40,0x1,0x30eb61b34,0x30eb61b38
+[REMu][VFS] miss=Some(20) sceKernelOpen failed guest="/app0/engine/content/internationalization/icudt64l/lang/en_us.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/lang/en_us.res": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb61b50,0x0,0x0,0x1
+[REMu][AMPR] resolve absent guest="/app0/engine/content/internationalization/icudt64l/region/en_us_posix.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/region/en_us_posix.res" index=0 of 1
+[REMu][FAIL] nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes thread="main" result=0xffffffffffffffff args=0x30eb617e0,0x1,0x30eb617d4,0x30eb617d8
+[REMu][VFS] miss=Some(21) sceKernelOpen failed guest="/app0/engine/content/internationalization/icudt64l/region/en_us_posix.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/region/en_us_posix.res": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb617f0,0x0,0x0,0x1
+[REMu][AMPR] resolve absent guest="/app0/engine/content/internationalization/icudt64l/region/en_us.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/region/en_us.res" index=0 of 1
+[REMu][FAIL] nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes thread="main" result=0xffffffffffffffff args=0x30eb617e0,0x1,0x30eb617d4,0x30eb617d8
+[REMu][VFS] miss=Some(22) sceKernelOpen failed guest="/app0/engine/content/internationalization/icudt64l/region/en_us.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/region/en_us.res": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb617f0,0x0,0x0,0x1
+[REMu][IMPORT] first_hit=15232 nid=fZo48un7LK4 name=sceSystemServiceParamGetInt return=0x8013cc711 args=0x1,0x30eb62ca4,0x20,0x8001a70020,0x808649890,0x0
+[REMu][AMPR] resolve absent guest="/app0/engine/content/internationalization/icudt64l/curr/en_us.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/curr/en_us.res" index=0 of 1
+[REMu][FAIL] nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes thread="main" result=0xffffffffffffffff args=0x30eb61360,0x1,0x30eb61354,0x30eb61358
+[REMu][VFS] miss=Some(23) sceKernelOpen failed guest="/app0/engine/content/internationalization/icudt64l/curr/en_us.res" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/content/internationalization/icudt64l/curr/en_us.res": No such file or directory (os error 2)
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb61370,0x0,0x0,0x1
+[REMu][IMPORT] first_hit=15490 nid=n88vx3C5nW8 name=gettimeofday return=0x8059ffbf2 args=0x30eb62ca0,0x0,0x140,0xc2a63a0d36a80000,0x808649890,0x0
+[REMu][VFS] miss=24 sceKernelStat known absent guest="/app0/engine/restricted/notforlicensees/build/epicinternal.txt" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/restricted/notforlicensees/build/epicinternal.txt"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62ce0,0x30eb62c68,0x30eb62bbc,0x1
+[REMu][VFS] miss=25 sceKernelStat known absent guest="/app0/engine/build/perforcebuild.txt" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/build/perforcebuild.txt"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62ce0,0x30eb62c68,0x30eb62bbc,0x1
+[REMu][VFS] miss=26 sceKernelStat known absent guest="/app0/engine/build/sourcedistribution.txt" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/build/sourcedistribution.txt"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62ca0,0x30eb62c28,0x30eb62b7c,0x1
+[REMu][IMPORT] first_hit=15549 nid=j3YMu1MVNNo name=sceUserServiceInitialize return=0x8013d0541 args=0x0,0x0,0x10000000100,0x1,0x8,0x0
+[REMu][IMPORT] first_hit=15550 nid=CdWp0oHWGr0 name=sceUserServiceGetInitialUser return=0x8013d054d args=0x30eb62cec,0x2,0x0,0x1,0x1e4cf805,0x1
+[REMu][IMPORT] first_hit=15552 nid=1xxcMiGu2fo name=sceUserServiceGetUserName return=0x8013d05e9 args=0x10000000,0x8085fd160,0x200,0x1,0x776e7f6a277d6a07,0x1
+Looking for binary: ../../../theoregontrail/Config/BinaryConfig.ini
+[REMu][VFS] miss=27 sceKernelStat known absent guest="/app0/theoregontrail/config/binaryconfig.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/config/binaryconfig.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62c20,0x30eb62ba8,0x30eb62afc,0x1
+[REMu][VFS] miss=28 sceKernelStat known absent guest="/app0/engine/restricted/notforlicensees/config/baseengine.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/restricted/notforlicensees/config/baseengine.ini"
+[REMu][VFS] miss=29 sceKernelStat known absent guest="/app0/engine/restricted/noredist/config/baseengine.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/restricted/noredist/config/baseengine.ini"
+[REMu][VFS] miss=30 sceKernelStat known absent guest="/app0/engine/config/sony/basesonyengine.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/config/sony/basesonyengine.ini"
+[REMu][VFS] miss=31 sceKernelStat known absent guest="/app0/engine/config/ps5/baseps5engine.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/config/ps5/baseps5engine.ini"
+[REMu][VFS] miss=32 sceKernelStat known absent guest="/app0/engine/restricted/notforlicensees/config/sony/basesonyengine.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/restricted/notforlicensees/config/sony/basesonyengine.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62550,0x30eb624d8,0x30eb6242c,0x1
+[REMu][VFS] miss=64 sceKernelStat known absent guest="/app0/theoregontrail/restricted/noredist/platforms/sony/config/sonyengine.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/restricted/noredist/platforms/sony/config/sonyengine.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62550,0x30eb624d8,0x30eb6242c,0x1
+[REMu][VFS] miss=128 sceKernelStat known absent guest="/app0/theoregontrail/restricted/noredist/config/ps5/generatedps5game.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/restricted/noredist/config/ps5/generatedps5game.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62550,0x30eb624d8,0x30eb6242c,0x1
+[REMu][VFS] miss=256 sceKernelStat known absent guest="/app0/engine/restricted/noredist/config/basehardware.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/restricted/noredist/config/basehardware.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62550,0x30eb624d8,0x30eb6242c,0x1
+[REMu][VFS] miss=512 sceKernelStat known absent guest="/app0/theoregontrail/restricted/noredist/config/generatedgameplaytags.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/restricted/noredist/config/generatedgameplaytags.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62550,0x30eb624d8,0x30eb6242c,0x1
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62598,0x601,0x1ff,0x1
+[REMu][IMPORT] first_hit=16484 nid=1-LFLmRFxxM name=sceKernelMkdir return=0x8013be6c9 args=0x30eb62540,0x1ff,0x30eb6249c,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=16486 nid=oib76F-12fk name=sceKernelLseek return=0x8013e5ea4 args=0x7,0x0,0x0,0x0,0x0,0x8001a70160
+[REMu][IMPORT] first_hit=16489 nid=4wSze92BhLI name=sceKernelWrite return=0x8013e6001 args=0x7,0x7420e1a000,0x6b,0x0,0x1,0xa
+[REMu][VFS] miss=1024 sceKernelStat known absent guest="/app0/engine/plugins/experimental/codeview/restricted/noredist/platforms/ps5/config/ps5codeview.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/engine/plugins/experimental/codeview/restricted/noredist/platforms/ps5/config/ps5codeview.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb622f0,0x30eb62278,0x30eb621cc,0x1
+[REMu][VFS] miss=2048 sceKernelStat known absent guest="/app0/theoregontrail/config/sony/sonygamelofttecharttools.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/config/sony/sonygamelofttecharttools.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb622f0,0x30eb62278,0x30eb621cc,0x1
+[REMu][VFS] miss=4096 sceKernelStat known absent guest="/app0/theoregontrail/platforms/sony/config/generatedsonyniagara.ini" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/platforms/sony/config/generatedsonyniagara.ini"
+[REMu][FAIL] nid=eV9wAD2riIA name=sceKernelStat thread="main" result=0xffffffff80020002 args=0x30eb62710,0x30eb62698,0x30eb625ec,0x1
+[REMu][IMPORT] first_hit=21157 nid=dgJBaeJnGpo name=sceNetPoolCreate return=0x803022ba3 args=0x80750a4fa,0x4000,0x0,0x7060eb2940,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=21158 nid=hdpVEUDFW3s name=sceSslInit return=0x803022bb3 args=0x180000,0x30eb62010,0x0,0x1,0xf,0x0
+[REMu][IMPORT] first_hit=21159 nid=A9cVMUtEp4Y name=sceHttpInit return=0x803022bcb args=0x1,0x1,0x100000,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=21160 nid=0gYjPTR-6cY name=sceHttpCreateTemplate return=0x803022be9 args=0x1,0x807536d53,0x2,0x1,0x1,0x0
+[REMu][THREAD] raised host stack name="HttpManagerThread" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=21169 nid=1jfXLRVzisc name=sceKernelUsleep return=0x803025c84 args=0x81c8,0x1,0x39a83a54,0x57883ce64960,0x3e,0x0
+[REMu][IMPORT] first_hit=21178 nid=mL8NDH86iQI name=sceKernelMapNamedFlexibleMemory return=0x809b13109 args=0x30eb625f8,0x80000,0x2,0x0,0x30eb62600,0x1000
+[REMu][IMPORT] first_hit=21179 nid=-hn1tcVHq5Q name=sceLibcMspaceCreate return=0x809b1312a args=0x30eb62600,0xf004000000,0x80000,0x0,0x24d13a13,0x1
+[REMu][MSPACE] created name="0x7000e1f120" base=0xf004000000 end=0xf004080000
+[REMu][IMPORT] first_hit=21180 nid=OJjm-QOIHlI name=sceLibcMspaceMalloc return=0x809b1314a args=0xf004000000,0x60,0x0,0xf00401,0x24d25206,0x1
+[REMu][IMPORT] first_hit=21187 nid=2Tb92quprl0 name=scePthreadCondInit return=0x809b234a5 args=0xf004000180,0x0,0x80a090a7d,0x1,0x24d3e8c3,0x1
+[REMu][IMPORT] first_hit=21195 nid=3JCe3lCbQ8A name=sceHttp2Init return=0x800900f38 args=0x2,0x2,0x80000,0x1,0x23,0x7f7798007410
+[REMu][IMPORT] first_hit=21196 nid=+o9816YQhqQ name=sceNpWebApi2Initialize return=0x800900f4a args=0x3,0x100000,0x0,0x1,0xfffffc00,0x0
+[REMu][NP_WEB_API2] initialized context=1 http_context=3 pool_size=0x100000
+[REMu][IMPORT] first_hit=21197 nid=WV1GwM32NgY name=sceNpWebApi2PushEventCreateHandle return=0x800900f58 args=0x1,0x1052aafde,0x10000000000,0x1,0x2,0x6
+[REMu][IMPORT] first_hit=21198 nid=-hJRce8wn1U name=sce::Json::MemAllocator::MemAllocator return=0x8008ffb26 args=0x7000e21d20,0x0,0x8001a70000,0x7000e21d20,0x24d81207,0x1
+[REMu][IMPORT] first_hit=21199 nid=WSOuge5IsCg name=sce::Json::InitParameter2::InitParameter2 return=0x8008ffb72 args=0x30eb627b0,0x0,0x0,0x7120e3d8c0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=21200 nid=I2QC8PYhJWY name=sce::Json::InitParameter2::setAllocator return=0x8008ffb83 args=0x30eb627b0,0x7000e21d20,0x0,0x30e01,0x8,0x0
+[REMu][IMPORT] first_hit=21201 nid=Eu95jmqn5Rw name=sce::Json::InitParameter2::setFileBufferSize return=0x8008ffb8f args=0x30eb627b0,0x200,0x0,0x1,0x24da7cae,0x1
+[REMu][IMPORT] first_hit=21202 nid=cK6bYHf-Q5E name=sce::Json::Initializer::Initializer return=0x8008ffba4 args=0x7000e220c0,0x0,0x8001a70000,0x7000e220c0,0x24db31d5,0x1
+[REMu][IMPORT] first_hit=21203 nid=IXW-z8pggfg name=sce::Json::Initializer::initialize(InitParameter2) return=0x8008ffbb6 args=0x7000e220c0,0x30eb627b0,0x0,0x700001,0x8,0x0
+[REMu][THREAD] raised host stack name="OnlineAsyncTaskThreadPS5 Defau" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=21230 nid=YJtKLttI9fM name=sceGameUpdateInitialize return=0x80097f0ac args=0x30eb62760,0x2,0x0,0x1,0x24e30fd4,0x1
+[REMu][IMPORT] first_hit=21231 nid=27bAgiJmOh0 name=pthread_cond_timedwait return=0x801434934 args=0x7040eb8ab8,0x7040eb8ab0,0x31402ebd0,0x6a73edc9,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=21232 nid=qQJfO8HAiaY name=sceNpRegisterStateCallbackA return=0x8008d8ca8 args=0x8008d8bb0,0x7260e00010,0x3fffffe00,0x3,0x0,0x8001a70060
+[REMu][IMPORT] first_hit=21238 nid=sjaobBgqeB4 name=sceNpUniversalDataSystemInitialize return=0x80097f906 args=0x30eb627e8,0x0,0x40,0x8001a70040,0x808649890,0x34
+[REMu][IMPORT] first_hit=21244 nid=uoUpLGNkygk name=sceCommonDialogInitialize return=0x8009729e5 args=0x30eb62740,0x2,0x0,0x1,0x24f9a60e,0x1
+[REMu][IMPORT] first_hit=21250 nid=sUXGfNMalIo name=sceNpTrophy2RegisterUnlockCallback return=0x80096f724 args=0x80096f780,0x7200e05950,0x0,0x1,0x24fbf316,0x1
+[REMu][THREAD] raised host stack name="PoolThread 9" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 10" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 11" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="PoolThread 12" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=21395 nid=1n37q1Bvc5Y name=sceSystemServiceGetDisplaySafeAreaInfo return=0x80191ac75 args=0x30eb62d08,0x80743cb7a,0x87000000f00,0x87000000f00,0x1,0x0
+[REMu][IMPORT] first_hit=21546 nid=nBDD66kiFW8 name=sceShareInitialize return=0x801398597 args=0x20000,0x2bc,0x1fff,0x1,0x29e37856,0x1
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62cc0,0x20000,0x16d,0x1
+[REMu][IMPORT] first_hit=21773 nid=naInUjYt3so name=sceKernelRmdir return=0x8013be7f4 args=0x30eb62db0,0x30eb62d58,0x30eb62d0c,0x1,0x1,0x0
+[REMu][FILES] denied rmdir on read-only mount sequence=1 path="/app0/theoregontrail/intermediate/shaders/tmp"
+[REMu][FAIL] nid=naInUjYt3so name=sceKernelRmdir thread="main" result=0xffffffff8002000d args=0x30eb62db0,0x30eb62d58,0x30eb62d0c,0x1
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62cc0,0x20000,0x16d,0x1
+[REMu][FILES] denied rmdir on read-only mount sequence=2 path="/app0/theoregontrail/intermediate/shaders/workingdirectory"
+[REMu][FAIL] nid=naInUjYt3so name=sceKernelRmdir thread="main" result=0xffffffff8002000d args=0x30eb62db0,0x30eb62d58,0x30eb62d0c,0x1
+[REMu][IMPORT] first_hit=22027 nid=hv1luiJrqQM name=scePadInit return=0x801921cb4 args=0x310,0x31,0x0,0x8001a70000,0x808649890,0x30eb62a5c
+[REMu][THREAD] raised host stack name="SystemEventGatherThreadSony" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=22044 nid=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback return=0x80191b53e args=0x801921170,0x70c0df8490,0x70c0df84d0,0x8002af0000,0x177,0x0
+[REMu][IMPORT] first_hit=22047 nid=yH17Q6NWtVg name=sceUserServiceGetEvent return=0x8019212fc args=0x314a3bb80,0x105a199d0,0x9,0x80,0xffffffff00000000,0x10000000100
+[REMu][IMPORT] first_hit=22048 nid=m87BHxt-H60 name=sceNpGameIntentInitialize return=0x80191b65b args=0x30eb62de0,0x0,0x0,0x0,0x7e7891,0x7f776a000000
+[REMu][FAIL] nid=yH17Q6NWtVg name=sceUserServiceGetEvent thread="SystemEventGatherThreadSony" result=0xffffffff80960007 args=0x314a3bb80,0x6,0x8085fcbf0,0x0
+[REMu][IMPORT] first_hit=22050 nid=iQw3iQPhvUQ name=sceNetCtlCheckCallback return=0x801921375 args=0xf00007f77975335f,0x302db996,0xfcad0,0x0,0x200007f7797558da,0x7f7797500000
+[REMu][IMPORT] first_hit=22051 nid=obuxdTiwkF8 name=sceNetCtlGetInfo return=0x8019213b9 args=0x4,0x314a3bb80,0x105a0b3a8,0x6,0xffffffff00000000,0x0
+[REMu][FAIL] nid=obuxdTiwkF8 name=sceNetCtlGetInfo thread="SystemEventGatherThreadSony" result=0xffffffff80410132 args=0x4,0x314a3bb80,0x105a0b3a8,0x6
+[REMu][IMPORT] first_hit=22052 nid=rPo6tV8D9bM name=sceSystemServiceGetStatus return=0x801921463 args=0x314a3db88,0x6,0x8086d7d20,0x0,0xffffffff00000000,0x0
+[REMu][AMPR] resolve absent guest="/app0/theoregontrail/saved/preferences/editorkeybindings.txt" host="/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/theoregontrail/saved/preferences/editorkeybindings.txt" index=0 of 1
+[REMu][FAIL] nid=gEpBkcwxUjw name=sceKernelAprResolveFilepathsToIdsAndFileSizes thread="main" result=0xffffffffffffffff args=0x30eb626c0,0x1,0x30eb626b4,0x30eb626b8
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb626d0,0x0,0x0,0x1
+[REMu][IMPORT] first_hit=22481 nid=vSMAm3cxYTY name=sceKernelMprotect return=0x804a85a21 args=0x8084b8000,0x19d80,0x12,0x1,0x11,0x8001a70000
+[REMu][IMPORT] first_hit=22483 nid=23LRUSvYu1M name=sceAgcInit return=0x804a85a62 args=0x8088a77c0,0xc,0x0,0x1,0x30eb8553,0x1
+[REMu][FAIL] nid=23LRUSvYu1M name=sceAgcInit thread="main" result=0xffffffff80020016 args=0x8088a77c0,0xc,0x0,0x1
+[REMu][IMPORT] first_hit=22485 nid=X-Nm5KLREeg name=sceAgcDriverRegisterOwner return=0x804bbb7f5 args=0x8088a827c,0x80761786c,0x0,0x1,0x30ee2509,0x1
+[REMu][AGC] declining resource registration (first: nid=X-Nm5KLREeg): REmu presents no PA Debug target, so the whole cluster reports 0x8a6c9018; this is expected, registration only labels memory for Razor GPU
+[REMu][FAIL] nid=X-Nm5KLREeg name=sceAgcDriverRegisterOwner thread="main" result=0x8a6c9018 args=0x8088a827c,0x80761786c,0x0,0x1
+[REMu][IMPORT] first_hit=22486 nid=f3dg2CSgRKY name=sceAgcCreateShader return=0x804bbb848 args=0x30eb62e30,0x8084c0d90,0x8084f1400,0x0,0x1,0x7f7797767470
+[REMu][AGC] accepted shader registration type=0 program_low=0x20c count=10 block=[0x20c=0x0 0x20d=0x0 0x22a=0x280000a0 0x22a=0x6aa53f9b 0x212=0x402c0040 0x213=0x10 0x228=0x0 0x207=0x1 0x208=0x1 0x209=0x1]
+[REMu][IMPORT] first_hit=22772 nid=wr23dPKyWc0 name=sceAgcCbReleaseMem return=0x804a87368 args=0x7420f49230,0x28,0x0,0x1,0x3,0x8006e6ffe0
+[REMu][THREAD] raised host stack name="AgcCleanupThread" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=22788 nid=w2rJhmD+dsE name=sceAgcDriverAddEqEvent return=0x801371e2e args=0x2,0x20,0x0,0x1,0x31143ab6,0x1
+[REMu][AGC] registered completion event equeue=0x2 ident=0x20 user_data=0x0
+[REMu][AGC] registered completion event equeue=0x2 ident=0x0 user_data=0x0
+[REMu][IMPORT] first_hit=22790 nid=WDszmSbWuDk name=sceKernelAddUserEventEdge return=0x801371ea5 args=0x2,0x1800,0x0,0x1,0x3117d2f5,0x1
+[REMu][THREAD] raised host stack name="AgcInterruptThread" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="AgcSubmissionThread" guest=0x40000 host=0x200000
+[REMu][KERNEL][EQUEUE] wait sequence=3 equeue=0x2 events=0x314e43bc0 capacity=1 out_count=0x314e43bbc timeout_ptr=0x0 timeout_us=None thread="AgcInterruptThread"/0x7f77ae933000
+[REMu][AGC] accepted shader registration type=1 program_low=0x8 count=6 block=[0x8=0x0 0x9=0x0 0x6=0x21000120 0x6=0xd567eae5 0xa=0x22c0080 0xb=0x28]
+[REMu][AGC] accepted shader registration type=2 program_low=0xc8 count=6 block=[0xc8=0x0 0xc9=0x0 0x80=0xa000300 0x80=0xfec270f5 0x8a=0x622c00c2 0x8b=0x30020]
+[REMu][AGC] accepted shader registration type=8 program_low=none count=8 block=[0x0=0x1220 0x1=0x40104004 0x2=0xa0 0x5=0x0 0x3=0x10 0x4=0x6 0x6=0x0 0x7=0x0]
+[REMu][AGC] accepted shader registration type=4 program_low=none count=5 block=[0x8a=0x60000003 0x8b=0x30018 0xca=0x3000003 0x80=0x140002f0 0x80=0xc0cd2882]
+[REMu][AGC] accepted shader registration type=6 program_low=0xc8 count=10 block=[0xc8=0x0 0xc9=0x0 0x80=0x0 0x80=0x0 0x8a=0x622c0046 0x8b=0x930008 0x88=0x0 0x89=0x0 0x80=0x36000710 0x80=0x31ab4277]
+[REMu][THREAD] raised host stack name="RHIThread" guest=0x80000 host=0x200000
+[REMu][IMPORT] first_hit=28069 nid=aJf+j5yntiU name=sceAgcDcbEventWrite return=0x804b494b9 args=0x7420f49230,0x7,0x0,0xffffffff,0x0,0x0
+[REMu][IMPORT] first_hit=28073 nid=LtTouSCZjHM name=sceAgcCbNop return=0x804b498d5 args=0x30eb628e8,0xa,0x30eb62d20,0x0,0x0,0x804a86f50
+[REMu][IMPORT] first_hit=28074 nid=i1jyy49AjXU name=sceAgcDcbWriteData return=0x804b49904 args=0x30eb628e8,0x4,0x0,0x0,0x30eb628e4,0x1
+[REMu][IMPORT] first_hit=28076 nid=VmW0Tdpy420 name=sceAgcDcbWaitRegMem return=0x804b4995c args=0x30eb628e8,0x0,0x3,0x0,0x0,0x0
+[REMu][IMPORT] first_hit=28077 nid=V++UgBtQhn0 name=sceAgcGetDataPacketPayloadAddress return=0x804b499a2 args=0x30eb628d8,0x8006d70040,0x0,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=28078 nid=fPSCdQxgpSw name=sceAgcWriteDataPatchSetAddressOrOffset return=0x804b499bc args=0x8006d70068,0x8006d70048,0x30eb60000,0x1,0x755e707f3a747f36,0x1
+[REMu][IMPORT] first_hit=28079 nid=3KDcnM3lrcU name=sceAgcWaitRegMemPatchAddress return=0x804b499c7 args=0x7cf820d720,0x8006d70048,0x0,0x1,0x62,0x620
+[REMu][IMPORT] first_hit=28080 nid=0fWWK5uG9rQ name=sceAgcQueueEndOfPipeActionPatchAddress return=0x804b499d2 args=0x8006d7007c,0x8006d70048,0x0,0x1,0xa3,0x7f776a03b9d0
+[REMu][IMPORT] first_hit=28081 nid=57labkp+rSQ name=sceAgcDcbAcquireMem return=0x804b499f8 args=0x7420f49230,0x1,0x0,0x9000,0x8006d70048,0x20
+[REMu][IMPORT] first_hit=28088 nid=UglJIZjGssM name=sceAgcDriverSubmitDcb return=0x804a8688f args=0x315046bb0,0x8006d70000,0x3f,0x0,0xffffffff00000000,0x10000000100
+[REMu][AGC] queue=graphics submit=1 address=0x8006d70000 dwords=63
+[REMu][AGC][SYNC] release packet=0x8006d70000 standard=false control=0x00030000 selection=3 address=0x8006e6ffe0 data=0x0 emitted=true
+[REMu][AGC][SYNC] write sequence=1 packet=0x8006d70068 standard=true destination=2 address=0x8006d70048 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d7007c standard=false control=0x00010000 selection=1 address=0x8006d70048 data=0x1 emitted=true
+[REMu][AGC][SYNC] release packet=0x8006d700bc standard=false control=0x00030000 selection=3 address=0x8006e6ffc0 data=0x0 emitted=true
+[REMu][AGC][SYNC] release packet=0x8006d700dc standard=false control=0x02020000 selection=2 address=0x8006e6ffa0 data=0x0 emitted=true
+[REMu][AGC] submit=1 address=0x8006d70000 dwords=63 parsed=63 packets=[op=0x10/reg=0x00:1,op=0x10/reg=0x14:1,op=0x10/reg=0x18:4,op=0x37/reg=0x00:1,op=0x46/reg=0x00:4] flips=0
+[REMu][PERF-GPU-PUBLICATION] exact runtime phase attribution enabled
+[REMu][IMPORT] first_hit=28089 nid=h9z6+0hEydk name=sceAgcSuspendPoint return=0x80134970e args=0x315046ac0,0x2,0x8086032a8,0x9e3779b97f4a7c15,0xffffffff00000000,0x40000000400
+[REMu][PERF-STARTUP] milestone=first-queue-submission elapsed_us=7767934
+[REMu][AGC] completed submission=1 newest_backend=1 equeues=2
+[REMu][AGC][EQUEUE] delivered sequence=1 equeue=0x2 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][KERNEL][EQUEUE] woke sequence=3 equeue=0x2 delivered=1
+[REMu][KERNEL][EQUEUE] wait sequence=4 equeue=0x2 events=0x314e43bc0 capacity=1 out_count=0x314e43bbc timeout_ptr=0x0 timeout_us=None thread="AgcInterruptThread"/0x7f77ae933000
+[REMu][THREAD] raised host stack name="RenderThread 0" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="RTHeartBeat 0" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=28206 nid=6xVpy0Fdq+I name=_sigprocmask return=0x809a1cd3b args=0x1,0x0,0x72e0e40048,0x72e0e40000,0x0,0x801a34650
+[REMu][IMPORT] first_hit=30886 nid=Up36PTk687E name=sceVideoOutOpen return=0x80136a732 args=0xff,0x0,0x0,0x0,0x2,0x1
+[REMu][IMPORT] first_hit=30889 nid=utPrVdxio-8 name=sceVideoOutGetOutputStatus return=0x80136ab1c args=0x1,0x30eb62240,0x807e29998,0x0,0x45,0x0
+[REMu][IMPORT] first_hit=30893 nid=HV4j+E0MBHE name=sceAgcCreateInterpolantMapping return=0x804b48ea3 args=0x8085f0018,0x71c0e48fc0,0x0,0x71c0e48fc0,0x0,0x7
+[REMu][IMPORT] first_hit=30894 nid=D9sr1xGUriE name=sceAgcCreatePrimState return=0x80135257b args=0x8085f0118,0x8085eff00,0x0,0x71c0e48fc0,0x7,0x30e961a08
+[REMu][IMPORT] first_hit=30895 nid=+kSrjIVxKFE name=sceAgcDcbPushMarker return=0x8013525bb args=0x30eb61dc0,0x8075d9d47,0x0,0x0,0x607b4a692f5e7f07,0x9
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=7 reserved=0 old=0x8085efef0..0x8085efef0 new=0x8085efef0..0x8085eff0c
+[REMu][IMPORT] first_hit=30896 nid=qj7QZpgr9Uw name=sceAgcDcbContextStateOp return=0x8013525c8 args=0x30eb61dc0,0x3,0x8085e0000,0x80801,0x72,0x1
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=1 reserved=0 old=0x8085eff0c..0x8085eff0c new=0x8085efef0..0x8085efef4
+[REMu][IMPORT] first_hit=30897 nid=ZvwO9euwYzc name=sceAgcDcbSetCxRegistersIndirect return=0x8013525d7 args=0x30eb61dc0,0x8085efef0,0x51,0x80801,0x0,0x1
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=5 reserved=0 old=0x8085efef4..0x8085efef4 new=0x8085efef0..0x8085eff04
+[REMu][IMPORT] first_hit=30898 nid=-HOOCn0JY48 name=sceAgcDcbSetShRegistersIndirect return=0x8013525e6 args=0x30eb61dc0,0x8085efef0,0x6,0x80801,0xffffffffffffffe1,0x30e961a08
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=5 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085eff04
+[REMu][IMPORT] first_hit=30899 nid=hvUfkUIQcOE name=sceAgcDcbSetUcRegistersIndirect return=0x8013525f6 args=0x30eb61dc0,0x8085efef0,0x5,0x80801,0x0,0x1
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=5 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085eff04
+[REMu][IMPORT] first_hit=30900 nid=tSBxhAPyytQ name=sceAgcDcbSetNumInstances return=0x801352603 args=0x30eb61dc0,0x1,0x8085e0000,0x80801,0x0,0x1
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=2 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085efef8
+[REMu][IMPORT] first_hit=30901 nid=Yw0jKSqop+E name=sceAgcDcbDrawIndexAuto return=0x801352618 args=0x30eb61dc0,0x3,0x40000000,0x80801,0x0,0x1
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=3 reserved=0 old=0x8085efef8..0x8085efef8 new=0x8085efef0..0x8085efefc
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=1 reserved=0 old=0x8085efefc..0x8085efefc new=0x8085efef0..0x8085efef4
+[REMu][IMPORT] first_hit=30903 nid=H7uZqCoNuWk name=sceAgcDcbPopMarker return=0x801364745 args=0x30eb61dc0,0x8085efef0,0x8085e0006,0x80801,0x0,0x1
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=2 reserved=0 old=0x8085efef4..0x8085efef4 new=0x8085efef0..0x8085efef8
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=7 reserved=0 old=0x8085efef0..0x8085efef0 new=0x8085efef0..0x8085eff0c
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=1 reserved=0 old=0x8085eff0c..0x8085eff0c new=0x8085efef0..0x8085efef4
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=5 reserved=0 old=0x8085efef4..0x8085efef4 new=0x8085efef0..0x8085eff04
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=5 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085eff04
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=5 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085eff04
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=2 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085efef8
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=3 reserved=0 old=0x8085efef8..0x8085efef8 new=0x8085efef0..0x8085efefc
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=1 reserved=0 old=0x8085efefc..0x8085efefc new=0x8085efef0..0x8085efef4
+[REMu][AGC] command-buffer grow descriptor=0x30eb61dc0 requested=2 reserved=0 old=0x8085efef4..0x8085efef4 new=0x8085efef0..0x8085efef8
+[REMu][IMPORT] first_hit=30940 nid=PjS5uASwcV8 name=sceVideoOutSetBufferAttribute2 return=0x80136ad92 args=0x30eb62240,0x8000000000000000,0x0,0xf00,0x870,0x0
+[REMu][IMPORT] first_hit=30941 nid=rKBUtgRrtbk name=sceVideoOutRegisterBuffers2 return=0x80136adb7 args=0x1,0x0,0x0,0x70e0ea4e80,0x2,0x30eb62240
+[REMu][VIDEO] registered 2 buffers at 3840x2160 format=0x8000000000000000 tiling=0 addresses=[efc0000000, efc2000000]
+[REMu][IMPORT] first_hit=30945 nid=CBiu4mCE1DA name=sceVideoOutSetFlipRate return=0x80136a826 args=0x1,0x0,0x80867d618,0x0,0x808649890,0x0
+[REMu][IMPORT] first_hit=30946 nid=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins return=0x80136a86d args=0x1,0x0,0x0,0x0,0xcfb54a0,0x1
+[REMu][IMPORT] first_hit=30948 nid=HXzjK9yI30k name=sceVideoOutAddFlipEvent return=0x80136a88e args=0x3,0x1,0x0,0x1,0xcfc6a9f,0x1
+[REMu][IMPORT] first_hit=30949 nid=Xru92wHJRmg name=sceVideoOutAddVblankEvent return=0x80136a89f args=0x3,0x1,0x0,0x1,0xcfd6b21,0x1
+[REMu][METAL] display registered 3840x2160 pitch=3840 format=0x8000000000000000 tiling=0 buffers=[efc0000000, efc2000000]
+[REMu][THREAD] raised host stack name="AgcViewportThread" guest=0x40000 host=0x200000
+[REMu][KERNEL][EQUEUE] wait sequence=5 equeue=0x3 events=0x315852bf8 capacity=1 out_count=0x315852bf4 timeout_ptr=0x0 timeout_us=None thread="AgcViewportThread"/0x7f77be0f6000
+[REMu][THREAD] raised host stack name="RHIFrameOffsetThread" guest=0x40000 host=0x200000
+[REMu][THREAD] raised host stack name="RHIFrameFlipThread" guest=0x40000 host=0x200000
+[REMu][IMPORT] first_hit=30997 nid=xk0AcarP3V4 name=scePadOpen return=0x80191e833 args=0x10000000,0x0,0x0,0x0,0x8019221d0,0x0
+[REMu][IMPORT] first_hit=30998 nid=W2G-yoyMF5U name=scePadSetVibrationMode return=0x80191e7b5 args=0x1,0x1,0x0,0x8001a70000,0x808649890,0x8001a70000
+[REMu][IMPORT] first_hit=30999 nid=rbknaUjpqWo name=sceNpGetAccountIdA return=0x8008d507a args=0x10000000,0x30eb621c8,0x0,0x70e0ea4e80,0x0,0x0
+[REMu][IMPORT] first_hit=31004 nid=XDncXQIJUSk name=sceNpGetOnlineId return=0x8008d7633 args=0x10000000,0x30eb62218,0x0,0x0,0xffffffff00000000,0x0
+[REMu][FAIL] nid=yH17Q6NWtVg name=sceUserServiceGetEvent thread="SystemEventGatherThreadSony" result=0xffffffff80960007 args=0x314a3bb80,0x7fffffffffffffff,0x9,0x80
+[REMu][FAIL] nid=1G3lF1Gg1k8 name=sceKernelOpen thread="main" result=0xffffffff80020002 args=0x30eb62af0,0x20000,0x16d,0x1
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=6 reserved=0 old=0x8085efef0..0x8085efef0 new=0x8085efef0..0x8085eff08
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=1 reserved=0 old=0x8085eff08..0x8085eff08 new=0x8085efef0..0x8085efef4
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=5 reserved=0 old=0x8085efef4..0x8085efef4 new=0x8085efef0..0x8085eff04
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=5 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085eff04
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=5 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085eff04
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=2 reserved=0 old=0x8085eff04..0x8085eff04 new=0x8085efef0..0x8085efef8
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=3 reserved=0 old=0x8085efef8..0x8085efef8 new=0x8085efef0..0x8085efefc
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=1 reserved=0 old=0x8085efefc..0x8085efefc new=0x8085efef0..0x8085efef4
+[REMu][AGC] command-buffer grow descriptor=0x31544b9d0 requested=2 reserved=0 old=0x8085efef4..0x8085efef4 new=0x8085efef0..0x8085efef8
+[REMu][IMPORT] first_hit=31178 nid=vcmNN+AAXnY name=sceAgcSetCxRegIndirectPatchSetAddress return=0x804b4904d args=0x8006d7014c,0x8006e6f780,0x3ff76,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=31179 nid=d-6uF9sZDIU name=sceAgcSetCxRegIndirectPatchAddRegisters return=0x804b49082 args=0x8006d7014c,0x15,0x8,0x0,0x63,0x630
+[REMu][IMPORT] first_hit=31195 nid=Qrj4c+61z4A name=sceAgcSetShRegIndirectPatchSetAddress return=0x804b4919d args=0x8006d70200,0x8006e6ef80,0x3fd49,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=31196 nid=z2duB-hHQSM name=sceAgcSetShRegIndirectPatchAddRegisters return=0x804b491d2 args=0x8006d70200,0xa,0x0,0x0,0x63,0x630
+[REMu][IMPORT] first_hit=31197 nid=n2fD4A+pb+g name=sceAgcCbSetShRegisterRangeDirect return=0x804a8716f args=0x7420f49230,0x240,0x0,0xc,0x0,0xc
+[REMu][IMPORT] first_hit=31199 nid=k3GhuSNmBLU name=sceAgcCbDispatch return=0x80134d0e7 args=0x7420f49230,0x1,0x1,0x1,0x1,0x0
+[REMu][IMPORT] first_hit=31415 nid=bbFueFP+J4k name=sceAgcDcbSetPredication return=0x8013502d4 args=0x7420f49230,0x1,0x3,0x1,0x8006e6e700,0x72c0ec0060
+[REMu][IMPORT] first_hit=31416 nid=xSAR0LTcRKM name=sceAgcDcbJump return=0x8013502e7 args=0x7420f49230,0x0,0x0,0x72c0ec0800,0x1e,0x0
+[REMu][IMPORT] first_hit=31417 nid=w6Dj1VJt5qY name=sceAgcSetPacketPredication return=0x8013502f4 args=0x8006d70d10,0x1,0x8006d70000,0x800601,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=31525 nid=MWiElSNE8j8 name=sceAgcDcbWaitUntilSafeForRendering return=0x801350849 args=0x7420f49230,0x1,0x0,0x800601,0x8006d712ac,0x0
+[REMu][IMPORT] first_hit=31569 nid=YUeqkyT7mEQ name=sceAgcDcbSetFlip return=0x80136b88f args=0x7420f49230,0x1,0x0,0x1,0x1,0x2
+[REMu][AGC] queue=graphics submit=2 address=0x8006d700fc dwords=1298
+[REMu][AGC][SYNC] release packet=0x8006d700fc standard=false control=0x00030000 selection=3 address=0x8006e6ff80 data=0x0 emitted=true
+[REMu][AGC][SYNC] write sequence=2 packet=0x8006d701ac standard=true destination=2 address=0x8006d70188 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d701c0 standard=false control=0x00010000 selection=1 address=0x8006d70188 data=0x1 emitted=true
+[REMu][AGC] compute=1 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=3 packet=0x8006d7031c standard=true destination=2 address=0x8006d702f8 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70330 standard=false control=0x00010000 selection=1 address=0x8006d702f8 data=0x1 emitted=true
+[REMu][AGC] compute=2 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=4 packet=0x8006d7048c standard=true destination=2 address=0x8006d70468 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d704a0 standard=false control=0x00010000 selection=1 address=0x8006d70468 data=0x1 emitted=true
+[REMu][AGC] compute=3 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=5 packet=0x8006d705fc standard=true destination=2 address=0x8006d705d8 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70610 standard=false control=0x00010000 selection=1 address=0x8006d705d8 data=0x1 emitted=true
+[REMu][AGC] compute=4 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=6 packet=0x8006d7076c standard=true destination=2 address=0x8006d70748 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70780 standard=false control=0x00010000 selection=1 address=0x8006d70748 data=0x1 emitted=true
+[REMu][AGC] compute=5 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=7 packet=0x8006d708f0 standard=true destination=2 address=0x8006d708d0 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70904 standard=false control=0x00010000 selection=1 address=0x8006d708d0 data=0x1 emitted=true
+[REMu][AGC] compute=6 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=8 packet=0x8006d70a60 standard=true destination=2 address=0x8006d70a40 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70a74 standard=false control=0x00010000 selection=1 address=0x8006d70a40 data=0x1 emitted=true
+[REMu][AGC] compute=7 source=Direct grid=Threadgroups([1, 1, 1]) base=[0, 0, 0] local=[8, 8, 1] wave=64 cs=0x8008050000
+[REMu][AGC][SYNC] write sequence=9 packet=0x8006d70bd0 standard=true destination=2 address=0x8006d70bb0 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70be4 standard=false control=0x00010000 selection=1 address=0x8006d70bb0 data=0x1 emitted=true
+[REMu][AGC] compute=8 source=Direct grid=Threadgroups([128, 1, 1]) base=[0, 0, 0] local=[64, 1, 1] wave=64 cs=0x8007fd0000
+[REMu][AGC] indirect sequence=1 depth=1 packet=0x8006d70d10 address=0x72c0ec0800 dwords=30
+[REMu][AGC] shader evaluation cache draw=1 hits=0 misses=9 failures=0 invalidations=0 entries=0 evictions=0 pending_admissions=9
+[REMu][AGC] draw=1 indexed=false source=direct count=3 instances=1 offset=0 base_vertex=0 index_buffer=0x0/0 resource=0x0 index_size=0 primitive=0x7 es=0x8008100000 ps=0x0 target=0x0 scanout=0x0 target_mask=0x0 viewport=[Some(3f800000), Some(0), Some(3f800000), Some(0)] es_user_base=0x8c es_user=[Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)] ps_user=[Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)]
+[REMu][AGC][SYNC] write sequence=10 packet=0x8006d70d60 standard=true destination=2 address=0x8006d70d40 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70d74 standard=false control=0x00010000 selection=1 address=0x8006d70d40 data=0x1 emitted=true
+[REMu][AGC][SYNC] write sequence=11 packet=0x8006d70e44 standard=true destination=2 address=0x8006d70e20 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70e58 standard=false control=0x00010000 selection=1 address=0x8006d70e20 data=0x1 emitted=true
+[REMu][AGC][SYNC] write sequence=12 packet=0x8006d70fb4 standard=true destination=2 address=0x8006d70f90 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d70fc8 standard=false control=0x00010000 selection=1 address=0x8006d70f90 data=0x1 emitted=true
+[REMu][AGC][SYNC] release packet=0x8006d712ac standard=false control=0x00030000 selection=3 address=0x8006e6ddd0 data=0x0 emitted=true
+[REMu][AGC][WAIT-FLIP-DONE] phase=accept sequence=1 packet=0x8006d712cc handle=1 index=0 address=0xefc0000000
+[REMu][AGC][SYNC] release packet=0x8006d712e8 standard=false control=0x00030000 selection=3 address=0x8006e6ddf0 data=0x0 emitted=true
+[REMu][AGC][SYNC] write sequence=13 packet=0x8006d71348 standard=true destination=2 address=0x8006d71328 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d7135c standard=false control=0x00010000 selection=1 address=0x8006d71328 data=0x1 emitted=true
+[REMu][AGC][SYNC] write sequence=14 packet=0x8006d713fc standard=true destination=2 address=0x8006d713d8 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d71410 standard=false control=0x00010000 selection=1 address=0x8006d713d8 data=0x1 emitted=true
+[REMu][AGC][SYNC] write sequence=15 packet=0x8006d714b0 standard=true destination=2 address=0x8006d71490 dwords=1 increment=true values=[0]
+[REMu][AGC][SYNC] release packet=0x8006d714c4 standard=false control=0x00010000 selection=1 address=0x8006d71490 data=0x1 emitted=true
+[REMu][AGC][SYNC] release packet=0x8006d71504 standard=false control=0x00030000 selection=3 address=0x8006e6dda0 data=0x0 emitted=true
+[REMu][AGC][SYNC] release packet=0x8006d71524 standard=false control=0x02020000 selection=2 address=0x8006e6dd80 data=0x0 emitted=true
+[REMu][AGC] submit=2 address=0x8006d700fc dwords=1298 parsed=1298 packets=[op=0x10/reg=0x00:14,op=0x10/reg=0x06:1,op=0x10/reg=0x0b:10,op=0x10/reg=0x0c:10,op=0x10/reg=0x14:35,op=0x10/reg=0x17:1,op=0x10/reg=0x18:19,op=0x15/reg=0x00:15,op=0x20/reg=0x00:2,op=0x37/reg=0x00:14,op=0x3f/reg=0x00:2,op=0x46/reg=0x00:84,op=0x63/reg=0x00:15,op=0x76/reg=0x00:15,op=0x9f/reg=0x00:5] flips=1
+[REMu][GPU] linear submission chunking enabled chunk_size=32
+[REMu][METAL] preserving cold compute=1 cs=0x8008050000 while its pipeline compiles
+[REMu][METAL] compiled Gen5 compute cs=0x8008050000 MSL=9680 bytes time=0.3/0.2/0.3ms lower/function/pipeline local=[8, 8, 1] LDS=0 bytes
+[REMu][METAL] compiled Gen5 compute cs=0x8008050000 MSL=9614 bytes time=0.3/0.2/0.3ms lower/function/pipeline local=[8, 8, 1] LDS=0 bytes
+[REMu][METAL] compiled Gen5 compute cs=0x8007fd0000 MSL=21692 bytes time=0.4/0.1/0.4ms lower/function/pipeline local=[64, 1, 1] LDS=0 bytes
+[REMu][METAL] compiled Gen5 compute cs=0x8007f60000 MSL=21255 bytes time=0.2/0.1/0.1ms lower/function/pipeline local=[64, 1, 1] LDS=0 bytes
+[REMu][METAL] compiled Gen5 compute cs=0x800a530000 MSL=35428 bytes time=0.7/0.2/0.3ms lower/function/pipeline local=[8, 8, 1] LDS=0 bytes
+[REMu][WAIT-FLIP-DONE] phase=pass occurrence=1 address=0xefc0000000 index=0 required=None
+[REMu][PERF-STARTUP] milestone=first-flip-accepted elapsed_us=7897307
+[REMu][COMPLETION-ORDER] phase=accept flip=1 submission=Some(2) submission_terminal=false
+[REMu][PERF-STARTUP] milestone=first-guest-present-submitted elapsed_us=7897791
+[REMu][AGC] completed submission=2 newest_backend=2 equeues=2
+[REMu][AGC][EQUEUE] delivered sequence=2 equeue=0x2 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][KERNEL][EQUEUE] woke sequence=4 equeue=0x2 delivered=1
+[REMu][KERNEL][EQUEUE] wait sequence=6 equeue=0x2 events=0x314e43bc0 capacity=1 out_count=0x314e43bbc timeout_ptr=0x0 timeout_us=None thread="AgcInterruptThread"/0x7f77ae933000
+[REMu][COMPLETION-ORDER] phase=await-presented flip=Some(1) command_buffer=completed age_ms=2.878
+[REMu][COMPLETION-ORDER] phase=publish flip=1 submission=Some(2) terminal=presentation submission_terminal=true age_ms=10.895
+[REMu][PERF] REMu | FPS 0.0 (0.0 ms) | Present 0.0/s | GPU 0% Lat 0.0 ms | RSS 930 MiB Foot 934/1418 MiB MTL 53/18187 MiB | Draw 0/s RP 0/s CS 0/s | CB 0/s PB 0/s (0) | Q W1 P0 F0 | Tex 13/1 MiB | Pipe 0/0 | Audio 0/s U 0.0%
+[REMu][PERF-DISPATCH] window_ms=5017 calls=2238041 direct=2205791 leaf=2 sync=7126 audio=0 pad=3 stateless=792 fd=5401 equeue=6 loader=0 ampr=2830 video=0 stateful=16090 | lock-wait count=18936 total_ns=20372830 mean_ns=1075 max_ns=3149667 buckets=[18683, 89, 71, 92, 1, 0, 0, 0] | lock-hold count=18936 total_ns=355453130 mean_ns=18771 max_ns=4237542 buckets=[14685, 1020, 752, 2477, 2, 0, 0, 0] | gpu-publication count=3 total_ns=35500 mean_ns=11833 max_ns=15000 buckets=[0, 1, 2, 0, 0, 0, 0, 0] bucket_upper_ns=[1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+[REMu][PERF-GPU-PUBLICATION] window_ms=5017 calls=3 values=count/total_ns/mean_ns/max_ns
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=2/0/0/0 barrier=2/792/396/625 setup=2/5709/2854/3334
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=2/458/229/375 send=2/4749/2374/3708 residual=2/17834/8917/10584
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=1/0/0/0 barrier=1/42/42/42 setup=1/2583/2583/2583
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=1/125/125/125 send=1/583/583/583 residual=1/2625/2625/2625
+[REMu][PERF-DIRECT] window_ms=5017 total=2205791 process-time=3106 sce-self=178520 posix-self=0 sce-thread-id=22100 sce-tls-get=1395458 posix-tls-get=0 sce-tls-set=147 posix-tls-set=0 sce-mutex-lock=180503 posix-mutex-lock=1927 sce-mutex-unlock=180458 posix-mutex-unlock=1886 posix-rwlock-write=120771 posix-rwlock-unlock=120915
+[REMu][PERF-CAUSES] RP-end compute=0/s key=0/s color-op=0/s flush=0/s | CB tick=0/s memory=0/s wait=0/s shared-host=0/s flip=0/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=0/s waits=0/s same-queue-elided=0/s host-blocks=0/s host-wakes=0/s acquire-noop-drops=0/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=0/s error-advances=0 fallback-no-exact=0/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5017 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=1 deferred=1 published=1 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=0/5 active=0/0 failed=0/0 interval=enqueued:5/full:0/done:5/failed:0/gates:0/1 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-QUEUES] q0:pending:0/submissions:0/blocked:none/front:empty
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=1
+[REMu][PERF-TEXTURE] snapshot=0/0.0MiB/0.0ms/0unstable dirty_validate=0/0.0MiB/0.0ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=13/1MiB guest=1MiB metal=53/18187MiB watches=13 hit=0 miss=13 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=0 capacity_evict=0 depth_native=0 alias_writeback=0/0.0MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=0.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/0 layered-depth-alias=0/0 sampled-alias=0/0
+[REMu][PERF-TEXTURE-OWNED] live=0 stale=0 owned=0.0MiB/0 runs debt=0.0MiB survived=0 demoted=0 reclaim_discard=0 rematerialise=0/0/0/0 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=13/0.8MiB targets=0/0.0MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=0/0.0MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=0.8MiB other=52.2MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:0/0.0MiB,cpu:0/0.0MiB mapping=active:0/0.0MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:0/+0versions,spans:0/+0duplicates,unresolved:0/0.0MiB top=[]
+[REMu][PERF-GLOBAL-CACHE] captured=0/0.0MiB identity=0/0.0MiB
+[REMu][TELEMETRY] recording windows to /Users/xnetcat/Documents/REmu-phase1g/docs/notes/phase1g-20260806-handoff/runs/oregon-trail-artifacts/20260806T021320Z-decrypted/telemetry.jsonl
+[REMu][PERF] REMu | FPS 0.0 (0.0 ms) | Present 0.0/s | GPU 0% Lat 0.0 ms | RSS 930 MiB Foot 933/1418 MiB MTL 53/18187 MiB | Draw 0/s RP 0/s CS 0/s | CB 0/s PB 0/s (0) | Q W1 P0 F0 | Tex 13/1 MiB | Pipe 0/0 | Audio 0/s U 0.0%
+[REMu][PERF-DISPATCH] window_ms=5016 calls=4287 direct=3653 leaf=0 sync=347 audio=0 pad=0 stateless=287 fd=0 equeue=0 loader=0 ampr=0 video=0 stateful=0 | lock-wait count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | lock-hold count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | gpu-publication count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] bucket_upper_ns=[1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+[REMu][PERF-GPU-PUBLICATION] window_ms=5016 calls=0 values=count/total_ns/mean_ns/max_ns
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-DIRECT] window_ms=5016 total=3653 process-time=1005 sce-self=96 posix-self=0 sce-thread-id=569 sce-tls-get=1099 posix-tls-get=0 sce-tls-set=0 posix-tls-set=0 sce-mutex-lock=96 posix-mutex-lock=346 sce-mutex-unlock=96 posix-mutex-unlock=346 posix-rwlock-write=0 posix-rwlock-unlock=0
+[REMu][PERF-CAUSES] RP-end compute=0/s key=0/s color-op=0/s flush=0/s | CB tick=0/s memory=0/s wait=0/s shared-host=0/s flip=0/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=0/s waits=0/s same-queue-elided=0/s host-blocks=0/s host-wakes=0/s acquire-noop-drops=0/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=0/s error-advances=0 fallback-no-exact=0/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5016 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=1 deferred=1 published=1 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=0/5 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-QUEUES] q0:pending:0/submissions:0/blocked:none/front:empty
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=1
+[REMu][PERF-TEXTURE] snapshot=0/0.0MiB/0.0ms/0unstable dirty_validate=0/0.0MiB/0.0ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=13/1MiB guest=1MiB metal=53/18187MiB watches=13 hit=0 miss=0 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=0 capacity_evict=0 depth_native=0 alias_writeback=0/0.0MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=0.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/0 layered-depth-alias=0/0 sampled-alias=0/0
+[REMu][PERF-TEXTURE-OWNED] live=0 stale=0 owned=0.0MiB/0 runs debt=0.0MiB survived=0 demoted=0 reclaim_discard=0 rematerialise=0/0/0/0 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=13/0.8MiB targets=0/0.0MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=0/0.0MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=0.8MiB other=52.2MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:0/0.0MiB,cpu:0/0.0MiB mapping=active:0/0.0MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:0/+0versions,spans:0/+0duplicates,unresolved:0/0.0MiB top=[]
+[REMu][PERF-GLOBAL-CACHE] captured=0/0.0MiB identity=0/0.0MiB
+[REMu][PERF] REMu | FPS 0.0 (0.0 ms) | Present 0.0/s | GPU 0% Lat 0.0 ms | RSS 930 MiB Foot 931/1418 MiB MTL 53/18187 MiB | Draw 0/s RP 0/s CS 0/s | CB 0/s PB 0/s (0) | Q W1 P0 F0 | Tex 13/1 MiB | Pipe 0/0 | Audio 0/s U 0.0%
+[REMu][PERF-DISPATCH] window_ms=5016 calls=4679 direct=3992 leaf=0 sync=379 audio=0 pad=0 stateless=308 fd=0 equeue=0 loader=0 ampr=0 video=0 stateful=0 | lock-wait count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | lock-hold count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | gpu-publication count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] bucket_upper_ns=[1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+[REMu][PERF-GPU-PUBLICATION] window_ms=5016 calls=0 values=count/total_ns/mean_ns/max_ns
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-DIRECT] window_ms=5016 total=3992 process-time=1103 sce-self=98 posix-self=0 sce-thread-id=621 sce-tls-get=1216 posix-tls-get=0 sce-tls-set=0 posix-tls-set=0 sce-mutex-lock=98 posix-mutex-lock=379 sce-mutex-unlock=98 posix-mutex-unlock=379 posix-rwlock-write=0 posix-rwlock-unlock=0
+[REMu][PERF-CAUSES] RP-end compute=0/s key=0/s color-op=0/s flush=0/s | CB tick=0/s memory=0/s wait=0/s shared-host=0/s flip=0/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=0/s waits=0/s same-queue-elided=0/s host-blocks=0/s host-wakes=0/s acquire-noop-drops=0/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=0/s error-advances=0 fallback-no-exact=0/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5016 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=1 deferred=1 published=1 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=0/5 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-QUEUES] q0:pending:0/submissions:0/blocked:none/front:empty
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=1
+[REMu][PERF-TEXTURE] snapshot=0/0.0MiB/0.0ms/0unstable dirty_validate=0/0.0MiB/0.0ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=13/1MiB guest=1MiB metal=53/18187MiB watches=13 hit=0 miss=0 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=0 capacity_evict=0 depth_native=0 alias_writeback=0/0.0MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=0.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/0 layered-depth-alias=0/0 sampled-alias=0/0
+[REMu][PERF-TEXTURE-OWNED] live=0 stale=0 owned=0.0MiB/0 runs debt=0.0MiB survived=0 demoted=0 reclaim_discard=0 rematerialise=0/0/0/0 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=13/0.8MiB targets=0/0.0MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=0/0.0MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=0.8MiB other=52.2MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:0/0.0MiB,cpu:0/0.0MiB mapping=active:0/0.0MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:0/+0versions,spans:0/+0duplicates,unresolved:0/0.0MiB top=[]
+[REMu][PERF-GLOBAL-CACHE] captured=0/0.0MiB identity=0/0.0MiB
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=26 total_calls=60
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=30
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=2
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=2
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=2
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=2
+[REMu][REPORT] fabricated success key=-hJRce8wn1U name=sce::Json::MemAllocator::MemAllocator calls=1
+[REMu][REPORT] fabricated success key=0gYjPTR-6cY name=sceHttpCreateTemplate calls=1
+[REMu][REPORT] fabricated success key=1xxcMiGu2fo name=sceUserServiceGetUserName calls=1
+[REMu][REPORT] fabricated success key=3JCe3lCbQ8A name=sceHttp2Init calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=A9cVMUtEp4Y name=sceHttpInit calls=1
+[REMu][REPORT] fabricated success key=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=W2G-yoyMF5U name=scePadSetVibrationMode calls=1
+[REMu][REPORT] fabricated success key=WSOuge5IsCg name=sce::Json::InitParameter2::InitParameter2 calls=1
+[REMu][REPORT] fabricated success key=XDncXQIJUSk name=sceNpGetOnlineId calls=1
+[REMu][REPORT] fabricated success key=cK6bYHf-Q5E name=sce::Json::Initializer::Initializer calls=1
+[REMu][REPORT] fabricated success key=gpu:noop-cover-placeholder name=internal calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
+[REMu][REPORT] fabricated success key=qQJfO8HAiaY name=sceNpRegisterStateCallbackA calls=1
+[REMu][REPORT] fabricated success key=rbknaUjpqWo name=sceNpGetAccountIdA calls=1
+[REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=5342 calls=5350 results=0xffffffff80020002:5342
+[REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=17 calls=22 results=0xffffffff80020002:17
+[REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=6 calls=9 results=0xffffffffffffffff:6
+[REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=2 calls=3 results=0xffffffff80960007:2
+[REMu][REPORT] failing import name=sceAgcInit nid=23LRUSvYu1M failures=1 calls=1 results=0xffffffff80020016:1
+[REMu][REPORT] failing import name=sceAgcDriverRegisterOwner nid=X-Nm5KLREeg failures=1 calls=1 results=0x8a6c9018:1
+[REMu][REPORT] failing import name=sceNetCtlGetInfo nid=obuxdTiwkF8 failures=1 calls=1 results=0xffffffff80410132:1
+[REMu][PERF] REMu | FPS 0.0 (0.0 ms) | Present 0.0/s | GPU 0% Lat 0.0 ms | RSS 931 MiB Foot 932/1418 MiB MTL 53/18187 MiB | Draw 0/s RP 0/s CS 0/s | CB 0/s PB 0/s (0) | Q W1 P0 F0 | Tex 13/1 MiB | Pipe 0/0 | Audio 0/s U 0.0%
+[REMu][PERF-DISPATCH] window_ms=5019 calls=4359 direct=3720 leaf=0 sync=352 audio=0 pad=0 stateless=287 fd=0 equeue=0 loader=0 ampr=0 video=0 stateful=0 | lock-wait count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | lock-hold count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | gpu-publication count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] bucket_upper_ns=[1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+[REMu][PERF-GPU-PUBLICATION] window_ms=5019 calls=0 values=count/total_ns/mean_ns/max_ns
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-DIRECT] window_ms=5019 total=3720 process-time=1012 sce-self=96 posix-self=0 sce-thread-id=596 sce-tls-get=1120 posix-tls-get=0 sce-tls-set=0 posix-tls-set=0 sce-mutex-lock=96 posix-mutex-lock=352 sce-mutex-unlock=96 posix-mutex-unlock=352 posix-rwlock-write=0 posix-rwlock-unlock=0
+[REMu][PERF-CAUSES] RP-end compute=0/s key=0/s color-op=0/s flush=0/s | CB tick=0/s memory=0/s wait=0/s shared-host=0/s flip=0/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=0/s waits=0/s same-queue-elided=0/s host-blocks=0/s host-wakes=0/s acquire-noop-drops=0/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=0/s error-advances=0 fallback-no-exact=0/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5019 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=1 deferred=1 published=1 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=0/5 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-QUEUES] q0:pending:0/submissions:0/blocked:none/front:empty
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=1
+[REMu][PERF-TEXTURE] snapshot=0/0.0MiB/0.0ms/0unstable dirty_validate=0/0.0MiB/0.0ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=13/1MiB guest=1MiB metal=53/18187MiB watches=13 hit=0 miss=0 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=0 capacity_evict=0 depth_native=0 alias_writeback=0/0.0MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=0.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/0 layered-depth-alias=0/0 sampled-alias=0/0
+[REMu][PERF-TEXTURE-OWNED] live=0 stale=0 owned=0.0MiB/0 runs debt=0.0MiB survived=0 demoted=0 reclaim_discard=0 rematerialise=0/0/0/0 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=13/0.8MiB targets=0/0.0MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=0/0.0MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=0.8MiB other=52.2MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:0/0.0MiB,cpu:0/0.0MiB mapping=active:0/0.0MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:0/+0versions,spans:0/+0duplicates,unresolved:0/0.0MiB top=[]
+[REMu][PERF-GLOBAL-CACHE] captured=0/0.0MiB identity=0/0.0MiB
+[REMu][PERF] REMu | FPS 0.0 (0.0 ms) | Present 0.0/s | GPU 0% Lat 0.0 ms | RSS 931 MiB Foot 932/1418 MiB MTL 53/18187 MiB | Draw 0/s RP 0/s CS 0/s | CB 0/s PB 0/s (0) | Q W1 P0 F0 | Tex 13/1 MiB | Pipe 0/0 | Audio 0/s U 0.0%
+[REMu][PERF-DISPATCH] window_ms=5017 calls=4305 direct=3675 leaf=0 sync=348 audio=0 pad=0 stateless=282 fd=0 equeue=0 loader=0 ampr=0 video=0 stateful=0 | lock-wait count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | lock-hold count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] | gpu-publication count=0 total_ns=0 mean_ns=0 max_ns=0 buckets=[0, 0, 0, 0, 0, 0, 0, 0] bucket_upper_ns=[1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+[REMu][PERF-GPU-PUBLICATION] window_ms=5017 calls=0 values=count/total_ns/mean_ns/max_ns
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-DIRECT] window_ms=5017 total=3675 process-time=1003 sce-self=92 posix-self=0 sce-thread-id=587 sce-tls-get=1113 posix-tls-get=0 sce-tls-set=0 posix-tls-set=0 sce-mutex-lock=92 posix-mutex-lock=348 sce-mutex-unlock=92 posix-mutex-unlock=348 posix-rwlock-write=0 posix-rwlock-unlock=0
+[REMu][PERF-CAUSES] RP-end compute=0/s key=0/s color-op=0/s flush=0/s | CB tick=0/s memory=0/s wait=0/s shared-host=0/s flip=0/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=0/s waits=0/s same-queue-elided=0/s host-blocks=0/s host-wakes=0/s acquire-noop-drops=0/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=0/s error-advances=0 fallback-no-exact=0/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5017 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=1 deferred=1 published=1 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=0/5 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-QUEUES] q0:pending:0/submissions:0/blocked:none/front:empty
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=1
+[REMu][PERF-TEXTURE] snapshot=0/0.0MiB/0.0ms/0unstable dirty_validate=0/0.0MiB/0.0ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=13/1MiB guest=1MiB metal=53/18187MiB watches=13 hit=0 miss=0 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=0 capacity_evict=0 depth_native=0 alias_writeback=0/0.0MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=0.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/0 layered-depth-alias=0/0 sampled-alias=0/0
+[REMu][PERF-TEXTURE-OWNED] live=0 stale=0 owned=0.0MiB/0 runs debt=0.0MiB survived=0 demoted=0 reclaim_discard=0 rematerialise=0/0/0/0 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=13/0.8MiB targets=0/0.0MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=0/0.0MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=0.8MiB other=52.2MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:0/0.0MiB,cpu:0/0.0MiB mapping=active:0/0.0MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:0/+0versions,spans:0/+0duplicates,unresolved:0/0.0MiB top=[]
+[REMu][PERF-GLOBAL-CACHE] captured=0/0.0MiB identity=0/0.0MiB
+[REMu] external launch watchdog reached 35s
+[REMu] watchdog stopping pid=88920 after external timeout

@@ -1,0 +1,368 @@
+[REMu] acquiring exclusive build lock: /Users/xnetcat/Documents/REmu-phase1g/target/.remu-build.lock
+[REMu] held exclusive build lock
+[REMu] building the Rosetta release runner
+warning: unused imports: `CachedGlobalBuffer` and `GlobalBufferCacheKey`
+ --> crates/remu-gpu-metal/src/presenter/cache.rs:5:5
+  |
+5 |     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
+  |     ^^^^^^^^^^^^^^^^^^
+6 |     GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `TextureWritebackOutcome`, `encode_mode27_mip_chain_into_raw`, `mode27_mip_chain_layout`, `snapshot_watched_guest_range`, `texture_element_layout`, `write_guest_texture_linear_into_raw_at_z`, `write_watched_guest_range`, and `write_watched_guest_texture_linear`
+  --> crates/remu-gpu-metal/src/presenter/readback.rs:10:28
+   |
+10 |     TextureReadbackLayout, TextureWritebackOutcome, capture_interval, diagnostic_dump_glyph_draw,
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^
+...
+13 |     encode_mode27_mip_chain_into_raw, evaluation_samples_glyph_atlas, half_float_to_f32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+14 |     half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
+15 |     mode27_mip_chain_layout, retire_multisample_textures_overlapping_writeback,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+16 |     retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+17 |     texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+18 |     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
+19 |     write_watched_guest_texture_linear,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `decode_guest_texture_linear_from_raw` and `snapshot_watched_guest_texture_raw`
+  --> crates/remu-gpu-metal/src/presenter/texture/residency.rs:23:5
+   |
+23 |     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+32 |     snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `TEXTURE_DIRTY_VALIDATION_BYTES`, `TEXTURE_DIRTY_VALIDATION_COUNT`, `TEXTURE_DIRTY_VALIDATION_NANOSECONDS`, and `TEXTURE_DIRTY_VALIDATION_UNCHANGED`
+  --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:9:18
+   |
+ 9 |     StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+   |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10 |     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `create_exact_mode27_sampled_mip_view` and `create_exact_mode5_sampled_mip_view`
+  --> crates/remu-gpu-metal/src/presenter/texture.rs:69:5
+   |
+69 |     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `encode_gpu_publish_to_guest_view`
+  --> crates/remu-gpu-metal/src/presenter/tiler/mod.rs:22:48
+   |
+22 |     GpuTilerView, encode_gpu_publish_to_guest, encode_gpu_publish_to_guest_view,
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `lease_validated_reconciliation_ready`
+  --> crates/remu-gpu-metal/src/presenter/tiler/mod.rs:26:51
+   |
+26 |     EndStateWriteClass, classify_end_state_write, lease_validated_reconciliation_ready,
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `MODE27_TILER_MSL`, `MODE5_TILER_MSL`, `TilerKernelKind`, `cached_tiler_library`, `compile_tiler_library`, `mode5_tiler_pipelines`, `tiler_kernel_name`, and `tiler_kernel_source`
+  --> crates/remu-gpu-metal/src/presenter/tiler/mod.rs:35:5
+   |
+35 |     MODE5_TILER_MSL, MODE27_TILER_MSL, TilerKernelKind, cached_tiler_library,
+   |     ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+36 |     compile_tiler_library, mode27_tiler_pipelines, mode5_tiler_pipelines, tiler_kernel_name,
+   |     ^^^^^^^^^^^^^^^^^^^^^                          ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^
+37 |     tiler_kernel_source,
+   |     ^^^^^^^^^^^^^^^^^^^
+
+warning: variant `SampledCacheCreate` is never constructed
+   --> crates/remu-gpu-metal/src/presenter.rs:548:5
+    |
+546 | enum Mode27WorkOrigin {
+    |      ---------------- variant in this enum
+547 |     RenderTargetCreate,
+548 |     SampledCacheCreate,
+    |     ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `Mode27WorkOrigin` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `gpu_authored_offsets` is never used
+    --> crates/remu-gpu-metal/src/presenter.rs:1496:8
+     |
+1389 | impl ResidentGuestTexture {
+     | ------------------------- method in this implementation
+...
+1496 |     fn gpu_authored_offsets(&self) -> Option<Vec<(u64, u64)>> {
+     |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `bytes`, `buffer`, and `offset` are never read
+    --> crates/remu-gpu-metal/src/presenter.rs:1634:5
+     |
+1633 | struct CachedGlobalBuffer {
+     |        ------------------ fields in this struct
+1634 |     bytes: Vec<u8>,
+     |     ^^^^^
+1635 |     buffer: Buffer,
+     |     ^^^^^^
+1636 |     offset: u64,
+     |     ^^^^^^
+
+warning: constant `GLOBAL_BUFFER_CACHE_CAPACITY` is never used
+    --> crates/remu-gpu-metal/src/presenter/cache.rs:1876:18
+     |
+1876 | pub(super) const GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GLOBAL_BUFFER_CACHE_BYTE_CAPACITY` is never used
+    --> crates/remu-gpu-metal/src/presenter/cache.rs:1878:18
+     |
+1878 | pub(super) const GLOBAL_BUFFER_CACHE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `journal_guest_write_segments` is never used
+    --> crates/remu-gpu-metal/src/presenter/diagnostics.rs:1607:15
+     |
+1607 | pub(super) fn journal_guest_write_segments(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `encode_mip` is never used
+   --> crates/remu-gpu-metal/src/presenter/readback.rs:532:19
+    |
+510 | impl PendingTextureReadback {
+    | --------------------------- associated function in this implementation
+...
+532 |     pub(super) fn encode_mip(
+    |                   ^^^^^^^^^^
+
+warning: function `read_texture_mip_linear` is never used
+    --> crates/remu-gpu-metal/src/presenter/readback.rs:1101:15
+     |
+1101 | pub(super) fn read_texture_mip_linear(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `active_transient_global_buffer_cache` and `active_transient_global_buffer_cache_mut` are never used
+   --> crates/remu-gpu-metal/src/presenter/submission/batch.rs:832:19
+    |
+309 | impl MetalPresenter {
+    | ------------------- methods in this implementation
+...
+832 |     pub(crate) fn active_transient_global_buffer_cache(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+851 |     pub(crate) fn active_transient_global_buffer_cache_mut(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_guest_texture_linear_into_raw` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture.rs:186:15
+    |
+186 | pub(super) fn write_guest_texture_linear_into_raw(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_guest_texture_linear_into_raw_at_z` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture.rs:194:15
+    |
+194 | pub(super) fn write_guest_texture_linear_into_raw_at_z(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_watched_guest_texture_linear` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture.rs:235:15
+    |
+235 | pub(super) fn write_watched_guest_texture_linear(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `comparison_pixel_format` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:460:4
+    |
+460 | fn comparison_pixel_format(format: metal::MTLPixelFormat) -> metal::MTLPixelFormat {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_exact_sampled_mip_texture` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:467:4
+    |
+467 | fn create_exact_sampled_mip_texture(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_exact_mode5_sampled_mip_view` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:626:15
+    |
+626 | pub(crate) fn create_exact_mode5_sampled_mip_view(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_exact_mode27_sampled_mip_view` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:703:15
+    |
+703 | pub(crate) fn create_exact_mode27_sampled_mip_view(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_guest_texture` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/residency.rs:2751:15
+     |
+2751 | pub(crate) fn create_guest_texture(
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `trace_glyph_atlas_linear` is never used
+  --> crates/remu-gpu-metal/src/presenter/texture/upload.rs:35:4
+   |
+35 | fn trace_glyph_atlas_linear(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `TextureWritebackOutcome` is never used
+  --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:37:17
+   |
+37 | pub(crate) enum TextureWritebackOutcome {
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `generations` is never used
+  --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:79:19
+   |
+70 | impl AcquireNoOpWatchToken {
+   | -------------------------- method in this implementation
+...
+79 |     pub(crate) fn generations(&self) -> &[u64] {
+   |                   ^^^^^^^^^^^
+
+warning: methods `with_live_backing`, `alias_address_for_canonical_range`, `copy_from_live_aliases`, `cpu_watches`, and `record_live_content_baseline` are never used
+   --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:536:19
+    |
+338 | impl GuestTextureWriteWatch {
+    | --------------------------- methods in this implementation
+...
+536 |     pub(crate) fn with_live_backing<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+584 |     fn alias_address_for_canonical_range(&self, address: u64, byte_count: u64) -> Option<u64> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+599 |     unsafe fn copy_from_live_aliases(
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+...
+649 |     pub(crate) fn cpu_watches(&self) -> Vec<&remu_memory::CpuWriteWatch> {
+    |                   ^^^^^^^^^^^
+...
+726 |     pub(crate) fn record_live_content_baseline(&self) -> Result<(), String> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `snapshot_watched_guest_texture_raw` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1129:15
+     |
+1129 | pub(crate) fn snapshot_watched_guest_texture_raw(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_watched_guest_range` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1149:15
+     |
+1149 | pub(crate) fn write_watched_guest_range(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `BaselineSource` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1210:6
+     |
+1210 | enum BaselineSource<'a> {
+     |      ^^^^^^^^^^^^^^
+
+warning: function `publish_segments_leased` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1221:4
+     |
+1221 | fn publish_segments_leased(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `trace_discarded_stale_texture_writeback` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1332:4
+     |
+1332 | fn trace_discarded_stale_texture_writeback(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `authored_segments` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1349:15
+     |
+1349 | pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(u64, &'a [u8])> {
+     |               ^^^^^^^^^^^^^^^^^
+
+warning: function `lease_validated_reconciliation_ready` is never used
+  --> crates/remu-gpu-metal/src/presenter/tiler/end_state.rs:42:15
+   |
+42 | pub(crate) fn lease_validated_reconciliation_ready(lease: Option<&GuestRangeLease>) -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_linear_to_tiled_at_z` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling.rs:110:15
+    |
+110 | pub(super) fn copy_linear_to_tiled_at_z(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_linear_to_mode27_mip_level` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode27.rs:281:15
+    |
+281 | pub(crate) fn copy_linear_to_mode27_mip_level(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_mode27_mip_chain_into_raw` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode27.rs:394:15
+    |
+394 | pub(crate) fn encode_mode27_mip_chain_into_raw(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_mode5_mip_level_to_linear` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode5.rs:160:4
+    |
+160 | fn copy_mode5_mip_level_to_linear(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `decode_mode5_mip_chain_from_raw` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode5.rs:308:15
+    |
+308 | pub(crate) fn decode_mode5_mip_chain_from_raw(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `remu-gpu-metal` (lib) generated 41 warnings (run `cargo fix --lib -p remu-gpu-metal` to apply 8 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.05s
+[REMu] host vm.loadavg: { 5.83 4.13 3.68 }
+[REMu] launching void tRrLM Void Terrarium; artifacts: /Users/xnetcat/Documents/REmu-phase1g/docs/notes/phase1g-20260806-handoff/runs/void-terrarium-artifacts/20260806T021316Z-void tRrLM Void Terrarium
+[REMu] render resolution: 1920x1080 (presentation-only)
+[REMu] warning: no guest-native resolution hook was found; only presentation is 1920x1080
+[REMu] launching the interactive REmu.app bundle
+[REMu] automatic shutdown after 30s (pass 0 to disable)
+[REMu] external launch watchdog after 35s
+[REMu][MUTEX][ABI] op=lock arg=0x800837bb0 slot=Some(140299182720416) object=0x7f99f2f2c5a0 result=0x0
+[REMu][IMPORT] first_hit=61 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x8007e6668 args=0x30a660448,0x80083ac10,0x800834000,0x9e3779b97f4a7c15,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=62 nid=x1X76arYMxU name=scePthreadAttrGet return=0x8007e6681 args=0x7f99e303f000,0x30a660448,0x10373b3a8,0x1,0x1797d1d9,0x1
+[REMu][IMPORT] first_hit=63 nid=8+s5BzZjxSg name=scePthreadAttrGetaffinity return=0x8007e6692 args=0x30a660448,0x30a660440,0x0,0x1,0x1798e05b,0x1
+[REMu][IMPORT] first_hit=64 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x8007e669b args=0x30a660448,0x2,0x0,0x1,0x1799afe0,0x1
+[REMu][PERF-STARTUP] milestone=module-initializers-complete elapsed_us=353581
+[REMu][PERF-STARTUP] milestone=guest-entry-begin elapsed_us=353618
+[REMu][IMPORT] first_hit=68 nid=hv1luiJrqQM name=scePadInit return=0x800000064 args=0x30a6603d0,0x0,0x800524010,0x9e3779b97f4a7c15,0x7000be60d0,0x7000000300
+[REMu][IMPORT] first_hit=69 nid=Tz4RNUCBbGI name=_sceKernelRtldThreadAtexitIncrement return=0x80075bec3 args=0x800524010,0x800892569,0x800524010,0x800372585,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=70 nid=f7KBOafysXo name=sceKernelGetModuleInfoFromAddr return=0x80075c063 args=0x800524010,0x2,0x30a65fd18,0x0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=71 nid=0NTHN1NKONI name=sceKernelConvertLocaltimeToUtc return=0x800794e57 args=0x601c384b,0x0,0x30a660218,0x30a660230,0x30a66020c,0xaaaaaaaaaaaaaaef
+[REMu][IMPORT] first_hit=72 nid=-o5uEDpN+oY name=sceKernelConvertUtcToLocaltime return=0x800794e72 args=0x601c2a3b,0x30a660210,0x30a660220,0x0,0xffffffe200000dd4,0x401
+[REMu][IMPORT] first_hit=75 nid=BpFoboUJoZU name=sceKernelCreateEventFlag return=0x80036fcc0 args=0x70067fdfc8,0x80041a6c6,0x21,0x0,0x0,0x8080808080808061
+[REMu][IMPORT] first_hit=76 nid=7uhBFWRAS60 name=sceKernelClearEventFlag return=0x80036fd08 args=0x1,0x0,0x7000000400,0x1b,0xb00007f99f2f4c72,0x7f99f2f00000
+[REMu][IMPORT] first_hit=77 nid=nsYoNRywwNg name=scePthreadAttrInit return=0x80036cb81 args=0x30a65fbd0,0x0,0x400,0x70067fdfc0,0xffffffff00000000,0x0
+[REMu][IMPORT] first_hit=78 nid=eXbUSpEaTsA name=scePthreadAttrSetinheritsched return=0x80036cb92 args=0x30a65fbd0,0x0,0x0,0x1,0x1908441d,0x1
+[REMu][IMPORT] first_hit=79 nid=4+h9EzwKF4I name=scePthreadAttrSetschedpolicy return=0x80036cb9f args=0x30a65fbd0,0x1,0x0,0x1,0x19096f6e,0x1
+[REMu][IMPORT] first_hit=80 nid=DzES9hQF4f4 name=scePthreadAttrSetschedparam return=0x80036cbab args=0x30a65fbd0,0x30a65fbc8,0x0,0x1,0x190a43ff,0x1
+[REMu][IMPORT] first_hit=81 nid=UTXzJbWhhTE name=scePthreadAttrSetstacksize return=0x80036cbb6 args=0x30a65fbd0,0x400,0x0,0x1,0x190b0cd8,0x1
+[REMu][FAIL] nid=UTXzJbWhhTE name=scePthreadAttrSetstacksize thread="main" result=0xffffffff80020016 args=0x30a65fbd0,0x400,0x0,0x1
+[REMu][IMPORT] first_hit=82 nid=6UgtwV+0zb4 name=scePthreadCreate return=0x80036cbce args=0x70067fe000,0x30a65fbd0,0x80036cc00,0x70067fe010,0x80041447d,0x7f99f2f00000
+[REMu][THREAD] raised host stack name="AsyncMemoryThread" guest=0x100000 host=0x200000
+[REMu][IMPORT] first_hit=83 nid=62KCwEMmzcM name=scePthreadAttrDestroy return=0x80036cbd6 args=0x30a65fbd0,0x2,0x11e9f,0x1,0x190e499e,0x1
+[REMu][IMPORT] first_hit=84 nid=JTvBflhYazQ name=sceKernelWaitEventFlag return=0x800370046 args=0x1,0x1,0x1,0x30b712c48,0x0,0x30b712c88
+[REMu][THREAD] raised host stack name="VirtualVBlankIntr" guest=0x4000 host=0x200000
+[REMu][IMPORT] first_hit=92 nid=D0OdFMjp46I name=sceKernelCreateEqueue return=0x80036dec0 args=0x80062db90,0x80041954f,0x0,0x30b915d20[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x8003716b9 space=host reason=null-address; forwarding
+[REMu][WATCH] fault registers rax=0x8003716b9 rbx=0x70077ff020 rcx=0x80043beec rdx=0x0 rdi=0x7000000020 rsi=0x70077ff020 rbp=0x30a65fcc0 rsp=0x30a65f490 r8=0x19115c3d r9=0x1 r10=0x1 r11=0x0 r12=0x800626ab0 r13=0x80062a2f0 r14=0x30a65ffc0 r15=0x7f99f2f65380
+[REMu][WATCH] fault stack rsp=0x30a65f490 words=0x0,0x4465079cb8d67cac,0x4000,0x40c9018e40c8f342,0x11,0x7f99f2f506a0,0x11,0x7f99f2f42bf0,0x11,0x80036cc00,0x1c2cfa84d83cc989,0xeef4fe790134b79d,0xc6cb37d3f68a4ee7,0x14bd070c1daeb2c6,0x7,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x1,0x200000,0x11,0x7f99f2f3a040,0x11,0x0,0x200000,0x30000,0x7f99f8038000,0x30000,0x7f99f8058000,0x11,0x0
+,0x2,0x30b915c88
+/Users/xnetcat/Documents/REmu-phase1g/scripts/run-with-watchdog.sh: line 165: 88825 Segmentation fault: 11  "$@"
+revision=07e3b98
+game=/Volumes/Untitled/sharpemu/games/void tRrLM Void Terrarium/eboot.bin
+timeout_seconds=30
+elapsed_seconds=2
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=presentation-only
+[REMu] complete; full artifacts: /Users/xnetcat/Documents/REmu-phase1g/docs/notes/phase1g-20260806-handoff/runs/void-terrarium-artifacts/20260806T021316Z-void tRrLM Void Terrarium
