@@ -1,4 +1,4 @@
-revision=5b920ab
+revision=7a541bd
 game=/Volumes/Untitled/sharpemu/games/Demon Souls/PPSA01342-app0/eboot.bin
 timeout_seconds=30
 elapsed_seconds=34
@@ -9,11 +9,11 @@ unimplemented_nids=5
 render_size=1920x1080
 render_policy=presentation-only
 [REMu][REPORT] --- ABI gap summary ---
-[REMu][REPORT] fabricated success keys=23 total_calls=3499
-[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=3109
-[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=313
+[REMu][REPORT] fabricated success keys=23 total_calls=1979
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=1630
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=274
 [REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=28
-[REMu][REPORT] fabricated success key=eQH7nWPcAgc name=sceNpGetState calls=24
+[REMu][REPORT] fabricated success key=eQH7nWPcAgc name=sceNpGetState calls=22
 [REMu][REPORT] fabricated success key=gky0+oaNM4k name=sceNetCtlInit calls=3
 [REMu][REPORT] fabricated success key=3JCe3lCbQ8A name=sceHttp2Init calls=2
 [REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
@@ -33,13 +33,13 @@ render_policy=presentation-only
 [REMu][REPORT] fabricated success key=qQJfO8HAiaY name=sceNpRegisterStateCallbackA calls=1
 [REMu][REPORT] fabricated success key=qpo-mEOwje0 name=sceSystemGestureOpen calls=1
 [REMu][REPORT] fabricated success key=ysmw6J-P8Ak name=sceNpSessionSignalingInitialize calls=1
-[REMu][REPORT] unimplemented import nid=8fe55ktlNVo name=sceAcmBatchStartBuffers calls=3084
+[REMu][REPORT] unimplemented import nid=8fe55ktlNVo name=sceAcmBatchStartBuffers calls=1603
 [REMu][REPORT] unimplemented import nid=GgFMb22sbbI name=sceSystemGestureUpdatePrimitiveTouchRecognizer calls=1
 [REMu][REPORT] unimplemented import nid=h8uongcBNVs name=sceSystemGestureGetTouchEventsCount calls=1
 [REMu][REPORT] unimplemented import nid=j4h82CQWENo name=sceSystemGestureUpdateTouchRecognizer calls=1
-[REMu][REPORT] unimplemented import nid=u70oWo92SYQ name=sceAcm_ConvReverb_SharedInput calls=1024
-[REMu][REPORT] failing import name=sceAcmBatchStartBuffers nid=8fe55ktlNVo failures=3084 calls=3084 results=0xffffffff8002004e:3084
-[REMu][REPORT] failing import name=sceAcm_ConvReverb_SharedInput nid=u70oWo92SYQ failures=1024 calls=1024 results=0xffffffff8002004e:1024
+[REMu][REPORT] unimplemented import nid=u70oWo92SYQ name=sceAcm_ConvReverb_SharedInput calls=532
+[REMu][REPORT] failing import name=sceAcmBatchStartBuffers nid=8fe55ktlNVo failures=1603 calls=1603 results=0xffffffff8002004e:1603
+[REMu][REPORT] failing import name=sceAcm_ConvReverb_SharedInput nid=u70oWo92SYQ failures=532 calls=532 results=0xffffffff8002004e:532
 [REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=3 calls=16 results=0xffffffff80020002:3
 [REMu][REPORT] failing import name=sceUserServiceGetPlatformPrivacyWs1 nid=D-CzAxQL0XI failures=1 calls=1 results=0xffffffff80960009:1
 [REMu][REPORT] failing import name=sceSystemGestureUpdatePrimitiveTouchRecognizer nid=GgFMb22sbbI failures=1 calls=1 results=0xffffffff8002004e:1
