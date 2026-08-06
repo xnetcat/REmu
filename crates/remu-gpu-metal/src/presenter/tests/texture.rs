@@ -1021,7 +1021,6 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
 }
 
 #[test]
-#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,

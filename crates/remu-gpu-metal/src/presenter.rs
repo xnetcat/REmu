@@ -1511,15 +1511,21 @@ impl ResidentGuestTexture {
         &mut self,
         refresh: WriteWatchRefresh,
     ) -> Result<bool, String> {
-        // Phase 1G: no self-readback generations. Coarse dirty / pending validation means the
-        // guest wrote; otherwise Metal remains authoritative.
-        let possibly_changed = matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
-            || self.write_watch.content_validation_pending()
-            || self.write_watch.is_dirty();
-        if !possibly_changed {
-            return Ok(false);
+        // Phase 1G: no self-readback generations / fingerprints. Mapping renewal can report
+        // dirty without a guest store into the resource — remaps must not steal Metal authority.
+        // Only an Active watch with coarse dirty / pending validation proves a guest write.
+        match refresh {
+            WriteWatchRefresh::Replaced => Ok(true),
+            WriteWatchRefresh::Reprotecting | WriteWatchRefresh::Renewed { .. } => Ok(false),
+            WriteWatchRefresh::Active => {
+                if self.write_watch.content_validation_pending() || self.write_watch.is_dirty()
+                {
+                    self.write_watch.content_has_changed()
+                } else {
+                    Ok(false)
+                }
+            }
         }
-        self.write_watch.content_has_changed()
     }
 
     fn note_read(&mut self, stamp: ResidentTextureActivityStamp) {
