@@ -758,8 +758,6 @@ impl GuestTextureWriteWatch {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-
 pub(crate) fn refresh_resident_texture_write_watch(
     resident: &mut ResidentGuestTexture,
 ) -> Result<WriteWatchRefresh, String> {
