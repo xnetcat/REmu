@@ -37,6 +37,7 @@ mod path_roots;
 // other host the NIDs fall through to the unimplemented path rather than to a stub that lies.
 #[cfg(target_arch = "x86_64")]
 mod fiber;
+mod guest_signal;
 mod guest_sync;
 mod hid;
 mod kernel_api;
@@ -826,8 +827,12 @@ impl GuestMspace {
     }
 }
 
-/// Native PS5 process affinity from SDK 10 `_kernel.h`: thirteen logical CPUs.
-const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x1fff;
+/// Prospero SYSTEM/NATIVE mask from SDK 10 `_kernel.h` (`SCE_KERNEL_CPUMASK_13CPU`).
+pub(crate) const SYSTEM_THREAD_AFFINITY_MASK: u64 = 0x1fff;
+/// Game-process default affinity (`SCE_KERNEL_CPUMASK_7CPU_ALL`). Distinct from
+/// [`SYSTEM_THREAD_AFFINITY_MASK`]: titles that size worker pools from the attr default must not
+/// see the thirteen-CPU SYSTEM set (Demon's Souls otherwise spawns 13 spinning JobWorkers).
+pub(crate) const DEFAULT_THREAD_AFFINITY_MASK: u64 = 0x7f;
 const DEFAULT_THREAD_STACK_SIZE: u64 = 0x10_0000;
 const DEFAULT_THREAD_GUARD_SIZE: u64 = 0x1000;
 const DEFAULT_THREAD_PRIORITY: i32 = 700;
@@ -1458,38 +1463,21 @@ static NEXT_NET_POOL_HANDLE: AtomicUsize = AtomicUsize::new(1);
 static NEXT_SSL_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_HTTP_CONTEXT: AtomicUsize = AtomicUsize::new(1);
 static NEXT_NP_WEB_API2_CONTEXT: AtomicUsize = AtomicUsize::new(1);
-static GUEST_EXCEPTION_DELIVERY: OnceLock<Mutex<GuestExceptionDeliveryState>> = OnceLock::new();
-
-static GUEST_EXCEPTION_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static KERNEL_MEMORY_READABLE_RANGES: OnceLock<RwLock<Arc<[(u64, u64)]>>> = OnceLock::new();
 #[cfg(target_os = "macos")]
 static KERNEL_MEMORY_READABLE_RANGES_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PendingGuestException {
-    handler: u64,
-    exception: i32,
-}
-
-#[derive(Debug, Default)]
-struct GuestExceptionDeliveryState {
-    pending: BTreeMap<u64, PendingGuestException>,
-    active: BTreeSet<u64>,
-}
-
-fn guest_exception_delivery() -> &'static Mutex<GuestExceptionDeliveryState> {
-    GUEST_EXCEPTION_DELIVERY.get_or_init(|| Mutex::new(GuestExceptionDeliveryState::default()))
-}
-
-fn guest_exception_is_pending(thread: u64) -> bool {
-    thread != 0
-        && guest_exception_delivery()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending
-            .contains_key(&thread)
-}
+#[allow(unused_imports)] // some re-exports are only reached from the x86_64 probe entry path
+pub(crate) use guest_signal::{
+    GuestExceptionDeliveryState, apply_host_priority, clear_installed_guest_handler,
+    clear_installed_guest_handlers, deliver_pending_guest_exception_at_import,
+    guest_exception_delivery, guest_exception_is_pending, guest_exception_pending_flag,
+    guest_sigprocmask, install_guest_signal_delivery, publish_installed_guest_handler,
+    queue_and_interrupt_guest_exception, register_current_host_pthread, unregister_host_pthread,
+};
+#[cfg(test)]
+pub(crate) use guest_signal::PendingGuestException;
 
 #[derive(Debug)]
 struct ImportTelemetry {
@@ -2196,6 +2184,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     }));
     state.unwind_modules.clone_from(&image.unwind_modules);
     state.installed_exception_handlers.clear();
+    clear_installed_guest_handlers();
     ajm_engine::reset_for_new_process();
     state.next_acm_context = 1;
     state.acm_contexts.clear();
@@ -2203,7 +2192,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
         GuestExceptionDeliveryState::default();
-    GUEST_EXCEPTION_PENDING.store(false, Ordering::Release);
+    guest_exception_pending_flag().store(false, Ordering::Release);
     state.heap_trace_storage.clear();
     state.heap_trace_storage.resize(65, 0);
     state.guest_mspaces.clear();
@@ -2501,15 +2490,15 @@ fn parse_guest_code_number(value: &str) -> Option<u64> {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default)]
-struct ImportCallFrame {
-    integer_arguments: [u64; 6],
-    rax: u64,
-    guest_rsp: u64,
-    guest_return_address: u64,
-    dispatch_index: u64,
-    xmm_arguments: [u128; 8],
-    guest_rbx: u64,
-    _reserved: u64,
+pub(crate) struct ImportCallFrame {
+    pub(crate) integer_arguments: [u64; 6],
+    pub(crate) rax: u64,
+    pub(crate) guest_rsp: u64,
+    pub(crate) guest_return_address: u64,
+    pub(crate) dispatch_index: u64,
+    pub(crate) xmm_arguments: [u128; 8],
+    pub(crate) guest_rbx: u64,
+    pub(crate) _reserved: u64,
 }
 
 #[derive(Debug)]
@@ -2830,74 +2819,6 @@ const _: () = {
     assert!(std::mem::offset_of!(ImportCallFrame, xmm_arguments) == 0x50);
     assert!(std::mem::offset_of!(ImportCallFrame, guest_rbx) == 0xd0);
 };
-
-#[repr(C, align(16))]
-struct GuestExceptionContext([u8; 0x500]);
-
-fn write_exception_context_word(context: &mut GuestExceptionContext, offset: usize, value: u64) {
-    context.0[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
-fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame) {
-    let thread = current_guest_thread_handle();
-    if thread == 0 || (!cfg!(test) && !GUEST_EXCEPTION_PENDING.load(Ordering::Acquire)) {
-        return;
-    }
-    let pending = {
-        let mut delivery = guest_exception_delivery()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if delivery.active.contains(&thread) {
-            return;
-        }
-        let Some(pending) = delivery.pending.remove(&thread) else {
-            return;
-        };
-        GUEST_EXCEPTION_PENDING.store(!delivery.pending.is_empty(), Ordering::Release);
-        delivery.active.insert(thread);
-        pending
-    };
-
-    let mut context = GuestExceptionContext([0; 0x500]);
-    const MCONTEXT: usize = 0x40;
-    for (offset, value) in [
-        (0x08, frame.integer_arguments[0]),
-        (0x10, frame.integer_arguments[1]),
-        (0x18, frame.integer_arguments[2]),
-        (0x20, frame.integer_arguments[3]),
-        (0x28, frame.integer_arguments[4]),
-        (0x30, frame.integer_arguments[5]),
-        (0x38, frame.rax),
-    ] {
-        write_exception_context_word(&mut context, MCONTEXT + offset, value);
-    }
-    write_exception_context_word(&mut context, MCONTEXT + 0xa0, frame.guest_return_address);
-    write_exception_context_word(&mut context, MCONTEXT + 0xb8, frame.guest_rsp);
-    write_exception_context_word(&mut context, MCONTEXT + 0xc8, 0x480);
-    write_exception_context_word(
-        &mut context,
-        MCONTEXT + 0x440,
-        current_guest_thread_pointer(),
-    );
-
-    eprintln!(
-        "[REMu][KERNEL] delivering cooperative exception target={thread:#x} type={} handler={:#x} rip={:#x} rsp={:#x}",
-        pending.exception, pending.handler, frame.guest_return_address, frame.guest_rsp,
-    );
-    type GuestExceptionHandler = unsafe extern "C" fn(i32, *mut u8);
-    // SAFETY: The process installed this mapped executable guest handler for the requested signal.
-    // Delivery runs at an import boundary on the target's own native thread, so its guest TLS and
-    // stack identity remain intact while the handler observes the synthesized Orbis ucontext.
-    let handler: GuestExceptionHandler = unsafe { std::mem::transmute(pending.handler) };
-    // SAFETY: `context` is live and writable for the complete synchronous handler invocation.
-    unsafe { handler(pending.exception, context.0.as_mut_ptr()) };
-
-    guest_exception_delivery()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .active
-        .remove(&thread);
-}
 
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
@@ -3672,9 +3593,12 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             set_current_guest_thread_unique_id(unique_id);
             set_current_guest_thread_name(trace_name.clone());
             set_current_guest_thread_pointer(guest_tls.thread_pointer);
+            register_current_host_pthread(handle);
+            apply_host_priority(attributes.schedule_priority);
             let result = run_guest_thread(entry, thread_argument);
             run_guest_thread_destructors();
             retire_current_guest_import_trace();
+            unregister_host_pthread(handle);
             set_current_guest_thread_pointer(0);
             set_current_guest_thread_handle(0);
             set_current_guest_thread_unique_id(0);
@@ -4496,6 +4420,7 @@ fn kernel_install_exception_handler(arguments: [u64; 6], state: &mut ProbeDispat
     {
         return sce_kernel_error(SCE_KERNEL_ERROR_ALREADY_EXISTS);
     }
+    publish_installed_guest_handler(exception, arguments[1]);
     eprintln!(
         "[REMu][KERNEL] exception handler installed type={exception} address={:#x}",
         arguments[1]
@@ -4509,6 +4434,7 @@ fn kernel_remove_exception_handler(exception: u64, state: &mut ProbeDispatchStat
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     state.installed_exception_handlers.remove(&exception);
+    clear_installed_guest_handler(exception);
     0
 }
 
@@ -4517,41 +4443,19 @@ fn kernel_raise_exception(arguments: [u64; 6], state: &ProbeDispatchState) -> u6
     if arguments[0] == 0 || !(0..128).contains(&exception) {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    if let Some(handler) = state.installed_exception_handlers.get(&exception) {
-        let Some(target_thread) = state.pthread_threads.get(&arguments[0]) else {
-            eprintln!(
-                "[REMu][KERNEL] exception target is not a live pthread: {:#x}",
-                arguments[0]
-            );
-            return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
-        };
-        let source = current_guest_thread_handle();
-        guest_exception_delivery()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending
-            .entry(arguments[0])
-            .or_insert(PendingGuestException {
-                handler: *handler,
-                exception,
-            });
-        // Publish the pending bit and wake waiters under the sync mutex so the predicate and the
-        // notify share one critical section (plan C3 — closes the lost-wakeup window).
-        let sync = guest_sync();
-        let _sync_guard = sync
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        GUEST_EXCEPTION_PENDING.store(true, Ordering::Release);
-        drop(_sync_guard);
-        crate::guest_sync::wake_all_guest_sync_for_exception();
-        notify_kernel_equeue_waiters();
+    let Some(&handler) = state.installed_exception_handlers.get(&exception) else {
+        // Kernel accepts a raise with no process handler; nothing to deliver.
+        return 0;
+    };
+    let Some(target_thread) = state.pthread_threads.get(&arguments[0]) else {
         eprintln!(
-            "[REMu][KERNEL] queued cooperative exception source={source:#x} target={:#x} target_name={:?} type={exception} handler={handler:#x}",
-            arguments[0], target_thread.name
+            "[REMu][KERNEL] exception target is not a live pthread: {:#x}",
+            arguments[0]
         );
-    }
-    0
+        return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
+    };
+    let name = target_thread.name.clone();
+    queue_and_interrupt_guest_exception(arguments[0], exception, handler, Some(name.as_str()))
 }
 
 #[cfg(target_os = "macos")]
@@ -4842,6 +4746,13 @@ fn dispatch_stateless_import(
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
         // The POSIX spelling shares the sleep and reports errno rather than an SCE code.
         "QcteRwbsnV0" => posix_pthread_result(guest_usleep(arguments[0])),
+        "QvsZxomvUHs" => guest_nanosleep(arguments[0], arguments[1], false),
+        "NhpspxdjEKU" | "yS8U2TGCe1A" => guest_nanosleep(arguments[0], arguments[1], true),
+        "-ZR+hG7aDHw" => guest_kernel_sleep(arguments[0]),
+        "6XG4B33N09g" => {
+            std::thread::yield_now();
+            0
+        },
         "lLMT9vJAck0" | "QBi7HCK03hw" => guest_clock_gettime(arguments[0], arguments[1]),
         "n88vx3C5nW8" => guest_posix_gettimeofday(arguments[0]),
         "ejekcaNQNq0" => guest_kernel_gettimeofday(arguments[0]),
@@ -4911,7 +4822,7 @@ fn dispatch_probe_import(
         "WkwEd3N7w0Y" => kernel_install_exception_handler(arguments, state),
         "Qhv5ARAoOEc" => kernel_remove_exception_handler(arguments[0], state),
         "il03nluKfMk" => kernel_raise_exception(arguments, state),
-        "6xVpy0Fdq+I" => inert_ok("6xVpy0Fdq+I"),
+        "6xVpy0Fdq+I" => guest_sigprocmask(arguments),
         "bnZxYgAFeA0" => sanitizer_new_replace_external(),
         "vNe1w4diLCs" => guest_tls_get_addr(arguments[0]),
         "NWtTN10cJzE" => libc_heap_get_trace_info(arguments[0], state),
@@ -5422,6 +5333,9 @@ fn dispatch_probe_import(
         "vSMAm3cxYTY" => kernel_mprotect(arguments, state),
         // sceKernelUsleep
         "1jfXLRVzisc" => guest_usleep(arguments[0]),
+        "QvsZxomvUHs" => guest_nanosleep(arguments[0], arguments[1], false),
+        "NhpspxdjEKU" | "yS8U2TGCe1A" => guest_nanosleep(arguments[0], arguments[1], true),
+        "-ZR+hG7aDHw" => guest_kernel_sleep(arguments[0]),
         // POSIX clock_gettime. Darwin's timespec layout matches the x86-64 guest ABI.
         "lLMT9vJAck0" => guest_clock_gettime(arguments[0], arguments[1]),
         "QBi7HCK03hw" => guest_clock_gettime(arguments[0], arguments[1]),
@@ -5678,7 +5592,7 @@ fn kernel_equeue_wake() -> &'static (Mutex<u64>, Condvar) {
     KERNEL_EQUEUE_WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()))
 }
 
-fn notify_kernel_equeue_waiters() {
+pub(crate) fn notify_kernel_equeue_waiters() {
     let wake = kernel_equeue_wake();
     let mut generation = wake
         .0
@@ -8691,8 +8605,60 @@ fn signed_i32_return(value: i32) -> u64 {
 }
 
 fn guest_usleep(microseconds: u64) -> u64 {
+    // usleep(0) is a yield on the console; Duration::from_micros(0) is a no-op and lets
+    // backoff loops spin flat out (CORE-MECHANISMS §3).
+    if microseconds == 0 {
+        std::thread::yield_now();
+        return 0;
+    }
     let bounded = microseconds.min(u64::from(u32::MAX));
     std::thread::sleep(std::time::Duration::from_micros(bounded));
+    0
+}
+
+/// `sceKernelNanosleep` / `nanosleep` / `_nanosleep` over an Orbis `timespec` {tv_sec, tv_nsec}.
+fn guest_nanosleep(request: u64, remain: u64, posix: bool) -> u64 {
+    if request == 0 {
+        return if posix {
+            kernel_api::set_guest_errno(libc::EINVAL);
+            u64::MAX
+        } else {
+            sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        };
+    }
+    let seconds = read_guest_u64(request) as i64;
+    let nanoseconds = read_guest_u64(request + 8) as i64;
+    if seconds < 0 || !(0..1_000_000_000).contains(&nanoseconds) {
+        return if posix {
+            kernel_api::set_guest_errno(libc::EINVAL);
+            u64::MAX
+        } else {
+            sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        };
+    }
+    if seconds == 0 && nanoseconds == 0 {
+        if remain != 0 {
+            write_guest_u64(remain, 0);
+            write_guest_u64(remain + 8, 0);
+        }
+        return 0;
+    }
+    let duration = std::time::Duration::new(seconds as u64, nanoseconds as u32);
+    std::thread::sleep(duration);
+    if remain != 0 {
+        write_guest_u64(remain, 0);
+        write_guest_u64(remain + 8, 0);
+    }
+    0
+}
+
+fn guest_kernel_sleep(seconds: u64) -> u64 {
+    let bounded = seconds.min(u64::from(u32::MAX));
+    if bounded == 0 {
+        std::thread::yield_now();
+        return 0;
+    }
+    std::thread::sleep(std::time::Duration::from_secs(bounded));
     0
 }
 
@@ -8987,6 +8953,25 @@ fn probe_entry(
         }
         // Must follow fault-handler install: the backstop hooks the same SIGSEGV/SIGBUS path.
         tls_fault::install_fs_fault_backstop();
+        install_guest_signal_delivery();
+        #[cfg(target_arch = "x86_64")]
+        {
+            remu_memory::set_guest_fault_delivery_handler(guest_signal::try_deliver_guest_fault);
+        }
+    }
+    // Main thread identity for interruptive RaiseException and host QoS.
+    if let Some(main_handle) = PROBE_DISPATCH.get().and_then(|state| {
+        state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pthread_threads
+            .iter()
+            .find(|(_, thread)| thread.name == "main")
+            .map(|(handle, _)| *handle)
+    }) {
+        set_current_guest_thread_handle(main_handle);
+        register_current_host_pthread(main_handle);
+        apply_host_priority(DEFAULT_THREAD_PRIORITY);
     }
     if let Err(error) = sha_ni::install_sha_ni_sigill_recovery() {
         eprintln!("[REMu] warning: SHA-NI SIGILL recovery unavailable: {error}");

@@ -251,7 +251,7 @@ fn guest_range_is_readable(address: u64, length: usize) -> bool {
 }
 
 /// Stores a plain errno in the calling thread's cell for a POSIX-shaped failure.
-fn set_guest_errno(errno: i32) {
+pub(crate) fn set_guest_errno(errno: i32) {
     let address = guest_errno_address();
     if address != 0 {
         write_guest_u32(address, errno.cast_unsigned());

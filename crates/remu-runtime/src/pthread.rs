@@ -325,11 +325,17 @@ pub(crate) fn pthread_set_priority(arguments: [u64; 6], state: &mut ProbeDispatc
     if arguments[0] == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    let priority = low_i32(arguments[1]);
     state
         .thread_attributes
         .entry(arguments[0])
         .or_default()
-        .schedule_priority = low_i32(arguments[1]);
+        .schedule_priority = priority;
+    // Enforce on the calling thread when it is adjusting itself; cross-thread priority is
+    // recorded for Getprio but macOS has no portable cross-thread QoS API.
+    if arguments[0] == crate::current_guest_thread_handle() {
+        crate::apply_host_priority(priority);
+    }
     0
 }
 

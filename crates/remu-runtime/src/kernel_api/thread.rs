@@ -119,12 +119,14 @@ pub(super) fn scheduler_priority_bound(policy: i32, bound: i32) -> u64 {
     }
 }
 
-/// The number of logical CPUs the PS5 exposes to a native game process (cores 0-12).
+/// Logical CPU count of the Prospero SYSTEM/NATIVE mask (`SCE_KERNEL_CPUMASK_13CPU` = `0x1fff`).
 ///
-/// SDK 10 `_kernel.h` defines `SCE_KERNEL_CPUMASK_13CPU` and
-/// `SCE_KERNEL_CPUMASK_NATIVE_ALL` as `0x1fff`. The older 6/7-CPU masks alongside them are
-/// explicitly deprecated and must not bound native placement.
+/// Game-process defaults use the 7-CPU mask (`DEFAULT_THREAD_AFFINITY_MASK` = `0x7f`), but a title
+/// may still call `scePthreadSetaffinity(…, SCE_KERNEL_CPUMASK_13CPU)`, so placement must accept
+/// cores 0–12 whenever the thread's mask permits them.
 const PS5_LOGICAL_CPU_COUNT: u32 = 13;
+const _: () = assert!(crate::SYSTEM_THREAD_AFFINITY_MASK == 0x1fff);
+const _: () = assert!(crate::DEFAULT_THREAD_AFFINITY_MASK == 0x7f);
 
 /// Distributes freshly placed threads across the cores their affinity permits.
 ///
@@ -193,6 +195,7 @@ fn core_is_permitted(affinity_mask: u64, core: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SYSTEM_THREAD_AFFINITY_MASK;
 
     const THREAD: u64 = 0x4000_1000;
 
@@ -237,19 +240,19 @@ mod tests {
     #[test]
     fn every_placement_falls_inside_the_default_affinity_set() {
         let mut state = ProbeDispatchState::default();
-        // SDK 10's native default mask (0x1fff) permits every logical CPU from 0 through 12.
-        for index in 0..52 {
+        // Game-process default (0x7f) permits cores 0–6 only.
+        for index in 0..28 {
             let core = placed_core(&mut state, THREAD + index, DEFAULT_THREAD_AFFINITY_MASK);
             assert!(core_is_permitted(DEFAULT_THREAD_AFFINITY_MASK, core));
-            assert!(core < PS5_LOGICAL_CPU_COUNT);
+            assert!(core < 7);
         }
     }
 
     #[test]
-    fn sdk_native_affinity_can_place_a_thread_on_the_thirteenth_cpu() {
+    fn sdk_system_affinity_can_place_a_thread_on_the_thirteenth_cpu() {
         let mut state = ProbeDispatchState::default();
 
-        assert_eq!(placed_core(&mut state, THREAD, 1 << 12), 12);
+        assert_eq!(placed_core(&mut state, THREAD, SYSTEM_THREAD_AFFINITY_MASK & (1 << 12)), 12);
         assert_eq!(state.thread_running_cpu.get(&THREAD), Some(&12));
     }
 }
