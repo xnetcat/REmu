@@ -4,7 +4,7 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Phase 1F (2026-08-06) — execution substrate — CLOSED
+## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `01f5f18`)
 
 Guest exception delivery with Orbis `ucontext_t` (mcontext at `+0x40`); interruptive
 `sceKernelRaiseException` via host SIGUSR1/`pthread_kill`; unrecovered SIGSEGV/SIGBUS offered to
