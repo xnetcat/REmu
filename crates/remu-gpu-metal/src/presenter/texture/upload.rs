@@ -14,6 +14,7 @@ use super::{
     decode_image_descriptor, ensure_mipmapped_resident_texture_in_map,
     ensure_resident_texture_in_map, fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
@@ -615,7 +616,13 @@ pub(crate) fn upload_image_textures(
                                         ))
                             })
                             .max_by_key(|resident| {
-                                (resident.gpu_written(), resident.content_version)
+                                // Prefer a Depth* DB surface over a same-address R32/R16 sample
+                                // shadow even when the shadow has a newer content_version.
+                                (
+                                    resident_depth_sample_is_eligible(resident, descriptor),
+                                    resident.gpu_written(),
+                                    resident.content_version,
+                                )
                             })
                             .map(|resident| {
                                 (resident.descriptor, resident.gpu_written(), resident.content_version)
@@ -625,7 +632,21 @@ pub(crate) fn upload_image_textures(
                     // An earlier R32Float ImageLoad/sample can leave a clean exact resident on the
                     // same address before the DB surface is created as Depth32Float. Prefer the
                     // GPU-authored native depth view over that empty shadow so depth_native hits.
+                    // Also prefer Depth* when a later empty R32 "writer" bumped content_version
+                    // without being allowed to demote the DB (Silent Hill title 801ac2).
                     match (exact, compatible) {
+                        (
+                            Some((exact_descriptor, _, _)),
+                            Some((compatible_descriptor, true, _)),
+                        ) if exact_descriptor != compatible_descriptor
+                            && guest_texture_descriptors_share_depth_sample_storage(
+                                compatible_descriptor,
+                                exact_descriptor,
+                                descriptor.destination_select,
+                            ) =>
+                        {
+                            Some(compatible_descriptor)
+                        }
                         (
                             Some((exact_descriptor, exact_gpu_written, exact_version)),
                             Some((compatible_descriptor, true, compatible_version)),

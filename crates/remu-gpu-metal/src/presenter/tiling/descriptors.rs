@@ -276,6 +276,27 @@ enum PixelFormatViewClass {
     FourChannel32,
 }
 
+/// Prospero depth SRDs reinterpret the native DB as R16/R32. That sample view must never become
+/// a competing GPU writer that demotes the Depth* resident — Metal still holds Z in the DB
+/// texture, and later lighting/tonemap ImageLoads would otherwise bind an empty R32 shadow
+/// (`depth_native=0`, magnitude 0) after a real depth prepass.
+pub(crate) fn depth_sample_view_must_not_steal_depth_authority(
+    writer: GuestTextureDescriptor,
+    depth_candidate: GuestTextureDescriptor,
+) -> bool {
+    let formats_are_depth_sample_views = matches!(
+        (depth_candidate.pixel_format, writer.pixel_format),
+        (MTLPixelFormat::Depth16Unorm, MTLPixelFormat::R16Unorm)
+            | (MTLPixelFormat::Depth32Float, MTLPixelFormat::R32Float)
+    );
+    formats_are_depth_sample_views
+        && writer.width == depth_candidate.width
+        && writer.height == depth_candidate.height
+        && writer.tile_mode == depth_candidate.tile_mode
+        && writer.bytes_per_pixel == depth_candidate.bytes_per_pixel
+        && guest_texture_descriptors_share_byte_storage(writer, depth_candidate)
+}
+
 pub(crate) fn guest_texture_descriptors_share_depth_sample_storage(
     rendered: GuestTextureDescriptor,
     sampled: GuestTextureDescriptor,

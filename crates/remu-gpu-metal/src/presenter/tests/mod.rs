@@ -37,6 +37,7 @@ use super::{
     decode_render_targets_from_registers, decode_sampled_texture_format,
     decode_sampled_texture_linear_from_raw, decode_scanout_target, decode_scissor, decode_viewport,
     depth_array_face_descriptor, depth_array_face_set_is_complete,
+    depth_sample_view_must_not_steal_depth_authority,
     diagnostic_texture_depth_plane_summaries, disable_appkit_state_restoration,
     disabled_metal_blend_attachment, effective_linear_pitch, encode_mode5_mip_chain_into_raw,
     encode_mode27_mip_chain_into_raw, ensure_mipmapped_resident_texture_in_map,

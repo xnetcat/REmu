@@ -19,7 +19,8 @@ pub(crate) use self::blocks::{mode5_within_block_byte_offset, mode9_within_block
 #[cfg(test)]
 pub(crate) use self::descriptors::guest_texture_descriptors_share_component_reordered_storage;
 pub(crate) use self::descriptors::{
-    ResourceSpan, guest_physical_ranges_overlap, guest_ranges_overlap,
+    ResourceSpan, depth_sample_view_must_not_steal_depth_authority,
+    guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,

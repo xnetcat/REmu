@@ -26,7 +26,8 @@ use super::{
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
+    depth_sample_view_must_not_steal_depth_authority, guest_texture_raw_matches,
+    guest_texture_raw_range, image_destination_select_is_native,
     image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
     rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
@@ -515,6 +516,136 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         uploaded[0].texture.pixel_format(),
         MTLPixelFormat::Depth32Float,
         "R32 depth SRD must sample the GPU-written Depth32Float resident, not the clean R32 shadow"
+    );
+}
+
+#[test]
+fn r32_depth_sample_keeps_depth32_after_later_empty_r32_mark_written() {
+    // Silent Hill title @ 0x801ac20000: depth prepass marks Depth32Float, then a later empty
+    // R32Float shadow is mark_written (magnitude 0). Subtract must not demote the DB; sampling
+    // must still bind Depth32Float (depth_native path).
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest texture mapping");
+    let sampled = GuestTextureDescriptor {
+        address: address.get(),
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 24,
+        pixel_format: MTLPixelFormat::R32Float,
+        bytes_per_pixel: 4,
+    };
+    let rendered = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::Depth32Float,
+        ..sampled
+    };
+    assert!(depth_sample_view_must_not_steal_depth_authority(
+        sampled, rendered
+    ));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal command queue")
+        .clone();
+    presenter
+        .ensure_resident_texture(&device, sampled)
+        .expect("R32Float shadow");
+    presenter
+        .ensure_resident_texture(&device, rendered)
+        .expect("depth render target");
+    presenter.mark_resident_texture_written(rendered);
+    presenter.mark_resident_texture_written(sampled);
+    assert!(
+        presenter
+            .resident_guest_textures
+            .get(&rendered)
+            .is_some_and(|resident| resident.gpu_written()),
+        "Depth32Float must stay GPU-authored after a later R32 mark_written"
+    );
+
+    let address_words = sampled.address >> 8;
+    let width_minus_one = sampled.width - 1;
+    let height_minus_one = sampled.height - 1;
+    let resource_descriptor = vec![
+        address_words as u32,
+        ((address_words >> 32) as u32 & 0xff) | (22 << 20) | ((width_minus_one & 3) << 30),
+        (width_minus_one >> 2) | (height_minus_one << 14),
+        0x204 | (24 << 20) | (9 << 28),
+        sampled.pitch - 1,
+        0,
+        0,
+        0,
+    ];
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            pc: 0x80,
+            opcode: Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 12,
+                scalar_sampler: 20,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: resource_descriptor.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let uploaded = upload_image_textures(
+        "test",
+        &device,
+        &queue,
+        &evaluation,
+        &mut presenter.resident_guest_textures,
+        &presenter.depth_array_textures,
+        &presenter.multisample_textures,
+        &mut presenter.sampled_texture_cache,
+        &mut presenter.sampled_texture_write_watches,
+        &mut presenter.fallback_texture_cache,
+        &mut presenter.next_sampled_texture_use,
+        ResidentTextureActivityStamp::default(),
+        &[],
+    )
+    .expect("native depth sample upload after R32 mark");
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0].texture.pixel_format(),
+        MTLPixelFormat::Depth32Float,
+        "post-prepass R32 mark_written must not force sampling the empty R32 shadow"
     );
 }
 

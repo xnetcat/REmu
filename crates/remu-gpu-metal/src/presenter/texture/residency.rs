@@ -21,8 +21,8 @@ use super::{
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
     SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw, guest_ranges_overlap, guest_texture_byte_count,
-    guest_texture_descriptors_share_byte_storage,
+    decode_sampled_texture_linear_from_raw,     depth_sample_view_must_not_steal_depth_authority, guest_ranges_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
@@ -2601,6 +2601,16 @@ impl MetalPresenter {
             };
             if !other.is_live() {
                 // An already demoted allocation holds nothing left to take.
+                continue;
+            }
+            // An R16/R32 depth-sample SRD at the DB address must not demote the native Depth*
+            // resident. Silent Hill title: post-prepass samples bound an empty gpu-authored
+            // R32Float shadow (magnitude 0) while Depth32Float still held Z (gpufalse after
+            // subtract) → depth_native=0 and lighting/tonemap read clear depth.
+            if let Some(writer) = keep
+                && depth_sample_view_must_not_steal_depth_authority(writer, candidate)
+            {
+                OWNED_SUBTRACT_TENANTS_SURVIVED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             // ResourceSpan::overlaps consults shared-backing identity and can report neighbours

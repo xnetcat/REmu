@@ -248,8 +248,9 @@ use self::texture::{
 use self::tiling::{
     ResourceSpan, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
     copy_tiled_to_linear_at_z, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
-    effective_linear_pitch, encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap,
-    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
+    depth_sample_view_must_not_steal_depth_authority, effective_linear_pitch,
+    encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap, guest_ranges_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
