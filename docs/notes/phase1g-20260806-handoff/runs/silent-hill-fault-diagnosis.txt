@@ -1,0 +1,34 @@
+Silent Hill guest-fault diagnosis (Phase 1G)
+===========================================
+
+Symptom (tip before fix, n≥5 @ bf4130b / f21484c):
+  [REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x8000000080b0
+  pc=0x8016b7c09 space=host reason=outside-watched-memory
+  outcome=guest-failure exit_status=139 ~14s captured_frames=0
+
+Main control same hour (@ 9397f11):
+  outcome=external-watchdog-timeout exit_status=124 ~65s
+  NO SIGSEGV; flips to ≥512; captured_frames=0 (same frame-capture gap)
+
+Bisect:
+  53b97ba memory anonymous→committed — SURVIVES
+  a1618a1 / f9c11d3 GPU tiler land — SURVIVES
+  e731ce5 (56f7737 + compile fix) — CRASHES (first bad)
+
+Root cause (1G-introduced):
+  56f7737 classified AliasRebuild / LayeredDepthAlias / SampledAlias as
+  LeaseValidatedReconciliation when a lease was live, so settle published
+  GPU pixels into guest RAM on sampled-alias paths. Guest heaps reuse those
+  ranges as ICBs/resources; the publish corrupted pointers
+  (addr=0x8000000080b0). f9c11d3 refused those triggers by default.
+
+Secondary defect in same commit (also fixed):
+  RemuBookkeeping settle cleared gpu_authored without publishing (debt lie).
+
+Fixes:
+  f21484c keep Metal debt on bookkeeping settle + restore generations
+  f07da85 refuse alias/sampled publish by default (REMU_PUBLISH_INTERNAL_WRITEBACKS=1 opt-in)
+
+Post-fix (@ f07da85):
+  outcome=external-watchdog-timeout exit 124; flips to 1024; no SIGSEGV
+  captured_frames=0 — same as main; UI garbage not assessable via PPM

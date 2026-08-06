@@ -1,0 +1,103 @@
+[REMu] acquiring exclusive build lock: /Users/xnetcat/Documents/REmu/target/.remu-build.lock
+[REMu] held exclusive build lock
+[REMu] building the Rosetta release runner
+   Compiling remu-shader v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-shader)
+   Compiling remu-memory v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-memory)
+   Compiling remu-gpu v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-gpu)
+   Compiling remu-shader-metal v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-shader-metal)
+   Compiling remu-runtime v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-runtime)
+   Compiling remu-gpu-metal v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-gpu-metal)
+   Compiling remu-cli v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-cli)
+    Finished `release` profile [optimized] target(s) in 19.81s
+[REMu] host vm.loadavg: { 4.86 3.55 3.04 }
+[REMu] launching PPSA10112-app; artifacts: /Users/xnetcat/Documents/REmu/docs/notes/phase1g-20260806-handoff/runs/silent-hill-main-control-artifacts/20260806T015607Z-PPSA10112-app
+[REMu] render resolution: 1920x1080 (ue4-ps5-backbuffer)
+[REMu] launching the interactive REmu.app bundle
+[REMu] automatic shutdown after 60s (pass 0 to disable)
+[REMu] external launch watchdog after 65s
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=219/0/0/0 barrier=219/25912/118/417 setup=219/1994290/9106/76084
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=219/58642/267/915 send=219/1024838924/4679629/19817293 residual=219/1451396/6627/30210
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-DIRECT] window_ms=5187 total=3299771 process-time=991188 sce-self=21742 posix-self=876 sce-thread-id=54745 sce-tls-get=199693 posix-tls-get=1460 sce-tls-set=146 posix-tls-set=1460 sce-mutex-lock=998604 posix-mutex-lock=12779 sce-mutex-unlock=998605 posix-mutex-unlock=12779 posix-rwlock-write=1387 posix-rwlock-unlock=4307
+[REMu][PERF-CAUSES] RP-end compute=0/s key=30/s color-op=15/s flush=13/s | CB tick=2/s memory=0/s wait=26/s shared-host=28/s flip=15/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=714/s waits=28/s same-queue-elided=658/s host-blocks=28/s host-wakes=30/s acquire-noop-drops=13/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=106/s error-advances=0 fallback-no-exact=28/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=13/s accepted=0/s reject=cross-queue:13/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=15/s draw=0/s compute=0/s dma=13/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5187 completed=count/total_ns/mean_ns/max_ns ack=146/958770125/6566918/22133000 ack-prefix=146/0/0/0 prefix-terminal=146/359086291/2459495/14861917 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=713 deferred=712 published=712 outstanding=1 waiting_submission=1 waiting_terminal=1 joined_ordered=0 head=713:submission=Some(2146)/submission-terminal=false/terminal=pending
+[REMu][PERF-RP-KEY] target count=0/s addr=15/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=39/19 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:1/flip:0
+[REMu][PERF-QUEUES] q0:pending:443/submissions:16/blocked:none/front:other; q33:pending:9/submissions:1/blocked:memory:0x702108d960/front:wait:GpuWaitId(33564)@0x702108d960/ref:0x1/mask:0xffffffff/cmp:3
+[REMu][PERF-QUEUE-WAITS] q33:wait@0x702108d960/ref:0x1/mask:0xffffffff/cmp:3/producers:[q0/s5/e3:dma@0x702108d960/bytes:0x4,q0/s5/e4:release@0x702108d960=0x1]
+[REMu][PERF-BATCHES] q0/0:Scheduled:[draw(seq=29737,indexed=false,source=direct,es=0x800aed0000/92951B/dispatcher=false,ps=0x800aeb0000/35072B/dispatcher=false,indices=4,instances=64,target=0x8023050000/[64, 64]),draw(seq=29738,indexed=false,source=direct,es=0x800aed0000/92951B/dispatcher=false,ps=0x800aeb0000/35072B/dispatcher=false,indices=4,instances=64,target=0x8021f50000/[64, 64]),draw(seq=29739,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800a690000/84957B/dispatcher=false,indices=3,instances=1,target=0x803b6a0000/[1920, 1080]),draw(seq=29740,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x8009c40000/75969B/dispatcher=false,indices=3,instances=1,target=0x8039000000/[1920, 1080]),compute(seq=15719,cs=0x8007aa0000/21692B/dispatcher=false,source=Direct,grid=Threadgroups([320, 1, 1]),local=[64, 1, 1]),draw(seq=29741,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800ae70000/14694B/dispatcher=false,indices=3,instances=1,target=0x803d6e0000/[1920, 1080]),compute(seq=15720,cs=0x800c7e0000/95610B/dispatcher=false,source=Direct,grid=Threadgroups([144, 81, 1]),local=[8, 8, 1]),compute(seq=15721,cs=0x8009da0000/74091B/dispatcher=false,source=Direct,grid=Threadgroups([72, 41, 1]),local=[16, 16, 1]),compute(seq=15722,cs=0x8009dc0000/68406B/dispatcher=false,source=Direct,grid=Threadgroups([5, 3, 1]),local=[16, 16, 1]),draw(seq=29743,indexed=true,source=direct,es=0x800d690000/37502B/dispatcher=false,ps=0x800bf40000/78522B/dispatcher=false,indices=3,instances=1,target=0x8040770000/[1920, 1080]),draw(seq=29744,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800d860000/15745B/dispatcher=false,indices=3,instances=1,target=0x8041780000/[960, 540]),compute(seq=15723,cs=0x800d940000/47297B/dispatcher=false,source=Direct,grid=Threadgroups([9, 11, 1]),local=[8, 4, 1]),draw(seq=29745,indexed=true,source=direct,es=0x800d690000/37502B/dispatcher=false,ps=0x800c590000/7959B/dispatcher=false,indices=3,instances=1,target=0x8041bd0000/[16, 2]),compute(seq=15724,cs=0x8007680000/13626B/dispatcher=false,source=Direct,grid=Threadgroups([1, 1, 1]),local=[8, 8, 1]),draw(seq=29746,indexed=true,source=direct,es=0x800d690000/37502B/dispatcher=false,ps=0x800b440000/107295B/dispatcher=false,indices=3,instances=1,target=0x80466d0000/[1, 1]),draw(seq=29747,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800d860000/15745B/dispatcher=false,indices=3,instances=1,target=0x8041be0000/[480, 270]),draw(seq=29748,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800d860000/15745B/dispatcher=false,indices=3,instances=1,target=0x8041cf0000/[240, 135]),draw(seq=29749,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800d860000/15745B/dispatcher=false,indices=3,instances=1,target=0x8041d40000/[120, 68]),draw(seq=29750,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800d860000/15745B/dispatcher=false,indices=3,instances=1,target=0x8041d60000/[60, 34]),draw(seq=29751,indexed=true,source=direct,es=0x800bff0000/25976B/dispatcher=false,ps=0x800d860000/15745B/dispatcher=false,indices=3,instances=1,target=0x8041d80000/[30, 17]),draw(seq=29752,indexed=true,source=direct,es=0x800ea40000/54502B/dispatcher=false,ps=0x800ec40000/101280B/dispatcher=false,indices=3,instances=1,target=0x8041da0000/[30, 17]),draw(seq=29753,indexed=true,source=direct,es=0x800ea40000/54502B/dispatcher=false,ps=0x800ec40000/101280B/dispatcher=false,indices=3,instances=1,target=0x8041d80000/[30, 17]),draw(seq=29754,indexed=true,source=direct,es=0x800e990000/53077B/dispatcher=false,ps=0x800ee10000/96203B/dispatcher=false,indices=3,instances=1,target=0x8041d60000/[60, 34]),draw(seq=29755,indexed=true,source=direct,es=0x800e8c0000/47819B/dispatcher=false,ps=0x800f250000/68164B/dispatcher=false,indices=3,instances=1,target=0x8041de0000/[120, 68]),draw(seq=29756,indexed=true,source=direct,es=0x800e8c0000/47819B/dispatcher=false,ps=0x800f850000/70636B/dispatcher=false,indices=3,instances=1,target=0x8041d40000/[120, 68]),draw(seq=29757,indexed=true,source=direct,es=0x800e910000/42622B/dispatcher=false,ps=0x800f700000/34584B/dispatcher=false,indices=3,instances=1,target=0x8041e00000/[240, 135]),draw(seq=29758,indexed=true,source=direct,es=0x800e910000/42622B/dispatcher=false,ps=0x800f310000/37067B/dispatcher=false,indices=3,instances=1,target=0x8041cf0000/[240, 135]),draw(seq=29759,indexed=true,source=direct,es=0x800e910000/42622B/dispatcher=false,ps=0x800f700000/34584B/dispatcher=false,indices=3,instances=1,target=0x8041e50000/[480, 270]),draw(seq=29760,indexed=true,source=direct,es=0x800e910000/42622B/dispatcher=false,ps=0x800f310000/37067B/dispatcher=false,indices=3,instances=1,target=0x8041be0000/[480, 270]),draw(seq=29761,indexed=true,source=direct,es=0x800e8e0000/41400B/dispatcher=false,ps=0x800eb70000/26902B/dispatcher=false,indices=3,instances=1,target=0x8041f60000/[960, 540]),draw(seq=29762,indexed=true,source=direct,es=0x800e8e0000/41400B/dispatcher=false,ps=0x800f670000/29343B/dispatcher=false,indices=3,instances=1,target=0x8041780000/[960, 540]),draw(seq=29763,indexed=false,source=direct,es=0x800aed0000/92951B/dispatcher=false,ps=0x800d700000/575484B/dispatcher=false,indices=4,instances=32,target=0x803b480000/[32, 32]),compute(seq=15725,cs=0x80079e0000/21255B/dispatcher=false,source=Direct,grid=Threadgroups([192, 1, 1]),local=[64, 1, 1]),draw(seq=29764,indexed=true,source=direct,es=0x800dbb0000/44020B/dispatcher=false,ps=0x800e730000/28396B/dispatcher=false,indices=3,instances=1,target=0x8044590000/[1920, 1080]),compute(seq=15726,cs=0x80079e0000/21255B/dispatcher=false,source=Direct,grid=Threadgroups([96, 1, 1]),local=[64, 1, 1]),draw(seq=29765,indexed=true,source=direct,es=0x800d690000/37502B/dispatcher=false,ps=0x800da30000/23731B/dispatcher=false,indices=3,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29766,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008020000/16044B/dispatcher=false,indices=6,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29767,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008020000/16044B/dispatcher=false,indices=6,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29768,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008020000/16044B/dispatcher=false,indices=6,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29769,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008040000/15205B/dispatcher=false,indices=3942,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29770,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008040000/15205B/dispatcher=false,indices=48,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29771,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008020000/16044B/dispatcher=false,indices=6,instances=1,target=0xefc1000000/[1920, 1080]),draw(seq=29772,indexed=true,source=direct,es=0x800d550000/58486B/dispatcher=false,ps=0x8008020000/16044B/dispatcher=false,indices=6,instances=1,target=0xefc1000000/[1920, 1080])]
+[REMu][PERF-DROPPED] draws=713/3 keys compute=0/0 keys worst_draw=es:0x8007a80000/ps:0x8008020000/645
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=3 raster-off=1427 color-op=712 fce-idle=712
+[REMu][PERF-TEXTURE] snapshot=153/1890.9MiB/803.4ms/6unstable dirty_validate=504/5.8MiB/9.9ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=45/104MiB guest=104MiB metal=332/18187MiB watches=49 hit=2213 miss=117 dirty_reload=0 acquire_invalidate=6 resident_acquire_invalidate=483 capacity_evict=0 depth_native=0 alias_writeback=123/1412.8MiB/0.1ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=996.0MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/36 layered-depth-alias=0/0 sampled-alias=0/123
+[REMu][PERF-TEXTURE-OWNED] live=46 stale=1 owned=162.3MiB/52 runs debt=133.8MiB survived=15 demoted=483 reclaim_discard=73 rematerialise=0/0/0/21 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=45/103.4MiB targets=47/166.2MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=2/16.2MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=285.8MiB other=46.2MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:42/124.2MiB,cpu:5/42.0MiB mapping=active:47/166.2MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:47/+0versions,spans:47/+0duplicates,unresolved:0/0.0MiB top=[0x803e700000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v39732/None; 0x803b6a0000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v39729/None; 0x8039000000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v39730/None; 0x8043490000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gpufalse/v39675/None; 0x8027bd0000/1920x1080/p1920/RGBA16Unorm/tile27=15.9MiB/gpufalse/v0/None; 0x803d6e0000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v39731/None; 0x801ac20000/1920x1080/p1920/R32Float/tile24=8.0MiB/gpufalse/v0/None; 0x8040770000/1920x1080/p1920/RG11B10Float/tile27=8.0MiB/gputrue/v39736/None]
+[REMu][PERF-GLOBAL-CACHE] captured=4096/0.6MiB identity=5/11.5MiB
+[REMu][PERF-SNAPSHOT-TOP] 0x8043490000/15.9MiB@L851=44/701.2MiB/357.9ms; 0x8043490000/15.9MiB@L2764=36/573.8MiB/302.8ms; 0x8044590000/8.4MiB@L851=73/615.9MiB/142.7ms
+[REMu][PERF-TEXTURE-DIRTY-TOP] 0x8043490000/15.9MiB@L851=44snap/21clean/0imprecise dirty=1.9MiB(0.276%)/496pages; 0x8044590000/8.4MiB@L851=73snap/73clean/0imprecise dirty=0.0MiB(0.000%)/0pages; 0x8043490000/15.9MiB@L2764=36snap/36clean/0imprecise dirty=0.0MiB(0.000%)/0pages
+[REMu] external launch watchdog reached 65s
+[REMu] watchdog stopping pid=77574 after external timeout
+revision=9397f11
+game=/Volumes/Untitled/sharpemu/games/SILENT HILL The Short Message/PPSA10112-app/eboot.bin
+timeout_seconds=60
+elapsed_seconds=65
+outcome=external-watchdog-timeout
+exit_status=124
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=ue4-ps5-backbuffer
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=31 total_calls=17579
+[REMu][REPORT] fabricated success key=znaWI0gpuo8 name=scePadGetTriggerEffectState calls=11508
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=1097
+[REMu][REPORT] fabricated success key=gpu:noop-raster-disabled name=internal calls=1090
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=550
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=550
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=549
+[REMu][REPORT] fabricated success key=-4GCfYdNF1s name=sceImeUpdate calls=548
+[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=548
+[REMu][REPORT] fabricated success key=gpu:noop-color-operation name=internal calls=544
+[REMu][REPORT] fabricated success key=gpu:noop-fast-clear-idle name=internal calls=544
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=26
+[REMu][REPORT] fabricated success key=gpu:noop-cover-placeholder name=internal calls=3
+[REMu][REPORT] fabricated success key=v8iOE+j8a5o name=sceAudioOut2MasteringSetParam calls=3
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=0gYjPTR-6cY name=sceHttpCreateTemplate calls=1
+[REMu][REPORT] fabricated success key=1xxcMiGu2fo name=sceUserServiceGetUserName calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=A9cVMUtEp4Y name=sceHttpInit calls=1
+[REMu][REPORT] fabricated success key=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=W2G-yoyMF5U name=scePadSetVibrationMode calls=1
+[REMu][REPORT] fabricated success key=XHl38ZNknbs name=sceAudioOut2MasteringInit calls=1
+[REMu][REPORT] fabricated success key=YBiIdcDPrxs name=sceShareFeaturePermit calls=1
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=1
+[REMu][REPORT] fabricated success key=jh+8XiK4LeE name=sceKernelIsAddressSanitizerEnabled calls=1
+[REMu][REPORT] fabricated success key=kmSe30JTs+E name=sceVideoOutAddOutputModeEvent calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
+[REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
+[REMu][REPORT] failing import name=sceKernelWaitEventFlag nid=JTvBflhYazQ failures=8264282 calls=8264305 results=0xffffffff8002003c:8264282
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=6372 calls=6403 results=0xffffffff80020002:6372
+[REMu][REPORT] failing import name=scePadReadState nid=YndgXqQVV7c failures=1644 calls=2192 results=0xffffffff80920003:1644
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=550 calls=551 results=0xffffffff80960007:550
+[REMu][REPORT] failing import name=sceKernelWaitEqueue nid=fzyMKs9kim0 failures=547 calls=4211 results=0xffffffff8002003c:547
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=27 calls=38 results=0xffffffff80020002:25,0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
+[REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=14 calls=22 results=0xffffffffffffffff:14
+[REMu][REPORT] failing import name=sceKernelMkdir nid=1-LFLmRFxxM failures=8 calls=9 results=0xffffffff80020002:3,0xffffffff8002000d:5
+[REMu][REPORT] failing import name=sceNetCtlGetInfo nid=obuxdTiwkF8 failures=4 calls=4 results=0xffffffff80410132:4
+[REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceNetResolverCreate nid=C4UgDHHPvdw failures=1 calls=1 results=0xffffffff80410132:1
+[REMu] complete; full artifacts: /Users/xnetcat/Documents/REmu/docs/notes/phase1g-20260806-handoff/runs/silent-hill-main-control-artifacts/20260806T015607Z-PPSA10112-app

@@ -1,0 +1,1 @@
+../../../shpc/shpc.uproject -ResX=1920 -ResY=1080 -ForceRes -ExecCmds="r.SetRes 1920x1080f"
