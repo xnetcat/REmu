@@ -17,6 +17,7 @@ fn is_gpu_sync_label_address(address: u64) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AgcEventWrite {
     PipelineBarrier(remu_gpu::GpuPipelineBarrier),
+    RenderBackendFlush(remu_gpu::GpuRenderBackendFlush),
     PixelPipeStatDump { destination: u64 },
 }
 
@@ -34,6 +35,15 @@ pub(crate) fn decode_agc_event_write(
         return decode_agc_pipeline_barrier(packet_address, length)
             .map(AgcEventWrite::PipelineBarrier)
             .map(Some);
+    }
+    // SDK EventType CB/DB writeback-invalidate forms (drawcommandbuffer.h:77-84). sync.cpp
+    // emits these before end-of-pipe / acquire; silently dropping them deletes the only
+    // render-backend flush mechanism.
+    if let Some(flush) = remu_gpu::GpuRenderBackendFlush::from_event_type(event_type) {
+        if control & !0x3f != 0 {
+            return Err(AgcSubmissionError::UnsupportedEventWriteControl(control));
+        }
+        return Ok(Some(AgcEventWrite::RenderBackendFlush(flush)));
     }
     // EVENT_TYPE=0x39 is PIXEL_PIPE_STAT_DUMP / sce::Agc::EventType::kOcclusionCounterDump
     // (sdk/target/include/agc/drawcommandbuffer.h:86). AMD assigns it EVENT_INDEX=1 (the
@@ -122,11 +132,19 @@ pub(super) fn decode_agc_memory_write(
     })
 }
 
+/// Decoded Gen5 `DMA_DATA`: either a memory copy/fill or SDK `gpuSyncDma` (`DmaDataDst::kNowhere`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AgcDmaData {
+    Copy(remu_gpu::GpuMemoryCopy),
+    /// `sync.cpp` `gpuSyncDma`: dst=kNowhere, size=0, wait-previous + write-confirm + block CP.
+    SyncBarrier,
+}
+
 pub(crate) fn decode_agc_dma_data(
     packet_address: u64,
     length: u32,
     standard_packet: bool,
-) -> Option<remu_gpu::GpuMemoryCopy> {
+) -> Option<AgcDmaData> {
     let (source_address, destination_address, byte_count, source_selection, destination_selection) =
         if standard_packet {
             if length < 7 {
@@ -154,6 +172,10 @@ pub(crate) fn decode_agc_dma_data(
                 control & 0xff,
             )
         };
+    // SDK `gpuSyncDma` (sync.cpp:694-708): DmaDataDst::kNowhere (2), addresses 0, size 0.
+    if destination_selection == 2 && destination_address == 0 && byte_count == 0 {
+        return Some(AgcDmaData::SyncBarrier);
+    }
     let source_is_memory = matches!(source_selection, 0 | 3);
     let source_is_immediate = source_selection == 2;
     if (!source_is_memory && !source_is_immediate)
@@ -164,15 +186,16 @@ pub(crate) fn decode_agc_dma_data(
     {
         return None;
     }
-    Some(remu_gpu::GpuMemoryCopy {
+    Some(AgcDmaData::Copy(remu_gpu::GpuMemoryCopy {
         source_address,
         destination_address,
         byte_count,
         source_selection,
         destination_selection,
         source_snapshot: None,
-    })
+    }))
 }
+
 
 pub(crate) fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire {
     let coher_control = read_guest_u32(packet_address + 4);
@@ -195,13 +218,29 @@ pub(super) fn decode_agc_memory_release(
     standard_packet: bool,
 ) -> Option<remu_gpu::GpuMemoryRelease> {
     static TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    // NOP wrapper layout (agc_command_abi::cb_release_mem / sync.cpp queueEndOfPipeAction):
+    //   +4: action | (cache_policy << 8)
+    //   +8: gcr_control | (data_selection << 16) | (interrupt << 24)
+    let action_control = read_guest_u32(packet_address + 4);
     let control = read_guest_u32(packet_address + 8);
     let address = read_guest_u64(packet_address + 12);
     let data = read_guest_u64(packet_address + 20);
-    let data_selection = if standard_packet {
-        (control >> 29) & 0x7
+    let (action, cache_policy, gcr_control, data_selection, interrupt) = if standard_packet {
+        (
+            action_control & 0xff,
+            (action_control >> 25) & 0x3,
+            control & 0xffff,
+            (control >> 29) & 0x7,
+            (control >> 24) & 0x7,
+        )
     } else {
-        (control >> 16) & 0xff
+        (
+            action_control & 0xff,
+            (action_control >> 8) & 0xff,
+            control & 0xffff,
+            (control >> 16) & 0xff,
+            (control >> 24) & 0xff,
+        )
     };
     let value = match data_selection {
         1 if address.is_multiple_of(4) => {
@@ -218,16 +257,21 @@ pub(super) fn decode_agc_memory_release(
         || trace.is_power_of_two()
     {
         eprintln!(
-            "[REMu][AGC][SYNC] release packet={packet_address:#x} standard={standard_packet} control={control:#010x} selection={data_selection} address={address:#x} data={data:#x} emitted={}",
+            "[REMu][AGC][SYNC] release packet={packet_address:#x} standard={standard_packet} action={action:#x} gcr={gcr_control:#x} cache_policy={cache_policy} interrupt={interrupt} selection={data_selection} address={address:#x} data={data:#x} emitted={}",
             value.is_some() && address != 0
         );
     }
     Some(remu_gpu::GpuMemoryRelease {
         address,
         value: value?,
+        action,
+        gcr_control,
+        cache_policy,
+        interrupt,
     })
     .filter(|_| address != 0)
 }
+
 
 pub(crate) fn decode_agc_memory_wait(
     packet_address: u64,
@@ -259,6 +303,19 @@ pub(crate) fn decode_agc_memory_wait(
         )
     };
     let compare_function = control & 0x7;
+    // SDK WaitOperation packing (agc_command_abi::wait_reg_mem / drawcommandbuffer.h):
+    // engine select is the low bit (kWaitMe=0, kWaitPfp=1).
+    let (operation, cache_policy) = if standard_packet {
+        ((control >> 8) & 0x1, (control >> 25) & 0x3)
+    } else if is_64_bit {
+        let engine = (control >> 8) & 0x1;
+        let cond = (control >> 6) & 0x2;
+        (engine | cond, (control >> 25) & 0x3)
+    } else {
+        let low = (control >> 8) & 0x3;
+        let high = (control >> 4) & 0x0c;
+        (low | high, (control >> 25) & 0x3)
+    };
     let alignment = if is_64_bit { 8 } else { 4 };
     let decoded = if address == 0 || !address.is_multiple_of(alignment) || compare_function == 7 {
         None
@@ -269,6 +326,8 @@ pub(crate) fn decode_agc_memory_wait(
             mask,
             compare_function,
             is_64_bit,
+            operation,
+            cache_policy,
         })
     };
     let trace = TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
@@ -281,7 +340,7 @@ pub(crate) fn decode_agc_memory_wait(
             }
         });
         eprintln!(
-            "[REMu][AGC][SYNC] wait packet={packet_address:#x} standard={standard_packet} bits={} control={control:#010x} compare={compare_function} address={address:#x} mask={mask:#x} reference={reference:#x} current={current:?} satisfied={:?}",
+            "[REMu][AGC][SYNC] wait packet={packet_address:#x} standard={standard_packet} bits={} control={control:#010x} compare={compare_function} operation={operation} cache_policy={cache_policy} address={address:#x} mask={mask:#x} reference={reference:#x} current={current:?} satisfied={:?}",
             if is_64_bit { 64 } else { 32 },
             current
                 .zip(decoded)

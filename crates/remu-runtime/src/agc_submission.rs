@@ -28,8 +28,8 @@ mod shadow;
 #[cfg(test)]
 pub(crate) use self::decode::decode_agc_pipeline_barrier;
 pub(crate) use self::decode::{
-    AgcEventWrite, decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire,
-    decode_agc_memory_wait,
+    AgcDmaData, AgcEventWrite, decode_agc_dma_data, decode_agc_event_write,
+    decode_agc_memory_acquire, decode_agc_memory_wait,
 };
 pub(crate) use self::driver::{
     agc_driver_submit_acb, agc_driver_submit_dcb, agc_driver_submit_multi_acbs,
@@ -371,6 +371,9 @@ pub(crate) fn agc_handle_submission_packet(
             Some(AgcEventWrite::PipelineBarrier(barrier)) => {
                 emit_agc_gpu_event(remu_gpu::GpuEvent::PipelineBarrier(barrier));
             }
+            Some(AgcEventWrite::RenderBackendFlush(flush)) => {
+                emit_agc_gpu_event(remu_gpu::GpuEvent::RenderBackendFlush(flush));
+            }
             Some(AgcEventWrite::PixelPipeStatDump { destination }) => {
                 // J1: emit the occlusion dump destination for MTLVisibilityResultBuffer publication.
                 // Do not fabricate counter values here — the Metal backend owns the sample count
@@ -410,59 +413,64 @@ pub(crate) fn agc_handle_submission_packet(
         emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryWrite(write));
     }
     if (opcode == AGC_IT_DMA_DATA || (opcode == AGC_IT_NOP && register == AGC_R_DMA_DATA))
-        && let Some(copy) = decode_agc_dma_data(packet_address, length, opcode == AGC_IT_DMA_DATA)
+        && let Some(dma) = decode_agc_dma_data(packet_address, length, opcode == AGC_IT_DMA_DATA)
     {
-        // Descriptor and indirect-argument decoding happens synchronously, so following packets
-        // need to observe this copy before the asynchronous backend reaches it. Stage that view
-        // in the submission shadow without changing guest memory; the MemoryCopy event below is
-        // the sole authoritative mutation and executes at this exact queue position.
-        let mut copy = copy;
-        let staged = stage_agc_memory_copy(&copy).map_err(|error| {
-            AgcSubmissionError::MemorySnapshotBudget {
-                requested_bytes: error.requested_bytes,
-                limit_bytes: error.limit_bytes,
+        match dma {
+            AgcDmaData::SyncBarrier => {
+                // SDK gpuSyncDma (sync.cpp:694-722): wait for prior DMAs, write-confirm, block CP.
+                emit_agc_gpu_event(remu_gpu::GpuEvent::DmaSyncBarrier);
             }
-        })?;
-        copy.source_snapshot = staged.source_snapshot;
-        static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
-        static DMA_SNAPSHOT_COUNT: AtomicUsize = AtomicUsize::new(0);
-        static DMA_SNAPSHOT_BYTES: AtomicUsize = AtomicUsize::new(0);
-        let sequence = DMA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_bytes = copy
-            .source_snapshot
-            .as_ref()
-            .map_or(0, |snapshot| snapshot.len());
-        if snapshot_bytes != 0 {
-            DMA_SNAPSHOT_COUNT.fetch_add(1, Ordering::Relaxed);
-            DMA_SNAPSHOT_BYTES.fetch_add(snapshot_bytes, Ordering::Relaxed);
+            AgcDmaData::Copy(mut copy) => {
+                // Descriptor and indirect-argument decoding happens synchronously, so following
+                // packets need to observe this copy before the asynchronous backend reaches it.
+                let staged = stage_agc_memory_copy(&copy).map_err(|error| {
+                    AgcSubmissionError::MemorySnapshotBudget {
+                        requested_bytes: error.requested_bytes,
+                        limit_bytes: error.limit_bytes,
+                    }
+                })?;
+                copy.source_snapshot = staged.source_snapshot;
+                static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
+                static DMA_SNAPSHOT_COUNT: AtomicUsize = AtomicUsize::new(0);
+                static DMA_SNAPSHOT_BYTES: AtomicUsize = AtomicUsize::new(0);
+                let sequence = DMA_TRACE_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                let snapshot_bytes = copy
+                    .source_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.len());
+                if snapshot_bytes != 0 {
+                    DMA_SNAPSHOT_COUNT.fetch_add(1, Ordering::Relaxed);
+                    DMA_SNAPSHOT_BYTES.fetch_add(snapshot_bytes, Ordering::Relaxed);
+                }
+                let fence_label_dma =
+                    (0x7e00_0000_0000..0x8000_0000_0000).contains(&copy.destination_address);
+                if fence_label_dma
+                    || trace_guest_sync()
+                    || trace_agc_programs()
+                    || sequence <= 32
+                    || sequence.is_power_of_two()
+                    || graphics
+                        .sampled_texture_addresses
+                        .contains(&copy.destination_address)
+                {
+                    eprintln!(
+                        "[REMu][AGC][DMA] sequence={sequence} packet={packet_address:#x} standard={} src_sel={} dst_sel={} source={:#x} destination={:#x} bytes={:#x} shadowed={} snapshot_bytes={} snapshot_count={} snapshot_cumulative_bytes={} snapshot_retained={:?}",
+                        opcode == AGC_IT_DMA_DATA,
+                        copy.source_selection,
+                        copy.destination_selection,
+                        copy.source_address,
+                        copy.destination_address,
+                        copy.byte_count,
+                        staged.shadowed,
+                        snapshot_bytes,
+                        DMA_SNAPSHOT_COUNT.load(Ordering::Relaxed),
+                        DMA_SNAPSHOT_BYTES.load(Ordering::Relaxed),
+                        remu_gpu::gpu_memory_copy_snapshot_statistics(),
+                    );
+                }
+                emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryCopy(copy));
+            }
         }
-        let fence_label_dma =
-            (0x7e00_0000_0000..0x8000_0000_0000).contains(&copy.destination_address);
-        if fence_label_dma
-            || trace_guest_sync()
-            || trace_agc_programs()
-            || sequence <= 32
-            || sequence.is_power_of_two()
-            || graphics
-                .sampled_texture_addresses
-                .contains(&copy.destination_address)
-        {
-            eprintln!(
-                "[REMu][AGC][DMA] sequence={sequence} packet={packet_address:#x} standard={} src_sel={} dst_sel={} source={:#x} destination={:#x} bytes={:#x} shadowed={} snapshot_bytes={} snapshot_count={} snapshot_cumulative_bytes={} snapshot_retained={:?}",
-                opcode == AGC_IT_DMA_DATA,
-                copy.source_selection,
-                copy.destination_selection,
-                copy.source_address,
-                copy.destination_address,
-                copy.byte_count,
-                staged.shadowed,
-                snapshot_bytes,
-                DMA_SNAPSHOT_COUNT.load(Ordering::Relaxed),
-                DMA_SNAPSHOT_BYTES.load(Ordering::Relaxed),
-                remu_gpu::gpu_memory_copy_snapshot_statistics(),
-            );
-        }
-        emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryCopy(copy));
     }
     if opcode == AGC_IT_NOP && register == AGC_R_ACQUIRE_MEM && length >= 8 {
         emit_agc_gpu_event(remu_gpu::GpuEvent::MemoryAcquire(
