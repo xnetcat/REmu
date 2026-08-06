@@ -17,16 +17,16 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Silent Hill present — sampled tiler ownership (2026-08-06; partial)
+## Silent Hill present — sampled tiler + splash UI (2026-08-06)
 
-- **Root cause of `captured_frames=0`:** compositor `es=0x800d55…/ps=0x800802…` → VideoOut failed
-  on Phase 1G sampled upload refuse for tile 1/5/9 (RGBA8→BC7), not present/flip.
-- **Fix:** GPU-tiler own mode-1/9 uncompressed + mode-1/5/9 BC element grids (detile in elements,
-  Metal blit in pixels). Commits on `sh-present-mode19-tiler` → merge.
-- **Live:** tiler refuses gone; compositor encodes to `0xefc…`; **still black** / frames=0.
+- **Compositor root cause:** Phase 1G sampled upload refuse tile 1/5/9 (RGBA8→BC7). Fixed:
+  GPU-tiler own mode-1/5/9 uncompressed + BC element grids.
+- **Matrix `captured_frames=0`:** often `REMU_CAPTURE_FRAMES` default-off — not present failure.
+- **Live @ tip + `REMU_CAPTURE_FRAMES=1`:** frames=13; HEXA DRIVE + KONAMI splash assessable;
+  early efc readbacks truly black (`skip capture … nonzero=0`); some garbage PPMs remain.
 - Handoff: `docs/notes/sh-present-20260806-handoff/`.
-- **Next:** BC detile oracle vs live SRD; then DeS ACM / Unity null-SIGSEGV if SH stays black.
-- **Anti-claim:** not UI/3D closure.
+- **Anti-claim:** splash UI ≠ title 3D / hallway closure.
+- **Next:** post-splash / title 3D sample+PS path; else DeS ACM / Unity null-SIGSEGV.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

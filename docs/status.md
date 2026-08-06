@@ -4,14 +4,19 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Silent Hill present / sampled tiler (2026-08-06) — partial (on tip → merge)
+## Silent Hill present / sampled tiler (2026-08-06) — splash UI open; 3D not closed
 
-Root cause of post–Phase-1 `captured_frames=0`: VideoOut compositor draws failed every frame
-because Phase 1G refused sampled GPU upload for `tile ∈ {1,5,9}` (RGBA8 then BC7) — “no tiler
-ownership”. GPU-tiler ownership + mode-1/9 MSL + mode-1/5/9 BC element-grid upload landed
-(`docs/notes/sh-present-20260806-handoff/`). Live SH @ tip: compositor tiler refuses **gone**;
-mesh compositor encodes into `0xefc…`; **still** `captured_frames=0` (fully black readback) —
-**not** UI/3D closure. Next: prove BC detile bytes / compositor sampling, not flip plumbing.
+**Root cause (compositor):** Phase 1G refused sampled GPU upload for `tile ∈ {1,5,9}` (RGBA8→BC7)
+— “no tiler ownership”. GPU-tiler owns mode-1/5/9 uncompressed + BC element grids
+(`docs/notes/sh-present-20260806-handoff/`).
+
+**Root cause (matrix `captured_frames=0`):** ordinary `run-game.sh` leaves `REMU_CAPTURE_FRAMES`
+unset (default 0), so PPM capture never runs. That is not “present broken”.
+
+**Live @ `3f261a8` with `REMU_CAPTURE_FRAMES=1`:** `captured_frames=13`; early VideoOut readbacks
+are RGB-zero (`skip capture: fully black nonzero=0`); later frames show **HEXA DRIVE** and
+**KONAMI** splash (assessable 2D UI). Some mid-run PPMs are still noise/garbage. **Not** title-menu
+3D / hallway closure. Next: sample/PS path for post-splash / title 3D.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

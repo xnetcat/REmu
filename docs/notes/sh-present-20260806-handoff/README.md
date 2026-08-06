@@ -40,28 +40,35 @@ sampled uploads, including the BC element grid** — not present/flip plumbing.
 
 Compressed mip chains and mode-27 BC stay loud-refused.
 
-## Live Silent Hill @ `1d5d4b3` (90s, clean tree)
+## Live Silent Hill
 
-Artifacts: `runs/silent-hill-mode1bc/`.
+### Without `REMU_CAPTURE_FRAMES` (matrix default) — `@1d5d4b3` / `@119f798`
 
-| Metric | 1H tip (`f8bdad5`) | This tip |
-| --- | --- | --- |
-| outcome | watchdog 124 | watchdog 124 |
-| `captured_frames` | 0 | **0** (still fully black) |
-| worst PERF-DROPPED | `800d55/800802` ~9k (tiler refuse) | `8007a8/800802` ~1.7k (no CB target) |
-| tiler refuse on compositor | yes | **gone** |
-| encoded compositor to VideoOut | no | **yes** (`encoded … es=0x800d550000 ps=0x8008040000` → `0xefc1…`) |
-| pipeline failed | 0 | 0 |
-| launch `vm.loadavg` | (overloaded earlier) | `{ 3.x … }` — no FPS claim |
+Artifacts: `runs/silent-hill-mode1bc/`. `captured_frames=0` because **PPM capture is off**, not
+because present never wrote. Compositor tiler refuses gone; mesh encodes to `0xefc…`.
 
-**Honest UI/3D assessment:** tiler ownership no longer blocks the compositor path, and at least
-one mesh compositor pair encodes into the flip targets. Present readback is still fully black, so
-PPM UI/3D remains **unassessable**. This is **not** title-UI/3D closure (“success is not the
-hallway”).
+### With `REMU_CAPTURE_FRAMES=1` — `@3f261a8` (60s, clean tree)
+
+Artifacts: `runs/silent-hill-black-skip2/` (loadavg launch `{ 4.58 … }` — no FPS claim).
+
+| Metric | Value |
+| --- | --- |
+| outcome | external-watchdog-timeout / 124 |
+| `captured_frames` | **13** |
+| early efc readback | `skip capture: fully black … nonzero=0` (first presents) |
+| assessable splash | **HEXA DRIVE** logo; **KONAMI** on magenta |
+| other PPMs | solid brand-color fades; at least one dense noise/garbage frame |
+| tiler refuse on compositor | gone |
+
+**Honest UI/3D assessment:** boot/splash 2D UI is assessable again after the tiler-ownership fix
+when capture is enabled. This is **not** title-menu 3D / ruined-hallway closure (“success is not
+the hallway”). Garbage frames after splash remain an open present/sample path.
 
 ## Anti-claims
 
-- Do not claim UI or 3D from flip count, watchdog timeout, or “no tiler refuse”.
+- Do not treat matrix `captured_frames=0` as proof of black present when `REMU_CAPTURE_FRAMES`
+  was unset (default).
+- Do not claim title 3D or hallway from splash logos or flip count.
 - Do not claim FPS.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 - Remaining `8007a8/800802` drops with `target=0x0` / `target_mask=0x0` are genuine no-attachment
@@ -86,15 +93,14 @@ bytes / mesh+PS exports), not “no encode into VideoOut”.
 
 ## Next recommended blocker
 
-**Why encoded VideoOut compositor output is still fully black**, in order:
+**Post-splash / title 3D (and garbage PPMs)**, in order:
 
-1. Prove BC/R8 mode-1/5/9 GPU detile bytes against the CPU `blocks.rs` oracle on a live SH SRD
-   (`REMU_CAPTURE_DIR` + `REMU_CAPTURE_TARGET_SAMPLES=1`, or GPU↔CPU linear buffer compare).
-2. Trace `ps=0x8008020000` / `0x8008040000` after upload (SRD, resident `content_version`,
-   nonzero sample fingerprints) — dump scanout MSL if needed.
+1. Keep `REMU_CAPTURE_FRAMES=1` on SH UI evidence runs; correlate noise frames with sample
+   uploads (`REMU_CAPTURE_TARGET_SAMPLES=1`) for mode-9 BC7/R8 compositor SRDs.
+2. Trace `ps=0x8008020000` / `0x8008040000` after splash (title background path).
 3. Keep LDS+missing-EXP loud refuse (no INTERFACE-FILL / UV invent).
-4. If SH present stays black with proven uploads, pivot: DeS `sceAcmBatchStartBuffers`, or
-   Dreaming Sarah / Void null-SIGSEGV.
+4. Parallel high blockers if SH 3D stalls: DeS `sceAcmBatchStartBuffers`, Dreaming Sarah / Void
+   null-SIGSEGV.
 
 ## Checks
 
