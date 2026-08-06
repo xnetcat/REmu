@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** UV/tex0 attribution closed (tonemap5c + `UV-TEX0-ATTR.txt`); diagnostic `{:x?}` extent footgun fixed.
-Prior tip `9b17b54` / SLoad `37589c3`. Live: `800bf4` TARGET mag≠0; efc title BG still not assessable.
+**Tip:** `main` @ `a363cde` — UV/tex0 attribution closed; `a82f031` decimal TARGET extents.
+Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
 
 ## Closed gates
 
