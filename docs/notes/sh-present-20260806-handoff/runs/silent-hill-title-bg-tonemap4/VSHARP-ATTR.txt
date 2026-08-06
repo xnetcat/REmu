@@ -1,0 +1,55 @@
+revision=HEAD attribution on tonemap4 TARGET draw=47402 globals (no new live yet)
+
+## BUF_RSRC_WORD3 mis-decode? REFUTED (SDK AGC)
+
+word3 `0x00005204` matches `Agc::Core::initializeRegularBuffer` exactly:
+  Format::k8UInt = 5
+  Swizzle::kX001_R1S1 = 0x204
+See sdk-1000 `agc/core/buffer.cpp` + `agc/core/buffer.h` DWORD3 bitfields
+(swizzle:12 | format:7 | … | oob:2 | type:2). REmu `(word3>>12)&0x7f` / DST_SEL
+3-bit nibbles match AGC. Not a PS5 bit-layout bug.
+
+## Why the table holds that V#
+
+UE NGG mesh attribute path (ES `800d69`):
+1. Userdata s8 holds a float4 constant V# (scale/bias), not the mesh VB.
+2. Shader S_LOADs V# from heap `8054eb9354` (draw 47402 TARGET globals).
+3. Heap slot 0 is RegularBuffer → base `7120e7d8c0`, stride 32, records 6.
+4. Meshlet at s14 (`72a0e11600`) supplies FORMAT/swizzle override:
+   s20=0x26e0 → format 77 (float4) pos, slot 0, soff 0
+   s21=0x42020 → format 64 (float2) UV, slot 0, soff 16
+5. Shader patches word3 before BufferLoadFormat; format==0 keeps heap word3.
+
+So the RegularBuffer in the table is architecturally correct, not stale mis-decode.
+
+## “ASCII” at 7120e7d8c0? REVISED
+
+TARGET global head is float pos/uv ±1.0; trailing UTF-16 (`S5/C`, `_40x`) sits in
+stride-32 padding — not proof the VB is material constants.
+
+v0: pos (1,1,0,1) uv (1,1)
+v4: pos (-1,1,0,1) uv (-1,1)
+v5: pos (1,-1,0,1) uv (1,-1)
+indices [0,4,5] = fullscreen NDC triangle.
+
+## Why 800bf4 still exports 0 (remaining)
+
+Static “DST_SEL_Y=0 collapses UV” only holds if meshlet FORMAT override fails.
+With s21 format 64, Metal should patch to float2 XY01.
+
+ES then scales UV with userdata constants (1152×648 and 1/1920×1/1080) →
+~±0.6 without +0.5 bias → samples mostly empty TL of lit tex0 `804345`
+(quadrant-garbage elsewhere). PS samples attr0[0/1] as tex0 UV.
+
+## SLoad heap bind
+
+Evaluation bound `(c, 8054eb9354, 0x10)` — one slot. Shader can index up to
+`(x<<4)&0x1F0`. Fix: dynamic-offset S_LOAD minimum span 0x200.
+
+## Exact next blockers
+
+1. Live dump with MESH-V# diagnostic + per-draw pixel clear: confirm post-patch
+   word3 is float2 (not RegularBuffer) and PARAM0 UV range on draw ≥47000.
+2. If patch applies: fix ES/PS UV scale-bias (1152/1920 mismatch / missing +0.5)
+   or prove guest constants intentional — then re-assess efc.
+3. `804345` quadrant-garbage tiler/store once UVs sample lit texels.
