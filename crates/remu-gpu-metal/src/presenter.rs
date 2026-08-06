@@ -141,7 +141,8 @@ use self::present::{
 };
 use self::readback::{
     WRITEBACK_TRIGGER_COUNT, WRITEBACK_TRIGGERS, WritebackTrigger, capture_guest_frame,
-    diagnostic_texture_depth_plane_summaries, guest_frame_fingerprint,
+    diagnostic_f32_bits_magnitude_nonzero, diagnostic_texture_depth_plane_summaries,
+    diagnostic_texture_magnitude_nonzero_texels, guest_frame_fingerprint,
     metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, read_texture_array_linear,
     read_texture_linear, read_texture_linear_after_event, read_texture_volume_linear,
 };

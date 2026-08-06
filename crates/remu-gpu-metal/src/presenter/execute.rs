@@ -39,7 +39,8 @@ use super::{
     diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
     diagnostic_scanout_writer_slot, diagnostic_scanout_writer_target_selected,
     diagnostic_shader_summary, diagnostic_target_draw_filter,
-    diagnostic_texture_depth_plane_summaries, diagnostic_texture_writer,
+    diagnostic_f32_bits_magnitude_nonzero, diagnostic_texture_depth_plane_summaries,
+    diagnostic_texture_magnitude_nonzero_texels, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
     diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
     diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
@@ -2479,6 +2480,10 @@ impl MetalPresenter {
                             (
                                 bytes.len(),
                                 bytes.iter().filter(|&&value| value != 0).count(),
+                                diagnostic_texture_magnitude_nonzero_texels(
+                                    &bytes,
+                                    readback_descriptor,
+                                ),
                                 guest_frame_fingerprint(&bytes),
                                 bytes.get(..bytes.len().min(32)).unwrap_or(&[]).to_vec(),
                                 depth_planes,
@@ -2489,6 +2494,10 @@ impl MetalPresenter {
                                 (
                                     bytes.len(),
                                     bytes.iter().filter(|&&value| value != 0).count(),
+                                    diagnostic_texture_magnitude_nonzero_texels(
+                                        &bytes,
+                                        uploaded.descriptor.guest,
+                                    ),
                                     guest_frame_fingerprint(&bytes),
                                     bytes.get(..bytes.len().min(32)).unwrap_or(&[]).to_vec(),
                                 )
@@ -2527,6 +2536,8 @@ impl MetalPresenter {
                     _ => read_texture_linear(&device, &queue, &texture, descriptor)?,
                 };
                 let nonzero = bytes.iter().filter(|&&value| value != 0).count();
+                let magnitude_nonzero =
+                    diagnostic_texture_magnitude_nonzero_texels(&bytes, descriptor);
                 let fingerprint = guest_frame_fingerprint(&bytes);
                 if diagnostic_dump_glyph_draw()
                     && evaluation_samples_glyph_atlas(pixel_evaluation)
@@ -2978,9 +2989,17 @@ impl MetalPresenter {
                         let words =
                             super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
                         let covered = words.chunks_exact(5).filter(|pixel| pixel[0] != 0).count();
+                        // Count magnitude, not raw bits: IEEE -0.0 is 0x80000000 and must not
+                        // look like a live HDR export (SH title 800bf4).
                         let nonzero = words
                             .chunks_exact(5)
-                            .filter(|pixel| pixel[0] != 0 && pixel[1..].iter().any(|&v| v != 0))
+                            .filter(|pixel| {
+                                pixel[0] != 0
+                                    && pixel[1..]
+                                        .iter()
+                                        .copied()
+                                        .any(diagnostic_f32_bits_magnitude_nonzero)
+                            })
                             .count();
                         let mut finite = 0_usize;
                         let mut sum = [0.0_f64; 4];
@@ -3059,7 +3078,7 @@ impl MetalPresenter {
                     );
                 }
                 eprintln!(
-                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
+                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} magnitude_nz={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
                     draw.sequence,
                     draw.export_shader_address,
                     draw.pixel_shader_address,
@@ -3078,6 +3097,7 @@ impl MetalPresenter {
                     descriptor.pixel_format,
                     bytes.len(),
                     nonzero,
+                    magnitude_nonzero,
                     key.targets,
                     key.vertex_output_control,
                     key.pixel_input_controls,

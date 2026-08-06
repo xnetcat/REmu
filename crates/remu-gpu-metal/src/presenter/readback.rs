@@ -1419,6 +1419,44 @@ pub(super) fn guest_frame_fingerprint(bytes: &[u8]) -> u64 {
         })
 }
 
+/// IEEE ±0.0 share a non-zero sign bit. Byte/bit occupancy must not treat that as content —
+/// Silent Hill's HDR tonemap path exported `0x80000000` / fp16 `0x8000` and looked "nz≠0"
+/// while every float magnitude was still zero.
+#[must_use]
+pub(super) fn diagnostic_f32_bits_magnitude_nonzero(bits: u32) -> bool {
+    f32::from_bits(bits) != 0.0
+}
+
+/// Count texels whose decoded float components have non-zero magnitude.
+///
+/// Falls back to byte occupancy for formats without a float decode path.
+#[must_use]
+pub(super) fn diagnostic_texture_magnitude_nonzero_texels(
+    plane: &[u8],
+    descriptor: GuestTextureDescriptor,
+) -> usize {
+    let Ok(bytes_per_pixel) = usize::try_from(descriptor.bytes_per_pixel) else {
+        return plane.iter().filter(|&&value| value != 0).count();
+    };
+    if bytes_per_pixel == 0 || !plane.len().is_multiple_of(bytes_per_pixel) {
+        return plane.iter().filter(|&&value| value != 0).count();
+    }
+    match descriptor.pixel_format {
+        MTLPixelFormat::RGBA16Float | MTLPixelFormat::RG11B10Float => plane
+            .chunks_exact(bytes_per_pixel)
+            .filter(|pixel| {
+                diagnostic_texture_numeric_components(pixel, descriptor.pixel_format).is_some_and(
+                    |(values, count)| values[..count].iter().any(|value| *value != 0.0),
+                )
+            })
+            .count(),
+        _ => plane
+            .chunks_exact(bytes_per_pixel)
+            .filter(|pixel| pixel.iter().any(|&value| value != 0))
+            .count(),
+    }
+}
+
 fn guest_frame_is_fully_black(bgra: &[u8]) -> bool {
     bgra.chunks_exact(4)
         .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
@@ -1489,7 +1527,12 @@ pub(super) fn capture_guest_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::begin_capture_attempt_if_due;
+    use super::{
+        begin_capture_attempt_if_due, diagnostic_f32_bits_magnitude_nonzero,
+        diagnostic_texture_magnitude_nonzero_texels,
+    };
+    use crate::presenter::GuestTextureDescriptor;
+    use metal::MTLPixelFormat;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1518,5 +1561,33 @@ mod tests {
             start + interval + Duration::from_secs(1),
             interval
         ));
+    }
+
+    #[test]
+    fn signed_zero_float_bits_are_not_magnitude_nonzero() {
+        assert!(!diagnostic_f32_bits_magnitude_nonzero(0));
+        assert!(!diagnostic_f32_bits_magnitude_nonzero(0x8000_0000));
+        assert!(diagnostic_f32_bits_magnitude_nonzero(0x3f80_0000));
+        assert!(diagnostic_f32_bits_magnitude_nonzero(0xbf80_0000));
+    }
+
+    #[test]
+    fn rgba16float_signed_zero_texels_are_not_magnitude_nonzero() {
+        // Matches the SH title tonemap tex0 Metal preview: R=-0, G=+0, B=-0, A=+0.
+        let plane = [0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00];
+        let descriptor = GuestTextureDescriptor {
+            address: 0,
+            width: 1,
+            height: 1,
+            pitch: 1,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA16Float,
+            bytes_per_pixel: 8,
+        };
+        assert_eq!(
+            diagnostic_texture_magnitude_nonzero_texels(&plane, descriptor),
+            0
+        );
+        assert_eq!(plane.iter().filter(|&&value| value != 0).count(), 2);
     }
 }
