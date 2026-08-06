@@ -3426,6 +3426,7 @@ fn deferred_shared_guest_write_rejects_reused_mapping() {
 }
 
 #[test]
+#[ignore = "Phase 1G routes anonymous maps through committed backing; deferred anonymous replacement contract deleted with host-private Anonymous VMA"]
 fn deferred_anonymous_guest_write_rejects_reused_mapping() {
     let mut address_space =
         GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");

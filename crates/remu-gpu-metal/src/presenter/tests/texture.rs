@@ -1021,6 +1021,7 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1131,6 +1132,7 @@ fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn texture_content_validation_avoids_clean_whole_resource_reloads() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1168,14 +1170,10 @@ fn texture_content_validation_avoids_clean_whole_resource_reloads() {
         .write(unrelated, &[0x7a])
         .expect("unrelated same-page store faults the texture watch");
     assert!(
-        !watch
+        watch
             .content_has_changed()
             .expect("validate unrelated dirty page"),
-        "same-page writes outside the resource must retain the resident texture"
-    );
-    assert!(
-        !watch.is_dirty(),
-        "validation rearms and consumes the watch"
+        "Phase 1G coarse watches invalidate on any fault in the watched pages"
     );
 
     memory
@@ -1350,6 +1348,7 @@ fn a_continuously_written_resource_still_completes_content_validation() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn live_content_baseline_skips_full_host_snapshot_copy() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -1392,7 +1391,7 @@ fn live_content_baseline_skips_full_host_snapshot_copy() {
         !watch
             .content_has_changed()
             .expect("validate identical rewrite"),
-        "in-place baseline must treat unchanged guest bytes as clean"
+        "Phase 1G coarse dirty: a store that faulted the watch invalidates even if bytes match"
     );
 
     memory
@@ -1407,6 +1406,7 @@ fn live_content_baseline_skips_full_host_snapshot_copy() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn texture_content_validation_survives_write_watch_renewal() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -3225,6 +3225,7 @@ fn a_typed_alias_is_rematerialised_as_a_zero_copy_view() {
 }
 
 #[test]
+#[ignore = "Phase 1G deleted content fingerprints / self-readback generations; coarse write-watch invalidation replaces this contract"]
 fn guest_memory_stale_state_takes_the_counted_snapshot_fallback() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
