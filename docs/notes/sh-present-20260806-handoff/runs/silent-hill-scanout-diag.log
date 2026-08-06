@@ -1,0 +1,420 @@
+[REMu] acquiring exclusive build lock: /Users/xnetcat/Documents/REmu/target/.remu-build.lock
+[REMu] held exclusive build lock
+[REMu] building the Rosetta release runner
+   Compiling remu-memory v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-memory)
+   Compiling remu-gpu v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-gpu)
+   Compiling remu-gpu-metal v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-gpu-metal)
+   Compiling remu-runtime v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-runtime)
+warning: unused imports: `CachedGlobalBuffer` and `GlobalBufferCacheKey`
+ --> crates/remu-gpu-metal/src/presenter/cache.rs:5:5
+  |
+5 |     CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
+  |     ^^^^^^^^^^^^^^^^^^
+6 |     GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
+  |     ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `TextureWritebackOutcome`, `encode_mode27_mip_chain_into_raw`, `mode27_mip_chain_layout`, `snapshot_watched_guest_range`, `texture_element_layout`, `write_guest_texture_linear_into_raw_at_z`, `write_watched_guest_range`, and `write_watched_guest_texture_linear`
+  --> crates/remu-gpu-metal/src/presenter/readback.rs:10:28
+   |
+10 |     TextureReadbackLayout, TextureWritebackOutcome, capture_interval, diagnostic_dump_glyph_draw,
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^
+...
+13 |     encode_mode27_mip_chain_into_raw, evaluation_samples_glyph_atlas, half_float_to_f32,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+14 |     half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
+15 |     mode27_mip_chain_layout, retire_multisample_textures_overlapping_writeback,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^
+16 |     retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
+   |                                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+17 |     texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+18 |     write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
+19 |     write_watched_guest_texture_linear,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `decode_guest_texture_linear_from_raw` and `snapshot_watched_guest_texture_raw`
+  --> crates/remu-gpu-metal/src/presenter/texture/residency.rs:23:5
+   |
+23 |     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+32 |     snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `StaleSource`, `TEXTURE_DIRTY_VALIDATION_BYTES`, `TEXTURE_DIRTY_VALIDATION_COUNT`, `TEXTURE_DIRTY_VALIDATION_NANOSECONDS`, `TEXTURE_DIRTY_VALIDATION_UNCHANGED`, and `trace_resident_texture_demotion`
+  --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:9:5
+   |
+ 9 |     StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
+   |     ^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+10 |     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+16 |     trace_resident_texture_demotion, trace_resident_texture_removal,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `create_exact_mode27_sampled_mip_view` and `create_exact_mode5_sampled_mip_view`
+  --> crates/remu-gpu-metal/src/presenter/texture.rs:69:5
+   |
+69 |     create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `encode_gpu_publish_to_guest_view`
+  --> crates/remu-gpu-metal/src/presenter/tiler/mod.rs:24:48
+   |
+24 |     GpuTilerView, encode_gpu_publish_to_guest, encode_gpu_publish_to_guest_view,
+   |                                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `lease_validated_reconciliation_ready`
+  --> crates/remu-gpu-metal/src/presenter/tiler/mod.rs:28:51
+   |
+28 |     EndStateWriteClass, classify_end_state_write, lease_validated_reconciliation_ready,
+   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `MODE27_TILER_MSL`, `MODE5_TILER_MSL`, `MODE9_TILER_MSL`, `TilerKernelKind`, `cached_tiler_library`, `compile_tiler_library`, `mode5_tiler_pipelines`, `mode9_tiler_pipelines`, `tiler_kernel_name`, and `tiler_kernel_source`
+  --> crates/remu-gpu-metal/src/presenter/tiler/mod.rs:38:5
+   |
+38 |     MODE5_TILER_MSL, MODE9_TILER_MSL, MODE27_TILER_MSL, TilerKernelKind, cached_tiler_library,
+   |     ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+39 |     compile_tiler_library, mode27_tiler_pipelines, mode5_tiler_pipelines, mode9_tiler_pipelines,
+   |     ^^^^^^^^^^^^^^^^^^^^^                          ^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+40 |     tiler_kernel_name, tiler_kernel_source,
+   |     ^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^
+
+warning: variant `SampledCacheCreate` is never constructed
+   --> crates/remu-gpu-metal/src/presenter.rs:548:5
+    |
+546 | enum Mode27WorkOrigin {
+    |      ---------------- variant in this enum
+547 |     RenderTargetCreate,
+548 |     SampledCacheCreate,
+    |     ^^^^^^^^^^^^^^^^^^
+    |
+    = note: `Mode27WorkOrigin` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `gpu_authored_offsets` is never used
+    --> crates/remu-gpu-metal/src/presenter.rs:1508:8
+     |
+1392 | impl ResidentGuestTexture {
+     | ------------------------- method in this implementation
+...
+1508 |     fn gpu_authored_offsets(&self) -> Option<Vec<(u64, u64)>> {
+     |        ^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `bytes`, `buffer`, and `offset` are never read
+    --> crates/remu-gpu-metal/src/presenter.rs:1646:5
+     |
+1645 | struct CachedGlobalBuffer {
+     |        ------------------ fields in this struct
+1646 |     bytes: Vec<u8>,
+     |     ^^^^^
+1647 |     buffer: Buffer,
+     |     ^^^^^^
+1648 |     offset: u64,
+     |     ^^^^^^
+
+warning: constant `GLOBAL_BUFFER_CACHE_CAPACITY` is never used
+    --> crates/remu-gpu-metal/src/presenter/cache.rs:1876:18
+     |
+1876 | pub(super) const GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GLOBAL_BUFFER_CACHE_BYTE_CAPACITY` is never used
+    --> crates/remu-gpu-metal/src/presenter/cache.rs:1878:18
+     |
+1878 | pub(super) const GLOBAL_BUFFER_CACHE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `journal_guest_write_segments` is never used
+    --> crates/remu-gpu-metal/src/presenter/diagnostics.rs:1607:15
+     |
+1607 | pub(super) fn journal_guest_write_segments(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `encode_mip` is never used
+   --> crates/remu-gpu-metal/src/presenter/readback.rs:532:19
+    |
+510 | impl PendingTextureReadback {
+    | --------------------------- associated function in this implementation
+...
+532 |     pub(super) fn encode_mip(
+    |                   ^^^^^^^^^^
+
+warning: function `read_texture_mip_linear` is never used
+    --> crates/remu-gpu-metal/src/presenter/readback.rs:1101:15
+     |
+1101 | pub(super) fn read_texture_mip_linear(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `active_transient_global_buffer_cache` and `active_transient_global_buffer_cache_mut` are never used
+   --> crates/remu-gpu-metal/src/presenter/submission/batch.rs:832:19
+    |
+309 | impl MetalPresenter {
+    | ------------------- methods in this implementation
+...
+832 |     pub(crate) fn active_transient_global_buffer_cache(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+851 |     pub(crate) fn active_transient_global_buffer_cache_mut(
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_guest_texture_linear_into_raw` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture.rs:186:15
+    |
+186 | pub(super) fn write_guest_texture_linear_into_raw(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_guest_texture_linear_into_raw_at_z` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture.rs:194:15
+    |
+194 | pub(super) fn write_guest_texture_linear_into_raw_at_z(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_watched_guest_texture_linear` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture.rs:235:15
+    |
+235 | pub(super) fn write_watched_guest_texture_linear(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `comparison_pixel_format` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:462:4
+    |
+462 | fn comparison_pixel_format(format: metal::MTLPixelFormat) -> metal::MTLPixelFormat {
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_exact_sampled_mip_texture` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:469:4
+    |
+469 | fn create_exact_sampled_mip_texture(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_exact_mode5_sampled_mip_view` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:628:15
+    |
+628 | pub(crate) fn create_exact_mode5_sampled_mip_view(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_exact_mode27_sampled_mip_view` is never used
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:705:15
+    |
+705 | pub(crate) fn create_exact_mode27_sampled_mip_view(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `create_guest_texture` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/residency.rs:2756:15
+     |
+2756 | pub(crate) fn create_guest_texture(
+     |               ^^^^^^^^^^^^^^^^^^^^
+
+warning: function `trace_glyph_atlas_linear` is never used
+  --> crates/remu-gpu-metal/src/presenter/texture/upload.rs:35:4
+   |
+35 | fn trace_glyph_atlas_linear(
+   |    ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `TextureWritebackOutcome` is never used
+  --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:37:17
+   |
+37 | pub(crate) enum TextureWritebackOutcome {
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `generations` is never used
+  --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:79:19
+   |
+70 | impl AcquireNoOpWatchToken {
+   | -------------------------- method in this implementation
+...
+79 |     pub(crate) fn generations(&self) -> &[u64] {
+   |                   ^^^^^^^^^^^
+
+warning: methods `with_live_backing`, `alias_address_for_canonical_range`, `copy_from_live_aliases`, `cpu_watches`, and `record_live_content_baseline` are never used
+   --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:526:19
+    |
+328 | impl GuestTextureWriteWatch {
+    | --------------------------- methods in this implementation
+...
+526 |     pub(crate) fn with_live_backing<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+574 |     fn alias_address_for_canonical_range(&self, address: u64, byte_count: u64) -> Option<u64> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+589 |     unsafe fn copy_from_live_aliases(
+    |               ^^^^^^^^^^^^^^^^^^^^^^
+...
+639 |     pub(crate) fn cpu_watches(&self) -> Vec<&remu_memory::CpuWriteWatch> {
+    |                   ^^^^^^^^^^^
+...
+716 |     pub(crate) fn record_live_content_baseline(&self) -> Result<(), String> {
+    |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `snapshot_watched_guest_texture_raw` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1119:15
+     |
+1119 | pub(crate) fn snapshot_watched_guest_texture_raw(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_watched_guest_range` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1139:15
+     |
+1139 | pub(crate) fn write_watched_guest_range(
+     |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: enum `BaselineSource` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1200:6
+     |
+1200 | enum BaselineSource<'a> {
+     |      ^^^^^^^^^^^^^^
+
+warning: function `publish_segments_leased` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1211:4
+     |
+1211 | fn publish_segments_leased(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `trace_discarded_stale_texture_writeback` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1322:4
+     |
+1322 | fn trace_discarded_stale_texture_writeback(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `authored_segments` is never used
+    --> crates/remu-gpu-metal/src/presenter/texture/watch.rs:1339:15
+     |
+1339 | pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(u64, &'a [u8])> {
+     |               ^^^^^^^^^^^^^^^^^
+
+warning: function `lease_validated_reconciliation_ready` is never used
+  --> crates/remu-gpu-metal/src/presenter/tiler/end_state.rs:42:15
+   |
+42 | pub(crate) fn lease_validated_reconciliation_ready(lease: Option<&GuestRangeLease>) -> bool {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_linear_to_tiled_at_z` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling.rs:108:15
+    |
+108 | pub(super) fn copy_linear_to_tiled_at_z(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_linear_to_mode27_mip_level` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode27.rs:281:15
+    |
+281 | pub(crate) fn copy_linear_to_mode27_mip_level(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `encode_mode27_mip_chain_into_raw` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode27.rs:394:15
+    |
+394 | pub(crate) fn encode_mode27_mip_chain_into_raw(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `copy_mode5_mip_level_to_linear` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode5.rs:160:4
+    |
+160 | fn copy_mode5_mip_level_to_linear(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `decode_mode5_mip_chain_from_raw` is never used
+   --> crates/remu-gpu-metal/src/presenter/tiling/mode5.rs:308:15
+    |
+308 | pub(crate) fn decode_mode5_mip_chain_from_raw(
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `remu-gpu-metal` (lib) generated 41 warnings (run `cargo fix --lib -p remu-gpu-metal` to apply 8 suggestions)
+   Compiling remu-cli v0.1.0 (/Users/xnetcat/Documents/REmu/crates/remu-cli)
+    Finished `release` profile [optimized] target(s) in 23.78s
+[REMu] host vm.loadavg: { 5.32 4.48 3.99 }
+[REMu] launching PPSA10112-app; artifacts: /Users/xnetcat/Documents/REmu/docs/notes/sh-present-20260806-handoff/runs/silent-hill-scanout-diag/20260806T051609Z-PPSA10112-app
+[REMu] render resolution: 1920x1080 (ue4-ps5-backbuffer)
+[REMu] automatic shutdown after 90s (pass 0 to disable)
+[REMu] external launch watchdog after 95s
+[REMu] headless Metal presenter enabled
+[REMu][METAL][SCANOUT-WRITE] writer=DiagnosticScanoutWriter { draw: 3460, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) } target=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } direct=false
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc0000000 1920x1080 selected=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4705, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3460, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3460, 549890162688, [GuestTextureDescriptor { address: 550920323072, width: 3840, height: 2160, pitch: 3840, tile_mode: 9, pixel_format: BC7_RGBAUnorm_sRGB, bytes_per_pixel: 16 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=88 address=0xefc0000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4705, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=88 finalized=88 uploaded=88 submitted=88
+[REMu][METAL][SCANOUT-WRITE] writer=DiagnosticScanoutWriter { draw: 3461, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) } target=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } direct=false
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc0000000 1920x1080 selected=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4706, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3461, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3461, 549890293760, [GuestTextureDescriptor { address: 549847367680, width: 1024, height: 1024, pitch: 1024, tile_mode: 9, pixel_format: R8Unorm, bytes_per_pixel: 1 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=88 address=0xefc0000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4706, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=88 finalized=88 uploaded=88 submitted=88
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc0000000 1920x1080 selected=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4706, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3461, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3461, 549890293760, [GuestTextureDescriptor { address: 549847367680, width: 1024, height: 1024, pitch: 1024, tile_mode: 9, pixel_format: R8Unorm, bytes_per_pixel: 1 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=89 address=0xefc0000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029718409216, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4706, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=89 finalized=88 uploaded=88 submitted=88
+[REMu][METAL][SCANOUT-FLIP] phase=finalize sequence=89 buffer=0 address=0xefc0000000 activation=translated finalized=89 uploaded=89 submitted=89 pending_queue=None target_written=false
+[REMu][AGC] command-buffer grow descriptor=0x7420e32230 requested=32 reserved=18 old=0x80444d6278..0x80444d62d0 new=0x80470f00d4..0x80471efdcc
+[REMu][AGC] build branch descriptor=0x315909888 command=0x80444d6278 mode=1 compare=0 address=0x80444d6278 mask=0x0 reference=0x0 then=0x80470f0000/3600 cache=0 else=0x0/0 cache=0
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc1000000 1920x1080 selected=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4756, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3421, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3497, 549984600064, [GuestTextureDescriptor { address: 550902497280, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }, GuestTextureDescriptor { address: 550902497280, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }, GuestTextureDescriptor { address: 550902497280, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }, GuestTextureDescriptor { address: 550902497280, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }, GuestTextureDescriptor { address: 550902497280, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=89 address=0xefc1000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4756, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=89 finalized=89 uploaded=89 submitted=89
+[REMu][METAL][SCANOUT-WRITE] writer=DiagnosticScanoutWriter { draw: 3498, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) } target=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } direct=false
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc1000000 1920x1080 selected=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4757, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3498, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3498, 549890162688, [GuestTextureDescriptor { address: 549856018432, width: 1, height: 1, pitch: 1, tile_mode: 1, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=89 address=0xefc1000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4757, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=89 finalized=89 uploaded=89 submitted=89
+[REMu][METAL][SCANOUT-WRITE] writer=DiagnosticScanoutWriter { draw: 3499, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) } target=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } direct=false
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc1000000 1920x1080 selected=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4758, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3499, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3499, 549890162688, [GuestTextureDescriptor { address: 549856018432, width: 1, height: 1, pitch: 1, tile_mode: 1, pixel_format: RGBA8Unorm, bytes_per_pixel: 4 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=89 address=0xefc1000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4758, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=89 finalized=89 uploaded=89 submitted=89
+[REMu][METAL][SCANOUT-WRITE] writer=DiagnosticScanoutWriter { draw: 3500, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) } target=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } direct=false
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc1000000 1920x1080 selected=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4759, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3500, export_shader: 549979488256, pixel_shader: 549890162688, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3500, 549890162688, [GuestTextureDescriptor { address: 550920323072, width: 3840, height: 2160, pitch: 3840, tile_mode: 9, pixel_format: BC7_RGBAUnorm_sRGB, bytes_per_pixel: 16 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=89 address=0xefc1000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4759, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=89 finalized=89 uploaded=89 submitted=89
+[REMu][METAL][SCANOUT-WRITE] writer=DiagnosticScanoutWriter { draw: 3501, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) } target=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } direct=false
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc1000000 1920x1080 selected=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4760, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3501, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3501, 549890293760, [GuestTextureDescriptor { address: 549847367680, width: 1024, height: 1024, pitch: 1024, tile_mode: 9, pixel_format: R8Unorm, bytes_per_pixel: 1 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=89 address=0xefc1000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4760, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=89 finalized=89 uploaded=89 submitted=89
+[REMu][METAL][SCANOUT-SOURCE] address=0xefc1000000 1920x1080 selected=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } candidates=[(GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 }, 4760, true)] last_writer=Some(DiagnosticScanoutWriter { draw: 3501, export_shader: 549979488256, pixel_shader: 549890293760, queue_id: Some(0) }) last_texture_writer=Some(("draw", 3501, 549890293760, [GuestTextureDescriptor { address: 549847367680, width: 1024, height: 1024, pitch: 1024, tile_mode: 9, pixel_format: R8Unorm, bytes_per_pixel: 1 }]))
+[REMu][METAL][SCANOUT-SNAPSHOT] sequence=90 address=0xefc1000000 source=resident snapshot_queue=Some(0) descriptor=GuestTextureDescriptor { address: 1029735186432, width: 1920, height: 1080, pitch: 1920, tile_mode: 27, pixel_format: BGRA8Unorm, bytes_per_pixel: 4 } selected_state=Some((4760, true)) source_format=BGRA8Unorm snapshot_format=Some(BGRA8Unorm) pending=90 finalized=89 uploaded=89 submitted=89
+[REMu][METAL][SCANOUT-FLIP] phase=finalize sequence=90 buffer=1 address=0xefc1000000 activation=translated finalized=90 uploaded=90 submitted=90 pending_queue=None target_written=false
+[REMu] external launch watchdog reached 95s
+[REMu] watchdog stopping pid=40283 after external timeout
+revision=119f798
+game=/Volumes/Untitled/sharpemu/games/SILENT HILL The Short Message/PPSA10112-app/eboot.bin
+timeout_seconds=90
+elapsed_seconds=95
+outcome=external-watchdog-timeout
+exit_status=124
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=ue4-ps5-backbuffer
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=31 total_calls=2601
+[REMu][REPORT] fabricated success key=znaWI0gpuo8 name=scePadGetTriggerEffectState calls=1680
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=161
+[REMu][REPORT] fabricated success key=gpu:noop-raster-disabled name=internal calls=154
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=81
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=81
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=81
+[REMu][REPORT] fabricated success key=-4GCfYdNF1s name=sceImeUpdate calls=80
+[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=80
+[REMu][REPORT] fabricated success key=gpu:noop-color-operation name=internal calls=76
+[REMu][REPORT] fabricated success key=gpu:noop-fast-clear-idle name=internal calls=76
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=26
+[REMu][REPORT] fabricated success key=gpu:noop-cover-placeholder name=internal calls=3
+[REMu][REPORT] fabricated success key=v8iOE+j8a5o name=sceAudioOut2MasteringSetParam calls=3
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=0gYjPTR-6cY name=sceHttpCreateTemplate calls=1
+[REMu][REPORT] fabricated success key=1xxcMiGu2fo name=sceUserServiceGetUserName calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=A9cVMUtEp4Y name=sceHttpInit calls=1
+[REMu][REPORT] fabricated success key=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=W2G-yoyMF5U name=scePadSetVibrationMode calls=1
+[REMu][REPORT] fabricated success key=XHl38ZNknbs name=sceAudioOut2MasteringInit calls=1
+[REMu][REPORT] fabricated success key=YBiIdcDPrxs name=sceShareFeaturePermit calls=1
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=1
+[REMu][REPORT] fabricated success key=jh+8XiK4LeE name=sceKernelIsAddressSanitizerEnabled calls=1
+[REMu][REPORT] fabricated success key=kmSe30JTs+E name=sceVideoOutAddOutputModeEvent calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
+[REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
+[REMu][REPORT] failing import name=sceKernelWaitEventFlag nid=JTvBflhYazQ failures=13346955 calls=13346977 results=0xffffffff8002003c:13346955
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=6372 calls=6419 results=0xffffffff80020002:6372
+[REMu][REPORT] failing import name=scePadReadState nid=YndgXqQVV7c failures=240 calls=320 results=0xffffffff80920003:240
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=81 calls=82 results=0xffffffff80960007:81
+[REMu][REPORT] failing import name=sceKernelWaitEqueue nid=fzyMKs9kim0 failures=79 calls=5566 results=0xffffffff8002003c:79
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=27 calls=38 results=0xffffffff80020002:25,0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
+[REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=14 calls=22 results=0xffffffffffffffff:14
+[REMu][REPORT] failing import name=sceKernelMkdir nid=1-LFLmRFxxM failures=8 calls=9 results=0xffffffff80020002:3,0xffffffff8002000d:5
+[REMu][REPORT] failing import name=sceNetCtlGetInfo nid=obuxdTiwkF8 failures=4 calls=4 results=0xffffffff80410132:4
+[REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceNetResolverCreate nid=C4UgDHHPvdw failures=1 calls=1 results=0xffffffff80410132:1
+[REMu] complete; full artifacts: /Users/xnetcat/Documents/REmu/docs/notes/sh-present-20260806-handoff/runs/silent-hill-scanout-diag/20260806T051609Z-PPSA10112-app

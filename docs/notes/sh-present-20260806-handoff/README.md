@@ -67,16 +67,32 @@ hallway”).
 - Remaining `8007a8/800802` drops with `target=0x0` / `target_mask=0x0` are genuine no-attachment
   draws (pipeline key), not the efc compositor path.
 
+## Follow-up diagnostic (main @ tip, `runs/silent-hill-scanout-diag/`)
+
+With `REMU_TRACE_SCANOUT_WRITES=1` + `REMU_DIAGNOSTIC_SCANOUT_WRITERS=targets:0xefc0…,0xefc1…`:
+
+| Observation | Evidence |
+| --- | --- |
+| Compositor writes VideoOut | **273** `SCANOUT-WRITE` for `es=0x800d55` / `ps=0x800802\|800804` |
+| Residents advance | `content_version` → ~4760, `gpu_written=true` |
+| Present snapshots translated | every flip `activation=translated` |
+| Flip write coalescing | **all** `target_written=false` under TRACE (mid-frame snapshot sets `uploaded_flip_sequence` → `note_pending_flip_target_write` early-return); not the sole black cause |
+| Bound samples | mode-9 **BC7** 3840×2160, mode-9 **R8** 1024², mode-1 **RGBA8** 1×1 |
+| Alias publish | still default-off (`sampled-alias` / `alias-rebuild` RemuBookkeeping) |
+| Outcome | still `captured_frames=0` — Metal readback of efc is fully black |
+
+So the tiler-ownership gate is closed; the remaining gate is **compositor color** (sample
+bytes / mesh+PS exports), not “no encode into VideoOut”.
+
 ## Next recommended blocker
 
 **Why encoded VideoOut compositor output is still fully black**, in order:
 
-1. Prove BC mode-1/5/9 GPU detile bytes against the CPU `blocks.rs` oracle on a live SH SRD
-   (wrong element addressing → black samples).
-2. Trace `ps=0x8008020000` / `0x8008040000` bindings after upload (resident content_version,
-   format view, SRD).
-3. Separate depth/internal passes from color-producing UI; keep LDS+missing-EXP loud refuse
-   (no INTERFACE-FILL / UV invent).
+1. Prove BC/R8 mode-1/5/9 GPU detile bytes against the CPU `blocks.rs` oracle on a live SH SRD
+   (`REMU_CAPTURE_DIR` + `REMU_CAPTURE_TARGET_SAMPLES=1`, or GPU↔CPU linear buffer compare).
+2. Trace `ps=0x8008020000` / `0x8008040000` after upload (SRD, resident `content_version`,
+   nonzero sample fingerprints) — dump scanout MSL if needed.
+3. Keep LDS+missing-EXP loud refuse (no INTERFACE-FILL / UV invent).
 4. If SH present stays black with proven uploads, pivot: DeS `sceAcmBatchStartBuffers`, or
    Dreaming Sarah / Void null-SIGSEGV.
 
