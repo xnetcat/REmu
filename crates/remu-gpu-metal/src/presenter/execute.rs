@@ -1333,39 +1333,57 @@ impl MetalPresenter {
             .copied()
             .map(|depth| self.cached_depth_stencil_state(&device, depth));
         let diagnostic_vertex_position_buffer = if diagnostic_capture_vertex_position() {
+            let byte_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
+                .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)
+                .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or("diagnostic vertex-position byte count overflow")?;
             if self.diagnostic_vertex_position_buffer.is_none() {
-                let byte_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
-                    .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)
-                    .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .ok_or("diagnostic vertex-position byte count overflow")?;
                 let buffer = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
                 buffer.set_label("REMu diagnostic vertex positions");
                 self.diagnostic_vertex_position_buffer = Some(buffer);
             }
-            self.diagnostic_vertex_position_buffer.clone()
+            // Zero per draw so TARGET dumps do not inherit prior-draw residue. Mesh stages do not
+            // write this buffer today; stale non-zeros previously looked like guest VB samples.
+            let buffer = self
+                .diagnostic_vertex_position_buffer
+                .as_ref()
+                .expect("diagnostic vertex-position buffer was just ensured");
+            let byte_count = usize::try_from(byte_count)
+                .expect("diagnostic vertex-position byte count fits usize");
+            assert!(
+                super::MetalBytes::new(buffer).fill(0, 0, byte_count),
+                "diagnostic vertex-position buffer must expose byte_count shared bytes"
+            );
+            Some(buffer.clone())
         } else {
             None
         };
         let diagnostic_pixel_output_buffer = if diagnostic_capture_pixel_output() {
+            let byte_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
+                .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)
+                .and_then(|pixels| pixels.checked_mul(5))
+                .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
+                .and_then(|bytes| u64::try_from(bytes).ok())
+                .ok_or("diagnostic pixel-output byte count overflow")?;
             if self.diagnostic_pixel_output_buffer.is_none() {
-                let byte_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
-                    .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)
-                    .and_then(|pixels| pixels.checked_mul(5))
-                    .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
-                    .and_then(|bytes| u64::try_from(bytes).ok())
-                    .ok_or("diagnostic pixel-output byte count overflow")?;
                 let buffer = device.new_buffer(byte_count, MTLResourceOptions::StorageModeShared);
                 buffer.set_label("REMu diagnostic pixel outputs");
-                let byte_count = usize::try_from(byte_count)
-                    .expect("diagnostic pixel-output byte count fits usize");
-                assert!(
-                    super::MetalBytes::new(&buffer).fill(0, 0, byte_count),
-                    "the newly allocated shared buffer exposes exactly byte_count bytes"
-                );
                 self.diagnostic_pixel_output_buffer = Some(buffer);
             }
-            self.diagnostic_pixel_output_buffer.clone()
+            // Zero per draw: without this, covered=2073600 accumulates across every PS draw in the
+            // session and cannot attribute fullscreen coverage to the dumped TARGET draw.
+            let buffer = self
+                .diagnostic_pixel_output_buffer
+                .as_ref()
+                .expect("diagnostic pixel-output buffer was just ensured");
+            let byte_count =
+                usize::try_from(byte_count).expect("diagnostic pixel-output byte count fits usize");
+            assert!(
+                super::MetalBytes::new(buffer).fill(0, 0, byte_count),
+                "diagnostic pixel-output buffer must expose byte_count shared bytes"
+            );
+            Some(buffer.clone())
         } else {
             None
         };
