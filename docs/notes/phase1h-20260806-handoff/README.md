@@ -2,7 +2,8 @@
 
 **Branch:** `phase1h-gpu-sync` @ tip before merge (worktree `/Users/xnetcat/Documents/REmu-phase1h`)  
 **Base:** `main` @ `8ed20de`  
-**Code tip for live matrix:** `f8bdad5`
+**Code tip for live matrix:** 
+**Merged to main** @ . Phase 1 A–H complete.`f8bdad5`
 
 ## CLOSED — what “closed” means (loud anti-claims)
 

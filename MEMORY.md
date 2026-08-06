@@ -26,7 +26,7 @@ registers/packets that state intent.
 - Handoff: `docs/notes/phase1f-20260806-handoff/`.
 - **Anti-claim:** Unity GC STW not live-closed (Dreaming Sarah dies before InstallExceptionHandler).
 
-## Phase 1H — GPU sync completeness (CLOSED 2026-08-06)
+## Phase 1H — GPU sync completeness (CLOSED 2026-08-06; on  @ )
 
 - SDK `sync.cpp`: RELEASE_MEM action/GCR/cache_policy; CB/DB EVENT_WRITE writebacks;
   WAIT_REG_MEM WaitOperation (PFP vs ME); `gpuSyncDma` nowhere barrier; label visibility on
