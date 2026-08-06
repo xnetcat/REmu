@@ -509,12 +509,20 @@ pub(crate) fn decode_ngg_registers_from_state(
         export_user_data_register.saturating_sub(2),
     )
     .ok_or("NGG state is missing merged-stage SPI_SHADER_PGM_RSRC1")?;
+    // SDK `ShShaderResource2Gs_0 = 0x008b` sits immediately before the merged-stage user-data
+    // base (`0x08c`). Same relative slot for the LS/ES user-data bases.
+    let pgm_rsrc2 = register_value(
+        shader_registers,
+        export_user_data_register.saturating_sub(1),
+    )
+    .ok_or("NGG state is missing merged-stage SPI_SHADER_PGM_RSRC2")?;
     let gs_max_vert_out = register_value(context_registers, VGT_GS_MAX_VERT_OUT)
         .ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
     let ge_max_output_per_subgroup = register_value(context_registers, GE_MAX_OUTPUT_PER_SUBGROUP)
         .ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
     Ok(remu_shader_metal::NggRegisters {
         pgm_rsrc1,
+        pgm_rsrc2,
         gs_max_vert_out,
         ge_max_output_per_subgroup,
     })

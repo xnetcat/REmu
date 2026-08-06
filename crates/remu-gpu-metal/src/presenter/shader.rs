@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use super::{
     CompiledComputePipeline, CompiledShaderPair, ComputePipelineKey, GraphicsPipelineKey,
-    MetalPresenter, NGG_MESH_LDS_BYTES, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
+    MetalPresenter, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
     PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
     PersistentRenderPipelineArchive, PipelineCompileCandidate, ProgramIdentity,
     RenderPipelineArchiveState, ShaderCompileRequest, ShaderCompileResult, ShaderFunctionCache,
@@ -508,9 +508,11 @@ impl MetalPresenter {
             // Q5: derive the Metal interface and proof flag from the live SDK register dwords.
             // Meshlet preparation still uses the more detailed decoded limits above, including
             // the independent input-primitive bound.
+            // LDS comes from `ShShaderResource2Gs::getLdsSize` via proven `NggRegisters` — never a
+            // hardcoded 16 KiB cushion. Over-allocating guest LDS plus compacted EXP staging is what
+            // pushes Metal mesh pipelines past the 32 KiB threadgroup limit.
             let mut mesh_options = remu_shader_metal::MetalCompileOptions::mesh_from_ngg_registers(
                 pixel_msl.interpolated_attribute_count,
-                NGG_MESH_LDS_BYTES,
                 limits.threadgroup_threads,
                 registers,
             );

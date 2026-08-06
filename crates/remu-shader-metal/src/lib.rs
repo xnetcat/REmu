@@ -128,6 +128,8 @@ pub const fn identity_pixel_input_controls() -> [PixelInputControl; PIXEL_INPUT_
 pub struct NggRegisters {
     /// `SPI_SHADER_PGM_RSRC1_*` for the merged NGG stage. Only the low `VGPRS` field is consumed.
     pub pgm_rsrc1: u32,
+    /// `SPI_SHADER_PGM_RSRC2_*` / `ShShaderResource2Gs` for the merged NGG stage. Supplies LDS.
+    pub pgm_rsrc2: u32,
     /// `VGT_GS_MAX_VERT_OUT`: the geometry stage's maximum output vertex count.
     pub gs_max_vert_out: u32,
     /// `GE_MAX_OUTPUT_PER_SUBGROUP`: the per-subgroup output-vertex cap after amplification.
@@ -144,6 +146,17 @@ impl NggRegisters {
     #[must_use]
     pub const fn allocated_vgprs_wave32(self) -> u32 {
         ((self.pgm_rsrc1 & 0x3f) + 1) << 3
+    }
+
+    /// Guest LDS reservation in bytes for one NGG threadgroup, from `PGM_RSRC2.LDS_SIZE`.
+    ///
+    /// SDK `ShShaderResource2Gs::getLdsSize()` (registerstructs.h:12154-12157):
+    /// `((m_regs[0].m_value & 0x07f80000u) >> 12)`. The 8-bit field in bits `[26:19]` is already
+    /// scaled by the getter into a byte count with a 128-byte granule (field `1` → 128 bytes;
+    /// field `0x80` → 16 KiB; field `0xff` → 32640).
+    #[must_use]
+    pub const fn lds_size_bytes(self) -> u32 {
+        (self.pgm_rsrc2 & 0x07f8_0000) >> 12
     }
 
     /// Maximum geometry output vertices, from `VGT_GS_MAX_VERT_OUT`.
@@ -426,7 +439,6 @@ impl MetalCompileOptions {
     #[must_use]
     pub fn mesh_from_ngg_registers(
         required_vertex_output_count: u32,
-        lds_size_bytes: u32,
         mesh_threadgroup_size: u32,
         registers: NggRegisters,
     ) -> Self {
@@ -445,7 +457,7 @@ impl MetalCompileOptions {
             ngg_registers_proven: true,
             ..Self::mesh(
                 required_vertex_output_count,
-                lds_size_bytes,
+                registers.lds_size_bytes(),
                 vertex_capacity,
                 vertex_capacity,
                 mesh_threadgroup_size,

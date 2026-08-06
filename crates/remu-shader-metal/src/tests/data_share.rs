@@ -423,10 +423,11 @@ fn proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole() {
     let program = empty_workaround_ngg_program();
     let mut options = MetalCompileOptions::mesh_from_ngg_registers(
         1,
-        16 * 1024,
         192,
         NggRegisters {
             pgm_rsrc1: 0x8,
+            // 16 KiB guest LDS (field 0x80) — matches the prior explicit lds_size_bytes argument.
+            pgm_rsrc2: 0x80 << 19,
             gs_max_vert_out: 64,
             ge_max_output_per_subgroup: 64,
         },
@@ -544,10 +545,10 @@ fn proven_ngg_registers_stage_compacted_vertex_exports_by_compacted_id() {
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh_from_ngg_registers(
         2,
-        16 * 1024,
         64,
         NggRegisters {
             pgm_rsrc1: 0x8,
+            pgm_rsrc2: 0x80 << 19,
             gs_max_vert_out: 64,
             ge_max_output_per_subgroup: 64,
         },

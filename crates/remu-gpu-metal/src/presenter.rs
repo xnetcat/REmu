@@ -314,7 +314,6 @@ const DEFAULT_SHADER_COMPILER_WORKER_COUNT: usize = 4;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 const NGG_MESHLET_BUFFER_INDEX: u64 = 29;
 const NGG_MESH_DRAW_BUFFER_INDEX: u64 = 30;
-const NGG_MESH_LDS_BYTES: u32 = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum NggOutputPrimitiveType {
