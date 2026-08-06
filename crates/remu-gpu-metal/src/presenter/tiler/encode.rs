@@ -35,9 +35,9 @@ pub(crate) fn gpu_tiler_owns_descriptor(descriptor: GuestTextureDescriptor) -> b
     {
         return matches!(descriptor.tile_mode, 0 | 1 | 5 | 9 | 24 | 27);
     }
-    // Mode-5/9 BC family: the CPU tiler already detiles the element grid; Silent Hill's
+    // Mode-1/5/9 BC family: the CPU tiler already detiles the element grid; Silent Hill's
     // VideoOut compositor samples these, so the GPU path must own them too.
-    matches!(descriptor.tile_mode, 5 | 9)
+    matches!(descriptor.tile_mode, 1 | 5 | 9)
         && compressed_texture_block_extent(descriptor.pixel_format).is_some()
         && matches!(descriptor.bytes_per_pixel, 8 | 16)
 }
@@ -228,7 +228,7 @@ fn plan_upload_subresources(
     let bytes_per_element =
         u64::try_from(layout_bpe).map_err(|_| "GPU tiler element size does not fit u64")?;
     let compressed_block = compressed_texture_block_extent(descriptor.pixel_format);
-    if compressed_block.is_some() && !matches!(descriptor.tile_mode, 5 | 9) {
+    if compressed_block.is_some() && !matches!(descriptor.tile_mode, 1 | 5 | 9) {
         return Err(format!(
             "Phase 1G GPU tiler refuses compressed format {:?} on tile={}",
             descriptor.pixel_format, descriptor.tile_mode
@@ -890,12 +890,14 @@ mod tests {
     }
 
     #[test]
-    fn tiler_owns_mode5_and_mode9_bc7_element_grid() {
+    fn tiler_owns_mode1_5_9_bc7_element_grid() {
         let mut bc7 = descriptor(5);
         bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
         bc7.bytes_per_pixel = 16;
         assert!(gpu_tiler_owns_descriptor(bc7));
         bc7.tile_mode = 9;
+        assert!(gpu_tiler_owns_descriptor(bc7));
+        bc7.tile_mode = 1;
         assert!(gpu_tiler_owns_descriptor(bc7));
         // Compressed ownership stays off mode-27 until that element-grid encode is wired.
         bc7.tile_mode = 27;
