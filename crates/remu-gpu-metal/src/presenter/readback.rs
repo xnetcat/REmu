@@ -168,6 +168,13 @@ impl MetalPresenter {
             trace_discarded_resident_writeback(resident, trigger, refusal);
             return Ok(false);
         }
+        if !crate::presenter::tiler::gpu_tiler_owns_descriptor(resident.descriptor) {
+            return Err(format!(
+                "Phase 1G: refusing CPU texture writeback for tile={} format={:?} — GPU tiler does not own this descriptor",
+                resident.descriptor.tile_mode,
+                resident.descriptor.pixel_format
+            ));
+        }
         let alias_ranges = resident.write_watch.alias_ranges();
         // A sampled or multisample view of the same storage would shadow the bytes about to be
         // published, so both are retired only on the path that really publishes them.
@@ -185,39 +192,53 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let queue = self
-            .command_queue
-            .as_ref()
-            .ok_or("Metal command queue is unavailable")?
-            .clone();
+        let resident = self
+            .resident_guest_textures
+            .get(&descriptor)
+            .ok_or("resident texture disappeared before its writeback")?;
+        let published_bytes = resident.gpu_authored.byte_count();
+        let authored: Vec<(u64, u64)> = resident.gpu_authored.runs().to_vec();
+        let texture = resident.texture.clone();
+        let guest_descriptor = resident.descriptor;
+        // Lease lifetime: require the watch's mapping still covers the descriptor before encode.
+        if resident.write_watch.retirement().is_some() {
+            let resident = self
+                .resident_guest_textures
+                .get_mut(&descriptor)
+                .ok_or("resident disappeared during revoked publish")?;
+            RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
+            RESIDENT_WRITEBACK_DISCARDED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
+            eprintln!(
+                "[REMu][METAL] demoting resident after revoked texture publish lease address={:#x} trigger={}",
+                resident.descriptor.address,
+                trigger.label(),
+            );
+            resident.demote(StaleSource::GuestMemory);
+            return Ok(false);
+        }
+        self.ensure_active_open_guest_batch()?;
+        let command_buffer = {
+            let batch = self
+                .active_open_guest_batch_mut()
+                .expect("guest batch opened for Phase 1G publish");
+            batch.close_active_pass_encoders();
+            batch.command_buffer.clone()
+        };
+        crate::presenter::tiler::encode_gpu_publish_to_guest(
+            &device,
+            &command_buffer,
+            guest_descriptor,
+            &texture,
+            &authored,
+        )?;
         let resident = self
             .resident_guest_textures
             .get_mut(&descriptor)
-            .ok_or("resident texture disappeared before its writeback")?;
-        let published_bytes = resident.gpu_authored.byte_count();
-        let outcome = write_resident_texture_contents_to_guest(&device, &queue, resident)?;
-        match outcome {
-            TextureWritebackOutcome::Applied => {
-                // Guest RAM and the Metal allocation are identical now: the allocation stays in
-                // place, still the authority for its bytes and owing none of them.
-                resident.clear_gpu_authored();
-                RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
-                RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
-                Ok(true)
-            }
-            TextureWritebackOutcome::DiscardedStale => {
-                // D4-texture: a revoked lease must demote loudly, never silently rebuild.
-                RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
-                RESIDENT_WRITEBACK_DISCARDED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
-                eprintln!(
-                    "[REMu][METAL] demoting resident after revoked texture writeback lease address={:#x} trigger={}",
-                    resident.descriptor.address,
-                    trigger.label(),
-                );
-                resident.demote(StaleSource::GuestMemory);
-                Ok(false)
-            }
-        }
+            .ok_or("resident texture disappeared after GPU publish encode")?;
+        resident.clear_gpu_authored();
+        RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
+        RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
+        Ok(true)
     }
 
     pub(super) fn direct_scanout_needs_initial_clear(&self, address: u64) -> bool {

@@ -11,9 +11,14 @@
 
 mod absolute_address;
 mod deferred;
+mod encode;
 mod end_state;
 mod equations;
 mod msl;
+
+pub(crate) use encode::{
+    encode_gpu_publish_to_guest, encode_gpu_upload_from_guest, gpu_tiler_owns_descriptor,
+};
 
 #[allow(unused_imports)]
 // Q4 absolute-address pool surface — co-owned with shader-metal; not Phase 1G.

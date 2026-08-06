@@ -3,7 +3,9 @@
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::completion::commit_and_settle;
-use super::super::tiler::mode27_tiler_pipelines;
+use super::super::tiler::{
+    encode_gpu_upload_from_guest, gpu_tiler_owns_descriptor, mode27_tiler_pipelines,
+};
 use super::super::{
     FlushPolicy, GuestBatchFlushReason, SharedEventResidentTextureVersion, SharedEventWriteKind,
     WritebackTrigger,
@@ -1598,14 +1600,102 @@ impl MetalPresenter {
         }
         // The map path only ever adopts, reuses or creates under the exact key.
         Ok(SelectedResidentTexture {
-            texture: ensure_resident_texture_in_map(
+            texture: self.ensure_resident_texture_in_map_phase1g(
                 device,
                 descriptor,
-                &mut self.resident_guest_textures,
                 upload_guest_contents,
             )?,
             descriptor,
         })
+    }
+
+    /// Phase 1G: create/adopt a resident under the exact key using GPU-timeline upload when
+    /// the descriptor is tiler-owned. Never CPU-snapshots guest RAM for those modes.
+    fn ensure_resident_texture_in_map_phase1g(
+        &mut self,
+        device: &Device,
+        descriptor: GuestTextureDescriptor,
+        upload_guest_contents: bool,
+    ) -> Result<Texture, String> {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .get_mut(&descriptor)
+            .filter(|resident| {
+                resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count >= 1
+            })
+        {
+            match refresh_resident_texture_write_watch(resident)? {
+                WriteWatchRefresh::Active
+                | WriteWatchRefresh::Reprotecting
+                | WriteWatchRefresh::Renewed { .. } => {
+                    if resident.reclaim_for_bind(!upload_guest_contents) {
+                        return Ok(resident.texture.clone());
+                    }
+                }
+                WriteWatchRefresh::Replaced => {}
+            }
+        }
+        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+            trace_resident_texture_removal("ensure-exact-resident-replaced-phase1g", &resident);
+        }
+        let write_watch = watch_guest_texture(descriptor)?;
+        let usage = MTLTextureUsage::RenderTarget
+            | MTLTextureUsage::ShaderRead
+            | MTLTextureUsage::ShaderWrite
+            | MTLTextureUsage::PixelFormatView;
+        let texture = if upload_guest_contents {
+            if !gpu_tiler_owns_descriptor(descriptor) {
+                return Err(format!(
+                    "Phase 1G: refusing CPU snapshot upload for tile={} format={:?} bpe={} — no GPU tiler ownership",
+                    descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
+                ));
+            }
+            let texture = create_uninitialized_guest_texture(device, descriptor, usage)?;
+            // Create-time upload uses a dedicated command buffer that settles before return so
+            // a later CPU `replace_region` (tests) or GPU draw cannot race a deferred zero
+            // upload still pending in the open guest batch. Steady-state publication stays on
+            // the open guest batch via `encode_gpu_publish_to_guest`.
+            let queue = self
+                .command_queue
+                .as_ref()
+                .ok_or("Metal command queue is unavailable for Phase 1G upload")?
+                .clone();
+            let upload_buffer = queue.new_command_buffer().to_owned();
+            upload_buffer.set_label("REMu Phase 1G create-time GPU upload");
+            encode_gpu_upload_from_guest(device, &upload_buffer, descriptor, &texture)?;
+            upload_buffer.commit();
+            upload_buffer.wait_until_completed();
+            texture
+        } else {
+            // Discarded targets still need a coarse watch; content baseline fingerprints are
+            // deleted with the CPU upload path — the watch itself invalidates on guest writes.
+            create_uninitialized_guest_texture(device, descriptor, usage)?
+        };
+        texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
+        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
+        self.resident_guest_textures.insert(
+            descriptor,
+            ResidentGuestTexture {
+                texture: texture.clone(),
+                component_reorder_view: None,
+                descriptor,
+                texture_type: 9,
+                layer_count: 1,
+                mip_level_count: 1,
+                write_watch,
+                span,
+                owned,
+                gpu_authored: RangeSet::default(),
+                state: ResidencyState::Live,
+                content_version: 0,
+                gpu_write_watch_generations: Vec::new(),
+                last_use: ResidentTextureActivityStamp::default(),
+                activity: super::super::ResidentTextureActivity::enabled(),
+            },
+        );
+        Ok(texture)
     }
 
     pub(crate) fn ensure_mipmapped_render_target_texture(
@@ -2610,15 +2700,19 @@ pub(crate) fn ensure_resident_texture_in_map(
         | MTLTextureUsage::ShaderWrite
         | MTLTextureUsage::PixelFormatView;
     let texture = if upload_guest_contents {
-        let raw = snapshot_watched_guest_texture_raw(descriptor, &write_watch)?;
-        let linear = decode_guest_texture_linear_from_raw(descriptor, &raw)?;
-        create_guest_texture(device, descriptor, usage, &linear)?
+        // Phase 1G: CPU snapshot+detile+replaceRegion is deleted for tiler-owned descriptors.
+        // Callers with an open guest batch must use MetalPresenter::ensure_resident_texture_* .
+        if gpu_tiler_owns_descriptor(descriptor) {
+            return Err(format!(
+                "Phase 1G: ensure_resident_texture_in_map refuses CPU upload for tile={} at {:#x}; use the presenter GPU-timeline path",
+                descriptor.tile_mode, descriptor.address
+            ));
+        }
+        return Err(format!(
+            "Phase 1G: refusing CPU snapshot upload for tile={} format={:?} bpe={} — no GPU tiler ownership",
+            descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
+        ));
     } else {
-        // A discarded render target still needs a CPU-content baseline. Mapping a later coherent
-        // alias retires this watch and requests validation; without initialized fingerprints an
-        // unchanged guest allocation would look CPU-modified and could discard newer GPU output.
-        // Fingerprint the live mapping in place — a full host snapshot Vec was pure overhead here.
-        write_watch.record_live_content_baseline()?;
         create_uninitialized_guest_texture(device, descriptor, usage)?
     };
     texture.set_label(&format!("REMu guest image {:#x}", descriptor.address));
