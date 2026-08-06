@@ -17,7 +17,7 @@ Oregon / Poppy watchdog-timeout clean; `pthread_setschedparam` no longer fabrica
 GC STW **not** live-proven — Dreaming Sarah still null-SIGSEGV before `InstallExceptionHandler`.
 Demon's Souls still ACM-blocked.
 
-## Phase 1H (2026-08-06) — GPU sync completeness — CLOSED (on  @ )
+## Phase 1H (2026-08-06) — GPU sync completeness — CLOSED (on `main` @ `6f503df`)
 
 SDK `sync.cpp` RELEASE_MEM / WAIT_REG_MEM / CB·DB writeback / `gpuSyncDma`; W712 cross-queue
 fence DMA on the GPU timeline (`CrossQueue` 1ms host reject deleted); consumer-aware ACQUIRE
