@@ -17,16 +17,19 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Silent Hill present — sampled tiler + splash UI (2026-08-06)
+## Silent Hill present — past splash; title 3D still black (2026-08-06)
 
-- **Compositor root cause:** Phase 1G sampled upload refuse tile 1/5/9 (RGBA8→BC7). Fixed:
-  GPU-tiler own mode-1/5/9 uncompressed + BC element grids.
-- **Matrix `captured_frames=0`:** often `REMU_CAPTURE_FRAMES` default-off — not present failure.
-- **Live @ tip + `REMU_CAPTURE_FRAMES=1`:** frames=13; HEXA DRIVE + KONAMI splash assessable;
-  early efc readbacks truly black (`skip capture … nonzero=0`); some garbage PPMs remain.
+- **Compositor tiler:** mode-1/5/9 uncompressed + BC element grids (splash UI).
+- **Mesh LDS (`f28cee1`):** NGG mesh LDS from SDK `ShShaderResource2Gs::getLdsSize`.
+- **Mode-5 BC mips (`8e4ed20`):** GPU tiler plans AddrLib mode-5 compressed mip chains
+  (element grid + floor-shifted pixel blit). Live refuse count **0** (was ~10).
+- **Live @ `8e4ed20` + capture + Cross:** splash → content-warning **hallway 3D** → title UI.
+  Title **background still solid black**. `failed=0`.
+- **Remaining title-3D blockers:** compositor/`ps=0x8008020000` no-attachment + SRD path;
+  mode-1/9 compressed mips still refused; stencil-only; NGG topology `0x7`.
 - Handoff: `docs/notes/sh-present-20260806-handoff/`.
-- **Anti-claim:** splash UI ≠ title 3D / hallway closure.
-- **Next:** post-splash / title 3D sample+PS path; else DeS ACM / Unity null-SIGSEGV.
+- **Anti-claim:** hallway / title UI / closing mode-5 BC mips ≠ title-background 3D closure.
+- **Next:** compositor SRD / title-BG path after splash; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

@@ -4,19 +4,23 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Silent Hill present / sampled tiler (2026-08-06) — splash UI open; 3D not closed
+## Silent Hill present (2026-08-06) — past splash + hallway; title 3D black
 
-**Root cause (compositor):** Phase 1G refused sampled GPU upload for `tile ∈ {1,5,9}` (RGBA8→BC7)
-— “no tiler ownership”. GPU-tiler owns mode-1/5/9 uncompressed + BC element grids
-(`docs/notes/sh-present-20260806-handoff/`).
+**Compositor tiler:** mode-1/5/9 uncompressed + BC element grids (splash UI assessable).
 
-**Root cause (matrix `captured_frames=0`):** ordinary `run-game.sh` leaves `REMU_CAPTURE_FRAMES`
-unset (default 0), so PPM capture never runs. That is not “present broken”.
+**Mesh LDS (`f28cee1`):** NGG mesh LDS from SDK `ShShaderResource2Gs::getLdsSize`.
 
-**Live @ `3f261a8` with `REMU_CAPTURE_FRAMES=1`:** `captured_frames=13`; early VideoOut readbacks
-are RGB-zero (`skip capture: fully black nonzero=0`); later frames show **HEXA DRIVE** and
-**KONAMI** splash (assessable 2D UI). Some mid-run PPMs are still noise/garbage. **Not** title-menu
-3D / hallway closure. Next: sample/PS path for post-splash / title 3D.
+**Mode-5 BC mips (`8e4ed20` on `main`):** GPU tiler owns AddrLib mode-5 compressed mip chains.
+Live @ tip: compressed-mip refuse count **0** (was ~10 @ `f28cee1`). Mode-1/9 BC mips and
+mode-27 BC stay loud-refused / unowned.
+
+**Live @ `8e4ed20` with `REMU_CAPTURE_FRAMES=1` + Cross:** splash → content-warning **hallway 3D**
+→ title UI (NEW GAME / OPTIONS / CONTROLS). Title **background still solid black**.
+`failed=0`; worst drops are no-attachment compositor `ps=0x8008020000`, not image upload.
+
+**Remaining title-3D blockers:** compositor/SRD title-BG path; mode-1/9 compressed mips;
+stencil-only; NGG topology `0x7`. See `docs/notes/sh-present-20260806-handoff/`.
+Anti-claim: hallway/title UI / mode-5 BC-mip fix ≠ title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
