@@ -922,6 +922,48 @@ mod tests {
     }
 
     #[test]
+    fn plans_mode9_bc7_and_mode1_r8_element_space_like_silent_hill_samples() {
+        let mut bc7 = descriptor(9);
+        bc7.width = 3840;
+        bc7.height = 2160;
+        bc7.pitch = 3840;
+        bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        bc7.bytes_per_pixel = 16;
+        let (subs, _, _) = plan_upload_subresources(bc7, GpuTilerView::SINGLE_LEVEL_2D)
+            .expect("mode-9 BC7 plan");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].width, 960);
+        assert_eq!(subs[0].height, 540);
+        assert_eq!(subs[0].metal_width, 3840);
+        assert_eq!(subs[0].metal_height, 2160);
+        assert_eq!(subs[0].pitch, 960);
+
+        let mut atlas = descriptor(9);
+        atlas.width = 1024;
+        atlas.height = 1024;
+        atlas.pitch = 1024;
+        atlas.pixel_format = MTLPixelFormat::R8Unorm;
+        atlas.bytes_per_pixel = 1;
+        let (subs, _, _) = plan_upload_subresources(atlas, GpuTilerView::SINGLE_LEVEL_2D)
+            .expect("mode-9 R8 plan");
+        assert_eq!(subs[0].width, 1024);
+        assert_eq!(subs[0].metal_width, 1024);
+        assert_eq!(subs[0].bytes_per_element, 1);
+
+        let mut tiny = descriptor(1);
+        tiny.width = 1;
+        tiny.height = 1;
+        tiny.pitch = 1;
+        tiny.pixel_format = MTLPixelFormat::RGBA8Unorm;
+        tiny.bytes_per_pixel = 4;
+        assert!(gpu_tiler_owns_descriptor(tiny));
+        let (subs, _, _) = plan_upload_subresources(tiny, GpuTilerView::SINGLE_LEVEL_2D)
+            .expect("mode-1 1x1 plan");
+        assert_eq!(subs[0].width, 1);
+        assert_eq!(subs[0].metal_width, 1);
+    }
+
+    #[test]
     fn plans_mode5_layered_single_level() {
         let (subs, guest_bytes, _) =
             plan_upload_subresources(descriptor(5), GpuTilerView {

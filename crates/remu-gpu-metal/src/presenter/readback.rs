@@ -26,7 +26,7 @@ use remu_gpu::IndexedDraw;
 use std::collections::HashSet;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -417,6 +417,7 @@ impl MetalPresenter {
         if guest_frame_is_fully_black(&self.guest_bgra_bytes) {
             // A compositor clear can land in the private scanout snapshot before the cover draw
             // finishes. Defer the capture interval until a later present produces real pixels.
+            trace_fully_black_capture_skip(descriptor, &self.guest_bgra_bytes, "guest-bgra");
             return;
         }
         if !begin_capture_attempt_if_due(
@@ -469,6 +470,7 @@ impl MetalPresenter {
         };
         debug_assert_eq!(bgra.len(), bgra_length);
         if guest_frame_is_fully_black(&bgra) {
+            trace_fully_black_capture_skip(descriptor, &bgra, "translated-native");
             return;
         }
         self.guest_bgra_bytes = bgra;
@@ -1420,6 +1422,31 @@ pub(super) fn guest_frame_fingerprint(bytes: &[u8]) -> u64 {
 fn guest_frame_is_fully_black(bgra: &[u8]) -> bool {
     bgra.chunks_exact(4)
         .all(|pixel| pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
+}
+
+/// Rate-limited evidence that present readback ran but PPM capture refused a fully-black frame.
+///
+/// `captured_frames=0` alone cannot distinguish "never read back" from "read back, all RGB zero".
+fn trace_fully_black_capture_skip(
+    descriptor: GuestTextureDescriptor,
+    bgra: &[u8],
+    source: &'static str,
+) {
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let nonzero = bgra.iter().filter(|&&byte| byte != 0).count();
+    let fingerprint = guest_frame_fingerprint(bgra);
+    eprintln!(
+        "[REMu][METAL] skip capture: fully black source={source} address={:#x} {}x{} tile={} format={:?} bytes={} nonzero={nonzero} fingerprint={fingerprint:016x}",
+        descriptor.address,
+        descriptor.width,
+        descriptor.height,
+        descriptor.tile_mode,
+        descriptor.pixel_format,
+        bgra.len(),
+    );
 }
 
 pub(super) fn capture_guest_frame(
