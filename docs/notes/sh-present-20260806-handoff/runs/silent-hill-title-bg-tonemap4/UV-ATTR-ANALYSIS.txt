@@ -1,0 +1,49 @@
+revision=4c819b94 (analysis on tonemap4 @ 267d256 evidence; no new live run yet)
+source: tonemap4 TARGET draw=47402 + MSL/IR es-800d69 / ps-800bf4
+
+## Binary split (tonemap4)
+REJECTED: blend, empty tex0 bind, packing, missing pixel shader.
+OPEN: UV/attr0 collapse vs tonemap ALU zeroing.
+
+## Static attribution (this note)
+Mesh ES `800d69` BufferLoadFormat path reloads V# from global binding
+`(c, 8054eb9354, 0x10)` into s8..s11, then fetches indices from meshlet
+vertex IDs (draw indices [0,4,5]).
+
+Runtime V# word3 = `0x00005204`:
+  DST_SEL = [X=4, Y=0, Z=0, W=1]
+  unified FORMAT = 5 → (dfmt=1, nfmt=4) = **8-bit** element
+  RESOURCE_LEVEL bit31 = 0
+  base = `0x7120e7d8c0`, stride=32, records=6
+
+Bound guest bytes at that VA are **material/debug constants**, not a
+fullscreen VB (ASCII fragments `S5/C`, `r/Sl`, `ode/`, `Mode`, `_40x`
+interleaved with ±1.0f).
+
+Consequences for PARAM0:
+  BufferLoadFormatXy applies DST_SEL_Y=0 → **UV.v forced to 0** for every
+  vertex. With 8-bit dfmt on float32 storage, UV.u also collapses toward 0.
+  PS `800bf4` samples tex0 with `float2(attr0[0], attr0[1])` → empty TL of
+  `804345` (known ±0 head / empty TL quadrant) → early remu_v_19/20 pack
+  true 0 → mrt0 true 0.0. Matches tonemap4 pixel_outputs.
+
+Contrast: userdata V# at s8 before reload (`0x0004dfac`) has DST_SEL
+RGBA and format 77 (16-byte), but the guest shader **intentionally**
+reloads from the table; fixing must make that table/V# architecturally
+correct, not skip the reload.
+
+## Coverage caveat
+`pixel_outputs covered=2073600` on tonemap4 is **not authoritative** for
+draw 47402 alone: diagnostic pixel buffer was allocated once and never
+cleared between draws while `REMU_DIAGNOSTIC_CAPTURE_PIXEL_OUTPUT=1`.
+TARGET `magnitude_nz=0` remains authoritative for empty tonemap RT.
+Fix landed separately: zero diagnostic buffers per draw.
+
+## Exact next blockers
+1. Why descriptor table `8054eb9354` holds this V# (stale guest memory vs
+   wrong table base vs format-bit mis-decode on PS5 BUF_RSRC_WORD3).
+2. SDK-grounded fix so BufferLoad sees a real float UV/pos VB (or prove
+   format/DST_SEL decode wrong against AGC).
+3. Re-run tonemap dump with per-draw diagnostic clear; confirm coverage
+   and attr0; then re-assess efc.
+4. Separately: `804345` quadrant-garbage tiler/store once UV forwards.
