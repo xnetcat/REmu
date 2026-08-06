@@ -2602,23 +2602,25 @@ fn resident_writeback_publishes_only_the_bytes_the_gpu_authored() {
 
 #[test]
 fn writeback_triggers_follow_end_state_classification() {
+    for trigger in [WritebackTrigger::DmaSource, WritebackTrigger::FlipTarget] {
+        assert!(
+            trigger.publishes_to_guest(),
+            "{} is guest-observable and publishes",
+            trigger.label()
+        );
+    }
     for trigger in [
-        WritebackTrigger::DmaSource,
-        WritebackTrigger::FlipTarget,
+        WritebackTrigger::PressureEviction,
         WritebackTrigger::AliasRebuild,
         WritebackTrigger::LayeredDepthAlias,
         WritebackTrigger::SampledAlias,
     ] {
         assert!(
-            trigger.publishes_to_guest(),
-            "{} publishes under a live lease (guest-observable or lease-validated)",
+            !trigger.publishes_to_guest(),
+            "{} is RemuBookkeeping by default and must not publish into recycled heaps",
             trigger.label()
         );
     }
-    assert!(
-        !WritebackTrigger::PressureEviction.publishes_to_guest(),
-        "pressure eviction is RemuBookkeeping and must not publish"
-    );
 }
 
 #[test]

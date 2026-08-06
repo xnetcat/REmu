@@ -1158,9 +1158,21 @@ fn texture_writeback_disabled() -> bool {
     })
 }
 
+/// Restores publication for residency-bookkeeping triggers (alias / sampled / pressure).
+///
+/// Off by default: a live lease does not prove the guest will read these bytes from RAM, and
+/// publishing into a recycled heap corrupted Silent Hill (stable SIGSEGV after `56f7737` classified
+/// alias/sampled as lease-validated). Opt in only for differential diagnosis.
+fn internal_writeback_publication_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_PUBLISH_INTERNAL_WRITEBACKS").is_some_and(|value| value == "1")
+    })
+}
+
 /// Names why a GPU publish encode was requested. Phase 1G classifies through
-/// [`crate::presenter::tiler::classify_end_state_write`] — bookkeeping clears authored runs
-/// without publishing; guest-observable / lease-validated paths encode GPU retile then clear.
+/// [`crate::presenter::tiler::classify_end_state_write`]. Guest-observable DMA/flip paths encode
+/// then clear. Bookkeeping triggers refuse and keep Metal debt unless explicitly opted in.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WritebackTrigger {
     /// A guest DMA_DATA packet reads this range, so the packet itself proves it is live.
@@ -1218,9 +1230,13 @@ impl WritebackTrigger {
                 crate::presenter::tiler::classify_end_state_write(true, has_live_lease, true)
             }
             Self::AliasRebuild | Self::LayeredDepthAlias | Self::SampledAlias => {
-                // Guest-named alias rebuild / sample paths publish when the lease is live
-                // (lease-validated reconciliation). Without a lease they are bookkeeping.
-                crate::presenter::tiler::classify_end_state_write(true, has_live_lease, false)
+                // Live lease ≠ guest will read from RAM. Default refuse (keep Metal debt); opt-in
+                // via REMU_PUBLISH_INTERNAL_WRITEBACKS restores pre-1G differential publishing.
+                if internal_writeback_publication_enabled() {
+                    crate::presenter::tiler::classify_end_state_write(true, has_live_lease, false)
+                } else {
+                    crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping
+                }
             }
             Self::PressureEviction => crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping,
         }
