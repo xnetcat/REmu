@@ -27,17 +27,19 @@ composite discard.
 full-screen `pixel_outputs` on `800bf4`. **Still** `nonzero=0` / PS `±0.0` — coverage ≠ content.
 
 **Zero PS exports (proven):** AbgrFp16→RG11B10 is not the discard path. Tonemap tex0 is
-float-`±0` (byte-nz from sign bits only); PS exports match. Next: why `800c7e` writes that
-scene color. Diagnostics now expose `magnitude_nz`.
+float-`±0` (byte-nz from sign bits only); PS exports match.
 
-**Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void
-(`runs/silent-hill-title-bg-vte-w0/` @ `e75d19c`).
+**`800c7e` ±0 (`32b445d` clean `runs/silent-hill-title-bg-cs800c7e/`):** CS `ImageLoad`s
+full-res zero `803d6e` (not SRD-missing). Upstream `800a69` full coverage + zero exports;
+GBuffer sample `8023b9` Metal+guest all-zero. Next: empty GBuffer sources.
 
-**Remaining title-3D blockers:** `800c7e` float-±0 scene color; null IMAGE-FALLBACK;
-no-attachment if on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
-`docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 / stencil /
-type-0+alias / black-intermediate proof / VTE coverage-without-content / byte-nz-of-±0 ≠
-title-background 3D closure.
+**Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void.
+
+**Remaining title-3D blockers:** empty GBuffer sources → zero lighting → ±0 scene color;
+null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 compressed mips; NGG `0x7` if
+critical. See `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI /
+mode-5 / stencil / type-0+alias / black-intermediate / VTE coverage-without-content /
+byte-nz-of-±0 / “CS only binds 1×1 dummies” ≠ title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

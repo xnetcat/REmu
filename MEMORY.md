@@ -35,14 +35,19 @@ registers/packets that state intent.
   (`803e6c` RGBA16Float, writer `800c7e`) is float-all-`±0` (fp16 `0x8000` sign bits); prior
   "nz≠0" was byte occupancy of those sign bits. PS exports match `[-0,0,-0,0]`. tex2 RG11B10
   has real magnitude; scene color does not. Diagnostic now reports `magnitude_nz`.
-- **Live:** hallway 3D + title UI; title BG still black (`runs/silent-hill-title-bg-vte-w0/`).
-- **Remaining:** why compute `800c7e` writes float-`±0` scene color into `803e6c` (bindings are
-  black depth + game 1×1 dummies); null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC
-  mips; NGG `0x7` if critical.
+- **`800c7e` ±0 attributed (`32b445d` clean cs800c7e run):** CS is not missing color SRDs —
+  it `ImageLoad`s full-res `803d6e` (+ depth + R8Uint) and `ImageStore`s scene color. Those
+  loads are magnitude-zero because lighting `800a69` exports all-zero with full coverage;
+  sampled GBuffer `8023b9` is Metal+guest all-zero. 1×1 `80106d`/`8010ad` are optional
+  sampled dummies, not the sole inputs (sampled-only writer lineage hid the ImageLoads).
+- **Live:** hallway 3D + title UI; title BG still black (`runs/silent-hill-title-bg-cs800c7e/`).
+- **Remaining:** why GBuffer sources (`8023b9`/friends) stay empty at title (geometry writer /
+  drop / clear); null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC mips; NGG `0x7`.
 - Handoff: `docs/notes/sh-present-20260806-handoff/`.
 - **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate /
-  VTE coverage-without-content / byte-nz-of-±0 ≠ title-BG 3D closure.
-- **Next:** `800c7e` float-±0 scene color with proven tonemap coverage; else DeS ACM.
+  VTE coverage-without-content / byte-nz-of-±0 / “800c7e only binds 1×1 dummies” ≠ title-BG
+  3D closure.
+- **Next:** empty GBuffer sources feeding `800a69`/`8009c4`/`800ae7`; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 
