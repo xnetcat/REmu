@@ -19,7 +19,7 @@ mod page;
 use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_infallible};
 
 mod signal;
-pub use signal::{GuestFsFaultHandler, GuestReadMaterializer};
+pub use signal::{GuestFaultDeliveryHandler, GuestFsFaultHandler, GuestReadMaterializer};
 pub use signal::{install_fault_handlers, install_thread_signal_stack};
 
 /// Registers the process-global read-watch materializer used by [`CpuWriteWatch::new_read_materialized`].
@@ -40,6 +40,13 @@ pub fn set_read_watch_materializer(
 /// be async-signal-safe (see [`GuestFsFaultHandler`]).
 pub fn set_fs_fault_handler(handler: GuestFsFaultHandler) -> Option<GuestFsFaultHandler> {
     signal::set_fs_fault_handler(handler)
+}
+
+/// Registers the guest exception-handler delivery hook for unrecovered SIGSEGV/SIGBUS.
+pub fn set_guest_fault_delivery_handler(
+    handler: GuestFaultDeliveryHandler,
+) -> Option<GuestFaultDeliveryHandler> {
+    signal::set_guest_fault_delivery_handler(handler)
 }
 
 mod snapshot;

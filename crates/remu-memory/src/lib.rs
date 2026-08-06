@@ -26,9 +26,9 @@ pub use write_watch::notify_guest_memory_written;
 pub use write_watch::notify_guest_memory_written_excluding;
 #[cfg(target_os = "macos")]
 pub use write_watch::{
-    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement, GuestFsFaultHandler,
-    GuestReadMaterializer, install_fault_handlers, install_thread_signal_stack,
-    set_fs_fault_handler, set_read_watch_materializer,
+    CpuWriteWatch, CpuWriteWatchReprotection, CpuWriteWatchRetirement, GuestFaultDeliveryHandler,
+    GuestFsFaultHandler, GuestReadMaterializer, install_fault_handlers, install_thread_signal_stack,
+    set_fs_fault_handler, set_guest_fault_delivery_handler, set_read_watch_materializer,
 };
 
 /// Non-macOS builds have no unified-memory write-watch backend to notify.

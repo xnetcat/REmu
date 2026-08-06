@@ -45,6 +45,16 @@ pub type GuestFsFaultHandler =
 /// The process-global FS fault backstop, stored as a raw function-pointer address (0 = none).
 static FS_FAULT_HANDLER: AtomicUsize = AtomicUsize::new(0);
 
+/// Delivers an unrecovered host fault to an installed guest exception handler.
+///
+/// Invoked after write-watch / FS recovery decline and before chaining the previous host action.
+/// Must be async-signal-safe aside from the guest handler itself (which matches console delivery).
+/// Returning `true` means the guest handler ran and the fault is consumed.
+pub type GuestFaultDeliveryHandler =
+    unsafe extern "C" fn(signal: i32, fault_address: u64, context: *mut c_void) -> bool;
+
+static GUEST_FAULT_DELIVERY: AtomicUsize = AtomicUsize::new(0);
+
 /// Registers the read-watch materializer, returning the previously registered one if any.
 pub(super) fn set_read_watch_materializer(
     materializer: GuestReadMaterializer,
@@ -73,6 +83,22 @@ fn fs_fault_handler() -> Option<GuestFsFaultHandler> {
     let raw = FS_FAULT_HANDLER.load(Ordering::Acquire);
     // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestFsFaultHandler`.
     (raw != 0).then(|| unsafe { std::mem::transmute::<usize, GuestFsFaultHandler>(raw) })
+}
+
+/// Registers the guest-fault delivery hook, returning the previously registered handler if any.
+pub(super) fn set_guest_fault_delivery_handler(
+    handler: GuestFaultDeliveryHandler,
+) -> Option<GuestFaultDeliveryHandler> {
+    let previous = GUEST_FAULT_DELIVERY.swap(handler as usize, Ordering::AcqRel);
+    // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestFaultDeliveryHandler`.
+    (previous != 0)
+        .then(|| unsafe { std::mem::transmute::<usize, GuestFaultDeliveryHandler>(previous) })
+}
+
+fn guest_fault_delivery_handler() -> Option<GuestFaultDeliveryHandler> {
+    let raw = GUEST_FAULT_DELIVERY.load(Ordering::Acquire);
+    // SAFETY: a nonzero slot only ever holds a value stored from a live `GuestFaultDeliveryHandler`.
+    (raw != 0).then(|| unsafe { std::mem::transmute::<usize, GuestFaultDeliveryHandler>(raw) })
 }
 
 /// Whether a delivered fault was a read, a write, or could not be classified from the context.
@@ -267,6 +293,14 @@ extern "C" fn write_fault_signal_handler(
     ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
     if handled {
         return;
+    }
+    // Phase 1F: wire unrecovered faults to installed guest exception handlers (Unity / Orbis
+    // InstallExceptionHandler) with Darwin→Orbis ucontext translation, before the host crash path.
+    if let Some(delivery) = guest_fault_delivery_handler() {
+        // SAFETY: registered handler consumes the live SA_SIGINFO context when it returns true.
+        if unsafe { delivery(signal, fault_address, context) } {
+            return;
+        }
     }
     // SAFETY: the previous action was captured before this handler was published.
     unsafe { chain_previous_action(signal, information, context) };
