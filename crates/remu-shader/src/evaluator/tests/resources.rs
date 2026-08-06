@@ -295,6 +295,49 @@ fn executes_scalar_loads_and_records_the_backing_binding() {
 }
 
 #[test]
+fn expands_dynamic_offset_sload_bindings_to_descriptor_heap_span() {
+    // UE NGG mesh reloads V# slots with `(packet << 4) & 0x1F0`. Snapshot evaluation may see
+    // offset 0 while draw-time packets select later slots; the Metal bind must cover the heap.
+    let mut memory = TestMemory::default();
+    let mut heap = vec![0_u8; 0x200];
+    heap[0x1F0..0x1F4].copy_from_slice(&0xaabb_ccdd_u32.to_le_bytes());
+    memory.write(0x8000, &heap);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Smem,
+                "SLoadDwordx4",
+                vec![Operand::scalar(0), Operand::scalar(2)],
+                vec![
+                    Operand::scalar(4),
+                    Operand::scalar(5),
+                    Operand::scalar(6),
+                    Operand::scalar(7),
+                ],
+                Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                    destination_count: 4,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: Some(2),
+                })),
+            ),
+            end(8),
+        ],
+        // s0:s1 = heap base, s2 = dynamic offset 0 (evaluation snapshot).
+        vec![0x8000, 0, 0],
+    );
+    let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+        .expect("dynamic-offset SLoad evaluation");
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    assert!(
+        evaluation.global_memory_bindings[0].byte_count >= 0x200,
+        "dynamic-offset SLoad must cover the 0x1F0-masked descriptor heap, got {}",
+        evaluation.global_memory_bindings[0].byte_count
+    );
+    assert_eq!(evaluation.scalar_registers[4], 0);
+}
+
+#[test]
 fn null_scalar_loads_return_zero_and_keep_a_zero_binding() {
     let shader = state(
         vec![

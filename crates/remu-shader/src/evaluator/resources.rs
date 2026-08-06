@@ -18,6 +18,13 @@ use super::{
     SCALAR_REGISTER_COUNT, SCALAR_REGISTER_COUNT_U32, invalid,
 };
 
+/// Minimum absolute `S_LOAD` bind when the instruction uses a dynamic SGPR offset.
+///
+/// UE NGG mesh attribute paths index a V# heap with `(packet << 4) & 0x1F0` (32 × 16-byte
+/// descriptors). Evaluation often snapshots offset 0; without this floor Metal only uploads
+/// one slot and later non-zero indices read as OOB zeroes.
+const SLOAD_DESCRIPTOR_HEAP_MIN_BYTES: u64 = 0x200;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BufferDescriptor {
     pub(crate) base_address: u64,
@@ -389,12 +396,20 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         } else if let Some(descriptor) = descriptor {
             descriptor.size_bytes
         } else {
-            byte_offset
-                .checked_add(
-                    u64::try_from(instruction.destinations.len().max(1) * 4)
-                        .map_err(|_| EvaluationError::BindingSizeOverflow { pc: instruction.pc })?,
-                )
-                .ok_or(EvaluationError::BindingSizeOverflow { pc: instruction.pc })?
+            // Absolute S_LOAD uses a raw 64-bit base (often a descriptor heap). Evaluation may
+            // observe dynamic_offset == 0 while later meshlets select other 16-byte slots
+            // (UE NGG masks the slot offset to 0x1F0). Size only to the snapshot offset leaves
+            // Metal with a 16-byte bind so non-zero slots OOB-zero the reloaded V#.
+            let component_bytes = u64::try_from(instruction.destinations.len().max(1) * 4)
+                .map_err(|_| EvaluationError::BindingSizeOverflow { pc: instruction.pc })?;
+            let exact = byte_offset
+                .checked_add(component_bytes)
+                .ok_or(EvaluationError::BindingSizeOverflow { pc: instruction.pc })?;
+            if control.dynamic_offset_register.is_some() {
+                exact.max(SLOAD_DESCRIPTOR_HEAP_MIN_BYTES)
+            } else {
+                exact
+            }
         };
         let binding_result = self.record_global_binding(
             instruction,
@@ -619,6 +634,31 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             && (self.options.resolve_vertex_inputs
                 || self.options.required_vertex_record_count.is_some());
         if bounded_vertex_fetch {
+            // UE mesh attribute paths keep RegularBuffer (k8UInt+X001) in the heap and patch
+            // FORMAT/DST_SEL from the meshlet packet before BufferLoadFormat. Seeing the
+            // unpatched pair here means the meshlet dword was zero/wrong — UV.v collapses.
+            if descriptor.data_format == 1
+                && descriptor.number_format == 4
+                && instruction.opcode.starts_with("BufferLoadFormat")
+            {
+                static LOGGED_REGULAR: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let sequence =
+                    LOGGED_REGULAR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    let words =
+                        buffer_descriptor_words(registers, control.scalar_resource).unwrap_or_default();
+                    eprintln!(
+                        "[REMu][SHADER][MESH-V#] sequence={sequence} pc={:#x} \
+                         unpatched RegularBuffer-style V# words={words:08x?} base={:#x} \
+                         stride={} records={} (meshlet FORMAT override missing → UV collapse)",
+                        instruction.pc,
+                        descriptor.base_address,
+                        descriptor.stride,
+                        descriptor.record_count,
+                    );
+                }
+            }
             let scalar_offset = instruction
                 .sources
                 .get(2)
