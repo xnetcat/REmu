@@ -1,6 +1,6 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ pending (`COLOR-EMIT` AGC ATTRIB2 extent) on top of `9cc9f2f` /
+**Tip:** `main` @ `be21eb9` (AGC ATTRIB2 extent in `COLOR-EMIT`) on top of `9cc9f2f` /
 `736d540` (`COLOR-EMIT` / `GBUFFER-UNWRITTEN`).
 
 ## Closed gates
@@ -122,11 +122,11 @@ full-res 7-MRT writes to `8068e0…` (PERF `gputrue`); BG still void.
 | `32b445d` | Compute `COMPUTE-IMAGES` + ImageLoad inputs in writer lineage |
 | `736d540` | Emit-side `COLOR-EMIT` / `COLOR-MALFORMED` + `GBUFFER-UNWRITTEN` |
 | `9cc9f2f` | docs: SH GBuffers empty because BasePass never emits (content-warning scope) |
-| *(this)* | AGC ATTRIB2 extent in `COLOR-EMIT` + title BasePass evidence correction |
+| `be21eb9` | AGC ATTRIB2 extent in `COLOR-EMIT` + title BasePass evidence correction |
 
 ## Checks
 
-- `cargo check -p remu-runtime -p remu-gpu-metal` — arm64 + `x86_64-apple-darwin` (pending this tip)
+- `cargo check -p remu-runtime -p remu-gpu-metal -p remu-gpu` — arm64 + `x86_64-apple-darwin` green @ `be21eb9`
 - Live SH clean title @ `9cc9f2f` (`runs/silent-hill-title-bg-basepass/`) — NEW GAME;
   `total_mask_mrt3plus≈8591`; title 3D still not closed
 - Prior content-warning-only @ `736d540` (`runs/silent-hill-title-bg-gbuffer/`) —
