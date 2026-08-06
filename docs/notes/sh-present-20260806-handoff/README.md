@@ -1,6 +1,6 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `b526ed2` (SLoad heap-span `37589c3` + V# docs). Depth fix `3f9e559`.
+**Tip:** `main` @ `787ae29` (SLoad heap-span `37589c3` + tonemap5c live). Depth fix `3f9e559`.
 Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag≠0) + `tonemap4/VSHARP-ATTR.txt`.
 
 ## Closed gates
