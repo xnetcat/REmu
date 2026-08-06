@@ -2553,8 +2553,40 @@ impl MetalPresenter {
                         )
                     })
                     .collect::<Vec<_>>();
+                // Do not use {:x?} on GuestTextureDescriptor: Rust's hex Debug prints
+                // width/height/pitch as hex without a 0x prefix (1920→780, 1080→438), which
+                // previously falsified a "half-res tex0 SRD" title-BG blocker.
+                let texture_dump = texture_summaries
+                    .iter()
+                    .map(|summary| {
+                        let guest = summary.5.guest;
+                        format!(
+                            "(slot={}, pc={:#x}, op={}, srd={:08x?}, samp={:08x?}, guest={{addr={:#x} {}x{} pitch={} tile={} fmt={:?} bpp={}}}, metal=({:?},{}x{}x{},arr={},{:?}), native={:x?}, guest_occ={:x?})",
+                            summary.0,
+                            summary.1,
+                            summary.2,
+                            summary.3,
+                            summary.4,
+                            guest.address,
+                            guest.width,
+                            guest.height,
+                            guest.pitch,
+                            guest.tile_mode,
+                            guest.pixel_format,
+                            guest.bytes_per_pixel,
+                            summary.6.0,
+                            summary.6.1,
+                            summary.6.2,
+                            summary.6.3,
+                            summary.6.4,
+                            summary.6.5,
+                            summary.7,
+                            summary.8,
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 eprintln!(
-                    "[REMu][METAL][TARGET-DRAW-TEXTURES] draw={} tex0_3={texture_summaries:x?}",
+                    "[REMu][METAL][TARGET-DRAW-TEXTURES] draw={} tex0_3={texture_dump:?}",
                     draw.sequence,
                 );
                 // GBuffer attribution: lighting samples large textures that were never COLOR
@@ -2944,6 +2976,32 @@ impl MetalPresenter {
                         ))
                     })
                     .collect::<Vec<_>>();
+                // Same {:x?} footgun as TARGET-DRAW-TEXTURES: print guest extents in decimal.
+                let sampled_dump = sampled_summaries
+                    .iter()
+                    .map(|summary| {
+                        let guest = summary.1;
+                        format!(
+                            "(meta={:x?}, guest={{addr={:#x} {}x{} pitch={} tile={} fmt={:?} bpp={}}}, resident={:x?}, writer={:x?}, overlap_writers={:x?}, related_writers={:x?}, mem={:x?}, raw_upstream={:x?}, aliases={:x?}, occ={:x?})",
+                            summary.0,
+                            guest.address,
+                            guest.width,
+                            guest.height,
+                            guest.pitch,
+                            guest.tile_mode,
+                            guest.pixel_format,
+                            guest.bytes_per_pixel,
+                            summary.2,
+                            summary.3,
+                            summary.4,
+                            summary.5,
+                            summary.6,
+                            summary.7,
+                            summary.8,
+                            summary.9,
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 let rgba8_summary = if matches!(
                     descriptor.pixel_format,
                     MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::BGRA8Unorm
@@ -3142,7 +3200,7 @@ impl MetalPresenter {
                     );
                 }
                 eprintln!(
-                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} magnitude_nz={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_summaries:x?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
+                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} magnitude_nz={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_dump:?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
                     draw.sequence,
                     draw.export_shader_address,
                     draw.pixel_shader_address,
