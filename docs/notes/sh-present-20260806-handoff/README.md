@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ SLoad heap-span + V# attribution (`VSHARP-ATTR.txt`). Depth fix `3f9e559`.
-Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANALYSIS.txt` + `VSHARP-ATTR.txt`.
+**Tip:** `main` @ `b526ed2` (SLoad heap-span `37589c3` + V# docs). Depth fix `3f9e559`.
+Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag≠0) + `tonemap4/VSHARP-ATTR.txt`.
 
 ## Closed gates
 
@@ -24,7 +24,7 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 | Post-BasePass lighting sample VA | Clean `runs/silent-hill-title-bg-lightpost2/` @ `de613d3`: `800b22` @ draw 22072 binds remapped `80688f` (BasePass BGRA8 slot), **not** empty `8023b9`. Early `800a69` still legacy-empty (pre-BasePass only). |
 | R32 depth-sample view stealing Depth DB authority | `3f9e559` + live `runs/silent-hill-title-bg-depthfix/`: `depth_native` max **469** (was **0** forever on `lightpost2`). Post-BP `800c7e` writes non-zero scene color to `804345` (`magnitude_nz≈0x13b220`). |
 | `800bf4` empty TARGET with lit tex0 — not blend/coverage/bind | Clean `runs/silent-hill-title-bg-tonemap4/` @ `267d256` + AUTO_CROSS, `MIN_DRAW=47000`: draw **47402** after BasePass peak (`mrt3plus≈8192`). tex0 `804345` Metal+guest `magnitude_nz≃0xf5640`; blend off; TARGET + exports true 0.0. Packing not implicated. |
-| `800bf4` zero exports — UV/attr0 class (revised) | Heap V# `0x00005204` is SDK **RegularBuffer** (not word3 mis-decode); meshlet patches format 64/77. VB at `7120e7d8c0` has real float ±1 UV + UTF-16 padding. See `VSHARP-ATTR.txt`. Remaining: UV scale-bias / TL sample + `804345` tiler garbage. |
+| `800bf4` zero exports — UV/attr0 class (revised) | Heap V# `0x00005204` is SDK **RegularBuffer** (not word3 mis-decode); meshlet patches format 64/77. VB has float ±1 UV. SLoad heap span `0x200` (`37589c3`). Live `tonemap5c`: TARGET **magnitude_nz=109231** (was 0 @ tonemap4). Remaining: UV ±0.6 / 780×438 tex0 / efc still black. |
 
 ## Live progression (capture on)
 
@@ -33,7 +33,7 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 | Splash logos | Yes |
 | Content-warning + **ruined hallway 3D** | Yes |
 | Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs + `depthfix` efc) |
-| Title **3D background** | **No — still solid black** (UI yes; BasePass + lit tex0; `800bf4` true-zero; V# decode cleared — RegularBuffer+meshlet patch; UV transform / TL sample open) |
+| Title **3D background** | **No — efc still black/near-black** (`tonemap5c`: `800bf4` TARGET now nonzero mag≈1.1e5; UI yes; UV ±0.6 + 780×438 tex0 + tiler/composite open) |
 
 ## Root causes (historical → current)
 
@@ -81,13 +81,12 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 14. **`800bf4` true-zero exports with lit tex0** (clean `tonemap4` @ `267d256`):
     post-BasePass draw 47402, blend off, tex0 `804345` Metal+guest magnitude ≫0, TARGET
     and exports true float 0.0. Not packing / empty bind / pre-BP stale SRD (`tonemap3`).
-15. **UV/attr0 via mesh BufferLoad V#** (tonemap4 TARGET globals + SDK AGC):
-    Heap `8054eb9354` holds **RegularBuffer** `0x00005204` (= `initializeRegularBuffer`
-    k8UInt+X001) — **not** a BUF_RSRC_WORD3 mis-decode. UE patches FORMAT from meshlet
-    (`s21` format 64 float2, soff 16). VB `7120e7d8c0` is float ±1 pos/uv with UTF-16
-    padding (not material ASCII). Sticky pixel diagnostic fixed (`d23a898`). Remaining:
-    UV scale-bias maps NDC±1 → ~±0.6 (samples empty TL of lit `804345`); tiler garbage
-    on `804345` once UVs forward; SLoad heap bind floor `0x200` for multi-slot.
+15. **UV/attr0 via mesh BufferLoad V#** (tonemap4 analysis + tonemap5c live @ `37589c3`):
+    Heap holds **RegularBuffer** `0x00005204` (= AGC `initializeRegularBuffer`) — **not**
+    BUF_RSRC_WORD3 mis-decode. UE patches FORMAT from meshlet (64/77). SLoad dynamic-offset
+    heap span fixed to `0x200` (`37589c3`); live heap bind is `0x200` and `800bf4` TARGET
+    magnitude_nz=109231 (tonemap4 was 0). Remaining: ES UV → ±0.6 (1152/1920, bias 0) sampled
+    raw by PS; tex0 SRD 780×438; efc title BG still not assessable.
 
 ## Anti-claims
 
@@ -122,15 +121,12 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 
 ## Next recommended blockers
 
-1. **Live confirm meshlet FORMAT patch + PARAM0 UV range** on post-BP `800bf4` (MESH-V#
-   diagnostic; per-draw pixel clear). If patch applies, fix ES/PS UV scale-bias
-   (1152/1920 vs missing +0.5) so samples leave empty TL of `804345`.
-2. **Why `804345` Metal texels are quadrant-garbage** (tiler/store) once tonemap forwards
-   nonzero samples — otherwise BG still will not be assessable scene content.
-3. **Optional:** dump `8009c1` TARGET post-BP for MRT0 lighting exports (title substitute for
-   absent post-BP `800a69`).
-4. **No-attachment `ps=0x8008020000` / friends** — only if proven on the title-BG path; do
-   not invent CB targets.
+1. **ES/PS UV scale-bias** — guest userdata maps VB ±1 → PARAM0 ±0.6 (1152/1920, bias 0);
+   PS samples raw attr0. Prove missing +0.5 / CB slot bug vs intentional viewport — no
+   fabricated UVs.
+2. **tex0 extent 780×438** on tonemap SRD vs 1920×1080 present (decode vs real half-res).
+3. **Scene-color tiler/store** (`8071ca`/`804345`) once UVs sample coherently.
+4. **Nonzero `800bf4` → efc** — why TARGET mag≠0 still leaves title scanout black.
 5. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
 
 ## Commits (this continuation)
@@ -157,8 +153,11 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 | `76e6828` | docs: point handoff commits table at UV-attr tip |
 | `37589c3` | Expand dynamic-offset S_LOAD binds to descriptor-heap span + MESH-V# warn |
 | `6cf8932` | docs: V# RegularBuffer+meshlet patch attribution (`VSHARP-ATTR`) |
+| `b526ed2` | docs: record 6cf8932 and dual-arch check at SLoad tip |
+| *(pending)* | docs: tonemap5c live — TARGET mag≠0 after SLoad span; UV±0.6 next |
 
 ## Checks
 
 - `cargo check --workspace --all-targets` — arm64 + `x86_64-apple-darwin` green @ `37589c3`
 - Unit: `expands_dynamic_offset_sload_bindings_to_descriptor_heap_span`
+- Live clean `tonemap5c` @ `b526ed27`: TARGET magnitude_nz=109231; efc BG not assessable

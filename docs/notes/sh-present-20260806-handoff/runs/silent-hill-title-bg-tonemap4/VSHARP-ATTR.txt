@@ -1,4 +1,4 @@
-revision=HEAD attribution on tonemap4 TARGET draw=47402 globals (no new live yet)
+revision=b526ed27 live tonemap5c + SDK attribution
 
 ## BUF_RSRC_WORD3 mis-decode? REFUTED (SDK AGC)
 
@@ -13,43 +13,43 @@ See sdk-1000 `agc/core/buffer.cpp` + `agc/core/buffer.h` DWORD3 bitfields
 
 UE NGG mesh attribute path (ES `800d69`):
 1. Userdata s8 holds a float4 constant V# (scale/bias), not the mesh VB.
-2. Shader S_LOADs V# from heap `8054eb9354` (draw 47402 TARGET globals).
-3. Heap slot 0 is RegularBuffer → base `7120e7d8c0`, stride 32, records 6.
-4. Meshlet at s14 (`72a0e11600`) supplies FORMAT/swizzle override:
-   s20=0x26e0 → format 77 (float4) pos, slot 0, soff 0
-   s21=0x42020 → format 64 (float2) UV, slot 0, soff 16
+2. Shader S_LOADs V# from heap (draw 34299: `80d0351584`) with dynamic offset
+   masked to `0x1F0`.
+3. Heap slot 0 is RegularBuffer → base `7120e7d8c0`, stride 32, records 6,
+   word3 `0x00005204`.
+4. Meshlet supplies FORMAT/swizzle override:
+   s20=0x26e0 → format 77 (float4) pos
+   s21=0x42020 → format 64 (float2) UV, soff 16
 5. Shader patches word3 before BufferLoadFormat; format==0 keeps heap word3.
+   DST_SEL immediates after load: `s14=0x022C0204`, `s15=0x0FAC03AC`
+   → slot1 = XY01 (UV), slot3 = XYZW (pos).
 
-So the RegularBuffer in the table is architecturally correct, not stale mis-decode.
+## SLoad heap bind (FIXED `37589c3`)
 
-## “ASCII” at 7120e7d8c0? REVISED
+tonemap4 bound `(c, heap, 0x10)` — one slot.
+tonemap5c binds `(c, heap, 0x200)` — full UE mask span.
+MESH-V# diagnostic count=0 on live tonemap5c.
 
-TARGET global head is float pos/uv ±1.0; trailing UTF-16 (`S5/C`, `_40x`) sits in
-stride-32 padding — not proof the VB is material constants.
+## “ASCII” at VB? REVISED
 
-v0: pos (1,1,0,1) uv (1,1)
-v4: pos (-1,1,0,1) uv (-1,1)
-v5: pos (1,-1,0,1) uv (1,-1)
-indices [0,4,5] = fullscreen NDC triangle.
+Float pos/uv ±1.0 with UTF-16 stride-32 padding — not material-only garbage.
 
-## Why 800bf4 still exports 0 (remaining)
+## ES / PS UV math (remaining)
 
-Static “DST_SEL_Y=0 collapses UV” only holds if meshlet FORMAT override fails.
-With s21 format 64, Metal should patch to float2 XY01.
+Userdata floats: 1152, 648, 0, 0, 1152, 648, 0, 0, 1/1152, 1/648, 1/1920, 1/1080.
+ES: `uv = (uv_vb * 1152 + 0) / 1920` → **±0.6** from VB ±1 (no +0.5).
+PS `800bf4` samples tex0 with **raw attr0.xy** (not the later s40.. fma).
+That matches empty-TL / partial samples of half-res scene color.
 
-ES then scales UV with userdata constants (1152×648 and 1/1920×1/1080) →
-~±0.6 without +0.5 bias → samples mostly empty TL of lit tex0 `804345`
-(quadrant-garbage elsewhere). PS samples attr0[0/1] as tex0 UV.
+## Live tonemap5c vs tonemap4
 
-## SLoad heap bind
-
-Evaluation bound `(c, 8054eb9354, 0x10)` — one slot. Shader can index up to
-`(x<<4)&0x1F0`. Fix: dynamic-offset S_LOAD minimum span 0x200.
+tonemap4: TARGET magnitude_nz=0 with lit tex0.
+tonemap5c @ SLoad tip: TARGET magnitude_nz=109231, coverage 746496, tex0 780×438
+SRD (`8071ca`), efc still not assessable title BG.
 
 ## Exact next blockers
 
-1. Live dump with MESH-V# diagnostic + per-draw pixel clear: confirm post-patch
-   word3 is float2 (not RegularBuffer) and PARAM0 UV range on draw ≥47000.
-2. If patch applies: fix ES/PS UV scale-bias (1152/1920 mismatch / missing +0.5)
-   or prove guest constants intentional — then re-assess efc.
-3. `804345` quadrant-garbage tiler/store once UVs sample lit texels.
+1. UV scale-bias (+0.5 / viewport) — prove guest intent vs emulator CB/slot bug.
+2. tex0 extent 780×438 vs 1920×1080 present.
+3. Scene-color tiler/store quadrant-garbage once UVs are coherent.
+4. Nonzero 800bf4 → efc title BG composite path.

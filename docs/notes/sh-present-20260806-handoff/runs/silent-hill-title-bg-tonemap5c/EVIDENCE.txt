@@ -1,0 +1,42 @@
+revision=b526ed27 dirty_tree=0
+run: 20260806T153137Z-PPSA10112-app
+loadavg-pre={ 3.02 3.86 3.65 }  (clean; SKIP_BUILD after release rebuild @ SLoad tip)
+AUTO_CROSS=8 REPEAT_MS=4000 CAPTURE_FRAMES=1 timeout=180s
+REMU_DUMP_TARGET_PS=0x800bf40000 MIN_DRAW=34000 MATCH_INDEX=0
+REMU_CAPTURE_TARGET_SAMPLES=1
+REMU_DIAGNOSTIC_CAPTURE_PIXEL_OUTPUT=1
+REMU_DIAGNOSTIC_CAPTURE_VERTEX_POSITION=1
+outcome=external-watchdog-timeout ~185s captured_frames=32
+max total_mask_mrt3plus=8192 at draw≈33655
+MESH-V# warnings=0
+
+Post-BasePass-ish 800bf4 @ draw=34299 → RG11B10Float:
+  TARGET nonzero=156496 magnitude_nz=109231  (**NOT** true-zero; tonemap4 was 0/0)
+  blend: disabled (One/Zero)
+  pixel_outputs=Some((746496, 109231, 685370, … max G≈65504 / mean G≈1843 …))
+    → per-draw clear active; ~36% coverage this draw; nonzero exports
+  tex0 SRD VA=8071ca RGBA16Float decoded **780×438** (not 1920×1080)
+    Metal occ magnitude_nz=0x1142f; writer still compute 800c7e class
+  vertex_globals heap bind (c, 80d0351584, **0x200**) — SLoad span fix live
+    slot0 still RegularBuffer word3 0x00005204 + meshlet [0x26e0, 0x42020]
+  vertex_positions diagnostic still all 0 (mesh capture gap; not authoritative)
+
+efc title scanout:
+  late frames center (0,0,0) or (13,13,13); UI chrome only — **title 3D BG not assessable**
+
+Compared to tonemap4 @ 267d256 (MIN_DRAW=47000, draw 47402):
+  that dump: TARGET magnitude_nz=0 with lit tex0 804345
+  this dump: TARGET magnitude_nz=109231 after SLoad heap-span 0x200
+
+Attribution update:
+  BUF_RSRC_WORD3 mis-decode REFUTED (SDK AGC initializeRegularBuffer)
+  Heap RegularBuffer + meshlet FORMAT patch is the intended UE path
+  Prior 0x10 heap bind was insufficient for dynamic-offset S_LOAD mask 0x1F0
+  Remaining: ES UV → ±0.6 (1152/1920, bias 0) sampled raw by PS; tex0 780×438
+    quadrant/tiler garbage; efc still black despite nonzero tonemap RT
+
+Exact next blockers:
+  1. Prove/fix ES/PS UV scale-bias (missing +0.5 / viewport) without fabricated UVs
+  2. Why tex0 T# decodes 780×438 for scene color (extent vs full 1920×1080)
+  3. 8071ca/804345 tiler quadrant-garbage once UVs sample lit texels coherently
+  4. Why nonzero 800bf4 RT does not yet yield assessable efc title BG
