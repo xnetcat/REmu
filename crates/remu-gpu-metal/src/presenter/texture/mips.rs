@@ -184,6 +184,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             gpu_authored: RangeSet::default(),
             state: ResidencyState::Live,
             content_version: 0,
+            gpu_write_watch_generations: Vec::new(),
             last_use: super::super::ResidentTextureActivityStamp::default(),
             activity: super::super::ResidentTextureActivity::enabled(),
         },
@@ -369,6 +370,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
         gpu_authored,
         state: resident.state,
         content_version: resident.content_version,
+        gpu_write_watch_generations: resident.gpu_write_watch_generations,
         last_use: resident.last_use,
         activity: resident.activity,
     })

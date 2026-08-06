@@ -146,8 +146,10 @@ impl MetalPresenter {
 
     /// Settles authored Metal bytes for `trigger` via GPU publish (encode-then-clear).
     ///
-    /// Phase 1G: no persistent debt fiction. Guest-observable / lease-validated triggers encode
-    /// GPU retile then clear. Bookkeeping triggers clear authored runs without publishing.
+    /// Guest-observable / lease-validated triggers encode GPU retile then clear. Bookkeeping
+    /// triggers must refuse and **keep** the debt: clearing `gpu_authored` without publishing
+    /// lies that guest RAM already agrees with Metal (Silent Hill guest-fault regression after
+    /// `56f7737`; live refutation — believe the run).
     pub(super) fn settle_resident_texture_writeback(
         &mut self,
         descriptor: GuestTextureDescriptor,
@@ -168,13 +170,8 @@ impl MetalPresenter {
             trace_discarded_resident_writeback(
                 resident,
                 trigger,
-                "RemuBookkeeping — clear authored without publish",
+                "RemuBookkeeping — refuse publish; keep Metal debt",
             );
-            let resident = self
-                .resident_guest_textures
-                .get_mut(&descriptor)
-                .ok_or("resident disappeared while clearing bookkeeping authored runs")?;
-            resident.clear_gpu_authored();
             return Ok(false);
         }
         crate::presenter::tiler::refuse_bookkeeping_writeback(class)?;

@@ -1303,13 +1303,20 @@ struct ResidentGuestTexture {
     span: Option<ResourceSpan>,
     /// Guest bytes this allocation is the authority for.
     owned: RangeSet,
-    /// Subset of `owned` whose current value exists only in Metal until the next GPU publish encode.
+    /// Subset of `owned` whose current value exists only in Metal.
     ///
-    /// Ephemeral authored runs for encode-then-clear publication — not a persistent debt ledger.
+    /// This is the publication debt the guest is owed, and it is what `gpu_written()` reports.
+    /// Bookkeeping settles must not clear it without publishing — that lies that guest RAM agrees.
     gpu_authored: RangeSet,
     /// `Live` unless every owned byte was taken by another writer or by the CPU.
     state: ResidencyState,
     content_version: u64,
+    /// CPU-write generations observed when Metal most recently became authoritative.
+    ///
+    /// Guest heaps reuse image allocations as ICBs. A plain dirty bit cannot distinguish a later
+    /// guest write from presenter-side watch renewal; generations establish the ownership boundary
+    /// at the actual GPU write (kept after fingerprint deletion for the Active false-positive path).
+    gpu_write_watch_generations: Vec<u64>,
     /// Most recent ordered guest work/flip that read or wrote this Metal allocation.
     ///
     /// This stamp is always maintained because pressure eviction must distinguish completed
@@ -1507,23 +1514,32 @@ impl ResidentGuestTexture {
         self.gpu_authored = RangeSet::default();
     }
 
+    fn note_gpu_write(&mut self) {
+        self.gpu_write_watch_generations = self.write_watch.generations();
+    }
+
     fn cpu_write_obsoletes_gpu_writeback(
         &mut self,
         refresh: WriteWatchRefresh,
     ) -> Result<bool, String> {
-        // Phase 1G: no self-readback generations / fingerprints. Mapping renewal can report
-        // dirty without a guest store into the resource — remaps must not steal Metal authority.
-        // Only an Active watch with coarse dirty / pending validation proves a guest write.
+        // Mapping renewal can report dirty without a guest store — remaps must not steal Metal
+        // authority (`5b920ab`). On Active watches, generations still filter false-positive dirt
+        // after fingerprint deletion: unchanged content re-anchors the GPU ownership boundary.
         match refresh {
             WriteWatchRefresh::Replaced => Ok(true),
             WriteWatchRefresh::Reprotecting | WriteWatchRefresh::Renewed { .. } => Ok(false),
             WriteWatchRefresh::Active => {
-                if self.write_watch.content_validation_pending() || self.write_watch.is_dirty()
-                {
-                    self.write_watch.content_has_changed()
-                } else {
-                    Ok(false)
+                let possibly_changed = self.write_watch.content_validation_pending()
+                    || self.write_watch.is_dirty()
+                    || self.write_watch.generations() != self.gpu_write_watch_generations;
+                if !possibly_changed {
+                    return Ok(false);
                 }
+                if self.write_watch.content_has_changed()? {
+                    return Ok(true);
+                }
+                self.note_gpu_write();
+                Ok(false)
             }
         }
     }

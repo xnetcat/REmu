@@ -2622,7 +2622,7 @@ fn writeback_triggers_follow_end_state_classification() {
 }
 
 #[test]
-fn bookkeeping_trigger_clears_authored_without_publishing() {
+fn bookkeeping_trigger_refuses_publish_and_keeps_debt() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -2685,11 +2685,11 @@ fn bookkeeping_trigger_clears_authored_without_publishing() {
     let discarded_before = RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
         .load(AtomicOrdering::Relaxed);
     let untouched =
-        snapshot_guest_texture_raw(descriptor).expect("guest bytes before bookkeeping clear");
+        snapshot_guest_texture_raw(descriptor).expect("guest bytes before bookkeeping refuse");
     assert!(
         !presenter
             .settle_resident_texture_writeback(descriptor, WritebackTrigger::PressureEviction)
-            .expect("bookkeeping clear")
+            .expect("bookkeeping refuse")
     );
     assert_eq!(
         RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
@@ -2697,14 +2697,14 @@ fn bookkeeping_trigger_clears_authored_without_publishing() {
         discarded_before + 1
     );
     assert_eq!(
-        snapshot_guest_texture_raw(descriptor).expect("guest bytes after bookkeeping clear"),
+        snapshot_guest_texture_raw(descriptor).expect("guest bytes after bookkeeping refuse"),
         untouched,
         "bookkeeping must leave guest memory exactly as the guest left it"
     );
     let resident = &presenter.resident_guest_textures[&descriptor];
     assert!(
-        !resident.gpu_written() && resident.is_live(),
-        "bookkeeping clears authored runs — no persistent debt fiction"
+        resident.gpu_written() && resident.is_live(),
+        "bookkeeping must keep Metal debt — clearing without publish lies that RAM agrees"
     );
 
     presenter.mark_resident_texture_written_at(
