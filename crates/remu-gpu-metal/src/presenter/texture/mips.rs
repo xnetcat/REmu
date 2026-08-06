@@ -184,7 +184,6 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             gpu_authored: RangeSet::default(),
             state: ResidencyState::Live,
             content_version: 0,
-            gpu_write_watch_generations: Vec::new(),
             last_use: super::super::ResidentTextureActivityStamp::default(),
             activity: super::super::ResidentTextureActivity::enabled(),
         },
@@ -336,11 +335,6 @@ pub(crate) fn promote_resident_mip_hierarchy(
         "REMu promoted {}-level image {:#x}",
         underlying_mip_count, descriptor.guest.address
     ));
-    let gpu_write_watch_generations = if resident.gpu_written() {
-        write_watch.generations()
-    } else {
-        Vec::new()
-    };
     // Adding a level moves every other level's offset inside the chain, so the previous runs name
     // the wrong bytes. The promotion preserves every level's pixels, so a live allocation stays the
     // authority for its whole grown range and owes exactly what it owed before, widened to that
@@ -375,7 +369,6 @@ pub(crate) fn promote_resident_mip_hierarchy(
         gpu_authored,
         state: resident.state,
         content_version: resident.content_version,
-        gpu_write_watch_generations,
         last_use: resident.last_use,
         activity: resident.activity,
     })

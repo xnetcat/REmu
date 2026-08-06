@@ -489,33 +489,20 @@ fn retained_resident_version_is_current(
         || resident.span != Some(version.span)
         || (requires_gpu_authored && !resident.gpu_written())
         || !resident.serves_reads()
-        || resident.gpu_write_watch_generations != version.gpu_write_watch_generations
     {
         return false;
     }
 
-    // CPU fault delivery, mapping retirement, and content-validation publication use independent
-    // atomics/locks. Read the complete token twice. Equality gives the admission a concrete
-    // linearization point; a CPU write after it cannot redirect the retained Metal binding used
-    // by this draw, while any write/reprotect already in progress rejects here.
-    let stable_clean_token = || {
-        if resident.write_watch.retirement().is_some()
-            || !resident.write_watch.precise_tracking()
-            || resident.write_watch.is_dirty()
-            || !resident.write_watch.dirty_page_ranges().is_empty()
-            || resident.write_watch.content_validation_pending()
-        {
-            return None;
-        }
-        Some(resident.write_watch.generations())
-    };
-    let Some(first) = stable_clean_token() else {
+    // Phase 1G: coarse write-watch dirty is enough. Self-readback generations are deleted with
+    // CPU writeback — a clean watch means the guest has not stored since Metal authored.
+    if resident.write_watch.retirement().is_some()
+        || resident.write_watch.is_dirty()
+        || !resident.write_watch.dirty_page_ranges().is_empty()
+        || resident.write_watch.content_validation_pending()
+    {
         return false;
-    };
-    let Some(second) = stable_clean_token() else {
-        return false;
-    };
-    first == second && second == version.gpu_write_watch_generations
+    }
+    true
 }
 
 fn direct_draw_dependencies_are_gpu_orderable(
@@ -1707,7 +1694,6 @@ mod tests {
             layer_count: sampled.layer_count,
             mip_level_count: sampled.mip_level_count,
             content_version: 17,
-            gpu_write_watch_generations: Vec::new(),
             span,
             kind,
         };
@@ -1820,7 +1806,6 @@ mod tests {
                     layer_count: sampled.layer_count,
                     mip_level_count: sampled.mip_level_count,
                     content_version: 17,
-                    gpu_write_watch_generations: Vec::new(),
                     span,
                     kind: SharedEventWriteKind::ResidentDestination,
                 },
@@ -1887,7 +1872,6 @@ mod tests {
             layer_count: resident.layer_count,
             mip_level_count: resident.mip_level_count,
             content_version: resident.content_version,
-            gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
             span: resident.span.expect("resident has physical span"),
             kind: SharedEventWriteKind::ResidentDestination,
         }

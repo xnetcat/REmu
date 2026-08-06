@@ -579,10 +579,14 @@ impl MetalPresenter {
             base_address: binding.base_address,
             byte_count: binding.data.len(),
         };
+        // Prefer guest-backed identity over packet-byte caches (CORE-MECHANISMS §1: delete
+        // per-hit full byte compares). When shared backing exists, Metal sees guest RAM directly.
+        if let Some(uploaded) = self.upload_identity_global_buffer(device, binding)? {
+            return Ok(uploaded);
+        }
         if binding.data.len() > GLOBAL_BUFFER_CACHE_BYTE_CAPACITY {
-            if let Some(cached) = self.active_transient_global_buffer_cache().get(&key)
-                && cached.bytes == binding.data
-            {
+            if let Some(cached) = self.active_transient_global_buffer_cache().get(&key) {
+                // Key hit only — no full-buffer byte compare on the hot path.
                 return Ok(UploadedGlobalBuffer {
                     buffer: cached.buffer.clone(),
                     offset: cached.offset,
@@ -611,9 +615,8 @@ impl MetalPresenter {
                 original_version: None,
             });
         }
-        if let Some(cached) = self.global_buffer_cache.get(&key)
-            && cached.bytes == binding.data
-        {
+        if let Some(cached) = self.global_buffer_cache.get(&key) {
+            // Key hit only — no full-buffer byte compare on the hot path.
             return Ok(UploadedGlobalBuffer {
                 buffer: cached.buffer.clone(),
                 offset: cached.offset,

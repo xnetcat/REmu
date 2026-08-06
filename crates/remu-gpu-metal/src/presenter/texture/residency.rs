@@ -774,7 +774,6 @@ impl MetalPresenter {
                     layer_count: resident.layer_count,
                     mip_level_count: resident.mip_level_count,
                     content_version: resident.content_version,
-                    gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
                     span: resident.span?,
                     kind: SharedEventWriteKind::InternalResidentDestination,
                 })
@@ -1183,7 +1182,6 @@ impl MetalPresenter {
         target.state = ResidencyState::Live;
         target.content_version = source_version;
         if target.gpu_written() {
-            target.note_gpu_write();
         }
         self.resident_guest_textures
             .insert(target_descriptor, target);
@@ -1692,7 +1690,6 @@ impl MetalPresenter {
                 gpu_authored: RangeSet::default(),
                 state: ResidencyState::Live,
                 content_version: 0,
-                gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
@@ -1851,7 +1848,6 @@ impl MetalPresenter {
                 gpu_authored: RangeSet::default(),
                 state: ResidencyState::Live,
                 content_version: 0,
-                gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
@@ -1977,7 +1973,6 @@ impl MetalPresenter {
                 gpu_authored: RangeSet::default(),
                 state: ResidencyState::Live,
                 content_version: 0,
-                gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
@@ -2239,7 +2234,6 @@ impl MetalPresenter {
                 gpu_authored: RangeSet::default(),
                 state: ResidencyState::Live,
                 content_version: 0,
-                gpu_write_watch_generations: Vec::new(),
                 last_use: ResidentTextureActivityStamp::default(),
                 activity: super::super::ResidentTextureActivity::enabled(),
             },
@@ -2501,7 +2495,6 @@ impl MetalPresenter {
                     "a GPU write must leave its resident owing the bytes it covered"
                 );
                 resident.content_version = version;
-                resident.note_gpu_write();
                 if let Some(writer_span) = writer_span {
                     texture_version = Some(SharedEventResidentTextureVersion {
                         texture: resident.texture.clone(),
@@ -2510,7 +2503,6 @@ impl MetalPresenter {
                         layer_count: resident.layer_count,
                         mip_level_count: resident.mip_level_count,
                         content_version: resident.content_version,
-                        gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
                         span: writer_span,
                         kind: SharedEventWriteKind::ResidentDestination,
                     });
@@ -2742,7 +2734,6 @@ pub(crate) fn ensure_resident_texture_in_map(
             gpu_authored: RangeSet::default(),
             state: ResidencyState::Live,
             content_version: 0,
-            gpu_write_watch_generations: Vec::new(),
             last_use: ResidentTextureActivityStamp::default(),
             activity: super::super::ResidentTextureActivity::enabled(),
         },

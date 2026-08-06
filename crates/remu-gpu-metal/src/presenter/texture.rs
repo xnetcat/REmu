@@ -47,7 +47,6 @@ mod extent;
 mod lifetime;
 mod mips;
 mod ranges;
-mod read_watch;
 mod residency;
 mod resident_map;
 mod retire;
@@ -72,7 +71,6 @@ pub(crate) use self::mips::{
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::ranges::RangeSet;
-pub(crate) use self::read_watch::ensure_read_watch_materializer_registered;
 #[cfg(test)]
 pub(crate) use self::residency::rematerialisation_blit_source_origin_y;
 pub(crate) use self::residency::{

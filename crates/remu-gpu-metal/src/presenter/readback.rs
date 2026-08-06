@@ -144,12 +144,10 @@ impl MetalPresenter {
         Ok(())
     }
 
-    /// Settles a resident's publication debt for `trigger`, and reports whether guest memory
-    /// was written.
+    /// Settles authored Metal bytes for `trigger` via GPU publish (encode-then-clear).
     ///
-    /// A refused trigger keeps the debt: the bytes still exist only in Metal, and saying otherwise
-    /// would let a later guest-observable read believe guest RAM already agrees. Authority is not
-    /// handed to guest RAM either, so the resident keeps serving reads from its own texels.
+    /// Phase 1G: no persistent debt fiction. Guest-observable / lease-validated triggers encode
+    /// GPU retile then clear. Bookkeeping triggers clear authored runs without publishing.
     pub(super) fn settle_resident_texture_writeback(
         &mut self,
         descriptor: GuestTextureDescriptor,
@@ -161,13 +159,25 @@ impl MetalPresenter {
         if !resident.gpu_written() {
             return Ok(false);
         }
-        if let Some(refusal) = trigger.refusal() {
+        let has_live_lease = resident.write_watch.retirement().is_none();
+        let class = trigger.end_state_class(has_live_lease);
+        if class == crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping {
             RESIDENT_WRITEBACK_DISCARDED[trigger.index()].fetch_add(1, Ordering::Relaxed);
             RESIDENT_WRITEBACK_DISCARDED_BYTES
                 .fetch_add(resident.gpu_authored.byte_count(), Ordering::Relaxed);
-            trace_discarded_resident_writeback(resident, trigger, refusal);
+            trace_discarded_resident_writeback(
+                resident,
+                trigger,
+                "RemuBookkeeping — clear authored without publish",
+            );
+            let resident = self
+                .resident_guest_textures
+                .get_mut(&descriptor)
+                .ok_or("resident disappeared while clearing bookkeeping authored runs")?;
+            resident.clear_gpu_authored();
             return Ok(false);
         }
+        crate::presenter::tiler::refuse_bookkeeping_writeback(class)?;
         if !crate::presenter::tiler::gpu_tiler_owns_descriptor(resident.descriptor) {
             return Err(format!(
                 "Phase 1G: refusing CPU texture writeback for tile={} format={:?} — GPU tiler does not own this descriptor",
@@ -1151,25 +1161,9 @@ fn texture_writeback_disabled() -> bool {
     })
 }
 
-/// Restores publication for the triggers only REmu's own residency bookkeeping raises.
-///
-/// Those publications are off by default because nothing in the guest asked for them. The switch
-/// exists so a run can be compared against the old behaviour without rebuilding.
-fn internal_writeback_publication_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_PUBLISH_INTERNAL_WRITEBACKS").is_some_and(|value| value == "1")
-    })
-}
-
-/// What made REmu consider copying a resident's Metal pixels into guest memory.
-///
-/// Hardware never performs this copy: a GPU write lands in unified memory at draw time, and memory
-/// the guest recycles simply loses its old contents. Every publication here is REmu re-staging
-/// bytes on its own timeline into a range whose tenancy it cannot verify, because a guest `free()`
-/// touches no mapping and raises no GPU event. A trigger therefore admits a publication only when
-/// it names a guest-observable read of those exact bytes; a trigger raised by residency
-/// bookkeeping has no such reader and drops the pixels instead.
+/// Names why a GPU publish encode was requested. Phase 1G classifies through
+/// [`crate::presenter::tiler::classify_end_state_write`] — bookkeeping clears authored runs
+/// without publishing; guest-observable / lease-validated paths encode GPU retile then clear.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WritebackTrigger {
     /// A guest DMA_DATA packet reads this range, so the packet itself proves it is live.
@@ -1214,26 +1208,35 @@ impl WritebackTrigger {
         }
     }
 
-    /// Why this trigger may not write guest memory, or `None` when it may.
-    fn refusal(self) -> Option<&'static str> {
+    /// End-state classification for this trigger given whether the resident's lease is live.
+    pub(crate) fn end_state_class(
+        self,
+        has_live_lease: bool,
+    ) -> crate::presenter::tiler::EndStateWriteClass {
         if texture_writeback_disabled() {
-            return Some("REMU_DISABLE_TEXTURE_WRITEBACK=1");
+            return crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping;
         }
         match self {
-            Self::DmaSource | Self::FlipTarget => None,
-            Self::PressureEviction
-            | Self::AliasRebuild
-            | Self::LayeredDepthAlias
-            | Self::SampledAlias => (!internal_writeback_publication_enabled())
-                .then_some("residency bookkeeping, no guest read of these bytes"),
+            Self::DmaSource | Self::FlipTarget => {
+                crate::presenter::tiler::classify_end_state_write(true, has_live_lease, true)
+            }
+            Self::AliasRebuild | Self::LayeredDepthAlias | Self::SampledAlias => {
+                // Guest-named alias rebuild / sample paths publish when the lease is live
+                // (lease-validated reconciliation). Without a lease they are bookkeeping.
+                crate::presenter::tiler::classify_end_state_write(true, has_live_lease, false)
+            }
+            Self::PressureEviction => crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping,
         }
     }
 
     /// Whether a publication for this trigger would reach guest memory at all.
     ///
-    /// Call sites use this to skip the pipeline flush and readback ordering a publication needs.
+    /// Call sites use this to skip the pipeline flush a publication needs.
     pub(crate) fn publishes_to_guest(self) -> bool {
-        self.refusal().is_none()
+        !matches!(
+            self.end_state_class(true),
+            crate::presenter::tiler::EndStateWriteClass::RemuBookkeeping
+        )
     }
 }
 

@@ -6987,7 +6987,7 @@ fn invalidating_acquire_rejects_overlapping_deferred_guest_publication() {
 }
 
 #[test]
-fn invalidating_acquire_rejects_dirty_and_gpu_generation_mismatch() {
+fn invalidating_acquire_rejects_dirty_and_gpu_authored_residents() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
@@ -7020,13 +7020,13 @@ fn invalidating_acquire_rejects_dirty_and_gpu_generation_mismatch() {
             &GpuEvent::MemoryAcquire(acquire),
         ),
         SharedEventEventDisposition::HostEffect,
-        "GPU ownership from an older watch generation is not a no-op"
+        "GPU-authored residents are never ACQUIRE no-ops"
     );
     presenter
         .resident_guest_textures
         .get_mut(&descriptor)
         .expect("watched resident")
-        .note_gpu_write();
+        .clear_gpu_authored();
     assert_eq!(
         presenter.shared_event_event_disposition(
             0,
@@ -7035,7 +7035,7 @@ fn invalidating_acquire_rejects_dirty_and_gpu_generation_mismatch() {
             &GpuEvent::MemoryAcquire(acquire),
         ),
         SharedEventEventDisposition::DropSemanticNoOp,
-        "matching GPU ownership generations make the clean action empty"
+        "clean non-authored residents make the invalidating acquire empty"
     );
 
     // SAFETY: the test retains the live read/write guest mapping and deliberately exercises its
