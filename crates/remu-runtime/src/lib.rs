@@ -5284,7 +5284,7 @@ fn dispatch_probe_import(
         "kwGyyjohI50" => kernel_get_event_data(arguments[0]),
         "F6e0kwo4cnk" => kernel_trigger_user_event(arguments, state),
         "mJ7aghmgvfc" => kernel_get_event_id(arguments[0]),
-        "Xs9hdiD7sAA" => pthread_set_schedule_parameters(arguments),
+        "Xs9hdiD7sAA" => pthread_set_schedule_parameters(arguments, state),
         // Direct unit-dispatch callers use the nonblocking poll. Live imports are routed through
         // `kernel_wait_equeue_blocking` before acquiring the process-wide dispatch lock.
         "fzyMKs9kim0" => kernel_wait_equeue(arguments, state),
@@ -5541,18 +5541,20 @@ fn kernel_get_event_data(event: u64) -> u64 {
     read_guest_u64(event + 0x10)
 }
 
-/// Applies a scheduling policy and priority to a running guest thread.
-///
-/// REmu runs guest threads on host threads whose priorities the host scheduler owns, so the
-/// request is validated and accepted without changing host scheduling. Rejecting it would fail
-/// engine worker setup for a property the guest cannot observe directly.
-fn pthread_set_schedule_parameters(arguments: [u64; 6]) -> u64 {
-    remu_gpu::note_inert("Xs9hdiD7sAA");
-    let (thread, parameters) = (arguments[0], arguments[2]);
-    if thread == 0 || parameters == 0 {
-        return u64::from(libc::EINVAL.cast_unsigned());
+/// POSIX `pthread_setschedparam` — same ABI as `scePthreadSetschedparam`.
+fn pthread_set_schedule_parameters(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    // Return POSIX errno (not SCE_KERNEL_ERROR_*) for the libc import.
+    let result = pthread_set_schedule_param(arguments, state);
+    if result == 0 {
+        0
+    } else if result == sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT) {
+        u64::from(libc::EINVAL.cast_unsigned())
+    } else {
+        result
     }
-    0
 }
 
 /// Registers interest in APR/AMPR command-buffer completion on an event queue.

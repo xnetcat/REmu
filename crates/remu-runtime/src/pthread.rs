@@ -294,6 +294,10 @@ pub(crate) fn pthread_set_schedule_param(
     let attributes = state.thread_attributes.entry(arguments[0]).or_default();
     attributes.schedule_policy = policy;
     attributes.schedule_priority = priority;
+    // Same self-thread QoS enforcement as scePthreadSetprio; cross-thread is recorded only.
+    if arguments[0] == crate::current_guest_thread_handle() {
+        crate::apply_host_priority(priority);
+    }
     0
 }
 
