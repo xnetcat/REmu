@@ -1,7 +1,7 @@
-revision=5b920ab
+revision=1a1e22f
 game=/Volumes/Untitled/sharpemu/games/Poppy Playtime Chapter 1/eboot.bin
 timeout_seconds=30
-elapsed_seconds=35
+elapsed_seconds=36
 outcome=external-watchdog-timeout
 exit_status=124
 captured_frames=0
@@ -37,9 +37,9 @@ render_policy=presentation-only
 [REMu][REPORT] fabricated success key=qQJfO8HAiaY name=sceNpRegisterStateCallbackA calls=1
 [REMu][REPORT] fabricated success key=rbknaUjpqWo name=sceNpGetAccountIdA calls=1
 [REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
-[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni=474840 sse4a=0 handler_ms=52 mean_ns=110
-[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=730 calls=744 results=0xffffffff80020002:730
-[REMu][REPORT] failing import name=scePthreadCondTimedwait nid=BmMjYxmew1w failures=54 calls=58 results=0xffffffff8002003c:54
+[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni=474840 sse4a=0 handler_ms=51 mean_ns=109
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=611 calls=626 results=0xffffffff80020002:611
+[REMu][REPORT] failing import name=scePthreadCondTimedwait nid=BmMjYxmew1w failures=52 calls=56 results=0xffffffff8002003c:52
 [REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
 [REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=18 calls=43 results=0xffffffff80020002:18
 [REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=7 calls=10 results=0xffffffffffffffff:7
