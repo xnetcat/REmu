@@ -216,14 +216,27 @@ impl MetalPresenter {
             resident.demote(StaleSource::GuestMemory);
             return Ok(false);
         }
-        self.ensure_active_open_guest_batch()?;
-        let command_buffer = {
+        let queue = self
+            .command_queue
+            .as_ref()
+            .ok_or("Metal command queue is unavailable")?
+            .clone();
+        // Prefer the open guest batch when a submit owns a queue. Standalone settles (tests /
+        // out-of-submit DMA/flip paths without an active queue) use a dedicated publish CB.
+        let command_buffer = if self.active_open_guest_batch().is_some()
+            || self.ensure_active_open_guest_batch().is_ok()
+        {
             let batch = self
                 .active_open_guest_batch_mut()
                 .expect("guest batch opened for Phase 1G publish");
             batch.close_active_pass_encoders();
             batch.command_buffer.clone()
+        } else {
+            let buffer = queue.new_command_buffer().to_owned();
+            buffer.set_label("REMu Phase 1G standalone GPU publish");
+            buffer
         };
+        let standalone = self.active_open_guest_batch().is_none();
         crate::presenter::tiler::encode_gpu_publish_to_guest(
             &device,
             &command_buffer,
@@ -231,6 +244,10 @@ impl MetalPresenter {
             &texture,
             &authored,
         )?;
+        if standalone {
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        }
         let resident = self
             .resident_guest_textures
             .get_mut(&descriptor)
