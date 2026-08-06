@@ -234,10 +234,14 @@ fn plan_upload_subresources(
             descriptor.pixel_format, descriptor.tile_mode
         ));
     }
-    if compressed_block.is_some() && view.mip_level_count > 1 {
-        return Err(
-            "Phase 1G GPU tiler refuses compressed mip chains (single-level only)".to_owned(),
-        );
+    // Mode-5 already has AddrLib-backed mip-chain layout in element space (texels or BC
+    // blocks). Mode-1/9 stay single-level until their mip layouts are wired; mode-27 BC
+    // remains outside ownership entirely.
+    if compressed_block.is_some() && view.mip_level_count > 1 && descriptor.tile_mode != 5 {
+        return Err(format!(
+            "Phase 1G GPU tiler refuses compressed mip chains on tile={} (mode-5 element-grid mips only)",
+            descriptor.tile_mode
+        ));
     }
     let mut linear_offset = 0_u64;
     let mut subs = Vec::new();
@@ -354,11 +358,27 @@ fn plan_upload_subresources(
                             .map_err(|_| "mode-5 mip width does not fit u64")?;
                         let level_h = u64::try_from(level.height)
                             .map_err(|_| "mode-5 mip height does not fit u64")?;
+                        // Layout widths are tiling elements (texels or BC blocks). Metal blit
+                        // extents stay in pixels — floor-shift the guest base, matching the
+                        // CPU exact-mip upload path (not element_count * block_size, which
+                        // overshoots sub-block mips).
+                        let shift = u32::try_from(level_index)
+                            .map_err(|_| "mode-5 mip index does not fit u32")?;
+                        let metal_w = if compressed_block.is_some() {
+                            u64::from(descriptor.width.checked_shr(shift).unwrap_or(0).max(1))
+                        } else {
+                            level_w
+                        };
+                        let metal_h = if compressed_block.is_some() {
+                            u64::from(descriptor.height.checked_shr(shift).unwrap_or(0).max(1))
+                        } else {
+                            level_h
+                        };
                         push(
                             level_w,
                             level_h,
-                            level_w,
-                            level_h,
+                            metal_w,
+                            metal_h,
                             level_offset,
                             u64::try_from(level.padded_width)
                                 .map_err(|_| "mode-5 mip pitch does not fit u64")?,
@@ -919,6 +939,62 @@ mod tests {
         assert_eq!(subs[0].height, 16);
         assert_eq!(subs[0].metal_width, 64);
         assert_eq!(subs[0].metal_height, 64);
+    }
+
+    #[test]
+    fn plans_mode5_bc7_mip_chain_element_grid_with_pixel_blit_extents() {
+        let mut bc7 = descriptor(5);
+        bc7.width = 64;
+        bc7.height = 64;
+        bc7.pitch = 64;
+        bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        bc7.bytes_per_pixel = 16;
+        let (subs, guest_bytes, _) = plan_upload_subresources(
+            bc7,
+            GpuTilerView {
+                texture_type: 9,
+                layer_count: 1,
+                mip_level_count: 7,
+            },
+        )
+        .expect("mode-5 BC7 mip chain plan");
+        assert_eq!(subs.len(), 7);
+        assert_eq!((subs[0].width, subs[0].height), (16, 16));
+        assert_eq!((subs[0].metal_width, subs[0].metal_height), (64, 64));
+        assert_eq!((subs[1].width, subs[1].height), (8, 8));
+        assert_eq!((subs[1].metal_width, subs[1].metal_height), (32, 32));
+        // Sub-block mips: one BC block element, but Metal extent is 1×1 pixel — not 4×4.
+        assert_eq!((subs[6].width, subs[6].height), (1, 1));
+        assert_eq!((subs[6].metal_width, subs[6].metal_height), (1, 1));
+        assert!(guest_bytes > 0);
+        for (index, sub) in subs.iter().enumerate() {
+            assert_eq!(sub.metal_level, u64::try_from(index).unwrap());
+        }
+    }
+
+    #[test]
+    fn refuses_mode9_bc7_mip_chains_until_layout_exists() {
+        let mut bc7 = descriptor(9);
+        bc7.width = 64;
+        bc7.height = 64;
+        bc7.pitch = 64;
+        bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        bc7.bytes_per_pixel = 16;
+        let err = match plan_upload_subresources(
+            bc7,
+            GpuTilerView {
+                texture_type: 9,
+                layer_count: 1,
+                mip_level_count: 4,
+            },
+        ) {
+            Ok(_) => panic!("mode-9 BC mips must stay loud"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("compressed mip chains on tile=9"),
+            "unexpected refuse: {err}"
+        );
     }
 
     #[test]
