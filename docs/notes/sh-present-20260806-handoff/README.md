@@ -1,6 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `e75d19c` (`VTX_W0_FMT`) on top of `ef55a61` / `a86c225` attribution.
+**Tip:** `main` @ `bbe413d` (`magnitude_nz`) on top of `e75d19c` (`VTX_W0_FMT`) / `ef55a61` /
+`a86c225` attribution.
 
 ## Closed gates
 
@@ -15,6 +16,7 @@
 | False shared-heap SampledAlias / authority theft on title intermediate | BGRA→RGBA `ALIAS-FLUSH` **0**; `ALIAS-VIEW` binds gpu-written BGRA; VA-only authority subtract |
 | Attribution: black intermediate vs composite discard | Clean `runs/silent-hill-title-bg-occ/` — intermediate **RGB black**; not a later blend discard |
 | Missing `PA_CL_VTE_CNTL.VTX_W0_FMT` → Metal clip (no coverage) | Clean `runs/silent-hill-title-bg-vte-w0/` @ `e75d19c`: `800bf4` now has `pixel_outputs=Some((2073600,…))` vs pre-fix `None` |
+| `800bf4` zero exports after coverage — cause class | Clean vte-w0: PS exports `±0.0` because tonemap **tex0 is float-±0**; AbgrFp16→RG11B10 packing not implicated; prior “nz≠0” was sign-bit byte occupancy |
 
 ## Live progression (capture on)
 
@@ -28,8 +30,9 @@
 Clean post-`VTX_W0_FMT` @ `e75d19c` (`runs/silent-hill-title-bg-vte-w0/`, `dirty_tree=0`,
 launch loadavg ~3.1→4.8): `captured_frames=19`; title UI present on black void; hallway 3D
 still assessable. First `800bf4` `[TARGET]`: `PA_CL_VTE_CNTL=0x43f`, full-screen pixel
-coverage (`2073600`), but `nonzero=0` `fp=97d30483e5dd6325` and PS exports `±0.0` despite
-sampled natives with `nz≠0`.
+coverage (`2073600`), PS exports `[-0.0, 0.0, -0.0, 0.0]` (`0x80000000` bits), RT
+`nonzero=0` `fp=97d30483e5dd6325`. Tonemap tex0 Metal preview is repeating fp16
+`[0,80,0,0]` (= `±0`); tex2 RG11B10 has real magnitude (`0xf7dc0000`).
 
 ## Root causes (historical → current)
 
@@ -48,10 +51,10 @@ sampled natives with `nz≠0`.
 8. **HDR producer lacked mesh coverage:** ES float4 VB left **W=0**; AGC
    `PA_CL_VTE_CNTL=0x43f` (`VTX_W0_FMT`) was not applied → Metal clipped the triangle.
    Fixed (`e75d19c`); live proves coverage restored.
-9. **`800bf4` still writes clear-black after coverage** (clean `vte-w0` run): PS runs
-   full-screen but exports `±0.0`; RT `nonzero=0` same fingerprint as pre-fix. **Next
-   architectural concern:** why tonemap/HDR pixel math stays zero given non-zero samples
-   (`AbgrFp16`→`RG11B10` / sample path / inputs) — not VTE clip.
+9. **`800bf4` exports float-zero after coverage** (clean `vte-w0`): PS runs full-screen;
+   exports match float-±0 scene tex0. **Not** an AbgrFp16→RG11B10 CB packing bug. Prior
+   “sampled natives nz≠0” counted IEEE sign bits (`0x80` / `0x80000000`). Writer of tex0 is
+   compute `800c7e` (inputs: clear-black `R32Float` depth + game 1×1 dummies at `80106d`).
 
 ## Anti-claims
 
@@ -63,15 +66,17 @@ sampled natives with `nz≠0`.
 - Closing type-0 refuse + BGRA↔RGBA authority ≠ title-background 3D closure (proven live: BG still black with ALIAS-VIEW).
 - Proving intermediate texels black ≠ title-background 3D closure — only attributes the failure upstream of `800da3`.
 - Restoring `VTX_W0_FMT` coverage ≠ title-background 3D closure — clean live @ `e75d19c` still
-  shows title UI on black void with `800bf4` `nonzero=0`.
+  shows title UI on black void with `800bf4` float-zero exports.
+- Byte/`bit` nonzero on HDR textures that are float-±0 ≠ “non-zero sampled natives”.
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **`800bf4` PS exports zero after coverage** — dump MSL/`AbgrFp16`→`RG11B10` / sample
-   fetches for `es=0x800d690000 ps=0x800bf40000` with live `pixel_outputs` proving coverage.
+1. **`800c7e` float-±0 scene color** — dump MSL / image+buffer bindings for the compute that
+   writes tonemap tex0 (`803e6c`); determine whether color SRDs are missing vs empty upstream
+   GBuffer draws (`800a69`/`8009c4`/`800ae7`) at title time.
 2. **No-attachment `ps=0x8008020000` / friends:** many drops keep `target_mask=0` while
    `ps_scalars` hold live image SRDs — only if proven on the HDR/title-BG path; do not invent CB targets.
 3. Null IMAGE-FALLBACK policy (optional binds) if still modulating covers.
@@ -89,11 +94,13 @@ sampled natives with `nz≠0`.
 | `3c025bd` | Type-0 refuse + BGRA↔RGBA sample authority |
 | `a86c225` | BGRA occupancy dump + `ADDRESS=auto` skips scanout covers |
 | `e75d19c` | Honor `PA_CL_VTE_CNTL.VTX_W0_FMT` in Metal position export |
+| `bbe413d` | TARGET/PS occupancy: float ±0 is not magnitude-nonzero |
 
 ## Checks
 
 - `cargo test -p remu-shader-metal --lib forces_clip_space_w_to_one` — green
 - `cargo test -p remu-gpu-metal --lib carries_pa_cl_vte_cntl` — green
+- `cargo test -p remu-gpu-metal --lib magnitude_nonzero` — green
 - `cargo check -p remu-gpu-metal -p remu-shader-metal` — arm64 + `x86_64-apple-darwin` green
 - Live SH clean @ `e75d19c` (`runs/silent-hill-title-bg-vte-w0/`) — hallway + title UI;
-  title 3D still black; `800bf4` coverage restored but `nonzero=0` / PS `±0.0`
+  title 3D still black; `800bf4` coverage restored but float-zero exports from ±0 scene tex0

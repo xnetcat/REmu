@@ -26,14 +26,18 @@ composite discard.
 **`VTX_W0_FMT` (`e75d19c`):** mesh position W=0 was clipping the HDR cover; live now shows
 full-screen `pixel_outputs` on `800bf4`. **Still** `nonzero=0` / PS `±0.0` — coverage ≠ content.
 
+**Zero PS exports (proven):** AbgrFp16→RG11B10 is not the discard path. Tonemap tex0 is
+float-`±0` (byte-nz from sign bits only); PS exports match. Next: why `800c7e` writes that
+scene color. Diagnostics now expose `magnitude_nz`.
+
 **Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void
 (`runs/silent-hill-title-bg-vte-w0/` @ `e75d19c`).
 
-**Remaining title-3D blockers:** why `800bf4` PS exports zero after coverage; null
-IMAGE-FALLBACK; no-attachment if on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
+**Remaining title-3D blockers:** `800c7e` float-±0 scene color; null IMAGE-FALLBACK;
+no-attachment if on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
 `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 / stencil /
-type-0+alias / black-intermediate proof / VTE coverage-without-content ≠ title-background 3D
-closure.
+type-0+alias / black-intermediate proof / VTE coverage-without-content / byte-nz-of-±0 ≠
+title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

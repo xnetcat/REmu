@@ -31,13 +31,18 @@ registers/packets that state intent.
 - **`VTX_W0_FMT` (`e75d19c`):** ES float4 VB W=0 was clipping HDR mesh; AGC `PA_CL_VTE_CNTL=0x43f`
   now forces W=1 in Metal. Live: `800bf4` `pixel_outputs` full-screen — **but** PS still
   exports `±0.0`, RT `nonzero=0`, title BG still void.
+- **Zero PS exports (proven @ vte-w0):** not AbgrFp16→RG11B10 packing. Tonemap tex0
+  (`803e6c` RGBA16Float, writer `800c7e`) is float-all-`±0` (fp16 `0x8000` sign bits); prior
+  "nz≠0" was byte occupancy of those sign bits. PS exports match `[-0,0,-0,0]`. tex2 RG11B10
+  has real magnitude; scene color does not. Diagnostic now reports `magnitude_nz`.
 - **Live:** hallway 3D + title UI; title BG still black (`runs/silent-hill-title-bg-vte-w0/`).
-- **Remaining:** why `800bf4` PS exports zero after coverage (`AbgrFp16`→`RG11B10` / samples);
-  null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC mips; NGG `0x7` if critical.
+- **Remaining:** why compute `800c7e` writes float-`±0` scene color into `803e6c` (bindings are
+  black depth + game 1×1 dummies); null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC
+  mips; NGG `0x7` if critical.
 - Handoff: `docs/notes/sh-present-20260806-handoff/`.
 - **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate /
-  VTE coverage-without-content ≠ title-BG 3D closure.
-- **Next:** `800bf4` zero PS exports with proven coverage; else DeS ACM.
+  VTE coverage-without-content / byte-nz-of-±0 ≠ title-BG 3D closure.
+- **Next:** `800c7e` float-±0 scene color with proven tonemap coverage; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 
