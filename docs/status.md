@@ -17,13 +17,18 @@ Oregon / Poppy watchdog-timeout clean; `pthread_setschedparam` no longer fabrica
 GC STW **not** live-proven — Dreaming Sarah still null-SIGSEGV before `InstallExceptionHandler`.
 Demon's Souls still ACM-blocked.
 
-## Phase 1G (2026-08-06) — memory model — MID-STOP (branch `phase1g-memory-model` @ `8ef3057`)
+## Phase 1G (2026-08-06) — memory model — CLOSED (on `main` after merge)
 
-Architectural GPU-timeline tiling + guest-backed upload/publish for tiler-owned textures landed
-on the branch (fingerprints / self-readback gens / D5 prestaging / CPU sampled snapshot path
-deleted). **Not merged to `main`.** Live matrix at tip: all titles `captured_frames=0`; Silent Hill
-guest-faults before UI (primary UI-garbage gate unassessable). See
-`docs/notes/phase1g-20260806-handoff/`. Phase 1H not started.
+Guest-backed GPU-tiler upload/publish for tiler-owned textures; anonymous→committed backing;
+CPU sampled snapshot/`replaceRegion` path deleted on that surface; fingerprints and dead tiler
+seams deleted. Silent Hill 1G-introduced SIGSEGV (`addr=0x8000000080b0`) fixed: alias/sampled
+publish refused by default; bookkeeping keeps Metal debt. See
+`docs/notes/phase1g-20260806-handoff/`.
+
+**Acceptance:** package tests + both-arch `cargo check` green; SH/Oregon/Poppy watchdog-timeout
+clean; SH fault closed vs main control. **Anti-claim:** `captured_frames=0` on tip and main —
+PPM UI-garbage unassessable; not a 3D/UI closure. Dreaming Sarah/Void null-SIGSEGV and DeS ACM
+unchanged. Phase 1H not started.
 
 ## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5bb169b`)
 

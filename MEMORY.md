@@ -26,15 +26,19 @@ registers/packets that state intent.
 - Handoff: `docs/notes/phase1f-20260806-handoff/`.
 - **Anti-claim:** Unity GC STW not live-closed (Dreaming Sarah dies before InstallExceptionHandler).
 
-## Phase 1G — memory model (MID-STOP 2026-08-06; branch `phase1g-memory-model` @ `8ef3057`)
+## Phase 1G — memory model (CLOSED 2026-08-06; merged to `main`)
 
-- Guest-backed GPU tiler upload/publish for tiler-owned textures; sampled/storage CPU
-  snapshot+detile+`replaceRegion` deleted on that path. Fingerprints, self-readback generations,
-  D5 prestaging, dead tiler deferred/absolute-address seams deleted. End-state settle wired.
-- **Not closed / not on `main`:** live title matrix all `captured_frames=0` (Silent Hill UI-garbage
-  gate unassessable — guest-fault before present). Handoff:
-  `docs/notes/phase1g-20260806-handoff/`.
-- Phase 1H not started.
+- Guest-backed GPU tiler upload/publish for tiler-owned textures; anonymous→committed backing;
+  sampled/storage CPU snapshot+detile+`replaceRegion` deleted on that path. Fingerprints, D5
+  prestaging, dead tiler deferred/absolute-address seams deleted. End-state settle: DMA/flip
+  publish; bookkeeping refuses and **keeps** Metal debt; alias/sampled publish off by default
+  (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in). Generations kept for Active false-positive filter.
+- **SH fault (1G-introduced, fixed):** `56f7737` lease-validated alias/sampled publish →
+  `SIGSEGV addr=0x8000000080b0 pc=0x8016b7c09` (n≥5); main `9397f11` control same hour survived.
+  Fixes `f21484c`/`f07da85`. Post-fix watchdog 124, flips≥1024.
+- Handoff: `docs/notes/phase1g-20260806-handoff/`.
+- **Anti-claim:** `captured_frames=0` on tip and main — PPM UI-garbage unassessable; not UI/3D
+  closure. Phase 1H not started.
 
 ## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5bb169b`)
 
