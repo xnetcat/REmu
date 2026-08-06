@@ -286,13 +286,7 @@ mod tests {
         remu_gpu::clear_event_sink();
         let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_event_sink(sender);
-        let wait = GpuMemoryWait {
-            address: 0x7000_1000,
-            reference: 1,
-            mask: u64::from(u32::MAX),
-            compare_function: 3,
-            is_64_bit: false,
-        };
+        let wait = GpuMemoryWait::memory(0x7000_1000, 1, u64::from(u32::MAX), 3, false);
         assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
             queue_id: 0,
             events: vec![GpuEvent::MemoryWait(wait), GpuEvent::MemoryWait(wait)],

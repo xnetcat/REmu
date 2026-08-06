@@ -105,4 +105,4 @@ Evidence: `runs/silent-hill-fault-diagnosis.txt`, `runs/silent-hill-main-control
 
 ## Phase 1H
 
-**Not started.**
+Closed separately — see `docs/notes/phase1h-20260806-handoff/`.

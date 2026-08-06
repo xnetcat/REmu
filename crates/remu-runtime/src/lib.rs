@@ -145,8 +145,9 @@ pub(crate) use agc_registers::{
 };
 #[cfg(test)]
 pub(crate) use agc_submission::{
-    AgcEventWrite, AgcSubmissionPacket, agc_handle_submission_packet, agc_parse_submission,
-    decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
+    AgcDmaData, AgcEventWrite, AgcSubmissionPacket, agc_handle_submission_packet,
+    agc_parse_submission, decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire,
+    decode_agc_memory_wait,
 };
 pub(crate) use agc_submission::{
     AgcSubmissionContext, agc_driver_submit_acb, agc_driver_submit_dcb,

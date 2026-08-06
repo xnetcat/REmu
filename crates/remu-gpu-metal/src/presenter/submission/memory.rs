@@ -26,12 +26,11 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
-pub(crate) const SAME_QUEUE_DMA_FILL_REJECT_COUNT: usize = 12;
+pub(crate) const SAME_QUEUE_DMA_FILL_REJECT_COUNT: usize = 11;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(usize)]
 pub(crate) enum SameQueueDmaFillReject {
-    CrossQueue,
     NonImmediateSource,
     DestinationSelector,
     SourceSnapshot,
@@ -52,7 +51,6 @@ impl SameQueueDmaFillReject {
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
-            Self::CrossQueue => "cross-queue",
             Self::NonImmediateSource => "non-immediate-source",
             Self::DestinationSelector => "destination-selector",
             Self::SourceSnapshot => "source-snapshot",
@@ -106,6 +104,15 @@ impl MetalPresenter {
             return Err("release destination is null".to_owned());
         }
         validate_guest_memory_release(release)?;
+        // SDK queueEndOfPipeAction: non-kNone CB/DB actions flush render-backend caches before the
+        // label write (sync.cpp). On Metal, ending the open pass stores attachments.
+        if release.flushes_render_backend() {
+            if let Some(batch) = self.active_open_guest_batch_mut() {
+                batch.close_active_pass_encoders();
+            }
+            self.statistics.render_backend_flushes =
+                self.statistics.render_backend_flushes.saturating_add(1);
+        }
         trace_diagnostic_guest_write(
             "release",
             release.address,
@@ -188,17 +195,12 @@ impl MetalPresenter {
         dependencies: &[super::super::SharedEventFence],
         copy: &GpuMemoryCopy,
     ) -> Result<PreparedSameQueueDmaFill, SameQueueDmaFillReject> {
-        if dependencies.is_empty()
-            || dependencies
-                .iter()
-                .any(|fence| fence.producer().queue_id() != queue_id)
-        {
-            return Err(if dependencies.is_empty() {
-                SameQueueDmaFillReject::IncompleteDependency
-            } else {
-                SameQueueDmaFillReject::CrossQueue
-            });
+        if dependencies.is_empty() {
+            return Err(SameQueueDmaFillReject::IncompleteDependency);
         }
+        // Phase 1H / W712: cross-queue fence DMA fills stay on the GPU timeline. Look up the
+        // producer's signal checkpoint on its own queue (same as WAIT_REG_MEM) instead of
+        // rejecting foreign producers as a 1ms host effect.
         if copy.source_selection != 2 {
             return Err(SameQueueDmaFillReject::NonImmediateSource);
         }
@@ -231,11 +233,25 @@ impl MetalPresenter {
             return Err(SameQueueDmaFillReject::MissingOpenBatch);
         }
         for dependency in dependencies {
-            let Some(checkpoint) = consumer
-                .resource_dependencies
-                .get(&dependency.producer())
-                .filter(|checkpoint| checkpoint.fence == *dependency)
-            else {
+            let producer_queue = dependency.producer().queue_id();
+            let checkpoint = if producer_queue == queue_id {
+                consumer
+                    .resource_dependencies
+                    .get(&dependency.producer())
+                    .filter(|checkpoint| checkpoint.fence == *dependency)
+            } else {
+                self.guest_queue_batches
+                    .get(&producer_queue)
+                    .and_then(|producer| {
+                        producer
+                            .committed_batches
+                            .iter()
+                            .chain(producer.open_batch.iter())
+                            .flat_map(|batch| &batch.signal_checkpoints)
+                            .find(|checkpoint| checkpoint.fence == *dependency)
+                    })
+            };
+            let Some(checkpoint) = checkpoint else {
                 return Err(SameQueueDmaFillReject::IncompleteDependency);
             };
             if !checkpoint.footprint_complete {
@@ -340,12 +356,104 @@ impl MetalPresenter {
             ));
         }
         record_diagnostic_memory_copy(copy);
+        // Encode waits on any foreign producer fences already recorded as host/resource deps so
+        // the fill cannot become guest-visible ahead of those producers (W712 convoy).
+        self.encode_pending_cross_queue_waits(queue_id)?;
         let batch = self
             .guest_queue_batches
             .get_mut(&queue_id)
             .and_then(|state| state.open_batch.as_mut())
             .ok_or_else(|| format!("same-queue DMA fill has no open q{queue_id} batch"))?;
         batch.memory_writes.push(prepared.pending);
+        // Unreal fence_label_dma: 4-byte zero fills are RELEASE_MEM equivalents for wait wakeups.
+        if copy.source_selection == 2
+            && copy.byte_count == 4
+            && copy.source_address as u32 == 0
+        {
+            let release = GpuMemoryRelease::label(
+                copy.destination_address,
+                GpuMemoryReleaseValue::Immediate32(0),
+            );
+            let matching_waits = release_shared_event_waits(release);
+            if !matching_waits.is_empty() {
+                self.encode_guest_release_shared_event(queue_id, &matching_waits)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn signal_dma_fence_label(&mut self, address: u64, value: u32) -> Result<(), String> {
+        if !self.per_queue_guest_batches {
+            return Ok(());
+        }
+        let Some(queue_id) = self.active_guest_queue else {
+            return Ok(());
+        };
+        let release =
+            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(value));
+        let matching_waits = release_shared_event_waits(release);
+        if matching_waits.is_empty() {
+            return Ok(());
+        }
+        self.encode_guest_release_shared_event(queue_id, &matching_waits)
+    }
+
+    fn signal_dma_fence_label_u64(&mut self, address: u64, value: u64) -> Result<(), String> {
+        if !self.per_queue_guest_batches {
+            return Ok(());
+        }
+        let Some(queue_id) = self.active_guest_queue else {
+            return Ok(());
+        };
+        let release =
+            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate64(value));
+        let matching_waits = release_shared_event_waits(release);
+        if matching_waits.is_empty() {
+            return Ok(());
+        }
+        self.encode_guest_release_shared_event(queue_id, &matching_waits)
+    }
+
+    fn encode_pending_cross_queue_waits(&mut self, consumer_queue_id: u64) -> Result<(), String> {
+        let host_deps: Vec<_> = self
+            .guest_queue_batches
+            .get(&consumer_queue_id)
+            .map(|state| {
+                state
+                    .host_dependencies
+                    .iter()
+                    .map(|(&producer, &value)| (producer, value))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (producer, value) in host_deps {
+            if producer.queue_id() == consumer_queue_id {
+                continue;
+            }
+            let producer_event = self
+                .guest_queue_batches
+                .get(&producer.queue_id())
+                .ok_or_else(|| {
+                    format!(
+                        "cross-queue DMA fill missing producer queue {}",
+                        producer.queue_id()
+                    )
+                })?
+                .shared_event_timeline
+                .event_owned();
+            let consumer = self
+                .guest_queue_batches
+                .get_mut(&consumer_queue_id)
+                .ok_or_else(|| format!("missing consumer guest queue {consumer_queue_id}"))?;
+            let batch = consumer
+                .open_batch
+                .as_mut()
+                .ok_or("cross-queue DMA fill has no open consumer batch")?;
+            batch.close_active_pass_encoders();
+            batch
+                .command_buffer
+                .encode_wait_for_event(&producer_event, value);
+        }
         Ok(())
     }
 
@@ -395,6 +503,10 @@ impl MetalPresenter {
                 value: copy.source_address as u32,
                 dword_count: copy.byte_count / 4,
             })?;
+            // Fence-shaped immediate fills are RELEASE_MEM equivalents for wait wakeups (W712).
+            if copy.byte_count == 4 && copy.source_address as u32 == 0 {
+                self.signal_dma_fence_label(copy.destination_address, 0)?;
+            }
             // The fill itself is a terminal command-processor publication. Cache and metadata
             // authority must move at that same truthful point, not while the owning Metal batch
             // is still in flight.
@@ -505,10 +617,23 @@ impl MetalPresenter {
                     };
                     bytes.extend_from_slice(source);
                 }
+                let fence32 = (bytes.len() == 4)
+                    .then(|| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+                let fence64 = (bytes.len() == 8).then(|| {
+                    u64::from_le_bytes([
+                        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6],
+                        bytes[7],
+                    ])
+                });
                 self.queue_pending_guest_memory_write(GuestMemoryWriteOperation::Copy {
                     address: copy.destination_address,
                     bytes,
                 })?;
+                if let Some(value) = fence32 {
+                    self.signal_dma_fence_label(copy.destination_address, value)?;
+                } else if let Some(value) = fence64 {
+                    self.signal_dma_fence_label_u64(copy.destination_address, value)?;
+                }
             } else {
                 if !authoritative_gpu_source && let Some(snapshot) = copy.source_snapshot.as_ref() {
                     // SAFETY: snapshot validation above proves a complete immutable packet-time
@@ -789,13 +914,7 @@ impl MetalPresenter {
                         );
                     }
                     GpuMemoryReleaseValue::Timestamp => {
-                        let value = read_guest_memory_wait_value(GpuMemoryWait {
-                            address: release.address,
-                            reference: 0,
-                            mask: u64::MAX,
-                            compare_function: 0,
-                            is_64_bit: true,
-                        });
+                        let value = read_guest_memory_wait_value(GpuMemoryWait::memory(release.address, 0, u64::MAX, 0, true));
                         self.record_guest_memory_producer(release.address, true, value);
                         self.record_guest_memory_producer(
                             release.address,
@@ -1610,6 +1729,7 @@ fn observe_pending_guest_memory_release(pending: &PendingGuestMemoryWrite) -> Op
     let GuestMemoryWriteOperation::Release(GpuMemoryRelease {
         address,
         value: GpuMemoryReleaseValue::Immediate64(_),
+        ..
     }) = pending.operation
     else {
         return None;

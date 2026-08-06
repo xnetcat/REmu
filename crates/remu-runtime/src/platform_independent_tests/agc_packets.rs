@@ -6,7 +6,8 @@ use super::{
     AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
     AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, VideoOutBufferAttributes,
     VideoOutState, agc_apply_submission_registers, agc_pm4, compute_graphics_state,
-    decode_agc_dma_data, decode_agc_memory_acquire, decode_agc_memory_wait, low_u32,
+    AgcDmaData, decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire,
+    decode_agc_memory_wait, low_u32,
 };
 
 fn append_native_memory_dma(
@@ -233,13 +234,7 @@ fn decodes_native_32_bit_wait_reference_before_its_control_word() {
             crate::AGC_R_WAIT_MEM_32,
             false
         ),
-        Some(remu_gpu::GpuMemoryWait {
-            address: label_address,
-            reference: 1,
-            mask: u64::from(u32::MAX),
-            compare_function: 3,
-            is_64_bit: false,
-        })
+        Some(remu_gpu::GpuMemoryWait::memory(label_address, 1, u64::from(u32::MAX), 3, false))
     );
 }
 
@@ -260,15 +255,51 @@ fn decodes_native_dma_immediate_fill_without_treating_the_value_as_an_address() 
 
     assert_eq!(
         decode_agc_dma_data(packet.as_ptr().addr() as u64, 7, true),
-        Some(remu_gpu::GpuMemoryCopy {
+        Some(AgcDmaData::Copy(remu_gpu::GpuMemoryCopy {
             source_address: 1,
             destination_address,
             byte_count: 8,
             source_selection: 2,
             destination_selection: 3,
             source_snapshot: None,
-        })
+        }))
     );
+}
+
+#[test]
+fn decodes_gpu_sync_dma_nowhere_barrier() {
+    // SDK gpuSyncDma / DmaDataDst::kNowhere, size 0 (sync.cpp:694-708).
+    let packet = [
+        agc_pm4(7, crate::AGC_IT_DMA_DATA, 0),
+        (2 << 20), // dst_sel = kNowhere
+        0,
+        0,
+        0,
+        0,
+        0,
+    ];
+    assert_eq!(
+        decode_agc_dma_data(packet.as_ptr().addr() as u64, 7, true),
+        Some(AgcDmaData::SyncBarrier)
+    );
+}
+
+#[test]
+fn decodes_cb_db_writeback_invalidate_event_writes() {
+    for (event_type, flush) in [
+        (0x16_u32, remu_gpu::GpuRenderBackendFlush::CbDbData),
+        (0x2a, remu_gpu::GpuRenderBackendFlush::DbData),
+        (0x2c, remu_gpu::GpuRenderBackendFlush::DbMetadata),
+        (0x2e, remu_gpu::GpuRenderBackendFlush::CbMetadata),
+        (0x31, remu_gpu::GpuRenderBackendFlush::CbData),
+    ] {
+        let packet = [agc_pm4(2, crate::AGC_IT_EVENT_WRITE, 0), event_type];
+        assert_eq!(
+            decode_agc_event_write(packet.as_ptr().addr() as u64, 2)
+                .expect("CB/DB writeback event decodes"),
+            Some(crate::AgcEventWrite::RenderBackendFlush(flush))
+        );
+    }
 }
 
 #[test]
@@ -571,20 +602,11 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
 
     assert_eq!(
         receiver.recv().expect("release event"),
-        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease {
-            address: label_address,
-            value: remu_gpu::GpuMemoryReleaseValue::Immediate64(0x0123_4567_89ab_cdef),
-        })
+        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease::label(label_address, remu_gpu::GpuMemoryReleaseValue::Immediate64(0x0123_4567_89ab_cdef)))
     );
     assert_eq!(
         receiver.recv().expect("wait event"),
-        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait {
-            address: label_address,
-            reference: 0x0123_4567_89ab_cdef,
-            mask: u64::MAX,
-            compare_function: 3,
-            is_64_bit: true,
-        })
+        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait::memory(label_address, 0x0123_4567_89ab_cdef, u64::MAX, 3, true))
     );
     assert_eq!(submission_count, 1);
     assert!(receiver.try_recv().is_err());
@@ -640,20 +662,11 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
 
     assert_eq!(
         receiver.recv().expect("indirect release event"),
-        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease {
-            address: label_address,
-            value: remu_gpu::GpuMemoryReleaseValue::Immediate32(1),
-        })
+        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease::label(label_address, remu_gpu::GpuMemoryReleaseValue::Immediate32(1)))
     );
     assert_eq!(
         receiver.recv().expect("following wait event"),
-        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait {
-            address: label_address,
-            reference: 1,
-            mask: u64::from(u32::MAX),
-            compare_function: 3,
-            is_64_bit: false,
-        })
+        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait::memory(label_address, 1, u64::from(u32::MAX), 3, false))
     );
     assert_eq!(submission_count, 1);
     assert!(receiver.try_recv().is_err());

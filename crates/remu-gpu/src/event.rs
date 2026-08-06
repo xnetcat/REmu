@@ -70,8 +70,15 @@ pub enum GpuEvent {
     /// preceding micro-engine work which can produce those arguments.
     CommandProcessorBarrier,
     PipelineBarrier(GpuPipelineBarrier),
+    /// CB/DB writeback-invalidate `EVENT_WRITE` (`drawcommandbuffer.h` EventType 0x16/0x2A/0x2C/0x2E/0x31).
+    ///
+    /// SDK `sync.cpp` emits these before end-of-pipe / acquire paths; they are the only render-backend
+    /// flush mechanism. On Metal, ending the open render pass stores attachments (TBDR writeback).
+    RenderBackendFlush(GpuRenderBackendFlush),
     MemoryAcquire(GpuMemoryAcquire),
     MemoryCopy(GpuMemoryCopy),
+    /// `gpuSyncDma`: DMA with `DmaDataDst::kNowhere` / size 0 that waits for prior DMAs and blocks the CP.
+    DmaSyncBarrier,
     MemoryWrite(GpuMemoryWrite),
     MemoryRelease(GpuMemoryRelease),
     /// A Gen5 `PIXEL_PIPE_STAT_DUMP` / `kOcclusionCounterDump` (event type 0x39).
@@ -135,6 +142,35 @@ pub struct GpuFlipCompletion {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuPipelineBarrier {
     pub wait_for: GpuPipelineStage,
+}
+
+/// One of the CB/DB writeback-invalidate events from SDK `EventType`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuRenderBackendFlush {
+    /// `EventType::kCbDbDataWritebackInvalidate` (0x16).
+    CbDbData,
+    /// `EventType::kDbDataWritebackInvalidate` (0x2A).
+    DbData,
+    /// `EventType::kDbMetadataWritebackInvalidate` (0x2C).
+    DbMetadata,
+    /// `EventType::kCbMetadataWritebackInvalidate` (0x2E).
+    CbMetadata,
+    /// `EventType::kCbDataWritebackInvalidate` (0x31).
+    CbData,
+}
+
+impl GpuRenderBackendFlush {
+    #[must_use]
+    pub const fn from_event_type(event_type: u32) -> Option<Self> {
+        match event_type {
+            0x16 => Some(Self::CbDbData),
+            0x2A => Some(Self::DbData),
+            0x2C => Some(Self::DbMetadata),
+            0x2E => Some(Self::CbMetadata),
+            0x31 => Some(Self::CbData),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,11 +339,138 @@ pub const PIXEL_PIPE_STAT_COUNTER_PAIRS: u64 = 16;
 /// retired. Native titles (and Unreal's blocking render-query path) spin until this bit appears.
 pub const PIXEL_PIPE_STAT_VALID: u64 = 1 << 63;
 
+/// Gen5 `CachePolicy` for CP label / wait packets (`drawcommandbuffer.h`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GpuCachePolicy {
+    Lru = 0,
+    Stream = 1,
+    Noalloc = 2,
+    Bypass = 3,
+}
+
+impl GpuCachePolicy {
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Lru),
+            1 => Some(Self::Stream),
+            2 => Some(Self::Noalloc),
+            3 => Some(Self::Bypass),
+            _ => None,
+        }
+    }
+}
+
+/// `EndOfPipeCbDbAction` values carried in `RELEASE_MEM` (`commandbuffer.h`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GpuEndOfPipeCbDbAction {
+    WritebackCbDbData = 0x04,
+    WritebackInvalidateCbDbData = 0x14,
+    None = 0x28,
+    WritebackInvalidateDbData = 0x2B,
+    WritebackInvalidateCbData = 0x2D,
+}
+
+impl GpuEndOfPipeCbDbAction {
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0x04 => Some(Self::WritebackCbDbData),
+            0x14 => Some(Self::WritebackInvalidateCbDbData),
+            0x28 => Some(Self::None),
+            0x2B => Some(Self::WritebackInvalidateDbData),
+            0x2D => Some(Self::WritebackInvalidateCbData),
+            _ => None,
+        }
+    }
+
+    /// SDK: any non-`kNone` action flushes CB/DB data caches before the label write.
+    #[must_use]
+    pub const fn flushes_render_backend(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
+/// `WaitOperation` engine select from `WAIT_REG_MEM` (`drawcommandbuffer.h`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum GpuWaitOperation {
+    /// PFP waits — parser-front work cannot overtake the compare.
+    WaitPfp = 1,
+    /// ME waits — PFP may run ahead of the stalled micro-engine.
+    WaitMe = 0,
+    /// Conditional ME wait (`CondWriteSpace::kScratch`).
+    WaitCondMe = 4,
+}
+
+impl GpuWaitOperation {
+    #[must_use]
+    pub const fn from_u32(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::WaitMe),
+            1 => Some(Self::WaitPfp),
+            4 => Some(Self::WaitCondMe),
+            _ => None,
+        }
+    }
+
+    /// PFP waits must close open encoders before the GPU wait (parser cannot skip ahead).
+    #[must_use]
+    pub const fn stalls_parser(self) -> bool {
+        matches!(self, Self::WaitPfp)
+    }
+}
+
 /// An ordered CPU-visible label write produced by a Gen5 end-of-pipe packet.
+///
+/// Fields beyond address/value come from SDK `queueEndOfPipeAction` / `RELEASE_MEM`
+/// (`sync.cpp` `gpuSyncEvent` / `gpuSyncPostProducer`): CB/DB action, GCR control, and the
+/// cache policy that distinguishes CPU-visible (`kBypass`/`kNoalloc`) from GPU-visible (`kLru`)
+/// labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuMemoryRelease {
     pub address: u64,
     pub value: GpuMemoryReleaseValue,
+    /// `EndOfPipeCbDbAction` byte from the packet.
+    pub action: u32,
+    /// `GcrCntl` / acquire GCR bits packed beside data selection.
+    pub gcr_control: u32,
+    /// `CachePolicy` selecting CPU vs GPU label visibility.
+    pub cache_policy: u32,
+    /// `QueuedInterrupt` selector (decoded; interrupt delivery is a separate surface).
+    pub interrupt: u32,
+}
+
+impl GpuMemoryRelease {
+    /// Label-only release with SDK `kNone` CB/DB action and GPU-visible LRU policy.
+    #[must_use]
+    pub const fn label(address: u64, value: GpuMemoryReleaseValue) -> Self {
+        Self {
+            address,
+            value,
+            action: GpuEndOfPipeCbDbAction::None as u32,
+            gcr_control: 0,
+            cache_policy: GpuCachePolicy::Lru as u32,
+            interrupt: 0,
+        }
+    }
+
+    /// SDK: Bypass/Noalloc label stores are CPU-visible; LRU stores are GPU-visible (`sync.cpp`).
+    #[must_use]
+    pub const fn cpu_visible(self) -> bool {
+        self.cache_policy == GpuCachePolicy::Bypass as u32
+            || self.cache_policy == GpuCachePolicy::Noalloc as u32
+    }
+
+    #[must_use]
+    pub const fn flushes_render_backend(self) -> bool {
+        match GpuEndOfPipeCbDbAction::from_u32(self.action) {
+            Some(action) => action.flushes_render_backend(),
+            None => self.action != GpuEndOfPipeCbDbAction::None as u32,
+        }
+    }
 }
 
 /// An ordered command-processor write of one or more dwords to guest memory.
@@ -330,6 +493,9 @@ pub enum GpuMemoryReleaseValue {
 }
 
 /// An ordered Gen5 command-processor wait on a guest-memory label.
+///
+/// `operation` is the SDK `WaitOperation` (PFP vs ME engine select). Ignoring it collapses every
+/// wait to one engine and is why producerless suspensions mis-order relative to PFP fetches.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuMemoryWait {
     pub address: u64,
@@ -337,6 +503,36 @@ pub struct GpuMemoryWait {
     pub mask: u64,
     pub compare_function: u32,
     pub is_64_bit: bool,
+    /// `WaitOperation` including the mandatory PFP/ME engine select.
+    pub operation: u32,
+    /// `CachePolicy` for the wait probe (CPU labels use Noalloc; GPU labels use LRU).
+    pub cache_policy: u32,
+}
+
+impl GpuMemoryWait {
+    #[must_use]
+    pub const fn memory(
+        address: u64,
+        reference: u64,
+        mask: u64,
+        compare_function: u32,
+        is_64_bit: bool,
+    ) -> Self {
+        Self {
+            address,
+            reference,
+            mask,
+            compare_function,
+            is_64_bit,
+            operation: GpuWaitOperation::WaitPfp as u32,
+            cache_policy: GpuCachePolicy::Lru as u32,
+        }
+    }
+
+    #[must_use]
+    pub const fn wait_operation(self) -> Option<GpuWaitOperation> {
+        GpuWaitOperation::from_u32(self.operation)
+    }
 }
 
 /// Process-unique identity for one submitted guest-memory wait.

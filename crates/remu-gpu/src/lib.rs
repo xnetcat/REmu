@@ -36,11 +36,11 @@ pub use compute::{
 
 mod event;
 pub use event::{
-    GpuEvent, GpuFlipCompletion, GpuFlipWait, GpuMemoryAcquire, GpuMemoryCopy,
-    GpuMemoryCopySnapshot, GpuMemoryCopySnapshotBudgetExceeded, GpuMemoryRelease,
-    GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage,
-    GpuWaitId, PIXEL_PIPE_STAT_COUNTER_PAIRS, PIXEL_PIPE_STAT_VALID,
-    gpu_memory_copy_snapshot_statistics,
+    GpuCachePolicy, GpuEndOfPipeCbDbAction, GpuEvent, GpuFlipCompletion, GpuFlipWait,
+    GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryCopySnapshot, GpuMemoryCopySnapshotBudgetExceeded,
+    GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuMemoryWrite, GpuPipelineBarrier,
+    GpuPipelineStage, GpuRenderBackendFlush, GpuWaitId, GpuWaitOperation,
+    PIXEL_PIPE_STAT_COUNTER_PAIRS, PIXEL_PIPE_STAT_VALID, gpu_memory_copy_snapshot_statistics,
 };
 
 mod diagnostics;

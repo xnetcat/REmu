@@ -17,6 +17,17 @@ Oregon / Poppy watchdog-timeout clean; `pthread_setschedparam` no longer fabrica
 GC STW **not** live-proven — Dreaming Sarah still null-SIGSEGV before `InstallExceptionHandler`.
 Demon's Souls still ACM-blocked.
 
+## Phase 1H (2026-08-06) — GPU sync completeness — CLOSED
+
+SDK `sync.cpp` RELEASE_MEM / WAIT_REG_MEM / CB·DB writeback / `gpuSyncDma`; W712 cross-queue
+fence DMA on the GPU timeline (`CrossQueue` 1ms host reject deleted); consumer-aware ACQUIRE
+demotion. See `docs/notes/phase1h-20260806-handoff/`.
+
+**Acceptance:** package tests + both-arch `cargo check` green; live matrix at `f8bdad5`
+(SH/Oregon/Poppy watchdog-timeout; DS/Void null-SIGSEGV; DeS ACM). **Anti-claim:**
+`captured_frames=0`; SH DMA-FILL rate meter `attempts=0` — no fabricated Q W712 counter win;
+no FPS (SH launch loadavg 5.17). Phase 1 A–H invariants complete after merge.
+
 ## Phase 1G (2026-08-06) — memory model — CLOSED (on `main` @ `b4a82f5`)
 
 Guest-backed GPU-tiler upload/publish for tiler-owned textures; anonymous→committed backing;
@@ -28,7 +39,7 @@ publish refused by default; bookkeeping keeps Metal debt. See
 **Acceptance:** package tests + both-arch `cargo check` green; SH/Oregon/Poppy watchdog-timeout
 clean; SH fault closed vs main control. **Anti-claim:** `captured_frames=0` on tip and main —
 PPM UI-garbage unassessable; not a 3D/UI closure. Dreaming Sarah/Void null-SIGSEGV and DeS ACM
-unchanged. Phase 1H not started.
+unchanged.
 
 ## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5bb169b`)
 

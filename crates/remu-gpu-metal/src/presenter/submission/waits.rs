@@ -88,6 +88,11 @@ impl MetalPresenter {
                         fence.value()
                     )
                 })?;
+            // SDK WaitOperation: PFP waits stall the parser (must close open encoders); ME waits
+            // leave PFP free to run ahead (sync.cpp waitOnAddress / waitOnLabel).
+            let stall_parser = wait
+                .wait_operation()
+                .is_none_or(|operation| operation.stalls_parser());
             if fence.producer().queue_id() == consumer_queue_id {
                 // A3: same-queue WAIT_REG_MEM elision — the default disposition.
                 //
@@ -139,7 +144,9 @@ impl MetalPresenter {
                 .open_batch
                 .as_mut()
                 .ok_or("shared-event wait has no open consumer batch")?;
-            batch.close_active_pass_encoders();
+            if stall_parser {
+                batch.close_active_pass_encoders();
+            }
             batch
                 .command_buffer
                 .encode_wait_for_event(&producer_event, fence.value());
@@ -314,6 +321,8 @@ impl GuestMemoryWaitKey {
             mask: wait.mask,
             compare_function: wait.compare_function,
             is_64_bit: wait.is_64_bit,
+            operation: wait.operation,
+            cache_policy: wait.cache_policy,
         }
     }
 
@@ -324,6 +333,8 @@ impl GuestMemoryWaitKey {
             mask: self.mask,
             compare_function: self.compare_function,
             is_64_bit: self.is_64_bit,
+            operation: self.operation,
+            cache_policy: self.cache_policy,
         }
     }
 }

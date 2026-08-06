@@ -238,13 +238,7 @@ mod tests {
     use super::*;
 
     fn wait(address: u64, is_64_bit: bool) -> GpuMemoryWait {
-        GpuMemoryWait {
-            address,
-            reference: 1,
-            mask: u64::MAX,
-            compare_function: 3,
-            is_64_bit,
-        }
+        GpuMemoryWait::memory(address, 1, u64::MAX, 3, is_64_bit)
     }
 
     #[test]

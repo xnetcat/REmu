@@ -477,6 +477,14 @@ impl MetalPresenter {
                     }
                 }
                 GpuEvent::PipelineBarrier(barrier) => self.end_guest_pipeline_barrier(barrier),
+                GpuEvent::RenderBackendFlush(flush) => {
+                    self.flush_guest_render_backend(flush);
+                }
+                GpuEvent::DmaSyncBarrier => {
+                    if let Err(error) = self.end_guest_dma_sync_barrier() {
+                        eprintln!("[REMu][METAL] gpuSyncDma barrier failed: {error}");
+                    }
+                }
                 GpuEvent::MemoryAcquire(acquire) => {
                     if let Err(error) = self.synchronize_cpu_written_guest_resources(acquire) {
                         eprintln!("[REMu][METAL] ACQUIRE_MEM synchronization failed: {error}");
@@ -813,6 +821,32 @@ impl MetalPresenter {
         PresenterFlow::Continue
     }
 
+    /// SDK CB/DB writeback-invalidate EVENT_WRITE: store attachments by ending the render pass.
+    pub(super) fn flush_guest_render_backend(&mut self, flush: remu_gpu::GpuRenderBackendFlush) {
+        let Some(batch) = self.active_open_guest_batch_mut() else {
+            return;
+        };
+        // Partial CS/PS flushes keep the pass open (TBDR). CB/DB writeback events are the SDK's
+        // only render-backend flush: ending the pass stores color/depth to guest-visible memory.
+        batch.close_active_pass_encoders();
+        self.statistics.render_backend_flushes =
+            self.statistics.render_backend_flushes.saturating_add(1);
+        let _ = flush;
+    }
+
+    /// SDK `gpuSyncDma`: wait for prior CP DMAs with write-confirm and block the CP.
+    pub(super) fn end_guest_dma_sync_barrier(&mut self) -> Result<(), String> {
+        if let Some(batch) = self.active_open_guest_batch_mut() {
+            batch.close_active_pass_encoders();
+        }
+        // Prior DMA fills/copies are already ordered as terminal memory_writes on this batch.
+        // Flushing commits them so following CP work cannot overtake unpublished DMA effects.
+        self.flush_guest_command_batch(
+            FlushPolicy::Required,
+            GuestBatchFlushReason::CommandProcessorBarrier,
+        )
+    }
+
     pub(super) fn end_guest_pipeline_barrier(&mut self, _barrier: remu_gpu::GpuPipelineBarrier) {
         let Some(batch) = self.active_open_guest_batch_mut() else {
             return;
@@ -1061,7 +1095,10 @@ impl MetalPresenter {
         event: &GpuEvent,
     ) -> bool {
         match event {
-            GpuEvent::CommandProcessorBarrier | GpuEvent::PipelineBarrier(_) => true,
+            GpuEvent::CommandProcessorBarrier
+            | GpuEvent::PipelineBarrier(_)
+            | GpuEvent::RenderBackendFlush(_)
+            | GpuEvent::DmaSyncBarrier => true,
             // With no invalidation bits, or with no live cached resource in its effective range,
             // ACQUIRE_MEM has no presenter-side resource effect. It is safe to consume after
             // encoding the queue's Metal wait: the normal handler either returns immediately or

@@ -26,6 +26,17 @@ registers/packets that state intent.
 - Handoff: `docs/notes/phase1f-20260806-handoff/`.
 - **Anti-claim:** Unity GC STW not live-closed (Dreaming Sarah dies before InstallExceptionHandler).
 
+## Phase 1H — GPU sync completeness (CLOSED 2026-08-06)
+
+- SDK `sync.cpp`: RELEASE_MEM action/GCR/cache_policy; CB/DB EVENT_WRITE writebacks;
+  WAIT_REG_MEM WaitOperation (PFP vs ME); `gpuSyncDma` nowhere barrier; label visibility on
+  Phase 1C release stores; W712 cross-queue fence DMA on Metal timeline (`CrossQueue` reject
+  deleted); ACQUIRE demotion deferred to consumer bind (fingerprints already gone in 1G).
+- Handoff: `docs/notes/phase1h-20260806-handoff/`.
+- **Anti-claim:** SH `captured_frames=0`; live DMA-FILL rate meter `attempts=0` this tip — no
+  claim that historic Q W712 convoy counters were re-measured. No FPS (SH launch loadavg 5.17).
+- Phase 1 A–H architectural invariants complete after merge to `main`.
+
 ## Phase 1G — memory model (CLOSED 2026-08-06; on `main` @ `b4a82f5`)
 
 - Guest-backed GPU tiler upload/publish for tiler-owned textures; anonymous→committed backing;
@@ -38,7 +49,7 @@ registers/packets that state intent.
   Fixes `f21484c`/`f07da85`. Post-fix watchdog 124, flips≥1024.
 - Handoff: `docs/notes/phase1g-20260806-handoff/`.
 - **Anti-claim:** `captured_frames=0` on tip and main — PPM UI-garbage unassessable; not UI/3D
-  closure. Phase 1H not started.
+  closure.
 
 ## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5bb169b`)
 
