@@ -1,4 +1,4 @@
-revision=5b920ab
+revision=07e3b98
 game=/Volumes/Untitled/sharpemu/games/void tRrLM Void Terrarium/eboot.bin
 timeout_seconds=30
 elapsed_seconds=2
