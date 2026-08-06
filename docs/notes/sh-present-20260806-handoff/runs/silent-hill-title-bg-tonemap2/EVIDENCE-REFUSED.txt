@@ -1,0 +1,13 @@
+revision=de613d3 dirty_tree=0
+run: 20260806T133950Z-PPSA10112-app
+REFUSED as title post-BasePass tonemap evidence.
+
+Reasons:
+  - loadavg-pre one-min 4.73 but five-min 6.09 (machine still hot from concurrent work)
+  - No BasePass PS 8070b3 LATE-DRAW; no 800bf4 LATE-DRAW after MIN_DRAW=22070
+  - TARGET dump never matched (MIN_DRAW=22070 not reached for 800bf4 under dump hooks)
+  - final total_mask_mrt3plus=1024 but title 7-MRT BasePass geometry path not confirmed
+  - efc frames show mixed bright content (not a clean title-BG attribution run)
+
+Do not cite this run for 800bf4 post-BasePass sample VAs.
+Use lightpost2 + mrtocc2 for attribution instead.

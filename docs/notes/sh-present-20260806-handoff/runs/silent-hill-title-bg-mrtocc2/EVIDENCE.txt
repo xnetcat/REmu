@@ -1,0 +1,45 @@
+revision=de613d3 dirty_tree=0 evidence_status=clean
+loadavg-pre={ 4.04 4.34 4.25 }; run.json vm_loadavg={ 5.86 4.72 4.39 }
+run: 20260806T130218Z-PPSA10112-app
+timeout=150s AUTO_CROSS every 4s from 8..140 (repeat 4s)
+captured_frames=15
+outcome=external-watchdog-timeout
+
+Title frame: CONFIRMED (TITLE-UI-ON-DARK e.g. mean≈4 brightUI=58).
+Title 3D BG: still not assessable (solid dark void behind UI).
+
+COLOR-EMIT (AGC ATTRIB2 fixed): fullres=1 slots show 780×438 (=1920×1080).
+  total_mask_mrt3plus final ≈13928
+  Dominant 7-MRT MRT0 this run: 806aa4 (remapped vs prior 8068e0 / 8068f4)
+
+MRT0 occupancy (REMU_DUMP_TARGET_MRT_MIN=7 MATCH_INDEX=100 MIN_DRAW=22000):
+  TARGET-MATCH index=100 draw=22100 es=0x8091100000 ps=0x8091140000
+  address=0x806aa40000 1920×1080 RGBA16Float
+  bytes=16588800 nonzero=1327104 magnitude_nz=1327104 zero=746496
+  → NOT clear-only version bumps: ~64% of texels have float magnitude.
+  This dump draw itself: vertex_positions all 0.0, pixel_outputs coverage=0
+  (accumulated prior BasePass writers left the magnitude; this mesh export was dead).
+
+Title lighting sample VAs (from TARGET sampled writer lineage):
+  800a69 @ draw=4811 sampled remapped set:
+    8069a3 / 8068a2 / 801ac2 / 80659f / 80649c / 8071d2 …
+  8009c4 @ draw=4687 still sampled legacy:
+    8023b9 / 8024b9 / 801c44 / 801ac2 …
+  → Not “only empty 8023b9”; title lighting remaps onto 8068* class AND
+    legacy 8023b9 path still exists on another PS.
+
+Late COMPUTE-IMAGES (seq≥5000, cs=800c7e):
+  still ImageLoad full-res 803d8e (scene color) + Gather depth 801ac2
+  — does not bind BasePass MRT0 directly (expected; lighting → scene color → tonemap).
+
+Attribution:
+  Empty emitted MRT content: REJECTED (magnitude_nz≫0 on 806aa4).
+  Sample VA mismatch alone: NARROWED — 800a69 does bind remapped 8068* set;
+    black BG is downstream of that (empty depth / dead mesh exports / scene-color ±0 /
+    wrong format views), not “BasePass never wrote”.
+
+Next blockers (exact):
+1. Dump title 800a69 TARGET: export magnitude + occupancy of sampled 8068* vs 8023b9
+2. Depth 801ac2 still gpufalse/v0; no-attachment 800802 drops (worst PERF-DROPPED)
+3. Why some BasePass mesh draws export all-zero positions (pixel_outputs=0) while
+   other draws filled magnitude_nz

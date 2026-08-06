@@ -1,0 +1,29 @@
+revision=de613d3 dirty_tree=0 evidence_status=clean
+loadavg-pre={ 2.25 3.34 4.01 }
+run: 20260806T131502Z-PPSA10112-app
+timeout=150s AUTO_CROSS; REMU_DUMP_TARGET_PS=0x800a690000 MIN_DRAW=4000 MATCH_INDEX=0
+CAPTURE_TARGET_SAMPLES=1; MRT_MIN unset (prior lightva matched wrong PS due to sticky MRT_MIN)
+
+TARGET-MATCH index=0 draw=4025 es=0x800bff0000 ps=0x800a690000
+  color_target=0x803b8a0000 1920×1080 RGBA16Float
+  magnitude_nz=0 zero=2073600 (lighting output empty)
+  pixel_outputs coverage=0; vertex_positions all 0; vs_out=0
+
+Title lighting sample VAs at this draw (CAPTURED PPMs, occupancy from TARGET sampled=):
+  8023b9 RGBA8Unorm 1920×1080 — EMPTY (nonzero=0, fp=97d30483e5dd6325)
+  8025ba RGBA8Unorm — EMPTY (same fp)
+  801c44 RGB10A2Unorm — EMPTY
+  801ac2 R32Float depth — exact=(false,0) NEVER gpu-written; EMPTY
+  804349 RGBA16Float — has some content (nonzero trail d25f32) via compute 800c7e lineage
+  NO 8068*/8069*/806aa* in this 800a69 binding set
+
+PERF (mrtocc2): 800a69 only at seq≈885 and 12223 — NEVER after BasePass (≥18117).
+lightva2 first COLOR-EMIT mrt3plus draw≈20935 (after this dump).
+
+Attribution:
+  Empty emitted BasePass MRT: still REJECTED (mrtocc2 magnitude_nz on 806aa4).
+  Sample VA mismatch for 800a69 path: CONFIRMED — binds empty legacy 8023b9 set,
+    not the filled BasePass 8068* set; and 800a69 is not the post-BasePass consumer.
+  Depth/no-attachment: CONFIRMED contributor on this path (801ac2 v0).
+
+Note: COLOR-EMIT slot widths like 780,438 are hex Debug (:x?) = 1920×1080 decimal.

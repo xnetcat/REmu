@@ -1,0 +1,17 @@
+revision=de613d3 dirty_tree=0 evidence_status=clean
+loadavg-pre={ 2.35 3.39 3.91 }
+run: 20260806T131939Z-PPSA10112-app
+REMU_DUMP_TARGET_PS=0x800b220000 MIN_DRAW=19000 MATCH_INDEX=0 CAPTURE_TARGET_SAMPLES=1
+
+TARGET-MATCH draw=19029 ps=0x800b220000 → address=0x8028fb0000 RGBA16Float
+  magnitude_nz=2073600 but first half-float alpha=0x3c (1.0); RGB channels 0
+  pixel_outputs: full coverage with (0,0,0,1) — solid black opaque, not geometry lit
+
+Samples:
+  8023b5 RGBA8Unorm — EMPTY (fp=97d30483e5dd6325), never aliased to a gpu-written resident
+  8021b1 R8Unorm — FULL 0xFF (mask/utility)
+  801abe depth — exact=(false,0) empty
+  NO 8068* BasePass MRT in bindings
+
+Timing caveat: first COLOR-EMIT mrt3plus this run is draw=21178 (806a30… set).
+  draw=19029 is STILL PRE-BasePass. Retried as lightpost2 with MIN_DRAW=22000.

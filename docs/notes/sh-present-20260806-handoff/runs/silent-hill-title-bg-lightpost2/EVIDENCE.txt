@@ -1,0 +1,47 @@
+revision=de613d3 dirty_tree=0 evidence_status=clean
+loadavg-pre={ 2.62 3.51 3.88 }
+run: 20260806T132317Z-PPSA10112-app
+REMU_DUMP_TARGET_PS=0x800b220000 MIN_DRAW=22000 MATCH_INDEX=0 CAPTURE_TARGET_SAMPLES=1
+AUTO_CROSS every 4s (title NEW GAME)
+
+Timing:
+  first COLOR-EMIT mrt3plus draw=20487 bases MRT0=806990 … slot6=80688f
+  Depth prepass 8007f4 draws≈22005–22028 depth=801ac2 write_enabled=true tile=24
+  BasePass 8070b3 draws=22029–22057 (7-MRT; slot2 BGRA8=80688f, MRT0 RGBA16Float=806990)
+  BasePass depth: test_enabled=true write_enabled=false (consumes prepass Z)
+  800b22 TARGET draw=22072 (AFTER BasePass)
+  800bf4 TARGET-WRITE draw=22079 → 806e9a RG11B10Float
+  efc composite 22102–22104 (800da3 / 8070bd / 800802)
+
+800b22 (post-BasePass):
+  color_target=0x8069900000 (BasePass MRT0) RGBA16Float magnitude_nz=1327104
+  samples remapped 80688f as RGBA8Unorm (NOT legacy 8023b9)
+    Metal alias BGRA8Unorm gpu_written magnitude≈1327104; guest RAM empty
+    captured PPM RGB all-zero (alpha-only byte occupancy / RGB-black view)
+  also samples 8021b5 R8Unorm = full 0xFF
+  pixel_outputs: full coverage export (0,0,0,1)
+  blend One/SourceAlpha → preserves dest RGB (RGB no-op on lit/BasePass MRT0)
+
+Pipeline gap (LATE-DRAW counts this run):
+  800a69 last seq/draw ≈15546 — NEVER after BasePass (≥22029)
+  800c7e last ≈13536 — NEVER after BasePass
+  Post-BasePass consumers of 806990/80688f: only 800b22 (above)
+  Tonemap 800bf4 still runs once but does not bind BasePass MRT0
+
+Present:
+  efc skip-capture fully black RGB (alpha-full fingerprint 0c998342…) interleaved with UI frames
+  Title UI-on-dark assessable; 3D BG not
+
+Attribution:
+  Empty emitted BasePass MRT: REJECTED (MRT0 + slot occupancy magnitude_nz≫0).
+  Sample VA mismatch as sole title cause: REJECTED for post-BasePass 800b22
+    (binds remapped 80688f). Still TRUE for early pre-BasePass 800a69 (legacy 8023b9).
+  Architectural black BG: PRESENT-CHAIN GAP — BasePass fills remapped GBuffers/MRT0,
+    but deferred lighting (800a69) + tonemap CS (800c7e) do not re-run afterward;
+    tonemap/present continue on stale float-±0 scene-color path; MRT0 never sampled
+    into efc.
+
+Next blockers (exact):
+  1. Why 800a69/800c7e absent after title BasePass (never submitted vs PERF-dropped vs fence).
+  2. Clean-env dump 800bf4 with MIN_DRAW after BasePass geometry (≥22070) — sample VAs + exports.
+  3. Depth 801ac2 occupancy after 8007f4 (REMU_DUMP_DEPTH_ES) — still historically v0 suspicion.
