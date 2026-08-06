@@ -11,7 +11,8 @@ use super::{
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey, SpanQueryOrder, WriteWatchRefresh,
     comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
+    guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
@@ -87,7 +88,17 @@ impl MetalPresenter {
                             let overlaps_resident = resident
                                 .write_watch
                                 .overlaps_alias_range(sampled.guest.address, sampled_bytes);
+                            // Write-watch ranges can over-report neighbours in a shared heap
+                            // (Silent Hill: RGBA16Float @ 0x8043490000 vs BGRA8 @ 0x8044590000).
+                            // Only residents that actually share the sampled bytes can need a
+                            // SampledAlias publish; format views of the same allocation are
+                            // served in Metal and must not enter this flush set.
+                            let shares_sampled_bytes = guest_texture_descriptors_share_byte_storage(
+                                resident.descriptor,
+                                sampled.guest,
+                            );
                             let aliases_sample = overlaps_resident
+                                && shares_sampled_bytes
                                 && resident.descriptor != sampled.guest
                                 && !guest_texture_descriptors_share_storage(
                                     resident.descriptor,
@@ -483,9 +494,20 @@ pub(crate) fn resident_color_view_sample_is_eligible(
     let underlying_mip_count = sampled
         .base_mip_level
         .checked_add(sampled.mip_level_count.max(1));
+    // Same-address, same-extent BGRA↔RGBA (etc.) reinterprets one Metal allocation. A neighbour
+    // in the shared heap can partially supersede owned-byte accounting via an over-broad
+    // ResourceSpan overlap while leaving this GPU image intact — Silent Hill title BG then
+    // sampled unpublished guest RAM (solid black) because serves_reads() became false.
+    // Sub-rect writers at the same address (different height/width) still require full coverage.
+    let authority_ok = resident.serves_reads()
+        || (resident.is_live()
+            && resident.descriptor.address == sampled.guest.address
+            && resident.descriptor.width == sampled.guest.width
+            && resident.descriptor.height == sampled.guest.height
+            && resident.descriptor.tile_mode == sampled.guest.tile_mode);
     !comparison
         && resident.gpu_written()
-        && resident.serves_reads()
+        && authority_ok
         && resident.texture_type == 9
         && resident.layer_count == 1
         && sampled.texture_type == 9

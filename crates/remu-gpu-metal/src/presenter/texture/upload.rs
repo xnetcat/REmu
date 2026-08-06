@@ -15,15 +15,17 @@ use super::{
     ensure_resident_texture_in_map, fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    is_storage_image_opcode, is_writable_image_opcode, persistent_sampled_texture_write_watch,
-    refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
-    render_resolve_candidate_matches, resident_color_view_sample_is_eligible,
-    resident_depth_sample_is_eligible, resident_texture_for_sample, retire_sampled_texture,
-    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_supports_access,
-    sampler_uses_normalized_coordinates, storage_image_requires_mip_hierarchy,
-    texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
-    trace_resident_texture_removal, trace_target_sampling,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
+    refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
+    sampled_texture_key, sampled_texture_supports_access, sampler_uses_normalized_coordinates,
+    storage_image_requires_mip_hierarchy, texture_element_layout,
+    trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
+    trace_target_sampling,
 };
+use super::super::capture_target_sample_textures;
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
@@ -339,6 +341,29 @@ pub(crate) fn upload_image_textures(
             let decoded = decode_image_descriptor(&binding.resource_descriptor);
             let fallback = decoded.is_err();
             if let Err(error) = &decoded {
+                let is_null =
+                    image_resource_descriptor_is_null(&binding.resource_descriptor);
+                let texture_type = binding
+                    .resource_descriptor
+                    .get(3)
+                    .map_or(0, |word| (word >> 28) & 0xf);
+                // GFX10 buffer V# / TYPE nibble 0 is not an image T#. Falling back to opaque
+                // black 1x1 hides the bad bind (title compositor BG samples as solid black).
+                // Null SRDs still take the optional-bind fallback below; non-null type-0 must
+                // loud-refuse so the draw is attributable instead of silently modulated.
+                if !is_null && texture_type == 0 {
+                    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                    if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+                        eprintln!(
+                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd",
+                            binding.pc, binding.opcode, binding.resource_descriptor,
+                        );
+                    }
+                    return Err(format!(
+                        "image at PC {:#x}: refusing opaque-black fallback for non-null type-0 SRD ({error})",
+                        binding.pc
+                    ));
+                }
                 // A fallback image samples as opaque black, so any draw that modulates by its
                 // alpha renders solid covers (Poppy menu glyphs). Name the failing descriptor
                 // once so the responsible guest SRD is attributable from the run log.
@@ -407,10 +432,17 @@ pub(crate) fn upload_image_textures(
                 && descriptor.guest.height == 1_080
             {
                 // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+                // Attribution runs that also set REMU_CAPTURE_TARGET_SAMPLES need late title
+                // intermediates (e.g. 0x8044590000); the first-128 cap exhausted during splash.
                 static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                let sample_cap = if capture_target_sample_textures() {
+                    512
+                } else {
+                    128
+                };
                 let normalized_coordinates =
                     sampler_uses_normalized_coordinates(&binding.sampler_descriptor);
-                if LOGGED.fetch_add(1, Ordering::Relaxed) < 128 {
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < sample_cap {
                     let byte_count = guest_texture_byte_count(descriptor.guest);
                     let mapping = byte_count.and_then(|byte_count| {
                         guest_shared_mapping_identity(descriptor.guest.address, byte_count)
@@ -554,7 +586,7 @@ pub(crate) fn upload_image_textures(
                         resident_guest_textures
                             .values()
                             .filter(|resident| {
-                                resident.serves_reads()
+                                resident.is_live()
                                     && resident.texture_type == 9
                                     && resident.layer_count == 1
                                     && resident.mip_level_count >= underlying_mip_count
@@ -571,6 +603,16 @@ pub(crate) fn upload_image_textures(
                                             comparison,
                                         )))
                                         || resident_depth_sample_is_eligible(resident, descriptor))
+                                    // Exact same-address colour views may remain gpu-authored after
+                                    // a neighbour partially supersedes owned-byte accounting; those
+                                    // still bind through resident_color_view_sample_is_eligible.
+                                    // Every other compatible path still needs full owned coverage.
+                                    && (resident.serves_reads()
+                                        || resident_color_view_sample_is_eligible(
+                                            resident,
+                                            descriptor,
+                                            comparison,
+                                        ))
                             })
                             .max_by_key(|resident| {
                                 (resident.gpu_written(), resident.content_version)

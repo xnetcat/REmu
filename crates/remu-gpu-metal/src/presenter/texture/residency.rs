@@ -21,7 +21,8 @@ use super::{
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
     SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw, guest_texture_byte_count,
+    decode_sampled_texture_linear_from_raw, guest_ranges_overlap, guest_texture_byte_count,
+    guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
@@ -2601,6 +2602,28 @@ impl MetalPresenter {
             if !other.is_live() {
                 // An already demoted allocation holds nothing left to take.
                 continue;
+            }
+            // ResourceSpan::overlaps consults shared-backing identity and can report neighbours
+            // in the same heap that do not share virtual bytes (Silent Hill title intermediate
+            // @ 0x8044590000 vs RGBA16Float @ 0x8043490000). Never steal authority from a
+            // different-address resident unless the descriptors actually share storage or
+            // overlap in guest VA.
+            if let Some(writer) = keep.filter(|writer| writer.address != candidate.address) {
+                let shares = guest_texture_descriptors_share_byte_storage(writer, candidate);
+                let overlaps_va = guest_texture_byte_count(writer).is_some_and(|left_bytes| {
+                    guest_texture_byte_count(candidate).is_some_and(|right_bytes| {
+                        guest_ranges_overlap(
+                            writer.address,
+                            left_bytes,
+                            candidate.address,
+                            right_bytes,
+                        )
+                    })
+                });
+                if !shares && !overlaps_va {
+                    OWNED_SUBTRACT_TENANTS_SURVIVED.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
             }
             let comparable = other
                 .span

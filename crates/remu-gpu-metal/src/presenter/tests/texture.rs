@@ -30,7 +30,8 @@ use super::{
     image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
     rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
-    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
+    resident_color_view_sample_is_eligible, resident_texture_activity_stats,
+    resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
     sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
@@ -1807,9 +1808,17 @@ fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
     ));
     assert!(decode_image_descriptor(&buffer_descriptor.resource_descriptor).is_err());
     assert!(sampled_alias_descriptor(&buffer_descriptor).is_none());
+    // fallback_image_descriptor still builds a 1x1 placeholder for callers that need a
+    // dimensioned Metal object, but sampled upload must refuse non-null type-0 SRDs instead of
+    // silently sampling opaque black (see upload_image_textures IMAGE-REFUSE path).
     let fallback =
         fallback_image_descriptor(&buffer_descriptor).expect("type-zero sampled fallback");
     assert_eq!(fallback.texture_type, 9);
+    assert_eq!(
+        (buffer_descriptor.resource_descriptor[3] >> 28) & 0xf,
+        0,
+        "fixture must remain TYPE nibble 0"
+    );
 
     buffer_descriptor.resource_descriptor =
         vec![0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x91b0_03ac].into();
@@ -4174,6 +4183,108 @@ fn a_partially_superseded_tenant_stays_live_but_stops_serving_reads() {
     );
     assert!(!tenant_resident.serves_reads());
     assert_eq!(tenant_resident.owned.byte_count(), owned_before / 2);
+}
+
+#[test]
+fn same_address_color_view_survives_partial_owned_supersession() {
+    // Silent Hill title BG: CB writes BGRA8 @ addr, PS samples RGBA8 @ same addr. A neighbour in
+    // the shared heap can partially supersede owned-byte accounting while the Metal image stays
+    // authoritative. Colour-view sampling must still bind that resident instead of uploading
+    // unpublished guest RAM (opaque black).
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            2 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let bgra = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 32,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let rgba_sample = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            ..bgra
+        },
+        span: ResourceSpan::for_texture(GuestTextureDescriptor {
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            ..bgra
+        }),
+        destination_select: 0xf2e,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type: 9,
+        layer_count: 1,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, bgra)
+        .expect("bgra resident");
+    presenter.mark_resident_texture_written(bgra);
+
+    {
+        let resident = presenter
+            .resident_guest_textures
+            .get_mut(&bgra)
+            .expect("bgra resident");
+        let span = resident.span.expect("declared span");
+        let mid = (span.range_start() + span.range_end()) / 2;
+        let stolen = RangeSet::from_run(span.range_start(), mid);
+        resident.subtract_authority(&stolen, StaleSource::GuestMemory);
+    }
+
+    let bgra_resident = &presenter.resident_guest_textures[&bgra];
+    assert!(bgra_resident.is_live());
+    assert!(bgra_resident.gpu_written());
+    assert!(
+        !bgra_resident.serves_reads(),
+        "partial supersession must clear full-range owned coverage"
+    );
+    assert!(
+        resident_color_view_sample_is_eligible(bgra_resident, rgba_sample, false),
+        "same-address same-extent BGRA→RGBA must stay eligible after partial owned supersession"
+    );
+    let subrect_sample = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            height: 16,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            ..bgra
+        },
+        span: ResourceSpan::for_texture(GuestTextureDescriptor {
+            height: 16,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            ..bgra
+        }),
+        destination_select: 0xf2e,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type: 9,
+        layer_count: 1,
+    };
+    assert!(
+        !resident_color_view_sample_is_eligible(bgra_resident, subrect_sample, false),
+        "sub-rect same-address views still require full owned coverage"
+    );
 }
 
 #[test]

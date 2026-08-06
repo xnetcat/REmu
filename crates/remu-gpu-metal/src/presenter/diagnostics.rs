@@ -97,10 +97,17 @@ pub(super) fn evaluation_samples_glyph_atlas(evaluation: &ShaderEvaluation) -> b
     })
 }
 
+fn remu_env_flag(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| value == "1")
+}
+
 pub(super) fn trace_target_sampling() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
+    // REMU_CAPTURE_TARGET_SAMPLES historically only dumped textures inside the gbuffer
+    // TARGET-MATCH path, so title-BG attribution runs that set only that flag produced no
+    // SAMPLE lines. Treat it as enabling the 1920x1080 sample residency trace as well.
     *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_TRACE_TARGET_SAMPLING").is_some_and(|value| value == "1")
+        remu_env_flag("REMU_TRACE_TARGET_SAMPLING") || remu_env_flag("REMU_CAPTURE_TARGET_SAMPLES")
     })
 }
 
@@ -603,9 +610,7 @@ pub(super) fn trace_video_target_compute_consumer(dispatch: &ComputeDispatch) {
 
 pub(super) fn capture_target_sample_textures() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var_os("REMU_CAPTURE_TARGET_SAMPLES").is_some_and(|value| value == "1")
-    })
+    *ENABLED.get_or_init(|| remu_env_flag("REMU_CAPTURE_TARGET_SAMPLES"))
 }
 
 pub(super) fn trace_scanout_writes() -> bool {

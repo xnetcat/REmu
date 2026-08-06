@@ -21,6 +21,7 @@ pub(crate) use self::descriptors::guest_texture_descriptors_share_component_reor
 pub(crate) use self::descriptors::{
     ResourceSpan, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,

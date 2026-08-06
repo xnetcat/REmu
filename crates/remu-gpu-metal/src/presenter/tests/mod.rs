@@ -73,6 +73,7 @@ use super::{
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
     rematerialisation_blit_source_origin_y,
     render_resolve_candidate_matches, render_target_cmask_address, render_target_fast_clear_color,
+    resident_color_view_sample_is_eligible,
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
