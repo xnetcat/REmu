@@ -24,15 +24,18 @@ registers/packets that state intent.
 - **Mode-5 BC mips (`8e4ed20`):** GPU tiler AddrLib mode-5 compressed mip chains; live refuse **0**.
 - **Latched stencil (`0a22e15`):** `STENCIL_ENABLE` + no Z ops → no depth attachment (`Ok(None)`),
   not a color-MRT abort. True stencil-only still loud-refused. Live stencil-only refuses **0**.
-- **Type-0 refuse + BGRA↔RGBA authority:** non-null TYPE-0 no longer opaque-black IMAGE-FALLBACK;
-  same-address color-views survive false shared-heap owned-byte theft. Live: `ALIAS-VIEW` binds;
-  title **BG still solid black**.
+- **Type-0 refuse + BGRA↔RGBA authority (`3c025bd`):** non-null TYPE-0 no longer opaque-black
+  IMAGE-FALLBACK; same-address color-views survive false shared-heap owned-byte theft.
+- **Attribution (`a86c225` clean occ run):** title intermediate after `800e73` is **RGB black**
+  (`rgb_nonzero=0`); HDR `RG11B10` input also black. Not a `800da3`/ALIAS composite discard.
+  Deeper: `800bf4` HDR write is all-zero while sampled natives are non-zero.
 - **Live:** hallway 3D + title UI; title BG still void. Worst drops no-attachment `ps=0x8008020000`.
-- **Remaining:** prove `800e73` intermediate texels at title (black upstream vs composite);
-  null IMAGE-FALLBACK; no-attachment covers; mode-1/9 BC mips; NGG `0x7` if critical.
-- Handoff: `docs/notes/sh-present-20260806-handoff/` (`runs/silent-hill-title-bg-alias/`).
-- **Anti-claim:** hallway / title UI / mode-5 mips / stencil / type-0+alias authority ≠ title-BG 3D.
-- **Next:** dump title intermediate occupancy; else DeS ACM.
+- **Remaining:** why `800bf4` writes zero HDR; null IMAGE-FALLBACK; no-attachment if on path;
+  mode-1/9 BC mips; NGG `0x7` if critical.
+- Handoff: `docs/notes/sh-present-20260806-handoff/` (`runs/silent-hill-title-bg-occ/`).
+- **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate
+  attribution ≠ title-BG 3D closure.
+- **Next:** `800bf4` HDR empty-write (MSL / coverage / `AbgrFp16`→`RG11B10`); else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 
