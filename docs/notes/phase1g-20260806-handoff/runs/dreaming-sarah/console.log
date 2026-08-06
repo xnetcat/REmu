@@ -89,24 +89,24 @@ warning: variant `SampledCacheCreate` is never constructed
     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
 
 warning: method `gpu_authored_offsets` is never used
-    --> crates/remu-gpu-metal/src/presenter.rs:1489:8
+    --> crates/remu-gpu-metal/src/presenter.rs:1496:8
      |
-1382 | impl ResidentGuestTexture {
+1389 | impl ResidentGuestTexture {
      | ------------------------- method in this implementation
 ...
-1489 |     fn gpu_authored_offsets(&self) -> Option<Vec<(u64, u64)>> {
+1496 |     fn gpu_authored_offsets(&self) -> Option<Vec<(u64, u64)>> {
      |        ^^^^^^^^^^^^^^^^^^^^
 
 warning: fields `bytes`, `buffer`, and `offset` are never read
-    --> crates/remu-gpu-metal/src/presenter.rs:1618:5
+    --> crates/remu-gpu-metal/src/presenter.rs:1634:5
      |
-1617 | struct CachedGlobalBuffer {
+1633 | struct CachedGlobalBuffer {
      |        ------------------ fields in this struct
-1618 |     bytes: Vec<u8>,
+1634 |     bytes: Vec<u8>,
      |     ^^^^^
-1619 |     buffer: Buffer,
+1635 |     buffer: Buffer,
      |     ^^^^^^
-1620 |     offset: u64,
+1636 |     offset: u64,
      |     ^^^^^^
 
 warning: constant `GLOBAL_BUFFER_CACHE_CAPACITY` is never used
@@ -128,18 +128,18 @@ warning: function `journal_guest_write_segments` is never used
      |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: associated function `encode_mip` is never used
-   --> crates/remu-gpu-metal/src/presenter/readback.rs:535:19
+   --> crates/remu-gpu-metal/src/presenter/readback.rs:532:19
     |
-513 | impl PendingTextureReadback {
+510 | impl PendingTextureReadback {
     | --------------------------- associated function in this implementation
 ...
-535 |     pub(super) fn encode_mip(
+532 |     pub(super) fn encode_mip(
     |                   ^^^^^^^^^^
 
 warning: function `read_texture_mip_linear` is never used
-    --> crates/remu-gpu-metal/src/presenter/readback.rs:1104:15
+    --> crates/remu-gpu-metal/src/presenter/readback.rs:1101:15
      |
-1104 | pub(super) fn read_texture_mip_linear(
+1101 | pub(super) fn read_texture_mip_linear(
      |               ^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: methods `active_transient_global_buffer_cache` and `active_transient_global_buffer_cache_mut` are never used
@@ -173,33 +173,33 @@ warning: function `write_watched_guest_texture_linear` is never used
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `comparison_pixel_format` is never used
-   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:458:4
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:460:4
     |
-458 | fn comparison_pixel_format(format: metal::MTLPixelFormat) -> metal::MTLPixelFormat {
+460 | fn comparison_pixel_format(format: metal::MTLPixelFormat) -> metal::MTLPixelFormat {
     |    ^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `create_exact_sampled_mip_texture` is never used
-   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:465:4
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:467:4
     |
-465 | fn create_exact_sampled_mip_texture(
+467 | fn create_exact_sampled_mip_texture(
     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `create_exact_mode5_sampled_mip_view` is never used
-   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:624:15
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:626:15
     |
-624 | pub(crate) fn create_exact_mode5_sampled_mip_view(
+626 | pub(crate) fn create_exact_mode5_sampled_mip_view(
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `create_exact_mode27_sampled_mip_view` is never used
-   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:701:15
+   --> crates/remu-gpu-metal/src/presenter/texture/mips.rs:703:15
     |
-701 | pub(crate) fn create_exact_mode27_sampled_mip_view(
+703 | pub(crate) fn create_exact_mode27_sampled_mip_view(
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: function `create_guest_texture` is never used
-    --> crates/remu-gpu-metal/src/presenter/texture/residency.rs:2744:15
+    --> crates/remu-gpu-metal/src/presenter/texture/residency.rs:2751:15
      |
-2744 | pub(crate) fn create_guest_texture(
+2751 | pub(crate) fn create_guest_texture(
      |               ^^^^^^^^^^^^^^^^^^^^
 
 warning: function `trace_glyph_atlas_linear` is never used
@@ -317,9 +317,9 @@ warning: function `decode_mode5_mip_chain_from_raw` is never used
     |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 warning: `remu-gpu-metal` (lib) generated 41 warnings (run `cargo fix --lib -p remu-gpu-metal` to apply 8 suggestions)
-    Finished `release` profile [optimized] target(s) in 0.05s
-[REMu] host vm.loadavg: { 3.34 3.06 2.73 }
-[REMu] launching PPSA02929-app0; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs/20260806T015131Z-PPSA02929-app0
+    Finished `release` profile [optimized] target(s) in 0.06s
+[REMu] host vm.loadavg: { 5.83 4.13 3.68 }
+[REMu] launching PPSA02929-app0; artifacts: /Users/xnetcat/Documents/REmu-phase1g/docs/notes/phase1g-20260806-handoff/runs/dreaming-sarah-artifacts/20260806T021312Z-PPSA02929-app0
 [REMu] render resolution: 1920x1080 (presentation-only)
 [REMu] warning: no guest-native resolution hook was found; only presentation is 1920x1080
 [REMu] launching the interactive REmu.app bundle
@@ -329,7 +329,7 @@ Could not open file /app0/shaders/replacecolor.vert.
 [REMu][VM] unmapped address=0x70056b0000 length=0x10000
 [REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
 [REMu][VFS] miss=Some(16) sceKernelOpen failed guest="/app0/shaders/tint.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/tint.vert": No such file or directory (os error 2)
-[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x307675e50,0x0,0x0,0x1b6
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x30fde9e50,0x0,0x0,0x1b6
 Could not open file /app0/shaders/tint.vert.
 [REMu][VM] unmapped address=0x70056b0000 length=0x10000
 [REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
@@ -352,17 +352,17 @@ Could not open file /app0/shaders/water.vert.
 [REMu][VFS] miss=Some(20) sceKernelOpen failed guest="/app0/shaders/waterbg.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/waterbg.vert": No such file or directory (os error 2)
 Could not open file /app0/shaders/waterbg.vert.
 [REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x8000e5c57 space=host reason=null-address; forwarding
-[REMu][WATCH] fault registers rax=0x8000e5c57 rbx=0x7000250080 rcx=0x8002eeddc rdx=0x6e rdi=0x8002fb72e rsi=0x8002fcfe0 rbp=0x307686570 rsp=0x307676420 r8=0x101010101010101 r9=0x8080808080808080 r10=0x46000001d0 r11=0x1b r12=0x30767e4f0 r13=0x307676490 r14=0x3076865a0 r15=0x307686b40
-[REMu][WATCH] fault stack rsp=0x307676420 words=0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0
-/Users/xnetcat/Documents/REmu-phase1g/scripts/run-with-watchdog.sh: line 165: 76216 Segmentation fault: 11  "$@"
-revision=5b920ab
+[REMu][WATCH] fault registers rax=0x8000e5c57 rbx=0x7000250080 rcx=0x8002eeddc rdx=0x6e rdi=0x8002fb72e rsi=0x8002fcfe0 rbp=0x30fdfa570 rsp=0x30fdea420 r8=0x101010101010101 r9=0x8080808080808080 r10=0x46000001d0 r11=0x1b r12=0x30fdf24f0 r13=0x30fdea490 r14=0x30fdfa5a0 r15=0x30fdfab40
+[REMu][WATCH] fault stack rsp=0x30fdea420 words=0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0
+/Users/xnetcat/Documents/REmu-phase1g/scripts/run-with-watchdog.sh: line 165: 88729 Segmentation fault: 11  "$@"
+revision=c74a420
 game=/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/eboot.bin
 timeout_seconds=30
-elapsed_seconds=1
+elapsed_seconds=2
 outcome=guest-failure
 exit_status=139
 captured_frames=0
 unimplemented_nids=0
 render_size=1920x1080
 render_policy=presentation-only
-[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs/20260806T015131Z-PPSA02929-app0
+[REMu] complete; full artifacts: /Users/xnetcat/Documents/REmu-phase1g/docs/notes/phase1g-20260806-handoff/runs/dreaming-sarah-artifacts/20260806T021312Z-PPSA02929-app0
