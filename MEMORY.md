@@ -28,16 +28,16 @@ registers/packets that state intent.
   IMAGE-FALLBACK; same-address color-views survive false shared-heap owned-byte theft.
 - **Attribution (`a86c225` clean occ run):** title intermediate after `800e73` is **RGB black**
   (`rgb_nonzero=0`); HDR `RG11B10` input also black. Not a `800da3`/ALIAS composite discard.
-- **`800bf4` empty HDR root cause:** ES float4 VB exports W=0; AGC `PA_CL_VTE_CNTL=0x43f`
-  (`VTX_W0_FMT`) must force W=1 before clip. Tip applies that in Metal vertex/mesh epilogue.
-- **Live:** hallway 3D + title UI; title BG still void pre-fix. Post-fix live capture pending.
-- **Remaining:** live-verify VTE W0 → assessable title BG; else next architectural remainder;
+- **`VTX_W0_FMT` (`e75d19c`):** ES float4 VB W=0 was clipping HDR mesh; AGC `PA_CL_VTE_CNTL=0x43f`
+  now forces W=1 in Metal. Live: `800bf4` `pixel_outputs` full-screen — **but** PS still
+  exports `±0.0`, RT `nonzero=0`, title BG still void.
+- **Live:** hallway 3D + title UI; title BG still black (`runs/silent-hill-title-bg-vte-w0/`).
+- **Remaining:** why `800bf4` PS exports zero after coverage (`AbgrFp16`→`RG11B10` / samples);
   null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC mips; NGG `0x7` if critical.
-- Handoff: `docs/notes/sh-present-20260806-handoff/` (`runs/silent-hill-title-bg-occ/`,
-  `runs/silent-hill-title-bg-hdr/`).
-- **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate
-  attribution / VTE fix without clean live ≠ title-BG 3D closure.
-- **Next:** clean live capture with `REMU_CAPTURE_FRAMES=1`; else DeS ACM.
+- Handoff: `docs/notes/sh-present-20260806-handoff/`.
+- **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate /
+  VTE coverage-without-content ≠ title-BG 3D closure.
+- **Next:** `800bf4` zero PS exports with proven coverage; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

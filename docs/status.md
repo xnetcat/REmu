@@ -21,16 +21,19 @@ intermediate.
 
 **Attribution (`a86c225` clean):** `800e73` intermediate Metal texels are **RGB black**
 (`rgb_nonzero=0`); HDR `RG11B10` input black too. Failure is upstream of `800da3`/alias, not a
-composite discard. `800bf4` wrote all-zero HDR while sampled natives were non-zero because
-mesh position **W stayed 0** — `PA_CL_VTE_CNTL.VTX_W0_FMT` was not applied (fix on tip).
+composite discard.
+
+**`VTX_W0_FMT` (`e75d19c`):** mesh position W=0 was clipping the HDR cover; live now shows
+full-screen `pixel_outputs` on `800bf4`. **Still** `nonzero=0` / PS `±0.0` — coverage ≠ content.
 
 **Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void
-pre-fix. Post-`VTX_W0_FMT` live capture pending.
+(`runs/silent-hill-title-bg-vte-w0/` @ `e75d19c`).
 
-**Remaining title-3D blockers:** live-verify VTE W0 fix; null IMAGE-FALLBACK; no-attachment if
-on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
+**Remaining title-3D blockers:** why `800bf4` PS exports zero after coverage; null
+IMAGE-FALLBACK; no-attachment if on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
 `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 / stencil /
-type-0+alias / black-intermediate proof / VTE fix-without-live ≠ title-background 3D closure.
+type-0+alias / black-intermediate proof / VTE coverage-without-content ≠ title-background 3D
+closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
