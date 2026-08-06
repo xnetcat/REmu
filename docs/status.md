@@ -4,22 +4,23 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Phase 1E (2026-08-06) — shader core — CLOSED (with loud remaining NGG attr seam)
+## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5853fa7`)
 
 Exact image compare lattice; VALU sign/saturate/SCC; precise `V_DIV_SCALE/FMAS_F32`; sub-dword
 LDS; graphics scratch + GS wave width; no raw VOP3/DS/MUBUF/MIMG operand fabrication; `0x351` =
 `V_MIN3_F16`; graphics-Dispatcher single-lane ballots; `S_BARRIER` allowed on structured CF and
 refused under Dispatcher; compacted-vertex EXP staging under proven `NggRegisters`;
-**`INTERFACE-FILL` deleted**. Missing non-procedural `SPI_PS_INPUT_CNTL` ↔ `EXP PARAM` links
-loud-refuse (Silent Hill PARAM-less NGG still refuses — no UV invent). See
+**`INTERFACE-FILL` deleted**. Follow-up (`5853fa7`): reconcile `SPI_PS_INPUT_CNTL` with EXP PARAM
+producers — unmatched slots without general LDS take SDK `UseDefault0` (not RemuVsOut zero-fill /
+fabricated UVs); general LDS + missing EXP stays loud-refuse. See
 `docs/notes/phase1e-20260806-handoff/`.
 
-**Acceptance (`71d259e`):** package tests + both-arch workspace check green (2 pre-existing
-irreducible CF unit fails unchanged from `0a8212a`). Silent Hill watchdog-times out with
-`INTERFACE-FILL=0` and loud missing-PARAM refuses — **not** a 3D-scene closure. Dreaming Sarah /
-Void Terrarium host null SIGSEGV also reproduces on Phase 1D tip `0a8212a` (not a 1E
-introduction); `bf50225` DS control same hour was ~30 FPS (not 60) so no FPS claims. Phase 1F–H
-not started.
+**Acceptance:** package tests + both-arch workspace check green (2 pre-existing irreducible CF
+unit fails unchanged from `0a8212a`). Silent Hill at `5853fa7`: missing-PARAM Gen5 pair fails
+**31→0**; `INTERFACE-FILL=0` — **still not** a 3D-scene closure (“success is not the hallway”;
+follow-up run `captured_frames=0` under overloaded `vm.loadavg`). Dreaming Sarah / Void Terrarium
+host null SIGSEGV also reproduces on Phase 1D tip `0a8212a` (not a 1E introduction); `bf50225`
+DS control same hour was ~30 FPS (not 60) so no FPS claims. Phase 1F–H not started.
 
 ## Phase 1D (2026-08-05) — register model — CLOSED
 
@@ -444,7 +445,8 @@ After both fixes, a 120s foreground verify with the bundled offline compiler rea
 `PERF-DROPPED` lines. A separate in-process-only verify matches verify2-style pipeline health.
 Visual confirmation past NEW GAME/character select without pad injection remains open; if the
 display is still black with healthy pipelines, the next suspect is post-process composite sampling
-(`INTERFACE-FILL` procedural draws, scanout vs resident color RT timing).
+(scanout vs resident color RT timing; NGG attr path is `UseDefault0` / loud LDS refuse after
+Phase 1E — not INTERFACE-FILL).
 
 Scanout presentation re-snapshots at present only when resident `content_version`
 advances past the last private copy (not on every in-flight batch overlap), skips writing

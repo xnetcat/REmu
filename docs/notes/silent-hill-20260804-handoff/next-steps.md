@@ -29,22 +29,25 @@ change complete.
 
 ## 3. Finish real NGG vertex/primitive attribute lowering
 
-The current `INTERFACE-FILL` behavior is an explicit unfinished seam: real 3D pixel inputs can be
-zero-filled when the export half has no conventional `EXP PARAM`. Resolve this from SDK semantics,
-not from a title/address heuristic.
+**Phase 1E follow-up (`5853fa7` on `main`):** `INTERFACE-FILL` zero-fill is deleted. Unmatched
+`SPI_PS_INPUT_CNTL` slots without EXP PARAM and without general LDS take SDK `UseDefault0`
+(identity PARAM offsets from null-PS `createInterpolantMapping` no longer refuse the pair).
+General LDS + missing EXP PARAM remains a loud refuse — attribute-ring producer not lowered.
+Silent Hill missing-PARAM Gen5 fails dropped **31→0**; still **not** a title-UI/3D closure
+(“success is not the hallway”).
 
-Suggested diagnostic sequence:
+Remaining diagnostic sequence for real attribute producers (LDS / primitive-attr when EXP is
+absent):
 
-1. Dump mesh MSL for `es=0x8066760000` / `ps=0x800da30000` after the stage fix and compare it with
-   the preserved pre-fix vertex MSL.
+1. Dump mesh MSL for LDS-bearing ES halves paired with VInterp PS and compare with pass-through
+   PRIM+POS-only exports already covered by `UseDefault0`.
 2. Capture actual mesh vertex positions and attributes on the title-scene color-producing passes;
    separate depth-only/internal passes from final G-buffer/color passes.
-3. Trace `SPI_PS_INPUT_CNTL` physical mapping and the merged ES/GS export records.
-4. Determine whether parameters are staged through LDS, compacted vertex records, or primitive
-   attributes, then implement that architectural data flow in `remu-shader-metal`.
-5. Delete the zero-filled fallback for cases whose guest semantics are representable. Keep a loud,
-   specific refusal for genuinely unsupported forms; do not fabricate UVs/colors.
-6. Add decoder/compiler/presenter tests derived from the generic instruction/register contract.
+3. Trace whether parameters are staged through LDS attribute rings or primitive attributes, then
+   implement that architectural data flow in `remu-shader-metal` (not RemuVsOut invent).
+4. Keep a loud, specific refusal for genuinely unsupported forms; do not fabricate UVs/colors or
+   restore INTERFACE-FILL.
+5. Add decoder/compiler/presenter tests derived from the generic instruction/register contract.
 
 ## 4. Continue Silent Hill beyond the title
 

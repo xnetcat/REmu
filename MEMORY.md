@@ -17,14 +17,16 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Phase 1E — shader core (CLOSED 2026-08-06)
+## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5853fa7`)
 
 - Exact `image_is_comparison` lattice; VALU BFE/CLAMP/SCC; `V_DIV_SCALE/FMAS_F32`; sub-dword LDS;
   graphics scratch + GS wave; no raw VOP3/DS/MUBUF/MIMG operand fabrication; `0x351`=`V_MIN3_F16`.
-- NGG: compacted EXP staging under proven `NggRegisters`; **`INTERFACE-FILL` deleted**; missing
-  non-procedural PARAM links loud-refuse. PARAM-less SH NGG attrs still refused (no UV invent).
+- NGG: compacted EXP staging under proven `NggRegisters`; **`INTERFACE-FILL` deleted**;
+  `SPI_PS_INPUT_CNTL` reconciled to EXP PARAM producers (`5853fa7`) — unmatched / no general LDS →
+  SDK `UseDefault0`; general LDS + missing EXP loud-refuse (no UV invent).
+- SH live: missing-PARAM pair fails 31→0 at `5853fa7`; still not 3D-scene closure.
 - Barriers: structured OK; Dispatcher refuse. Graphics Dispatcher ballots = single-lane.
-- Handoff: `docs/notes/phase1e-20260806-handoff/`. Head ~`71d259e`.
+- Handoff: `docs/notes/phase1e-20260806-handoff/`.
 - Phase 1F–H not started.
 
 ## Phase 1D — register model (CLOSED 2026-08-05)
