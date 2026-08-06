@@ -64,6 +64,21 @@ pub struct GpuColorTarget {
     pub attrib3: u32,
 }
 
+impl GpuColorTarget {
+    /// AGC `CxRenderTarget` / `CB_COLORn_ATTRIB2` extent: height-1 in bits 0..13, width-1 in
+    /// bits 14..27 (not GFX10's width@0..15 / height@16..31 packing).
+    pub const fn agc_extent(self) -> (u32, u32) {
+        agc_color_attrib2_extent(self.attrib2)
+    }
+}
+
+/// Decode Prospero CB color ATTRIB2 into `(width, height)`.
+pub const fn agc_color_attrib2_extent(attrib2: u32) -> (u32, u32) {
+    let width = ((attrib2 >> 14) & 0x3fff).saturating_add(1);
+    let height = (attrib2 & 0x3fff).saturating_add(1);
+    (width, height)
+}
+
 /// A display attachment named explicitly by a following `VideoOut` flip. `color_surface` retains
 /// exact prior GFX10 surface state when one exists; otherwise the backend renders directly to a
 /// host scanout image using the registered display format without fabricating guest registers.
@@ -183,5 +198,31 @@ impl GpuHostImage {
     #[must_use]
     pub fn rgba8(&self) -> &[u8] {
         &self.rgba8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuColorTarget, agc_color_attrib2_extent};
+
+    #[test]
+    fn agc_color_attrib2_extent_matches_cx_render_target_packing() {
+        // Prospero CxRenderTarget: ((width-1) << 14) | (height-1). 1920×1080 → 0x1dfc437.
+        let attrib2 = ((1920 - 1) << 14) | (1080 - 1);
+        assert_eq!(attrib2, 0x01df_c437);
+        assert_eq!(agc_color_attrib2_extent(attrib2), (1920, 1080));
+        // GFX10-style width@0..15/height@16..31 mis-decode yields the bogus 0xc438×0x1e0
+        // that polluted Silent Hill COLOR-EMIT logs before the AGC helper.
+        assert_ne!((attrib2 & 0xffff).saturating_add(1), 1920);
+        let target = GpuColorTarget {
+            slot: 0,
+            address: 0x8068_e0_0000,
+            view: 0,
+            info: 0,
+            attrib: 0,
+            attrib2,
+            attrib3: 0,
+        };
+        assert_eq!(target.agc_extent(), (1920, 1080));
     }
 }

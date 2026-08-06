@@ -33,18 +33,23 @@ float-`±0` (byte-nz from sign bits only); PS exports match.
 full-res zero `803d6e` (not SRD-missing). Upstream `800a69` full coverage + zero exports;
 GBuffer sample `8023b9` Metal+guest all-zero.
 
-**No BasePass emit (`736d540` clean `runs/silent-hill-title-bg-gbuffer/`):**
+**No BasePass emit on content-warning-only (`736d540` `runs/silent-hill-title-bg-gbuffer/`):**
 `total_mask_mrt3plus=0`; multi-MRT is only 2-slot shadows; GBuffer COLOR writers absent;
-depth `801ac2` `gpufalse/v0`. Not Metal-dropped BasePass / not Malformed CB.
+depth `801ac2` `gpufalse/v0`. Pad not advanced — not title evidence.
+
+**Title BasePass emits (`9cc9f2f` `runs/silent-hill-title-bg-basepass/` + AUTO_CROSS):**
+NEW GAME confirmed; `total_mask_mrt3plus≈8591`; 7×1920×1080 MRT `8068e0…` Metal `gputrue`.
+`8023b9` still never COLOR; depth `801ac2` still `v0`; title BG still black.
 
 **Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void.
 
-**Remaining title-3D blockers:** why Unreal never emits deferred BasePass for
-`8023b9`/friends → empty lighting → ±0 scene color; null IMAGE-FALLBACK; no-attachment if
-on path; mode-1/9 compressed mips; NGG `0x7` if critical. See
+**Remaining title-3D blockers:** occupancy of emitted `8068e0` (clear vs geometry); whether
+title lighting still samples empty `8023b9`; depth `801ac2` / no-attachment ImageStore;
+null IMAGE-FALLBACK; NGG `0x7` if critical. See
 `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 / stencil /
 type-0+alias / black-intermediate / VTE coverage-without-content / byte-nz-of-±0 /
-“CS only binds 1×1 dummies” / “Metal dropped BasePass” ≠ title-background 3D closure.
+“CS only binds 1×1 dummies” / “Metal dropped BasePass” / “BasePass never submitted at title”
+≠ title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

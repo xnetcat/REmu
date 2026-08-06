@@ -265,21 +265,24 @@ fn agc_trace_color_target_emit(
     if multi {
         let total = MULTI.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let logged = LOGGED_MULTI.fetch_add(1, Ordering::Relaxed);
-        if logged < 64 || targets.len() >= 3 {
+        // Bound volume: first 64 multi-MRT emits, then power-of-two. Do not log every ≥3-slot
+        // BasePass draw — title sessions emit thousands and drown the evidence log.
+        let mrt3 = targets.len() >= 3;
+        if logged < 64 || total.is_power_of_two() || (mrt3 && BASEPASS_MRT.load(Ordering::Relaxed).is_power_of_two()) {
             let slots = targets
                 .iter()
                 .map(|target| {
-                    // CB_COLORn_ATTRIB2: bits 0..15 = width-1, 16..31 = height-1 (GFX10).
-                    let width = (target.attrib2 & 0xffff).saturating_add(1);
-                    let height = ((target.attrib2 >> 16) & 0xffff).saturating_add(1);
+                    let (width, height) = remu_gpu::agc_color_attrib2_extent(target.attrib2);
                     (target.slot, target.address, width, height)
                 })
                 .collect::<Vec<_>>();
+            let fullres = slots.iter().any(|&(_, _, w, h)| w >= 1280 && h >= 720);
             eprintln!(
                 "[REMu][AGC][COLOR-EMIT] draw={draw_sequence} mrt={} total_multi={total} \
-                 total_mask_mrt3plus={} slots={slots:x?}",
+                 total_mask_mrt3plus={} fullres={} slots={slots:x?}",
                 targets.len(),
                 BASEPASS_MRT.load(Ordering::Relaxed),
+                u32::from(fullres),
             );
         }
     } else {
@@ -402,8 +405,8 @@ pub(crate) fn agc_resolve_targetless_scanout(
         .get(&target.address)
         .copied()
         .filter(|surface| {
-            ((surface.attrib2 >> 14) & 0x3fff) + 1 == target.attributes.width
-                && (surface.attrib2 & 0x3fff) + 1 == target.attributes.height
+            let (width, height) = remu_gpu::agc_color_attrib2_extent(surface.attrib2);
+            width == target.attributes.width && height == target.attributes.height
         });
     draw.scanout_target = Some(remu_gpu::GpuScanoutTarget {
         address: target.address,

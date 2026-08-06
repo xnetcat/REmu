@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `736d540` (`COLOR-EMIT` / `GBUFFER-UNWRITTEN`) on top of `0a37dcf` /
-`32b445d` (`COMPUTE-IMAGES`).
+**Tip:** `main` @ pending (`COLOR-EMIT` AGC ATTRIB2 extent) on top of `9cc9f2f` /
+`736d540` (`COLOR-EMIT` / `GBUFFER-UNWRITTEN`).
 
 ## Closed gates
 
@@ -18,7 +18,8 @@
 | Missing `PA_CL_VTE_CNTL.VTX_W0_FMT` → Metal clip (no coverage) | Clean `runs/silent-hill-title-bg-vte-w0/` @ `e75d19c`: `800bf4` now has `pixel_outputs=Some((2073600,…))` vs pre-fix `None` |
 | `800bf4` zero exports after coverage — cause class | Clean vte-w0: PS exports `±0.0` because tonemap **tex0 is float-±0**; AbgrFp16→RG11B10 packing not implicated; prior “nz≠0” was sign-bit byte occupancy |
 | `800c7e` float-±0 scene color — not missing color SRD | Clean `runs/silent-hill-title-bg-cs800c7e/` @ `32b445d`: CS `ImageLoad`s full-res `803d6e` (all-zero) + depth; writes ±0. Sampled 1×1 dummies are optional. Upstream `800a69` full coverage + zero exports; GBuffer `8023b9` Metal+guest empty |
-| Empty GBuffers — not Metal-dropped BasePass | Clean `runs/silent-hill-title-bg-gbuffer/` @ `736d540`: `total_mask_mrt3plus=0` for the whole run; multi-MRT emits are only 2-slot shadow atlases; `COLOR-MALFORMED=0`; `target=0x8023b9…` never appears. Depth `801ac2` stays `gpufalse/v0` |
+| Empty GBuffers — not Metal-dropped BasePass | Clean `runs/silent-hill-title-bg-gbuffer/` @ `736d540`: content-warning-only (no pad) had `total_mask_mrt3plus=0`; multi-MRT emits only 2-slot shadows; `COLOR-MALFORMED=0`; `target=0x8023b9…` never appears. Depth `801ac2` stays `gpufalse/v0` |
+| Title BasePass **does** emit (≥3 MRT) | Clean `runs/silent-hill-title-bg-basepass/` @ `9cc9f2f` + AUTO_CROSS: title NEW GAME confirmed; `total_mask_mrt3plus≈8591`; 7×1920×1080 MRT to `8068e0…` (Metal `gputrue`); also mrt=3 incl. `801c44`. Prior “never emits” was pad-not-advanced artifact. Title BG still black; `8023b9` still never COLOR; depth `801ac2` still `v0` |
 
 ## Live progression (capture on)
 
@@ -27,12 +28,16 @@
 | Splash logos | Yes |
 | Content-warning + **ruined hallway 3D** | Yes |
 | Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs) |
-| Title **3D background** | **No — still solid black** |
+| Title **3D background** | **No — still solid black** (title UI yes; BasePass-class MRT emits yes) |
 
 Clean post-`COLOR-EMIT` @ `736d540` (`runs/silent-hill-title-bg-gbuffer/`,
 `dirty_tree=0`, launch loadavg ~2.2→4.1): `captured_frames=33`; this particular 120s run
-stayed on content-warning hallway (pad not advanced). Emit counters still cover the deferred
-lighting stream that feeds empty GBuffers.
+stayed on content-warning hallway (pad not advanced). Emit counters there cover only the
+pre-title deferred stream.
+
+Clean title-frame evidence @ `9cc9f2f` (`runs/silent-hill-title-bg-basepass/`, AUTO_CROSS,
+`dirty_tree=0`, loadavg ~4.0): NEW GAME frame confirmed; `total_mask_mrt3plus≈8591` with
+full-res 7-MRT writes to `8068e0…` (PERF `gputrue`); BG still void.
 
 ## Root causes (historical → current)
 
@@ -61,12 +66,12 @@ lighting stream that feeds empty GBuffers.
     `0x8000` only. Lighting `800a69` has full coverage but zero exports; its sampled
     `8023b9` is all-zero in Metal and guest. Sampled-only writer lineage previously hid
     the ImageLoads — not “CS only binds dummies”.
-11. **GBuffers empty because deferred BasePass is never submitted** (clean `gbuffer` @ `736d540`):
-    AGC `COLOR-EMIT` shows `total_mask_mrt3plus=0` (no CB_TARGET_MASK with ≥3 enabled slots).
-    All `mrt=2` emits are 64×64 shadow pairs, not GBuffer MRTs. Not Malformed CB decode
-    (`COLOR-MALFORMED=0`) and not a post-emit Metal drop of BasePass. Depth plane `801ac2`
-    also never gains a GPU writer (`gpufalse/v0`). Hallway 3D assessability is a **different**
-    path and does not prove these GBuffer VAs were filled.
+11. **GBuffers empty because deferred BasePass is never submitted** — **narrowed**: true for
+    content-warning-only (clean `gbuffer` @ `736d540`, no pad). **False at title**: clean
+    `basepass` @ `9cc9f2f` + AUTO_CROSS reaches NEW GAME with `total_mask_mrt3plus≈8591`
+    (7-slot 1920×1080 to `8068e0…`, Metal `gputrue`). `8023b9` still never a COLOR target;
+    depth `801ac2` still `gpufalse/v0`; title BG still black. COLOR-EMIT previously mis-logged
+    AGC ATTRIB2 extents as GFX10 packing (`c438×1e0`); real size is 1920×1080.
 
 ## Anti-claims
 
@@ -82,21 +87,22 @@ lighting stream that feeds empty GBuffers.
 - Byte/`bit` nonzero on HDR textures that are float-±0 ≠ “non-zero sampled natives”.
 - Sampled-only diagnostic writer lists for compute ≠ complete image inputs (`ImageLoad` counts).
 - Proving `800c7e` binds real (but empty) GBuffers ≠ title-background 3D closure.
-- Proving BasePass never reaches AGC emit ≠ title-background 3D closure — only closes the
-  “Metal dropped BasePass” fork.
+- Proving BasePass never reaches AGC emit on a **content-warning-only** run ≠ title-BG closure
+  and ≠ “BasePass absent at title” (clean title `basepass` run emits ≥3-slot MRTs).
+- Emitting full-res multi-MRT BasePass-class draws ≠ title-BG 3D closure while BG stays black.
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **Why Unreal never emits deferred BasePass (≥3-slot MRT) for the view that fills
-   `8023b9` / `8025ba` / `801c44` / depth `801ac2`** — CPU cull / empty draw list / missing
-   mesh-or-pak assets / depth-prepass gate / indirect count 0 / visibility. Emit-side absence
-   is proven clean @ `runs/silent-hill-title-bg-gbuffer/`; do not re-litigate Metal drop or
-   fabricated GBuffer fills.
+1. **Why title BG stays black despite ≥3-slot full-res MRT emits** (`8068e0…` Metal `gputrue`):
+   occupancy (clear-only vs geometry), whether lighting/tonemap still samples empty `8023b9`
+   instead of the emitted set, depth `801ac2` never written / no-attachment ImageStore path.
+   Clean title evidence: `runs/silent-hill-title-bg-basepass/`. Do not re-litigate
+   “BasePass never submitted at title”.
 2. **No-attachment `ps=0x8008020000` / friends:** many drops keep `target_mask=0` while
-   `ps_scalars` hold live image SRDs — only if proven on the HDR/title-BG path; do not invent CB targets.
+   `ps_scalars` hold live image SRDs (incl. `801ac2`) — only if proven on the HDR/title-BG path; do not invent CB targets.
 3. Null IMAGE-FALLBACK policy (optional binds) if still modulating covers.
 4. Mode-1/9 compressed mips + NGG rect-list `0x7` if proven on the title-BG critical path.
 5. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
@@ -115,9 +121,13 @@ lighting stream that feeds empty GBuffers.
 | `bbe413d` | TARGET/PS occupancy: float ±0 is not magnitude-nonzero |
 | `32b445d` | Compute `COMPUTE-IMAGES` + ImageLoad inputs in writer lineage |
 | `736d540` | Emit-side `COLOR-EMIT` / `COLOR-MALFORMED` + `GBUFFER-UNWRITTEN` |
+| `9cc9f2f` | docs: SH GBuffers empty because BasePass never emits (content-warning scope) |
+| *(this)* | AGC ATTRIB2 extent in `COLOR-EMIT` + title BasePass evidence correction |
 
 ## Checks
 
-- `cargo check -p remu-runtime -p remu-gpu-metal` — arm64 + `x86_64-apple-darwin` green @ `736d540`
-- Live SH clean @ `736d540` (`runs/silent-hill-title-bg-gbuffer/`) — `total_mask_mrt3plus=0`;
-  hallway assessable; title 3D still not closed
+- `cargo check -p remu-runtime -p remu-gpu-metal` — arm64 + `x86_64-apple-darwin` (pending this tip)
+- Live SH clean title @ `9cc9f2f` (`runs/silent-hill-title-bg-basepass/`) — NEW GAME;
+  `total_mask_mrt3plus≈8591`; title 3D still not closed
+- Prior content-warning-only @ `736d540` (`runs/silent-hill-title-bg-gbuffer/`) —
+  `total_mask_mrt3plus=0` (not title evidence)

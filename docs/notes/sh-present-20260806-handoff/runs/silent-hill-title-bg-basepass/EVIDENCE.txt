@@ -1,0 +1,34 @@
+revision=9cc9f2f dirty_tree=0 evidence_status=clean
+loadavg at launch: { 3.99 3.36 3.07 }
+run: 20260806T124355Z-PPSA10112-app
+timeout=150s AUTO_CROSS every 4s from 8..140 (repeat 4s)
+captured_frames=21
+
+Title frame: CONFIRMED (NEW GAME / OPTIONS / CONTROLS on solid black BG).
+  e.g. png/remu-efc1000000-1920x1080-tile27-9a4e37c68822e74d.png
+
+COLOR-EMIT at title (pad advanced past content-warning):
+  total_mask_mrt3plus final ≈ 8591 (NOT 0)
+  first ≥3-slot emit at draw≈20299
+  Dominant 7-MRT set: 8068e0 / 8063da / 8067df / 8065dd / 8062d8 / 8066de / 8064dc
+    PERF: 1920×1080 RGBA16Float tile27 gputrue (high versions) — full-res GBuffer-class
+  Also 1667× mrt=3: 8069e2 / 8028ff / 801c44
+  COLOR-MALFORMED=0
+  8023b9: still 0 COLOR-EMIT / never COLOR target (only early ps_user sample)
+  depth 801ac2: still gpufalse/v0 through PERF samples
+
+Correction vs prior gbuffer run (736d540, no AUTO_CROSS):
+  that run stayed on content-warning hallway; total_mask_mrt3plus=0 there does NOT
+  prove BasePass absence at the title menu.
+
+COLOR-EMIT size log used wrong GFX10 ATTRIB2 packing (showed c438×1e0); AGC packing
+is ((w-1)<<14)|(h-1) → real 1920×1080 (confirmed via PERF + 0x1dfc437).
+
+Title BG still solid black despite multi-MRT emits + Metal GPU writers on 8068e0….
+
+Next blockers (exact):
+1. Occupancy of emitted full-res MRT0 (8068e0): clear-only version bumps vs geometry texels
+2. Title-time lighting/tonemap sample VAs — still 8023b9 or remapped to 8068e0 set?
+3. Depth 801ac2 never written; no-attachment draws with 801ac2 in ps_scalars refused
+   ("neither color nor depth") — ImageStore depth path?
+4. NGG topology 0x7 refuse (2×) if on critical path

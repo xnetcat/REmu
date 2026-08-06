@@ -40,19 +40,25 @@ registers/packets that state intent.
   loads are magnitude-zero because lighting `800a69` exports all-zero with full coverage;
   sampled GBuffer `8023b9` is Metal+guest all-zero. 1×1 `80106d`/`8010ad` are optional
   sampled dummies, not the sole inputs (sampled-only writer lineage hid the ImageLoads).
-- **No BasePass emit (`736d540` clean gbuffer run):** `COLOR-EMIT` `total_mask_mrt3plus=0`
-  for the whole session; only 2-slot shadow MRTs; `COLOR-MALFORMED=0`; GBuffer VAs never
-  appear as COLOR targets; depth `801ac2` stays `gpufalse/v0`. Not a Metal post-emit drop.
-- **Live:** hallway 3D assessable; title BG still black. Handoff evidence:
-  `runs/silent-hill-title-bg-gbuffer/` (+ prior `cs800c7e`).
-- **Remaining:** why Unreal never submits deferred BasePass (≥3-slot MRT) that would fill
-  `8023b9`/friends (cull / empty draw list / assets / depth-prepass / indirect count);
-  null IMAGE-FALLBACK; no-attachment if on path; mode-1/9 BC mips; NGG `0x7`.
+- **No BasePass emit on content-warning-only (`736d540` gbuffer run):** `COLOR-EMIT`
+  `total_mask_mrt3plus=0`; only 2-slot shadows; GBuffer VAs never COLOR; depth `801ac2`
+  `gpufalse/v0`. Pad was not advanced — not title evidence.
+- **Title BasePass emits (`9cc9f2f` basepass run + AUTO_CROSS):** NEW GAME confirmed;
+  `total_mask_mrt3plus≈8591`; 7×1920×1080 MRT to `8068e0…` Metal `gputrue`; mrt=3 includes
+  `801c44`. `8023b9` still never COLOR; depth `801ac2` still `v0`; **title BG still black**.
+  Prior “never emits” claim does not hold at title.
+- **COLOR-EMIT ATTRIB2:** Prospero packing is `((w-1)<<14)|(h-1)` (not GFX10
+  width@0..15/height@16..31). Mis-decode logged `c438×1e0` for real 1920×1080.
+- **Live:** hallway 3D assessable; title UI assessable; title BG still black. Handoff:
+  `runs/silent-hill-title-bg-basepass/` (+ prior `gbuffer` / `cs800c7e`).
+- **Remaining:** occupancy of emitted `8068e0` (clear vs geometry); title lighting sample
+  VA (`8023b9` vs emitted set); depth `801ac2` / no-attachment ImageStore; NGG `0x7`.
 - Handoff: `docs/notes/sh-present-20260806-handoff/`.
 - **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate /
   VTE coverage-without-content / byte-nz-of-±0 / “800c7e only binds 1×1 dummies” /
-  “Metal dropped BasePass” ≠ title-BG 3D closure.
-- **Next:** emit-side BasePass absence root (CPU/asset/cull) before `800a69`; else DeS ACM.
+  “Metal dropped BasePass” / “BasePass never submitted at title” (content-warning-only) ≠
+  title-BG 3D closure.
+- **Next:** BasePass output occupancy + lighting sample VA at title; else depth no-attachment.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 
