@@ -31,6 +31,7 @@ use super::{
     diagnostic_dump_depth_export_shader, diagnostic_dump_gbuffer, diagnostic_dump_glyph_draw,
     diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_index_count, diagnostic_dump_target_match_index,
+    diagnostic_dump_target_mrt_min,
     diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
     diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
@@ -2211,6 +2212,18 @@ impl MetalPresenter {
                 .flatten()
             })
             .or_else(|| diagnostic_gbuffer_draw.then(|| targets.get(4)).flatten())
+            .or_else(|| {
+                // Title BasePass MRT0 remaps across runs (8068e0 ↔ 8068f4). Select by decoded
+                // full-res attachment count instead of a brittle absolute VA.
+                diagnostic_dump_target_mrt_min().and_then(|minimum| {
+                    (targets.len() >= minimum
+                        && targets.iter().all(|target| {
+                            target.texture.width >= 1_280 && target.texture.height >= 720
+                        }))
+                    .then(|| targets.first())
+                    .flatten()
+                })
+            })
             .or_else(|| {
                 (diagnostic_dump_shadow_consumer()
                     && evaluation_samples_layered_comparison(pixel_evaluation))

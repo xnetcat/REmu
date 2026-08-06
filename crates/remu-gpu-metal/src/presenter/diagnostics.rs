@@ -1168,6 +1168,7 @@ pub(super) fn diagnostic_texture_writer_enabled() -> bool {
         || diagnostic_dump_target_pixel_shader().is_some()
         || diagnostic_dump_target_sample_address().is_some()
         || diagnostic_dump_target_pixel_instruction_count().is_some()
+        || diagnostic_dump_target_mrt_min().is_some()
         || diagnostic_dump_complex_msaa()
         || diagnostic_dump_gbuffer()
         || diagnostic_dump_shadow_consumer()
@@ -1218,6 +1219,19 @@ pub(super) fn diagnostic_dump_target_match_index() -> usize {
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(0)
+    })
+}
+
+/// When set, TARGET dumps also select draws whose decoded color attachment count is ≥ this
+/// value (and full-res). Silent Hill title BasePass remaps MRT0 (`8068e0` vs `8068f4`), so a
+/// fixed `REMU_DUMP_TARGET_ADDRESS` misses occupancy; MRT-min selects the emit class instead.
+pub(super) fn diagnostic_dump_target_mrt_min() -> Option<usize> {
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("REMU_DUMP_TARGET_MRT_MIN")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|value| *value > 0)
     })
 }
 

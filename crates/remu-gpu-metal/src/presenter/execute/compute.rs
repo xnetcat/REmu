@@ -251,10 +251,25 @@ impl MetalPresenter {
         // Scene-color CS (e.g. SH 800c7e) may ImageLoad GBuffers that never appear in the
         // sampled-only writer lineage. Dump every image SRD once per filtered CS so missing
         // vs dummy-1x1 vs real half-res color is attributable without fabricating binds.
+        // Early occurrences alone miss title-menu remaps: also log a few dispatches at/after
+        // REMU_DUMP_COMPUTE_TEXTURE_MIN_DISPATCH (Silent Hill BasePass starts ~seq thousands).
         if dump_msl_compute_filter_matches(dispatch.shader_address) {
             static LOGGED_COMPUTE_IMAGES: AtomicUsize = AtomicUsize::new(0);
-            let sequence = LOGGED_COMPUTE_IMAGES.fetch_add(1, Ordering::Relaxed);
-            if sequence < 4 {
+            static LOGGED_LATE_COMPUTE_IMAGES: AtomicUsize = AtomicUsize::new(0);
+            let early_slot = LOGGED_COMPUTE_IMAGES.fetch_add(1, Ordering::Relaxed);
+            let min_dispatch = diagnostic_dump_compute_texture_minimum_dispatch();
+            let late_eligible = diagnostic_compute_texture_dispatch_is_eligible(
+                dispatch.sequence,
+                min_dispatch,
+            ) && min_dispatch > 0;
+            let late_slot = if late_eligible {
+                Some(LOGGED_LATE_COMPUTE_IMAGES.fetch_add(1, Ordering::Relaxed))
+            } else {
+                None
+            };
+            let log_early = early_slot < 4;
+            let log_late = late_slot.is_some_and(|slot| slot < 2);
+            if log_early || log_late {
                 let images = evaluation
                     .image_bindings
                     .iter()
@@ -294,8 +309,16 @@ impl MetalPresenter {
                         )
                     })
                     .collect::<Vec<_>>();
+                let phase = if log_late && !log_early {
+                    "late"
+                } else if log_late {
+                    "early+late"
+                } else {
+                    "early"
+                };
                 eprintln!(
-                    "[REMu][METAL][COMPUTE-IMAGES] occurrence={sequence} seq={} cs={:#x} grid={:?} local={:?} image_count={} uploaded={} images={images:08x?}",
+                    "[REMu][METAL][COMPUTE-IMAGES] phase={phase} occurrence={early_slot} late={} seq={} cs={:#x} grid={:?} local={:?} image_count={} uploaded={} images={images:08x?}",
+                    late_slot.unwrap_or(usize::MAX),
                     dispatch.sequence,
                     dispatch.shader_address,
                     dispatch.launch.grid,
