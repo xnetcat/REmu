@@ -156,9 +156,9 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 | `38a9747` | docs: 800bf4 UV collapse via mesh V# DST_SEL_Y=0 / format 5 |
 | `76e6828` | docs: point handoff commits table at UV-attr tip |
 | `37589c3` | Expand dynamic-offset S_LOAD binds to descriptor-heap span + MESH-V# warn |
-| *(pending)* | docs: V# RegularBuffer+meshlet patch attribution (`VSHARP-ATTR`) |
+| `6cf8932` | docs: V# RegularBuffer+meshlet patch attribution (`VSHARP-ATTR`) |
 
 ## Checks
 
-- `cargo check -p remu-runtime -p remu-gpu-metal -p remu-gpu` — arm64 + `x86_64-apple-darwin` green @ `3f9e559`
-- Unit: `r32_depth_sample_*` (prefer Depth over clean R32; keep Depth after later R32 mark_written)
+- `cargo check --workspace --all-targets` — arm64 + `x86_64-apple-darwin` green @ `37589c3`
+- Unit: `expands_dynamic_offset_sload_bindings_to_descriptor_heap_span`
