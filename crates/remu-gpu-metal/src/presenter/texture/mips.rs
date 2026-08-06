@@ -22,6 +22,7 @@ use std::time::Instant;
 
 pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     device: &Device,
+    queue: Option<&metal::CommandQueue>,
     promotion_command_buffer: Option<&CommandBufferRef>,
     descriptor: DecodedImageDescriptor,
     resident_guest_textures: &mut ResidentTextureMap,
@@ -116,16 +117,46 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         descriptor.layer_count,
         underlying_mip_count,
     )?;
-    let raw =
-        snapshot_watched_guest_range(descriptor.guest.address, layout.byte_count, &write_watch)?;
-    let (_, linear_levels) =
-        decode_mode27_mip_chain_from_raw(descriptor.guest, underlying_mip_count, &raw)?;
-    let texture = create_mipmapped_guest_texture(
+    if !crate::presenter::tiler::gpu_tiler_owns_descriptor(descriptor.guest) {
+        return Err(format!(
+            "Phase 1G: mipmapped storage refuses tile={} format={:?} — no GPU tiler ownership",
+            descriptor.guest.tile_mode, descriptor.guest.pixel_format
+        ));
+    }
+    let queue = queue.ok_or_else(|| {
+        format!(
+            "Phase 1G: mipmapped storage at {:#x} needs a Metal queue for GPU upload",
+            descriptor.guest.address
+        )
+    })?;
+    let usage = MTLTextureUsage::RenderTarget
+        | MTLTextureUsage::ShaderRead
+        | MTLTextureUsage::ShaderWrite
+        | MTLTextureUsage::PixelFormatView;
+    let metal_descriptor = TextureDescriptor::new();
+    metal_descriptor.set_texture_type(MTLTextureType::D2);
+    metal_descriptor.set_pixel_format(descriptor.guest.pixel_format);
+    metal_descriptor.set_width(u64::from(descriptor.guest.width));
+    metal_descriptor.set_height(u64::from(descriptor.guest.height));
+    metal_descriptor.set_mipmap_level_count(u64::from(underlying_mip_count));
+    metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
+    metal_descriptor.set_usage(usage);
+    let texture = device.new_texture(&metal_descriptor);
+    let upload_buffer = queue.new_command_buffer().to_owned();
+    upload_buffer.set_label("REMu Phase 1G mipmapped storage GPU upload");
+    crate::presenter::tiler::encode_gpu_upload_from_guest_view(
         device,
+        &upload_buffer,
         descriptor.guest,
-        underlying_mip_count,
-        &linear_levels,
+        &texture,
+        crate::presenter::tiler::GpuTilerView {
+            texture_type: 9,
+            layer_count: 1,
+            mip_level_count: underlying_mip_count,
+        },
     )?;
+    upload_buffer.commit();
+    upload_buffer.wait_until_completed();
     record_mode27_work_detail(
         origin,
         descriptor.guest,
@@ -141,7 +172,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     resident_guest_textures.insert(
         descriptor.guest,
         ResidentGuestTexture {
-            texture,
+            texture: texture.clone(),
             component_reorder_view: None,
             descriptor: descriptor.guest,
             texture_type: descriptor.texture_type,

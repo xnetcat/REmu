@@ -9,7 +9,8 @@
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::tiling::{
-    guest_texture_byte_count, tiled_block_bytes, tiled_block_dimensions,
+    guest_texture_byte_count, mode27_surface_z_xor, mode5_mip_chain_layout,
+    mode27_mip_chain_layout, tiled_block_bytes, tiled_block_dimensions,
 };
 use super::super::{GuestTextureDescriptor, ResourceSpan, texture_element_layout};
 use super::msl::{mode27_tiler_pipelines, mode5_tiler_pipelines};
@@ -31,6 +32,22 @@ pub(crate) fn gpu_tiler_owns_descriptor(descriptor: GuestTextureDescriptor) -> b
             == Some(descriptor.bytes_per_pixel)
 }
 
+/// View shape for GPU upload/publish beyond a single-level 2D face.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct GpuTilerView {
+    pub texture_type: u32,
+    pub layer_count: u32,
+    pub mip_level_count: u32,
+}
+
+impl GpuTilerView {
+    pub(crate) const SINGLE_LEVEL_2D: Self = Self {
+        texture_type: 9,
+        layer_count: 1,
+        mip_level_count: 1,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct DetileSubresource {
     width: u64,
@@ -43,62 +60,14 @@ struct DetileSubresource {
     bytes_per_element: u64,
     block_width: u64,
     block_height: u64,
+    tail_x: u64,
+    tail_y: u64,
     surface_z_xor: u64,
+    in_tail: u64,
     tile_mode: u64,
     metal_slice: u64,
     metal_level: u64,
     metal_z: u64,
-}
-
-fn single_level_subresource(
-    descriptor: GuestTextureDescriptor,
-) -> Result<(DetileSubresource, u64, u64), String> {
-    let bytes_per_element = u64::from(descriptor.bytes_per_pixel);
-    let face_bytes = guest_texture_byte_count(descriptor)
-        .ok_or("GPU tiler face size overflows")?;
-    let (block_width, block_height) = if descriptor.tile_mode == 0 {
-        (1_u64, 1_u64)
-    } else {
-        let block_bytes = tiled_block_bytes(descriptor.tile_mode)
-            .ok_or("GPU tiler block size unavailable for tile mode")?;
-        let (w, h) = tiled_block_dimensions(
-            block_bytes,
-            usize::try_from(bytes_per_element).map_err(|_| "element size does not fit usize")?,
-        )
-        .ok_or("GPU tiler block dimensions unavailable")?;
-        (
-            u64::try_from(w).map_err(|_| "block width does not fit u64")?,
-            u64::try_from(h).map_err(|_| "block height does not fit u64")?,
-        )
-    };
-    let packed_row = u64::from(descriptor.width)
-        .checked_mul(bytes_per_element)
-        .ok_or("GPU tiler packed row overflows")?;
-    let linear_row_bytes = align_256(packed_row).ok_or("GPU tiler row alignment overflows")?;
-    let linear_image_bytes = linear_row_bytes
-        .checked_mul(u64::from(descriptor.height))
-        .ok_or("GPU tiler image size overflows")?;
-    Ok((
-        DetileSubresource {
-            width: u64::from(descriptor.width),
-            height: u64::from(descriptor.height),
-            linear_offset: 0,
-            linear_row_bytes,
-            linear_image_bytes,
-            level_offset: 0,
-            pitch: u64::from(descriptor.pitch),
-            bytes_per_element,
-            block_width,
-            block_height,
-            surface_z_xor: 0,
-            tile_mode: u64::from(descriptor.tile_mode),
-            metal_slice: 0,
-            metal_level: 0,
-            metal_z: 0,
-        },
-        face_bytes,
-        linear_image_bytes,
-    ))
 }
 
 fn mode27_parameters(
@@ -120,10 +89,10 @@ fn mode27_parameters(
         sub.bytes_per_element,
         sub.block_width,
         sub.block_height,
-        0, // tail_x
-        0, // tail_y
+        sub.tail_x,
+        sub.tail_y,
         sub.surface_z_xor,
-        0, // in_tail
+        sub.in_tail,
         target_length,
         u64::try_from(run_count).map_err(|_| "GPU tiler run count does not fit u64")?,
         sub.tile_mode,
@@ -149,34 +118,247 @@ fn mode5_parameters(
         sub.bytes_per_element,
         sub.block_width,
         sub.block_height,
-        0, // tail_x
-        0, // tail_y
-        0, // in_tail
+        sub.tail_x,
+        sub.tail_y,
+        sub.in_tail,
         target_length,
         u64::try_from(run_count).map_err(|_| "GPU tiler run count does not fit u64")?,
     ])
 }
 
-fn guest_buffer_for_descriptor(
+fn guest_buffer_for_range(
     device: &Device,
-    descriptor: GuestTextureDescriptor,
+    address: u64,
     byte_count: u64,
+    tile_mode: u32,
 ) -> Result<(Buffer, u64), String> {
-    let backing_range = guest_shared_backing_range(descriptor.address, byte_count).ok_or_else(
-        || {
-            format!(
-                "Phase 1G: guest texture {:#x}+{byte_count:#x} has no committed/shared backing for Metal (tile={})",
-                descriptor.address, descriptor.tile_mode
-            )
-        },
-    )?;
-    let buffer = metal_buffer_with_guest_backing_range(device, &backing_range).ok_or_else(|| {
+    let backing_range = guest_shared_backing_range(address, byte_count).ok_or_else(|| {
         format!(
-            "Phase 1G: guest texture {:#x} backing cannot be exposed as MTLBuffer",
-            descriptor.address
+            "Phase 1G: guest texture {address:#x}+{byte_count:#x} has no committed/shared backing for Metal (tile={tile_mode})"
         )
     })?;
+    let buffer = metal_buffer_with_guest_backing_range(device, &backing_range).ok_or_else(|| {
+        format!("Phase 1G: guest texture {address:#x} backing cannot be exposed as MTLBuffer")
+    })?;
     Ok((buffer, backing_range.resource_offset()))
+}
+
+fn plan_upload_subresources(
+    descriptor: GuestTextureDescriptor,
+    view: GpuTilerView,
+) -> Result<(Vec<DetileSubresource>, u64, u64), String> {
+    if view.layer_count == 0 || view.mip_level_count == 0 {
+        return Err("Phase 1G GPU tiler view requires nonempty layers and mips".to_owned());
+    }
+    if !matches!(view.texture_type, 9 | 10 | 11 | 13) {
+        return Err(format!(
+            "Phase 1G GPU tiler cannot represent texture type {}",
+            view.texture_type
+        ));
+    }
+    if view.mip_level_count > 1
+        && descriptor.tile_mode == 0
+        && (view.texture_type != 9 || view.layer_count != 1)
+    {
+        return Err(
+            "Phase 1G linear GPU upload synthesizes mips only for single-layer 2D base uploads"
+                .to_owned(),
+        );
+    }
+    if view.mip_level_count > 1
+        && matches!(descriptor.tile_mode, 5 | 24 | 27)
+        && !(matches!(descriptor.tile_mode, 27) && view.texture_type == 9 && view.layer_count == 1
+            || matches!(descriptor.tile_mode, 5)
+                && matches!(view.texture_type, 9 | 11 | 13)
+                && view.layer_count >= 1)
+    {
+        return Err(format!(
+            "Phase 1G GPU tiler cannot represent mipmapped type={} layers={} tile={}",
+            view.texture_type, view.layer_count, descriptor.tile_mode
+        ));
+    }
+    if descriptor.tile_mode == 24 && view.mip_level_count > 1 {
+        return Err("Phase 1G GPU tiler refuses mode-24 mip chains (no SDK mip layout)".to_owned());
+    }
+
+    let bytes_per_element = u64::from(descriptor.bytes_per_pixel);
+    let mut linear_offset = 0_u64;
+    let mut subs = Vec::new();
+
+    let mut push = |width: u64,
+                    height: u64,
+                    level_offset: u64,
+                    pitch: u64,
+                    block_width: u64,
+                    block_height: u64,
+                    tail_x: u64,
+                    tail_y: u64,
+                    in_tail: bool,
+                    surface_z: u32,
+                    metal_level: u64|
+     -> Result<(), String> {
+        let packed_row = width
+            .checked_mul(bytes_per_element)
+            .ok_or("GPU tiler packed row overflows")?;
+        let linear_row_bytes = align_256(packed_row).ok_or("GPU tiler row alignment overflows")?;
+        let linear_image_bytes = linear_row_bytes
+            .checked_mul(height)
+            .ok_or("GPU tiler image size overflows")?;
+        linear_offset = align_256(linear_offset).ok_or("GPU tiler offset overflows")?;
+        let metal_slice = if matches!(view.texture_type, 11 | 13) {
+            u64::from(surface_z)
+        } else {
+            0
+        };
+        let metal_z = if view.texture_type == 10 {
+            u64::from(surface_z)
+        } else {
+            0
+        };
+        subs.push(DetileSubresource {
+            width,
+            height,
+            linear_offset,
+            linear_row_bytes,
+            linear_image_bytes,
+            level_offset,
+            pitch,
+            bytes_per_element,
+            block_width,
+            block_height,
+            tail_x,
+            tail_y,
+            surface_z_xor: u64::try_from(mode27_surface_z_xor(
+                usize::try_from(surface_z).map_err(|_| "surface index does not fit usize")?,
+            ))
+            .map_err(|_| "surface xor does not fit u64")?,
+            in_tail: u64::from(in_tail),
+            tile_mode: u64::from(descriptor.tile_mode),
+            metal_slice,
+            metal_level,
+            metal_z,
+        });
+        linear_offset = linear_offset
+            .checked_add(linear_image_bytes)
+            .ok_or("GPU tiler linear buffer size overflows")?;
+        Ok(())
+    };
+
+    let guest_bytes = if view.mip_level_count > 1 {
+        match descriptor.tile_mode {
+            27 => {
+                let layout = mode27_mip_chain_layout(descriptor, view.mip_level_count)?;
+                for (level_index, level) in layout.levels.iter().enumerate() {
+                    push(
+                        u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?,
+                        u64::try_from(level.height).map_err(|_| "mip height does not fit u64")?,
+                        u64::try_from(level.offset).map_err(|_| "mip offset does not fit u64")?,
+                        u64::try_from(level.padded_width)
+                            .map_err(|_| "mip pitch does not fit u64")?,
+                        u64::try_from(layout.block_width)
+                            .map_err(|_| "mip block width does not fit u64")?,
+                        u64::try_from(layout.block_height)
+                            .map_err(|_| "mip block height does not fit u64")?,
+                        u64::try_from(level.tail_x).map_err(|_| "mip tail X does not fit u64")?,
+                        u64::try_from(level.tail_y).map_err(|_| "mip tail Y does not fit u64")?,
+                        level.in_tail,
+                        0,
+                        u64::try_from(level_index).map_err(|_| "mip index does not fit u64")?,
+                    )?;
+                }
+                u64::try_from(layout.byte_count).map_err(|_| "mip chain bytes do not fit u64")?
+            }
+            5 => {
+                let layout = mode5_mip_chain_layout(descriptor, view.mip_level_count)?;
+                let face_bytes =
+                    u64::try_from(layout.byte_count).map_err(|_| "mode-5 face bytes overflow")?;
+                for surface_z in 0..view.layer_count {
+                    let layer_base = face_bytes
+                        .checked_mul(u64::from(surface_z))
+                        .ok_or("mode-5 layer base overflows")?;
+                    for (level_index, level) in layout.levels.iter().enumerate() {
+                        let level_offset = layer_base
+                            .checked_add(
+                                u64::try_from(level.offset)
+                                    .map_err(|_| "mode-5 mip offset does not fit u64")?,
+                            )
+                            .ok_or("mode-5 layered mip offset overflows")?;
+                        push(
+                            u64::try_from(level.width)
+                                .map_err(|_| "mode-5 mip width does not fit u64")?,
+                            u64::try_from(level.height)
+                                .map_err(|_| "mode-5 mip height does not fit u64")?,
+                            level_offset,
+                            u64::try_from(level.padded_width)
+                                .map_err(|_| "mode-5 mip pitch does not fit u64")?,
+                            u64::try_from(layout.block_width)
+                                .map_err(|_| "mode-5 block width does not fit u64")?,
+                            u64::try_from(layout.block_height)
+                                .map_err(|_| "mode-5 block height does not fit u64")?,
+                            u64::try_from(level.tail_x)
+                                .map_err(|_| "mode-5 mip tail X does not fit u64")?,
+                            u64::try_from(level.tail_y)
+                                .map_err(|_| "mode-5 mip tail Y does not fit u64")?,
+                            level.in_tail,
+                            surface_z,
+                            u64::try_from(level_index)
+                                .map_err(|_| "mode-5 mip index does not fit u64")?,
+                        )?;
+                    }
+                }
+                face_bytes
+                    .checked_mul(u64::from(view.layer_count))
+                    .ok_or("mode-5 layered mip chain overflows")?
+            }
+            _ => {
+                return Err(format!(
+                    "Phase 1G GPU tiler refuses mip upload for tile={}",
+                    descriptor.tile_mode
+                ));
+            }
+        }
+    } else {
+        let (block_width, block_height) = if descriptor.tile_mode == 0 {
+            (1_u64, 1_u64)
+        } else {
+            let block_bytes = tiled_block_bytes(descriptor.tile_mode)
+                .ok_or("GPU tiler block size unavailable for tile mode")?;
+            let (w, h) = tiled_block_dimensions(
+                block_bytes,
+                usize::try_from(bytes_per_element).map_err(|_| "element size does not fit usize")?,
+            )
+            .ok_or("GPU tiler block dimensions unavailable")?;
+            (
+                u64::try_from(w).map_err(|_| "block width does not fit u64")?,
+                u64::try_from(h).map_err(|_| "block height does not fit u64")?,
+            )
+        };
+        let face_bytes =
+            guest_texture_byte_count(descriptor).ok_or("GPU tiler face size overflows")?;
+        for surface_z in 0..view.layer_count {
+            push(
+                u64::from(descriptor.width),
+                u64::from(descriptor.height),
+                face_bytes
+                    .checked_mul(u64::from(surface_z))
+                    .ok_or("GPU tiler layer offset overflows")?,
+                u64::from(descriptor.pitch),
+                block_width,
+                block_height,
+                0,
+                0,
+                false,
+                surface_z,
+                0,
+            )?;
+        }
+        face_bytes
+            .checked_mul(u64::from(view.layer_count))
+            .ok_or("GPU tiler layered face size overflows")?
+    };
+
+    let linear_length = linear_offset;
+    Ok((subs, guest_bytes, linear_length))
 }
 
 /// Encodes guest tiled/linear bytes → `destination` texture on `command_buffer`.
@@ -189,6 +371,23 @@ pub(crate) fn encode_gpu_upload_from_guest(
     descriptor: GuestTextureDescriptor,
     destination: &Texture,
 ) -> Result<(), String> {
+    encode_gpu_upload_from_guest_view(
+        device,
+        command_buffer,
+        descriptor,
+        destination,
+        GpuTilerView::SINGLE_LEVEL_2D,
+    )
+}
+
+/// Guest → texture upload for a layered / mipmapped view owned by the GPU tiler.
+pub(crate) fn encode_gpu_upload_from_guest_view(
+    device: &Device,
+    command_buffer: &CommandBufferRef,
+    descriptor: GuestTextureDescriptor,
+    destination: &Texture,
+    view: GpuTilerView,
+) -> Result<(), String> {
     let _ = texture_element_layout(descriptor)?;
     if !gpu_tiler_owns_descriptor(descriptor) {
         return Err(format!(
@@ -196,129 +395,140 @@ pub(crate) fn encode_gpu_upload_from_guest(
             descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
         ));
     }
-    let (sub, face_bytes, linear_length) = single_level_subresource(descriptor)?;
-    let (guest, guest_offset) = guest_buffer_for_descriptor(device, descriptor, face_bytes)?;
+    // Linear/non-exact sampled mips: upload base level only; caller may generate_mipmaps.
+    let plan_view = if descriptor.tile_mode == 0 && view.mip_level_count > 1 {
+        GpuTilerView {
+            mip_level_count: 1,
+            ..view
+        }
+    } else {
+        view
+    };
+    let (subs, guest_bytes, linear_length) = plan_upload_subresources(descriptor, plan_view)?;
+    let (guest, guest_offset) =
+        guest_buffer_for_range(device, descriptor.address, guest_bytes, descriptor.tile_mode)?;
     let span = ResourceSpan::for_texture(descriptor)
         .ok_or("Phase 1G: guest texture span overflows")?;
-    // RangeSet / tiler kernels share ResourceSpan::range_start space (backing offset when
-    // resolved, else guest VA) — never mix guest VAs into debt/run comparisons.
     let resource_base = span.range_start();
     let target_base = span.range_start();
 
     if descriptor.tile_mode == 0 {
-        let guest_row_bytes = u64::from(descriptor.pitch)
-            .checked_mul(u64::from(descriptor.bytes_per_pixel))
-            .ok_or("Phase 1G linear guest row bytes overflow")?;
-        let guest_image_bytes = guest_row_bytes
-            .checked_mul(u64::from(descriptor.height))
-            .ok_or("Phase 1G linear guest image bytes overflow")?;
-        let blit = command_buffer.new_blit_command_encoder();
-        blit.set_label("REMu Phase 1G linear guest→texture upload");
-        blit.copy_from_buffer_to_texture(
-            &guest,
-            guest_offset,
-            guest_row_bytes,
-            guest_image_bytes,
-            MTLSize::new(sub.width, sub.height, 1),
-            destination,
-            0,
-            0,
-            MTLOrigin { x: 0, y: 0, z: 0 },
-            MTLBlitOption::None,
-        );
-        blit.end_encoding();
+        for sub in &subs {
+            let guest_row_bytes = sub
+                .pitch
+                .checked_mul(sub.bytes_per_element)
+                .ok_or("Phase 1G linear guest row bytes overflow")?;
+            let guest_image_bytes = guest_row_bytes
+                .checked_mul(sub.height)
+                .ok_or("Phase 1G linear guest image bytes overflow")?;
+            let blit = command_buffer.new_blit_command_encoder();
+            blit.set_label("REMu Phase 1G linear guest→texture upload");
+            blit.copy_from_buffer_to_texture(
+                &guest,
+                guest_offset
+                    .checked_add(sub.level_offset)
+                    .ok_or("Phase 1G linear guest layer offset overflows")?,
+                guest_row_bytes,
+                guest_image_bytes,
+                MTLSize::new(sub.width, sub.height, 1),
+                destination,
+                sub.metal_slice,
+                sub.metal_level,
+                MTLOrigin {
+                    x: 0,
+                    y: 0,
+                    z: sub.metal_z,
+                },
+                MTLBlitOption::None,
+            );
+            blit.end_encoding();
+        }
         return Ok(());
     }
 
     let linear = device.new_buffer(linear_length, MTLResourceOptions::StorageModePrivate);
     linear.set_label("REMu Phase 1G detile linear");
+    let tiled_source = if guest_offset == 0 {
+        guest.clone()
+    } else {
+        let scratch = device.new_buffer(guest_bytes, MTLResourceOptions::StorageModePrivate);
+        let blit = command_buffer.new_blit_command_encoder();
+        blit.set_label("REMu Phase 1G align guest tiled view");
+        blit.copy_from_buffer(&guest, guest_offset, &scratch, 0, guest_bytes);
+        blit.end_encoding();
+        scratch
+    };
+
     match descriptor.tile_mode {
         5 => {
             let (detile, _) = mode5_tiler_pipelines(device)?;
-            let parameters =
-                mode5_parameters(sub, resource_base, target_base, face_bytes, 0)?;
-            encode_detile_dispatch(
-                device,
-                command_buffer,
-                &detile,
-                &guest,
-                guest_offset,
-                face_bytes,
-                &linear,
-                &parameters,
-                sub,
-            );
+            for sub in &subs {
+                let parameters =
+                    mode5_parameters(*sub, resource_base, target_base, guest_bytes, 0)?;
+                encode_detile_dispatch(
+                    command_buffer,
+                    &detile,
+                    &tiled_source,
+                    &linear,
+                    &parameters,
+                    *sub,
+                );
+            }
         }
         24 | 27 => {
             let (detile, _) = mode27_tiler_pipelines(device)?;
-            let parameters =
-                mode27_parameters(sub, resource_base, target_base, face_bytes, 0)?;
-            encode_detile_dispatch(
-                device,
-                command_buffer,
-                &detile,
-                &guest,
-                guest_offset,
-                face_bytes,
-                &linear,
-                &parameters,
-                sub,
-            );
+            for sub in &subs {
+                let parameters =
+                    mode27_parameters(*sub, resource_base, target_base, guest_bytes, 0)?;
+                encode_detile_dispatch(
+                    command_buffer,
+                    &detile,
+                    &tiled_source,
+                    &linear,
+                    &parameters,
+                    *sub,
+                );
+            }
         }
         _ => unreachable!("tile mode gated by gpu_tiler_owns_descriptor"),
     }
 
     let upload = command_buffer.new_blit_command_encoder();
     upload.set_label("REMu Phase 1G detiled linear→texture");
-    upload.copy_from_buffer_to_texture(
-        &linear,
-        sub.linear_offset,
-        sub.linear_row_bytes,
-        sub.linear_image_bytes,
-        MTLSize::new(sub.width, sub.height, 1),
-        destination,
-        sub.metal_slice,
-        sub.metal_level,
-        MTLOrigin {
-            x: 0,
-            y: 0,
-            z: sub.metal_z,
-        },
-        MTLBlitOption::None,
-    );
+    for sub in &subs {
+        upload.copy_from_buffer_to_texture(
+            &linear,
+            sub.linear_offset,
+            sub.linear_row_bytes,
+            sub.linear_image_bytes,
+            MTLSize::new(sub.width, sub.height, 1),
+            destination,
+            sub.metal_slice,
+            sub.metal_level,
+            MTLOrigin {
+                x: 0,
+                y: 0,
+                z: sub.metal_z,
+            },
+            MTLBlitOption::None,
+        );
+    }
     upload.end_encoding();
     Ok(())
 }
 
 fn encode_detile_dispatch(
-    device: &Device,
     command_buffer: &CommandBufferRef,
     detile: &ComputePipelineState,
-    guest: &Buffer,
-    guest_offset: u64,
-    face_bytes: u64,
+    tiled_source: &Buffer,
     linear: &Buffer,
     parameters: &[u64],
     sub: DetileSubresource,
 ) {
-    // Tiled address math indexes `physical - target_base` into buffer 0, so the bound
-    // buffer must start at the resource base. Page-aligned views with a nonzero resource
-    // offset are copied into a private scratch first.
-    let tiled_source = if guest_offset == 0 {
-        guest.clone()
-    } else {
-        let scratch = device.new_buffer(face_bytes, MTLResourceOptions::StorageModePrivate);
-        let blit = command_buffer.new_blit_command_encoder();
-        blit.set_label("REMu Phase 1G align guest tiled view");
-        blit.copy_from_buffer(guest, guest_offset, &scratch, 0, face_bytes);
-        blit.end_encoding();
-        scratch
-    };
-
     let compute = command_buffer.new_compute_command_encoder();
     compute.set_label("REMu Phase 1G GPU detile");
     compute.set_compute_pipeline_state(detile);
-    compute.set_buffer(0, Some(&tiled_source), 0);
+    compute.set_buffer(0, Some(tiled_source), 0);
     compute.set_buffer(1, Some(linear), 0);
     compute.set_bytes(
         3,
@@ -343,6 +553,25 @@ pub(crate) fn encode_gpu_publish_to_guest(
     source: &Texture,
     authored: &[(u64, u64)],
 ) -> Result<(), String> {
+    encode_gpu_publish_to_guest_view(
+        device,
+        command_buffer,
+        descriptor,
+        source,
+        authored,
+        GpuTilerView::SINGLE_LEVEL_2D,
+    )
+}
+
+/// Texture → guest publish for a layered / mipmapped view.
+pub(crate) fn encode_gpu_publish_to_guest_view(
+    device: &Device,
+    command_buffer: &CommandBufferRef,
+    descriptor: GuestTextureDescriptor,
+    source: &Texture,
+    authored: &[(u64, u64)],
+    view: GpuTilerView,
+) -> Result<(), String> {
     if authored.is_empty() {
         return Ok(());
     }
@@ -352,8 +581,9 @@ pub(crate) fn encode_gpu_publish_to_guest(
             descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
         ));
     }
-    let (sub, face_bytes, linear_length) = single_level_subresource(descriptor)?;
-    let (guest, guest_offset) = guest_buffer_for_descriptor(device, descriptor, face_bytes)?;
+    let (subs, guest_bytes, linear_length) = plan_upload_subresources(descriptor, view)?;
+    let (guest, guest_offset) =
+        guest_buffer_for_range(device, descriptor.address, guest_bytes, descriptor.tile_mode)?;
     let span = ResourceSpan::for_texture(descriptor)
         .ok_or("Phase 1G: guest texture span overflows")?;
     let resource_base = span.range_start();
@@ -363,33 +593,34 @@ pub(crate) fn encode_gpu_publish_to_guest(
 
     let blit = command_buffer.new_blit_command_encoder();
     blit.set_label("REMu Phase 1G texture→linear for guest publish");
-    blit.copy_from_texture_to_buffer(
-        source,
-        sub.metal_slice,
-        sub.metal_level,
-        MTLOrigin {
-            x: 0,
-            y: 0,
-            z: sub.metal_z,
-        },
-        MTLSize::new(sub.width, sub.height, 1),
-        &linear,
-        sub.linear_offset,
-        sub.linear_row_bytes,
-        sub.linear_image_bytes,
-        MTLBlitOption::None,
-    );
+    for sub in &subs {
+        blit.copy_from_texture_to_buffer(
+            source,
+            sub.metal_slice,
+            sub.metal_level,
+            MTLOrigin {
+                x: 0,
+                y: 0,
+                z: sub.metal_z,
+            },
+            MTLSize::new(sub.width, sub.height, 1),
+            &linear,
+            sub.linear_offset,
+            sub.linear_row_bytes,
+            sub.linear_image_bytes,
+            MTLBlitOption::None,
+        );
+    }
     blit.end_encoding();
 
     if descriptor.tile_mode == 0 {
-        // Publish only authored byte runs into the guest linear buffer.
         for &(start, end) in authored {
             if end <= start || start < target_base {
                 continue;
             }
             let offset = start - target_base;
             let len = end - start;
-            if offset.saturating_add(len) > face_bytes {
+            if offset.saturating_add(len) > guest_bytes {
                 continue;
             }
             let copy = command_buffer.new_blit_command_encoder();
@@ -418,12 +649,11 @@ pub(crate) fn encode_gpu_publish_to_guest(
     let tiled_dest = if guest_offset == 0 {
         guest.clone()
     } else {
-        // Retile into a private scratch then blit the authored runs into the offset view.
-        let scratch = device.new_buffer(face_bytes, MTLResourceOptions::StorageModePrivate);
+        let scratch = device.new_buffer(guest_bytes, MTLResourceOptions::StorageModePrivate);
         scratch.set_label("REMu Phase 1G retile scratch");
         let init = command_buffer.new_blit_command_encoder();
         init.set_label("REMu Phase 1G seed retile scratch from guest");
-        init.copy_from_buffer(&guest, guest_offset, &scratch, 0, face_bytes);
+        init.copy_from_buffer(&guest, guest_offset, &scratch, 0, guest_bytes);
         init.end_encoding();
         scratch
     };
@@ -431,60 +661,73 @@ pub(crate) fn encode_gpu_publish_to_guest(
     match descriptor.tile_mode {
         5 => {
             let (_, retile) = mode5_tiler_pipelines(device)?;
-            let parameters =
-                mode5_parameters(sub, resource_base, target_base, face_bytes, authored.len())?;
-            let compute = command_buffer.new_compute_command_encoder();
-            compute.set_label("REMu Phase 1G GPU retile publish");
-            compute.set_compute_pipeline_state(&retile);
-            compute.set_buffer(0, Some(&linear), 0);
-            compute.set_buffer(1, Some(&tiled_dest), 0);
-            compute.set_buffer(2, Some(&runs), 0);
-            compute.set_bytes(
-                3,
-                u64::try_from(std::mem::size_of_val(&parameters))
-                    .expect("parameter byte count fits u64"),
-                parameters.as_ptr().cast::<c_void>(),
-            );
-            compute.dispatch_threads(
-                MTLSize::new(sub.width, sub.height, 1),
-                MTLSize::new(16, 16, 1),
-            );
-            compute.end_encoding();
+            for sub in &subs {
+                let parameters = mode5_parameters(
+                    *sub,
+                    resource_base,
+                    target_base,
+                    guest_bytes,
+                    authored.len(),
+                )?;
+                let compute = command_buffer.new_compute_command_encoder();
+                compute.set_label("REMu Phase 1G GPU retile publish");
+                compute.set_compute_pipeline_state(&retile);
+                compute.set_buffer(0, Some(&linear), 0);
+                compute.set_buffer(1, Some(&tiled_dest), 0);
+                compute.set_buffer(2, Some(&runs), 0);
+                compute.set_bytes(
+                    3,
+                    u64::try_from(std::mem::size_of_val(&parameters))
+                        .expect("parameter byte count fits u64"),
+                    parameters.as_ptr().cast::<c_void>(),
+                );
+                compute.dispatch_threads(
+                    MTLSize::new(sub.width, sub.height, 1),
+                    MTLSize::new(16, 16, 1),
+                );
+                compute.end_encoding();
+            }
         }
         24 | 27 => {
             let (_, retile) = mode27_tiler_pipelines(device)?;
-            let parameters =
-                mode27_parameters(sub, resource_base, target_base, face_bytes, authored.len())?;
-            let compute = command_buffer.new_compute_command_encoder();
-            compute.set_label("REMu Phase 1G GPU retile publish");
-            compute.set_compute_pipeline_state(&retile);
-            compute.set_buffer(0, Some(&linear), 0);
-            compute.set_buffer(1, Some(&tiled_dest), 0);
-            compute.set_buffer(2, Some(&runs), 0);
-            compute.set_bytes(
-                3,
-                u64::try_from(std::mem::size_of_val(&parameters))
-                    .expect("parameter byte count fits u64"),
-                parameters.as_ptr().cast::<c_void>(),
-            );
-            compute.dispatch_threads(
-                MTLSize::new(sub.width, sub.height, 1),
-                MTLSize::new(16, 16, 1),
-            );
-            compute.end_encoding();
+            for sub in &subs {
+                let parameters = mode27_parameters(
+                    *sub,
+                    resource_base,
+                    target_base,
+                    guest_bytes,
+                    authored.len(),
+                )?;
+                let compute = command_buffer.new_compute_command_encoder();
+                compute.set_label("REMu Phase 1G GPU retile publish");
+                compute.set_compute_pipeline_state(&retile);
+                compute.set_buffer(0, Some(&linear), 0);
+                compute.set_buffer(1, Some(&tiled_dest), 0);
+                compute.set_buffer(2, Some(&runs), 0);
+                compute.set_bytes(
+                    3,
+                    u64::try_from(std::mem::size_of_val(&parameters))
+                        .expect("parameter byte count fits u64"),
+                    parameters.as_ptr().cast::<c_void>(),
+                );
+                compute.dispatch_threads(
+                    MTLSize::new(sub.width, sub.height, 1),
+                    MTLSize::new(16, 16, 1),
+                );
+                compute.end_encoding();
+            }
         }
         _ => unreachable!("tile mode gated by gpu_tiler_owns_descriptor"),
     }
 
     if guest_offset != 0 {
-        // Copy authored runs from the private scratch back into the offset guest view.
         for &(start, end) in authored {
             if end <= start || start < target_base {
                 continue;
             }
             let offset = start - target_base;
             let len = end - start;
-            if offset.saturating_add(len) > face_bytes {
+            if offset.saturating_add(len) > guest_bytes {
                 continue;
             }
             let copy = command_buffer.new_blit_command_encoder();
@@ -519,5 +762,18 @@ mod tests {
         assert!(gpu_tiler_owns_descriptor(descriptor(27)));
         assert!(gpu_tiler_owns_descriptor(descriptor(24)));
         assert!(gpu_tiler_owns_descriptor(descriptor(5)));
+    }
+
+    #[test]
+    fn plans_mode5_layered_single_level() {
+        let (subs, guest_bytes, _) =
+            plan_upload_subresources(descriptor(5), GpuTilerView {
+                texture_type: 13,
+                layer_count: 3,
+                mip_level_count: 1,
+            })
+            .expect("mode-5 layered plan");
+        assert_eq!(subs.len(), 3);
+        assert_eq!(guest_bytes, guest_texture_byte_count(descriptor(5)).unwrap() * 3);
     }
 }

@@ -94,11 +94,11 @@ pub(crate) use self::sampled::{
     new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
 };
 pub(crate) use self::sampled::{
-    create_sampled_guest_texture, decode_sampled_texture_linear_from_raw,
-    gpu_written_resident_serving_sampled_key, resident_color_view_sample_is_eligible,
-    resident_depth_sample_is_eligible, resident_texture_for_sample,
-    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_supports_access,
-    sampled_texture_usage,
+    create_sampled_guest_texture, create_sampled_guest_texture_from_guest_gpu,
+    decode_sampled_texture_linear_from_raw, gpu_written_resident_serving_sampled_key,
+    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
+    sampled_texture_supports_access, sampled_texture_usage,
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 #[cfg(test)]

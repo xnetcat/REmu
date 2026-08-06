@@ -16,9 +16,10 @@ use super::{
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
-    resident_is_depth_array_face, sampled_alias_descriptor, texture_element_layout,
-    trace_image_descriptors, trace_resident_texture_removal, trace_target_sampling,
-    trace_video_target_consumers,
+    resident_is_depth_array_face, sampled_alias_descriptor,
+    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
+    texture_element_layout, trace_image_descriptors, trace_resident_texture_removal,
+    trace_target_sampling, trace_video_target_consumers,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -555,6 +556,116 @@ pub(crate) fn decode_sampled_texture_linear_from_raw(
         )?);
     }
     Ok(linear)
+}
+
+/// Creates a sampled Metal texture and fills it from guest backing on `command_buffer`.
+///
+/// Phase 1G: never CPU-snapshots / detiles / `replaceRegion`s guest-authored bytes. Synthetic
+/// host buffers (diagnostics / fallbacks) still use [`create_sampled_guest_texture`].
+pub(crate) fn create_sampled_guest_texture_from_guest_gpu(
+    device: &Device,
+    command_buffer: &metal::CommandBufferRef,
+    descriptor: DecodedImageDescriptor,
+    comparison: bool,
+    writable: bool,
+) -> Result<Texture, String> {
+    use crate::presenter::tiler::{
+        GpuTilerView, encode_gpu_upload_from_guest_view, gpu_tiler_owns_descriptor,
+    };
+
+    let guest = descriptor.guest;
+    if comparison
+        && !matches!(
+            guest.pixel_format,
+            MTLPixelFormat::R16Unorm | MTLPixelFormat::R32Float
+        )
+    {
+        return Err(format!(
+            "Phase 1G: comparison sampled upload refuses format {:?} — only R16Unorm/R32Float reinterpret as depth on the GPU timeline (no CPU convert)",
+            guest.pixel_format
+        ));
+    }
+    if !gpu_tiler_owns_descriptor(guest) {
+        return Err(format!(
+            "Phase 1G: sampled GPU upload refuses tile={} format={:?} bpe={} — no tiler ownership (compressed/host-only formats stay loud)",
+            guest.tile_mode, guest.pixel_format, guest.bytes_per_pixel
+        ));
+    }
+    let underlying_mip_level_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count.max(1))
+        .ok_or("sampled Metal mip range overflows")?;
+    let exact_guest_mips = sampled_texture_uses_exact_mode5_mips(descriptor)
+        || sampled_texture_uses_exact_mode27_mips(descriptor);
+    let mip_level_count = if exact_guest_mips {
+        underlying_mip_level_count
+    } else if compressed_texture_block_extent(guest.pixel_format).is_some() {
+        1
+    } else {
+        underlying_mip_level_count
+    };
+    let metal_descriptor = TextureDescriptor::new();
+    metal_descriptor.set_texture_type(match descriptor.texture_type {
+        9 => MTLTextureType::D2,
+        10 => MTLTextureType::D3,
+        11 | 13 => MTLTextureType::D2Array,
+        _ => {
+            return Err(format!(
+                "unsupported sampled Metal texture type {}",
+                descriptor.texture_type
+            ));
+        }
+    });
+    let pixel_format = if comparison {
+        match guest.pixel_format {
+            MTLPixelFormat::R16Unorm => MTLPixelFormat::Depth16Unorm,
+            MTLPixelFormat::R32Float => MTLPixelFormat::Depth32Float,
+            _ => unreachable!("comparison format gated above"),
+        }
+    } else {
+        guest.pixel_format
+    };
+    metal_descriptor.set_pixel_format(pixel_format);
+    metal_descriptor.set_width(u64::from(guest.width));
+    metal_descriptor.set_height(u64::from(guest.height));
+    if descriptor.texture_type == 10 {
+        metal_descriptor.set_depth(u64::from(descriptor.layer_count));
+    }
+    metal_descriptor.set_mipmap_level_count(u64::from(mip_level_count));
+    if matches!(descriptor.texture_type, 11 | 13) {
+        metal_descriptor.set_array_length(u64::from(descriptor.layer_count));
+    }
+    metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
+    metal_descriptor.set_usage(sampled_texture_usage(comparison, writable)?);
+    let texture = device.new_texture(&metal_descriptor);
+    let view = GpuTilerView {
+        texture_type: descriptor.texture_type,
+        layer_count: descriptor.layer_count,
+        mip_level_count: if exact_guest_mips {
+            mip_level_count
+        } else {
+            1
+        },
+    };
+    encode_gpu_upload_from_guest_view(device, command_buffer, guest, &texture, view)?;
+    if !exact_guest_mips && mip_level_count > 1 {
+        let encoder = command_buffer.new_blit_command_encoder();
+        encoder.set_label("REMu sampled image generated mip hierarchy");
+        encoder.generate_mipmaps(&texture);
+        encoder.end_encoding();
+    }
+    if descriptor.base_mip_level == 0 {
+        return Ok(texture);
+    }
+    Ok(texture.new_texture_view_from_slice(
+        pixel_format,
+        texture.texture_type(),
+        NSRange::new(
+            u64::from(descriptor.base_mip_level),
+            u64::from(descriptor.mip_level_count.max(1)),
+        ),
+        NSRange::new(0, texture.array_length()),
+    ))
 }
 
 pub(crate) fn create_sampled_guest_texture(

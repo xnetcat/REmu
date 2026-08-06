@@ -1369,8 +1369,10 @@ impl MetalPresenter {
         } else {
             None
         };
+        let queue = self.command_queue.as_ref();
         let texture = super::ensure_mipmapped_resident_texture_in_map(
             device,
+            queue,
             promotion_command_buffer.as_deref(),
             descriptor,
             &mut self.resident_guest_textures,
@@ -2659,6 +2661,7 @@ impl MetalPresenter {
 
 pub(crate) fn ensure_resident_texture_in_map(
     device: &Device,
+    queue: Option<&metal::CommandQueue>,
     descriptor: GuestTextureDescriptor,
     resident_guest_textures: &mut ResidentTextureMap,
     upload_guest_contents: bool,
@@ -2700,18 +2703,25 @@ pub(crate) fn ensure_resident_texture_in_map(
         | MTLTextureUsage::ShaderWrite
         | MTLTextureUsage::PixelFormatView;
     let texture = if upload_guest_contents {
-        // Phase 1G: CPU snapshot+detile+replaceRegion is deleted for tiler-owned descriptors.
-        // Callers with an open guest batch must use MetalPresenter::ensure_resident_texture_* .
-        if gpu_tiler_owns_descriptor(descriptor) {
+        if !gpu_tiler_owns_descriptor(descriptor) {
             return Err(format!(
-                "Phase 1G: ensure_resident_texture_in_map refuses CPU upload for tile={} at {:#x}; use the presenter GPU-timeline path",
-                descriptor.tile_mode, descriptor.address
+                "Phase 1G: refusing CPU snapshot upload for tile={} format={:?} bpe={} — no GPU tiler ownership",
+                descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
             ));
         }
-        return Err(format!(
-            "Phase 1G: refusing CPU snapshot upload for tile={} format={:?} bpe={} — no GPU tiler ownership",
-            descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
-        ));
+        let queue = queue.ok_or_else(|| {
+            format!(
+                "Phase 1G: ensure_resident_texture_in_map needs a Metal queue for GPU upload of tile={} at {:#x}",
+                descriptor.tile_mode, descriptor.address
+            )
+        })?;
+        let texture = create_uninitialized_guest_texture(device, descriptor, usage)?;
+        let upload_buffer = queue.new_command_buffer().to_owned();
+        upload_buffer.set_label("REMu Phase 1G ensure-map GPU upload");
+        encode_gpu_upload_from_guest(device, &upload_buffer, descriptor, &texture)?;
+        upload_buffer.commit();
+        upload_buffer.wait_until_completed();
+        texture
     } else {
         create_uninitialized_guest_texture(device, descriptor, usage)?
     };

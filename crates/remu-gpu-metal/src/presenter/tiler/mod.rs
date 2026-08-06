@@ -17,7 +17,8 @@ mod equations;
 mod msl;
 
 pub(crate) use encode::{
-    encode_gpu_publish_to_guest, encode_gpu_upload_from_guest, gpu_tiler_owns_descriptor,
+    GpuTilerView, encode_gpu_publish_to_guest, encode_gpu_publish_to_guest_view,
+    encode_gpu_upload_from_guest, encode_gpu_upload_from_guest_view, gpu_tiler_owns_descriptor,
 };
 
 #[allow(unused_imports)]

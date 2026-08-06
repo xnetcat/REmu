@@ -976,7 +976,8 @@ fn pending_alias_validation_survives_a_later_gpu_ownership_boundary() {
         bytes_per_pixel: 4,
     };
     let mut residents = ResidentTextureMap::new();
-    ensure_resident_texture_in_map(&device, descriptor, &mut residents, true)
+    let queue = device.new_command_queue();
+    ensure_resident_texture_in_map(&device, Some(&queue), descriptor, &mut residents, true)
         .expect("resident with initialized content baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
@@ -1054,7 +1055,7 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
         bytes_per_pixel: 4,
     };
     let mut residents = ResidentTextureMap::new();
-    ensure_resident_texture_in_map(&device, descriptor, &mut residents, false)
+    ensure_resident_texture_in_map(&device, None, descriptor, &mut residents, false)
         .expect("discarded render target with a CPU baseline");
     {
         let resident = residents.get_mut(&descriptor).expect("resident exists");
@@ -2787,6 +2788,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
 
     let error = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         descriptor,
         &mut presenter.resident_guest_textures,
@@ -2802,6 +2804,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
     let command_buffer = queue.new_command_buffer().to_owned();
     let view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         Some(&command_buffer),
         descriptor,
         &mut presenter.resident_guest_textures,
@@ -4287,8 +4290,10 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     };
     // Residency comes from the hierarchy the guest declares. A single-level descriptor is
     // never promoted into a larger one on the presenter's own initiative.
+    let queue = device.new_command_queue();
     let original = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         complete,
         &mut presenter.resident_guest_textures,
@@ -4299,6 +4304,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
 
     let complete_view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         complete,
         &mut presenter.resident_guest_textures,
@@ -4326,6 +4332,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
     };
     let view = super::ensure_mipmapped_resident_texture_in_map(
         &device,
+        Some(&queue),
         None,
         sampled,
         &mut presenter.resident_guest_textures,

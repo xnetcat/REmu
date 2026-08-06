@@ -698,61 +698,19 @@ impl GuestTextureWriteWatch {
         Ok(())
     }
 
+    /// Coarse write-watch invalidation: any observed guest store retires derived Metal objects.
+    ///
+    /// Phase 1G deletes content fingerprints / dirty chunk compares. Self-readback generations
+    /// are gone with CPU writeback, so a fault means a real guest write.
     pub(crate) fn content_has_changed(&self) -> Result<bool, String> {
-        let mut dirty_ranges = self
-            .content_state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_dirty_ranges
-            .clone();
-        dirty_ranges.extend(self.dirty_page_ranges());
-        if self.is_dirty() && dirty_ranges.is_empty() {
-            dirty_ranges.push(self.range());
-        }
-        let dirty_ranges = normalize_content_ranges(self, dirty_ranges);
-        if dirty_ranges.is_empty() {
-            return Ok(false);
-        }
-        if !self.precise_tracking() {
-            return Ok(true);
-        }
-
-        let started = Instant::now();
-        let (chunks, stable) = snapshot_dirty_content_fingerprints(self, dirty_ranges)?;
-        let validated_bytes = chunks
-            .iter()
-            .fold(0_u64, |total, chunk| total.saturating_add(chunk.byte_count));
         let mut state = self
             .content_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let changed = !stable
-            || chunks.iter().any(|chunk| {
-                !state
-                    .initialized_chunks
-                    .get(chunk.index)
-                    .copied()
-                    .unwrap_or(false)
-                    || state
-                        .chunk_fingerprints
-                        .get(chunk.index)
-                        .copied()
-                        .unwrap_or_default()
-                        != chunk.fingerprint
-            });
+        let pending = !state.pending_dirty_ranges.is_empty();
         state.pending_dirty_ranges.clear();
         drop(state);
-
-        TEXTURE_DIRTY_VALIDATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        TEXTURE_DIRTY_VALIDATION_BYTES.fetch_add(validated_bytes, Ordering::Relaxed);
-        TEXTURE_DIRTY_VALIDATION_NANOSECONDS.fetch_add(
-            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        if !changed {
-            TEXTURE_DIRTY_VALIDATION_UNCHANGED.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(changed)
+        Ok(pending || self.is_dirty() || !self.dirty_page_ranges().is_empty())
     }
 
     pub(crate) fn content_validation_pending(&self) -> bool {
