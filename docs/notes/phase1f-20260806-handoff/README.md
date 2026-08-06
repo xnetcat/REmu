@@ -1,7 +1,9 @@
 # Phase 1F handoff — EXECUTION SUBSTRATE (2026-08-06)
 
+Merged onto `main` at `cf0de3b` (substrate `483e943` + docs). Phase 1G–H **not** started.
+
 Architectural data flow for guest signals, fault delivery, game-process core mask, real sleep,
-and honest host priorities. Phase 1G–H **not** started.
+and honest host priorities.
 
 ## Design
 
