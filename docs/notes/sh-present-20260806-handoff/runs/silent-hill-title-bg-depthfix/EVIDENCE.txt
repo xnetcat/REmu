@@ -1,0 +1,30 @@
+revision=3f9e559d dirty_tree=0
+run: 20260806T140508Z-PPSA10112-app
+loadavg-pre={ 4.08 3.69 4.51 }  (post-build launch host loadavg reported { 6.47 4.23 4.68 } — not clean for FPS claims)
+AUTO_CROSS=8 CAPTURE_FRAMES=1
+REMU_DUMP_TARGET_PS=0x800bf40000 MIN_DRAW=22000 CAPTURE_TARGET_SAMPLES=1
+outcome=guest-failure SIGSEGV/MallocBinned3 ~74s captured_frames=23
+
+Attribution correction vs lightpost2 "800c7e never after BasePass":
+  FALSE — PERF-BATCHES shows cs=0x800c7e after BasePass (e.g. with draws ≥22077 / later 40096 window).
+  800a69 still never LATE-DRAW after title BasePass; title lighting-class PS is 8009c1 onto MRT0.
+
+Depth authority fix (3f9e559) live signal:
+  depth_native max=469 (was 0 forever on lightpost2 @ de613d3)
+  nonzero depth_native windows=8/12
+
+Post-BP 800bf4 @ draw=22881 → 806e56 RG11B10Float:
+  TARGET magnitude_nz=0 (output still empty)
+  tex0 sample VA=804345 RGBA16Float — Metal occupancy nonzero/mag≈0x13b220 (~1.28M);
+    writer lineage compute 800c7e (post-BasePass tonemap CS wrote real scene color)
+  Also samples depth 801abe (R32 SRD; native Depth path now eligible)
+  REFUSE: title present still not consuming lit scene into efc (800bf4 exports/target empty)
+
+Present:
+  efc PPMs: UI/splash/hallway-class frames present; title 3D BG still not assessable as lit BG
+  Intermediate 804345 / 806d54 PPMs show non-black content (scene/post intermediates)
+
+Exact next blockers:
+  1. Why 800bf4 writes magnitude 0 despite non-zero tex0 804345 (exports/blend/constants/bind)
+  2. Clean cold-start AUTO_CROSS (loadavg 1-min <5 at launch, no release rebuild spike) + no guest SIGSEGV
+  3. Optional: dump 8009c1 TARGET post-BP for MRT0 lighting exports

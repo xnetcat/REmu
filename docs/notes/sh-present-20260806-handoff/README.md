@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `de613d3` (MRT-min TARGET dump + late `COMPUTE-IMAGES`) on top of
-`be21eb9` / `9cc9f2f` / `736d540`.
+**Tip:** `main` @ `3f9e559` (Depth32Float authority over R32 depth-sample views) on top of
+`de613d3` / `be21eb9` / `9cc9f2f` / `736d540`.
 
 ## Closed gates
 
@@ -22,7 +22,7 @@
 | Title BasePass **does** emit (≥3 MRT) | Clean `runs/silent-hill-title-bg-basepass/` @ `9cc9f2f` + AUTO_CROSS: title NEW GAME confirmed; `total_mask_mrt3plus≈8591`; 7×1920×1080 MRT to `8068e0…` (Metal `gputrue`); also mrt=3 incl. `801c44`. Prior “never emits” was pad-not-advanced artifact. Title BG still black; `8023b9` still never COLOR; depth `801ac2` still `v0` |
 | Emitted title MRT0 **not** clear-only | Clean `runs/silent-hill-title-bg-mrtocc2/` @ `de613d3` + AUTO_CROSS: `REMU_DUMP_TARGET_MRT_MIN=7` → `806aa4` `magnitude_nz=1327104` (≈64% texels). MRT0 VA remaps (`8068e0`/`8068f4`/`806aa4`). `800a69` samples remapped `8068*` set; `8009c4` still samples legacy `8023b9`. Title BG still black |
 | Post-BasePass lighting sample VA | Clean `runs/silent-hill-title-bg-lightpost2/` @ `de613d3`: `800b22` @ draw 22072 binds remapped `80688f` (BasePass BGRA8 slot), **not** empty `8023b9`. Early `800a69` still legacy-empty (pre-BasePass only). |
-| Title present-chain gap (attribution) | Clean `lightpost2`: after BasePass `8070b3`, `800a69`/`800c7e` **never** re-run; only `800b22` touches `806990`/`80688f` (RGB-preserving blend no-op); `800bf4`/efc stay on stale ±0 scene-color path. MRT0 never sampled into present. |
+| R32 depth-sample view stealing Depth DB authority | `3f9e559` + live `runs/silent-hill-title-bg-depthfix/`: `depth_native` max **469** (was **0** forever on `lightpost2`). Post-BP `800c7e` writes non-zero scene color to `804345` (`magnitude_nz≈0x13b220`). |
 
 ## Live progression (capture on)
 
@@ -30,17 +30,8 @@
 | --- | --- |
 | Splash logos | Yes |
 | Content-warning + **ruined hallway 3D** | Yes |
-| Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs) |
-| Title **3D background** | **No — still solid black** (title UI yes; BasePass-class MRT emits yes) |
-
-Clean post-`COLOR-EMIT` @ `736d540` (`runs/silent-hill-title-bg-gbuffer/`,
-`dirty_tree=0`, launch loadavg ~2.2→4.1): `captured_frames=33`; this particular 120s run
-stayed on content-warning hallway (pad not advanced). Emit counters there cover only the
-pre-title deferred stream.
-
-Clean title-frame evidence @ `9cc9f2f` (`runs/silent-hill-title-bg-basepass/`, AUTO_CROSS,
-`dirty_tree=0`, loadavg ~4.0): NEW GAME frame confirmed; `total_mask_mrt3plus≈8591` with
-full-res 7-MRT writes to `8068e0…` (PERF `gputrue`); BG still void.
+| Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs + `depthfix` efc) |
+| Title **3D background** | **No — still solid black** (UI yes; BasePass + post-BP `800c7e` scene color nonzero; `800bf4`/efc still void) |
 
 ## Root causes (historical → current)
 
@@ -78,9 +69,15 @@ full-res 7-MRT writes to `8068e0…` (PERF `gputrue`); BG still void.
 12. **Title BG black despite filled BasePass MRTs** (clean `mrtocc2` + `lightpost2` @ `de613d3`):
     occupancy is real geometry magnitude, not clear-only version bumps. Post-BasePass
     `800b22` samples remapped `80688f` (RGB-black/alpha-occupied PPM; blend preserves MRT0).
-    Deferred lighting `800a69` and tonemap CS `800c7e` stop before BasePass and do not
-    resume; tonemap/present never consume filled `806990`. Early “empty `8023b9`” remains
-    true only for the pre-BasePass lighting path.
+    Deferred lighting `800a69` is **not** re-submitted after title BasePass (title uses
+    `8009c1` onto MRT0 instead). **`800c7e` does re-run after BasePass** (PERF-BATCHES;
+    prior “never after BasePass” overstated from early-only `COMPUTE-IMAGES` dumps).
+13. **Empty R32Float depth shadow stole Depth32Float DB authority** (fix `3f9e559`):
+    post-prepass samples at `801ac2`/`801abe` bound a gpu-authored magnitude-0 R32Float
+    resident while Depth32Float was demoted (`gpufalse`) → `depth_native=0`. Live after fix:
+    `depth_native` hits hundreds; post-BP `800c7e` writes non-zero `804345`. **Still open:**
+    tonemap `800bf4` TARGET @ draw 22881 writes `magnitude_nz=0` despite non-zero tex0
+    `804345`; efc title remains UI-on-black.
 
 ## Anti-claims
 
@@ -100,21 +97,22 @@ full-res 7-MRT writes to `8068e0…` (PERF `gputrue`); BG still void.
   and ≠ “BasePass absent at title” (clean title `basepass` run emits ≥3-slot MRTs).
 - Emitting full-res multi-MRT BasePass-class draws ≠ title-BG 3D closure while BG stays black.
 - Post-BasePass `800b22` binding remapped `80688f` ≠ lighting/tonemap consuming BasePass MRT0.
+- Claiming `800c7e` “never after BasePass” from early-only `COMPUTE-IMAGES` ≠ absence (PERF-BATCHES
+  shows post-BP `cs=0x800c7e`).
+- `depth_native>0` + non-zero `800c7e` scene color ≠ title-BG closure while `800bf4`/efc stay empty/black.
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **Why `800a69` / `800c7e` never re-run after title BasePass** (clean `lightpost2`):
-   never submitted vs PERF-dropped vs fence/stall. Without them, filled `8068*` MRTs never
-   reach scene color / efc. Do not re-litigate empty MRT0 or “always samples `8023b9`” for
-   the post-BasePass path.
-2. **Clean-env dump `800bf4` with `MIN_DRAW` after BasePass geometry** (unset sticky
-   `REMU_DUMP_*` / `REMU_RUN_ROOT`; loadavg 1-min <5): prove post-BP tonemap sample VAs +
-   exports. `tonemap2` refused (no BasePass under hot load).
-3. **Depth `801ac2` occupancy after `8007f4` prepass** (`REMU_DUMP_DEPTH_ES`) — prepass
-   `write_enabled=true` but historical `gpufalse/v0` suspicion remains.
+1. **Why `800bf4` TARGET is magnitude 0 after BasePass despite non-zero tex0 `804345`**
+   (clean-ish `depthfix` @ `3f9e559`, draw 22881): exports / blend / constants / wrong bind
+   at encode time. This is now the present-chain gap into efc.
+2. **Clean cold-start AUTO_CROSS** (1-min loadavg <5 at launch, no release-rebuild spike;
+   avoid guest `MallocBinned3`/SIGSEGV mid-run) to re-confirm title BG assessability.
+3. **Optional:** dump `8009c1` TARGET post-BP for MRT0 lighting exports (title substitute for
+   absent post-BP `800a69`).
 4. **No-attachment `ps=0x8008020000` / friends** — only if proven on the title-BG path; do
    not invent CB targets.
 5. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
@@ -135,11 +133,9 @@ full-res 7-MRT writes to `8068e0…` (PERF `gputrue`); BG still void.
 | `736d540` | Emit-side `COLOR-EMIT` / `COLOR-MALFORMED` + `GBUFFER-UNWRITTEN` |
 | `9cc9f2f` | docs: SH GBuffers empty because BasePass never emits (content-warning scope) |
 | `be21eb9` | AGC ATTRIB2 extent in `COLOR-EMIT` + title BasePass evidence correction |
+| `3f9e559` | Keep Depth32Float authority over same-address R32 depth sample views |
 
 ## Checks
 
-- `cargo check -p remu-runtime -p remu-gpu-metal -p remu-gpu` — arm64 + `x86_64-apple-darwin` green @ `be21eb9`
-- Live SH clean title @ `9cc9f2f` (`runs/silent-hill-title-bg-basepass/`) — NEW GAME;
-  `total_mask_mrt3plus≈8591`; title 3D still not closed
-- Prior content-warning-only @ `736d540` (`runs/silent-hill-title-bg-gbuffer/`) —
-  `total_mask_mrt3plus=0` (not title evidence)
+- `cargo check -p remu-runtime -p remu-gpu-metal -p remu-gpu` — arm64 + `x86_64-apple-darwin` green @ `3f9e559`
+- Unit: `r32_depth_sample_*` (prefer Depth over clean R32; keep Depth after later R32 mark_written)
