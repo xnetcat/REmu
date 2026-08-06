@@ -13,7 +13,7 @@ use super::super::tiling::{
     mode27_mip_chain_layout, tiled_block_bytes, tiled_block_dimensions,
 };
 use super::super::{GuestTextureDescriptor, ResourceSpan, texture_element_layout};
-use super::msl::{mode27_tiler_pipelines, mode5_tiler_pipelines};
+use super::msl::{mode27_tiler_pipelines, mode5_tiler_pipelines, mode9_tiler_pipelines};
 use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, Device, MTLBlitOption, MTLOrigin,
     MTLResourceOptions, MTLSize, Texture,
@@ -27,7 +27,7 @@ fn align_256(value: u64) -> Option<u64> {
 
 /// True when Phase 1G GPU-timeline tiling owns this descriptor's upload/publish path.
 pub(crate) fn gpu_tiler_owns_descriptor(descriptor: GuestTextureDescriptor) -> bool {
-    matches!(descriptor.tile_mode, 0 | 5 | 24 | 27)
+    matches!(descriptor.tile_mode, 0 | 1 | 5 | 9 | 24 | 27)
         && super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
             == Some(descriptor.bytes_per_pixel)
 }
@@ -92,6 +92,34 @@ fn mode27_parameters(
         sub.tail_x,
         sub.tail_y,
         sub.surface_z_xor,
+        sub.in_tail,
+        target_length,
+        u64::try_from(run_count).map_err(|_| "GPU tiler run count does not fit u64")?,
+        sub.tile_mode,
+    ])
+}
+
+fn mode9_parameters(
+    sub: DetileSubresource,
+    resource_base: u64,
+    target_base: u64,
+    target_length: u64,
+    run_count: usize,
+) -> Result<[u64; 17], String> {
+    Ok([
+        sub.width,
+        sub.height,
+        sub.linear_row_bytes,
+        sub.linear_offset,
+        resource_base,
+        target_base,
+        sub.level_offset,
+        sub.pitch,
+        sub.bytes_per_element,
+        sub.block_width,
+        sub.block_height,
+        sub.tail_x,
+        sub.tail_y,
         sub.in_tail,
         target_length,
         u64::try_from(run_count).map_err(|_| "GPU tiler run count does not fit u64")?,
@@ -363,8 +391,8 @@ fn plan_upload_subresources(
 
 /// Encodes guest tiled/linear bytes → `destination` texture on `command_buffer`.
 ///
-/// Mode 0 blit-copies rows from the guest buffer. Modes 5/24/27 detile through the S2
-/// compute kernels. Never snapshots guest RAM on the CPU.
+/// Mode 0 blit-copies rows from the guest buffer. Modes 1/5/9/24/27 detile through the
+/// GPU compute kernels. Never snapshots guest RAM on the CPU.
 pub(crate) fn encode_gpu_upload_from_guest(
     device: &Device,
     command_buffer: &CommandBufferRef,
@@ -460,6 +488,21 @@ pub(crate) fn encode_gpu_upload_from_guest_view(
     };
 
     match descriptor.tile_mode {
+        1 | 9 => {
+            let (detile, _) = mode9_tiler_pipelines(device)?;
+            for sub in &subs {
+                let parameters =
+                    mode9_parameters(*sub, resource_base, target_base, guest_bytes, 0)?;
+                encode_detile_dispatch(
+                    command_buffer,
+                    &detile,
+                    &tiled_source,
+                    &linear,
+                    &parameters,
+                    *sub,
+                );
+            }
+        }
         5 => {
             let (detile, _) = mode5_tiler_pipelines(device)?;
             for sub in &subs {
@@ -659,6 +702,35 @@ pub(crate) fn encode_gpu_publish_to_guest_view(
     };
 
     match descriptor.tile_mode {
+        1 | 9 => {
+            let (_, retile) = mode9_tiler_pipelines(device)?;
+            for sub in &subs {
+                let parameters = mode9_parameters(
+                    *sub,
+                    resource_base,
+                    target_base,
+                    guest_bytes,
+                    authored.len(),
+                )?;
+                let compute = command_buffer.new_compute_command_encoder();
+                compute.set_label("REMu Phase 1G GPU retile publish");
+                compute.set_compute_pipeline_state(&retile);
+                compute.set_buffer(0, Some(&linear), 0);
+                compute.set_buffer(1, Some(&tiled_dest), 0);
+                compute.set_buffer(2, Some(&runs), 0);
+                compute.set_bytes(
+                    3,
+                    u64::try_from(std::mem::size_of_val(&parameters))
+                        .expect("parameter byte count fits u64"),
+                    parameters.as_ptr().cast::<c_void>(),
+                );
+                compute.dispatch_threads(
+                    MTLSize::new(sub.width, sub.height, 1),
+                    MTLSize::new(16, 16, 1),
+                );
+                compute.end_encoding();
+            }
+        }
         5 => {
             let (_, retile) = mode5_tiler_pipelines(device)?;
             for sub in &subs {
@@ -759,9 +831,11 @@ mod tests {
     #[test]
     fn tiler_owns_linear_and_mode27_uncompressed() {
         assert!(gpu_tiler_owns_descriptor(descriptor(0)));
+        assert!(gpu_tiler_owns_descriptor(descriptor(1)));
+        assert!(gpu_tiler_owns_descriptor(descriptor(5)));
+        assert!(gpu_tiler_owns_descriptor(descriptor(9)));
         assert!(gpu_tiler_owns_descriptor(descriptor(27)));
         assert!(gpu_tiler_owns_descriptor(descriptor(24)));
-        assert!(gpu_tiler_owns_descriptor(descriptor(5)));
     }
 
     #[test]

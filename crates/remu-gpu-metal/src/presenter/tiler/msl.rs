@@ -1,14 +1,16 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! MSL compute kernels for mode-27/24 then mode-5 de/re-tile (MASTER-PLAN B2 / Phase 1G).
+//! MSL compute kernels for mode-27/24, mode-5, and mode-9/1 de/re-tile (Phase 1G+).
 //!
 //! Equations match `presenter/tiling` (CPU differential oracle). The specialised loops in
 //! SDK `generated_27.cpp` / `generated_5.cpp` implement the same within-block XOR tables;
-//! we port the tables, not the SIMD specialisations.
+//! we port the tables, not the SIMD specialisations. Mode-9/1 use the non-XOR SW_64KB_S /
+//! SW_256_S tables from `blocks.rs` (mode-1 is the low eight bits of mode-9).
 //!
 //! Parameter layout matches the residency rematerialisation ABI (18 ulong words for the
-//! 64 KB family, including `kTileMode` so mode-24 and mode-27 share one library).
+//! 64 KB family, including `kTileMode` so mode-24 and mode-27 share one library; mode-1
+//! and mode-9 share their library the same way).
 
 use metal::{CompileOptions, ComputePipelineState, Device, Library};
 use std::sync::OnceLock;
@@ -258,8 +260,113 @@ kernel void remu_tiler5_retile(
 }
 "#;
 
+/// Mode-9 (SW_64KB_S) + mode-1 (SW_256_S) tiler — Silent Hill UI compositor samples these.
+pub(crate) const MODE9_TILER_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+enum RemuTiler9Param {
+    kWidth = 0, kHeight = 1, kLinearRowBytes = 2, kLinearOffset = 3,
+    kResourceBase = 4, kTargetBase = 5, kLevelOffset = 6, kPitch = 7,
+    kBytesPerElement = 8, kBlockWidth = 9, kBlockHeight = 10,
+    kTailX = 11, kTailY = 12, kInTail = 13,
+    kTargetLength = 14, kRunCount = 15, kTileMode = 16
+};
+
+// Port of presenter/tiling/blocks.rs:mode9_within_block_byte_offset —
+// ADDR_SW_64KB_S bit interleave. Mode-1 keeps only the low eight bits.
+static uint remu_mode9_within_block(uint x, uint y, uint log2_bytes) {
+    switch (log2_bytes) {
+        case 0:
+            return (x & 0x000fu) | ((y & 0x000fu) << 4) | ((y & 0x0010u) << 4)
+                | ((x & 0x0010u) << 5) | ((y & 0x0020u) << 5) | ((x & 0x0020u) << 6)
+                | ((y & 0x0040u) << 6) | ((x & 0x0040u) << 7) | ((y & 0x0080u) << 7)
+                | ((x & 0x0080u) << 8);
+        case 1:
+            return ((x & 0x0007u) << 1) | ((y & 0x0007u) << 4) | ((x & 0x0008u) << 4)
+                | ((y & 0x0008u) << 5) | ((x & 0x0010u) << 5) | ((y & 0x0010u) << 6)
+                | ((x & 0x0020u) << 6) | ((y & 0x0020u) << 7) | ((x & 0x0040u) << 7)
+                | ((y & 0x0040u) << 8) | ((x & 0x0080u) << 8);
+        case 2:
+            return ((x & 0x0003u) << 2) | ((y & 0x0007u) << 4) | ((x & 0x0004u) << 5)
+                | ((y & 0x0008u) << 5) | ((x & 0x0008u) << 6) | ((y & 0x0010u) << 6)
+                | ((x & 0x0010u) << 7) | ((y & 0x0020u) << 7) | ((x & 0x0020u) << 8)
+                | ((y & 0x0040u) << 8) | ((x & 0x0040u) << 9);
+        case 3:
+            return ((x & 0x0001u) << 3) | ((y & 0x0003u) << 4) | ((x & 0x0002u) << 5)
+                | ((x & 0x0004u) << 5) | ((y & 0x0004u) << 6) | ((x & 0x0008u) << 6)
+                | ((y & 0x0008u) << 7) | ((x & 0x0010u) << 7) | ((y & 0x0010u) << 8)
+                | ((x & 0x0020u) << 8) | ((y & 0x0020u) << 9) | ((x & 0x0040u) << 9);
+        default:
+            return ((y & 0x0003u) << 4) | ((x & 0x0003u) << 6) | ((y & 0x0004u) << 6)
+                | ((x & 0x0004u) << 7) | ((y & 0x0008u) << 7) | ((x & 0x0008u) << 8)
+                | ((y & 0x0010u) << 8) | ((x & 0x0010u) << 9) | ((y & 0x0020u) << 9)
+                | ((x & 0x0020u) << 10);
+    }
+}
+
+static ulong remu_mode9_physical(constant ulong* p, uint2 gid) {
+    const uint block_width = uint(p[kBlockWidth]);
+    const uint block_height = uint(p[kBlockHeight]);
+    const bool tail = p[kInTail] != 0;
+    const uint x = tail ? uint(p[kTailX]) + gid.x : gid.x;
+    const uint y = tail ? uint(p[kTailY]) + gid.y : gid.y;
+    const uint block_x = tail ? 0u : gid.x / block_width;
+    const uint block_y = tail ? 0u : gid.y / block_height;
+    const ulong blocks_per_row = (p[kPitch] + block_width - 1u) / block_width;
+    const ulong block = tail ? 0ul : ulong(block_y) * blocks_per_row + block_x;
+    const uint log2_bytes = ctz(uint(p[kBytesPerElement]));
+    uint within = remu_mode9_within_block(x, y, log2_bytes);
+    const ulong block_bytes = p[kTileMode] == 1ul ? 256ul : 65536ul;
+    if (p[kTileMode] == 1ul) {
+        within &= 0xffu;
+    }
+    return p[kResourceBase] + p[kLevelOffset] + block * block_bytes + within;
+}
+
+static bool remu_in_debt9(device const ulong2* runs, ulong count, ulong address) {
+    for (ulong index = 0; index < count; ++index) {
+        if (runs[index].x <= address && address < runs[index].y) return true;
+    }
+    return false;
+}
+
+kernel void remu_tiler9_detile(
+    device const uchar* tiled [[buffer(0)]], device uchar* linear [[buffer(1)]],
+    constant ulong* p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
+    const ulong physical = remu_mode9_physical(p, gid);
+    const ulong destination = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
+        + ulong(gid.x) * p[kBytesPerElement];
+    if (physical < p[kTargetBase]
+        || physical - p[kTargetBase] + p[kBytesPerElement] > p[kTargetLength]) return;
+    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
+        linear[destination + byte] = tiled[physical - p[kTargetBase] + byte];
+    }
+}
+
+kernel void remu_tiler9_retile(
+    device const uchar* linear [[buffer(0)]], device uchar* tiled [[buffer(1)]],
+    device const ulong2* debt [[buffer(2)]], constant ulong* p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
+    const ulong physical = remu_mode9_physical(p, gid);
+    const ulong source = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
+        + ulong(gid.x) * p[kBytesPerElement];
+    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
+        const ulong address = physical + byte;
+        if (address >= p[kTargetBase]
+            && address - p[kTargetBase] < p[kTargetLength]
+            && remu_in_debt9(debt, p[kRunCount], address)) {
+            tiled[address - p[kTargetBase]] = linear[source + byte];
+        }
+    }
+}
+"#;
+
 pub(crate) fn tiler_kernel_source(mode: GpuTilerMode) -> &'static str {
     match mode {
+        GpuTilerMode::Mode1 | GpuTilerMode::Mode9 => MODE9_TILER_MSL,
         GpuTilerMode::Mode5 => MODE5_TILER_MSL,
         GpuTilerMode::Mode27 => MODE27_TILER_MSL,
     }
@@ -271,6 +378,12 @@ pub(crate) fn tiler_kernel_name(mode: GpuTilerMode, kind: TilerKernelKind) -> &'
         (GpuTilerMode::Mode27, TilerKernelKind::Retile) => "remu_tiler27_retile",
         (GpuTilerMode::Mode5, TilerKernelKind::Detile) => "remu_tiler5_detile",
         (GpuTilerMode::Mode5, TilerKernelKind::Retile) => "remu_tiler5_retile",
+        (GpuTilerMode::Mode1 | GpuTilerMode::Mode9, TilerKernelKind::Detile) => {
+            "remu_tiler9_detile"
+        }
+        (GpuTilerMode::Mode1 | GpuTilerMode::Mode9, TilerKernelKind::Retile) => {
+            "remu_tiler9_retile"
+        }
     }
 }
 
@@ -302,6 +415,13 @@ pub(crate) fn cached_tiler_library(
         GpuTilerMode::Mode5 => {
             static LIB: OnceLock<Result<Library, String>> = OnceLock::new();
             match LIB.get_or_init(|| compile_tiler_library(device, GpuTilerMode::Mode5)) {
+                Ok(library) => Ok(library),
+                Err(error) => Err(error.clone()),
+            }
+        }
+        GpuTilerMode::Mode1 | GpuTilerMode::Mode9 => {
+            static LIB: OnceLock<Result<Library, String>> = OnceLock::new();
+            match LIB.get_or_init(|| compile_tiler_library(device, GpuTilerMode::Mode9)) {
                 Ok(library) => Ok(library),
                 Err(error) => Err(error.clone()),
             }
@@ -363,6 +483,33 @@ pub(crate) fn mode5_tiler_pipelines(
     ))
 }
 
+/// Compiles (or reuses) the mode-9/1 detile + retile compute pipelines.
+pub(crate) fn mode9_tiler_pipelines(
+    device: &Device,
+) -> Result<(ComputePipelineState, ComputePipelineState), String> {
+    let library = cached_tiler_library(device, GpuTilerMode::Mode9)?;
+    let detile = library
+        .get_function(
+            tiler_kernel_name(GpuTilerMode::Mode9, TilerKernelKind::Detile),
+            None,
+        )
+        .map_err(|error| format!("Metal mode-9 detile function: {error}"))?;
+    let retile = library
+        .get_function(
+            tiler_kernel_name(GpuTilerMode::Mode9, TilerKernelKind::Retile),
+            None,
+        )
+        .map_err(|error| format!("Metal mode-9 retile function: {error}"))?;
+    Ok((
+        device
+            .new_compute_pipeline_state_with_function(&detile)
+            .map_err(|error| format!("Metal mode-9 detile pipeline: {error}"))?,
+        device
+            .new_compute_pipeline_state_with_function(&retile)
+            .map_err(|error| format!("Metal mode-9 retile pipeline: {error}"))?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,9 +522,16 @@ mod tests {
         assert!(MODE27_TILER_MSL.contains("kTileMode"));
         assert!(MODE5_TILER_MSL.contains("kernel void remu_tiler5_detile"));
         assert!(MODE5_TILER_MSL.contains("kernel void remu_tiler5_retile"));
+        assert!(MODE9_TILER_MSL.contains("kernel void remu_tiler9_detile"));
+        assert!(MODE9_TILER_MSL.contains("kernel void remu_tiler9_retile"));
+        assert!(MODE9_TILER_MSL.contains("kTileMode"));
         assert_eq!(
             tiler_kernel_name(GpuTilerMode::Mode27, TilerKernelKind::Detile),
             "remu_tiler27_detile"
+        );
+        assert_eq!(
+            tiler_kernel_name(GpuTilerMode::Mode1, TilerKernelKind::Detile),
+            "remu_tiler9_detile"
         );
     }
 
@@ -401,6 +555,18 @@ mod tests {
         };
         let (detile, retile) =
             mode5_tiler_pipelines(&device).expect("mode-5 tiler pipelines must compile");
+        assert!(detile.max_total_threads_per_threadgroup() > 0);
+        assert!(retile.max_total_threads_per_threadgroup() > 0);
+    }
+
+    #[test]
+    fn mode9_tiler_library_compiles_on_metal() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("[REMu][TILER] no Metal device; skipping compile proof");
+            return;
+        };
+        let (detile, retile) =
+            mode9_tiler_pipelines(&device).expect("mode-9/1 tiler pipelines must compile");
         assert!(detile.max_total_threads_per_threadgroup() > 0);
         assert!(retile.max_total_threads_per_threadgroup() > 0);
     }
@@ -470,6 +636,105 @@ mod tests {
                             bytes
                         ),
                         "mode-5 MSL/CPU mismatch at ({x},{y}) bpe={bytes}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode9_msl_within_block_matches_cpu_oracle_for_sampled_coords() {
+        fn msl_table(x: u32, y: u32, log2_bytes: u32) -> u32 {
+            match log2_bytes {
+                0 => {
+                    (x & 0x000f)
+                        | ((y & 0x000f) << 4)
+                        | ((y & 0x0010) << 4)
+                        | ((x & 0x0010) << 5)
+                        | ((y & 0x0020) << 5)
+                        | ((x & 0x0020) << 6)
+                        | ((y & 0x0040) << 6)
+                        | ((x & 0x0040) << 7)
+                        | ((y & 0x0080) << 7)
+                        | ((x & 0x0080) << 8)
+                }
+                1 => {
+                    ((x & 0x0007) << 1)
+                        | ((y & 0x0007) << 4)
+                        | ((x & 0x0008) << 4)
+                        | ((y & 0x0008) << 5)
+                        | ((x & 0x0010) << 5)
+                        | ((y & 0x0010) << 6)
+                        | ((x & 0x0020) << 6)
+                        | ((y & 0x0020) << 7)
+                        | ((x & 0x0040) << 7)
+                        | ((y & 0x0040) << 8)
+                        | ((x & 0x0080) << 8)
+                }
+                2 => {
+                    ((x & 0x0003) << 2)
+                        | ((y & 0x0007) << 4)
+                        | ((x & 0x0004) << 5)
+                        | ((y & 0x0008) << 5)
+                        | ((x & 0x0008) << 6)
+                        | ((y & 0x0010) << 6)
+                        | ((x & 0x0010) << 7)
+                        | ((y & 0x0020) << 7)
+                        | ((x & 0x0020) << 8)
+                        | ((y & 0x0040) << 8)
+                        | ((x & 0x0040) << 9)
+                }
+                3 => {
+                    ((x & 0x0001) << 3)
+                        | ((y & 0x0003) << 4)
+                        | ((x & 0x0002) << 5)
+                        | ((x & 0x0004) << 5)
+                        | ((y & 0x0004) << 6)
+                        | ((x & 0x0008) << 6)
+                        | ((y & 0x0008) << 7)
+                        | ((x & 0x0010) << 7)
+                        | ((y & 0x0010) << 8)
+                        | ((x & 0x0020) << 8)
+                        | ((y & 0x0020) << 9)
+                        | ((x & 0x0040) << 9)
+                }
+                _ => {
+                    ((y & 0x0003) << 4)
+                        | ((x & 0x0003) << 6)
+                        | ((y & 0x0004) << 6)
+                        | ((x & 0x0004) << 7)
+                        | ((y & 0x0008) << 7)
+                        | ((x & 0x0008) << 8)
+                        | ((y & 0x0010) << 8)
+                        | ((x & 0x0010) << 9)
+                        | ((y & 0x0020) << 9)
+                        | ((x & 0x0020) << 10)
+                }
+            }
+        }
+        use crate::presenter::tiling::mode9_within_block_byte_offset;
+        for log2 in 0..5_u32 {
+            let bytes = 1_usize << log2;
+            for y in 0..32_u32 {
+                for x in 0..32_u32 {
+                    let full = usize::try_from(msl_table(x, y, log2)).unwrap();
+                    assert_eq!(
+                        full,
+                        mode9_within_block_byte_offset(
+                            usize::try_from(x).unwrap(),
+                            usize::try_from(y).unwrap(),
+                            bytes
+                        ),
+                        "mode-9 MSL/CPU mismatch at ({x},{y}) bpe={bytes}"
+                    );
+                    assert_eq!(
+                        full & 0xff,
+                        mode9_within_block_byte_offset(
+                            usize::try_from(x).unwrap(),
+                            usize::try_from(y).unwrap(),
+                            bytes
+                        ) & 0xff,
+                        "mode-1 low-byte mask mismatch at ({x},{y}) bpe={bytes}"
                     );
                 }
             }
