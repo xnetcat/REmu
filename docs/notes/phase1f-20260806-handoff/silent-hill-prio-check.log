@@ -1,0 +1,94 @@
+[REMu] acquiring shared build lock: /Users/xnetcat/Documents/REmu-phase1f/target/.remu-build.lock
+[REMu] held shared build lock
+[REMu] host vm.loadavg: { 4.06 3.75 3.17 }
+[REMu] launching PPSA10112-app; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1f/20260806T012130Z-PPSA10112-app
+[REMu] render resolution: 1920x1080 (ue4-ps5-backbuffer)
+[REMu] automatic shutdown after 25s (pass 0 to disable)
+[REMu] external launch watchdog after 30s
+[REMu] headless Metal presenter enabled
+[REMu][WAIT-FLIP-DONE] phase=safe flip=25 address=0xefc0000000 index=0 source=snapshot-completed age_ms=1.360
+[REMu][COMPLETION-ORDER] phase=publish flip=25 submission=Some(78) terminal=surface-less submission_terminal=true age_ms=11.549
+[REMu][AGC][EQUEUE] delivered sequence=53 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][AGC] shader evaluation cache draw=1024 hits=118 misses=2483 failures=0 invalidations=0 entries=40 evictions=0 pending_admissions=2403
+[REMu][AGC] draw=1024 indexed=true source=direct count=3 instances=1 offset=6 base_vertex=0 index_buffer=0x7020f24340/9 resource=0x7020f24340 index_size=0 primitive=0x4 es=0x800e910000 ps=0x800f310000 target=0x8041be0000 scanout=0x0 target_mask=0xf viewport=[Some(43100000), Some(43100000), Some(c2a20000), Some(42a20000)] es_user_base=0x8c es_user=[Some(580e108), Some(100080), Some(4), Some(4dfac), Some(40f791b0), Some(100070), Some(3), Some(4dfac)] ps_user=[Some(8041e500), Some(c2400000), Some(434077), Some(91b003ac), Some(0), Some(700000), Some(6b0000), Some(8041f5)]
+[REMu][AGC][EQUEUE] delivered sequence=54 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][METAL][RESOURCE-RECT] sequence=32768 draw=997 es=0x800bd30000 guest_count=4 guest_primitive=0x6 translated=true
+[REMu][COMPLETION-ORDER] phase=accept flip=26 submission=Some(81) submission_terminal=false
+[REMu][WAIT-FLIP-DONE] phase=snapshot-queued flip=26 address=0xefc1000000 index=1
+[REMu][WAIT-FLIP-DONE] phase=safe flip=26 address=0xefc1000000 index=1 source=snapshot-completed age_ms=1.402
+[REMu][COMPLETION-ORDER] phase=publish flip=26 submission=Some(81) terminal=surface-less submission_terminal=true age_ms=11.477
+[REMu][AGC][EQUEUE] delivered sequence=55 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][AGC][EQUEUE] delivered sequence=56 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][METAL] encoded Gen5 draw=1024 es=0x800e910000 ps=0x800f310000 in 76.209µs
+[REMu][COMPLETION-ORDER] phase=accept flip=27 submission=Some(84) submission_terminal=false
+[REMu][WAIT-FLIP-DONE] phase=snapshot-queued flip=27 address=0xefc0000000 index=0
+[REMu][WAIT-FLIP-DONE] phase=safe flip=27 address=0xefc0000000 index=0 source=snapshot-completed age_ms=1.407
+[REMu][COMPLETION-ORDER] phase=publish flip=27 submission=Some(84) terminal=surface-less submission_terminal=true age_ms=11.536
+[REMu][AGC][EQUEUE] delivered sequence=57 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][FAIL] nid=yH17Q6NWtVg name=sceUserServiceGetEvent thread="SystemEventGatherThreadSony" result=0xffffffff80960007 args=0x30d473b80,0x7fffffffffffffff,0x9,0x80
+[REMu][AGC][EQUEUE] delivered sequence=58 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu][FAIL] nid=JTvBflhYazQ name=sceKernelWaitEventFlag thread="AK::EventManager" result=0xffffffff8002003c args=0x3,0x1,0x12,0x0
+[REMu][AUDIO2] speaker query=2048 output=0x30f430ac8 args=0x1,0x30f430b38,0x0,0x7100b,0x7f7bb77e7f40
+[REMu][COMPLETION-ORDER] phase=accept flip=28 submission=Some(87) submission_terminal=false
+[REMu][WAIT-FLIP-DONE] phase=snapshot-queued flip=28 address=0xefc1000000 index=1
+[REMu][WAIT-FLIP-DONE] phase=safe flip=28 address=0xefc1000000 index=1 source=snapshot-completed age_ms=1.391
+[REMu][COMPLETION-ORDER] phase=publish flip=28 submission=Some(87) terminal=surface-less submission_terminal=true age_ms=11.845
+[REMu][AGC][EQUEUE] delivered sequence=59 equeue=0x4 ident=0x0 flags=0x0 fflags=1 data=0x0 user_data=0x0
+[REMu] external launch watchdog reached 30s
+[REMu] watchdog stopping pid=51956 after external timeout
+revision=483e943
+game=/Volumes/Untitled/sharpemu/games/SILENT HILL The Short Message/PPSA10112-app/eboot.bin
+timeout_seconds=25
+elapsed_seconds=30
+outcome=external-watchdog-timeout
+exit_status=124
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=ue4-ps5-backbuffer
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=31 total_calls=618
+[REMu][REPORT] fabricated success key=znaWI0gpuo8 name=scePadGetTriggerEffectState calls=378
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=37
+[REMu][REPORT] fabricated success key=gpu:noop-raster-disabled name=internal calls=29
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=26
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=20
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=20
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=19
+[REMu][REPORT] fabricated success key=-4GCfYdNF1s name=sceImeUpdate calls=18
+[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=18
+[REMu][REPORT] fabricated success key=gpu:noop-color-operation name=internal calls=14
+[REMu][REPORT] fabricated success key=gpu:noop-fast-clear-idle name=internal calls=14
+[REMu][REPORT] fabricated success key=gpu:noop-cover-placeholder name=internal calls=3
+[REMu][REPORT] fabricated success key=v8iOE+j8a5o name=sceAudioOut2MasteringSetParam calls=3
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=0gYjPTR-6cY name=sceHttpCreateTemplate calls=1
+[REMu][REPORT] fabricated success key=1xxcMiGu2fo name=sceUserServiceGetUserName calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=A9cVMUtEp4Y name=sceHttpInit calls=1
+[REMu][REPORT] fabricated success key=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=W2G-yoyMF5U name=scePadSetVibrationMode calls=1
+[REMu][REPORT] fabricated success key=XHl38ZNknbs name=sceAudioOut2MasteringInit calls=1
+[REMu][REPORT] fabricated success key=YBiIdcDPrxs name=sceShareFeaturePermit calls=1
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=1
+[REMu][REPORT] fabricated success key=jh+8XiK4LeE name=sceKernelIsAddressSanitizerEnabled calls=1
+[REMu][REPORT] fabricated success key=kmSe30JTs+E name=sceVideoOutAddOutputModeEvent calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
+[REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
+[REMu][REPORT] failing import name=sceKernelWaitEventFlag nid=JTvBflhYazQ failures=2624458 calls=2624479 results=0xffffffff8002003c:2624458
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=6372 calls=6400 results=0xffffffff80020002:6372
+[REMu][REPORT] failing import name=scePadReadState nid=YndgXqQVV7c failures=54 calls=72 results=0xffffffff80920003:54
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=27 calls=38 results=0xffffffff80020002:25,0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=20 calls=21 results=0xffffffff80960007:20
+[REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
+[REMu][REPORT] failing import name=sceKernelWaitEqueue nid=fzyMKs9kim0 failures=17 calls=5844 results=0xffffffff8002003c:17
+[REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=14 calls=22 results=0xffffffffffffffff:14
+[REMu][REPORT] failing import name=sceKernelMkdir nid=1-LFLmRFxxM failures=8 calls=9 results=0xffffffff80020002:3,0xffffffff8002000d:5
+[REMu][REPORT] failing import name=sceNetCtlGetInfo nid=obuxdTiwkF8 failures=4 calls=4 results=0xffffffff80410132:4
+[REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceNetResolverCreate nid=C4UgDHHPvdw failures=1 calls=1 results=0xffffffff80410132:1
+[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1f/20260806T012130Z-PPSA10112-app

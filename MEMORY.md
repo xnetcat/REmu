@@ -17,6 +17,16 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
+## Phase 1F — execution substrate (CLOSED 2026-08-06)
+
+- `guest_signal.rs`: Orbis ucontext (0x500 / mcontext +0x40 / rsp @ 0xf8); RaiseException →
+  SIGUSR1 interrupt; fault hook after write-watch decline; `_sigprocmask` oldset writeback.
+- Default affinity `0x7f` (7CPU); SYSTEM `0x1fff` still placeable. DeS still sizes 13 JobWorkers.
+- `usleep(0)` → yield; nanosleep/sleep/sched_yield wired; QoS from Setprio/setschedparam.
+- Handoff: `docs/notes/phase1f-20260806-handoff/`.
+- **Anti-claim:** Unity GC STW not live-closed (Dreaming Sarah dies before InstallExceptionHandler).
+- Phase 1G–H not started.
+
 ## Phase 1E — shader core (CLOSED 2026-08-06; on `main` @ `5bb169b`)
 
 - Exact `image_is_comparison` lattice; VALU BFE/CLAMP/SCC; `V_DIV_SCALE/FMAS_F32`; sub-dword LDS;
@@ -27,7 +37,6 @@ registers/packets that state intent.
 - SH live: missing-PARAM pair fails 31→0 at `5853fa7`; still not 3D-scene closure.
 - Barriers: structured OK; Dispatcher refuse. Graphics Dispatcher ballots = single-lane.
 - Handoff: `docs/notes/phase1e-20260806-handoff/`.
-- Phase 1F–H not started.
 
 ## Phase 1D — register model (CLOSED 2026-08-05)
 

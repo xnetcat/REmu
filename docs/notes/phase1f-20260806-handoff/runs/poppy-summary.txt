@@ -1,0 +1,51 @@
+revision=483e943
+game=/Volumes/Untitled/sharpemu/games/Poppy Playtime Chapter 1/eboot.bin
+timeout_seconds=30
+elapsed_seconds=35
+outcome=external-watchdog-timeout
+exit_status=124
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=presentation-only
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=27 total_calls=76
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=34
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=13
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=2
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=2
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=2
+[REMu][REPORT] fabricated success key=-hJRce8wn1U name=sce::Json::MemAllocator::MemAllocator calls=1
+[REMu][REPORT] fabricated success key=0gYjPTR-6cY name=sceHttpCreateTemplate calls=1
+[REMu][REPORT] fabricated success key=1xxcMiGu2fo name=sceUserServiceGetUserName calls=1
+[REMu][REPORT] fabricated success key=3JCe3lCbQ8A name=sceHttp2Init calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=A9cVMUtEp4Y name=sceHttpInit calls=1
+[REMu][REPORT] fabricated success key=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=U8IfNl6-Css name=sceVoiceQoSInit calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=W2G-yoyMF5U name=scePadSetVibrationMode calls=1
+[REMu][REPORT] fabricated success key=WSOuge5IsCg name=sce::Json::InitParameter2::InitParameter2 calls=1
+[REMu][REPORT] fabricated success key=XDncXQIJUSk name=sceNpGetOnlineId calls=1
+[REMu][REPORT] fabricated success key=cK6bYHf-Q5E name=sce::Json::Initializer::Initializer calls=1
+[REMu][REPORT] fabricated success key=jO8DM8oyego name=sceNpEntitlementAccessInitialize calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
+[REMu][REPORT] fabricated success key=qQJfO8HAiaY name=sceNpRegisterStateCallbackA calls=1
+[REMu][REPORT] fabricated success key=rbknaUjpqWo name=sceNpGetAccountIdA calls=1
+[REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
+[REMu][REPORT] recovered instructions via SIGILL emulation sha_ni=474840 sse4a=0 handler_ms=56 mean_ns=118
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=730 calls=743 results=0xffffffff80020002:730
+[REMu][REPORT] failing import name=scePthreadCondTimedwait nid=BmMjYxmew1w failures=348 calls=352 results=0xffffffff8002003c:348
+[REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=18 calls=43 results=0xffffffff80020002:18
+[REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=7 calls=10 results=0xffffffffffffffff:7
+[REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=2 calls=3 results=0xffffffff80960007:2
+[REMu][REPORT] failing import name=sceKernelMkdir nid=1-LFLmRFxxM failures=1 calls=2 results=0xffffffff8002000d:1
+[REMu][REPORT] failing import name=sceAgcDriverRegisterOwner nid=X-Nm5KLREeg failures=1 calls=1 results=0x8a6c9018:1
+[REMu][REPORT] failing import name=sceSysmoduleIsLoaded nid=fMP5NHUOaMk failures=1 calls=1 results=0xffffffff805a1001:1
+[REMu][REPORT] failing import name=sceNetCtlGetInfo nid=obuxdTiwkF8 failures=1 calls=1 results=0xffffffff80410132:1

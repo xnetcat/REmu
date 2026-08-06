@@ -1,0 +1,50 @@
+[REMu] acquiring shared build lock: /Users/xnetcat/Documents/REmu-phase1f/target/.remu-build.lock
+[REMu] held shared build lock
+[REMu] host vm.loadavg: { 3.15 3.20 2.91 }
+[REMu] launching PPSA02929-app0; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1f/20260806T011841Z-PPSA02929-app0
+[REMu] render resolution: 1920x1080 (presentation-only)
+[REMu] warning: no guest-native resolution hook was found; only presentation is 1920x1080
+[REMu] automatic shutdown after 45s (pass 0 to disable)
+[REMu] external launch watchdog after 50s
+[REMu] headless Metal presenter enabled
+Could not open file /app0/shaders/replacecolor.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(16) sceKernelOpen failed guest="/app0/shaders/tint.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/tint.vert": No such file or directory (os error 2)
+[REMu][FAIL] nid=6c3rCVE-fTU name=_open thread="spi_main_thread" result=0xffffffffffffffff args=0x3105f3e50,0x0,0x0,0x1b6
+Could not open file /app0/shaders/tint.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(17) sceKernelOpen failed guest="/app0/shaders/vhs.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/vhs.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/vhs.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(18) sceKernelOpen failed guest="/app0/shaders/vignette.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/vignette.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/vignette.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(19) sceKernelOpen failed guest="/app0/shaders/water.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/water.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/water.vert.
+[REMu][VM] unmapped address=0x70056b0000 length=0x10000
+[REMu][VM] released direct start=0x56b0000 length=0x10000 released=true
+[REMu][VFS] miss=Some(20) sceKernelOpen failed guest="/app0/shaders/waterbg.vert" host="/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/shaders/waterbg.vert": No such file or directory (os error 2)
+Could not open file /app0/shaders/waterbg.vert.
+[REMu][WATCH] unhandled SIGSEGV code=1(SEGV_MAPERR) addr=0x0 pc=0x8000e5c57 space=host reason=null-address; forwarding
+[REMu][WATCH] fault registers rax=0x8000e5c57 rbx=0x7000250080 rcx=0x8002eeddc rdx=0x6e rdi=0x8002fb72e rsi=0x8002fcfe0 rbp=0x310604570 rsp=0x3105f4420 r8=0x101010101010101 r9=0x8080808080808080 r10=0x46000001d0 r11=0x1b r12=0x3105fc4f0 r13=0x3105f4490 r14=0x3106045a0 r15=0x310604b40
+[REMu][WATCH] fault stack rsp=0x3105f4420 words=0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0,0x0
+/Users/xnetcat/Documents/REmu-phase1f/scripts/run-with-watchdog.sh: line 165: 50962 Segmentation fault: 11  "$@"
+revision=170daf0
+game=/Volumes/Untitled/sharpemu/games/Dreaming Sarah/PPSA02929-app0/eboot.bin
+timeout_seconds=45
+elapsed_seconds=0
+outcome=guest-failure
+exit_status=139
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=presentation-only
+[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1f/20260806T011841Z-PPSA02929-app0

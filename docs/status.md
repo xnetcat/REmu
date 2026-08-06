@@ -4,6 +4,19 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+## Phase 1F (2026-08-06) — execution substrate — CLOSED
+
+Guest exception delivery with Orbis `ucontext_t` (mcontext at `+0x40`); interruptive
+`sceKernelRaiseException` via host SIGUSR1/`pthread_kill`; unrecovered SIGSEGV/SIGBUS offered to
+installed guest handlers; game default affinity `0x7f` (SYSTEM `0x1fff` still placeable);
+`usleep(0)` yields; nanosleep/sleep/sched_yield wired; host QoS from Setprio/setschedparam (or loud
+refusal); `_sigprocmask` writes oldset. See `docs/notes/phase1f-20260806-handoff/`.
+
+**Acceptance:** architectural data flow + unit tests + both-arch `cargo check` green. Silent Hill /
+Oregon / Poppy watchdog-timeout clean; `pthread_setschedparam` no longer fabricated success. Unity
+GC STW **not** live-proven — Dreaming Sarah still null-SIGSEGV before `InstallExceptionHandler`.
+Demon's Souls still ACM-blocked. Phase 1G–H not started.
+
 ## Phase 1E (2026-08-06) — shader core — CLOSED (on `main` @ `5bb169b`)
 
 Exact image compare lattice; VALU sign/saturate/SCC; precise `V_DIV_SCALE/FMAS_F32`; sub-dword
@@ -20,7 +33,7 @@ unit fails unchanged from `0a8212a`). Silent Hill at `5853fa7`: missing-PARAM Ge
 **31→0**; `INTERFACE-FILL=0` — **still not** a 3D-scene closure (“success is not the hallway”;
 follow-up run `captured_frames=0` under overloaded `vm.loadavg`). Dreaming Sarah / Void Terrarium
 host null SIGSEGV also reproduces on Phase 1D tip `0a8212a` (not a 1E introduction); `bf50225`
-DS control same hour was ~30 FPS (not 60) so no FPS claims. Phase 1F–H not started.
+DS control same hour was ~30 FPS (not 60) so no FPS claims.
 
 ## Phase 1D (2026-08-05) — register model — CLOSED
 

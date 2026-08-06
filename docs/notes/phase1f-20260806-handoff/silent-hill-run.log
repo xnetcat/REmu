@@ -1,0 +1,95 @@
+[REMu] acquiring shared build lock: /Users/xnetcat/Documents/REmu-phase1f/target/.remu-build.lock
+[REMu] held shared build lock
+[REMu] host vm.loadavg: { 5.05 3.43 2.96 }
+[REMu] launching PPSA10112-app; artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1f/20260806T011729Z-PPSA10112-app
+[REMu] render resolution: 1920x1080 (ue4-ps5-backbuffer)
+[REMu] automatic shutdown after 45s (pass 0 to disable)
+[REMu] external launch watchdog after 50s
+[REMu] headless Metal presenter enabled
+[REMu][PERF-DISPATCH] window_ms=5018 calls=6758997 direct=2924675 leaf=0 sync=955650 audio=2860161 pad=200 stateless=18248 fd=0 equeue=30 loader=0 ampr=0 video=0 stateful=33 | lock-wait count=210 total_ns=9750666 mean_ns=46431 max_ns=1865917 buckets=[158, 23, 23, 0, 6, 0, 0, 0] | lock-hold count=210 total_ns=19111955 mean_ns=91009 max_ns=1975292 buckets=[152, 30, 11, 9, 8, 0, 0, 0] | gpu-publication count=23 total_ns=3546582833 mean_ns=154199253 max_ns=550730125 buckets=[0, 8, 8, 0, 0, 0, 7, 0] bucket_upper_ns=[1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000]
+[REMu][PERF-GPU-PUBLICATION] window_ms=5018 calls=23 values=count/total_ns/mean_ns/max_ns
+[REMu][PERF-GPU-PUBLICATION] route=queue part=admit order=23/0/0/0 barrier=23/2121/92/375 setup=23/171165/7441/18625
+[REMu][PERF-GPU-PUBLICATION] route=queue part=channel fifo=23/10370/450/2249 send=23/3546135630/154179810/550688250 residual=23/263547/11458/83919
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=admit order=0/0/0/0 barrier=0/0/0/0 setup=0/0/0/0
+[REMu][PERF-GPU-PUBLICATION] route=mixed part=channel fifo=0/0/0/0 send=0/0/0/0 residual=0/0/0/0
+[REMu][PERF-DIRECT] window_ms=5018 total=2924675 process-time=961865 sce-self=5879 posix-self=96 sce-thread-id=7448 sce-tls-get=23632 posix-tls-get=160 sce-tls-set=16 posix-tls-set=160 sce-mutex-lock=959269 posix-mutex-lock=3276 sce-mutex-unlock=959269 posix-mutex-unlock=3277 posix-rwlock-write=80 posix-rwlock-unlock=248
+[REMu][PERF-CAUSES] RP-end compute=0/s key=0/s color-op=0/s flush=60/s | CB tick=150/s memory=0/s wait=0/s shared-host=0/s flip=0/s capacity=0/s pfp=0/s sync=0/s
+[REMu][PERF-SHARED-EVENT] signals=68/s waits=0/s same-queue-elided=2/s host-blocks=0/s host-wakes=0/s acquire-noop-drops=0/s gpu-ordered-waits=0/s gpu-ordered-compute=0/s gpu-ordered-draw=0/s footprint-incomplete=0/s error-advances=0 fallback-no-exact=2/s fallback-overflow=0
+[REMu][PERF-SHARED-EVENT-DMA-FILL] attempts=0/s accepted=0/s reject=cross-queue:0/s,non-immediate-source:0/s,destination-selector:0/s,source-snapshot:0/s,unsupported-width:0/s,nonzero-immediate:0/s,invalid-range:0/s,missing-identity:0/s,metadata-overlap:0/s,cache-overlap:0/s,incomplete-dependency:0/s,missing-open-batch:0/s
+[REMu][PERF-SHARED-EVENT-DRAW] attempts=0/s disjoint-candidates=0/s versioned-global-candidates=0/s resident-image-candidates=0/s internal-drains=0/s admission=enabled reject=overlap-resident:0/s,overlap-scanout:0/s,overlap-copied-global:0/s,overlap-zero-copy-global:0/s,overlap-terminal-write:0/s,overlap-internal-resident:0/s,incomplete-producer:0/s,unresolved:0/s,indirect:0/s,shader-coverage:0/s,special-op:0/s,diagnostic:0/s,other:0/s
+[REMu][PERF-SHARED-EVENT-HOST] acquire=0/s draw=0/s compute=0/s dma=0/s wait=0/s flip=0/s ui=0/s other=0/s
+[REMu][PERF-SHARED-EVENT-LATENCY] window_ms=5018 completed=count/total_ns/mean_ns/max_ns ack=0/0/0/0 ack-prefix=0/0/0/0 prefix-terminal=0/0/0/0 pending=count/total_age_ns/max_age_ns ack=0/0/0 ack-prefix=0/0/0 prefix-terminal=0/0/0
+[REMu][COMPLETION-ORDER] accepted=47 deferred=47 published=47 outstanding=0 waiting_submission=0 waiting_terminal=0 joined_ordered=0 head=none
+[REMu][PERF-RP-KEY] target count=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s scanout=0/s type=0/s layers=0/s base-layer=0/s mip=0/s mip-count=0/s | depth presence=0/s addr=0/s width=0/s height=0/s pitch=0/s tile=0/s format=0/s bpp=0/s samples=0/s layers=0/s clear=0/s clear-seq=0/s
+[REMu][PERF-PIPELINE] ready=37/19 active=0/0 failed=0/0 interval=enqueued:0/full:0/done:0/failed:0/gates:0/0 blocked=pipeline:0/memory:0/flip:0
+[REMu][PERF-QUEUES] q0:pending:367/submissions:12/blocked:none/front:other; q33:pending:9/submissions:1/blocked:none/front:wait:GpuWaitId(2216)@0x7021071300/ref:0x1/mask:0xffffffff/cmp:3
+[REMu][PERF-DROPPED] draws=46/2 keys compute=0/0 keys worst_draw=es:0x8007a80000/ps:0x8008020000/44
+[REMu][PERF-NOOP] draws consumed without rasterizing: cover=3 raster-off=93 color-op=46 fce-idle=46
+[REMu][PERF-TEXTURE] snapshot=18/226.9MiB/94.3ms/0unstable dirty_validate=162/1.1MiB/2.8ms/0clean mode27=0/0.0MiB/0.0ms upload=0/0.0MiB/0.0ms
+[REMu][PERF-TEXTURE-CACHE] resident=37/94MiB guest=94MiB metal=287/18187MiB watches=41 hit=179 miss=14 dirty_reload=0 acquire_invalidate=0 resident_acquire_invalidate=162 capacity_evict=0 depth_native=0 alias_writeback=9/83.4MiB/0.0ms write_attribution_miss=0
+[REMu][PERF-TEXTURE-WRITEBACK] published=0.0MiB dropped=53.1MiB pub/drop: dma-source=0/0 flip-target=0/0 pressure-eviction=0/0 alias-rebuild=0/4 layered-depth-alias=0/0 sampled-alias=0/9
+[REMu][PERF-TEXTURE-OWNED] live=47 stale=0 owned=174.9MiB/59 runs debt=146.4MiB survived=0 demoted=162 reclaim_discard=8 rematerialise=0/0/0/4 failed=0(0/0/0/0) coarsened=0 unresolved=0 fallback=0
+[REMu][PERF-METAL-RESIDENCY] sampled=37/93.8MiB targets=47/166.2MiB depth_arrays=0/0.0MiB direct_scanout=0/0.0MiB scanout_snapshots=2/16.2MiB msaa=0/0.0MiB fallback=0/0.0MiB accounted=276.2MiB other=10.8MiB
+[REMu][PERF-METAL-TARGETS] owner=gpu:43/140.2MiB,cpu:4/26.0MiB mapping=active:47/166.2MiB,reprotected:0/0.0MiB,reprotecting:0/0.0MiB,replaced:0/0.0MiB backing=bases:47/+0versions,spans:47/+0duplicates,unresolved:0/0.0MiB top=[0x803b660000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v2412/None; 0x8038fb0000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v2413/None; 0x803d6a0000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v2414/None; 0x803e6c0000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v2364/None; 0x8043450000/1920x1080/p1920/RGBA16Float/tile27=15.9MiB/gputrue/v2415/None; 0x8027b90000/1920x1080/p1920/RGBA16Unorm/tile27=15.9MiB/gpufalse/v0/None; 0x8040730000/1920x1080/p1920/RG11B10Float/tile27=8.0MiB/gputrue/v2419/None; 0x8044550000/1920x1080/p1920/BGRA8Unorm/tile27=8.0MiB/gputrue/v2443/None]
+[REMu][PERF-GLOBAL-CACHE] captured=4096/0.7MiB identity=2/11.1MiB
+[REMu][PERF-SNAPSHOT-TOP] 0x8043450000/15.9MiB@L851=6/95.6MiB/47.5ms; 0x8043450000/15.9MiB@L2764=4/63.8MiB/30.8ms; 0x8044550000/8.4MiB@L851=8/67.5MiB/16.0ms
+[REMu][PERF-TEXTURE-DIRTY-TOP] 0x8043450000/15.9MiB@L851=6snap/0clean/0imprecise dirty=0.5MiB(0.539%)/132pages; 0x8044550000/8.4MiB@L851=8snap/8clean/0imprecise dirty=0.0MiB(0.000%)/0pages; 0x8043450000/15.9MiB@L2764=4snap/4clean/0imprecise dirty=0.0MiB(0.000%)/0pages
+[REMu] external launch watchdog reached 50s
+[REMu] watchdog stopping pid=50631 after external timeout
+revision=170daf0
+game=/Volumes/Untitled/sharpemu/games/SILENT HILL The Short Message/PPSA10112-app/eboot.bin
+timeout_seconds=45
+elapsed_seconds=51
+outcome=external-watchdog-timeout
+exit_status=124
+captured_frames=0
+unimplemented_nids=0
+render_size=1920x1080
+render_policy=ue4-ps5-backbuffer
+[REMu][REPORT] --- ABI gap summary ---
+[REMu][REPORT] fabricated success keys=32 total_calls=1207
+[REMu][REPORT] fabricated success key=znaWI0gpuo8 name=scePadGetTriggerEffectState calls=735
+[REMu][REPORT] fabricated success key=gatEUKG+Ea4 name=sceAudioOut2PortGetState calls=71
+[REMu][REPORT] fabricated success key=gpu:noop-raster-disabled name=internal calls=64
+[REMu][REPORT] fabricated success key=Xs9hdiD7sAA name=pthread_setschedparam calls=44
+[REMu][REPORT] fabricated success key=iQw3iQPhvUQ name=sceNetCtlCheckCallback calls=37
+[REMu][REPORT] fabricated success key=rPo6tV8D9bM name=sceSystemServiceGetStatus calls=37
+[REMu][REPORT] fabricated success key=h9z6+0hEydk name=sceAgcSuspendPoint calls=36
+[REMu][REPORT] fabricated success key=-4GCfYdNF1s name=sceImeUpdate calls=35
+[REMu][REPORT] fabricated success key=pad:fabricated-stationary-imu name=internal calls=35
+[REMu][REPORT] fabricated success key=gpu:noop-color-operation name=internal calls=31
+[REMu][REPORT] fabricated success key=gpu:noop-fast-clear-idle name=internal calls=31
+[REMu][REPORT] fabricated success key=g8cM39EUZ6o name=sceSysmoduleLoadModule calls=26
+[REMu][REPORT] fabricated success key=gpu:noop-cover-placeholder name=internal calls=3
+[REMu][REPORT] fabricated success key=v8iOE+j8a5o name=sceAudioOut2MasteringSetParam calls=3
+[REMu][REPORT] fabricated success key=dgJBaeJnGpo name=sceNetPoolCreate calls=2
+[REMu][REPORT] fabricated success key=0gYjPTR-6cY name=sceHttpCreateTemplate calls=1
+[REMu][REPORT] fabricated success key=1xxcMiGu2fo name=sceUserServiceGetUserName calls=1
+[REMu][REPORT] fabricated success key=8zLSfEfW5AU name=sceCoredumpRegisterCoredumpHandler calls=1
+[REMu][REPORT] fabricated success key=A9cVMUtEp4Y name=sceHttpInit calls=1
+[REMu][REPORT] fabricated success key=MTxxrOCeSig name=sceVideoOutSetWindowModeMargins calls=1
+[REMu][REPORT] fabricated success key=NWtTN10cJzE name=sceLibcHeapGetTraceInfo calls=1
+[REMu][REPORT] fabricated success key=R9lA82OraNs name=sceAppContentInitialize calls=1
+[REMu][REPORT] fabricated success key=UJ+Z7Q+4ck0 name=sceNetCtlRegisterCallback calls=1
+[REMu][REPORT] fabricated success key=W2G-yoyMF5U name=scePadSetVibrationMode calls=1
+[REMu][REPORT] fabricated success key=XHl38ZNknbs name=sceAudioOut2MasteringInit calls=1
+[REMu][REPORT] fabricated success key=YBiIdcDPrxs name=sceShareFeaturePermit calls=1
+[REMu][REPORT] fabricated success key=hdpVEUDFW3s name=sceSslInit calls=1
+[REMu][REPORT] fabricated success key=jh+8XiK4LeE name=sceKernelIsAddressSanitizerEnabled calls=1
+[REMu][REPORT] fabricated success key=kmSe30JTs+E name=sceVideoOutAddOutputModeEvent calls=1
+[REMu][REPORT] fabricated success key=nBDD66kiFW8 name=sceShareInitialize calls=1
+[REMu][REPORT] fabricated success key=nu4a0-arQis name=sceKernelAioInitializeParam calls=1
+[REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
+[REMu][REPORT] failing import name=sceKernelWaitEventFlag nid=JTvBflhYazQ failures=5423932 calls=5423953 results=0xffffffff8002003c:5423932
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=6372 calls=6399 results=0xffffffff80020002:6372
+[REMu][REPORT] failing import name=scePadReadState nid=YndgXqQVV7c failures=105 calls=140 results=0xffffffff80920003:105
+[REMu][REPORT] failing import name=sceUserServiceGetEvent nid=yH17Q6NWtVg failures=37 calls=38 results=0xffffffff80960007:37
+[REMu][REPORT] failing import name=sceKernelWaitEqueue nid=fzyMKs9kim0 failures=34 calls=4589 results=0xffffffff8002003c:34
+[REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=27 calls=38 results=0xffffffff80020002:25,0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
+[REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=14 calls=22 results=0xffffffffffffffff:14
+[REMu][REPORT] failing import name=sceKernelMkdir nid=1-LFLmRFxxM failures=8 calls=9 results=0xffffffff80020002:3,0xffffffff8002000d:5
+[REMu][REPORT] failing import name=sceNetCtlGetInfo nid=obuxdTiwkF8 failures=4 calls=4 results=0xffffffff80410132:4
+[REMu][REPORT] failing import name=sceKernelRmdir nid=naInUjYt3so failures=2 calls=2 results=0xffffffff8002000d:2
+[REMu][REPORT] failing import name=sceNetResolverCreate nid=C4UgDHHPvdw failures=1 calls=1 results=0xffffffff80410132:1
+[REMu] complete; full artifacts: /var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T//remu-runs-phase1f/20260806T011729Z-PPSA10112-app
