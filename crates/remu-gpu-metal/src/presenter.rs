@@ -50,7 +50,8 @@ use self::decode::{
     CB_COLOR_CONTROL, CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT,
     CB_TARGET_MASK, ColorOperationMode, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
     DEFAULT_CB_COLOR_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, NGG_MESHLET_WORDS_PER_GROUP,
-    PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
+    PA_CL_VTE_CNTL_VTX_W0_FMT, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1,
+    PA_SU_SC_MODE_CNTL,
     color_operation_is_raster_noop,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
@@ -683,6 +684,8 @@ struct GraphicsPipelineKey {
     export_allocated_vector_register_count: u32,
     pixel_allocated_vector_register_count: u32,
     vertex_output_control: u32,
+    /// Raw `PA_CL_VTE_CNTL`. Bit `VTX_W0_FMT` forces clip-space W to 1.0 after position export.
+    viewport_transform_control: u32,
     pixel_input_controls: [u32; 32],
     /// Live NGG subgroup sizing registers. Non-NGG pipelines leave this absent; NGG compilation
     /// and meshlet preparation require it rather than assuming that execution wave width is also

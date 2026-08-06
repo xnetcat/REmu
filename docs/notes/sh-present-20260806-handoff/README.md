@@ -51,8 +51,12 @@ Clean attribution @ `a86c225` (`runs/silent-hill-title-bg-occ/`, `dirty_tree=0`,
 8. **HDR producer `800bf4` writes zero despite non-zero samples** (clean
    `runs/silent-hill-title-bg-hdr/`): first `800bf4` `[TARGET]` `nonzero=0` while
    `TARGET-DRAW-TEXTURES` reports sampled natives with `nz≠0` (e.g. solid
-   `0x803f920000`). Next architectural concern is why that tonemap/HDR write stays empty
-   (export / mesh coverage / shader), not the BGRA↔RGBA alias path.
+   `0x803f920000`). **Root cause:** ES `0x800d690000` float4 VB leaves **W=0**; AGC
+   `PA_CL_VTE_CNTL=0x43f` sets `VTX_W0_FMT` (bit 10) so Gen5 replaces W with 1.0 before
+   clip; REmu previously forwarded `position.w=0` into Metal mesh → triangle clipped →
+   HDR RT stayed clear. Non-zero samples prove bindings exist, not coverage.
+9. **Fix (this tip):** pipeline key carries `PA_CL_VTE_CNTL`; MSL epilogue forces
+   `position.w = 1.0` when `VTX_W0_FMT` is set (vertex + mesh, including staged NGG).
 
 ## Anti-claims
 
@@ -63,14 +67,17 @@ Clean attribution @ `a86c225` (`runs/silent-hill-title-bg-occ/`, `dirty_tree=0`,
 - Closing latched-stencil color-MRT aborts ≠ title-background 3D closure (proven @ `0a22e15`).
 - Closing type-0 refuse + BGRA↔RGBA authority ≠ title-background 3D closure (proven live: BG still black with ALIAS-VIEW).
 - Proving intermediate texels black ≠ title-background 3D closure — only attributes the failure upstream of `800da3`.
+- Identifying / fixing `VTX_W0_FMT` ≠ title-background 3D closure until a clean live capture
+  shows the title BG assessable.
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **`800bf4` HDR write stays zero** while sampled Metal texels are non-zero — dump MSL /
-   pixel outputs / mesh coverage for `es=0x800d690000 ps=0x800bf40000` (`AbgrFp16`→`RG11B10`).
+1. **Live-verify `VTX_W0_FMT` fix** — clean tree, `REMU_CAPTURE_FRAMES=1`; title BG assessable
+   and/or first `800bf4` `[TARGET]` `nonzero≠0`. If still black: next architectural remainder
+   (pixel export / AbgrFp16→RG11B10 / later composite) with fresh evidence.
 2. **No-attachment `ps=0x8008020000` / friends:** many drops keep `target_mask=0` while
    `ps_scalars` hold live image SRDs — only if proven on the HDR/title-BG path; do not invent CB targets.
 3. Null IMAGE-FALLBACK policy (optional binds) if still modulating covers.
@@ -87,9 +94,12 @@ Clean attribution @ `a86c225` (`runs/silent-hill-title-bg-occ/`, `dirty_tree=0`,
 | `0a22e15` | Latched `STENCIL_ENABLE` must not abort color MRTs |
 | `3c025bd` | Type-0 refuse + BGRA↔RGBA sample authority |
 | `a86c225` | BGRA occupancy dump + `ADDRESS=auto` skips scanout covers |
+| *(tip)* | Honor `PA_CL_VTE_CNTL.VTX_W0_FMT` in Metal position export |
 
 ## Checks
 
-- `cargo test -p remu-gpu-metal --lib same_address_color_view` — green
-- `cargo check -p remu-gpu-metal --all-targets` — arm64 + `x86_64-apple-darwin` green
-- Live SH clean @ `a86c225` — hallway + title UI; title 3D still black; intermediate `rgb_nonzero=0`; HDR sample black; `800bf4` writes zero with non-zero samples
+- `cargo test -p remu-shader-metal --lib forces_clip_space_w_to_one` — green
+- `cargo test -p remu-gpu-metal --lib carries_pa_cl_vte_cntl` — green
+- `cargo check -p remu-gpu-metal -p remu-shader-metal` — arm64 + `x86_64-apple-darwin` green
+- Live SH clean @ `a86c225` — hallway + title UI; title 3D still black; intermediate `rgb_nonzero=0`; HDR sample black; `800bf4` writes zero with non-zero samples (pre-fix)
+- Live post-`VTX_W0_FMT` — **pending** (gate open until assessable title BG)

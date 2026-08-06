@@ -630,6 +630,11 @@ impl Compiler<'_> {
         }
         match self.options.stage {
             MetalShaderStage::Vertex | MetalShaderStage::Pixel => {
+                if self.options.stage == MetalShaderStage::Vertex && self.options.force_position_w1 {
+                    // PA_CL_VTE_CNTL.VTX_W0_FMT: Gen5 replaces the exported W with 1.0 before
+                    // clipping. Float4 vertex buffers that only carry XY commonly leave W=0.
+                    source.push_str("    remu_out.position.w = 1.0f;\n");
+                }
                 if self.options.stage == MetalShaderStage::Pixel {
                     if self.options.diagnostic_capture_pixel_output
                         && let Some(output) = self.options.pixel_outputs.first()
@@ -799,6 +804,16 @@ impl Compiler<'_> {
                 // When EXP is gated by a compacted vertex VGPR, publish staged payloads by that
                 // index — remu_out lives on the exporting thread, which is usually not the same
                 // as remu_thread_index == vertex_id.
+                if self.options.force_position_w1 {
+                    // PA_CL_VTE_CNTL.VTX_W0_FMT applies after position export, before clip.
+                    if self.mesh_export_vertex_vgpr.is_some() {
+                        source.push_str(
+                            "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh_staged_vertices[remu_thread_index].position.w = 1.0f;\n",
+                        );
+                    } else {
+                        source.push_str("    remu_out.position.w = 1.0f;\n");
+                    }
+                }
                 if self.mesh_export_vertex_vgpr.is_some() {
                     source.push_str(
                         "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index]);\n\

@@ -452,6 +452,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 stage,
                 required_vertex_output_count: 0,
                 vertex_output_control: 0,
+            force_position_w1: false,
                 render_target_array_length: 1,
                 pixel_outputs: Vec::new(),
                 pixel_depth_export: false,

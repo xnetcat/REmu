@@ -218,6 +218,34 @@ fn compressed_integer_mrt_pair_enables_preserve_the_other_pair() {
 }
 
 #[test]
+fn forces_clip_space_w_to_one_when_vtx_w0_fmt_enabled() {
+    let program = decode_program(0x1000, &[0xbf81_0000]).expect("minimal vertex program decodes");
+    let mut options = MetalCompileOptions::vertex(0);
+    options.force_position_w1 = true;
+    let shader = compile_msl(&program, &empty_evaluation(), &options).expect("vertex lowers");
+    assert!(
+        shader.source.contains("remu_out.position.w = 1.0f;"),
+        "VTX_W0_FMT must rewrite exported W before Metal clip"
+    );
+
+    let mut mesh_options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
+    mesh_options.force_position_w1 = true;
+    let mesh = compile_msl(&program, &empty_evaluation(), &mesh_options).expect("mesh lowers");
+    assert!(
+        mesh.source.contains("remu_out.position.w = 1.0f;"),
+        "mesh epilogue must apply VTX_W0_FMT before set_vertex"
+    );
+    assert!(
+        mesh.source.find("remu_out.position.w = 1.0f;").unwrap()
+            < mesh
+                .source
+                .find("remu_mesh.set_vertex(remu_thread_index, remu_out)")
+                .unwrap(),
+        "W rewrite must precede set_vertex"
+    );
+}
+
+#[test]
 fn maps_packed_secondary_position_exports_to_metal_clip_distances() {
     let export = |pc, target| Instruction {
         pc,

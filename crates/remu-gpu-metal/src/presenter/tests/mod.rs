@@ -175,6 +175,7 @@ fn cold_graphics_pipeline_key() -> GraphicsPipelineKey {
         export_allocated_vector_register_count: 256,
         pixel_allocated_vector_register_count: 256,
         vertex_output_control: 0,
+        viewport_transform_control: 0,
         pixel_input_controls: std::array::from_fn(|index| {
             u32::try_from(index).expect("PS input index fits u32")
         }),

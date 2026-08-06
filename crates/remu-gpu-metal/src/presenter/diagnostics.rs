@@ -1050,7 +1050,16 @@ pub(super) fn diagnostic_target_draw_filter() -> Option<DiagnosticTargetDrawFilt
 const fn is_diagnostic_context_register(offset: u32) -> bool {
     matches!(
         offset,
-        0x191..=0x1b0 | 0x1b3 | 0x1b4 | 0x1b6 | 0x1e0..=0x1e7 | 0x291 | 0x29b
+        0x191..=0x1b0
+            | 0x1b3
+            | 0x1b4
+            | 0x1b6
+            | 0x1e0..=0x1e7
+            // PA_SU_SC_MODE_CNTL / PA_CL_VTE_CNTL / PA_CL_VS_OUT_CNTL — clip + VTE state that
+            // gates fullscreen mesh coverage (VTX_W0_FMT).
+            | 0x205..=0x207
+            | 0x291
+            | 0x29b
     )
 }
 

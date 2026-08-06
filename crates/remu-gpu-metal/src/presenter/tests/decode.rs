@@ -124,6 +124,32 @@ fn accepts_fragmentless_depth_only_pipeline() {
 }
 
 #[test]
+fn carries_pa_cl_vte_cntl_into_pipeline_key() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader_address = 0x0080_07a8_0000;
+    draw.export_shader = Some(ShaderSnapshot {
+        header_address: 0,
+        program: Arc::new(Program::new(draw.export_shader_address, Vec::new())),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    });
+    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    append_depth_target_registers(&mut draw, 0x0080_10b5_0000, 256, 256, 0xa000_0003, 0x66);
+    draw.context_registers.push(GpuRegister {
+        offset: 0x206,
+        value: 0x43f,
+    });
+
+    let key = graphics_pipeline_key(&draw).expect("depth-only draw has a Metal pipeline");
+    assert_eq!(
+        key.viewport_transform_control, 0x43f,
+        "AGC-default PA_CL_VTE_CNTL (VTX_W0_FMT set) must reach the pipeline key"
+    );
+}
+
+#[test]
 fn recognizes_noop_placeholder_cover_without_attachments() {
     let words = [
         0xbfa0_0001,

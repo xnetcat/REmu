@@ -9,7 +9,8 @@ use super::{
     DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     GraphicsWaveState, MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits,
-    PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity, RenderTargetPipelineState,
+    PA_CL_VTE_CNTL, PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
+    RenderTargetPipelineState,
     SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT,
     VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE, common_render_target_array_length,
     decode_depth_target, decode_render_targets, diagnostic_capture_pixel_output,
@@ -1097,6 +1098,10 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             graphics_allocated_vector_register_count(&draw.shader_registers, 0x00c)
         },
         vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
+            .unwrap_or_default(),
+        // AGC seeds `PA_CL_VTE_CNTL=0x43f` (VTX_W0_FMT set). Missing after a sparse test draw
+        // must not invent that default — only seeded/live state may force W=1.
+        viewport_transform_control: register_value(&draw.context_registers, PA_CL_VTE_CNTL)
             .unwrap_or_default(),
         pixel_input_controls: if fragmentless {
             [0; 32]

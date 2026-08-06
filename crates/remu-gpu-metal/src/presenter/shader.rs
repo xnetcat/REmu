@@ -18,8 +18,8 @@ use super::{
     ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_disable_blending,
     dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
     dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video, image_component_class,
-    metal_color_write_mask, register_value, speculative_pipeline_compile_in_flight_capacity,
-    video_target_binding_summary,
+    metal_color_write_mask, PA_CL_VTE_CNTL_VTX_W0_FMT, register_value,
+    speculative_pipeline_compile_in_flight_capacity, video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -570,6 +570,8 @@ impl MetalPresenter {
             .scratch_bytes_per_lane(vertex_options.wave_lane_count);
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
+        vertex_options.force_position_w1 =
+            key.viewport_transform_control & PA_CL_VTE_CNTL_VTX_W0_FMT != 0;
         vertex_options.diagnostic_force_visible_clip_depth =
             key.diagnostics.force_visible_clip_depth;
         vertex_options.diagnostic_force_vertex_pattern = key.diagnostics.force_vertex_pattern;

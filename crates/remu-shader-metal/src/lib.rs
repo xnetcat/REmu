@@ -189,6 +189,11 @@ pub struct MetalCompileOptions {
     /// vector or either clip/cull-distance vector depending on this register. Keeping the raw
     /// value in the compile options makes that mapping part of the generated Metal interface.
     pub vertex_output_control: u32,
+    /// When set, `PA_CL_VTE_CNTL.VTX_W0_FMT` forces clip-space W to 1.0 after position export.
+    ///
+    /// UE fullscreen NGG covers often store XY in a float4 vertex buffer with W=0. On Gen5 the
+    /// VTE bit replaces that W with 1.0 before clipping; without it Metal rejects the triangle.
+    pub force_position_w1: bool,
     /// Number of active color/depth target layers. A guest misc position export selects the
     /// layer; procedural volume draws fall back to their instance index.
     pub render_target_array_length: u32,
@@ -266,6 +271,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Vertex,
             required_vertex_output_count,
             vertex_output_control: 0,
+            force_position_w1: false,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -299,6 +305,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
+            force_position_w1: false,
             render_target_array_length: 1,
             pixel_outputs,
             pixel_depth_export: false,
@@ -328,6 +335,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
+            force_position_w1: false,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -357,6 +365,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
+            force_position_w1: false,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -400,6 +409,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Mesh,
             required_vertex_output_count,
             vertex_output_control: 0,
+            force_position_w1: false,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,

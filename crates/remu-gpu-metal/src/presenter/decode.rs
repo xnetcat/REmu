@@ -98,6 +98,13 @@ pub(super) const PA_SU_SC_MODE_CNTL: u32 = 0x205;
 /// SDK / AGC v10 default for `PA_SU_SC_MODE_CNTL`: FACE clear → CCW front face (`0x240`).
 pub(super) const DEFAULT_PA_SU_SC_MODE_CNTL: u32 = 0x240;
 
+/// GFX10 `PA_CL_VTE_CNTL` (`R_028818` → Cx `0x206`). AGC public defaults seed `0x43f`.
+pub(super) const PA_CL_VTE_CNTL: u32 = 0x206;
+
+/// `PA_CL_VTE_CNTL.VTX_W0_FMT`: when set, clip-space W is architecturally 1.0 even if the
+/// export shader wrote a different W (including 0 from float4 vertex buffers that only carry XY).
+pub(super) const PA_CL_VTE_CNTL_VTX_W0_FMT: u32 = 1 << 10;
+
 pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
 
 /// AGC `CxVgtShaderStagesEn` (written by shader specials / state buffers).
