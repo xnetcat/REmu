@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `787ae29` (SLoad heap-span `37589c3` + tonemap5c live). Depth fix `3f9e559`.
-Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag≠0) + `tonemap4/VSHARP-ATTR.txt`.
+**Tip:** UV/tex0 attribution closed (tonemap5c + `UV-TEX0-ATTR.txt`); diagnostic `{:x?}` extent footgun fixed.
+Prior tip `9b17b54` / SLoad `37589c3`. Live: `800bf4` TARGET mag≠0; efc title BG still not assessable.
 
 ## Closed gates
 
@@ -24,7 +24,9 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag�
 | Post-BasePass lighting sample VA | Clean `runs/silent-hill-title-bg-lightpost2/` @ `de613d3`: `800b22` @ draw 22072 binds remapped `80688f` (BasePass BGRA8 slot), **not** empty `8023b9`. Early `800a69` still legacy-empty (pre-BasePass only). |
 | R32 depth-sample view stealing Depth DB authority | `3f9e559` + live `runs/silent-hill-title-bg-depthfix/`: `depth_native` max **469** (was **0** forever on `lightpost2`). Post-BP `800c7e` writes non-zero scene color to `804345` (`magnitude_nz≈0x13b220`). |
 | `800bf4` empty TARGET with lit tex0 — not blend/coverage/bind | Clean `runs/silent-hill-title-bg-tonemap4/` @ `267d256` + AUTO_CROSS, `MIN_DRAW=47000`: draw **47402** after BasePass peak (`mrt3plus≈8192`). tex0 `804345` Metal+guest `magnitude_nz≃0xf5640`; blend off; TARGET + exports true 0.0. Packing not implicated. |
-| `800bf4` zero exports — UV/attr0 class (revised) | Heap V# `0x00005204` is SDK **RegularBuffer** (not word3 mis-decode); meshlet patches format 64/77. VB has float ±1 UV. SLoad heap span `0x200` (`37589c3`). Live `tonemap5c`: TARGET **magnitude_nz=109231** (was 0 @ tonemap4). Remaining: UV ±0.6 / 780×438 tex0 / efc still black. |
+| `800bf4` zero exports — UV/attr0 class (revised) | Heap V# `0x00005204` is SDK **RegularBuffer** (not word3 mis-decode); meshlet patches format 64/77. VB has float ±1 UV. SLoad heap span `0x200` (`37589c3`). Live `tonemap5c`: TARGET **magnitude_nz=109231** (was 0 @ tonemap4). |
+| ES UV ±0.6 / “missing +0.5” | **Guest intent** — ViewSize 1152×648 / BufferSize 1920×1080, bias 0; oversized tri → screen UV [0,0.6]; PS samples raw attr0 (ISA). Not CB scramble / sample-VGPR bug. `UV-TEX0-ATTR.txt`. |
+| tex0 “780×438” vs 1920×1080 | **Diagnostic misread** — `TARGET-DRAW-TEXTURES` used `{:x?}` (1920→`780`, 1080→`438`). SRD+PPM are 1920×1080; `800c7e` fills TL 1152×648. |
 
 ## Live progression (capture on)
 
@@ -33,7 +35,7 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag�
 | Splash logos | Yes |
 | Content-warning + **ruined hallway 3D** | Yes |
 | Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs + `depthfix` efc) |
-| Title **3D background** | **No — efc still black/near-black** (`tonemap5c`: `800bf4` TARGET now nonzero mag≈1.1e5; UI yes; UV ±0.6 + 780×438 tex0 + tiler/composite open) |
+| Title **3D background** | **No — efc still black/near-black** (`tonemap5c`: `800bf4` TARGET mag≈1.1e5 in TL 1152×648; UI yes; UV/tex0-size closed; scene quality + composite open) |
 
 ## Root causes (historical → current)
 
@@ -85,8 +87,13 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag�
     Heap holds **RegularBuffer** `0x00005204` (= AGC `initializeRegularBuffer`) — **not**
     BUF_RSRC_WORD3 mis-decode. UE patches FORMAT from meshlet (64/77). SLoad dynamic-offset
     heap span fixed to `0x200` (`37589c3`); live heap bind is `0x200` and `800bf4` TARGET
-    magnitude_nz=109231 (tonemap4 was 0). Remaining: ES UV → ±0.6 (1152/1920, bias 0) sampled
-    raw by PS; tex0 SRD 780×438; efc title BG still not assessable.
+    magnitude_nz=109231 (tonemap4 was 0).
+16. **UV ±0.6 is intentional ViewSize/BufferSize** (`UV-TEX0-ATTR.txt`): ES
+    `(vb×1152)×(1/1920)` with oversized NDC tri → screen UV [0,0.6] for 60% view;
+    PS raw-attr0 sample matches ISA; s40–43 identity. “Missing +0.5” emulator patch
+    refuted.
+17. **tex0 “780×438” was `{:x?}` Debug** on 1920×1080 descriptors; occupancy confined to
+    TL 1152×648 matching `800c7e` dispatch. efc title BG still not assessable.
 
 ## Anti-claims
 
@@ -115,19 +122,19 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag�
 - Sticky `REMU_DIAGNOSTIC_CAPTURE_PIXEL_OUTPUT` buffer (no per-draw clear) ≠ per-draw coverage.
 - Heap RegularBuffer `0x00005204` ≠ BUF_RSRC_WORD3 mis-decode (matches AGC `initializeRegularBuffer`).
 - UTF-16 in stride-32 VB padding ≠ “VB is material/debug ASCII only”.
+- ES UV PARAM0 ±0.6 ≠ missing-+0.5 CB bug (ViewSize/BufferSize + oversized tri; ISA samples raw attr0).
+- TARGET dump `width: 780` under `{:x?}` ≠ half-res tex0 (decimal 1920; PPM 1920×1080).
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **ES/PS UV scale-bias** — guest userdata maps VB ±1 → PARAM0 ±0.6 (1152/1920, bias 0);
-   PS samples raw attr0. Prove missing +0.5 / CB slot bug vs intentional viewport — no
-   fabricated UVs.
-2. **tex0 extent 780×438** on tonemap SRD vs 1920×1080 present (decode vs real half-res).
-3. **Scene-color tiler/store** (`8071ca`/`804345`) once UVs sample coherently.
-4. **Nonzero `800bf4` → efc** — why TARGET mag≠0 still leaves title scanout black.
-5. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
+1. **Scene-color TL quality** — `8071ca` ~9.5% magnitude fill in 1152×648; tonemap exports
+   G-dominated (max fp16); tiler/store vs lighting content.
+2. **Nonzero `800bf4` → efc** — chain `800e73`→`80c5c5`→`800da3`→efc after TL tonemap;
+   why title BG still not assessable.
+3. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
 
 ## Commits (this continuation)
 
@@ -155,9 +162,12 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag�
 | `6cf8932` | docs: V# RegularBuffer+meshlet patch attribution (`VSHARP-ATTR`) |
 | `b526ed2` | docs: record 6cf8932 and dual-arch check at SLoad tip |
 | `b9a6bc24` | docs: tonemap5c live — TARGET mag≠0 after SLoad span; UV±0.6 next |
+| `9b17b54` | docs: point handoff tip at tonemap5c HEAD |
+| `a82f031` | TARGET dump: decimal extents (no `{:x?}` width/height) |
+| *(docs tip)* | UV/tex0 attribution (`UV-TEX0-ATTR.txt`) |
 
 ## Checks
 
-- `cargo check --workspace --all-targets` — arm64 + `x86_64-apple-darwin` green @ `37589c3`
-- Unit: `expands_dynamic_offset_sload_bindings_to_descriptor_heap_span`
+- `cargo check -p remu-gpu-metal --all-targets` — arm64 + `x86_64-apple-darwin` green
 - Live clean `tonemap5c` @ `b526ed27`: TARGET magnitude_nz=109231; efc BG not assessable
+- Attribution: `runs/silent-hill-title-bg-tonemap5c/UV-TEX0-ATTR.txt`

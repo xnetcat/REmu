@@ -1,0 +1,36 @@
+revision=9b17b541 analysis (tonemap5c live @ b526ed27; no new live yet)
+
+## tex0 "780×438" — CLOSED (diagnostic misread)
+
+`TARGET-DRAW-TEXTURES` / `TARGET sampled=` used Rust `{:x?}` Debug.
+Integers print as hex **without** `0x`: width 1920 → `780`, height 1080 → `438`,
+tile 27 → `1b`. SRD decode + captured PPM/PNG are **1920×1080**.
+Compute `800c7e` grid 144×81×8×8 = **1152×648** fills the TL view subrect of that
+full-res surface (occupancy bbox confirms).
+
+## UV ±0.6 / missing +0.5 — CLOSED (guest intent, not CB/sample bug)
+
+ES userdata (slot 8 @ draw 34299): `1152,648,0,0` ×2 then
+`1/1152,1/648,1/1920,1/1080`.
+- Pos: `(vb×ViewSize)×(1/ViewSize)` → ±1 → NDC via `2x-1` (oversized tri −3..3)
+- UV: `(vb×ViewSize)×(1/BufferSize)` → PARAM0 ±0.6
+Screen-space UV across the large triangle is **[0, 0.6]** (ViewMin=0), matching
+1152/1920. Coverage 746496 ≈ 1152×648.
+
+PS `800bf4` `ImageSampleLz` address regs = raw attr0 (v7/v6). Matches guest ISA.
+s40–s43 FMA is identity `(1,1,0,0)` and is **not** the sample path (used later).
+No fabricated UVs; no missing-+0.5 emulator patch.
+
+## Live spatial (tonemap5c draw 34299)
+
+- tex0 `8071ca` magnitude occupancy: all inside TL 1152×648 (~70k nz, ~9.5% fill)
+- tonemap TARGET `80c485`: all inside TL 1152×648 (109231 nz)
+- pixel_outputs: R/B≈0, G up to fp16-max (HDR/blow-up or channel skew)
+- efc: UI present; title 3D BG still not assessable
+
+## Exact next blockers
+
+1. **Scene-color content quality** in TL 1152×648 (tiler/store / lighting) —
+   sparse + G-dominated tonemap exports
+2. **800bf4 → 800e73 → 800da3 → efc** composite: why TL tonemap does not yield
+   assessable title BG (stale sample VA, range, or black composite)
