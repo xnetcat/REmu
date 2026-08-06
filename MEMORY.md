@@ -21,15 +21,16 @@ registers/packets that state intent.
 
 - **Compositor tiler:** mode-1/5/9 uncompressed + BC element grids (splash UI).
 - **Mesh LDS (`f28cee1`):** NGG mesh LDS from SDK `ShShaderResource2Gs::getLdsSize`.
-- **Mode-5 BC mips (`8e4ed20`):** GPU tiler plans AddrLib mode-5 compressed mip chains
-  (element grid + floor-shifted pixel blit). Live refuse count **0** (was ~10).
-- **Live @ `8e4ed20` + capture + Cross:** splash → content-warning **hallway 3D** → title UI.
-  Title **background still solid black**. `failed=0`.
-- **Remaining title-3D blockers:** compositor/`ps=0x8008020000` no-attachment + SRD path;
-  mode-1/9 compressed mips still refused; stencil-only; NGG topology `0x7`.
-- Handoff: `docs/notes/sh-present-20260806-handoff/`.
-- **Anti-claim:** hallway / title UI / closing mode-5 BC mips ≠ title-background 3D closure.
-- **Next:** compositor SRD / title-BG path after splash; else DeS ACM.
+- **Mode-5 BC mips (`8e4ed20`):** GPU tiler AddrLib mode-5 compressed mip chains; live refuse **0**.
+- **Latched stencil (`0a22e15`):** `STENCIL_ENABLE` + no Z ops → no depth attachment (`Ok(None)`),
+  not a color-MRT abort. True stencil-only still loud-refused. Live stencil-only refuses **0**.
+- **Live @ `0a22e15` + capture + Cross:** hallway 3D + title UI; title **BG still solid black**
+  (PPM hash unchanged vs pre-fix). Drops 603/20; worst no-attachment `ps=0x8008020000`.
+- **Remaining:** title compositor SRD/sample path (null/type-0 IMAGE-FALLBACK; no-attachment
+  with live `ps_scalars`); mode-1/9 compressed mips; NGG `0x7` if critical.
+- Handoff: `docs/notes/sh-present-20260806-handoff/` (`runs/silent-hill-title-bg/`).
+- **Anti-claim:** hallway / title UI / mode-5 mips / stencil latch ≠ title-BG 3D closure.
+- **Next:** title-BG sample attribution after splash; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

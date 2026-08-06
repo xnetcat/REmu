@@ -11,16 +11,19 @@ completion means stable interactive game progress with correct output and measur
 **Mesh LDS (`f28cee1`):** NGG mesh LDS from SDK `ShShaderResource2Gs::getLdsSize`.
 
 **Mode-5 BC mips (`8e4ed20` on `main`):** GPU tiler owns AddrLib mode-5 compressed mip chains.
-Live @ tip: compressed-mip refuse count **0** (was ~10 @ `f28cee1`). Mode-1/9 BC mips and
-mode-27 BC stay loud-refused / unowned.
+Live compressed-mip refuse count **0**. Mode-1/9 BC mips and mode-27 BC stay loud-refused.
 
-**Live @ `8e4ed20` with `REMU_CAPTURE_FRAMES=1` + Cross:** splash → content-warning **hallway 3D**
-→ title UI (NEW GAME / OPTIONS / CONTROLS). Title **background still solid black**.
-`failed=0`; worst drops are no-attachment compositor `ps=0x8008020000`, not image upload.
+**Latched stencil (`0a22e15`):** `STENCIL_ENABLE` with Z ops off no longer aborts color MRTs
+(depth decode `Ok(None)`; true stencil-only still refused). Live stencil-only refuses **0**.
 
-**Remaining title-3D blockers:** compositor/SRD title-BG path; mode-1/9 compressed mips;
-stencil-only; NGG topology `0x7`. See `docs/notes/sh-present-20260806-handoff/`.
-Anti-claim: hallway/title UI / mode-5 BC-mip fix ≠ title-background 3D closure.
+**Live @ `0a22e15` with `REMU_CAPTURE_FRAMES=1` + Cross:** splash → content-warning **hallway 3D**
+→ title UI. Title **background still solid black** (same PPM hash as pre-stencil-fix).
+`pipeline_failed=0`; worst drops remain no-attachment `es/ps=0x8007a80000/0x8008020000`.
+
+**Remaining title-3D blockers:** compositor/SRD title-BG samples (null/type-0 IMAGE-FALLBACK,
+no-attachment with live `ps_scalars`); mode-1/9 compressed mips; NGG topology `0x7` if on path.
+See `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 mips /
+stencil latch ≠ title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
