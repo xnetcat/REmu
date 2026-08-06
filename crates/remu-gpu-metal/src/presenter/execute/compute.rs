@@ -16,9 +16,9 @@ use super::{
     is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    sampled_image_bindings, shader_scalar_metadata_for_registers,
-    storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    shader_scalar_metadata_for_registers, storage_image_requires_mip_hierarchy,
+    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
+    wave64_split_blockers,
 };
 use metal::{MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
@@ -248,6 +248,63 @@ impl MetalPresenter {
             activity_stamp,
             &[],
         )?;
+        // Scene-color CS (e.g. SH 800c7e) may ImageLoad GBuffers that never appear in the
+        // sampled-only writer lineage. Dump every image SRD once per filtered CS so missing
+        // vs dummy-1x1 vs real half-res color is attributable without fabricating binds.
+        if dump_msl_compute_filter_matches(dispatch.shader_address) {
+            static LOGGED_COMPUTE_IMAGES: AtomicUsize = AtomicUsize::new(0);
+            let sequence = LOGGED_COMPUTE_IMAGES.fetch_add(1, Ordering::Relaxed);
+            if sequence < 4 {
+                let images = evaluation
+                    .image_bindings
+                    .iter()
+                    .map(|binding| {
+                        let decoded =
+                            decode_image_descriptor(&binding.resource_descriptor).ok();
+                        let uploaded = decoded.as_ref().and_then(|descriptor| {
+                            textures.iter().find_map(|texture| {
+                                (texture.descriptor.guest.address == descriptor.guest.address
+                                    && texture.descriptor.guest.width == descriptor.guest.width
+                                    && texture.descriptor.guest.height == descriptor.guest.height)
+                                    .then_some((
+                                        texture.writable,
+                                        texture.descriptor.guest.address,
+                                        texture.descriptor.guest.width,
+                                        texture.descriptor.guest.height,
+                                        texture.descriptor.guest.pixel_format,
+                                    ))
+                            })
+                        });
+                        (
+                            binding.pc,
+                            binding.opcode,
+                            binding.resource_descriptor.as_slice(),
+                            decoded.map(|descriptor| {
+                                (
+                                    descriptor.guest.address,
+                                    descriptor.guest.width,
+                                    descriptor.guest.height,
+                                    descriptor.guest.pitch,
+                                    descriptor.guest.tile_mode,
+                                    descriptor.guest.pixel_format,
+                                    descriptor.texture_type,
+                                )
+                            }),
+                            uploaded,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[REMu][METAL][COMPUTE-IMAGES] occurrence={sequence} seq={} cs={:#x} grid={:?} local={:?} image_count={} uploaded={} images={images:08x?}",
+                    dispatch.sequence,
+                    dispatch.shader_address,
+                    dispatch.launch.grid,
+                    dispatch.launch.threads_per_group,
+                    evaluation.image_bindings.len(),
+                    textures.len(),
+                );
+            }
+        }
         let (sampler_buffer, samplers) = self.cached_sampler_argument_buffer(
             &device,
             &function,
@@ -399,8 +456,13 @@ impl MetalPresenter {
                 rearm_depth_metadata_clear(&mut self.depth_metadata_clears, address);
             }
         }
-        let diagnostic_sampled = diagnostic_texture_writer_enabled().then(|| {
-            sampled_image_bindings(evaluation)
+        // Include ImageLoad storage inputs alongside ImageSample*; sampled-only lineage hid
+        // GBuffer-sized color that lighting/fog CS threads actually read.
+        let diagnostic_inputs = diagnostic_texture_writer_enabled().then(|| {
+            evaluation
+                .image_bindings
+                .iter()
+                .filter(|binding| !is_writable_image_opcode(binding.opcode))
                 .filter_map(|binding| decode_image_descriptor(&binding.resource_descriptor).ok())
                 .map(|descriptor| descriptor.guest)
                 .collect::<Vec<_>>()
@@ -413,7 +475,7 @@ impl MetalPresenter {
         );
         for texture in &textures {
             if texture.writable {
-                if let Some(sampled) = &diagnostic_sampled {
+                if let Some(sampled) = &diagnostic_inputs {
                     record_diagnostic_texture_writer(
                         texture.descriptor.guest,
                         "compute",
