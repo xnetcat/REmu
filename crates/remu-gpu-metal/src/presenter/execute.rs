@@ -2172,6 +2172,14 @@ impl MetalPresenter {
                     return None;
                 }
                 targets.iter().find(|target| {
+                    // ADDRESS=auto historically matched the first 1920x1080 target, which for the
+                    // Silent Hill title composite is often the early scanout cover written by the
+                    // same PS before the non-scanout intermediate. Prefer non-scanout when the
+                    // filter did not name an exact address, so occupancy dumps land on the
+                    // intermediate the compositor actually samples.
+                    if filter.auto_target_skips_scanout() && target.direct_scanout {
+                        return false;
+                    }
                     filter.matches(
                         draw.sequence,
                         draw.pixel_shader_address,
@@ -2861,14 +2869,24 @@ impl MetalPresenter {
                         ))
                     })
                     .collect::<Vec<_>>();
-                let rgba8_summary = if descriptor.pixel_format == MTLPixelFormat::RGBA8Unorm {
+                let rgba8_summary = if matches!(
+                    descriptor.pixel_format,
+                    MTLPixelFormat::RGBA8Unorm | MTLPixelFormat::BGRA8Unorm
+                ) {
+                    // BGRA and RGBA share the same 8-bit layout for occupancy: bytes 0..2 are the
+                    // color channels in Metal getBytes order (B,G,R or R,G,B). Count RGB-nonzero
+                    // pixels so a clear-alpha-only surface cannot look "occupied".
                     let first = bytes.get(..4).unwrap_or(&[]);
                     let mut minimum = [u8::MAX; 4];
                     let mut maximum = [u8::MIN; 4];
                     let mut different = 0_usize;
+                    let mut rgb_nonzero = 0_usize;
                     for pixel in bytes.chunks_exact(4) {
                         if pixel != first {
                             different += 1;
+                        }
+                        if pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0 {
+                            rgb_nonzero += 1;
                         }
                         for component in 0..4 {
                             minimum[component] = minimum[component].min(pixel[component]);
@@ -2876,7 +2894,7 @@ impl MetalPresenter {
                         }
                     }
                     format!(
-                        " first={first:02x?} min={minimum:02x?} max={maximum:02x?} different={different}"
+                        " first={first:02x?} min={minimum:02x?} max={maximum:02x?} different={different} rgb_nonzero={rgb_nonzero}"
                     )
                 } else if descriptor.pixel_format == MTLPixelFormat::RGBA16Float {
                     const MAGENTA_RGBA16F: [u8; 8] = [0x00, 0x3c, 0, 0, 0x00, 0x3c, 0x00, 0x3c];

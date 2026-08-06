@@ -988,6 +988,13 @@ pub(super) struct DiagnosticTargetDrawFilter {
 
 impl DiagnosticTargetDrawFilter {
     #[must_use]
+    pub(super) const fn auto_target_skips_scanout(self) -> bool {
+        // ADDRESS=auto (Some(0)) means "any 1920x1080"; callers should still skip direct
+        // scanout so compositor intermediate dumps are not stolen by early covers.
+        matches!(self.target_address, Some(0))
+    }
+
+    #[must_use]
     pub(super) const fn matches(
         self,
         draw_sequence: u64,
