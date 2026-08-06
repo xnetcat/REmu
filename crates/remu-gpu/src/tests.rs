@@ -5,8 +5,10 @@ use super::{
     COMPUTE_PGM_HI_REGISTER, COMPUTE_PGM_LO_REGISTER, COMPUTE_PGM_RSRC2_REGISTER,
     COMPUTE_START_X_REGISTER, COMPUTE_START_Y_REGISTER, COMPUTE_START_Z_REGISTER,
     COMPUTE_TMPRING_SIZE_REGISTER, ComputeDispatchDecodeError, ComputeGrid,
-    GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuEvent, GpuFlipCompletion,
-    GpuHostImage, GpuMemoryAcquire, GpuMemoryWait, GpuRegister, HostPadState, audio_output_frames,
+    GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuCachePolicy,
+    GpuEndOfPipeCbDbAction, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuMemoryAcquire,
+    GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuRegister, GpuRenderBackendFlush,
+    GpuWaitOperation, HostPadState, audio_output_frames,
     audio_progress_age_millis, audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
     decode_compute_system_registers, emit_event, emit_event_with_admission,
@@ -184,13 +186,7 @@ fn queue_submission_registers_wait_before_presenter_ingress() {
     let _event_guard = EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let wait = GpuMemoryWait {
-        address: 0x7000_2000,
-        reference: 1,
-        mask: u64::from(u32::MAX),
-        compare_function: 3,
-        is_64_bit: false,
-    };
+    let wait = GpuMemoryWait::memory(0x7000_2000, 1, u64::from(u32::MAX), 3, false);
     let (sender, receiver) = gpu_event_channel();
     install_event_sink(sender);
 
@@ -472,13 +468,7 @@ fn old_producer_does_not_satisfy_a_later_label_generation() {
     let _event_guard = EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let wait = GpuMemoryWait {
-        address: 0x7000_2020,
-        reference: 1,
-        mask: u64::from(u32::MAX),
-        compare_function: 3,
-        is_64_bit: false,
-    };
+    let wait = GpuMemoryWait::memory(0x7000_2020, 1, u64::from(u32::MAX), 3, false);
     let (sender, receiver) = gpu_event_channel();
     install_event_sink(sender);
     record_gpu_wait_producer(wait.address, false, 1);
@@ -505,13 +495,7 @@ fn failed_queue_send_cancels_all_registered_waits() {
     let _event_guard = EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let wait = GpuMemoryWait {
-        address: 0x7000_2040,
-        reference: 1,
-        mask: u64::from(u32::MAX),
-        compare_function: 3,
-        is_64_bit: false,
-    };
+    let wait = GpuMemoryWait::memory(0x7000_2040, 1, u64::from(u32::MAX), 3, false);
     let (sender, receiver) = gpu_event_channel();
     drop(receiver);
     install_event_sink(sender);
@@ -536,13 +520,7 @@ fn partial_queue_send_cancels_only_waits_that_never_reached_the_presenter() {
     let _event_guard = EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let first_wait = GpuMemoryWait {
-        address: 0x7000_2060,
-        reference: 1,
-        mask: u64::from(u32::MAX),
-        compare_function: 3,
-        is_64_bit: false,
-    };
+    let first_wait = GpuMemoryWait::memory(0x7000_2060, 1, u64::from(u32::MAX), 3, false);
     let last_wait = GpuMemoryWait {
         address: 0x7000_2080,
         ..first_wait
@@ -664,13 +642,7 @@ fn decodes_acquire_invalidation_scope_without_backend_assumptions() {
 
 #[test]
 fn memory_wait_comparisons_apply_the_packet_mask() {
-    let wait = GpuMemoryWait {
-        address: 0x1000,
-        reference: 0x34,
-        mask: 0xff,
-        compare_function: 3,
-        is_64_bit: false,
-    };
+    let wait = GpuMemoryWait::memory(0x1000, 0x34, 0xff, 3, false);
     assert!(wait.is_satisfied_by(0xabcd_1234));
     assert!(!wait.is_satisfied_by(0xabcd_1235));
     assert!(
@@ -680,6 +652,56 @@ fn memory_wait_comparisons_apply_the_packet_mask() {
         }
         .is_satisfied_by(0xabcd_1235)
     );
+}
+
+#[test]
+fn release_cache_policy_distinguishes_cpu_and_gpu_label_visibility() {
+    let mut release = GpuMemoryRelease::label(0x1000, GpuMemoryReleaseValue::Immediate64(1));
+    assert!(!release.cpu_visible());
+    assert!(!release.flushes_render_backend());
+    release.cache_policy = GpuCachePolicy::Bypass as u32;
+    assert!(release.cpu_visible());
+    release.action = GpuEndOfPipeCbDbAction::WritebackInvalidateCbData as u32;
+    assert!(release.flushes_render_backend());
+}
+
+#[test]
+fn wait_operation_engine_select_matches_sdk_wait_operation() {
+    assert_eq!(
+        GpuWaitOperation::from_u32(0),
+        Some(GpuWaitOperation::WaitMe)
+    );
+    assert_eq!(
+        GpuWaitOperation::from_u32(1),
+        Some(GpuWaitOperation::WaitPfp)
+    );
+    assert!(GpuWaitOperation::WaitPfp.stalls_parser());
+    assert!(!GpuWaitOperation::WaitMe.stalls_parser());
+}
+
+#[test]
+fn render_backend_flush_decodes_sdk_cb_db_event_types() {
+    assert_eq!(
+        GpuRenderBackendFlush::from_event_type(0x2E),
+        Some(GpuRenderBackendFlush::CbMetadata)
+    );
+    assert_eq!(
+        GpuRenderBackendFlush::from_event_type(0x2C),
+        Some(GpuRenderBackendFlush::DbMetadata)
+    );
+    assert_eq!(
+        GpuRenderBackendFlush::from_event_type(0x31),
+        Some(GpuRenderBackendFlush::CbData)
+    );
+    assert_eq!(
+        GpuRenderBackendFlush::from_event_type(0x2A),
+        Some(GpuRenderBackendFlush::DbData)
+    );
+    assert_eq!(
+        GpuRenderBackendFlush::from_event_type(0x16),
+        Some(GpuRenderBackendFlush::CbDbData)
+    );
+    assert_eq!(GpuRenderBackendFlush::from_event_type(0x07), None);
 }
 
 fn compute_registers(thread_words: [u32; 3], starts: [u32; 3]) -> Vec<GpuRegister> {
