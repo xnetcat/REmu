@@ -154,7 +154,7 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap5c/` (TARGET mag�
 | `37589c3` | Expand dynamic-offset S_LOAD binds to descriptor-heap span + MESH-V# warn |
 | `6cf8932` | docs: V# RegularBuffer+meshlet patch attribution (`VSHARP-ATTR`) |
 | `b526ed2` | docs: record 6cf8932 and dual-arch check at SLoad tip |
-| *(pending)* | docs: tonemap5c live — TARGET mag≠0 after SLoad span; UV±0.6 next |
+| `b9a6bc24` | docs: tonemap5c live — TARGET mag≠0 after SLoad span; UV±0.6 next |
 
 ## Checks
 
