@@ -151,7 +151,7 @@ Live post-BP tonemap: clean `runs/silent-hill-title-bg-tonemap4/` + `UV-ATTR-ANA
 | `267d256` | docs: depth-authority fix live; 800bf4 still empty after lit tex0 |
 | `4c819b9` | docs: tonemap4 — true-zero exports with lit tex0 post-BasePass |
 | `d23a898` | Clear TARGET diagnostic buffers each draw under capture |
-| `42538157` | docs: 800bf4 UV collapse via mesh V# DST_SEL_Y=0 / format 5 |
+| `38a9747` | docs: 800bf4 UV collapse via mesh V# DST_SEL_Y=0 / format 5 |
 
 ## Checks
 
