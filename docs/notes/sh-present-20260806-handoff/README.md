@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `3f9e559` (Depth32Float authority over R32 depth-sample views) on top of
-`de613d3` / `be21eb9` / `9cc9f2f` / `736d540`.
+**Tip:** `main` @ `267d256` (docs after depth-authority live). Depth fix remains `3f9e559`.
+Live post-BP tonemap attribution: clean `runs/silent-hill-title-bg-tonemap4/`.
 
 ## Closed gates
 
@@ -23,6 +23,7 @@
 | Emitted title MRT0 **not** clear-only | Clean `runs/silent-hill-title-bg-mrtocc2/` @ `de613d3` + AUTO_CROSS: `REMU_DUMP_TARGET_MRT_MIN=7` → `806aa4` `magnitude_nz=1327104` (≈64% texels). MRT0 VA remaps (`8068e0`/`8068f4`/`806aa4`). `800a69` samples remapped `8068*` set; `8009c4` still samples legacy `8023b9`. Title BG still black |
 | Post-BasePass lighting sample VA | Clean `runs/silent-hill-title-bg-lightpost2/` @ `de613d3`: `800b22` @ draw 22072 binds remapped `80688f` (BasePass BGRA8 slot), **not** empty `8023b9`. Early `800a69` still legacy-empty (pre-BasePass only). |
 | R32 depth-sample view stealing Depth DB authority | `3f9e559` + live `runs/silent-hill-title-bg-depthfix/`: `depth_native` max **469** (was **0** forever on `lightpost2`). Post-BP `800c7e` writes non-zero scene color to `804345` (`magnitude_nz≈0x13b220`). |
+| `800bf4` empty TARGET with lit tex0 — not blend/coverage/bind | Clean `runs/silent-hill-title-bg-tonemap4/` @ `267d256` + AUTO_CROSS, `MIN_DRAW=47000`: draw **47402** after BasePass peak (`mrt3plus≈8192`). tex0 `804345` Metal+guest `magnitude_nz≃0xf5640`; blend off; `pixel_outputs` **full coverage + all exports true 0.0**. Packing not implicated. |
 
 ## Live progression (capture on)
 
@@ -31,7 +32,7 @@
 | Splash logos | Yes |
 | Content-warning + **ruined hallway 3D** | Yes |
 | Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs + `depthfix` efc) |
-| Title **3D background** | **No — still solid black** (UI yes; BasePass + post-BP `800c7e` scene color nonzero; `800bf4`/efc still void) |
+| Title **3D background** | **No — still solid black** (UI yes; BasePass + lit tex0; `800bf4` full coverage but true-zero exports → efc void) |
 
 ## Root causes (historical → current)
 
@@ -75,9 +76,13 @@
 13. **Empty R32Float depth shadow stole Depth32Float DB authority** (fix `3f9e559`):
     post-prepass samples at `801ac2`/`801abe` bound a gpu-authored magnitude-0 R32Float
     resident while Depth32Float was demoted (`gpufalse`) → `depth_native=0`. Live after fix:
-    `depth_native` hits hundreds; post-BP `800c7e` writes non-zero `804345`. **Still open:**
-    tonemap `800bf4` TARGET @ draw 22881 writes `magnitude_nz=0` despite non-zero tex0
-    `804345`; efc title remains UI-on-black.
+    `depth_native` hits hundreds; post-BP `800c7e` writes non-zero `804345`.
+14. **`800bf4` true-zero exports with lit tex0** (clean `tonemap4` @ `267d256`):
+    post-BasePass draw 47402 has full coverage, blend off, tex0 `804345` Metal+guest
+    magnitude ≫0, yet `pixel_outputs` / TARGET are true float 0.0. Not packing, not empty
+    bind, not pre-BasePass stale SRD (that was `tonemap3` @ MIN_DRAW=22000 → `803e70`).
+    Remaining split: UV/attr0 collapse into empty TL vs tonemap ALU zeroing after tex0 pack.
+    `804345` PPM is still quadrant-garbage (separate tiler/store quality issue).
 
 ## Anti-claims
 
@@ -100,17 +105,20 @@
 - Claiming `800c7e` “never after BasePass” from early-only `COMPUTE-IMAGES` ≠ absence (PERF-BATCHES
   shows post-BP `cs=0x800c7e`).
 - `depth_native>0` + non-zero `800c7e` scene color ≠ title-BG closure while `800bf4`/efc stay empty/black.
+- Dumping `800bf4` before BasePass peak (`MIN_DRAW≈22000`) can bind empty `803e70` and must not
+  be cited as the lit-tex0 failure mode (`tonemap3` vs `tonemap4`).
+- Non-zero tex0 magnitude alone ≠ tonemap forwards it (`tonemap4` pixel_outputs all 0.0).
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **Why `800bf4` TARGET is magnitude 0 after BasePass despite non-zero tex0 `804345`**
-   (clean-ish `depthfix` @ `3f9e559`, draw 22881): exports / blend / constants / wrong bind
-   at encode time. This is now the present-chain gap into efc.
-2. **Clean cold-start AUTO_CROSS** (1-min loadavg <5 at launch, no release-rebuild spike;
-   avoid guest `MallocBinned3`/SIGSEGV mid-run) to re-confirm title BG assessability.
+1. **Why `800bf4` exports true 0.0 with lit tex0 `804345`** (clean `tonemap4` draw 47402):
+   dump attr0 UV and/or early `remu_v_19` after tex0 pack — UV-collapse vs tonemap ALU
+   zeroing. SDK-grounded fix on that branch; then re-assess efc.
+2. **Why `804345` Metal texels are quadrant-garbage** (tiler/store) once tonemap forwards
+   nonzero samples — otherwise BG still will not be assessable scene content.
 3. **Optional:** dump `8009c1` TARGET post-BP for MRT0 lighting exports (title substitute for
    absent post-BP `800a69`).
 4. **No-attachment `ps=0x8008020000` / friends** — only if proven on the title-BG path; do

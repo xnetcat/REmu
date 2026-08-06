@@ -1,0 +1,46 @@
+revision=267d2568 dirty_tree=0
+run: 20260806T142956Z-PPSA10112-app
+loadavg-pre={ 3.27 3.21 3.44 }  (clean cold-start; SKIP_BUILD)
+AUTO_CROSS=8 CAPTURE_FRAMES=1 timeout=150s
+REMU_DUMP_TARGET_PS=0x800bf40000 MIN_DRAW=47000 MATCH_INDEX=0
+REMU_CAPTURE_TARGET_SAMPLES=1
+REMU_DIAGNOSTIC_CAPTURE_PIXEL_OUTPUT=1
+REMU_DIAGNOSTIC_CAPTURE_VERTEX_POSITION=1
+outcome=external-watchdog-timeout ~150s captured_frames=30
+depth_native max=520
+max total_mask_mrt3plus=8192 at draw≈45814
+
+Post-BasePass 800bf4 @ draw=47402 → 806f5a RG11B10Float:
+  TARGET magnitude_nz=0 nonzero=0
+  blend: disabled (One/Zero) — not a blend discard
+  pixel_outputs=Some((2073600, 0, 2073600, all 0.0, raw [0,0,0,0]…))
+    → full-screen coverage; every export is true float 0.0 (not ±0 sign bits)
+  tex0 SRD VA=804345 RGBA16Float 1920x1080
+    Metal occupancy: bytes=fd2000 nonzero=83063c magnitude_nz=f5640 (~1.00M)
+    Guest occupancy: bytes=ff0000 nonzero=ad7d87 magnitude_nz=192b68
+    Metal head bytes still fp16 ±0 pattern; PPM TL quadrant empty, TR/BL/BR noisy
+    writer lineage still compute 800c7e class (post-BP scene-color store)
+
+Compared to tonemap3 (MIN_DRAW=22000 → draw 23642):
+  that dump was PRE peak-BasePass; tex0 was still empty 803e70 (mag 0).
+  depthfix draw 22881 had lit 804345 but no pixel_outputs; this run closes that gap.
+
+Attribution (exports / blend / constants / bind / format):
+  REJECTED blend (disabled One/Zero).
+  REJECTED missing coverage (pixel_outputs covered=2073600).
+  REJECTED wrong tex0 bind / empty tex0 (804345 Metal+guest magnitude ≫0).
+  REJECTED AbgrFp16→RG11B10 packing alone (diagnostic remu_out.mrt0 already all 0.0
+    before CB format conversion).
+  REMAINING: PS produces true-zero mrt0 despite nonzero tex0 —
+    either attr0 UV collapses samples into the empty TL/±0 region for every pixel,
+    or tonemap ALU/constants overwrite remu_v_19/20 to 0 after the early tex0 pack.
+    804345 PPM is tiler-garbage/quadrant noise, not a coherent lit hallway; fixing
+    export/UV is still required before efc can show assessable title BG.
+
+Exact next blockers:
+  1. Dump/fix attr0 UV (or early remu_v_19 after tex0 pack) on this draw —
+     distinguish UV-collapse vs tonemap-zeroing.
+  2. If UV-collapse: mesh PARAM0 / VB fetch / interpolator wiring (SDK-grounded).
+  3. If tonemap-zeroing: constant buffer / dst_sel / fp16 path on the late overwrite.
+  4. Separately: why 800c7e→804345 Metal texels are quadrant-garbage (tiler/store),
+     once tonemap actually forwards nonzero samples.
