@@ -536,9 +536,15 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
         .find(|register| register.offset == DB_DEPTH_CONTROL)
         .expect("depth control")
         .value = 0x771;
+    // Latched STENCIL_ENABLE with Z ops off is not a depth attachment. Color MRTs must still
+    // build pipelines; true stencil-only (no color either) is refused at graphics_pipeline_key.
+    assert_eq!(
+        decode_depth_target(&draw).expect("latched stencil without Z ops is not a depth target"),
+        None
+    );
     assert!(
-        decode_depth_target(&draw)
-            .expect_err("stencil-only without a depth/stencil surface must refuse")
+        graphics_pipeline_key(&draw)
+            .expect_err("stencil-only without color or depth must refuse")
             .contains("stencil is enabled without an active depth/stencil surface")
     );
 

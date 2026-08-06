@@ -3,8 +3,9 @@
 
 use super::{
     CB_BLEND0_CONTROL, CB_TARGET_MASK, CX_GRAPHICS_SCRATCH_RING_SIZE, CX_VGT_SHADER_STAGES_EN,
-    CX_VGT_SHADER_STAGES_EN_GS_WAVE32, DB_SHADER_CONTROL, DEFAULT_CB_BLEND_CONTROL,
-    DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState, DecodedRenderTarget,
+    CX_VGT_SHADER_STAGES_EN_GS_WAVE32, DB_DEPTH_CONTROL, DB_SHADER_CONTROL,
+    DEFAULT_CB_BLEND_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState,
+    DecodedRenderTarget,
     DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     GraphicsWaveState, MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits,
@@ -977,6 +978,17 @@ pub(crate) fn graphics_pipeline_key_from_targets(
 ) -> Result<GraphicsPipelineKey, String> {
     let depth = decode_depth_target(draw)?;
     if targets.is_empty() && depth.is_none() {
+        // Depth decode returns Ok(None) when STENCIL_ENABLE is latched without Z ops so color
+        // MRTs can still build a pipeline. A draw with neither color nor depth, but stencil
+        // still enabled, is the unsupported stencil-only case.
+        let control = register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default();
+        if control & 1 != 0 {
+            return Err(
+                "stencil is enabled without an active depth/stencil surface; \
+                 stencil-only targets are not implemented"
+                    .to_owned(),
+            );
+        }
         return Err(
             "draw has neither an enabled color target nor an active depth target".to_owned(),
         );

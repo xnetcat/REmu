@@ -708,12 +708,21 @@ fn decode_depth_target_impl(
     let clear_enabled = render_control & 1 != 0;
     let stencil = decode_stencil_state(&draw.context_registers, control)?;
     if !depth_enabled && !write_enabled && !clear_enabled {
-        if stencil.enabled {
-            return Err(
-                "stencil is enabled without an active depth/stencil surface; \
-                 stencil-only targets are not implemented"
-                    .to_owned(),
-            );
+        // STENCIL_ENABLE can stay latched across Unreal color-only composites while Z_ENABLE /
+        // Z_WRITE / DB clear are off and no DB surface is selected for this draw. Refusing here
+        // aborted those color MRTs (Silent Hill title post: target=0x8037bd0000 / 0x8025bb0000).
+        // No depth attachment → Ok(None); true stencil-only (no color either) is refused by
+        // graphics_pipeline_key_from_targets once both attachment sets are empty.
+        if stencil.enabled && emit_diagnostics {
+            // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
+            static LOGGED_LATCHED_STENCIL: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED_LATCHED_STENCIL.fetch_add(1, Ordering::Relaxed) < 16 {
+                eprintln!(
+                    "[REMu][METAL][DEPTH] ignoring latched STENCIL_ENABLE without Z ops/clear \
+                     (no depth attachment) draw={} es={:#x} ps={:#x} control={control:#010x}",
+                    draw.sequence, draw.export_shader_address, draw.pixel_shader_address,
+                );
+            }
         }
         return Ok(None);
     }
