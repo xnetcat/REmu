@@ -12,7 +12,10 @@ use super::super::tiling::{
     guest_texture_byte_count, mode27_surface_z_xor, mode5_mip_chain_layout,
     mode27_mip_chain_layout, tiled_block_bytes, tiled_block_dimensions,
 };
-use super::super::{GuestTextureDescriptor, ResourceSpan, texture_element_layout};
+use super::super::{
+    GuestTextureDescriptor, ResourceSpan, compressed_texture_block_extent,
+    metal_uncompressed_bytes_per_pixel, texture_element_layout,
+};
 use super::msl::{mode27_tiler_pipelines, mode5_tiler_pipelines, mode9_tiler_pipelines};
 use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, Device, MTLBlitOption, MTLOrigin,
@@ -27,9 +30,16 @@ fn align_256(value: u64) -> Option<u64> {
 
 /// True when Phase 1G GPU-timeline tiling owns this descriptor's upload/publish path.
 pub(crate) fn gpu_tiler_owns_descriptor(descriptor: GuestTextureDescriptor) -> bool {
-    matches!(descriptor.tile_mode, 0 | 1 | 5 | 9 | 24 | 27)
-        && super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
-            == Some(descriptor.bytes_per_pixel)
+    if metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+        == Some(descriptor.bytes_per_pixel)
+    {
+        return matches!(descriptor.tile_mode, 0 | 1 | 5 | 9 | 24 | 27);
+    }
+    // Mode-5 BC family: the CPU tiler already detiles the element grid; Silent Hill's
+    // VideoOut compositor samples these, so the GPU path must own them too.
+    matches!(descriptor.tile_mode, 5)
+        && compressed_texture_block_extent(descriptor.pixel_format).is_some()
+        && matches!(descriptor.bytes_per_pixel, 8 | 16)
 }
 
 /// View shape for GPU upload/publish beyond a single-level 2D face.
@@ -50,8 +60,12 @@ impl GpuTilerView {
 
 #[derive(Clone, Copy)]
 struct DetileSubresource {
+    /// Detile dispatch grid in tiling elements (texels for uncompressed, BC blocks for BC).
     width: u64,
     height: u64,
+    /// Metal blit extent in pixels (equals width/height except for block-compressed formats).
+    metal_width: u64,
+    metal_height: u64,
     linear_offset: u64,
     linear_row_bytes: u64,
     linear_image_bytes: u64,
@@ -209,12 +223,29 @@ fn plan_upload_subresources(
         return Err("Phase 1G GPU tiler refuses mode-24 mip chains (no SDK mip layout)".to_owned());
     }
 
-    let bytes_per_element = u64::from(descriptor.bytes_per_pixel);
+    let (elements_wide, elements_high, elements_pitch, layout_bpe) =
+        texture_element_layout(descriptor)?;
+    let bytes_per_element =
+        u64::try_from(layout_bpe).map_err(|_| "GPU tiler element size does not fit u64")?;
+    let compressed_block = compressed_texture_block_extent(descriptor.pixel_format);
+    if compressed_block.is_some() && !matches!(descriptor.tile_mode, 5) {
+        return Err(format!(
+            "Phase 1G GPU tiler refuses compressed format {:?} on tile={}",
+            descriptor.pixel_format, descriptor.tile_mode
+        ));
+    }
+    if compressed_block.is_some() && view.mip_level_count > 1 {
+        return Err(
+            "Phase 1G GPU tiler refuses compressed mode-5 mip chains (single-level only)".to_owned(),
+        );
+    }
     let mut linear_offset = 0_u64;
     let mut subs = Vec::new();
 
     let mut push = |width: u64,
                     height: u64,
+                    metal_width: u64,
+                    metal_height: u64,
                     level_offset: u64,
                     pitch: u64,
                     block_width: u64,
@@ -246,6 +277,8 @@ fn plan_upload_subresources(
         subs.push(DetileSubresource {
             width,
             height,
+            metal_width,
+            metal_height,
             linear_offset,
             linear_row_bytes,
             linear_image_bytes,
@@ -277,9 +310,15 @@ fn plan_upload_subresources(
             27 => {
                 let layout = mode27_mip_chain_layout(descriptor, view.mip_level_count)?;
                 for (level_index, level) in layout.levels.iter().enumerate() {
+                    let level_w =
+                        u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?;
+                    let level_h =
+                        u64::try_from(level.height).map_err(|_| "mip height does not fit u64")?;
                     push(
-                        u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?,
-                        u64::try_from(level.height).map_err(|_| "mip height does not fit u64")?,
+                        level_w,
+                        level_h,
+                        level_w,
+                        level_h,
                         u64::try_from(level.offset).map_err(|_| "mip offset does not fit u64")?,
                         u64::try_from(level.padded_width)
                             .map_err(|_| "mip pitch does not fit u64")?,
@@ -311,11 +350,15 @@ fn plan_upload_subresources(
                                     .map_err(|_| "mode-5 mip offset does not fit u64")?,
                             )
                             .ok_or("mode-5 layered mip offset overflows")?;
+                        let level_w = u64::try_from(level.width)
+                            .map_err(|_| "mode-5 mip width does not fit u64")?;
+                        let level_h = u64::try_from(level.height)
+                            .map_err(|_| "mode-5 mip height does not fit u64")?;
                         push(
-                            u64::try_from(level.width)
-                                .map_err(|_| "mode-5 mip width does not fit u64")?,
-                            u64::try_from(level.height)
-                                .map_err(|_| "mode-5 mip height does not fit u64")?,
+                            level_w,
+                            level_h,
+                            level_w,
+                            level_h,
                             level_offset,
                             u64::try_from(level.padded_width)
                                 .map_err(|_| "mode-5 mip pitch does not fit u64")?,
@@ -363,14 +406,22 @@ fn plan_upload_subresources(
         };
         let face_bytes =
             guest_texture_byte_count(descriptor).ok_or("GPU tiler face size overflows")?;
+        let elem_w =
+            u64::try_from(elements_wide).map_err(|_| "element width does not fit u64")?;
+        let elem_h =
+            u64::try_from(elements_high).map_err(|_| "element height does not fit u64")?;
+        let elem_pitch =
+            u64::try_from(elements_pitch).map_err(|_| "element pitch does not fit u64")?;
         for surface_z in 0..view.layer_count {
             push(
+                elem_w,
+                elem_h,
                 u64::from(descriptor.width),
                 u64::from(descriptor.height),
                 face_bytes
                     .checked_mul(u64::from(surface_z))
                     .ok_or("GPU tiler layer offset overflows")?,
-                u64::from(descriptor.pitch),
+                elem_pitch,
                 block_width,
                 block_height,
                 0,
@@ -544,7 +595,7 @@ pub(crate) fn encode_gpu_upload_from_guest_view(
             sub.linear_offset,
             sub.linear_row_bytes,
             sub.linear_image_bytes,
-            MTLSize::new(sub.width, sub.height, 1),
+            MTLSize::new(sub.metal_width, sub.metal_height, 1),
             destination,
             sub.metal_slice,
             sub.metal_level,
@@ -646,7 +697,7 @@ pub(crate) fn encode_gpu_publish_to_guest_view(
                 y: 0,
                 z: sub.metal_z,
             },
-            MTLSize::new(sub.width, sub.height, 1),
+            MTLSize::new(sub.metal_width, sub.metal_height, 1),
             &linear,
             sub.linear_offset,
             sub.linear_row_bytes,
@@ -836,6 +887,34 @@ mod tests {
         assert!(gpu_tiler_owns_descriptor(descriptor(9)));
         assert!(gpu_tiler_owns_descriptor(descriptor(27)));
         assert!(gpu_tiler_owns_descriptor(descriptor(24)));
+    }
+
+    #[test]
+    fn tiler_owns_mode5_bc7_element_grid() {
+        let mut bc7 = descriptor(5);
+        bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        bc7.bytes_per_pixel = 16;
+        assert!(gpu_tiler_owns_descriptor(bc7));
+        // Compressed ownership stays mode-5 only until other modes get element-grid encode.
+        bc7.tile_mode = 27;
+        assert!(!gpu_tiler_owns_descriptor(bc7));
+    }
+
+    #[test]
+    fn plans_mode5_bc7_single_level_in_element_space() {
+        let mut bc7 = descriptor(5);
+        bc7.width = 64;
+        bc7.height = 64;
+        bc7.pitch = 64;
+        bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
+        bc7.bytes_per_pixel = 16;
+        let (subs, _, _) = plan_upload_subresources(bc7, GpuTilerView::SINGLE_LEVEL_2D)
+            .expect("mode-5 BC7 plan");
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].width, 16); // 64/4 BC blocks
+        assert_eq!(subs[0].height, 16);
+        assert_eq!(subs[0].metal_width, 64);
+        assert_eq!(subs[0].metal_height, 64);
     }
 
     #[test]
