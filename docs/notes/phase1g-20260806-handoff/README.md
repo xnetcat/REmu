@@ -1,8 +1,8 @@
 # Phase 1G handoff — MEMORY MODEL (2026-08-06) — **CLOSED**
 
-**Branch:** `phase1g-memory-model` @ `02ae8cf` (worktree `/Users/xnetcat/Documents/REmu-phase1g`)  
+**Branch:** `phase1g-memory-model` @ `c197935` (worktree `/Users/xnetcat/Documents/REmu-phase1g`)  
 **Base:** `main` @ `9397f11`  
-**Merged to main** after live matrix + Silent Hill fault fix. Phase 1H **not** started.
+**Merged to main** @ `b4a82f5`. Phase 1H **not** started.
 
 ## CLOSED — what “closed” means (loud anti-claims)
 
