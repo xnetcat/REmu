@@ -59,6 +59,7 @@ use super::{
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_same_image_sample_is_eligible,
     sampled_image_bindings, shader_scalar_metadata_for_registers,
     should_record_diagnostic_target_writer, snapshot_guest_texture_raw, spans_overlap,
     storage_image_requires_mip_hierarchy, trace_glyph_atlas, trace_image_descriptors,
@@ -683,6 +684,7 @@ impl MetalPresenter {
                 let has_read_compatible_resident = !writable
                     && self.resident_guest_textures.values().any(|resident| {
                         resident_color_view_sample_is_eligible(resident, descriptor, false)
+                            || resident_same_image_sample_is_eligible(resident, descriptor, false)
                             || resident_depth_sample_is_eligible(resident, descriptor)
                     });
                 if !has_read_compatible_resident {

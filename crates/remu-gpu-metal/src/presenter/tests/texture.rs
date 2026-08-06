@@ -31,7 +31,8 @@ use super::{
     image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
     rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
-    resident_color_view_sample_is_eligible, resident_texture_activity_stats,
+    resident_color_view_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_texture_activity_stats,
     resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
@@ -4414,6 +4415,98 @@ fn same_address_color_view_survives_partial_owned_supersession() {
     };
     assert!(
         !resident_color_view_sample_is_eligible(bgra_resident, subrect_sample, false),
+        "sub-rect same-address views still require full owned coverage"
+    );
+}
+
+#[test]
+fn same_address_same_format_sample_survives_partial_owned_supersession() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    // EyeAdaptation-class 1×1: same-format sample must bind Metal after a neighbour clears
+    // serves_reads(), otherwise composite ES reads unpublished guest zeros (attr1.x≈0).
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("pooled mapping")
+        .get();
+    let eye = GuestTextureDescriptor {
+        address,
+        width: 1,
+        height: 1,
+        pitch: 1,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA32Float,
+        bytes_per_pixel: 16,
+    };
+    let sample = DecodedImageDescriptor {
+        guest: eye,
+        span: ResourceSpan::for_texture(eye),
+        destination_select: 0xfac,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type: 9,
+        layer_count: 1,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, eye)
+        .expect("eye resident");
+    presenter.mark_resident_texture_written(eye);
+
+    {
+        let resident = presenter
+            .resident_guest_textures
+            .get_mut(&eye)
+            .expect("eye resident");
+        let span = resident.span.expect("declared span");
+        let mid = (span.range_start() + span.range_end()) / 2;
+        let stolen = RangeSet::from_run(span.range_start(), mid);
+        resident.subtract_authority(&stolen, StaleSource::GuestMemory);
+    }
+
+    let eye_resident = &presenter.resident_guest_textures[&eye];
+    assert!(eye_resident.is_live());
+    assert!(eye_resident.gpu_written());
+    assert!(
+        !eye_resident.serves_reads(),
+        "partial supersession must clear full-range owned coverage"
+    );
+    assert!(
+        resident_same_image_sample_is_eligible(eye_resident, sample, false),
+        "same-address same-extent EyeAdapt sample must stay eligible after partial owned supersession"
+    );
+    let subrect_sample = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            height: 2,
+            ..eye
+        },
+        span: ResourceSpan::for_texture(GuestTextureDescriptor {
+            height: 2,
+            ..eye
+        }),
+        destination_select: 0xfac,
+        base_mip_level: 0,
+        mip_level_count: 1,
+        texture_type: 9,
+        layer_count: 1,
+    };
+    assert!(
+        !resident_same_image_sample_is_eligible(eye_resident, subrect_sample, false),
         "sub-rect same-address views still require full owned coverage"
     );
 }

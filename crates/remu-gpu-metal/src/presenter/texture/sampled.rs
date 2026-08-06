@@ -486,6 +486,49 @@ pub(crate) fn resident_texture_for_sample(
     }
 }
 
+/// Whether a GPU-authored resident may still answer a same-address same-extent sample after a
+/// neighbour's over-broad `ResourceSpan` cleared full-range `owned` coverage.
+///
+/// Silent Hill title EyeAdaptation (1×1 RGBA32Float) and BGRA↔RGBA color views both hit this:
+/// Metal still holds the texels, but `serves_reads()` is false, so the upload path used to fall
+/// through to unpublished guest RAM (zeros → composite `attr1.x≈0` → opaque-black title BG).
+/// Sub-rect writers at the same address (different height/width) still require full coverage.
+pub(crate) fn resident_sample_authority_ok(
+    resident: &ResidentGuestTexture,
+    sampled: GuestTextureDescriptor,
+) -> bool {
+    resident.serves_reads()
+        || (resident.is_live()
+            && resident.descriptor.address == sampled.address
+            && resident.descriptor.width == sampled.width
+            && resident.descriptor.height == sampled.height
+            && resident.descriptor.tile_mode == sampled.tile_mode)
+}
+
+/// Same-format / pitch-tolerant sample of a GPU image that lost full `owned` coverage.
+pub(crate) fn resident_same_image_sample_is_eligible(
+    resident: &ResidentGuestTexture,
+    sampled: DecodedImageDescriptor,
+    comparison: bool,
+) -> bool {
+    let underlying_mip_count = sampled
+        .base_mip_level
+        .checked_add(sampled.mip_level_count.max(1));
+    !comparison
+        && resident.gpu_written()
+        && resident_sample_authority_ok(resident, sampled.guest)
+        && resident.texture_type == 9
+        && resident.layer_count == 1
+        && sampled.texture_type == 9
+        && sampled.layer_count == 1
+        && underlying_mip_count.is_some_and(|count| resident.mip_level_count >= count)
+        && (guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest)
+            || guest_texture_descriptors_share_gpu_sample_storage(
+                resident.descriptor,
+                sampled.guest,
+            ))
+}
+
 pub(crate) fn resident_color_view_sample_is_eligible(
     resident: &ResidentGuestTexture,
     sampled: DecodedImageDescriptor,
@@ -494,20 +537,9 @@ pub(crate) fn resident_color_view_sample_is_eligible(
     let underlying_mip_count = sampled
         .base_mip_level
         .checked_add(sampled.mip_level_count.max(1));
-    // Same-address, same-extent BGRA↔RGBA (etc.) reinterprets one Metal allocation. A neighbour
-    // in the shared heap can partially supersede owned-byte accounting via an over-broad
-    // ResourceSpan overlap while leaving this GPU image intact — Silent Hill title BG then
-    // sampled unpublished guest RAM (solid black) because serves_reads() became false.
-    // Sub-rect writers at the same address (different height/width) still require full coverage.
-    let authority_ok = resident.serves_reads()
-        || (resident.is_live()
-            && resident.descriptor.address == sampled.guest.address
-            && resident.descriptor.width == sampled.guest.width
-            && resident.descriptor.height == sampled.guest.height
-            && resident.descriptor.tile_mode == sampled.guest.tile_mode);
     !comparison
         && resident.gpu_written()
-        && authority_ok
+        && resident_sample_authority_ok(resident, sampled.guest)
         && resident.texture_type == 9
         && resident.layer_count == 1
         && sampled.texture_type == 9

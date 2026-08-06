@@ -16,6 +16,7 @@ use super::{
     is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_same_image_sample_is_eligible,
     shader_scalar_metadata_for_registers, storage_image_requires_mip_hierarchy,
     trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
     wave64_split_blockers,
@@ -143,6 +144,7 @@ impl MetalPresenter {
             let has_read_compatible_resident = !is_writable_image_opcode(binding.opcode)
                 && self.resident_guest_textures.values().any(|resident| {
                     resident_color_view_sample_is_eligible(resident, descriptor, false)
+                        || resident_same_image_sample_is_eligible(resident, descriptor, false)
                         || resident_depth_sample_is_eligible(resident, descriptor)
                 });
             if !is_writable_image_opcode(binding.opcode)

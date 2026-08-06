@@ -20,6 +20,7 @@ use super::{
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
+    resident_same_image_sample_is_eligible, resident_sample_authority_ok,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
     sampled_texture_key, sampled_texture_supports_access, sampler_uses_normalized_coordinates,
     storage_image_requires_mip_hierarchy, texture_element_layout,
@@ -573,7 +574,14 @@ pub(crate) fn upload_image_textures(
                             resident_guest_textures
                                 .get(&descriptor.guest)
                                 .filter(|resident| {
-                                    resident.serves_reads()
+                                    // Same-extent GPU images keep answering after neighbour
+                                    // ResourceSpan over-report clears serves_reads() (SH EyeAdapt).
+                                    (resident.serves_reads()
+                                        || (resident.gpu_written()
+                                            && resident_sample_authority_ok(
+                                                resident,
+                                                descriptor.guest,
+                                            )))
                                         && resident.texture_type == descriptor.texture_type
                                         && resident.layer_count == descriptor.layer_count
                                         && resident.mip_level_count >= underlying_mip_count
@@ -602,14 +610,23 @@ pub(crate) fn upload_image_textures(
                                             resident,
                                             descriptor,
                                             comparison,
+                                        ) || resident_same_image_sample_is_eligible(
+                                            resident,
+                                            descriptor,
+                                            comparison,
                                         )))
                                         || resident_depth_sample_is_eligible(resident, descriptor))
-                                    // Exact same-address colour views may remain gpu-authored after
-                                    // a neighbour partially supersedes owned-byte accounting; those
-                                    // still bind through resident_color_view_sample_is_eligible.
-                                    // Every other compatible path still needs full owned coverage.
+                                    // Exact same-address images may remain gpu-authored after a
+                                    // neighbour partially supersedes owned-byte accounting; bind
+                                    // through same-image / colour-view eligibility instead of
+                                    // uploading unpublished guest RAM.
                                     && (resident.serves_reads()
                                         || resident_color_view_sample_is_eligible(
+                                            resident,
+                                            descriptor,
+                                            comparison,
+                                        )
+                                        || resident_same_image_sample_is_eligible(
                                             resident,
                                             descriptor,
                                             comparison,
