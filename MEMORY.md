@@ -17,7 +17,7 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `01f5f18`)
+## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 
 - `guest_signal.rs`: Orbis ucontext (0x500 / mcontext +0x40 / rsp @ 0xf8); RaiseException →
   SIGUSR1 interrupt; fault hook after write-watch decline; `_sigprocmask` oldset writeback.
