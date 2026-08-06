@@ -715,6 +715,7 @@ impl PresenterStatistics {
             shared_event_signals: 0,
             shared_event_waits: 0,
             same_queue_wait_elisions: 0,
+            render_backend_flushes: 0,
             shared_event_host_blocks: 0,
             shared_event_host_block_kinds: [0; super::SHARED_HOST_KIND_COUNT],
             shared_event_host_wakes: 0,

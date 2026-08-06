@@ -1310,6 +1310,9 @@ struct ResidentGuestTexture {
     gpu_authored: RangeSet,
     /// `Live` unless every owned byte was taken by another writer or by the CPU.
     state: ResidencyState,
+    /// ACQUIRE_MEM proved guest bytes diverged from the Metal copy, but no consumer has bound
+    /// this resident yet. Demotion is deferred until reclaim/bind (Phase 1H consumer-aware).
+    acquire_invalidated: bool,
     content_version: u64,
     /// CPU-write generations observed when Metal most recently became authoritative.
     ///
@@ -1442,6 +1445,7 @@ impl ResidentGuestTexture {
         );
         self.owned = RangeSet::default();
         self.gpu_authored = RangeSet::default();
+        self.acquire_invalidated = false;
         self.state = ResidencyState::Stale(source);
         OWNED_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
     }
@@ -1452,6 +1456,14 @@ impl ResidentGuestTexture {
     /// only the shape, the live watch and its fingerprints. `owned` stays empty until the mark
     /// that follows, which is the one window in which a `Live` resident owns nothing.
     fn reclaim_for_bind(&mut self, discard_guest_contents: bool) -> bool {
+        // Consumer-aware ACQUIRE demotion: invalidate at first consumer bind, not at acquire.
+        if self.acquire_invalidated && !discard_guest_contents {
+            self.demote(StaleSource::GuestMemory);
+            return false;
+        }
+        if discard_guest_contents {
+            self.acquire_invalidated = false;
+        }
         if self.serves_reads() {
             return true;
         }
@@ -1757,6 +1769,7 @@ struct PresenterStatistics {
     /// A3: same-queue `WAIT_REG_MEM`s the producer index proved were encoded ahead on this very
     /// queue, so Metal FIFO order already satisfies them and no GPU event wait is encoded.
     same_queue_wait_elisions: u32,
+    render_backend_flushes: u32,
     shared_event_host_blocks: u32,
     shared_event_host_block_kinds: [u32; SHARED_HOST_KIND_COUNT],
     shared_event_host_wakes: u32,
@@ -2024,6 +2037,8 @@ struct GuestMemoryWaitKey {
     mask: u64,
     compare_function: u32,
     is_64_bit: bool,
+    operation: u32,
+    cache_policy: u32,
 }
 
 #[derive(Clone, Copy, Debug)]

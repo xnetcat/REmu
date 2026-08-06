@@ -89,10 +89,7 @@ pub(crate) fn occlusion_counter_releases(
     };
     let value = PIXEL_PIPE_STAT_VALID | (sample_count & !PIXEL_PIPE_STAT_VALID);
     (0..PIXEL_PIPE_STAT_COUNTER_PAIRS)
-        .map(|pair| GpuMemoryRelease {
-            address: destination + pair * 16,
-            value: GpuMemoryReleaseValue::Immediate64(value),
-        })
+        .map(|pair| GpuMemoryRelease::label(destination + pair * 16, GpuMemoryReleaseValue::Immediate64(value)))
         .collect()
 }
 

@@ -3,7 +3,7 @@
 
 use super::{
     CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
-    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
+    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter, RangeSet,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
@@ -221,34 +221,24 @@ impl MetalPresenter {
                 );
                 continue;
             }
-            // An acquire only invalidates the old Metal copy; it does not require materializing a
-            // replacement here. Rebuilding eagerly decoded whole multi-megabyte Unreal render
-            // allocations even when several more acquires arrived before the image was used, and
-            // even when the next render pass discards those guest bytes anyway. Demote instead of
-            // destroying: the allocation, its watch, its `mprotect` state and its fingerprint
-            // baseline survive, so a later bind either overwrites it outright or rebuilds it from
-            // RAM through a validation the baseline usually answers for free.
+            // Phase 1H consumer-aware demotion: ACQUIRE_MEM proves the Metal copy is stale, but
+            // demoting here walked residents that no later bind rebuilt (REPORT fingerprint waste
+            // loop). Mark invalidate and demote at the first consumer reclaim/bind instead.
+            // Sampled-cache entries below still evict — a sample is itself a consumer.
             invalidated_multisample_descriptors.push(descriptor);
             trace_acquire(
                 resident,
                 refresh,
-                "removed",
+                if gpu_written { "gpu" } else { "cpu" },
                 Some(true),
-                if gpu_written {
-                    "removed-gpu-dirty"
-                } else {
-                    "removed-cpu-dirty"
-                },
+                "acquire-invalidated-deferred",
             );
-            resident.demote(StaleSource::GuestMemory);
-            trace_resident_texture_demotion(
-                if gpu_written {
-                    "acquire-gpu-dirty"
-                } else {
-                    "acquire-cpu-dirty"
-                },
-                resident,
-            );
+            resident.acquire_invalidated = true;
+            if gpu_written {
+                // CPU overwrote GPU-authored bytes: drop publication debt now; demotion still waits
+                // for a consumer bind so unused targets pay nothing.
+                resident.gpu_authored = RangeSet::default();
+            }
             RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         }
         // Resolve each invalidated descriptor once instead of once per multisample entry.
