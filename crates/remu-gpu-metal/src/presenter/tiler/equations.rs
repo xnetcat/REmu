@@ -25,10 +25,12 @@ pub(crate) enum GpuTilerMode {
 }
 
 impl GpuTilerMode {
+    /// Selects the MSL library family. Mode-24 depth shares the 64 KB mode-27 library
+    /// (`kTileMode` distinguishes the within-block table at dispatch time).
     pub(crate) fn from_tile_mode(tile_mode: u32) -> Option<Self> {
         match tile_mode {
             5 => Some(Self::Mode5),
-            27 => Some(Self::Mode27),
+            24 | 27 => Some(Self::Mode27),
             _ => None,
         }
     }

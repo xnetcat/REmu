@@ -3,9 +3,10 @@
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::completion::commit_and_settle;
+use super::super::tiler::mode27_tiler_pipelines;
 use super::super::{
     FlushPolicy, GuestBatchFlushReason, SharedEventResidentTextureVersion, SharedEventWriteKind,
-    WritebackTrigger, compile_metal_compute_library,
+    WritebackTrigger,
 };
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
@@ -102,147 +103,6 @@ fn record_rematerialisation_failure(kind: RematerialisationFailureKind) {
         }
     }
 }
-
-const MODE27_REMATERIALISATION_SOURCE: &str = r"
-#include <metal_stdlib>
-using namespace metal;
-
-// All fields are ulong so the host ABI is an unambiguous array of 64-bit words.
-enum RemuMode27Parameter {
-    kWidth = 0, kHeight = 1, kLinearRowBytes = 2, kLinearOffset = 3,
-    kResourceBase = 4, kTargetBase = 5, kLevelOffset = 6, kPitch = 7,
-    kBytesPerElement = 8, kBlockWidth = 9, kBlockHeight = 10,
-    kTailX = 11, kTailY = 12, kSurfaceZXor = 13, kInTail = 14,
-    kTargetLength = 15, kRunCount = 16, kTileMode = 17
-};
-
-static uint remu_mode27_within_block(uint x, uint y, uint log2_bytes) {
-    switch (log2_bytes) {
-        case 0:
-            return ((y << 2) & 0x0008u) ^ ((y << 4) & 0x0010u)
-                ^ ((y << 3) & 0x00a0u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 6) & 0x1000u) ^ ((y << 7) & 0x4000u)
-                ^ (x & 0x0007u) ^ ((x << 3) & 0x0040u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 4) & 0x0400u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
-                ^ ((x << 8) & 0x8000u);
-        case 1:
-            return ((y << 4) & 0x0070u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 8) & 0x5000u) ^ ((x << 1) & 0x000eu)
-                ^ ((x << 4) & 0x0480u) ^ ((x << 5) & 0x0300u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
-                ^ ((x << 8) & 0x8000u);
-        case 2:
-            return ((y << 4) & 0x0070u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 9) & 0x1000u) ^ ((y << 8) & 0x4000u)
-                ^ ((x << 2) & 0x000cu) ^ ((x << 5) & 0x0380u)
-                ^ ((x << 4) & 0x0400u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 9) & 0xa000u);
-        case 3:
-            return ((y << 4) & 0x0010u) ^ ((y << 6) & 0x0080u)
-                ^ ((y << 5) & 0x0f00u) ^ ((y << 10) & 0x5000u)
-                ^ ((x << 3) & 0x0008u) ^ ((x << 4) & 0x0460u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 10) & 0x2000u) ^ ((x << 9) & 0x8000u);
-        default:
-            return ((x << 4) & 0x0410u) ^ ((x << 5) & 0x0340u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 11) & 0xa000u)
-                ^ ((y << 5) & 0x0f20u) ^ ((y << 6) & 0x0080u)
-                ^ ((y << 10) & 0x1000u) ^ ((y << 11) & 0x4000u);
-    }
-}
-
-static uint remu_mode24_within_block(uint x, uint y, uint log2_bytes) {
-    switch (log2_bytes) {
-        case 0:
-            return (x & 0x0001u) ^ ((x << 1) & 0x0004u)
-                ^ ((x << 2) & 0x0010u) ^ ((x << 3) & 0x0040u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 4) & 0x0400u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 7) & 0x2000u)
-                ^ ((x << 8) & 0x8000u) ^ ((y << 1) & 0x0002u)
-                ^ ((y << 2) & 0x0008u) ^ ((y << 3) & 0x00a0u)
-                ^ ((y << 5) & 0x0f00u) ^ ((y << 6) & 0x1000u)
-                ^ ((y << 7) & 0x4000u);
-        case 1:
-            return ((x << 1) & 0x0002u) ^ ((x << 2) & 0x0008u)
-                ^ ((x << 3) & 0x0020u) ^ ((x << 4) & 0x0480u)
-                ^ ((x << 5) & 0x0300u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 7) & 0x2000u) ^ ((x << 8) & 0x8000u)
-                ^ ((y << 2) & 0x0004u) ^ ((y << 3) & 0x0010u)
-                ^ ((y << 4) & 0x0040u) ^ ((y << 5) & 0x0f00u)
-                ^ ((y << 8) & 0x5000u);
-        case 2:
-            return ((x << 2) & 0x0004u) ^ ((x << 3) & 0x0010u)
-                ^ ((x << 4) & 0x0440u) ^ ((x << 5) & 0x0300u)
-                ^ ((x << 6) & 0x0800u) ^ ((x << 9) & 0xa000u)
-                ^ ((y << 3) & 0x0008u) ^ ((y << 4) & 0x0020u)
-                ^ ((y << 5) & 0x0f80u) ^ ((y << 9) & 0x1000u)
-                ^ ((y << 8) & 0x4000u);
-        default:
-            return ((x << 3) & 0x0008u) ^ ((x << 4) & 0x0420u)
-                ^ ((x << 5) & 0x0380u) ^ ((x << 6) & 0x0800u)
-                ^ ((x << 10) & 0x2000u) ^ ((x << 9) & 0x8000u)
-                ^ ((y << 4) & 0x0010u) ^ ((y << 5) & 0x0f40u)
-                ^ ((y << 10) & 0x5000u);
-    }
-}
-
-static ulong remu_tiled_physical(constant ulong* p, uint2 gid) {
-    const uint block_width = uint(p[kBlockWidth]);
-    const uint block_height = uint(p[kBlockHeight]);
-    const bool tail = p[kInTail] != 0;
-    const uint x = tail ? uint(p[kTailX]) + gid.x : gid.x;
-    const uint y = tail ? uint(p[kTailY]) + gid.y : gid.y;
-    const uint block_x = tail ? 0u : gid.x / block_width;
-    const uint block_y = tail ? 0u : gid.y / block_height;
-    const ulong blocks_per_row = (p[kPitch] + block_width - 1u) / block_width;
-    const ulong block = tail ? 0ul : ulong(block_y) * blocks_per_row + block_x;
-    const uint log2_bytes = ctz(uint(p[kBytesPerElement]));
-    const uint within = p[kTileMode] == 24ul
-        ? remu_mode24_within_block(x, y, log2_bytes)
-        : remu_mode27_within_block(x, y, log2_bytes) ^ uint(p[kSurfaceZXor]);
-    return p[kResourceBase] + p[kLevelOffset] + block * 65536ul + within;
-}
-
-static bool remu_in_debt(device const ulong2* runs, ulong count, ulong address) {
-    for (ulong index = 0; index < count; ++index) {
-        if (runs[index].x <= address && address < runs[index].y) return true;
-    }
-    return false;
-}
-
-kernel void remu_mode27_scatter(
-    device const uchar* linear [[buffer(0)]], device uchar* tiled [[buffer(1)]],
-    device const ulong2* debt [[buffer(2)]], constant ulong* p [[buffer(3)]],
-    uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
-    const ulong physical = remu_tiled_physical(p, gid);
-    const ulong source = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
-        + ulong(gid.x) * p[kBytesPerElement];
-    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
-        const ulong address = physical + byte;
-        if (address >= p[kTargetBase]
-            && address - p[kTargetBase] < p[kTargetLength]
-            && remu_in_debt(debt, p[kRunCount], address)) {
-            tiled[address - p[kTargetBase]] = linear[source + byte];
-        }
-    }
-}
-
-kernel void remu_mode27_gather(
-    device const uchar* tiled [[buffer(0)]], device uchar* linear [[buffer(1)]],
-    constant ulong* p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p[kWidth] || gid.y >= p[kHeight]) return;
-    const ulong physical = remu_tiled_physical(p, gid);
-    const ulong destination = p[kLinearOffset] + ulong(gid.y) * p[kLinearRowBytes]
-        + ulong(gid.x) * p[kBytesPerElement];
-    if (physical < p[kTargetBase]
-        || physical - p[kTargetBase] + p[kBytesPerElement] > p[kTargetLength]) return;
-    for (ulong byte = 0; byte < p[kBytesPerElement]; ++byte) {
-        linear[destination + byte] = tiled[physical - p[kTargetBase] + byte];
-    }
-}
-";
 
 #[derive(Clone, Copy, Debug)]
 struct Mode27RematerialisationSubresource {
@@ -486,24 +346,13 @@ fn mode27_rematerialisation_parameters(
     ])
 }
 
+/// Returns `(retile/scatter, detile/gather)` pipelines from the S2 tiler module.
 fn compile_mode27_rematerialisation_pipelines(
     device: &Device,
 ) -> Result<(ComputePipelineState, ComputePipelineState), String> {
-    let library = compile_metal_compute_library(device, MODE27_REMATERIALISATION_SOURCE)?;
-    let scatter = library
-        .get_function("remu_mode27_scatter", None)
-        .map_err(|error| format!("Metal mode-27 scatter function: {error}"))?;
-    let gather = library
-        .get_function("remu_mode27_gather", None)
-        .map_err(|error| format!("Metal mode-27 gather function: {error}"))?;
-    Ok((
-        device
-            .new_compute_pipeline_state_with_function(&scatter)
-            .map_err(|error| format!("Metal mode-27 scatter pipeline: {error}"))?,
-        device
-            .new_compute_pipeline_state_with_function(&gather)
-            .map_err(|error| format!("Metal mode-27 gather pipeline: {error}"))?,
-    ))
+    let (detile, retile) = mode27_tiler_pipelines(device)?;
+    // Historical rematerialisation field order: scatter (=retile) then gather (=detile).
+    Ok((retile, detile))
 }
 
 fn encode_texture_to_linear_buffer(
