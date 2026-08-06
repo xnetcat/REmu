@@ -24,13 +24,15 @@ registers/packets that state intent.
 - **Mode-5 BC mips (`8e4ed20`):** GPU tiler AddrLib mode-5 compressed mip chains; live refuse **0**.
 - **Latched stencil (`0a22e15`):** `STENCIL_ENABLE` + no Z ops → no depth attachment (`Ok(None)`),
   not a color-MRT abort. True stencil-only still loud-refused. Live stencil-only refuses **0**.
-- **Live @ `0a22e15` + capture + Cross:** hallway 3D + title UI; title **BG still solid black**
-  (PPM hash unchanged vs pre-fix). Drops 603/20; worst no-attachment `ps=0x8008020000`.
-- **Remaining:** title compositor SRD/sample path (null/type-0 IMAGE-FALLBACK; no-attachment
-  with live `ps_scalars`); mode-1/9 compressed mips; NGG `0x7` if critical.
-- Handoff: `docs/notes/sh-present-20260806-handoff/` (`runs/silent-hill-title-bg/`).
-- **Anti-claim:** hallway / title UI / mode-5 mips / stencil latch ≠ title-BG 3D closure.
-- **Next:** title-BG sample attribution after splash; else DeS ACM.
+- **Type-0 refuse + BGRA↔RGBA authority:** non-null TYPE-0 no longer opaque-black IMAGE-FALLBACK;
+  same-address color-views survive false shared-heap owned-byte theft. Live: `ALIAS-VIEW` binds;
+  title **BG still solid black**.
+- **Live:** hallway 3D + title UI; title BG still void. Worst drops no-attachment `ps=0x8008020000`.
+- **Remaining:** prove `800e73` intermediate texels at title (black upstream vs composite);
+  null IMAGE-FALLBACK; no-attachment covers; mode-1/9 BC mips; NGG `0x7` if critical.
+- Handoff: `docs/notes/sh-present-20260806-handoff/` (`runs/silent-hill-title-bg-alias/`).
+- **Anti-claim:** hallway / title UI / mode-5 mips / stencil / type-0+alias authority ≠ title-BG 3D.
+- **Next:** dump title intermediate occupancy; else DeS ACM.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

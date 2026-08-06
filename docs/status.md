@@ -16,14 +16,18 @@ Live compressed-mip refuse count **0**. Mode-1/9 BC mips and mode-27 BC stay lou
 **Latched stencil (`0a22e15`):** `STENCIL_ENABLE` with Z ops off no longer aborts color MRTs
 (depth decode `Ok(None)`; true stencil-only still refused). Live stencil-only refuses **0**.
 
-**Live @ `0a22e15` with `REMU_CAPTURE_FRAMES=1` + Cross:** splash → content-warning **hallway 3D**
-→ title UI. Title **background still solid black** (same PPM hash as pre-stencil-fix).
-`pipeline_failed=0`; worst drops remain no-attachment `es/ps=0x8007a80000/0x8008020000`.
+**Sample-path (`IMAGE-REFUSE` + BGRA↔RGBA authority):** non-null TYPE-0 SRDs loud-refuse instead of
+opaque-black fallback; same-address color-views keep Metal debt across false shared-heap
+authority theft. Live dirty probe: `ALIAS-VIEW` on title intermediate; title **BG still black**.
 
-**Remaining title-3D blockers:** compositor/SRD title-BG samples (null/type-0 IMAGE-FALLBACK,
-no-attachment with live `ps_scalars`); mode-1/9 compressed mips; NGG topology `0x7` if on path.
-See `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 mips /
-stencil latch ≠ title-background 3D closure.
+**Live with `REMU_CAPTURE_FRAMES=1`:** splash → content-warning **hallway 3D** → title UI.
+Title background still solid black. `pipeline_failed=0`; worst drops remain no-attachment
+`es/ps=0x8007a80000/0x8008020000`.
+
+**Remaining title-3D blockers:** prove `800e73` intermediate occupancy at title; null
+IMAGE-FALLBACK; no-attachment with live `ps_scalars`; mode-1/9 compressed mips; NGG `0x7` if on
+path. See `docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 /
+stencil / type-0+alias ≠ title-background 3D closure.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
