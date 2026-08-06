@@ -23,10 +23,11 @@ use super::{
     missing_vertex_parameter_exports, ngg_export_uses_general_lds, ngg_export_uses_wave64_exec,
     ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
-    procedural_rectangle_stage_for_draw, rectangle_coordinate_parameter_mask,
-    rectangle_draw_has_incomplete_interface, sampler_lod_bias, sampler_uses_normalized_coordinates,
-    shader_scalar_metadata, shader_scalar_metadata_for_registers,
-    speculative_pipeline_compile_in_flight_capacity, truncated_memoryless_ngg_rectangle_cover,
+    procedural_rectangle_stage_for_draw, reconcile_pixel_input_controls_with_export_producers,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
+    sampler_lod_bias, sampler_uses_normalized_coordinates, shader_scalar_metadata,
+    shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
+    truncated_memoryless_ngg_rectangle_cover, unmatched_param_default_control,
     validate_compute_launch_for_metal, wave64_split_blockers,
 };
 
@@ -384,6 +385,44 @@ fn rejects_only_non_default_pixel_inputs_without_vertex_exports() {
         vec![(1, 3, 3)],
         "a non-default PARAM3 input cannot be supplied by a position-only stage"
     );
+}
+
+#[test]
+fn reconciles_param_less_exports_to_sdk_use_default_without_lds() {
+    let controls = std::array::from_fn(|index| {
+        u32::try_from(index).expect("input-control index fits u32")
+    });
+    let (reconciled, lds_missing) = reconcile_pixel_input_controls_with_export_producers(
+        &controls,
+        /*exported_parameters*/ 0,
+        /*interpolated_attributes*/ 0b11,
+        /*export_uses_general_lds*/ false,
+    );
+    assert!(lds_missing.is_empty());
+    assert_eq!(reconciled[0], unmatched_param_default_control(0));
+    assert_eq!(reconciled[1], unmatched_param_default_control(1));
+    assert_eq!(
+        remu_shader_metal::PixelInputControl::from_register(reconciled[0]).uses_default(),
+        true
+    );
+    assert_eq!(
+        missing_vertex_parameter_exports(0, 0b11, &reconciled),
+        Vec::new(),
+        "reconciled controls must not leave PARAM consumers without producers"
+    );
+}
+
+#[test]
+fn refuses_to_reconcile_param_holes_when_export_uses_general_lds() {
+    let controls = [0_u32; 32];
+    let (reconciled, lds_missing) = reconcile_pixel_input_controls_with_export_producers(
+        &controls,
+        0,
+        0b1,
+        true,
+    );
+    assert_eq!(reconciled[0], 0, "LDS holes must not be rewritten to UseDefault");
+    assert_eq!(lds_missing, vec![(0, 0, 0)]);
 }
 
 #[test]

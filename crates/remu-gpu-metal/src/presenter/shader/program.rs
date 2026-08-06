@@ -459,6 +459,45 @@ pub(crate) fn missing_vertex_parameter_exports(
         .collect()
 }
 
+/// SPI register value for an unmatched PS input when the export stage has no EXP PARAM producer.
+///
+/// Matches `agc_create_interpolant_mapping` / SDK `CxPsShaderUsage` when the geometry shader has
+/// no matching output semantic: `UseDefault0` with the programmed `Default0` selector, no flat
+/// shade, and a cleared PARAM offset. Compacted-record staging only relocates EXP payloads, so a
+/// missing EXP PARAM is exactly this unmatched-semantic case — not a RemuVsOut zero-fill.
+pub(crate) fn unmatched_param_default_control(raw: u32) -> u32 {
+    (raw & 0x0000_0300) | 0x20
+}
+
+/// Reconcile `SPI_PS_INPUT_CNTL` with EXP PARAM producers in the export program.
+///
+/// - Physical PARAM slots that EXP wrote keep their programmed controls (compacted staging
+///   publishes those payloads under proven `NggRegisters`).
+/// - Slots without an EXP producer and without general LDS traffic become architectural defaults
+///   (`UseDefault0`), matching SDK interpolant mapping when GS output semantics do not match.
+/// - Slots without an EXP producer **with** general LDS remain missing: LDS attribute rings are a
+///   real producer class REmu has not lowered, so callers must refuse loudly rather than invent
+///   UVs or zero-fill `RemuVsOut`.
+pub(crate) fn reconcile_pixel_input_controls_with_export_producers(
+    controls: &[u32; 32],
+    exported_parameters: u32,
+    interpolated_attributes: u32,
+    export_uses_general_lds: bool,
+) -> ([u32; 32], Vec<(u32, u32, u32)>) {
+    let mut reconciled = *controls;
+    let mut lds_missing = Vec::new();
+    for (logical, physical, raw) in
+        missing_vertex_parameter_exports(exported_parameters, interpolated_attributes, controls)
+    {
+        if export_uses_general_lds {
+            lds_missing.push((logical, physical, raw));
+            continue;
+        }
+        reconciled[logical as usize] = unmatched_param_default_control(raw);
+    }
+    (reconciled, lds_missing)
+}
+
 /// Recognizes a fused GFX10 NGG export/geometry program that requires a Metal mesh stage.
 ///
 /// The allocation message and primitive export are the architectural contract that distinguishes
@@ -514,8 +553,9 @@ pub(crate) fn ngg_export_uses_wave64_exec(program: &Program) -> bool {
 ///
 /// This distinguishes pass-through NGG from stages that exchange ES/GS records; it does not
 /// select the host stage. Even LDS-free NGG still consumes merged-wave system values and emits
-/// primitive connectivity, so non-procedural programs require the mesh ABI.
-#[cfg(test)]
+/// primitive connectivity, so non-procedural programs require the mesh ABI. Also the producer
+/// gate for PARAM-less SPI reconciliation: general LDS may carry an attribute ring that EXP does
+/// not name, so those holes stay loud-refused instead of UseDefault0.
 pub(crate) fn ngg_export_uses_general_lds(program: &Program) -> bool {
     program.instructions.iter().any(|instruction| {
         matches!(instruction.control, Some(InstructionControl::DataShare(_)))

@@ -36,18 +36,20 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, missing_vertex_parameter_exports,
-    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask, pixel_scalars,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
+    is_storage_image_opcode, is_writable_image_opcode, ngg_export_uses_general_lds,
+    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    program_uses_lds, reconcile_pixel_input_controls_with_export_producers,
     rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
 pub(crate) use self::program::{
-    lift_expanded_vertex_buffer_num_records, ngg_export_uses_general_lds, ngg_mesh_draw_supported,
-    procedural_rectangle_export_stage, rectangle_draw_has_incomplete_interface,
-    shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
+    lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
+    ngg_mesh_draw_supported, procedural_rectangle_export_stage,
+    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
+    truncated_memoryless_ngg_rectangle_cover, unmatched_param_default_control,
 };
 
 impl MetalPresenter {
@@ -442,6 +444,34 @@ impl MetalPresenter {
                 export_format: target.export_format,
             })
             .collect();
+        let uses_procedural_rectangle_stage = key.uses_procedural_rectangle_stage;
+        let exported_parameters = vertex_parameter_export_mask(&export.program);
+        let interpolated_attributes = pixel_interpolation_attribute_mask(pixel_program);
+        // Reconcile SPI_PS_INPUT_CNTL against EXP PARAM producers before pixel lowering so
+        // unmatched slots take the SDK UseDefault0 constant path (not RemuVsOut zero-fill).
+        // Procedural rectangles keep their host-synthesized UV ABI and skip this rewrite.
+        let mut pixel_input_controls = key.pixel_input_controls;
+        if key.render_target_array_length == 1 && !uses_procedural_rectangle_stage {
+            let export_uses_general_lds = ngg_export_uses_general_lds(&export.program);
+            let (reconciled, lds_missing) = reconcile_pixel_input_controls_with_export_producers(
+                &pixel_input_controls,
+                exported_parameters,
+                interpolated_attributes,
+                export_uses_general_lds,
+            );
+            if !lds_missing.is_empty() {
+                // General LDS without EXP PARAM is the unfinished attribute-ring producer class.
+                // Refuse loudly; do not invent UVs or restore INTERFACE-FILL.
+                return Err(format!(
+                    "pixel shader {:#x} interpolates SPI_PS_INPUT_CNTL slots without a matching \
+                     EXP PARAM, and export {:#x} uses general LDS that may stage attributes \
+                     (LDS attribute-ring producer not lowered; missing \
+                     logical/physical/control={lds_missing:08x?}; exports={exported_parameters:#010x})",
+                    draw.pixel_shader_address, draw.export_shader_address,
+                ));
+            }
+            pixel_input_controls = reconciled;
+        }
         let mut pixel_options = remu_shader_metal::MetalCompileOptions::pixel(
             pixel_outputs,
             register_value(&draw.context_registers, 0x1b3).unwrap_or_default(),
@@ -451,54 +481,13 @@ impl MetalPresenter {
         pixel_options.scratch_size_bytes = key.wave_state.pixel_scratch_bytes_per_lane();
         pixel_options.render_target_array_length = key.render_target_array_length;
         pixel_options.pixel_depth_export = key.pixel_depth_export;
-        pixel_options.pixel_input_controls = key
-            .pixel_input_controls
+        pixel_options.pixel_input_controls = pixel_input_controls
             .map(remu_shader_metal::PixelInputControl::from_register);
         pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
         pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
         let pixel_msl =
             remu_shader_metal::compile_msl(pixel_program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
-        let uses_procedural_rectangle_stage = key.uses_procedural_rectangle_stage;
-        if key.render_target_array_length == 1 {
-            let exported_parameters = vertex_parameter_export_mask(&export.program);
-            let interpolated_attributes = pixel_interpolation_attribute_mask(pixel_program);
-            let missing = missing_vertex_parameter_exports(
-                exported_parameters,
-                interpolated_attributes,
-                &key.pixel_input_controls,
-            );
-            if !missing.is_empty() {
-                // Procedural rectangle covers synthesize their UV/parameter interface in the
-                // host rectangle vertex stage. Every other missing SPI_PS_INPUT_CNTL → EXP PARAM
-                // link has no architectural producer in the export program (compacted-record
-                // staging only relocates payloads that EXP already wrote): refuse loudly instead
-                // of declaring RemuVsOut slots and leaving them zero.
-                let rectangle_covers_missing = uses_procedural_rectangle_stage
-                    && rectangle_coordinate_parameter_mask(
-                        pixel_program,
-                        &key.pixel_input_controls,
-                    )
-                    .is_some_and(|mask| {
-                        missing
-                            .iter()
-                            .all(|&(_, physical, _)| mask & (1 << physical) != 0)
-                    });
-                if !rectangle_covers_missing && !uses_procedural_rectangle_stage {
-                    return Err(format!(
-                        "pixel shader {:#x} interpolates SPI_PS_INPUT_CNTL slots without a matching \
-                         EXP PARAM / proven NGG attribute staging from export {:#x} \
-                         (missing logical/physical/control={missing:08x?}; exports={exported_parameters:#010x})",
-                        draw.pixel_shader_address, draw.export_shader_address,
-                    ));
-                }
-                if !rectangle_covers_missing && uses_procedural_rectangle_stage {
-                    // Procedural stage with incomplete ImageSample provenance still synthesizes
-                    // every live parameter as UV (see compile path below); that is an explicit
-                    // rectangle ABI, not a silent NGG zero-fill.
-                }
-            }
-        }
         let uses_mesh_stage = key.uses_mesh_stage;
         let mut vertex_options = if uses_mesh_stage {
             let limits = key

@@ -165,9 +165,10 @@ use self::shader::{
 use self::shader::{
     lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
     ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_mesh_draw_supported,
-    procedural_rectangle_export_stage, rectangle_coordinate_parameter_mask,
-    rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
-    truncated_memoryless_ngg_rectangle_cover,
+    procedural_rectangle_export_stage, reconcile_pixel_input_controls_with_export_producers,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
+    shader_scalar_metadata, truncated_memoryless_ngg_rectangle_cover,
+    unmatched_param_default_control,
 };
 use self::shared_event::{
     GpuWaitFenceMap, SharedEventFence, SharedEventProducerId, SharedEventTimeline,
