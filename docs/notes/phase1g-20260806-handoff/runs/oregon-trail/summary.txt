@@ -1,7 +1,7 @@
-revision=5b920ab
+revision=0f73333
 game=/Volumes/Untitled/sharpemu/games/The Oregon Trail/PPSA19244-app0/decrypted/eboot.bin
 timeout_seconds=30
-elapsed_seconds=36
+elapsed_seconds=35
 outcome=external-watchdog-timeout
 exit_status=124
 captured_frames=0
@@ -36,7 +36,7 @@ render_policy=presentation-only
 [REMu][REPORT] fabricated success key=qQJfO8HAiaY name=sceNpRegisterStateCallbackA calls=1
 [REMu][REPORT] fabricated success key=rbknaUjpqWo name=sceNpGetAccountIdA calls=1
 [REMu][REPORT] fabricated success key=vYU8P9Td2Zo name=sceKernelAioInitializeImpl calls=1
-[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=5342 calls=5349 results=0xffffffff80020002:5342
+[REMu][REPORT] failing import name=sceKernelStat nid=eV9wAD2riIA failures=5342 calls=5350 results=0xffffffff80020002:5342
 [REMu][REPORT] failing import name=sceKernelAllocateMainDirectMemory nid=B+vc2AO2Zrc failures=19 calls=39 results=0xffffffff80020023:19
 [REMu][REPORT] failing import name=sceKernelOpen nid=1G3lF1Gg1k8 failures=17 calls=22 results=0xffffffff80020002:17
 [REMu][REPORT] failing import name=sceKernelAprResolveFilepathsToIdsAndFileSizes nid=gEpBkcwxUjw failures=6 calls=9 results=0xffffffffffffffff:6
