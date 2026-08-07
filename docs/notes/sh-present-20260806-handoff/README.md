@@ -1,7 +1,7 @@
 # Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
 
-**Tip:** `main` @ `a363cde` — UV/tex0 attribution closed; `a82f031` decimal TARGET extents.
-Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
+**Tip:** `main` @ `884a372` — composite `800e73` zeros via EyeAdapt ES T# ≠ live `800b44` write VA;
+same-format owned-supersession sample bind shipped (not sufficient alone). efc title BG still not assessable.
 
 ## Closed gates
 
@@ -27,6 +27,10 @@ Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
 | `800bf4` zero exports — UV/attr0 class (revised) | Heap V# `0x00005204` is SDK **RegularBuffer** (not word3 mis-decode); meshlet patches format 64/77. VB has float ±1 UV. SLoad heap span `0x200` (`37589c3`). Live `tonemap5c`: TARGET **magnitude_nz=109231** (was 0 @ tonemap4). |
 | ES UV ±0.6 / “missing +0.5” | **Guest intent** — ViewSize 1152×648 / BufferSize 1920×1080, bias 0; oversized tri → screen UV [0,0.6]; PS samples raw attr0 (ISA). Not CB scramble / sample-VGPR bug. `UV-TEX0-ATTR.txt`. |
 | tex0 “780×438” vs 1920×1080 | **Diagnostic misread** — `TARGET-DRAW-TEXTURES` used `{:x?}` (1920→`780`, 1080→`438`). SRD+PPM are 1920×1080; `800c7e` fills TL 1152×648. |
+| Nonzero tonemap reaches composite sample VA | Clean `composite3`: title `800e73` tex0 `80c2d4` RG11B10 **mag≈685651**; TARGET still opaque black. |
+| `800e73` near-zero exports class | Filmic path × `attr1[0]` (ES `800dbb` 1×1 EyeAdapt read) + `remu_s_31`; epsilon `±1e-3` matches `fma(..., 0x3B2ED4E7)` with **attr1≈0**. |
+| `800b44` EyeAdapt writer itself | Clean `eyeadapt`: draw **34617** → 1×1 RGBA32Float exports **`[0.18, 0.18, 1, 1]`**. |
+| Same-format sample after owned-byte supersession | `884a372` + unit test; live `composite4` still epsilon — **not** the sole closer. |
 
 ## Live progression (capture on)
 
@@ -35,7 +39,7 @@ Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
 | Splash logos | Yes |
 | Content-warning + **ruined hallway 3D** | Yes |
 | Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs + `depthfix` efc) |
-| Title **3D background** | **No — efc still black/near-black** (`tonemap5c`: `800bf4` TARGET mag≈1.1e5 in TL 1152×648; UI yes; UV/tex0-size closed; scene quality + composite open) |
+| Title **3D background** | **No** — `composite4` @ `884a372`: `800e73` TARGET `rgb_nonzero=0`, pixel_outputs ±1e-3; efc center black |
 
 ## Root causes (historical → current)
 
@@ -55,45 +59,24 @@ Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
    `PA_CL_VTE_CNTL=0x43f` (`VTX_W0_FMT`) was not applied → Metal clipped the triangle.
    Fixed (`e75d19c`); live proves coverage restored.
 9. **`800bf4` exports float-zero after coverage** (clean `vte-w0`): PS runs full-screen;
-   exports match float-±0 scene tex0. **Not** an AbgrFp16→RG11B10 CB packing bug. Prior
-   “sampled natives nz≠0” counted IEEE sign bits (`0x80` / `0x80000000`). Writer of tex0 is
-   compute `800c7e`.
-10. **`800c7e` writes ±0 because upstream GBuffers are empty** (clean `cs800c7e` @ `32b445d`):
-    `COMPUTE-IMAGES` shows `ImageLoad` of full-res `803d6e` RGBA16Float + depth + R8Uint
-    (plus sampled 1×1 optionals). Readback bins: color+depth magnitude-zero; store is fp16
-    `0x8000` only. Lighting `800a69` has full coverage but zero exports; its sampled
-    `8023b9` is all-zero in Metal and guest. Sampled-only writer lineage previously hid
-    the ImageLoads — not “CS only binds dummies”.
-11. **GBuffers empty because deferred BasePass is never submitted** — **narrowed**: true for
-    content-warning-only (clean `gbuffer` @ `736d540`, no pad). **False at title**: clean
-    `basepass` @ `9cc9f2f` + AUTO_CROSS reaches NEW GAME with `total_mask_mrt3plus≈8591`
-    (7-slot 1920×1080 to `8068e0…`, Metal `gputrue`). `8023b9` still never a COLOR target;
-    depth `801ac2` still `gpufalse/v0`; title BG still black. COLOR-EMIT previously mis-logged
-    AGC ATTRIB2 extents as GFX10 packing (`c438×1e0`); real size is 1920×1080.
-12. **Title BG black despite filled BasePass MRTs** (clean `mrtocc2` + `lightpost2` @ `de613d3`):
-    occupancy is real geometry magnitude, not clear-only version bumps. Post-BasePass
-    `800b22` samples remapped `80688f` (RGB-black/alpha-occupied PPM; blend preserves MRT0).
-    Deferred lighting `800a69` is **not** re-submitted after title BasePass (title uses
-    `8009c1` onto MRT0 instead). **`800c7e` does re-run after BasePass** (PERF-BATCHES;
-    prior “never after BasePass” overstated from early-only `COMPUTE-IMAGES` dumps).
-13. **Empty R32Float depth shadow stole Depth32Float DB authority** (fix `3f9e559`):
-    post-prepass samples at `801ac2`/`801abe` bound a gpu-authored magnitude-0 R32Float
-    resident while Depth32Float was demoted (`gpufalse`) → `depth_native=0`. Live after fix:
-    `depth_native` hits hundreds; post-BP `800c7e` writes non-zero `804345`.
-14. **`800bf4` true-zero exports with lit tex0** (clean `tonemap4` @ `267d256`):
-    post-BasePass draw 47402, blend off, tex0 `804345` Metal+guest magnitude ≫0, TARGET
-    and exports true float 0.0. Not packing / empty bind / pre-BP stale SRD (`tonemap3`).
-15. **UV/attr0 via mesh BufferLoad V#** (tonemap4 analysis + tonemap5c live @ `37589c3`):
-    Heap holds **RegularBuffer** `0x00005204` (= AGC `initializeRegularBuffer`) — **not**
-    BUF_RSRC_WORD3 mis-decode. UE patches FORMAT from meshlet (64/77). SLoad dynamic-offset
-    heap span fixed to `0x200` (`37589c3`); live heap bind is `0x200` and `800bf4` TARGET
-    magnitude_nz=109231 (tonemap4 was 0).
-16. **UV ±0.6 is intentional ViewSize/BufferSize** (`UV-TEX0-ATTR.txt`): ES
-    `(vb×1152)×(1/1920)` with oversized NDC tri → screen UV [0,0.6] for 60% view;
-    PS raw-attr0 sample matches ISA; s40–43 identity. “Missing +0.5” emulator patch
-    refuted.
-17. **tex0 “780×438” was `{:x?}` Debug** on 1920×1080 descriptors; occupancy confined to
-    TL 1152×648 matching `800c7e` dispatch. efc title BG still not assessable.
+   exports match float-±0 scene tex0. **Not** an AbgrFp16→RG11B10 CB packing bug.
+10. **`800c7e` writes ±0 because upstream GBuffers are empty** (clean `cs800c7e` @ `32b445d`).
+11. **GBuffers empty on content-warning-only; BasePass emits at title** (`basepass` @ `9cc9f2f`).
+12. **Title BG black despite filled BasePass MRTs** (`mrtocc2` / `lightpost2`).
+13. **Empty R32Float depth shadow stole Depth32Float DB authority** (`3f9e559`).
+14. **`800bf4` true-zero exports with lit tex0** (`tonemap4`).
+15. **UV/attr0 via mesh BufferLoad V#** — SLoad heap span `0x200` (`37589c3`); tonemap5c mag≠0.
+16. **UV ±0.6 is intentional ViewSize/BufferSize** (`UV-TEX0-ATTR.txt`).
+17. **tex0 “780×438” was `{:x?}` Debug** on 1920×1080 descriptors.
+18. **`800bf4`→`800e73`→`800da3`→efc black despite lit tonemap** (clean `composite3`/`4`,
+    `eyeadapt`): HDR tex0 is bound and nonzero; `800e73` TARGET stays opaque black with
+    pixel_outputs ±1e-3. ES `800dbb` reads EyeAdapt 1×1 into `param1.x`/`attr1[0]` which
+    scales the filmic combine — **attr1≈0**. Live `800b44` writes valid exposure **0.18** to
+    its COLOR VA, but title ES user T# often names a **different** 1×1 (e.g. `composite4`:
+    ES `804327` vs PERF writer `803b67`; `composite3`: ES `803b67` vs writer `80466d`).
+    `884a372` closes same-format `serves_reads()` false-negatives after neighbour owned-byte
+    theft; live still epsilon → **ES EyeAdapt T# / history-buffer identity** is the open
+    composite blocker (not “tonemap never reaches composite”).
 
 ## Anti-claims
 
@@ -124,17 +107,21 @@ Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
 - UTF-16 in stride-32 VB padding ≠ “VB is material/debug ASCII only”.
 - ES UV PARAM0 ±0.6 ≠ missing-+0.5 CB bug (ViewSize/BufferSize + oversized tri; ISA samples raw attr0).
 - TARGET dump `width: 780` under `{:x?}` ≠ half-res tex0 (decimal 1920; PPM 1920×1080).
+- Lit composite tex0 + `800b44` writing 0.18 ≠ ES EyeAdapt T# is that write VA (`composite4`).
+- `884a372` same-format owned-supersession bind ≠ title-BG closure (live `composite4` still ε).
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
 - Alias/sampled publish stays default-off (`REMU_PUBLISH_INTERNAL_WRITEBACKS=1` opt-in).
 
 ## Next recommended blockers
 
-1. **Scene-color TL quality** — `8071ca` ~9.5% magnitude fill in 1152×648; tonemap exports
-   G-dominated (max fp16); tiler/store vs lighting content.
-2. **Nonzero `800bf4` → efc** — chain `800e73`→`80c5c5`→`800da3`→efc after TL tonemap;
-   why title BG still not assessable.
-3. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
+1. **ES EyeAdapt T# vs `800b44` COLOR VA** — why mesh ES user SRD names a 1×1 that is not the
+   live writer (stale history slot / dropped copy / user-SGPR refresh / CB decode). Prove with
+   same-run dump of ES scalars + `800b44` TARGET address + Metal occupancy of both VAs.
+2. **`remu_s_31` @ `b2+0x878`** — secondary scale on HDR/bloom before `attr1`; dump full
+   `0x1690` global (diagnostic head is 256B only).
+3. **Scene-color TL quality** — `8071ca` sparse G / noise after exposure scale works.
+4. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
 
 ## Commits (this continuation)
 
@@ -164,10 +151,12 @@ Prior SLoad `37589c3` / tonemap5c live. efc title BG still not assessable.
 | `b9a6bc24` | docs: tonemap5c live — TARGET mag≠0 after SLoad span; UV±0.6 next |
 | `9b17b54` | docs: point handoff tip at tonemap5c HEAD |
 | `a82f031` | TARGET dump: decimal extents (no `{:x?}` width/height) |
-| *(docs tip)* | UV/tex0 attribution (`UV-TEX0-ATTR.txt`) |
+| `a363cde` / `8e75b620` | docs: UV/tex0 attribution closed |
+| `884a372` | Same-format GPU sample after owned-byte supersession (EyeAdapt-class) |
 
 ## Checks
 
-- `cargo check -p remu-gpu-metal --all-targets` — arm64 + `x86_64-apple-darwin` green
-- Live clean `tonemap5c` @ `b526ed27`: TARGET magnitude_nz=109231; efc BG not assessable
-- Attribution: `runs/silent-hill-title-bg-tonemap5c/UV-TEX0-ATTR.txt`
+- `cargo check -p remu-gpu-metal --all-targets` — arm64 + `x86_64-apple-darwin` green @ `884a372`
+- Unit: `same_address_same_format_sample_survives_partial_owned_supersession` + BGRA color-view sibling
+- Live clean `composite4` @ `884a372`: `800e73` still ε / `rgb_nonzero=0`; ES T# `804327` ≠ writer `803b67`
+- Live clean `eyeadapt`: `800b44` exports `[0.18,0.18,1,1]`
