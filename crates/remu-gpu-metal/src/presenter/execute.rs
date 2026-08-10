@@ -6,7 +6,7 @@ use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
     DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO, DEFAULT_CB_COLOR_CONTROL,
-    DEFAULT_PA_SU_SC_MODE_CNTL,
+    DEFAULT_PA_SU_SC_MODE_CNTL, DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
@@ -29,42 +29,44 @@ use super::{
     diagnostic_disable_culling, diagnostic_disable_depth, diagnostic_disable_depth_and_culling,
     diagnostic_dump_complex_msaa, diagnostic_dump_compute_texture_minimum_dispatch,
     diagnostic_dump_depth_export_shader, diagnostic_dump_gbuffer, diagnostic_dump_glyph_draw,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_before_pixel_shader,
+    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    diagnostic_dump_target_address_range, diagnostic_dump_target_before_pixel_shader,
     diagnostic_dump_target_index_count, diagnostic_dump_target_match_index,
-    diagnostic_dump_target_mrt_min,
-    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
-    diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
-    diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
+    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_mrt_min,
+    diagnostic_dump_target_pixel_instruction_count, diagnostic_dump_target_pixel_shader,
+    diagnostic_dump_video_chain_consumer, diagnostic_dump_video_draw,
+    diagnostic_dump_video_target_consumer, diagnostic_f32_bits_magnitude_nonzero,
     diagnostic_force_msaa_vertex_pattern, diagnostic_global_binding_head,
-    diagnostic_overlapping_global_writers, diagnostic_overlapping_memory_copies,
-    diagnostic_overlapping_texture_writers, diagnostic_related_texture_writers,
-    diagnostic_scanout_writer_slot, diagnostic_scanout_writer_target_selected,
-    diagnostic_shader_summary, diagnostic_target_draw_filter,
-    diagnostic_f32_bits_magnitude_nonzero, diagnostic_texture_depth_plane_summaries,
-    diagnostic_texture_magnitude_nonzero_texels, diagnostic_texture_writer,
-    diagnostic_texture_writer_enabled, diagnostic_trace_all_target_contents,
-    diagnostic_trace_target_contents, diagnostic_trace_target_maximum_draw,
-    diagnostic_trace_target_stride, diagnostic_uploaded_global_binding_head,
-    diagnostic_use_draw_merged_wave_counts, diagnostic_video_chain_selected_draw,
-    dump_msl_compute_filter_matches, dump_shader_pair_msl, evaluation_samples_glyph_atlas,
-    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
-    fragmentless_pixel_evaluation, guest_frame_fingerprint, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
-    initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
-    is_writable_image_opcode, metal_nonindexed_vertex_count, metal_primitive_type,
-    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, ngg_mesh_base_vertex,
-    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_nonindexed_ngg_indices,
-    read_draw_indices, read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    diagnostic_note_full_resolution_mrt_draw, diagnostic_overlapping_global_writers,
+    diagnostic_overlapping_memory_copies, diagnostic_overlapping_texture_writers,
+    diagnostic_related_texture_writers, diagnostic_scanout_writer_slot,
+    diagnostic_scanout_writer_target_selected, diagnostic_shader_summary,
+    diagnostic_target_after_mrt_ready, diagnostic_target_draw_filter,
+    diagnostic_texture_depth_plane_summaries, diagnostic_texture_magnitude_nonzero_texels,
+    diagnostic_texture_numeric_range, diagnostic_texture_writer, diagnostic_texture_writer_enabled,
+    diagnostic_trace_all_target_contents, diagnostic_trace_target_contents,
+    diagnostic_trace_target_maximum_draw, diagnostic_trace_target_stride,
+    diagnostic_uploaded_global_binding_head, diagnostic_use_draw_merged_wave_counts,
+    diagnostic_video_chain_selected_draw, dump_msl_compute_filter_matches, dump_shader_pair_msl,
+    evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
+    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation, guest_frame_fingerprint,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
+    image_resource_descriptor_is_null, initial_depth_clear_for_target,
+    initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
+    metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
+    native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
+    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible,
-    sampled_image_bindings, shader_scalar_metadata_for_registers,
-    should_record_diagnostic_target_writer, snapshot_guest_texture_raw, spans_overlap,
-    storage_image_requires_mip_hierarchy, trace_glyph_atlas, trace_image_descriptors,
-    trace_msaa_writes, trace_scanout_writes, trace_target_sampling, upload_image_textures,
-    validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
+    resident_same_image_sample_is_eligible, sampled_image_bindings,
+    shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
+    snapshot_guest_texture_raw, spans_overlap, storage_image_requires_mip_hierarchy,
+    trace_glyph_atlas, trace_image_descriptors, trace_msaa_writes, trace_scanout_writes,
+    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
+    video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -148,13 +150,20 @@ impl MetalPresenter {
                     .as_ref()
                     .is_some_and(|shader| shader.program.instructions.len() == count)
             });
-        let diagnostic_gbuffer_draw = diagnostic_gbuffer_program
-            && draw.index_count == 6
-            && !targets.is_empty()
-            && targets
-                .iter()
-                .all(|target| target.texture.width == 1_920 && target.texture.height == 1_080)
-            && (targets.len() >= 4 || draw.pixel_shader_address >= 0x8030_0000_00);
+        let diagnostic_mrt_draw = diagnostic_dump_target_mrt_min().is_some_and(|minimum| {
+            targets.len() >= minimum
+                && targets
+                    .iter()
+                    .all(|target| target.texture.width >= 1_280 && target.texture.height >= 720)
+        });
+        let diagnostic_gbuffer_draw = diagnostic_mrt_draw
+            || (diagnostic_gbuffer_program
+                && draw.index_count == 6
+                && !targets.is_empty()
+                && targets
+                    .iter()
+                    .all(|target| target.texture.width == 1_920 && target.texture.height == 1_080)
+                && (targets.len() >= 4 || draw.pixel_shader_address >= 0x8030_0000_00));
         if diagnostic_dump_gbuffer()
             && draw.pixel_shader_address >= 0x8030_0000_00
             && draw.index_count == 6
@@ -876,7 +885,14 @@ impl MetalPresenter {
             {
                 // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
                 static DUMPED_SCANOUT_PAIRS: AtomicUsize = AtomicUsize::new(0);
-                if DUMPED_SCANOUT_PAIRS.fetch_add(1, Ordering::Relaxed) < 128 {
+                // General scanout tracing can exhaust its cap during the long title startup.
+                // Preserve one independent slot for the first semantically selected G-buffer
+                // draw so a relocated shader address cannot make the requested dump disappear.
+                static DUMPED_DIAGNOSTIC_GBUFFER_PAIR: AtomicBool = AtomicBool::new(false);
+                let general_slot = DUMPED_SCANOUT_PAIRS.fetch_add(1, Ordering::Relaxed) < 128;
+                let diagnostic_gbuffer_slot = diagnostic_gbuffer_draw
+                    && !DUMPED_DIAGNOSTIC_GBUFFER_PAIR.swap(true, Ordering::Relaxed);
+                if general_slot || diagnostic_gbuffer_slot {
                     let sampled = sampled_image_bindings(pixel_evaluation)
                         .map(|binding| {
                             let descriptor =
@@ -903,6 +919,38 @@ impl MetalPresenter {
                         eprintln!(
                             "[REMu][METAL] could not dump scanout MSL for es={:#x} ps={:#x}: {error}",
                             draw.export_shader_address, draw.pixel_shader_address,
+                        );
+                    }
+                }
+            }
+            if diagnostic_dump_video_chain_consumer()
+                && diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence
+                && let Some(directory) = std::env::var_os("REMU_DUMP_VIDEO_CHAIN_MSL_DIR")
+            {
+                static DUMPED_VIDEO_CHAIN_PAIR: AtomicBool = AtomicBool::new(false);
+                if !DUMPED_VIDEO_CHAIN_PAIR.swap(true, Ordering::Relaxed) {
+                    if let Err(error) = dump_shader_pair_msl(
+                        Path::new(&directory),
+                        draw.export_shader_address,
+                        draw.pixel_shader_address,
+                        &compiled.vertex.source,
+                        &compiled.pixel.source,
+                    ) {
+                        eprintln!(
+                            "[REMu][METAL] could not dump video-chain MSL for es={:#x} ps={:#x}: {error}",
+                            draw.export_shader_address, draw.pixel_shader_address,
+                        );
+                    } else {
+                        eprintln!(
+                            "[REMu][METAL][VIDEO-CHAIN-MSL] draw={} es={:#x} ps={:#x} vertex_bytes={} pixel_bytes={} vertex_capture={} pixel_capture={} directory={}",
+                            draw.sequence,
+                            draw.export_shader_address,
+                            draw.pixel_shader_address,
+                            compiled.vertex.source.len(),
+                            compiled.pixel.source.len(),
+                            compiled.vertex.source.contains("remu_debug_position"),
+                            compiled.pixel.source.contains("remu_debug_pixel"),
+                            Path::new(&directory).display(),
                         );
                     }
                 }
@@ -1263,6 +1311,10 @@ impl MetalPresenter {
                 }
             }
         }
+        let target_capture_requested = diagnostic_dump_target_pixel_shader().is_some()
+            || diagnostic_dump_target_pixel_instruction_count().is_some()
+            || diagnostic_dump_target_address().is_some()
+            || diagnostic_dump_target_address_range().is_some();
         let diagnostic_capture_enabled = if diagnostic_dump_video_target_consumer() {
             static VIDEO_CAPTURE_MATCHES: AtomicUsize = AtomicUsize::new(0);
             let is_target_candidate = draw.sequence >= diagnostic_dump_target_minimum_draw()
@@ -1278,13 +1330,49 @@ impl MetalPresenter {
                     == diagnostic_dump_target_match_index()
         } else if diagnostic_dump_video_chain_consumer() {
             diagnostic_video_chain_selected_draw().load(Ordering::Relaxed) == draw.sequence
+        } else if target_capture_requested {
+            diagnostic_target_draw_filter().is_some_and(|filter| {
+                targets.iter().any(|target| {
+                    (!filter.auto_target_skips_scanout() || !target.direct_scanout)
+                        && filter.matches(
+                            draw.sequence,
+                            draw.pixel_shader_address,
+                            target.texture.address,
+                            target.texture.width,
+                            target.texture.height,
+                        )
+                })
+            })
         } else {
             true
         };
-        if diagnostic_capture_vertex_position() {
+        if diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address) {
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+                eprintln!(
+                    "[REMu][METAL][TARGET-FILTER-CHECK] draw={} ps={:#x} ready={} armed={} key_capture={}/{} targets={:?}",
+                    draw.sequence,
+                    draw.pixel_shader_address,
+                    diagnostic_target_after_mrt_ready(),
+                    diagnostic_capture_enabled,
+                    key.diagnostics.capture_vertex_position,
+                    key.diagnostics.capture_pixel_output,
+                    targets
+                        .iter()
+                        .map(|target| (
+                            target.texture.address,
+                            target.texture.width,
+                            target.texture.height,
+                            target.direct_scanout,
+                        ))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        if key.diagnostics.capture_vertex_position {
             vertex_scalar_metadata.push(u32::from(diagnostic_capture_enabled));
         }
-        if diagnostic_capture_pixel_output() {
+        if key.diagnostics.capture_pixel_output {
             pixel_scalar_metadata.push(u32::from(diagnostic_capture_enabled));
         }
         let vertex_scalar_byte_count = vertex_scalar_metadata
@@ -1334,7 +1422,7 @@ impl MetalPresenter {
             .as_ref()
             .copied()
             .map(|depth| self.cached_depth_stencil_state(&device, depth));
-        let diagnostic_vertex_position_buffer = if diagnostic_capture_vertex_position() {
+        let diagnostic_vertex_position_buffer = if key.diagnostics.capture_vertex_position {
             let byte_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
                 .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)
                 .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
@@ -1345,23 +1433,25 @@ impl MetalPresenter {
                 buffer.set_label("REMu diagnostic vertex positions");
                 self.diagnostic_vertex_position_buffer = Some(buffer);
             }
-            // Zero per draw so TARGET dumps do not inherit prior-draw residue. Mesh stages do not
-            // write this buffer today; stale non-zeros previously looked like guest VB samples.
+            // Zero only for the armed draw. The shader pair is instrumented before the semantic
+            // gate opens, but its capture branch is disabled on earlier composites.
             let buffer = self
                 .diagnostic_vertex_position_buffer
                 .as_ref()
                 .expect("diagnostic vertex-position buffer was just ensured");
             let byte_count = usize::try_from(byte_count)
                 .expect("diagnostic vertex-position byte count fits usize");
-            assert!(
-                super::MetalBytes::new(buffer).fill(0, 0, byte_count),
-                "diagnostic vertex-position buffer must expose byte_count shared bytes"
-            );
+            if diagnostic_capture_enabled {
+                assert!(
+                    super::MetalBytes::new(buffer).fill(0, 0, byte_count),
+                    "diagnostic vertex-position buffer must expose byte_count shared bytes"
+                );
+            }
             Some(buffer.clone())
         } else {
             None
         };
-        let diagnostic_pixel_output_buffer = if diagnostic_capture_pixel_output() {
+        let diagnostic_pixel_output_buffer = if key.diagnostics.capture_pixel_output {
             let byte_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
                 .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)
                 .and_then(|pixels| pixels.checked_mul(5))
@@ -1373,18 +1463,20 @@ impl MetalPresenter {
                 buffer.set_label("REMu diagnostic pixel outputs");
                 self.diagnostic_pixel_output_buffer = Some(buffer);
             }
-            // Zero per draw: without this, covered=2073600 accumulates across every PS draw in the
-            // session and cannot attribute fullscreen coverage to the dumped TARGET draw.
+            // Zero only for the armed draw: without this, covered=2073600 can inherit an earlier
+            // capture and cannot be attributed to the dumped TARGET draw.
             let buffer = self
                 .diagnostic_pixel_output_buffer
                 .as_ref()
                 .expect("diagnostic pixel-output buffer was just ensured");
             let byte_count =
                 usize::try_from(byte_count).expect("diagnostic pixel-output byte count fits usize");
-            assert!(
-                super::MetalBytes::new(buffer).fill(0, 0, byte_count),
-                "diagnostic pixel-output buffer must expose byte_count shared bytes"
-            );
+            if diagnostic_capture_enabled {
+                assert!(
+                    super::MetalBytes::new(buffer).fill(0, 0, byte_count),
+                    "diagnostic pixel-output buffer must expose byte_count shared bytes"
+                );
+            }
             Some(buffer.clone())
         } else {
             None
@@ -1703,7 +1795,15 @@ impl MetalPresenter {
                 );
             }
             if let Some(buffer) = diagnostic_vertex_position_buffer.as_ref() {
-                encoder.set_vertex_buffer(DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, Some(buffer), 0);
+                if uses_mesh_stage {
+                    encoder.set_mesh_buffer(DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX, Some(buffer), 0);
+                } else {
+                    encoder.set_vertex_buffer(
+                        DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+                        Some(buffer),
+                        0,
+                    );
+                }
             }
             encoder.set_fragment_bytes(
                 u64::from(pixel_scalar_buffer_index),
@@ -1963,6 +2063,14 @@ impl MetalPresenter {
             // boundary so later compositor and interface passes cannot be skipped.
             self.note_pending_flip_target_write(target.texture);
         }
+        diagnostic_note_full_resolution_mrt_draw(
+            draw.sequence,
+            targets.len(),
+            !targets.is_empty()
+                && targets
+                    .iter()
+                    .all(|target| target.texture.width >= 1_280 && target.texture.height >= 720),
+        );
         let dump_target_before_pixel_shader =
             diagnostic_dump_target_before_pixel_shader().is_some() || diagnostic_dump_glyph_draw();
         let trace_scanout_writers = trace_scanout_writes();
@@ -2058,14 +2166,19 @@ impl MetalPresenter {
                         .diagnostic_vertex_position_buffer
                         .as_ref()
                         .and_then(|buffer| {
-                            let indices = indexed_draw.as_ref()?.0.as_ref();
                             let word_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
                                 .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)?;
                             let words =
                                 super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
-                            let mut seen = HashSet::new();
-                            Some(
-                                indices
+                            let indices = if uses_mesh_stage {
+                                // Mesh diagnostics are indexed by the Metal mesh-local thread,
+                                // not by the guest index buffer consumed inside that thread.
+                                (0..24).collect::<Vec<_>>()
+                            } else {
+                                let mut seen = HashSet::new();
+                                indexed_draw
+                                    .as_ref()?
+                                    .0
                                     .iter()
                                     .copied()
                                     .filter_map(|index| {
@@ -2079,6 +2192,11 @@ impl MetalPresenter {
                                         }) && seen.insert(*index)
                                     })
                                     .take(24)
+                                    .collect()
+                            };
+                            Some(
+                                indices
+                                    .into_iter()
                                     .map(|index| {
                                         let base = usize::try_from(index)
                                             .expect("filtered diagnostic vertex index fits usize")
@@ -2183,7 +2301,44 @@ impl MetalPresenter {
         {
             self.capture_scanout_writer_after_draw(slot, draw, target)?;
         }
-        let diagnostic_target = diagnostic_target_draw_filter()
+        let diagnostic_target_filter = diagnostic_target_draw_filter();
+        if diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address)
+            && diagnostic_target_after_mrt_ready()
+        {
+            static LOGGED_READY_TARGET_FILTERS: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED_READY_TARGET_FILTERS.fetch_add(1, Ordering::Relaxed) < 8 {
+                let sampled_addresses = diagnostic_sampled_storage
+                    .iter()
+                    .flatten()
+                    .map(|descriptor| descriptor.address)
+                    .collect::<Vec<_>>();
+                let target_matches = diagnostic_target_filter.map(|filter| {
+                    targets
+                        .iter()
+                        .map(|target| {
+                            (
+                                target.texture.address,
+                                target.texture.width,
+                                target.texture.height,
+                                target.direct_scanout,
+                                filter.matches(
+                                    draw.sequence,
+                                    draw.pixel_shader_address,
+                                    target.texture.address,
+                                    target.texture.width,
+                                    target.texture.height,
+                                ),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                });
+                eprintln!(
+                    "[REMu][METAL][TARGET-FILTER-READY] draw={} ps={:#x} filter={diagnostic_target_filter:?} sampled={sampled_addresses:#x?} targets={target_matches:?}",
+                    draw.sequence, draw.pixel_shader_address,
+                );
+            }
+        }
+        let diagnostic_target = diagnostic_target_filter
             .and_then(|filter| {
                 if !filter.matches_sampled_addresses(
                     diagnostic_sampled_storage
@@ -2400,6 +2555,75 @@ impl MetalPresenter {
                     .as_ref()
                     .ok_or("Metal command queue is unavailable")?
                     .clone();
+                // The title compositor's exposure is loaded by its export/mesh shader, while the
+                // ordinary target dump below only inventories pixel-stage textures. Preserve the
+                // exact native bytes bound for EyeAdaptation-class inputs so a zero guest shadow,
+                // stale history resident, or correct Metal value can be distinguished in one run.
+                for (slot, (binding, uploaded)) in canonical_texture_bindings(export_evaluation)
+                    .into_iter()
+                    .zip(&export_textures)
+                    .enumerate()
+                    .filter(|(_, (_, uploaded))| {
+                        uploaded.descriptor.guest.width == 1
+                            && uploaded.descriptor.guest.height == 1
+                            && uploaded.descriptor.guest.pixel_format == MTLPixelFormat::RGBA32Float
+                    })
+                {
+                    let readback_descriptor = GuestTextureDescriptor {
+                        pixel_format: uploaded.texture.pixel_format(),
+                        bytes_per_pixel: metal_uncompressed_bytes_per_pixel(
+                            uploaded.texture.pixel_format(),
+                        )
+                        .unwrap_or(uploaded.descriptor.guest.bytes_per_pixel),
+                        ..uploaded.descriptor.guest
+                    };
+                    let native = read_texture_linear(
+                        &device,
+                        &queue,
+                        &uploaded.texture,
+                        readback_descriptor,
+                    )
+                    .map(|bytes| {
+                        (
+                            bytes.iter().filter(|&&value| value != 0).count(),
+                            guest_frame_fingerprint(&bytes),
+                            bytes.get(..bytes.len().min(32)).unwrap_or(&[]).to_vec(),
+                        )
+                    });
+                    let guest =
+                        snapshot_guest_texture_raw(uploaded.descriptor.guest).map(|bytes| {
+                            (
+                                bytes.iter().filter(|&&value| value != 0).count(),
+                                guest_frame_fingerprint(&bytes),
+                                bytes.get(..bytes.len().min(32)).unwrap_or(&[]).to_vec(),
+                            )
+                        });
+                    let selected = uploaded.selected_resident.and_then(|descriptor| {
+                        self.resident_guest_textures
+                            .get(&descriptor)
+                            .map(|resident| {
+                                (
+                                    descriptor,
+                                    resident.state,
+                                    resident.serves_reads(),
+                                    resident.gpu_written(),
+                                    resident.content_version,
+                                    resident.owned.byte_count(),
+                                    resident.gpu_authored.byte_count(),
+                                    resident.last_use,
+                                )
+                            })
+                    });
+                    eprintln!(
+                        "[REMu][METAL][TARGET-EXPORT-TEXTURE] draw={} slot={slot} pc={:#x} op={} words={:08x?} requested={:?} selected={selected:?} native_format={:?} native={native:x?} guest={guest:x?}",
+                        draw.sequence,
+                        binding.pc,
+                        binding.opcode,
+                        binding.resource_descriptor,
+                        uploaded.descriptor,
+                        uploaded.texture.pixel_format(),
+                    );
+                }
                 if diagnostic_gbuffer_draw {
                     let mut attachment_summaries = Vec::with_capacity(targets.len());
                     for attachment_target in &targets {
@@ -2970,6 +3194,10 @@ impl MetalPresenter {
                                 sampled_bytes.iter().filter(|&&value| value != 0).count(),
                                 sampled_fingerprint,
                                 sampled_depth_planes,
+                                diagnostic_texture_numeric_range(
+                                    &sampled_bytes,
+                                    readback_descriptor,
+                                ),
                                 sampled_bytes
                                     .get(..sampled_bytes.len().min(32))
                                     .unwrap_or(&[])
@@ -3057,20 +3285,27 @@ impl MetalPresenter {
                 } else {
                     String::new()
                 };
+                let numeric_range = diagnostic_texture_numeric_range(&bytes, descriptor);
                 let diagnostic_vertex_positions = self
                     .diagnostic_vertex_position_buffer
                     .as_ref()
                     .and_then(|buffer| {
-                        let indices = indexed_draw.as_ref()?.0.as_ref();
                         let word_count = DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
                             .checked_mul(DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX)?;
                         // The diagnostic buffer is allocated above with exactly this many shared
                         // u32 words and the completed command batch is waited before readback.
                         let words =
                             super::MetalBytes::new(buffer).typed_slice::<u32>(0, word_count)?;
-                        let mut seen = HashSet::new();
-                        Some(
-                            indices
+                        let indices = if uses_mesh_stage {
+                            // The injected mesh capture writes one record per Metal mesh-local
+                            // thread. Guest indices are data read by those threads and do not name
+                            // records in this buffer.
+                            (0..24).collect::<Vec<_>>()
+                        } else {
+                            let mut seen = HashSet::new();
+                            indexed_draw
+                                .as_ref()?
+                                .0
                                 .iter()
                                 .copied()
                                 .filter_map(|index| {
@@ -3083,6 +3318,11 @@ impl MetalPresenter {
                                     }) && seen.insert(*index)
                                 })
                                 .take(24)
+                                .collect()
+                        };
+                        Some(
+                            indices
+                                .into_iter()
                                 .map(|index| {
                                     let base = usize::try_from(index)
                                         .expect("filtered diagnostic vertex index fits usize")
@@ -3202,7 +3442,7 @@ impl MetalPresenter {
                     );
                 }
                 eprintln!(
-                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} magnitude_nz={} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_dump:?} vertex_scalars={:08x?} pixel_scalars={:08x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
+                    "[REMu][METAL][TARGET] draw={} es={:#x} ps={:#x} indexed={} count={} instances={} primitive={:#x} index_offset={} base_vertex={} indices={:?} address={:#x} {}x{} format={:?} bytes={} nonzero={} magnitude_nz={} numeric={numeric_range:?} fingerprint={fingerprint:016x}{rgba8_summary} pipeline_targets={:?} vs_out={:#010x} ps_inputs={:08x?} vertex_positions={diagnostic_vertex_positions:?} pixel_outputs={diagnostic_pixel_outputs:?} sampled={sampled_dump:?} vertex_scalars={:08x?} pixel_scalars={:08x?} pixel_final_scalars={:08x?} pixel_scalar_memory_reads={:x?} vertex_globals_evaluated={:x?} pixel_globals_evaluated={:x?} vertex_globals_submitted={:x?} pixel_globals_submitted={:x?}",
                     draw.sequence,
                     draw.export_shader_address,
                     draw.pixel_shader_address,
@@ -3227,6 +3467,8 @@ impl MetalPresenter {
                     key.pixel_input_controls,
                     vertex_scalar_metadata,
                     pixel_evaluation.initial_scalar_registers,
+                    pixel_evaluation.scalar_registers,
+                    pixel_evaluation.scalar_memory_reads,
                     export_evaluation
                         .global_memory_bindings
                         .iter()

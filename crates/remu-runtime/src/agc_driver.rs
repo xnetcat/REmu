@@ -160,7 +160,7 @@ fn dispatch_tooling(nid: &str) -> Option<u64> {
         "Ddwk4gLT5j0" | "+TN0oRTBxJQ" | "qspAL8bgcBY" | "HMnVBVUyajk" => {
             remu_gpu::note_inert(nid);
             0
-        },
+        }
         "rJUyMrDdxJg" => SHADER_DEBUGGING_NOT_AVAILABLE,
         "Xq5WmbwPTnQ" | "SAfhzJPcjuk" | "FOwvmNlFLjM" | "+iAOE3jCnkk" | "WHIOMbb+iIU"
         | "chJWZcNSzjk" | "ICaGtkEIXTk" | "8F5j7U-Bq6s" => AGC_ERROR_GPU_CAPTURE_NOT_AVAILABLE,

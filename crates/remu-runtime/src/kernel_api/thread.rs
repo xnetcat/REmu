@@ -252,7 +252,10 @@ mod tests {
     fn sdk_system_affinity_can_place_a_thread_on_the_thirteenth_cpu() {
         let mut state = ProbeDispatchState::default();
 
-        assert_eq!(placed_core(&mut state, THREAD, SYSTEM_THREAD_AFFINITY_MASK & (1 << 12)), 12);
+        assert_eq!(
+            placed_core(&mut state, THREAD, SYSTEM_THREAD_AFFINITY_MASK & (1 << 12)),
+            12
+        );
         assert_eq!(state.thread_running_cpu.get(&THREAD), Some(&12));
     }
 }

@@ -664,8 +664,8 @@ fn decode_stencil_state(
     let separate_back = control & 0x80 != 0;
     let op_control = register_value(context_registers, DB_STENCIL_CONTROL).unwrap_or(0);
     let front_ref_mask = register_value(context_registers, DB_STENCILREFMASK).unwrap_or(0);
-    let back_ref_mask = register_value(context_registers, DB_STENCILREFMASK_BF)
-        .unwrap_or(front_ref_mask);
+    let back_ref_mask =
+        register_value(context_registers, DB_STENCILREFMASK_BF).unwrap_or(front_ref_mask);
     let front = DecodedStencilFace {
         compare: metal_compare_function((control >> 8) & 0x7),
         stencil_fail: metal_stencil_operation(op_control, "fail")?,

@@ -218,30 +218,71 @@ fn compressed_integer_mrt_pair_enables_preserve_the_other_pair() {
 }
 
 #[test]
-fn forces_clip_space_w_to_one_when_vtx_w0_fmt_enabled() {
+fn converts_vte_position_formats_to_metal_clip_coordinates() {
     let program = decode_program(0x1000, &[0xbf81_0000]).expect("minimal vertex program decodes");
     let mut options = MetalCompileOptions::vertex(0);
-    options.force_position_w1 = true;
+    options.viewport_transform_control = 1 << 10;
     let shader = compile_msl(&program, &empty_evaluation(), &options).expect("vertex lowers");
     assert!(
-        shader.source.contains("remu_out.position.w = 1.0f;"),
-        "VTX_W0_FMT must rewrite exported W before Metal clip"
+        !shader.source.contains("remu_position_w0"),
+        "canonical X/Y/Z/W clip coordinates must reach Metal unchanged"
     );
 
     let mut mesh_options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
-    mesh_options.force_position_w1 = true;
+    mesh_options.viewport_transform_control = 1 << 8 | 1 << 9 | 1 << 10;
     let mesh = compile_msl(&program, &empty_evaluation(), &mesh_options).expect("mesh lowers");
     assert!(
-        mesh.source.contains("remu_out.position.w = 1.0f;"),
-        "mesh epilogue must apply VTX_W0_FMT before set_vertex"
+        mesh.source
+            .contains("remu_out.position.xy *= remu_position_w0;"),
+        "pre-divided guest XY must be restored to homogeneous Metal clip coordinates"
     );
     assert!(
-        mesh.source.find("remu_out.position.w = 1.0f;").unwrap()
+        mesh.source
+            .find("remu_out.position.xy *= remu_position_w0;")
+            .unwrap()
             < mesh
                 .source
                 .find("remu_mesh.set_vertex(remu_thread_index, remu_out)")
                 .unwrap(),
-        "W rewrite must precede set_vertex"
+        "position-format conversion must precede set_vertex"
+    );
+
+    options.viewport_transform_control = 0;
+    let reciprocal = compile_msl(&program, &empty_evaluation(), &options).expect("vertex lowers");
+    assert!(
+        reciprocal
+            .source
+            .contains("float remu_position_w0 = 1.0f / remu_out.position.w;"),
+        "VTX_W0_FMT clear means the guest exported 1/W0"
+    );
+}
+
+#[test]
+fn diagnostic_vertex_capture_records_mesh_outputs_and_registers() {
+    let program = decode_program(0x1000, &[0xbf81_0000]).expect("minimal mesh program decodes");
+    let mut options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
+    options.diagnostic_capture_vertex_position = true;
+    let shader = compile_msl(&program, &empty_evaluation(), &options).expect("mesh lowers");
+
+    assert!(
+        shader
+            .source
+            .contains("device uint* remu_debug_position [[buffer(28)]]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_debug_position[remu_debug_base + 10u] = remu_v_6;")
+    );
+    assert!(
+        shader
+            .source
+            .find("remu_debug_position[remu_debug_base + 10u]")
+            .unwrap()
+            < shader
+                .source
+                .find("remu_mesh.set_vertex(remu_thread_index, remu_out)")
+                .unwrap()
     );
 }
 
@@ -387,34 +428,6 @@ fn emits_guest_misc_layer_as_mesh_primitive_output() {
         );
         std::fs::remove_dir_all(directory).expect("remove layered mesh Metal test directory");
     }
-}
-
-#[test]
-fn builds_fused_es_gs_rectangle_equivalent_for_volume_generation() {
-    let shader = compile_layered_rectangle_vertex(2, 64);
-
-    assert_eq!(shader.stage, MetalShaderStage::Vertex);
-    assert_eq!(shader.interpolated_attribute_count, 2);
-    assert!(
-        shader
-            .source
-            .contains("uint render_target_array_index [[render_target_array_index]]")
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_out.render_target_array_index = min(remu_instance_id, 63u);")
-    );
-    assert!(
-        shader
-            .source
-            .contains("float remu_layer = (float(remu_instance_id) + 0.5f) / 64.0f;")
-    );
-    assert!(
-        shader
-            .source
-            .contains("remu_out.param1 = float4(remu_uv.x, 1.0f - remu_uv.y, remu_layer, 1.0f);")
-    );
 }
 
 #[test]

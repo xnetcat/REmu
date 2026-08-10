@@ -161,14 +161,52 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
-        self.stage_mesh_vertex_export();
+        if field == "position" {
+            self.convert_compacted_mesh_position();
+        }
+        self.publish_compacted_mesh_vertex();
         Ok(())
+    }
+
+    /// Convert a compacted mesh position at its POS export. Later PARAM exports publish the
+    /// same already-converted position, while a loop's next POS overwrites it before converting
+    /// again. This avoids repeatedly applying reciprocal-W conversion to one output record.
+    fn convert_compacted_mesh_position(&mut self) {
+        if self.options.stage != MetalShaderStage::Mesh || self.mesh_export_vertex_vgpr.is_none() {
+            return;
+        }
+        const VTX_XY_FMT: u32 = 1 << 8;
+        const VTX_Z_FMT: u32 = 1 << 9;
+        const VTX_W0_FMT: u32 = 1 << 10;
+        let control = self.options.viewport_transform_control;
+        let xy_predivided = control & VTX_XY_FMT != 0;
+        let z_predivided = control & VTX_Z_FMT != 0;
+        let w_is_w0 = control & VTX_W0_FMT != 0;
+        if !xy_predivided && !z_predivided && w_is_w0 {
+            return;
+        }
+        let w0 = if w_is_w0 {
+            "remu_out.position.w".to_owned()
+        } else {
+            "1.0f / remu_out.position.w".to_owned()
+        };
+        self.line(3, &format!("if (exec) {{ float remu_position_w0 = {w0};"));
+        if xy_predivided {
+            self.line(4, "remu_out.position.xy *= remu_position_w0;");
+        }
+        if z_predivided {
+            self.line(4, "remu_out.position.z *= remu_position_w0;");
+        }
+        self.line(4, "remu_out.position.w = remu_position_w0;");
+        self.line(3, "}");
     }
 
     /// Publish the current `remu_out` under the guest compacted vertex id so Metal
     /// `set_vertex(i, …)` receives the payload that EXP wrote for vertex `i`, not the
     /// payload left in the arbitrary thread that happens to own `remu_thread_index == i`.
-    fn stage_mesh_vertex_export(&mut self) {
+    /// Direct publication is also required for full-LDS shaders: a threadgroup staging array
+    /// would exceed Metal's 32-KiB limit even though the guest allocation itself is valid.
+    fn publish_compacted_mesh_vertex(&mut self) {
         let Some(vgpr) = self.mesh_export_vertex_vgpr else {
             return;
         };
@@ -178,7 +216,7 @@ impl Compiler<'_> {
         self.line(
             3,
             &format!(
-                "if (exec && v[{vgpr}] < {}u) remu_mesh_staged_vertices[v[{vgpr}]] = remu_out;",
+                "if (exec && v[{vgpr}] < {}u) remu_mesh.set_vertex(v[{vgpr}], remu_out);",
                 self.options.mesh_max_vertex_count
             ),
         );
@@ -275,7 +313,7 @@ impl Compiler<'_> {
                 );
             }
         }
-        self.stage_mesh_vertex_export();
+        self.publish_compacted_mesh_vertex();
         Ok(())
     }
 

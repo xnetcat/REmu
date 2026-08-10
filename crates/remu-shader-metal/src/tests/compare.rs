@@ -148,7 +148,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -164,7 +164,9 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes: 0,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: 256,
@@ -179,6 +181,52 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
     );
     assert!(shader.source.contains("(uint)(uint64_t)simd_ballot("));
     assert!(!shader.source.contains("const uint remu_lane = 0u"));
+}
+
+#[test]
+fn pixel_wave64_compare_clears_the_explicit_mask_high_word() {
+    let compare = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Vopc,
+        opcode: Opcode::Known("VCmpEqU32"),
+        words: vec![0],
+        sources: vec![Operand::vector(1), Operand::vector(2)],
+        destinations: vec![Operand::scalar(8)],
+        control: Some(InstructionControl::Sdwa(SdwaControl {
+            destination_select: 6,
+            destination_unused: 0,
+            source0_select: 6,
+            source1_select: 6,
+            source0_sign_extend: false,
+            source1_sign_extend: false,
+            absolute_mask: 0,
+            negate_mask: 0,
+            output_modifier: 0,
+            clamp: false,
+            scalar_destination: Some(8),
+        })),
+    };
+    let saveexec = Instruction {
+        pc: 8,
+        encoding: ShaderEncoding::Sop1,
+        opcode: Opcode::Known("SAndSaveexecB64"),
+        words: vec![0],
+        sources: vec![Operand::scalar(8)],
+        destinations: vec![Operand::scalar(20)],
+        control: None,
+    };
+    let program = Program::new(0x1000, vec![compare, saveexec]);
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("wave64 pixel mask should lower through a local SIMD32 half");
+
+    assert!(
+        shader.source.contains("remu_s_9 = 0u;"),
+        "the absent high half must not retain the neighboring descriptor SGPR"
+    );
 }
 
 #[test]

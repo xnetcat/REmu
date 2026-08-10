@@ -24,8 +24,8 @@ use super::{
     ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     procedural_rectangle_stage_for_draw, reconcile_pixel_input_controls_with_export_producers,
-    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface,
-    sampler_lod_bias, sampler_uses_normalized_coordinates, shader_scalar_metadata,
+    rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
+    sampler_uses_normalized_coordinates, shader_scalar_metadata,
     shader_scalar_metadata_for_registers, speculative_pipeline_compile_in_flight_capacity,
     truncated_memoryless_ngg_rectangle_cover, unmatched_param_default_control,
     validate_compute_launch_for_metal, wave64_split_blockers,
@@ -69,6 +69,7 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
     let key = ComputePipelineKey {
         program_identity: ProgramIdentity(program),
         lds_size_bytes: 0,
+        compute_threadgroup_size: 64,
         scratch_size_bytes: 0,
         wave_lane_count: 64,
         allocated_vector_register_count: 4,
@@ -126,6 +127,7 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
             .insert(ComputePipelineKey {
                 program_identity: ProgramIdentity(Arc::new(Program::new(address, Vec::new()))),
                 lds_size_bytes: 0,
+                compute_threadgroup_size: 64,
                 scratch_size_bytes: 0,
                 wave_lane_count: 64,
                 allocated_vector_register_count: 4,
@@ -389,13 +391,10 @@ fn rejects_only_non_default_pixel_inputs_without_vertex_exports() {
 
 #[test]
 fn reconciles_param_less_exports_to_sdk_use_default_without_lds() {
-    let controls = std::array::from_fn(|index| {
-        u32::try_from(index).expect("input-control index fits u32")
-    });
+    let controls =
+        std::array::from_fn(|index| u32::try_from(index).expect("input-control index fits u32"));
     let (reconciled, lds_missing) = reconcile_pixel_input_controls_with_export_producers(
-        &controls,
-        /*exported_parameters*/ 0,
-        /*interpolated_attributes*/ 0b11,
+        &controls, /*exported_parameters*/ 0, /*interpolated_attributes*/ 0b11,
         /*export_uses_general_lds*/ false,
     );
     assert!(lds_missing.is_empty());
@@ -415,13 +414,12 @@ fn reconciles_param_less_exports_to_sdk_use_default_without_lds() {
 #[test]
 fn refuses_to_reconcile_param_holes_when_export_uses_general_lds() {
     let controls = [0_u32; 32];
-    let (reconciled, lds_missing) = reconcile_pixel_input_controls_with_export_producers(
-        &controls,
-        0,
-        0b1,
-        true,
+    let (reconciled, lds_missing) =
+        reconcile_pixel_input_controls_with_export_producers(&controls, 0, 0b1, true);
+    assert_eq!(
+        reconciled[0], 0,
+        "LDS holes must not be rewritten to UseDefault"
     );
-    assert_eq!(reconciled[0], 0, "LDS holes must not be rewritten to UseDefault");
     assert_eq!(lds_missing, vec![(0, 0, 0)]);
 }
 

@@ -10,7 +10,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use remu_shader::{ImageBindingSlotMap, OperandKind, Program, ShaderEvaluation, StructuredCfg};
+use remu_shader::{
+    ImageBindingSlotMap, Instruction, OperandKind, Program, ShaderEvaluation, StructuredCfg,
+};
 
 use crate::compiler::control_flow::ControlFlowLowering;
 use crate::compiler::image::ImageKind;
@@ -33,6 +35,8 @@ pub(crate) mod vector;
 const MAX_METAL_THREADGROUP_THREADS: usize = 1_024;
 const METAL_THREADGROUP_MEMORY_LIMIT_BYTES: usize = 32 * 1_024;
 const SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP: usize = MAX_METAL_THREADGROUP_THREADS / 32;
+const SPLIT_WAVE64_PAIR_STATE_SLOTS: usize = SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP * 2;
+const SPLIT_WAVE64_PAIR_STATE_BYTES: usize = SPLIT_WAVE64_PAIR_STATE_SLOTS * size_of::<u32>();
 
 pub(crate) struct Compiler<'a> {
     program: &'a Program,
@@ -48,13 +52,44 @@ pub(crate) struct Compiler<'a> {
     control_flow: ControlFlowLowering,
     /// VGPR holding the NGG compacted output vertex id that gates EXP (the `vM` in
     /// `V_CMPX_* sN, vM` immediately before `EXP POS`). When set under proven
-    /// `NggRegisters`, mesh exports stage `remu_out` into
-    /// `remu_mesh_staged_vertices[vM]` so the epilogue publishes by compacted index —
-    /// the architectural slot PRIM indices name — instead of `remu_thread_index`.
+    /// `NggRegisters`, each mesh export publishes `remu_out` directly to that Metal
+    /// vertex slot. This preserves the architectural compacted index without duplicating
+    /// the guest's potentially full 32-KiB LDS allocation in threadgroup memory.
     mesh_export_vertex_vgpr: Option<u32>,
 }
 
 impl Compiler<'_> {
+    fn diagnostic_compute_state_trace_group(&self) -> Option<[u32; 3]> {
+        if self.options.stage != MetalShaderStage::Compute {
+            return None;
+        }
+        let filter = std::env::var("REMU_TRACE_COMPUTE_STATE_CS").ok()?;
+        let filter = filter.trim().trim_start_matches("0x");
+        let address = u64::from_str_radix(filter, 16).ok()?;
+        if address != self.program.address {
+            return None;
+        }
+        let group = std::env::var("REMU_TRACE_COMPUTE_STATE_GROUP")
+            .unwrap_or_else(|_| "72,40,0".to_owned());
+        let mut components = group.split(',').map(str::trim).map(str::parse::<u32>);
+        let parsed = [
+            components.next()?.ok()?,
+            components.next()?.ok()?,
+            components.next()?.ok()?,
+        ];
+        components.next().is_none().then_some(parsed)
+    }
+
+    fn diagnostic_compute_state_trace_checkpoint(&self, pc: u32) -> Option<usize> {
+        self.diagnostic_compute_state_trace_group()?;
+        // These PCs bracket the texture reads and final color calculation in the selected
+        // diagnostic shader. The mechanism remains address-gated, so ordinary compilation is
+        // byte-for-byte unchanged.
+        [0x20, 0x228, 0x340, 0x3dc, 0x7e4, 0x884, 0xa4c, 0xa88]
+            .iter()
+            .position(|&checkpoint| checkpoint == pc)
+    }
+
     fn is_threadgroup_stage(&self) -> bool {
         matches!(
             self.options.stage,
@@ -64,6 +99,63 @@ impl Compiler<'_> {
 
     fn split_wave64(&self) -> bool {
         self.is_threadgroup_stage() && self.options.wave_lane_count == 64
+    }
+
+    /// Whether the two Metal SIMD32 halves are the complete compute workgroup.
+    ///
+    /// In this shape a guest-wave reconvergence point is also a legal Metal threadgroup barrier,
+    /// providing the cross-SIMD LDS visibility that a pair of relaxed atomics plus
+    /// `simdgroup_barrier` cannot establish.
+    fn split_wave64_is_whole_compute_threadgroup(&self) -> bool {
+        self.options.stage == MetalShaderStage::Compute
+            && self.split_wave64()
+            && (1..=64).contains(&self.options.compute_threadgroup_size)
+    }
+
+    /// Whether a wave64 compute program needs its two host SIMD32 mask words exchanged before a
+    /// scalar mask branch.
+    ///
+    /// Each Metal SIMD32 half owns the correct local ballot word, but `S_CBRANCH_{EXEC,VCC}{Z,NZ}`
+    /// tests the complete architectural 64-bit mask. Leaving the opposite word at zero lets the
+    /// two halves take different structured-CFG edges. Keep this compute-only: mesh shaders can
+    /// already consume the full 32 KiB Metal threadgroup-memory budget, and their control-flow
+    /// synchronization needs a storage-free lowering.
+    fn needs_split_wave64_branch_mask_exchange(&self) -> bool {
+        self.options.stage == MetalShaderStage::Compute
+            && self.split_wave64()
+            && self.program.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.opcode.known_name(),
+                    Some("SCbranchVccz" | "SCbranchVccnz" | "SCbranchExecz" | "SCbranchExecnz")
+                )
+            })
+    }
+
+    /// Whether split host SIMD32 groups need pair-scoped storage for guest-wave64 rendezvous.
+    fn needs_split_wave64_pair_rendezvous(&self) -> bool {
+        self.needs_split_wave64_branch_mask_exchange()
+            || (self.options.stage == MetalShaderStage::Compute
+                && self.split_wave64()
+                && !self.split_wave64_is_whole_compute_threadgroup()
+                && self.uses_lds_memory()
+                && self.program.instructions.iter().any(is_full_exec_restore))
+    }
+
+    /// Whether explicit VALU comparison destinations are architectural SGPR pairs.
+    ///
+    /// Pixel shaders have no threadgroup in which Metal can execute both halves of a guest
+    /// wave64, so they deliberately use the local SIMD32 mask in the low word.  The high word
+    /// still has to be cleared, however: wave64 shaders immediately consume these comparison
+    /// destinations with B64 scalar operations.  Leaving it untouched aliases unrelated SGPR
+    /// state (commonly the high words of image descriptors) into EXEC/SCC control flow.
+    fn uses_wave64_lane_mask_pairs(&self) -> bool {
+        self.split_wave64()
+            || self.program.instructions.iter().any(|instruction| {
+                instruction
+                    .opcode
+                    .known_name()
+                    .is_some_and(|name| name.ends_with("SaveexecB64"))
+            })
     }
 
     fn control_flow_may_revisit_instruction_sites(&self) -> bool {
@@ -253,6 +345,16 @@ impl Compiler<'_> {
         self.line(3, &format!("{ty} {name} = {expression};"));
         name
     }
+}
+
+fn is_full_exec_restore(instruction: &Instruction) -> bool {
+    instruction.opcode.is("SMovB64")
+        && instruction.destinations.first().is_some_and(|destination| {
+            destination.kind == OperandKind::ScalarRegister && destination.value == 126
+        })
+        && instruction.sources.first().is_some_and(|source| {
+            source.kind == OperandKind::EncodedConstant && source.value == 193
+        })
 }
 
 fn structured_cfg_contains_loop(tree: &StructuredCfg) -> bool {

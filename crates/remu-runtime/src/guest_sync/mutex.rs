@@ -123,7 +123,10 @@ fn lookup_mutex_by_handle(handle: u64) -> Option<Arc<GuestMutexEntry>> {
 /// 3. `*arg` is a static initializer → materialize a control block into the slot.
 ///
 /// Unknown non-initializer values refuse; there is no create-on-first-use fabrication.
-pub(crate) fn guest_mutex_entry(address: u64, allow_static_init: bool) -> Option<Arc<GuestMutexEntry>> {
+pub(crate) fn guest_mutex_entry(
+    address: u64,
+    allow_static_init: bool,
+) -> Option<Arc<GuestMutexEntry>> {
     if address == 0 {
         return None;
     }
@@ -136,15 +139,13 @@ pub(crate) fn guest_mutex_entry(address: u64, allow_static_init: bool) -> Option
         PthreadSlotValue::StaticDefault if allow_static_init => {
             materialize_static_mutex(address, PthreadMutexAttrState::default())
         }
-        PthreadSlotValue::StaticAdaptiveMutex if allow_static_init => {
-            materialize_static_mutex(
-                address,
-                PthreadMutexAttrState {
-                    mutex_type: 4,
-                    ..PthreadMutexAttrState::default()
-                },
-            )
-        }
+        PthreadSlotValue::StaticAdaptiveMutex if allow_static_init => materialize_static_mutex(
+            address,
+            PthreadMutexAttrState {
+                mutex_type: 4,
+                ..PthreadMutexAttrState::default()
+            },
+        ),
         PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => None,
     }
 }

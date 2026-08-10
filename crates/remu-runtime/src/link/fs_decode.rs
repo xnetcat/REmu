@@ -204,7 +204,8 @@ fn classify_fs_access(instruction: &Instruction) -> Option<FsAccessKind> {
         Mnemonic::Lea if instruction.op_count() == 2 => {
             // `lea` has no memory operand size; the destination register width is irrelevant to
             // address formation (the effective address is always 64-bit in long mode).
-            if instruction.op0_kind() != OpKind::Register || instruction.op1_kind() != OpKind::Memory
+            if instruction.op0_kind() != OpKind::Register
+                || instruction.op1_kind() != OpKind::Memory
             {
                 return Some(FsAccessKind::Other);
             }
@@ -354,7 +355,9 @@ pub(crate) fn classify_fs_instruction_bytes(bytes: &[u8]) -> Option<FsAccessSite
 
 #[cfg(test)]
 mod tests {
-    use super::{FsAccessKind, FsAccessSite, classify_fs_instruction_bytes, seeded_fs_access_sites};
+    use super::{
+        FsAccessKind, FsAccessSite, classify_fs_instruction_bytes, seeded_fs_access_sites,
+    };
 
     const FS_LOAD_RAX: [u8; 9] = [0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0];
     // mov rax, fs:[0x28]
@@ -442,11 +445,7 @@ mod tests {
                 }
             )
         }));
-        assert!(
-            sites
-                .iter()
-                .any(|s| matches!(s.kind, FsAccessKind::Other))
-        );
+        assert!(sites.iter().any(|s| matches!(s.kind, FsAccessKind::Other)));
     }
 
     #[test]

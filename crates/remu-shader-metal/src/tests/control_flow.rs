@@ -198,6 +198,70 @@ fn setpc_terminates_each_structured_conditional_arm() {
 }
 
 #[test]
+fn structured_wave64_compute_mask_branches_exchange_both_simd32_words() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchExecz"),
+                words: vec![1],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            setpc(4),
+            setpc(8),
+        ],
+    );
+
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(0, 64),
+    )
+    .expect("structured wave64 EXEC branch should lower");
+
+    assert!(
+        shader
+            .source
+            .contains("threadgroup atomic_uint remu_wave_pair_states[64]")
+    );
+    assert!(
+        shader
+            .source
+            .contains("atomic_store_explicit(&remu_wave_pair_states[")
+    );
+    assert!(
+        shader
+            .source
+            .contains("atomic_load_explicit(&remu_wave_pair_states[")
+    );
+    assert!(
+        shader
+            .source
+            .contains("simd_broadcast_first(remu_branch_mask_")
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        1,
+        "only the uniform kernel prologue may synchronize the whole threadgroup"
+    );
+
+    let wave32 = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(0, 32),
+    )
+    .expect("native wave32 branch should lower without an exchange");
+    assert!(!wave32.source.contains("remu_wave_pair_states"));
+}
+
+#[test]
 fn linked_setpc_lowers_real_continuation_param_exports() {
     let front = Program::new(0x1000, vec![setpc(0)]);
     // Decode an architectural RDNA2 EXP PARAM0 rather than constructing export IR by hand.

@@ -9,14 +9,14 @@
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::tiling::{
-    guest_texture_byte_count, mode27_surface_z_xor, mode5_mip_chain_layout,
-    mode27_mip_chain_layout, tiled_block_bytes, tiled_block_dimensions,
+    guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    mode27_surface_z_xor, tiled_block_bytes, tiled_block_dimensions,
 };
 use super::super::{
     GuestTextureDescriptor, ResourceSpan, compressed_texture_block_extent,
     metal_uncompressed_bytes_per_pixel, texture_element_layout,
 };
-use super::msl::{mode27_tiler_pipelines, mode5_tiler_pipelines, mode9_tiler_pipelines};
+use super::msl::{mode5_tiler_pipelines, mode9_tiler_pipelines, mode27_tiler_pipelines};
 use metal::{
     Buffer, CommandBufferRef, ComputePipelineState, Device, MTLBlitOption, MTLOrigin,
     MTLResourceOptions, MTLSize, Texture,
@@ -179,9 +179,10 @@ fn guest_buffer_for_range(
             "Phase 1G: guest texture {address:#x}+{byte_count:#x} has no committed/shared backing for Metal (tile={tile_mode})"
         )
     })?;
-    let buffer = metal_buffer_with_guest_backing_range(device, &backing_range).ok_or_else(|| {
-        format!("Phase 1G: guest texture {address:#x} backing cannot be exposed as MTLBuffer")
-    })?;
+    let buffer =
+        metal_buffer_with_guest_backing_range(device, &backing_range).ok_or_else(|| {
+            format!("Phase 1G: guest texture {address:#x} backing cannot be exposed as MTLBuffer")
+        })?;
     Ok((buffer, backing_range.resource_offset()))
 }
 
@@ -416,7 +417,8 @@ fn plan_upload_subresources(
                 .ok_or("GPU tiler block size unavailable for tile mode")?;
             let (w, h) = tiled_block_dimensions(
                 block_bytes,
-                usize::try_from(bytes_per_element).map_err(|_| "element size does not fit usize")?,
+                usize::try_from(bytes_per_element)
+                    .map_err(|_| "element size does not fit usize")?,
             )
             .ok_or("GPU tiler block dimensions unavailable")?;
             (
@@ -426,10 +428,8 @@ fn plan_upload_subresources(
         };
         let face_bytes =
             guest_texture_byte_count(descriptor).ok_or("GPU tiler face size overflows")?;
-        let elem_w =
-            u64::try_from(elements_wide).map_err(|_| "element width does not fit u64")?;
-        let elem_h =
-            u64::try_from(elements_high).map_err(|_| "element height does not fit u64")?;
+        let elem_w = u64::try_from(elements_wide).map_err(|_| "element width does not fit u64")?;
+        let elem_h = u64::try_from(elements_high).map_err(|_| "element height does not fit u64")?;
         let elem_pitch =
             u64::try_from(elements_pitch).map_err(|_| "element pitch does not fit u64")?;
         for surface_z in 0..view.layer_count {
@@ -504,10 +504,14 @@ pub(crate) fn encode_gpu_upload_from_guest_view(
         view
     };
     let (subs, guest_bytes, linear_length) = plan_upload_subresources(descriptor, plan_view)?;
-    let (guest, guest_offset) =
-        guest_buffer_for_range(device, descriptor.address, guest_bytes, descriptor.tile_mode)?;
-    let span = ResourceSpan::for_texture(descriptor)
-        .ok_or("Phase 1G: guest texture span overflows")?;
+    let (guest, guest_offset) = guest_buffer_for_range(
+        device,
+        descriptor.address,
+        guest_bytes,
+        descriptor.tile_mode,
+    )?;
+    let span =
+        ResourceSpan::for_texture(descriptor).ok_or("Phase 1G: guest texture span overflows")?;
     let resource_base = span.range_start();
     let target_base = span.range_start();
 
@@ -696,10 +700,14 @@ pub(crate) fn encode_gpu_publish_to_guest_view(
         ));
     }
     let (subs, guest_bytes, linear_length) = plan_upload_subresources(descriptor, view)?;
-    let (guest, guest_offset) =
-        guest_buffer_for_range(device, descriptor.address, guest_bytes, descriptor.tile_mode)?;
-    let span = ResourceSpan::for_texture(descriptor)
-        .ok_or("Phase 1G: guest texture span overflows")?;
+    let (guest, guest_offset) = guest_buffer_for_range(
+        device,
+        descriptor.address,
+        guest_bytes,
+        descriptor.tile_mode,
+    )?;
+    let span =
+        ResourceSpan::for_texture(descriptor).ok_or("Phase 1G: guest texture span overflows")?;
     let resource_base = span.range_start();
     let target_base = span.range_start();
     let linear = device.new_buffer(linear_length, MTLResourceOptions::StorageModePrivate);
@@ -932,8 +940,8 @@ mod tests {
         bc7.pitch = 64;
         bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
         bc7.bytes_per_pixel = 16;
-        let (subs, _, _) = plan_upload_subresources(bc7, GpuTilerView::SINGLE_LEVEL_2D)
-            .expect("mode-5 BC7 plan");
+        let (subs, _, _) =
+            plan_upload_subresources(bc7, GpuTilerView::SINGLE_LEVEL_2D).expect("mode-5 BC7 plan");
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].width, 16); // 64/4 BC blocks
         assert_eq!(subs[0].height, 16);
@@ -1005,8 +1013,8 @@ mod tests {
         bc7.pitch = 3840;
         bc7.pixel_format = MTLPixelFormat::BC7_RGBAUnorm_sRGB;
         bc7.bytes_per_pixel = 16;
-        let (subs, _, _) = plan_upload_subresources(bc7, GpuTilerView::SINGLE_LEVEL_2D)
-            .expect("mode-9 BC7 plan");
+        let (subs, _, _) =
+            plan_upload_subresources(bc7, GpuTilerView::SINGLE_LEVEL_2D).expect("mode-9 BC7 plan");
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].width, 960);
         assert_eq!(subs[0].height, 540);
@@ -1020,8 +1028,8 @@ mod tests {
         atlas.pitch = 1024;
         atlas.pixel_format = MTLPixelFormat::R8Unorm;
         atlas.bytes_per_pixel = 1;
-        let (subs, _, _) = plan_upload_subresources(atlas, GpuTilerView::SINGLE_LEVEL_2D)
-            .expect("mode-9 R8 plan");
+        let (subs, _, _) =
+            plan_upload_subresources(atlas, GpuTilerView::SINGLE_LEVEL_2D).expect("mode-9 R8 plan");
         assert_eq!(subs[0].width, 1024);
         assert_eq!(subs[0].metal_width, 1024);
         assert_eq!(subs[0].bytes_per_element, 1);
@@ -1033,22 +1041,27 @@ mod tests {
         tiny.pixel_format = MTLPixelFormat::RGBA8Unorm;
         tiny.bytes_per_pixel = 4;
         assert!(gpu_tiler_owns_descriptor(tiny));
-        let (subs, _, _) = plan_upload_subresources(tiny, GpuTilerView::SINGLE_LEVEL_2D)
-            .expect("mode-1 1x1 plan");
+        let (subs, _, _) =
+            plan_upload_subresources(tiny, GpuTilerView::SINGLE_LEVEL_2D).expect("mode-1 1x1 plan");
         assert_eq!(subs[0].width, 1);
         assert_eq!(subs[0].metal_width, 1);
     }
 
     #[test]
     fn plans_mode5_layered_single_level() {
-        let (subs, guest_bytes, _) =
-            plan_upload_subresources(descriptor(5), GpuTilerView {
+        let (subs, guest_bytes, _) = plan_upload_subresources(
+            descriptor(5),
+            GpuTilerView {
                 texture_type: 13,
                 layer_count: 3,
                 mip_level_count: 1,
-            })
-            .expect("mode-5 layered plan");
+            },
+        )
+        .expect("mode-5 layered plan");
         assert_eq!(subs.len(), 3);
-        assert_eq!(guest_bytes, guest_texture_byte_count(descriptor(5)).unwrap() * 3);
+        assert_eq!(
+            guest_bytes,
+            guest_texture_byte_count(descriptor(5)).unwrap() * 3
+        );
     }
 }

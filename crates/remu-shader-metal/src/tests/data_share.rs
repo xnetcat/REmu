@@ -297,7 +297,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(
         shader
             .source
-            .contains("((remu_thread_index >> 5u) & 0xfu) << 24u"),
+            .contains("((remu_mesh_wave_index & 0xfu) << 24u"),
         "96-thread NGG subgroups must pack a wave32 index into s3[27:24]"
     );
     assert!(
@@ -313,6 +313,17 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
         "unexported mesh vertices must default to w=0 so they stay clipped"
     );
     assert!(shader.source.contains("remu_mesh.set_index("));
+    assert!(
+        shader.source.contains(
+            "for (uint remu_null_primitive = remu_thread_index; remu_null_primitive < 96u;"
+        ),
+        "GS_ALLOC_REQ slots without EXP PRIM must be initialized as null primitives"
+    );
+    for component in 0..3 {
+        assert!(shader.source.contains(&format!(
+            "remu_mesh.set_index(remu_null_primitive * 3u + {component}u, 0u);"
+        )));
+    }
     assert!(shader.source.contains("remu_mesh.set_vertex("));
     assert!(
         !shader.source.contains("remu_mesh.set_vertex_count("),
@@ -326,7 +337,7 @@ fn lowers_ngg_lds_and_primitive_exports_to_a_mesh_function() {
     assert!(
         shader
             .source
-            .contains("if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex")
+            .contains("if (remu_thread_index < 96u) remu_mesh.set_vertex")
     );
     assert!(
         shader.source.contains("remu_v_8 = remu_group_id.y"),
@@ -388,8 +399,35 @@ fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
     assert!(
         shader
             .source
-            .contains("((remu_thread_index >> 6u) & 0xfu) << 24u"),
+            .contains("uint remu_mesh_wave_index = remu_thread_index >> 6u;")
+    );
+    assert!(
+        shader
+            .source
+            .contains("((remu_mesh_wave_index & 0xfu) << 24u"),
         "wave64 NGG subgroups must pack a wave64 index into s3[27:24]"
+    );
+    assert!(
+        shader.source.contains(
+            "remu_mesh_input_vertex_count > remu_mesh_wave_base ? remu_mesh_input_vertex_count - remu_mesh_wave_base : 0u, 63u + 1u"
+        ),
+        "merged-wave byte 0 must carry the current wave's ES invocation count"
+    );
+    assert!(
+        shader.source.contains(
+            "remu_mesh_input_primitive_count > remu_mesh_wave_base ? remu_mesh_input_primitive_count - remu_mesh_wave_base : 0u, 63u + 1u"
+        ),
+        "merged-wave byte 1 must carry the current wave's GS invocation count"
+    );
+    assert!(
+        shader
+            .source
+            .contains("(remu_mesh_wave_vertex_count & 0xffu)"),
+    );
+    assert!(
+        shader
+            .source
+            .contains("((remu_mesh_wave_primitive_count & 0xffu) << 8u)"),
     );
     assert!(
         shader.source.contains("+ 63u) >> 6u"),
@@ -398,7 +436,7 @@ fn packs_wave64_merged_wave_info_for_split_ngg_mesh_exports() {
     assert!(
         !shader
             .source
-            .contains("((remu_thread_index >> 5u) & 0xfu) << 24u"),
+            .contains("uint remu_mesh_wave_index = remu_thread_index >> 5u;"),
         "SIMD32 halves must not leak into the guest-visible merged wave info"
     );
 }
@@ -426,10 +464,11 @@ fn proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole() {
         192,
         NggRegisters {
             pgm_rsrc1: 0x8,
-            // 16 KiB guest LDS (field 0x80) — matches the prior explicit lds_size_bytes argument.
-            pgm_rsrc2: 0x80 << 19,
+            // 16 KiB guest LDS (field 0x20) — matches the prior explicit lds_size_bytes argument.
+            pgm_rsrc2: 0x20 << 19,
             gs_max_vert_out: 64,
             ge_max_output_per_subgroup: 64,
+            primgen_passthrough: false,
         },
     );
     options.wave_lane_count = 64;
@@ -541,36 +580,35 @@ fn compacted_vertex_exp_gate_refuses_without_proven_ngg_registers() {
 }
 
 #[test]
-fn proven_ngg_registers_stage_compacted_vertex_exports_by_compacted_id() {
+fn proven_ngg_registers_publish_compacted_vertex_exports_by_compacted_id() {
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh_from_ngg_registers(
         2,
         64,
         NggRegisters {
             pgm_rsrc1: 0x8,
-            pgm_rsrc2: 0x80 << 19,
+            pgm_rsrc2: 0x20 << 19,
             gs_max_vert_out: 64,
             ge_max_output_per_subgroup: 64,
+            primgen_passthrough: false,
         },
     );
     options.wave_lane_count = 64;
     let shader = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("proven NggRegisters lower compacted EXP through staged records");
+        .expect("proven NggRegisters lower compacted EXP through direct Metal records");
     assert!(
         shader
             .source
-            .contains("remu_mesh_staged_vertices[remu_v_18] = remu_out")
+            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)")
             || shader
                 .source
-                .contains("remu_mesh_staged_vertices[v[18]] = remu_out"),
-        "EXP must stage remu_out under the compacted vertex VGPR: {}",
+                .contains("remu_mesh.set_vertex(v[18], remu_out)"),
+        "EXP must publish remu_out under the compacted vertex VGPR: {}",
         shader.source
     );
     assert!(
-        shader.source.contains(
-            "if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index])"
-        ),
-        "epilogue must publish staged compacted records, not per-thread remu_out"
+        !shader.source.contains("remu_mesh_staged_vertices"),
+        "compacted output must not allocate a second threadgroup copy beside guest LDS"
     );
 }
 
@@ -777,22 +815,56 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
     assert_eq!(shader.stage, MetalShaderStage::Mesh);
     assert!(shader.register_footprint.direct_control_flow);
     assert!(
+        shader.source.contains(
+            "uint remu_mesh_gs_vtx_offset_0 = (((remu_mesh_primitive >> 0u) & 0x1ffu) << 2u"
+        ),
+        "a linked ES/GS stage must receive packed 16-bit dword offsets in the GFX9-11 GS ABI"
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_v_0 = remu_mesh_gs_vtx_offset_0;")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_v_1 = remu_mesh_gs_vtx_offset_1;")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_v_2 = remu_mesh_primitive_base + remu_thread_index;")
+    );
+    let front_lds_write = shader
+        .source
+        .find("atomic_store_explicit(remu_lds")
+        .expect("front ES LDS write");
+    let continuation_abi = shader
+        .source
+        .find("// GFX9-11 linked GS continuation VGPR ABI")
+        .expect("linked GS continuation must restore its hardware VGPR inputs");
+    assert!(
+        front_lds_write < continuation_abi,
+        "the GS VGPR ABI must be restored at the continuation, after the ES overwrites its inputs"
+    );
+    let continuation = &shader.source[continuation_abi..];
+    assert!(continuation.contains("remu_v_0 = remu_mesh_gs_vtx_offset_0;"));
+    assert!(continuation.contains("remu_v_1 = remu_mesh_gs_vtx_offset_1;"));
+    assert!(continuation.contains("remu_v_2 = remu_mesh_primitive_base + remu_thread_index;"));
+    assert!(continuation.contains("remu_v_3 = 0u;"));
+    assert!(continuation.contains("remu_v_4 = 0u;"));
+    assert!(
         shader
             .source
             .contains("threadgroup atomic_uint remu_lds_storage[4096]")
     );
     assert!(shader.source.contains("remu_mesh.set_index("));
+    assert!(!shader.source.contains("remu_mesh_output_vertex_count"));
     assert!(
-        shader
+        !shader
             .source
-            .contains("atomic_store_explicit(&remu_mesh_output_vertex_count")
+            .contains("threadgroup atomic_uint remu_mesh_output")
     );
-    assert!(
-        shader
-            .source
-            .contains("atomic_store_explicit(&remu_mesh_output_primitive_count")
-    );
-    assert!(shader.source.contains("remu_s_124 & 0x7ffu"));
     assert!(shader.source.contains("(remu_s_124 >> 12u) & 0x7ffu"));
     assert!(
         shader
@@ -815,17 +887,13 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
     );
     let allocation = shader
         .source
-        .find("atomic_store_explicit(&remu_mesh_output_vertex_count")
-        .expect("GS_ALLOC_REQ allocation store");
-    let publication = shader
-        .source
-        .rfind("threadgroup_barrier(mem_flags::mem_threadgroup)")
-        .expect("converged output-count publication barrier");
+        .find("remu_mesh_output_primitive_count = (remu_s_124 >> 12u)")
+        .expect("GS_ALLOC_REQ primitive allocation");
     let output_count = shader
         .source
         .find("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
         .expect("dynamic Metal primitive count");
-    assert!(allocation < publication && publication < output_count);
+    assert!(allocation < output_count);
     assert!(
         shader
             .source
@@ -834,6 +902,84 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
     assert!(shader.source.contains("remu_out.position = float4("));
     assert!(shader.source.contains("remu_out.param0 = float4("));
     assert!(!shader.source.contains("active = false;"));
+}
+
+#[test]
+fn selects_the_gfx10_ngg_input_vgpr_layout_from_primgen_passthrough() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(0)],
+                destinations: vec![Operand::vector(16)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(17)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(2)],
+                destinations: vec![Operand::vector(18)],
+                control: None,
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+
+    let ordinary = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(0, 0, 64, 64, 64),
+    )
+    .expect("ordinary NGG ABI");
+    assert!(
+        ordinary
+            .source
+            .contains("remu_v_0 = remu_mesh_gs_vtx_offset_0;")
+    );
+    assert!(
+        ordinary
+            .source
+            .contains("remu_v_1 = remu_mesh_gs_vtx_offset_1;")
+    );
+    assert!(
+        ordinary
+            .source
+            .contains("remu_v_2 = remu_mesh_primitive_base + remu_thread_index;")
+    );
+
+    let mut passthrough_options = MetalCompileOptions::mesh(0, 0, 64, 64, 64);
+    passthrough_options.ngg_primgen_passthrough = true;
+    let passthrough = compile_msl(&program, &empty_evaluation(), &passthrough_options)
+        .expect("passthrough NGG ABI");
+    assert!(
+        passthrough
+            .source
+            .contains("remu_v_0 = remu_mesh_primitive;")
+    );
+    assert!(!passthrough.source.contains("remu_mesh_gs_vtx_offset_0"));
 }
 
 #[test]

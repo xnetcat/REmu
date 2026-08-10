@@ -366,10 +366,7 @@ impl MetalPresenter {
             .ok_or_else(|| format!("same-queue DMA fill has no open q{queue_id} batch"))?;
         batch.memory_writes.push(prepared.pending);
         // Unreal fence_label_dma: 4-byte zero fills are RELEASE_MEM equivalents for wait wakeups.
-        if copy.source_selection == 2
-            && copy.byte_count == 4
-            && copy.source_address as u32 == 0
-        {
+        if copy.source_selection == 2 && copy.byte_count == 4 && copy.source_address as u32 == 0 {
             let release = GpuMemoryRelease::label(
                 copy.destination_address,
                 GpuMemoryReleaseValue::Immediate32(0),
@@ -389,8 +386,7 @@ impl MetalPresenter {
         let Some(queue_id) = self.active_guest_queue else {
             return Ok(());
         };
-        let release =
-            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(value));
+        let release = GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(value));
         let matching_waits = release_shared_event_waits(release);
         if matching_waits.is_empty() {
             return Ok(());
@@ -405,8 +401,7 @@ impl MetalPresenter {
         let Some(queue_id) = self.active_guest_queue else {
             return Ok(());
         };
-        let release =
-            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate64(value));
+        let release = GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate64(value));
         let matching_waits = release_shared_event_waits(release);
         if matching_waits.is_empty() {
             return Ok(());
@@ -914,7 +909,13 @@ impl MetalPresenter {
                         );
                     }
                     GpuMemoryReleaseValue::Timestamp => {
-                        let value = read_guest_memory_wait_value(GpuMemoryWait::memory(release.address, 0, u64::MAX, 0, true));
+                        let value = read_guest_memory_wait_value(GpuMemoryWait::memory(
+                            release.address,
+                            0,
+                            u64::MAX,
+                            0,
+                            true,
+                        ));
                         self.record_guest_memory_producer(release.address, true, value);
                         self.record_guest_memory_producer(
                             release.address,

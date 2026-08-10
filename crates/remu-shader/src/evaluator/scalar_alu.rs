@@ -948,18 +948,21 @@ pub(crate) fn execute_scalar_compare_k(
 ) -> Result<bool, EvaluationError> {
     let destination = scalar_destination(instruction)? as usize;
     let left = registers[destination];
-    let right = i32::from(
-        low_u16(
-            instruction
-                .sources
-                .first()
-                .ok_or_else(|| invalid(instruction, "compare-k source"))?
-                .value,
-        )
-        .cast_signed(),
-    )
-    .cast_unsigned();
-    let result = match instruction.opcode.known_name() {
+    let name = instruction.opcode.known_name();
+    let immediate = low_u16(
+        instruction
+            .sources
+            .first()
+            .ok_or_else(|| invalid(instruction, "compare-k source"))?
+            .value,
+    );
+    // Unlike the other SOPK instructions, unsigned S_CMPK comparisons zero-extend IMM16.
+    let right = if name.is_some_and(|name| name.ends_with("U32")) {
+        u32::from(immediate)
+    } else {
+        i32::from(immediate.cast_signed()).cast_unsigned()
+    };
+    let result = match name {
         Some("SCmpkEqI32") => left.cast_signed() == right.cast_signed(),
         Some("SCmpkLgI32") => left.cast_signed() != right.cast_signed(),
         Some("SCmpkGtI32") => left.cast_signed() > right.cast_signed(),

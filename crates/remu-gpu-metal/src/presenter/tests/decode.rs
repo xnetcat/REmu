@@ -714,8 +714,8 @@ fn blend_bypass_in_cb_color_info_disables_metal_blend() {
         .expect("MRT0 info")
         .value |= 1 << 16;
     registers.sort_unstable_by_key(|register| register.offset);
-    let targets = decode_render_targets_from_registers(&registers, 0xf)
-        .expect("blend-bypass color target");
+    let targets =
+        decode_render_targets_from_registers(&registers, 0xf).expect("blend-bypass color target");
     assert!(targets[0].blend_bypass);
 }
 
@@ -1874,7 +1874,7 @@ fn captures_proven_ngg_compile_registers_from_the_live_draw_state() {
     // The merged export stage's PGM_RSRC1 sits two registers before its user-data base. The
     // geometry limits are context registers and GE_MAX_OUTPUT_PER_SUBGROUP—not
     // GE_NGG_SUBGRP_CNTL—owns the SDK's ten-bit post-amplification vertex cap.
-    // PGM_RSRC2 LDS field 0x40 → SDK getLdsSize = 0x40 << 7 = 8192 bytes.
+    // PGM_RSRC2 LDS field 0x40 → SDK getLdsSize = 0x40 << 7 dwords = 32768 bytes.
     let registers = decode_ngg_registers_from_state(
         &[
             GpuRegister {
@@ -1899,6 +1899,10 @@ fn captures_proven_ngg_compile_registers_from_the_live_draw_state() {
                 offset: 0x2d3,
                 value: 7,
             },
+            GpuRegister {
+                offset: 0x2d5,
+                value: 0x0200_0000,
+            },
         ],
         0x08c,
     )
@@ -1906,9 +1910,10 @@ fn captures_proven_ngg_compile_registers_from_the_live_draw_state() {
 
     assert_eq!(registers.pgm_rsrc1, 0x25);
     assert_eq!(registers.pgm_rsrc2, 0x40 << 19);
-    assert_eq!(registers.lds_size_bytes(), 8192);
+    assert_eq!(registers.lds_size_bytes(), 32768);
     assert_eq!(registers.gs_max_vert_out, 24);
     assert_eq!(registers.ge_max_output_per_subgroup, 96);
+    assert!(registers.primgen_passthrough);
     assert_eq!(registers.max_verts_per_subgroup(), 96);
 }
 

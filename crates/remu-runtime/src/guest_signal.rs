@@ -101,7 +101,10 @@ pub(crate) fn clear_installed_guest_handler(exception: i32) {
     }
 }
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn installed_guest_handler(exception: i32) -> u64 {
     if (0..128).contains(&exception) {
         INSTALLED_GUEST_HANDLERS[exception as usize].load(Ordering::Acquire)
@@ -147,7 +150,10 @@ pub(crate) fn write_exception_context_word(
     context.0[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
 }
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn read_exception_context_word(context: &GuestExceptionContext, offset: usize) -> u64 {
     u64::from_le_bytes(context.0[offset..offset + 8].try_into().unwrap())
 }
@@ -307,7 +313,11 @@ mod darwin_x86 {
     }
 }
 
-fn invoke_guest_exception_handler(exception: i32, handler: u64, context: &mut GuestExceptionContext) {
+fn invoke_guest_exception_handler(
+    exception: i32,
+    handler: u64,
+    context: &mut GuestExceptionContext,
+) {
     type GuestExceptionHandler = unsafe extern "C" fn(i32, *mut u8);
     // SAFETY: handler is a mapped guest executable installed via InstallExceptionHandler.
     let handler: GuestExceptionHandler = unsafe { std::mem::transmute(handler) };
@@ -380,7 +390,10 @@ fn finish_active_delivery() {
     }
 }
 
-#[cfg_attr(not(all(target_os = "macos", target_arch = "x86_64")), allow(dead_code))]
+#[cfg_attr(
+    not(all(target_os = "macos", target_arch = "x86_64")),
+    allow(dead_code)
+)]
 fn guest_signal_is_blocked(exception: i32) -> bool {
     if !(0..64).contains(&exception) {
         return false;
@@ -680,8 +693,14 @@ mod tests {
             ..ImportCallFrame::default()
         };
         fill_orbis_ucontext_from_import(&mut context, &frame);
-        assert_eq!(read_exception_context_word(&context, 0xf8), 0x7000_0000_1000);
-        assert_eq!(read_exception_context_word(&context, 0xe0), 0x8000_0000_2000);
+        assert_eq!(
+            read_exception_context_word(&context, 0xf8),
+            0x7000_0000_1000
+        );
+        assert_eq!(
+            read_exception_context_word(&context, 0xe0),
+            0x8000_0000_2000
+        );
         assert_eq!(
             read_exception_context_word(&context, ORBIS_MCONTEXT_OFFSET + 0xc8),
             ORBIS_MCONTEXT_LEN
@@ -694,7 +713,14 @@ mod tests {
         let mut old = 0_u64;
         let mut set = 1_u64 << 30;
         assert_eq!(
-            guest_sigprocmask([3, (&raw mut set).addr() as u64, (&raw mut old).addr() as u64, 0, 0, 0]),
+            guest_sigprocmask([
+                3,
+                (&raw mut set).addr() as u64,
+                (&raw mut old).addr() as u64,
+                0,
+                0,
+                0
+            ]),
             0
         );
         assert_eq!(old, 0);

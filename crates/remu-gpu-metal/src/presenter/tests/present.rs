@@ -1419,7 +1419,7 @@ fn direct_scanout_texture_becomes_the_presented_frame_without_appkit() {
         mip_level_count: 1,
         dcc_enabled: false,
         fast_clear_enabled: false,
-            blend_bypass: false,
+        blend_bypass: false,
     };
     assert!(!presenter.is_diagnostic_scanout_target(&register_decoded_target));
     assert!(

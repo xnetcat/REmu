@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 
 use crate::{
     SCE_KERNEL_ERROR_BUSY, SCE_KERNEL_ERROR_INVALID_ARGUMENT,
-    SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED, SCE_KERNEL_ERROR_TIMED_OUT, SCE_KERNEL_ERROR_TRY_AGAIN,
-    STALL_SNAPSHOT_EMITTED, assert_wait_is_off_the_dispatch_lock, current_guest_thread_handle,
-    current_guest_thread_name, guest_calloc, guest_exception_is_pending, guest_free,
-    report_kernel_event_registrations, sce_kernel_error, stall_break_enabled,
-    stall_report_interval, trace_guest_sync, trace_logarithmic_sequence, write_guest_u64,
+    SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED, SCE_KERNEL_ERROR_TIMED_OUT,
+    SCE_KERNEL_ERROR_TRY_AGAIN, STALL_SNAPSHOT_EMITTED, assert_wait_is_off_the_dispatch_lock,
+    current_guest_thread_handle, current_guest_thread_name, guest_calloc,
+    guest_exception_is_pending, guest_free, report_kernel_event_registrations, sce_kernel_error,
+    stall_break_enabled, stall_report_interval, trace_guest_sync, trace_logarithmic_sequence,
+    write_guest_u64,
 };
 
 use super::identity::{
@@ -43,7 +44,9 @@ fn resolve_condition(address: u64, allow_static_init: bool) -> Option<Arc<GuestC
     let slot_value = read_pthread_slot(address)?;
     match classify_pthread_slot_value(slot_value) {
         PthreadSlotValue::ControlBlock(handle) => lookup_condition_by_handle(handle),
-        PthreadSlotValue::StaticDefault if allow_static_init => materialize_static_condition(address),
+        PthreadSlotValue::StaticDefault if allow_static_init => {
+            materialize_static_condition(address)
+        }
         PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => None,
     }
 }
@@ -69,7 +72,9 @@ fn materialize_static_condition(slot: u64) -> Option<Arc<GuestConditionEntry>> {
             write_guest_u64(slot, guest_object);
             Some(entry)
         }
-        PthreadSlotValue::StaticAdaptiveMutex => unreachable!("cond slots do not use adaptive init"),
+        PthreadSlotValue::StaticAdaptiveMutex => {
+            unreachable!("cond slots do not use adaptive init")
+        }
     }
 }
 

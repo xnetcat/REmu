@@ -214,7 +214,8 @@ mod tests {
 
     #[test]
     fn pixel_pipe_release_provenance_is_fifo_and_exact() {
-        let release = GpuMemoryRelease::label(0x7000_1230, GpuMemoryReleaseValue::Immediate64(1_u64 << 63));
+        let release =
+            GpuMemoryRelease::label(0x7000_1230, GpuMemoryReleaseValue::Immediate64(1_u64 << 63));
         let first = PixelPipeStatReleaseTrace {
             dump_sequence: 3,
             pair_index: 4,
@@ -227,7 +228,10 @@ mod tests {
         record_pixel_pipe_stat_release_trace(release, second);
 
         assert_eq!(
-            take_pixel_pipe_stat_release_trace(GpuMemoryRelease::label(release.address + 16, release.value)),
+            take_pixel_pipe_stat_release_trace(GpuMemoryRelease::label(
+                release.address + 16,
+                release.value
+            )),
             None
         );
         assert_eq!(take_pixel_pipe_stat_release_trace(release), Some(first));
@@ -240,14 +244,23 @@ mod tests {
         let payload_address = 0x7000_5200;
         record_pixel_pipe_stat_dump_trace(1001, payload_address, false);
         record_pixel_pipe_stat_dump_trace(1002, payload_address + 8, true);
-        let release = GpuMemoryRelease::label(payload_address + 0x100, GpuMemoryReleaseValue::Immediate64(1));
+        let release = GpuMemoryRelease::label(
+            payload_address + 0x100,
+            GpuMemoryReleaseValue::Immediate64(1),
+        );
 
         assert_eq!(
-            record_pixel_pipe_query_completion_release_trace(GpuMemoryRelease::label(release.address, GpuMemoryReleaseValue::Immediate64(2))),
+            record_pixel_pipe_query_completion_release_trace(GpuMemoryRelease::label(
+                release.address,
+                GpuMemoryReleaseValue::Immediate64(2)
+            )),
             None
         );
         assert_eq!(
-            record_pixel_pipe_query_completion_release_trace(GpuMemoryRelease::label(release.address + 8, release.value)),
+            record_pixel_pipe_query_completion_release_trace(GpuMemoryRelease::label(
+                release.address + 8,
+                release.value
+            )),
             None
         );
         let trace = record_pixel_pipe_query_completion_release_trace(release)

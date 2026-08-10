@@ -72,6 +72,12 @@ pub struct GuestAddressSpace {
     /// resolves as one physical run — mirroring hardware, where the GPU reads such memory through
     /// per-process page tables by virtual address.
     commit_backing: Option<GuestPhysicalBacking>,
+    /// Opt-in first-write probes installed as soon as their guest mapping exists.
+    ///
+    /// Texture write watches are normally created only when the GPU first samples a resource.
+    /// `REMU_TRACE_GUEST_CPU_WRITE_RANGE` needs to observe initialization which can happen before
+    /// that point, so the address space retains this diagnostic watch for the mapping's lifetime.
+    diagnostic_write_watches: Vec<CpuWriteWatch>,
 }
 
 impl GuestAddressSpace {
@@ -99,6 +105,7 @@ impl GuestAddressSpace {
             end,
             vmas: BTreeMap::new(),
             commit_backing: None,
+            diagnostic_write_watches: Vec::new(),
         })
     }
 

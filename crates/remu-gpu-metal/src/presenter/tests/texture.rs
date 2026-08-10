@@ -20,20 +20,18 @@ use super::{
     apply_image_destination_select, comparison_depth32_upload, copy_linear_to_tiled_at_z,
     create_sampled_guest_texture, decode_guest_texture_linear_from_raw, decode_image_descriptor,
     decode_mode27_mip_chain_from_raw, depth_array_face_descriptor,
-    depth_array_face_set_is_complete, fallback_image_descriptor, guest_shared_mapping_identity,
-    guest_texture_byte_count, guest_texture_descriptors_overlap,
-    guest_texture_descriptors_share_color_view_storage,
+    depth_array_face_set_is_complete, depth_sample_view_must_not_steal_depth_authority,
+    fallback_image_descriptor, guest_shared_mapping_identity, guest_texture_byte_count,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    depth_sample_view_must_not_steal_depth_authority, guest_texture_raw_matches,
-    guest_texture_raw_range, image_destination_select_is_native,
+    guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
     rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_same_image_sample_is_eligible,
-    resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats,
+    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
     sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
@@ -3974,7 +3972,7 @@ fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
         mip_level_count: 1,
         dcc_enabled: false,
         fast_clear_enabled: false,
-            blend_bypass: false,
+        blend_bypass: false,
     };
 
     let (_sender, receiver) = std::sync::mpsc::channel();
@@ -4491,14 +4489,8 @@ fn same_address_same_format_sample_survives_partial_owned_supersession() {
         "same-address same-extent EyeAdapt sample must stay eligible after partial owned supersession"
     );
     let subrect_sample = DecodedImageDescriptor {
-        guest: GuestTextureDescriptor {
-            height: 2,
-            ..eye
-        },
-        span: ResourceSpan::for_texture(GuestTextureDescriptor {
-            height: 2,
-            ..eye
-        }),
+        guest: GuestTextureDescriptor { height: 2, ..eye },
+        span: ResourceSpan::for_texture(GuestTextureDescriptor { height: 2, ..eye }),
         destination_select: 0xfac,
         base_mip_level: 0,
         mip_level_count: 1,

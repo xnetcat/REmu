@@ -475,7 +475,7 @@ fn pre_pixel_shader_diagnostic_can_capture_an_exact_resident_mode27_target() {
         mip_level_count: 1,
         dcc_enabled: false,
         fast_clear_enabled: false,
-            blend_bypass: false,
+        blend_bypass: false,
     };
 
     assert!(presenter.direct_scanout_textures.is_empty());

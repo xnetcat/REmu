@@ -6,7 +6,8 @@ use super::{
     GuestTextureDescriptor, UploadedGlobalBuffer, decode_depth_target, decode_image_descriptor,
     decode_metal_blend_attachment, decode_raster_state, decode_render_targets, decode_scissor,
     decode_viewport, guest_ranges_overlap, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
+    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     is_storage_image_opcode, is_writable_image_opcode, register_value, sampled_image_bindings,
 };
 use metal::MTLPixelFormat;
@@ -20,7 +21,7 @@ use remu_shader::{
     image_is_comparison,
 };
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY: usize = 262_144;
@@ -28,6 +29,9 @@ pub(super) const DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY: usize = 262_144;
 pub(super) const DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX: usize = 24;
 
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX: u64 = 30;
+
+/// Mesh shaders already reserve buffers 29 and 30 for meshlets and draw metadata.
+pub(super) const DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX: u64 = 28;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WIDTH: usize = 1_920;
 
@@ -268,6 +272,12 @@ fn diagnostic_video_chain_match(
                 .iter()
                 .copied()
                 .find(|(candidate, _)| guest_texture_descriptors_share_storage(*candidate, sampled))
+        })
+        .or_else(|| {
+            tracked.iter().copied().find(|(candidate, _)| {
+                guest_texture_descriptors_share_gpu_sample_storage(*candidate, sampled)
+                    || guest_texture_descriptors_share_color_view_storage(*candidate, sampled)
+            })
         })
 }
 
@@ -935,6 +945,103 @@ pub(super) fn diagnostic_dump_target_address() -> Option<u64> {
     })
 }
 
+fn diagnostic_dump_target_address_bound(name: &'static str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    let value = value.strip_prefix("0x").unwrap_or(&value);
+    u64::from_str_radix(value, 16).ok()
+}
+
+pub(super) fn diagnostic_dump_target_address_range() -> Option<(u64, u64)> {
+    static RANGE: OnceLock<Option<(u64, u64)>> = OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let minimum = diagnostic_dump_target_address_bound("REMU_DUMP_TARGET_ADDRESS_MIN")?;
+        let maximum = diagnostic_dump_target_address_bound("REMU_DUMP_TARGET_ADDRESS_MAX")?;
+        (minimum <= maximum).then_some((minimum, maximum))
+    })
+}
+
+fn diagnostic_dump_target_after_mrt_min() -> Option<usize> {
+    static MINIMUM: OnceLock<Option<usize>> = OnceLock::new();
+    *MINIMUM.get_or_init(|| {
+        std::env::var("REMU_DUMP_TARGET_AFTER_MRT_MIN")
+            .ok()?
+            .parse::<usize>()
+            .ok()
+            .filter(|minimum| *minimum != 0)
+    })
+}
+
+fn diagnostic_dump_target_after_mrt_draws() -> usize {
+    static DRAWS: OnceLock<usize> = OnceLock::new();
+    *DRAWS.get_or_init(|| {
+        std::env::var("REMU_DUMP_TARGET_AFTER_MRT_DRAWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1)
+    })
+}
+
+static DIAGNOSTIC_MAX_FULL_RESOLUTION_MRTS: AtomicUsize = AtomicUsize::new(0);
+static DIAGNOSTIC_FULL_RESOLUTION_MRT_DRAWS: AtomicUsize = AtomicUsize::new(0);
+static DIAGNOSTIC_AFTER_MRT_READY_DRAW: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn diagnostic_note_full_resolution_mrt_draw(
+    draw_sequence: u64,
+    target_count: usize,
+    full_resolution: bool,
+) {
+    let Some(required) = diagnostic_dump_target_after_mrt_min() else {
+        return;
+    };
+    if !full_resolution {
+        return;
+    }
+    DIAGNOSTIC_MAX_FULL_RESOLUTION_MRTS.fetch_max(target_count, Ordering::Relaxed);
+    if target_count < required {
+        return;
+    }
+    let observed = DIAGNOSTIC_FULL_RESOLUTION_MRT_DRAWS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let required_draws = diagnostic_dump_target_after_mrt_draws();
+    if observed == required_draws {
+        DIAGNOSTIC_AFTER_MRT_READY_DRAW.store(draw_sequence, Ordering::Relaxed);
+        eprintln!(
+            "[REMu][METAL][TARGET-AFTER-MRT] ready draw={draw_sequence} targets={target_count} required={required} qualifying_draws={observed} required_draws={required_draws}"
+        );
+    }
+}
+
+const fn diagnostic_target_after_mrt_minimum_draw(configured_minimum: u64, ready_draw: u64) -> u64 {
+    if configured_minimum >= ready_draw {
+        configured_minimum
+    } else {
+        ready_draw
+    }
+}
+
+pub(super) fn diagnostic_target_after_mrt_ready() -> bool {
+    diagnostic_target_after_mrt_satisfied(
+        diagnostic_dump_target_after_mrt_min(),
+        DIAGNOSTIC_MAX_FULL_RESOLUTION_MRTS.load(Ordering::Relaxed),
+        diagnostic_dump_target_after_mrt_draws(),
+        DIAGNOSTIC_FULL_RESOLUTION_MRT_DRAWS.load(Ordering::Relaxed),
+    )
+}
+
+const fn diagnostic_target_after_mrt_satisfied(
+    required: Option<usize>,
+    observed: usize,
+    required_draws: usize,
+    observed_draws: usize,
+) -> bool {
+    match required {
+        Some(required) => observed >= required && observed_draws >= required_draws,
+        None => true,
+    }
+}
+
 pub(super) const fn diagnostic_target_address_matches(
     expected: Option<u64>,
     target_address: u64,
@@ -982,6 +1089,7 @@ fn diagnostic_dump_target_sample_address() -> Option<u64> {
 pub(super) struct DiagnosticTargetDrawFilter {
     pixel_shader_address: Option<u64>,
     target_address: Option<u64>,
+    target_address_range: Option<(u64, u64)>,
     sampled_address: Option<u64>,
     minimum_draw: u64,
 }
@@ -1020,6 +1128,11 @@ impl DiagnosticTargetDrawFilter {
                 return false;
             }
         }
+        if let Some((minimum, maximum)) = self.target_address_range
+            && (target_address < minimum || target_address > maximum)
+        {
+            return false;
+        }
         true
     }
 
@@ -1033,17 +1146,33 @@ impl DiagnosticTargetDrawFilter {
 }
 
 pub(super) fn diagnostic_target_draw_filter() -> Option<DiagnosticTargetDrawFilter> {
+    if !diagnostic_target_after_mrt_ready() {
+        return None;
+    }
     let pixel_shader_address = diagnostic_dump_target_pixel_shader();
     let target_address = diagnostic_dump_target_address();
+    let target_address_range = diagnostic_dump_target_address_range();
     let sampled_address = diagnostic_dump_target_sample_address();
-    if pixel_shader_address.is_none() && target_address.is_none() && sampled_address.is_none() {
+    if pixel_shader_address.is_none()
+        && target_address.is_none()
+        && target_address_range.is_none()
+        && sampled_address.is_none()
+    {
         return None;
     }
     Some(DiagnosticTargetDrawFilter {
         pixel_shader_address,
         target_address,
+        target_address_range,
         sampled_address,
-        minimum_draw: diagnostic_dump_target_minimum_draw(),
+        // Decoding can run ahead of Metal execution. A boolean "MRT gate is ready" therefore
+        // lets an older queued compositor steal the one-shot capture after a later BasePass draw
+        // opens the gate. Retain that BasePass draw sequence and require the candidate itself to
+        // be at least as new.
+        minimum_draw: diagnostic_target_after_mrt_minimum_draw(
+            diagnostic_dump_target_minimum_draw(),
+            DIAGNOSTIC_AFTER_MRT_READY_DRAW.load(Ordering::Relaxed),
+        ),
     })
 }
 
@@ -1163,8 +1292,10 @@ pub(super) fn diagnostic_dump_gbuffer() -> bool {
 
 pub(super) fn diagnostic_texture_writer_enabled() -> bool {
     trace_scanout_writes()
+        || std::env::var_os("REMU_DUMP_COMPUTE_TEXTURE_DIR").is_some()
         || diagnostic_guest_write_trace_range().is_some()
         || diagnostic_dump_target_address().is_some()
+        || diagnostic_dump_target_address_range().is_some()
         || diagnostic_dump_target_pixel_shader().is_some()
         || diagnostic_dump_target_sample_address().is_some()
         || diagnostic_dump_target_pixel_instruction_count().is_some()
@@ -1283,8 +1414,21 @@ pub(super) fn diagnostic_trace_target_stride() -> u64 {
     })
 }
 
+fn diagnostic_global_binding_byte_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REMU_DUMP_TARGET_GLOBAL_BYTE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(256)
+            .clamp(1, 64 * 1024)
+    })
+}
+
 pub(super) fn diagnostic_global_binding_head(binding: &GlobalMemoryBinding) -> Vec<u8> {
-    let byte_count = binding.byte_count.min(256);
+    let byte_count = binding
+        .byte_count
+        .min(diagnostic_global_binding_byte_limit());
     if byte_count == 0 {
         return Vec::new();
     }
@@ -1312,7 +1456,7 @@ fn diagnostic_uploaded_global_binding_range(
     offset: u64,
     binding_byte_count: usize,
 ) -> Result<(usize, usize), String> {
-    let byte_count = binding_byte_count.min(256);
+    let byte_count = binding_byte_count.min(diagnostic_global_binding_byte_limit());
     let start = usize::try_from(offset)
         .map_err(|_| format!("Metal buffer offset {offset:#x} does not fit usize"))?;
     let end = start.checked_add(byte_count).ok_or_else(|| {
@@ -1855,6 +1999,35 @@ mod tests {
     }
 
     #[test]
+    fn video_chain_match_follows_a_typed_color_alias() {
+        let rendered = GuestTextureDescriptor {
+            address: 0x1000,
+            width: 378,
+            height: 150,
+            pitch: 378,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::BGRA8Unorm_sRGB,
+            bytes_per_pixel: 4,
+        };
+        let sampled = GuestTextureDescriptor {
+            pixel_format: MTLPixelFormat::RGBA8Unorm_sRGB,
+            ..rendered
+        };
+        let producer = DiagnosticVideoChainProducer {
+            stage: "draw",
+            sequence: 10,
+            shader: 0x2000,
+            generation: 1,
+        };
+
+        assert_eq!(
+            diagnostic_video_chain_match(&[(rendered, producer)], sampled)
+                .map(|(descriptor, producer)| (descriptor, producer.sequence)),
+            Some((rendered, producer.sequence)),
+        );
+    }
+
+    #[test]
     fn video_chain_write_retires_stale_overlap_without_fabricating_a_consumer() {
         let old_surface = GuestTextureDescriptor {
             address: 0x1000,
@@ -1957,6 +2130,7 @@ mod tests {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: Some(0x0080_0e73_0000),
             target_address: Some(0x00ef_c200_0000),
+            target_address_range: None,
             sampled_address: None,
             minimum_draw: 38,
         };
@@ -2037,6 +2211,7 @@ mod tests {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: None,
             target_address: Some(0),
+            target_address_range: None,
             sampled_address: None,
             minimum_draw: 0,
         };
@@ -2072,6 +2247,7 @@ mod tests {
         let filter = DiagnosticTargetDrawFilter {
             pixel_shader_address: Some(0x0080_0802_0000),
             target_address: Some(0x00ef_c000_0000),
+            target_address_range: None,
             sampled_address: Some(0x0080_65b3_0000),
             minimum_draw: 0,
         };
@@ -2080,6 +2256,41 @@ mod tests {
         assert!(filter.matches_sampled_addresses([0x1234, 0x0080_65b3_0000]));
         assert!(!filter.matches_sampled_addresses([0x0080_65b4_0000]));
         assert!(!filter.matches_sampled_addresses([]));
+    }
+
+    #[test]
+    fn target_address_range_selects_remapped_heap_targets() {
+        let filter = DiagnosticTargetDrawFilter {
+            pixel_shader_address: Some(0x0080_0e73_0000),
+            target_address: None,
+            target_address_range: Some((0x0080_5000_0000, 0x0080_9000_0000)),
+            sampled_address: None,
+            minimum_draw: 0,
+        };
+
+        assert!(filter.matches(1, 0x0080_0e73_0000, 0x0080_6f0c_0000, 1_920, 1_080));
+        assert!(!filter.matches(1, 0x0080_0e73_0000, 0x00ef_c100_0000, 1_920, 1_080));
+    }
+
+    #[test]
+    fn target_after_mrt_gate_waits_for_full_attachment_count() {
+        assert!(diagnostic_target_after_mrt_satisfied(None, 0, 1, 0));
+        assert!(!diagnostic_target_after_mrt_satisfied(Some(7), 6, 1, 1));
+        assert!(!diagnostic_target_after_mrt_satisfied(Some(7), 7, 2, 1));
+        assert!(diagnostic_target_after_mrt_satisfied(Some(7), 7, 2, 2));
+        assert!(diagnostic_target_after_mrt_satisfied(Some(7), 8, 2, 3));
+    }
+
+    #[test]
+    fn target_after_mrt_gate_rejects_queued_draws_older_than_ready_point() {
+        assert_eq!(
+            diagnostic_target_after_mrt_minimum_draw(20_000, 22_449),
+            22_449
+        );
+        assert_eq!(
+            diagnostic_target_after_mrt_minimum_draw(30_000, 22_449),
+            30_000
+        );
     }
 
     #[test]

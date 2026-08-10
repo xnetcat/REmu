@@ -9,6 +9,37 @@
 
 pub(super) use crate::signal_text::DiagnosticBuffer;
 
+const GUEST_CPU_WRITE_TRACE_VARIABLE: &str = "REMU_TRACE_GUEST_CPU_WRITE_RANGE";
+
+/// Resolves `START..END` once outside signal context.
+pub(super) fn guest_cpu_write_trace_range() -> Option<(u64, u64)> {
+    static RANGE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *RANGE.get_or_init(|| {
+        let value = std::env::var(GUEST_CPU_WRITE_TRACE_VARIABLE).ok()?;
+        let (start, end) = value.split_once("..")?;
+        let parse = |part: &str| {
+            let part = part.trim().trim_start_matches("0x");
+            u64::from_str_radix(part, 16).ok()
+        };
+        let start = parse(start)?;
+        let end = parse(end)?;
+        (start < end).then_some((start, end))
+    })
+}
+
+pub(super) fn guest_cpu_write_trace_matches(address: u64) -> bool {
+    guest_cpu_write_trace_range().is_some_and(|(start, end)| address >= start && address < end)
+}
+
+/// Renders an expected, handled write-watch fault selected by the diagnostic range.
+pub(super) fn format_guest_cpu_write_trace(report: FaultReport, buffer: &mut DiagnosticBuffer) {
+    buffer.push_bytes(b"[REMu][WATCH] guest CPU write addr=");
+    buffer.push_hexadecimal(report.address);
+    buffer.push_bytes(b" pc=");
+    buffer.push_hexadecimal(report.program_counter);
+    buffer.push_bytes(b" page-opened=1\n");
+}
+
 /// Where a faulting address lives relative to the emulator's guest address-space reservations.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) enum FaultSpace {

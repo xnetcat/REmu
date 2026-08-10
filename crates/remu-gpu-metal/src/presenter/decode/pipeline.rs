@@ -5,29 +5,29 @@ use super::{
     CB_BLEND0_CONTROL, CB_TARGET_MASK, CX_GRAPHICS_SCRATCH_RING_SIZE, CX_VGT_SHADER_STAGES_EN,
     CX_VGT_SHADER_STAGES_EN_GS_WAVE32, DB_DEPTH_CONTROL, DB_SHADER_CONTROL,
     DEFAULT_CB_BLEND_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState,
-    DecodedRenderTarget,
-    DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
+    DecodedRenderTarget, DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     GraphicsWaveState, MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits,
-    PA_CL_VTE_CNTL, PA_CL_VS_OUT_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
-    RenderTargetPipelineState,
-    SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT,
-    VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE, common_render_target_array_length,
-    decode_depth_target, decode_render_targets, diagnostic_capture_pixel_output,
-    diagnostic_capture_vertex_position, diagnostic_dump_gbuffer, diagnostic_dump_glyph_draw,
-    diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
-    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    PA_CL_VS_OUT_CNTL, PA_CL_VTE_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
+    RenderTargetPipelineState, SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_GS_INSTANCE_CNT,
+    VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
+    common_render_target_array_length, decode_depth_target, decode_render_targets,
+    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
+    diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
+    diagnostic_dump_target_address_range, diagnostic_dump_target_minimum_draw,
+    diagnostic_dump_target_mrt_min, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
     diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
     diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
     diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_target_address_matches, diagnostic_video_chain_selected_draw,
-    evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
-    fragmentless_pixel_program, graphics_allocated_vector_register_count, image_component_class,
-    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, pixel_input_controls, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base, register_value, video_target_binding_summary,
+    diagnostic_note_full_resolution_mrt_draw, diagnostic_target_address_matches,
+    diagnostic_video_chain_selected_draw, evaluation_samples_glyph_atlas,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program,
+    graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    pixel_input_controls, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
@@ -522,11 +522,14 @@ pub(crate) fn decode_ngg_registers_from_state(
         .ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
     let ge_max_output_per_subgroup = register_value(context_registers, GE_MAX_OUTPUT_PER_SUBGROUP)
         .ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
+    let primgen_passthrough = register_value(context_registers, CX_VGT_SHADER_STAGES_EN)
+        .is_some_and(|stages| stages & 0x0200_0000 != 0);
     Ok(remu_shader_metal::NggRegisters {
         pgm_rsrc1,
         pgm_rsrc2,
         gs_max_vert_out,
         ge_max_output_per_subgroup,
+        primgen_passthrough,
     })
 }
 
@@ -841,22 +844,31 @@ pub(crate) fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterSta
         value => return Err(format!("reserved GFX10 polygon mode {value}")),
     };
 
-    let front_scale = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_FRONT_SCALE)
-        .map(f32::from_bits)
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0);
-    let front_offset = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_FRONT_OFFSET)
-        .map(f32::from_bits)
-        .filter(|value| value.is_finite())
-        .unwrap_or(0.0);
+    let front_scale = register_value(
+        &draw.context_registers,
+        super::PA_SU_POLY_OFFSET_FRONT_SCALE,
+    )
+    .map(f32::from_bits)
+    .filter(|value| value.is_finite())
+    .unwrap_or(0.0);
+    let front_offset = register_value(
+        &draw.context_registers,
+        super::PA_SU_POLY_OFFSET_FRONT_OFFSET,
+    )
+    .map(f32::from_bits)
+    .filter(|value| value.is_finite())
+    .unwrap_or(0.0);
     let back_scale = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_BACK_SCALE)
         .map(f32::from_bits)
         .filter(|value| value.is_finite())
         .unwrap_or(front_scale);
-    let back_offset = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_BACK_OFFSET)
-        .map(f32::from_bits)
-        .filter(|value| value.is_finite())
-        .unwrap_or(front_offset);
+    let back_offset = register_value(
+        &draw.context_registers,
+        super::PA_SU_POLY_OFFSET_BACK_OFFSET,
+    )
+    .map(f32::from_bits)
+    .filter(|value| value.is_finite())
+    .unwrap_or(front_offset);
     let clamp = register_value(&draw.context_registers, super::PA_SU_POLY_OFFSET_CLAMP)
         .map(f32::from_bits)
         .filter(|value| value.is_finite())
@@ -925,6 +937,9 @@ fn graphics_diagnostic_pipeline_state(
                 .collect::<Vec<_>>(),
         );
     }
+    // Shader instrumentation must be compiled before execution reaches the semantic MRT gate:
+    // pipeline workers can evaluate draws out of order and the ordinary shader pair may already
+    // be cached by then. Execution metadata keeps the capture branch disabled until the gate.
     let selected_target = draw.sequence >= diagnostic_dump_target_minimum_draw()
         && targets.iter().any(|target| {
             diagnostic_target_address_matches(
@@ -932,8 +947,18 @@ fn graphics_diagnostic_pipeline_state(
                 target.texture.address,
                 target.texture.width,
                 target.texture.height,
-            )
+            ) || diagnostic_dump_target_address_range().is_some_and(|(minimum, maximum)| {
+                (minimum..=maximum).contains(&target.texture.address)
+            })
         });
+    let explicit_target_filter = diagnostic_dump_target_address().is_some()
+        || diagnostic_dump_target_address_range().is_some();
+    let selected_mrt = diagnostic_dump_target_mrt_min().is_some_and(|minimum| {
+        targets.len() >= minimum
+            && targets
+                .iter()
+                .all(|target| target.texture.width >= 1_280 && target.texture.height >= 720)
+    });
     let selected_shader = diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address)
         || diagnostic_dump_target_pixel_instruction_count()
             == Some(pixel_program.instructions.len())
@@ -951,6 +976,42 @@ fn graphics_diagnostic_pipeline_state(
         || (diagnostic_dump_shadow_consumer()
             && evaluation_samples_layered_comparison(pixel_evaluation))
         || (diagnostic_dump_glyph_draw() && evaluation_samples_glyph_atlas(pixel_evaluation));
+    let explicit_shader_filter = diagnostic_dump_target_pixel_shader().is_some()
+        || diagnostic_dump_target_pixel_instruction_count().is_some();
+    // Explicit shader and attachment selectors are conjunctive. Treating ADDRESS=auto as an
+    // alternative to PS instruments every full-resolution draw after BasePass, allocating and
+    // clearing diagnostic buffers across the whole post chain before the one requested composite
+    // can retire.
+    let selected_draw = diagnostic_filter_selection(
+        explicit_target_filter,
+        selected_target,
+        explicit_shader_filter,
+        selected_shader,
+    );
+    // Pipeline instrumentation may safely be a superset of the ultimately armed capture. In
+    // particular, compile an explicitly named PS even when asynchronous pipeline evaluation sees
+    // it before the dynamic target selector has stabilized. `execute_draw` keeps the branch off
+    // until the semantic gate and all target constraints match.
+    let instrumented_draw = selected_draw || selected_mrt || selected_shader;
+    if diagnostic_dump_target_pixel_shader() == Some(draw.pixel_shader_address) {
+        static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+            eprintln!(
+                "[REMu][METAL][TARGET-PIPELINE-SELECT] draw={} ps={:#x} target_filter={explicit_target_filter}/{selected_target} shader_filter={explicit_shader_filter}/{selected_shader} selected={selected_draw} instrumented={instrumented_draw} targets={:?}",
+                draw.sequence,
+                draw.pixel_shader_address,
+                targets
+                    .iter()
+                    .map(|target| (
+                        target.texture.address,
+                        target.texture.width,
+                        target.texture.height,
+                        target.direct_scanout,
+                    ))
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
     let samples_large_video =
         diagnostic_dump_video_draw() && evaluation_samples_large_linear_video(pixel_evaluation);
 
@@ -958,18 +1019,37 @@ fn graphics_diagnostic_pipeline_state(
         force_pixel_color: sample_count > 1
             && pixel_program.instructions.len() > 64
             && diagnostic_force_msaa_pixel_color(),
-        capture_pixel_output: diagnostic_capture_pixel_output()
+        // The semantic video-chain selector is armed only when the first consumer is dequeued.
+        // Pipeline lookahead can compile the ordinary pair before then, so make the chain dump
+        // self-contained: once selected, its distinct diagnostic key always carries both probes
+        // even when the generic capture environment variables were not set early enough.
+        capture_pixel_output: (diagnostic_capture_pixel_output()
+            || diagnostic_dump_video_chain_consumer())
             && ((sample_count > 1 && pixel_program.instructions.len() == 370)
-                || selected_shader
-                || selected_target
+                || instrumented_draw
                 || samples_large_video),
         force_visible_clip_depth: sample_count > 1 && diagnostic_force_visible_clip_depth(),
         force_vertex_pattern: diagnostic_force_msaa_vertex_pattern()
-            && (sample_count > 1 || selected_shader || selected_target),
+            && (sample_count > 1 || instrumented_draw),
         force_vertex_fetch_id: diagnostic_force_vertex_fetch_id()
-            && (sample_count > 1 || selected_shader || selected_target),
-        capture_vertex_position: diagnostic_capture_vertex_position()
-            && (sample_count > 1 || selected_shader || selected_target || samples_large_video),
+            && (sample_count > 1 || instrumented_draw),
+        capture_vertex_position: (diagnostic_capture_vertex_position()
+            || diagnostic_dump_video_chain_consumer())
+            && (sample_count > 1 || instrumented_draw || samples_large_video),
+    }
+}
+
+const fn diagnostic_filter_selection(
+    target_filter_present: bool,
+    target_matches: bool,
+    shader_filter_present: bool,
+    shader_matches: bool,
+) -> bool {
+    match (target_filter_present, shader_filter_present) {
+        (true, true) => target_matches && shader_matches,
+        (true, false) => target_matches,
+        (false, true) => shader_matches,
+        (false, false) => false,
     }
 }
 
@@ -1034,6 +1114,8 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             .map(|target| target.layer_count)
             .chain(depth.into_iter().map(|depth| depth.layer_count)),
     );
+    let vertex_output_control =
+        register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL).unwrap_or_default();
     if let Some(target) = targets
         .iter()
         .find(|target| target.sample_count != sample_count)
@@ -1051,6 +1133,18 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             depth.sample_count
         ));
     }
+    // Pipeline construction runs ahead of Metal execution. Open the semantic diagnostic gate
+    // here, in guest draw order, so the first compositor immediately following a full BasePass
+    // receives the instrumented key. Waiting until the MRT has executed is too late for a
+    // one-shot title composite whose ordinary pipeline may already be queued or cached.
+    diagnostic_note_full_resolution_mrt_draw(
+        draw.sequence,
+        targets.len(),
+        !targets.is_empty()
+            && targets
+                .iter()
+                .all(|target| target.texture.width >= 1_280 && target.texture.height >= 720),
+    );
     let export_user_data_register = [0x08c, 0x0cc, 0x04c]
         .into_iter()
         .find(|base| {
@@ -1059,10 +1153,8 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                 .any(|register| register.offset == base - 1)
         })
         .unwrap_or(0x0cc);
-    let ngg_subgroup_limits = decode_ngg_subgroup_limits_with_uc(
-        &draw.context_registers,
-        &draw.user_config_registers,
-    )?;
+    let ngg_subgroup_limits =
+        decode_ngg_subgroup_limits_with_uc(&draw.context_registers, &draw.user_config_registers)?;
     let ngg_registers = ngg_subgroup_limits
         .map(|_| {
             decode_ngg_registers_from_state(
@@ -1097,8 +1189,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         } else {
             graphics_allocated_vector_register_count(&draw.shader_registers, 0x00c)
         },
-        vertex_output_control: register_value(&draw.context_registers, PA_CL_VS_OUT_CNTL)
-            .unwrap_or_default(),
+        vertex_output_control,
         // AGC seeds `PA_CL_VTE_CNTL=0x43f` (VTX_W0_FMT set). Missing after a sparse test draw
         // must not invent that default — only seeded/live state may force W=1.
         viewport_transform_control: register_value(&draw.context_registers, PA_CL_VTE_CNTL)
@@ -1478,7 +1569,7 @@ pub(crate) fn metal_color_write_mask(guest_mask: u32) -> MTLColorWriteMask {
 
 #[cfg(test)]
 mod tests {
-    use super::{DB_SHADER_CONTROL, pixel_depth_export_enabled};
+    use super::{DB_SHADER_CONTROL, diagnostic_filter_selection, pixel_depth_export_enabled};
     use remu_gpu::GpuRegister;
 
     #[test]
@@ -1497,5 +1588,15 @@ mod tests {
             }],
             true,
         ));
+    }
+
+    #[test]
+    fn combines_explicit_diagnostic_shader_and_target_filters_conjunctively() {
+        assert!(diagnostic_filter_selection(true, true, true, true));
+        assert!(!diagnostic_filter_selection(true, true, true, false));
+        assert!(!diagnostic_filter_selection(true, false, true, true));
+        assert!(diagnostic_filter_selection(true, true, false, false));
+        assert!(diagnostic_filter_selection(false, false, true, true));
+        assert!(!diagnostic_filter_selection(false, false, false, false));
     }
 }

@@ -815,8 +815,14 @@ mod tests {
         assert_eq!(cx.get(&0x0b5), Some(&0));
         assert_eq!(cx.get(&0x2d5), Some(&0x2000));
         assert_eq!(cx.get(&0x202), Some(&0x00cc_0010));
-        assert_eq!(lookup_register_default(RegisterFile::Context, 0x205), Some(0x240));
-        assert_eq!(lookup_register_default(RegisterFile::Context, 0x1c5), Some(0));
+        assert_eq!(
+            lookup_register_default(RegisterFile::Context, 0x205),
+            Some(0x240)
+        );
+        assert_eq!(
+            lookup_register_default(RegisterFile::Context, 0x1c5),
+            Some(0)
+        );
 
         let uc = seed_register_defaults(RegisterFile::UserConfig);
         assert_eq!(uc.get(&0x24a), Some(&0));

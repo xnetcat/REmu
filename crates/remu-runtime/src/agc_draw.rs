@@ -4,14 +4,13 @@ use std::sync::{Mutex, OnceLock};
 use remu_shader::GuestMemoryReader;
 
 use crate::{
-    AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_COLOR_REGISTER_STRIDE, AGC_CB_SHADER_MASK,
+    AGC_CB_COLOR_REGISTER_STRIDE, AGC_CB_COLOR0_BASE, AGC_CB_COLOR0_BASE_EXT, AGC_CB_SHADER_MASK,
     AGC_CB_TARGET_MASK, AGC_COLOR_TARGET_COUNT, AGC_COMPUTE_USER_DATA_0, AGC_IT_DISPATCH_DIRECT,
     AGC_SPI_SHADER_PGM_HI_ES, AGC_SPI_SHADER_PGM_HI_PS, AGC_SPI_SHADER_PGM_LO_ES,
-    AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_PRIMITIVE_TYPE,
-    AgcColorTargetState, AgcComputeDispatchError, AgcGraphicsState, AgcShaderRegistry,
-    AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory, ShaderEvaluationWorkers,
-    VideoOutState, agc_color_target_state, agc_has_active_depth_state, agc_program_address,
-    agc_register_snapshot, agc_shader_prefix_snapshot, agc_shader_snapshot,
+    AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_PRIMITIVE_TYPE, AgcColorTargetState, AgcComputeDispatchError,
+    AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory,
+    ShaderEvaluationWorkers, VideoOutState, agc_color_target_state, agc_has_active_depth_state,
+    agc_program_address, agc_register_snapshot, agc_shader_prefix_snapshot, agc_shader_snapshot,
     agc_video_out_target_for_address, draw_required_vertex_record_count, dump_draw_shader_ir,
     emit_agc_gpu_event, evaluate_draw_shader_requests_parallel,
     evaluate_shader_register_snapshot_cached, export_user_data_register, read_guest_u32,
@@ -210,9 +209,9 @@ fn agc_color_base_snapshot(
             let primary = slot * AGC_CB_COLOR_REGISTER_STRIDE;
             let base = registers.get(&(AGC_CB_COLOR0_BASE + primary)).copied();
             let base_ext = registers.get(&(AGC_CB_COLOR0_BASE_EXT + slot)).copied();
-            let address = base.zip(base_ext).map(|(low, high)| {
-                (u64::from(high & 0xff) << 40) | (u64::from(low) << 8)
-            });
+            let address = base
+                .zip(base_ext)
+                .map(|(low, high)| (u64::from(high & 0xff) << 40) | (u64::from(low) << 8));
             (slot, address)
         })
         .collect()
@@ -247,7 +246,9 @@ fn agc_trace_color_target_emit(
     let enabled_slots = agc_enabled_color_slot_count(registers);
     // Mask says ≥3 slots even when decode produced fewer/empty targets (Malformed path).
     if enabled_slots >= 3 {
-        let total = BASEPASS_MRT.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let total = BASEPASS_MRT
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
         let logged = LOGGED_MASK_MRT.fetch_add(1, Ordering::Relaxed);
         if logged < 64 {
             eprintln!(
@@ -268,7 +269,10 @@ fn agc_trace_color_target_emit(
         // Bound volume: first 64 multi-MRT emits, then power-of-two. Do not log every ≥3-slot
         // BasePass draw — title sessions emit thousands and drown the evidence log.
         let mrt3 = targets.len() >= 3;
-        if logged < 64 || total.is_power_of_two() || (mrt3 && BASEPASS_MRT.load(Ordering::Relaxed).is_power_of_two()) {
+        if logged < 64
+            || total.is_power_of_two()
+            || (mrt3 && BASEPASS_MRT.load(Ordering::Relaxed).is_power_of_two())
+        {
             let slots = targets
                 .iter()
                 .map(|target| {

@@ -1365,12 +1365,12 @@ pub(crate) fn av_player_write_video_frame_info(
 ) {
     let visible_width = usize::try_from(width).unwrap_or(0);
     let visible_height = usize::try_from(height).unwrap_or(0);
-    // The width field carries the displayable extent; the storage stride lives in the pitch
-    // field at +60. Poppy Playtime scales the reported width onto the screen without reading
-    // any crop field, so reporting the pitch here squeezed the picture by pitch/width and
-    // showed the zero pad as a dead band on the right.
+    // `SceAvPlayerVideoEx::width` describes the framebuffer extent. The visible extent is the
+    // framebuffer width minus the left/right crop offsets, while `pitch` describes its row
+    // stride. Reporting the already-cropped width here makes consumers subtract the padding a
+    // second time (Silent Hill turned a 378-pixel movie into 378-(512-378)=244 pixels).
     let output_width = if extended {
-        visible_width
+        row_pitch
     } else {
         visible_width.saturating_add(15) & !15
     };
@@ -1390,10 +1390,8 @@ pub(crate) fn av_player_write_video_frame_info(
         write_guest_u8(output + 64, 8);
         write_guest_u8(output + 65, 8);
         // Silent Hill consumes the PS4-compatible 104-byte Gen5 VideoFrameInfoEx prefix. Crop
-        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively. Poppy's movie
-        // streamer reads width/pitch directly, while its MediaPlayer path ignores width and
-        // derives the visible extent as pitch-cropLeft-cropRight. Publish both contracts: true
-        // visible width plus a right crop that excludes storage-stride padding.
+        // fields are left, right, top, bottom at +44/+48/+52/+56 respectively. The framebuffer
+        // width above and right crop below therefore describe one consistent surface contract.
         write_guest_u32(
             output + 48,
             u32::try_from(row_pitch.saturating_sub(visible_width)).unwrap_or_default(),

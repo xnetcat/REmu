@@ -9,7 +9,7 @@
 //! consumer keeps its synthetic fallback, so publishing here is strictly additive.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::Instant;
 
 static VBLANK_COUNT: AtomicU64 = AtomicU64::new(0);

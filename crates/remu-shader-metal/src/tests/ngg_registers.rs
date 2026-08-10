@@ -19,6 +19,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
             pgm_rsrc2: 0,
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            primgen_passthrough: false,
         }
         .allocated_vgprs_wave32(),
         72,
@@ -30,6 +31,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
             pgm_rsrc2: 0,
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            primgen_passthrough: false,
         }
         .allocated_vgprs_wave32(),
         8,
@@ -43,6 +45,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
             pgm_rsrc2: 0,
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            primgen_passthrough: false,
         }
         .allocated_vgprs_wave32(),
         512,
@@ -65,6 +68,7 @@ fn gs_max_vert_out_is_the_eleven_bit_vgt_field() {
                 pgm_rsrc2: 0,
                 gs_max_vert_out: raw,
                 ge_max_output_per_subgroup: 0,
+                primgen_passthrough: false,
             }
             .gs_max_output_vertices(),
             expected,
@@ -89,6 +93,7 @@ fn subgroup_vertex_cap_is_the_ten_bit_ge_max_output_field() {
                 pgm_rsrc2: 0,
                 gs_max_vert_out: 0,
                 ge_max_output_per_subgroup: raw,
+                primgen_passthrough: false,
             }
             .max_verts_per_subgroup(),
             expected,
@@ -100,14 +105,23 @@ fn subgroup_vertex_cap_is_the_ten_bit_ge_max_output_field() {
 #[test]
 fn pgm_rsrc2_lds_size_follows_the_sdk_shshaderresource2gs_layout() {
     // SDK `ShShaderResource2Gs::getLdsSize()` (registerstructs.h:12154-12157):
-    // `((m_regs[0].m_value & 0x07f80000u) >> 12)`.
-    for (field, bytes) in [(0u32, 0u32), (1, 128), (0x40, 8192), (0x80, 16384), (0xff, 32640)] {
+    // `((m_regs[0].m_value & 0x07f80000u) >> 12)`. The result is a count of dwords,
+    // so the byte reservation is four times that value.
+    for (field, bytes) in [
+        (0u32, 0u32),
+        (1, 512),
+        (0x11, 8704),
+        (0x40, 32768),
+        (0x80, 65536),
+        (0xff, 130560),
+    ] {
         assert_eq!(
             NggRegisters {
                 pgm_rsrc1: 0,
                 pgm_rsrc2: field << 19,
                 gs_max_vert_out: 0,
                 ge_max_output_per_subgroup: 0,
+                primgen_passthrough: false,
             }
             .lds_size_bytes(),
             bytes,
@@ -120,23 +134,43 @@ fn pgm_rsrc2_lds_size_follows_the_sdk_shshaderresource2gs_layout() {
             pgm_rsrc2: 0xF807_FFFF | (0x40 << 19),
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            primgen_passthrough: false,
         }
         .lds_size_bytes(),
-        8192,
+        32768,
         "non-LDS RSRC2 bits must not change the decoded LDS byte count"
     );
+}
+
+#[test]
+fn silent_hill_lut_draw_lds_covers_its_captured_vertex_payload() {
+    // The title LUT mesh uses raw GS_RSRC2 0x008b0000 and accesses vertex payload through at
+    // least byte 0x1d20. Treating the SDK getter's dword count as bytes truncated this allocation
+    // to 2176 bytes, suppressed every guarded payload write/read, and emitted (0, 0, 0, 0)
+    // positions for all vertices.
+    let bytes = NggRegisters {
+        pgm_rsrc1: 0,
+        pgm_rsrc2: 0x008b_0000,
+        gs_max_vert_out: 0,
+        ge_max_output_per_subgroup: 0,
+        primgen_passthrough: false,
+    }
+    .lds_size_bytes();
+    assert_eq!(bytes, 8704);
+    assert!(bytes > 0x1d20);
 }
 
 #[test]
 fn mesh_options_derive_capacities_and_vgpr_allocation_from_registers() {
     // A subgroup that outputs 96 vertices after amplification, a VGPRS field selecting 128
     // wave32 registers (`((15)+1)<<3`), and an oversized GS_MAX_VERT_OUT the subgroup cap should
-    // win over. LDS field 0x20 → 4096 bytes from PGM_RSRC2.
+    // win over. LDS field 0x08 → 4096 bytes from PGM_RSRC2.
     let registers = NggRegisters {
         pgm_rsrc1: 15,
-        pgm_rsrc2: 0x20 << 19,
+        pgm_rsrc2: 0x08 << 19,
         gs_max_vert_out: 200,
         ge_max_output_per_subgroup: 96,
+        primgen_passthrough: false,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(4, 64, registers);
     assert_eq!(options.stage, MetalShaderStage::Mesh);
@@ -166,6 +200,7 @@ fn zero_subgroup_cap_falls_back_to_gs_max_vert_out() {
         pgm_rsrc2: 0,
         gs_max_vert_out: 128,
         ge_max_output_per_subgroup: 0,
+        primgen_passthrough: false,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(0, 32, registers);
     assert_eq!(options.mesh_max_vertex_count, 128);
@@ -182,6 +217,7 @@ fn derived_capacities_stay_inside_the_metal_validation_window() {
         pgm_rsrc2: 0,
         gs_max_vert_out: 0x7ff,
         ge_max_output_per_subgroup: 0x3ff,
+        primgen_passthrough: false,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(0, 256, registers);
     assert!((1..=256).contains(&options.mesh_max_vertex_count));

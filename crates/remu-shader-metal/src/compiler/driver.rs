@@ -21,6 +21,9 @@ use crate::compiler::image::{
 };
 use crate::compiler::interface::{PixelInterpolation, interpolation_for_barycentric_vgpr};
 use crate::compiler::memory::is_lds_memory_instruction;
+use crate::compiler::{
+    METAL_THREADGROUP_MEMORY_LIMIT_BYTES, SPLIT_WAVE64_PAIR_STATE_BYTES, is_full_exec_restore,
+};
 use crate::{
     Compiler, METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError,
     MetalCompileOptions, MetalRegisterFootprint, MetalShader, MetalShaderStage,
@@ -28,6 +31,71 @@ use crate::{
 };
 
 impl<'a> Compiler<'a> {
+    fn emit_diagnostic_compute_state_trace(&mut self, pc: u32) {
+        let Some(checkpoint) = self.diagnostic_compute_state_trace_checkpoint(pc) else {
+            return;
+        };
+        let Some([group_x, group_y, group_z]) = self.diagnostic_compute_state_trace_group() else {
+            return;
+        };
+        self.line(
+            3,
+            &format!(
+                "if (remu_group_id.x == {group_x}u && remu_group_id.y == {group_y}u && remu_group_id.z == {group_z}u) {{"
+            ),
+        );
+        self.line(
+            4,
+            &format!("uint remu_trace_base = (({checkpoint}u * 64u + remu_thread_index) * 128u);"),
+        );
+        for (offset, value) in [
+            format!("{pc}u"),
+            "exec ? 1u : 0u".to_owned(),
+            "vcc ? 1u : 0u".to_owned(),
+            "scc ? 1u : 0u".to_owned(),
+            "remu_thread_index".to_owned(),
+            "remu_wave_half".to_owned(),
+            "remu_lane".to_owned(),
+            "0u".to_owned(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.line(
+                4,
+                &format!("remu_debug_compute[remu_trace_base + {offset}u] = {value};"),
+            );
+        }
+        for register in 0..48u32 {
+            self.line(
+                4,
+                &format!(
+                    "remu_debug_compute[remu_trace_base + {}u] = v[{register}];",
+                    8 + register
+                ),
+            );
+        }
+        for register in 0..64u32 {
+            self.line(
+                4,
+                &format!(
+                    "remu_debug_compute[remu_trace_base + {}u] = s[{register}];",
+                    56 + register
+                ),
+            );
+        }
+        for (offset, register) in [106u32, 107, 126, 127].into_iter().enumerate() {
+            self.line(
+                4,
+                &format!(
+                    "remu_debug_compute[remu_trace_base + {}u] = s[{register}];",
+                    120 + offset
+                ),
+            );
+        }
+        self.line(3, "}");
+    }
+
     pub(crate) fn new(
         program: &'a Program,
         evaluation: &'a ShaderEvaluation,
@@ -188,7 +256,37 @@ impl<'a> Compiler<'a> {
             }
         }
         let control_flow = analyze_control_flow(program)?;
-        // Compacted-vertex EXP staging is architectural NGG export layout (PRIM indices name
+        let split_wave64 = matches!(
+            options.stage,
+            MetalShaderStage::Compute | MetalShaderStage::Mesh
+        ) && options.wave_lane_count == 64;
+        let needs_split_wave64_pair_rendezvous = split_wave64
+            && ((options.stage == MetalShaderStage::Compute
+                && program.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.opcode.known_name(),
+                        Some("SCbranchVccz" | "SCbranchVccnz" | "SCbranchExecz" | "SCbranchExecnz")
+                    )
+                }))
+                || (options.stage == MetalShaderStage::Compute
+                    && !(1..=64).contains(&options.compute_threadgroup_size)
+                    && program.instructions.iter().any(is_lds_memory_instruction)
+                    && program.instructions.iter().any(is_full_exec_restore)));
+        if needs_split_wave64_pair_rendezvous
+            && program.instructions.iter().any(is_lds_memory_instruction)
+            && usize::try_from(options.lds_size_bytes)
+                .ok()
+                .and_then(|bytes| bytes.checked_add(SPLIT_WAVE64_PAIR_STATE_BYTES))
+                .is_none_or(|bytes| bytes > METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
+        {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "wave64 paired-half rendezvous requires {} bytes of state in addition to {} bytes of guest LDS, exceeding Metal's {}-byte threadgroup-memory limit",
+                SPLIT_WAVE64_PAIR_STATE_BYTES,
+                options.lds_size_bytes,
+                METAL_THREADGROUP_MEMORY_LIMIT_BYTES
+            )));
+        }
+        // Compacted-vertex EXP indexing is architectural NGG export layout (PRIM indices name
         // compacted slots). It still requires proven Q5 NggRegisters so an unproven mesh ABI
         // cannot invent capacity. The GFX10 empty-workaround count rewrite stays deleted:
         // detecting that pattern without proven registers is a loud refuse; with proof the
@@ -371,6 +469,29 @@ impl<'a> Compiler<'a> {
         index: usize,
         dispatched: bool,
     ) -> Result<(), String> {
+        self.emit_diagnostic_compute_state_trace(instruction.pc);
+        if self.options.stage == MetalShaderStage::Mesh
+            && self
+                .program
+                .instructions
+                .iter()
+                .filter_map(|candidate| self.program.linked_transfer_target(candidate.pc))
+                .any(|target| target == instruction.pc)
+        {
+            // A GFX9-11 merged ES/GS binary is two independent programs sharing one code
+            // allocation. The ES half is per vertex and freely overwrites its VGPR inputs; when
+            // hardware enters the GS half it supplies a different VGPR ABI. Re-seed that ABI at
+            // the linked continuation entry, after the ES has populated LDS. Seeding these only
+            // in the mesh-function prologue made the values stale by the time the GS decoded its
+            // input vertex offsets, which produced valid-looking positions but null/garbled EXP
+            // PRIM connectivity in Silent Hill's layered color-LUT draw.
+            self.line(3, "// GFX9-11 linked GS continuation VGPR ABI");
+            self.line(3, "v[0] = remu_mesh_gs_vtx_offset_0;");
+            self.line(3, "v[1] = remu_mesh_gs_vtx_offset_1;");
+            self.line(3, "v[2] = remu_mesh_primitive_base + remu_thread_index;");
+            self.line(3, "v[3] = 0u;");
+            self.line(3, "v[4] = 0u;");
+        }
         let next_pc = self.program.instructions.get(index + 1).map(|next| next.pc);
         let name = instruction
             .opcode
@@ -429,22 +550,19 @@ impl<'a> Compiler<'a> {
                     // NGG passthrough rectangle-list stages still emit GS_ALLOC_REQ even when the
                     // host expands the three-vertex AMD rect into a Metal triangle strip and runs
                     // the guest export as an ordinary vertex shader. Ignore the alloc on that
-                    // path; only the mesh ABI needs the threadgroup counters.
+                    // path; only the mesh ABI needs the output primitive count.
                     if self.options.stage != MetalShaderStage::Mesh {
                         return Ok(());
                     }
                     // GFX10 GS_ALLOC_REQ is issued by subgroup zero. M0 carries the actual
-                    // allocation: vertices[10:0], primitives[22:12]. Capture it once for the
-                    // whole Metal threadgroup; a final converged barrier publishes it to every
-                    // exporter lane.
+                    // allocation: vertices[10:0], primitives[22:12]. Metal has no vertex-count
+                    // setter and only thread zero publishes the primitive count, so this value
+                    // can remain private to thread zero. A shared counter would exceed Metal's
+                    // memory limit when the guest already uses the full 32 KiB of LDS.
                     self.line(3, "if (remu_thread_index == 0u) {");
                     self.line(
                         4,
-                        "atomic_store_explicit(&remu_mesh_output_vertex_count, s[124] & 0x7ffu, memory_order_relaxed);",
-                    );
-                    self.line(
-                        4,
-                        "atomic_store_explicit(&remu_mesh_output_primitive_count, (s[124] >> 12u) & 0x7ffu, memory_order_relaxed);",
+                        "remu_mesh_output_primitive_count = (s[124] >> 12u) & 0x7ffu;",
                     );
                     self.line(3, "}");
                 }
@@ -647,7 +765,88 @@ impl<'a> Compiler<'a> {
             .opcode
             .known_name()
             .ok_or_else(|| format!("condition block {block_id} does not end in a named branch"))?;
-        scalar_branch_taken_condition(name).map(str::to_owned)
+        let mut exchanged_mask_predicate = None;
+        if self.needs_split_wave64_branch_mask_exchange() {
+            let registers = match name {
+                "SCbranchVccz" | "SCbranchVccnz" => Some((106_u32, 107_u32)),
+                "SCbranchExecz" | "SCbranchExecnz" => Some((126_u32, 127_u32)),
+                _ => None,
+            };
+            if let Some((low, high)) = registers {
+                // One guest wave64 is represented by two Metal SIMD32 groups. A scalar mask
+                // branch only needs to know whether either architectural word is nonzero; it
+                // does not need the remote word copied into every lane's private SGPR state.
+                //
+                // A whole-threadgroup barrier is illegal here: independent guest waves can be
+                // in different structured branches or loop iterations. Rendezvous only the two
+                // SIMD32 halves through a double-buffered atomic record. Packing the epoch and
+                // the nonzero bit into one atomic avoids depending on ordering between separate
+                // data and ready variables (pre-Metal-4.1 atomics only support relaxed order).
+                let exchange = self.next_temp;
+                self.next_temp += 1;
+                let prefix = format!("remu_branch_mask_{exchange}");
+                self.line(3, "remu_wave_pair_epoch += 1u;");
+                self.line(
+                    3,
+                    &format!(
+                        "uint {prefix}_local = (remu_wave_half == 0u ? s[{low}] : s[{high}]) != 0u ? 1u : 0u;"
+                    ),
+                );
+                self.line(
+                    3,
+                    &format!(
+                        "uint {prefix}_slot = ((remu_wave_pair_epoch & 1u) << 5u) + (remu_wave_index << 1u) + remu_wave_half;"
+                    ),
+                );
+                self.line(
+                    3,
+                    &format!(
+                        "bool {prefix}_has_partner = ((remu_wave_index << 6u) + ((remu_wave_half ^ 1u) << 5u)) < remu_thread_count;"
+                    ),
+                );
+                self.line(3, &format!("uint {prefix}_remote = 0u;"));
+                self.line(3, "if (remu_lane == 0u) {");
+                self.line(
+                    4,
+                    &format!(
+                        "atomic_store_explicit(&remu_wave_pair_states[{prefix}_slot], (remu_wave_pair_epoch << 1u) | {prefix}_local, memory_order_relaxed);"
+                    ),
+                );
+                self.line(4, &format!("if ({prefix}_has_partner) {{"));
+                self.line(5, "do {");
+                self.line(
+                    6,
+                    &format!(
+                        "{prefix}_remote = atomic_load_explicit(&remu_wave_pair_states[{prefix}_slot ^ 1u], memory_order_relaxed);"
+                    ),
+                );
+                self.line(
+                    5,
+                    &format!("}} while (({prefix}_remote >> 1u) != remu_wave_pair_epoch);"),
+                );
+                self.line(4, "}");
+                self.line(3, "}");
+                self.line(
+                    3,
+                    &format!("{prefix}_remote = simd_broadcast_first({prefix}_remote);"),
+                );
+                self.line(
+                    3,
+                    &format!(
+                        "bool {prefix}_any = {prefix}_local != 0u || ({prefix}_has_partner && ({prefix}_remote & 1u) != 0u);"
+                    ),
+                );
+                exchanged_mask_predicate = Some(match name {
+                    "SCbranchVccz" | "SCbranchExecz" => format!("!{prefix}_any"),
+                    "SCbranchVccnz" | "SCbranchExecnz" => format!("{prefix}_any"),
+                    _ => unreachable!("register selection only accepts scalar mask branches"),
+                });
+            }
+        }
+        exchanged_mask_predicate.map_or_else(
+            || scalar_branch_taken_condition(name).map(str::to_owned),
+            Ok,
+        )
     }
 
     fn emit_structured_block(

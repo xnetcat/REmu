@@ -4,11 +4,20 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
-## Silent Hill present (2026-08-06) — past splash + hallway; title 3D black
+## Silent Hill present (updated 2026-08-10) — NEW GAME 3D background black
+
+**Checkpoint correction:** the content-warning hallway is 2D. The first assessable 3D scene is
+the NEW GAME screen background; its UI renders, but the scene behind it is black.
+Silent Hill 2 is Unreal Engine 5, not Unity (also reflected by the local `ps5engine.ini` and
+`ue4commandline.txt` overlay), so this isolates the emulator's renderer without establishing a
+Unity-specific common cause.
 
 **Compositor tiler:** mode-1/5/9 uncompressed + BC element grids (splash UI assessable).
 
-**Mesh LDS (`f28cee1`):** NGG mesh LDS from SDK `ShShaderResource2Gs::getLdsSize`.
+**Mesh LDS correction:** `f28cee1` removed a hardcoded allocation but interpreted SDK
+`ShShaderResource2Gs::getLdsSize()` as bytes. It returns dwords. The title LUT writer's raw
+GS_RSRC2 `0x008b0000` therefore needs 8,704 bytes, not 2,176; its guest accesses reach byte
+`0x1d20`. The old bounds guards suppressed those payload accesses and left mesh positions zero.
 
 **Mode-5 BC mips (`8e4ed20` on `main`):** GPU tiler owns AddrLib mode-5 compressed mip chains.
 Live compressed-mip refuse count **0**. Mode-1/9 BC mips and mode-27 BC stay loud-refused.
@@ -41,15 +50,30 @@ depth `801ac2` `gpufalse/v0`. Pad not advanced — not title evidence.
 NEW GAME confirmed; `total_mask_mrt3plus≈8591`; 7×1920×1080 MRT `8068e0…` Metal `gputrue`.
 `8023b9` still never COLOR; depth `801ac2` still `v0`; title BG still black.
 
-**Live with `REMU_CAPTURE_FRAMES=1`:** splash → hallway 3D → title UI; title BG still void.
+**Live with `REMU_CAPTURE_FRAMES=1`:** splash → 2D hallway → title UI; title 3D background remains
+black. A finite eight-pulse `AUTO_CROSS` schedule reaches this checkpoint without starting a game.
 
-**Remaining title-3D blockers:** occupancy of emitted `8068e0` (clear vs geometry); whether
-title lighting still samples empty `8023b9`; depth `801ac2` / no-attachment ImageStore;
-null IMAGE-FALLBACK; NGG `0x7` if critical. See
-`docs/notes/sh-present-20260806-handoff/`. Anti-claim: hallway/title UI / mode-5 / stencil /
-type-0+alias / black-intermediate / VTE coverage-without-content / byte-nz-of-±0 /
-“CS only binds 1×1 dummies” / “Metal dropped BasePass” / “BasePass never submitted at title”
-≠ title-background 3D closure.
+**Direct 2026-08-09 diagnostic:** on real `800dbb`/`800e73` compositor draw 22555, the native
+GPU-written EyeAdapt texel X and the captured mesh shader `v6` were bit-identical
+(`0x3eb851f6`, `0.3600003`). Shader compilation, mesh-stage binding, texture residency, and that
+`ImageLoad` are working; zero guest shadow bytes are not authoritative for this GPU-owned image.
+The former “attr1 is zero because the EyeAdapt history VA differs” theory is superseded.
+
+That selected occurrence still had an all-zero HDR tex0 and preceded the later title BasePass peak,
+so it was transitional. Older clean post-BasePass evidence shows the compositor's HDR tex0 can be
+nonzero. Absolute draw and shader-occurrence selectors vary between runs and are insufficient.
+
+**2026-08-10 archived clean evidence (no new game run):** clean `composite4` draw 30370 executes
+`800dbb`/`800e73`, but its final tex3 is a 32³ RGB10A2 color LUT whose 32 captured depth planes are
+all exactly `[0,0,0,1]`. The preceding `800aed`/`800d700` draw generates that LUT. This explains
+why valid HDR scene input is reduced to dither-only black and supersedes EyeAdapt/remu_s31 as the
+first failing stage.
+
+**Remaining title-3D blocker:** stabilize the general NGG LUT-writer corrections offline: LDS
+dword→byte sizing, unsigned SOPK immediate zero-extension, per-wave merged ES/GS counts, and
+linked-continuation GS VGPR reseeding. Focused unit tests pass on the dirty tree, but no clean live
+validation exists and no game/address-specific workaround is justified. See
+`docs/notes/sh-present-20260806-handoff/` for the evidence and exact next steps.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

@@ -21,8 +21,8 @@ use super::{
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
     SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw,     depth_sample_view_must_not_steal_depth_authority, guest_ranges_overlap,
-    guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
+    decode_sampled_texture_linear_from_raw, depth_sample_view_must_not_steal_depth_authority,
+    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
@@ -1619,14 +1619,14 @@ impl MetalPresenter {
         descriptor: GuestTextureDescriptor,
         upload_guest_contents: bool,
     ) -> Result<Texture, String> {
-        if let Some(resident) = self
-            .resident_guest_textures
-            .get_mut(&descriptor)
-            .filter(|resident| {
-                resident.texture_type == 9
-                    && resident.layer_count == 1
-                    && resident.mip_level_count >= 1
-            })
+        if let Some(resident) =
+            self.resident_guest_textures
+                .get_mut(&descriptor)
+                .filter(|resident| {
+                    resident.texture_type == 9
+                        && resident.layer_count == 1
+                        && resident.mip_level_count >= 1
+                })
         {
             match refresh_resident_texture_write_watch(resident)? {
                 WriteWatchRefresh::Active

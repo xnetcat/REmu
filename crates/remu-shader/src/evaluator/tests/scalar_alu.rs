@@ -50,6 +50,31 @@ fn initializes_merged_export_wave_info_before_user_sgprs() {
 }
 
 #[test]
+fn unsigned_sopk_compare_zero_extends_its_immediate() {
+    let compare = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Sopk,
+        opcode: Opcode::Known("SCmpkLeU32"),
+        words: vec![0xb704_ffff],
+        sources: vec![Operand {
+            kind: OperandKind::EncodedConstant,
+            value: u32::from(u16::MAX),
+        }],
+        destinations: vec![Operand::scalar(4)],
+        control: None,
+    };
+    let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+    registers[4] = 0x1_0000;
+
+    assert!(!execute_scalar_compare_k(&compare, &registers).expect("unsigned compare-k"));
+
+    let mut signed = compare;
+    signed.opcode = Opcode::Known("SCmpkLeI32");
+    registers[4] = u32::MAX;
+    assert!(execute_scalar_compare_k(&signed, &registers).expect("signed compare-k"));
+}
+
+#[test]
 fn s_bcnt1_i32_b64_counts_the_source_pair_and_updates_scc() {
     let instruction = instruction(
         0,

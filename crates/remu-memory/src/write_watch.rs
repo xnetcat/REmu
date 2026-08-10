@@ -12,6 +12,14 @@ use std::sync::{Arc, OnceLock};
 
 mod diagnostic;
 
+/// Returns the optional half-open guest range whose first CPU write should be reported.
+///
+/// Resolving this through a `OnceLock` on the mapping thread keeps environment access and string
+/// parsing out of the SIGBUS/SIGSEGV handler.
+pub(crate) fn guest_cpu_write_trace_range() -> Option<(u64, u64)> {
+    diagnostic::guest_cpu_write_trace_range()
+}
+
 mod guest_space;
 pub(crate) use guest_space::{forget_guest_reservation, publish_guest_reservation};
 

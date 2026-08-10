@@ -3,27 +3,28 @@
 
 use super::{
     DecodedDepthBias, DecodedDepthTarget, DecodedImageDescriptor, DecodedRasterState,
-    DecodedRenderTarget, DecodedStencilFace, DecodedStencilState,
-    DepthTargetPipelineState, DisplayConfiguration, GraphicsDiagnosticPipelineState,
-    GraphicsPipelineKey, GraphicsShaderResourceKey, GraphicsWaveState, GuestScissor,
-    GuestTextureDescriptor,
+    DecodedRenderTarget, DecodedStencilFace, DecodedStencilState, DepthTargetPipelineState,
+    DisplayConfiguration, GraphicsDiagnosticPipelineState, GraphicsPipelineKey,
+    GraphicsShaderResourceKey, GraphicsWaveState, GuestScissor, GuestTextureDescriptor,
     MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits, ProgramIdentity,
     RenderTargetFormat, RenderTargetPipelineState, ResourceSpan, decode_sampled_texture_format,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
-    diagnostic_dump_target_minimum_draw, diagnostic_dump_target_pixel_instruction_count,
+    diagnostic_dump_target_address_range, diagnostic_dump_target_minimum_draw,
+    diagnostic_dump_target_mrt_min, diagnostic_dump_target_pixel_instruction_count,
     diagnostic_dump_target_pixel_shader, diagnostic_dump_video_chain_consumer,
     diagnostic_dump_video_draw, diagnostic_dump_video_target_consumer,
     diagnostic_force_msaa_pixel_color, diagnostic_force_msaa_vertex_pattern,
     diagnostic_force_vertex_fetch_id, diagnostic_force_visible_clip_depth,
-    diagnostic_target_address_matches, diagnostic_video_chain_selected_draw,
-    effective_linear_pitch, evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation,
-    fragmentless_pixel_program, graphics_allocated_vector_register_count, guest_texture_byte_count,
-    half_float_to_f32, is_storage_image_opcode, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw,
-    program_embeds_global_base, tiled_block_dimensions, trace_image_descriptors,
-    trace_target_sampling, unsigned_float_to_f32, video_target_binding_summary,
+    diagnostic_note_full_resolution_mrt_draw, diagnostic_target_address_matches,
+    diagnostic_video_chain_selected_draw, effective_linear_pitch, evaluation_samples_glyph_atlas,
+    evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program,
+    graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
+    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    tiled_block_dimensions, trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
+    video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
 use remu_gpu::{GpuRegister, IndexedDraw};
@@ -47,10 +48,10 @@ pub(crate) use self::pipeline::{
 #[cfg(test)]
 pub(crate) use self::pipeline::{
     apply_transparent_premultiplied_fill_clear, decode_graphics_wave_state,
-    decode_ngg_registers_from_state, decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc,
-    disabled_metal_blend_attachment, graphics_shader_resource_key,
-    is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
-    ngg_fullscreen_cover_draw,
+    decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
+    decode_ngg_subgroup_limits_with_uc, disabled_metal_blend_attachment,
+    graphics_shader_resource_key, is_transparent_premultiplied_fill_blend,
+    metal_primitive_topology_class, ngg_fullscreen_cover_draw,
 };
 #[cfg(test)]
 pub(crate) use self::scanout::{
@@ -100,10 +101,6 @@ pub(super) const DEFAULT_PA_SU_SC_MODE_CNTL: u32 = 0x240;
 
 /// GFX10 `PA_CL_VTE_CNTL` (`R_028818` → Cx `0x206`). AGC public defaults seed `0x43f`.
 pub(super) const PA_CL_VTE_CNTL: u32 = 0x206;
-
-/// `PA_CL_VTE_CNTL.VTX_W0_FMT`: when set, clip-space W is architecturally 1.0 even if the
-/// export shader wrote a different W (including 0 from float4 vertex buffers that only carry XY).
-pub(super) const PA_CL_VTE_CNTL_VTX_W0_FMT: u32 = 1 << 10;
 
 pub(super) const PA_CL_VS_OUT_CNTL: u32 = 0x207;
 

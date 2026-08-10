@@ -36,6 +36,6 @@ pub(crate) use equations::{
 };
 pub(crate) use msl::{
     MODE5_TILER_MSL, MODE9_TILER_MSL, MODE27_TILER_MSL, TilerKernelKind, cached_tiler_library,
-    compile_tiler_library, mode27_tiler_pipelines, mode5_tiler_pipelines, mode9_tiler_pipelines,
+    compile_tiler_library, mode5_tiler_pipelines, mode9_tiler_pipelines, mode27_tiler_pipelines,
     tiler_kernel_name, tiler_kernel_source,
 };

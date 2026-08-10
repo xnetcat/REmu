@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::SharedEventDrawTextureOverride;
+use super::super::capture_target_sample_textures;
 use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
@@ -27,7 +28,6 @@ use super::{
     trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
     trace_target_sampling,
 };
-use super::super::capture_target_sample_textures;
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
 use remu_shader::{ShaderEvaluation, image_is_comparison};
@@ -163,6 +163,96 @@ fn diagnostic_zero_r16_row_samples() -> bool {
     *ENABLED.get_or_init(|| {
         std::env::var_os("REMU_DIAGNOSTIC_ZERO_R16_ROW").is_some_and(|value| value == "1")
     })
+}
+
+fn diagnostic_zero_rgba8_1x1_white() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DIAGNOSTIC_ZERO_RGBA8_1X1_WHITE").is_some_and(|value| value == "1")
+    })
+}
+
+fn diagnostic_sampled_dcc_first_use_clear() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_DIAGNOSTIC_SAMPLED_DCC_FIRST_USE_CLEAR")
+            .is_some_and(|value| value == "1")
+    })
+}
+
+fn image_descriptor_dcc_enabled(words: &[u32]) -> bool {
+    words.get(6).is_some_and(|word| word & (1 << 21) != 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn synthetic_sampled_texture(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    key: SampledTextureKey,
+    descriptor: super::DecodedImageDescriptor,
+    linear: &[u8],
+    comparison: bool,
+    writable: bool,
+    label: &str,
+    cache: &mut HashMap<SampledTextureKey, Texture>,
+) -> Result<Texture, String> {
+    if let Some(texture) = cache
+        .get(&key)
+        .filter(|texture| sampled_texture_supports_access(texture, writable))
+    {
+        return Ok(texture.clone());
+    }
+    cache.remove(&key);
+    let texture = create_sampled_guest_texture(
+        device,
+        queue,
+        descriptor.guest,
+        linear,
+        descriptor.base_mip_level,
+        descriptor.mip_level_count,
+        descriptor.texture_type,
+        descriptor.layer_count,
+        comparison,
+        writable,
+    )?;
+    texture.set_label(label);
+    cache.insert(key, texture.clone());
+    Ok(texture)
+}
+
+fn rgba16_float_transparent_black_with_opaque_alpha(
+    descriptor: super::DecodedImageDescriptor,
+) -> Result<Vec<u8>, String> {
+    if descriptor.guest.pixel_format != MTLPixelFormat::RGBA16Float {
+        return Err(format!(
+            "diagnostic sampled DCC clear does not support {:?}",
+            descriptor.guest.pixel_format
+        ));
+    }
+    let texel_count = usize::try_from(descriptor.guest.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(descriptor.guest.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|texels| {
+            usize::try_from(descriptor.layer_count)
+                .ok()
+                .and_then(|layers| texels.checked_mul(layers))
+        })
+        .ok_or("diagnostic sampled DCC clear texel count overflows")?;
+    let mut linear = vec![
+        0;
+        texel_count
+            .checked_mul(8)
+            .ok_or("diagnostic sampled DCC clear byte count overflows",)?
+    ];
+    // IEEE-754 binary16 1.0 is 0x3c00. The host is little-endian, as is the guest payload.
+    for texel in linear.chunks_exact_mut(8) {
+        texel[6..8].copy_from_slice(&0x3c00_u16.to_le_bytes());
+    }
+    Ok(linear)
 }
 
 pub(crate) fn comparison_depth32_upload(
@@ -740,6 +830,8 @@ pub(crate) fn upload_image_textures(
                     .map(|(descriptor, _, _)| *descriptor)
             };
             let mut selected_resident = None;
+            let descriptor_dcc_enabled =
+                image_descriptor_dcc_enabled(&binding.resource_descriptor);
             // A layered depth-sample SRD assembled from resident depth faces is served directly:
             // the assembly ran before this upload pass, inside the guest command batch, so the
             // array already orders after the face render passes.
@@ -808,6 +900,29 @@ pub(crate) fn upload_image_textures(
                 )?;
                 texture.set_label("REMu diagnostic R32Float sample");
                 texture
+            } else if !storage
+                && descriptor.guest.width == 1
+                && descriptor.guest.height == 1
+                && descriptor.guest.pixel_format == MTLPixelFormat::RGBA8Unorm
+                && diagnostic_zero_rgba8_1x1_white()
+            {
+                static LOGGED: OnceLock<()> = OnceLock::new();
+                LOGGED.get_or_init(|| {
+                    eprintln!(
+                        "[REMu][METAL][DIAGNOSTIC] replacing sampled 1x1 RGBA8Unorm images with opaque white"
+                    );
+                });
+                synthetic_sampled_texture(
+                    device,
+                    queue,
+                    key,
+                    descriptor,
+                    &[u8::MAX; 4],
+                    comparison,
+                    requires_shader_write,
+                    "REMu diagnostic white 1x1 RGBA8 sample",
+                    fallback_texture_cache,
+                )?
             } else if fallback {
                 if let Some(texture) = fallback_texture_cache
                     .get(&key)
@@ -895,6 +1010,31 @@ pub(crate) fn upload_image_textures(
                 // change residency semantics.
                 selected_resident = render_resolve_descriptor;
                 texture
+            } else if !storage
+                && descriptor_dcc_enabled
+                && descriptor.guest.pixel_format == MTLPixelFormat::RGBA16Float
+                && diagnostic_sampled_dcc_first_use_clear()
+            {
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][DIAGNOSTIC] materializing sampled DCC first use at {:#x} as transparent black with alpha one sequence={sequence}",
+                        descriptor.guest.address,
+                    );
+                }
+                let linear = rgba16_float_transparent_black_with_opaque_alpha(descriptor)?;
+                synthetic_sampled_texture(
+                    device,
+                    queue,
+                    key,
+                    descriptor,
+                    &linear,
+                    comparison,
+                    requires_shader_write,
+                    "REMu diagnostic sampled DCC first-use clear",
+                    fallback_texture_cache,
+                )?
             } else {
                 if sampled_texture_cache.get(&key).is_some_and(|cached| {
                     !sampled_texture_supports_access(

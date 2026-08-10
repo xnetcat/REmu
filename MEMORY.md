@@ -17,48 +17,38 @@ registers/packets that state intent.
 - `cargo check --workspace --all-targets` on arm64 and `x86_64-apple-darwin`.
 - `remu-runtime` tests: `--test-threads=1`.
 
-## Silent Hill present — past splash; title 3D still black (2026-08-06)
+## Silent Hill present — NEW GAME 3D background black (updated 2026-08-10)
 
-- **Compositor tiler:** mode-1/5/9 uncompressed + BC element grids (splash UI).
-- **Mesh LDS (`f28cee1`):** NGG mesh LDS from SDK `ShShaderResource2Gs::getLdsSize`.
-- **Mode-5 BC mips (`8e4ed20`):** GPU tiler AddrLib mode-5 compressed mip chains; live refuse **0**.
-- **Latched stencil (`0a22e15`):** `STENCIL_ENABLE` + no Z ops → no depth attachment (`Ok(None)`),
-  not a color-MRT abort. True stencil-only still loud-refused. Live stencil-only refuses **0**.
-- **Type-0 refuse + BGRA↔RGBA authority (`3c025bd`):** non-null TYPE-0 no longer opaque-black
-  IMAGE-FALLBACK; same-address color-views survive false shared-heap owned-byte theft.
-- **Attribution (`a86c225` clean occ run):** title intermediate after `800e73` is **RGB black**
-  (`rgb_nonzero=0`); HDR `RG11B10` input also black. Not a `800da3`/ALIAS composite discard.
-- **`VTX_W0_FMT` (`e75d19c`):** ES float4 VB W=0 was clipping HDR mesh; AGC `PA_CL_VTE_CNTL=0x43f`
-  now forces W=1 in Metal. Live: `800bf4` `pixel_outputs` full-screen — **but** PS still
-  exports `±0.0`, RT `nonzero=0`, title BG still void.
-- **Zero PS exports (proven @ vte-w0):** not AbgrFp16→RG11B10 packing. Tonemap tex0
-  (`803e6c` RGBA16Float, writer `800c7e`) is float-all-`±0` (fp16 `0x8000` sign bits); prior
-  "nz≠0" was byte occupancy of those sign bits. PS exports match `[-0,0,-0,0]`. tex2 RG11B10
-  has real magnitude; scene color does not. Diagnostic now reports `magnitude_nz`.
-- **`800c7e` ±0 attributed (`32b445d` clean cs800c7e run):** CS is not missing color SRDs —
-  it `ImageLoad`s full-res `803d6e` (+ depth + R8Uint) and `ImageStore`s scene color. Those
-  loads are magnitude-zero because lighting `800a69` exports all-zero with full coverage;
-  sampled GBuffer `8023b9` is Metal+guest all-zero. 1×1 `80106d`/`8010ad` are optional
-  sampled dummies, not the sole inputs (sampled-only writer lineage hid the ImageLoads).
-- **No BasePass emit on content-warning-only (`736d540` gbuffer run):** `COLOR-EMIT`
-  `total_mask_mrt3plus=0`; only 2-slot shadows; GBuffer VAs never COLOR; depth `801ac2`
-  `gpufalse/v0`. Pad was not advanced — not title evidence.
-- **Title BasePass emits (`9cc9f2f` basepass run + AUTO_CROSS):** NEW GAME confirmed;
-  `total_mask_mrt3plus≈8591`; 7×1920×1080 MRT to `8068e0…` Metal `gputrue`; mrt=3 includes
-  `801c44`. `8023b9` still never COLOR; depth `801ac2` still `v0`; **title BG still black**.
-  Prior “never emits” claim does not hold at title.
-- **COLOR-EMIT ATTRIB2:** Prospero packing is `((w-1)<<14)|(h-1)` (not GFX10
-  width@0..15/height@16..31). Mis-decode logged `c438×1e0` for real 1920×1080.
-- **Live:** hallway 3D assessable; title UI assessable; title BG still black. Handoff:
-  `runs/silent-hill-title-bg-basepass/` (+ prior `gbuffer` / `cs800c7e`).
-- **Remaining:** occupancy of emitted `8068e0` (clear vs geometry); title lighting sample
-  VA (`8023b9` vs emitted set); depth `801ac2` / no-attachment ImageStore; NGG `0x7`.
-- Handoff: `docs/notes/sh-present-20260806-handoff/`.
-- **Anti-claim:** hallway / title UI / mode-5 / stencil / type-0+alias / black-intermediate /
-  VTE coverage-without-content / byte-nz-of-±0 / “800c7e only binds 1×1 dummies” /
-  “Metal dropped BasePass” / “BasePass never submitted at title” (content-warning-only) ≠
-  title-BG 3D closure.
-- **Next:** BasePass output occupancy + lighting sample VA at title; else depth no-attachment.
+- **Checkpoint correction:** the content-warning hallway is 2D. The first assessable 3D scene is
+  behind the NEW GAME UI. Eight finite `AUTO_CROSS` pulses at 8..36 seconds reach it. Silent Hill
+  2 is UE5, not Unity; use it as a renderer test case, not a Unity-specific attribution.
+- **Closed gates:** mode-1/5/9 compositor tiling; NGG mesh LDS; mode-5 BC mips; latched-stencil
+  color abort; non-null TYPE-0 fallback; BGRA/RGBA authority; `VTX_W0_FMT` cover clipping;
+  empty early GBuffers; remapped title BasePass/lighting path; R32 depth-view authority;
+  S_LOAD descriptor-heap span. Full history is in the handoff.
+- **Late clean state:** title BasePass emits occupied seven-MRT output; depth fix makes post-BP
+  `800c7e` scene color nonzero; `800bf4` can forward nonzero tonemap into `800e73` tex0, while
+  the final title composite remains opaque RGB black.
+- **Decomposed 3D scene cause is closed:** clean `3f9e559` kept native Depth32Float authoritative
+  over an empty same-address R32Float sample shadow. `depth_native` rose 0→469 and post-BP
+  `800c7e` became nonzero. This—not later dirty experiments—restored recognizable scene geometry.
+- **EyeAdapt theory superseded:** bounded 2026-08-09 diagnostic draw 22555 bound a `Live`, readable,
+  GPU-written RGBA32Float EyeAdapt resident. Native texel X and captured mesh `v6` match exactly:
+  `0x3eb851f6` (`0.3600003`). Guest shadow zero is expected and not authoritative.
+- **Capture caveat:** draw 22555's HDR tex0 was zero and it preceded the later BasePass peak, so it
+  is a transitional compositor, not the stable late draw. Shader occurrence and absolute draw IDs
+  vary significantly across runs.
+- **Archived clean final-stage cause:** `composite4` draw 30370 samples a 32³ RGB10A2 LUT at
+  `803b680`; all 32 native planes are exactly `[0,0,0,1]`. Its immediately preceding
+  `800aed`/`800d700` writer allocated 2,176 bytes of LDS for a 2,176-dword (8,704-byte) request;
+  accesses through byte `0x1d20` were guarded out and mesh positions stayed zero.
+- **Remaining:** stabilize the general NGG corrections offline (LDS units, unsigned SOPK,
+  per-wave counts, linked GS VGPR ABI). Focused dirty-tree tests pass, but this is not clean live
+  compatibility evidence. EyeAdapt/remu_s31 is no longer the first blocker. No game/address
+  heuristic.
+- Handoff: `docs/notes/sh-present-20260806-handoff/README.md`.
+- **Anti-claim:** 2D hallway/title UI, an early zero-HDR composite, different rotating EyeAdapt
+  VAs, or a dirty-tree diagnostic ≠ title-background 3D closure or clean compatibility evidence.
 
 ## Phase 1F — execution substrate (CLOSED 2026-08-06; on `main` @ `d7414fc`)
 

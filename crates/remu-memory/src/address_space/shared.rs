@@ -859,9 +859,7 @@ pub fn store_guest_visible_u64(address: u64, value: u64) {
 pub fn load_guest_visible_u32(address: u64) -> u32 {
     debug_assert!(address.is_multiple_of(4));
     // SAFETY: callers prove `address` is a live, 4-byte-aligned guest mapping retained for the load.
-    unsafe {
-        std::sync::atomic::AtomicU32::from_ptr(address as *mut u32).load(Ordering::Acquire)
-    }
+    unsafe { std::sync::atomic::AtomicU32::from_ptr(address as *mut u32).load(Ordering::Acquire) }
 }
 
 /// Acquire-load an aligned 64-bit word through a live guest VA.

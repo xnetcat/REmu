@@ -41,14 +41,25 @@ impl Compiler<'_> {
                 "{sampler_count} direct samplers exceed Metal's per-stage limit of 16"
             )));
         }
+        let mesh_reserved_buffer_start = if self.options.diagnostic_capture_vertex_position {
+            28
+        } else {
+            29
+        };
         if self.options.stage == MetalShaderStage::Mesh
             && !global_argument_buffer
-            && (initial_index >= 29
-                || (!direct_sampler_bindings && sampler_count != 0 && initial_index + 1 >= 29))
+            && (initial_index >= mesh_reserved_buffer_start
+                || (!direct_sampler_bindings
+                    && sampler_count != 0
+                    && initial_index + 1 >= mesh_reserved_buffer_start))
         {
             return Err(MetalCompileError::InvalidInterface(
-                "mesh lowering reserves Metal buffers 29 and 30 for indices and draw geometry"
-                    .into(),
+                if self.options.diagnostic_capture_vertex_position {
+                    "diagnostic mesh lowering reserves Metal buffers 28 through 30"
+                } else {
+                    "mesh lowering reserves Metal buffers 29 and 30 for indices and draw geometry"
+                }
+                .into(),
             ));
         }
         let mut source = String::from(
@@ -231,10 +242,18 @@ impl Compiler<'_> {
         {
             parameters.push("device uint* remu_debug_position [[buffer(30)]]".to_owned());
         }
+        if self.options.stage == MetalShaderStage::Mesh
+            && self.options.diagnostic_capture_vertex_position
+        {
+            parameters.push("device uint* remu_debug_position [[buffer(28)]]".to_owned());
+        }
         if self.options.stage == MetalShaderStage::Pixel
             && self.options.diagnostic_capture_pixel_output
         {
             parameters.push("device atomic_uint* remu_debug_pixel [[buffer(30)]]".to_owned());
+        }
+        if self.diagnostic_compute_state_trace_group().is_some() {
+            parameters.push("device uint* remu_debug_compute [[buffer(30)]]".to_owned());
         }
         match self.options.stage {
             MetalShaderStage::Vertex => {
@@ -357,28 +376,7 @@ impl Compiler<'_> {
             );
         }
         if self.options.stage == MetalShaderStage::Mesh {
-            source.push_str(
-                "    threadgroup atomic_uint remu_mesh_output_vertex_count;\n\
-                 \x20   threadgroup atomic_uint remu_mesh_output_primitive_count;\n",
-            );
-            if self.mesh_export_vertex_vgpr.is_some() {
-                let _ = writeln!(
-                    source,
-                    "    threadgroup RemuVsOut remu_mesh_staged_vertices[{}];",
-                    self.options.mesh_max_vertex_count
-                );
-                let _ = writeln!(
-                    source,
-                    "    if (remu_thread_index < {}u) {{",
-                    self.options.mesh_max_vertex_count
-                );
-                source.push_str(
-                    "        remu_mesh_staged_vertices[remu_thread_index] = {};\n\
-                     \x20       remu_mesh_staged_vertices[remu_thread_index].position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
-                     \x20   }\n\
-                     \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
-                );
-            }
+            source.push_str("    uint remu_mesh_output_primitive_count = 0u;\n");
         }
         if self.split_wave64() {
             source.push_str(
@@ -386,6 +384,24 @@ impl Compiler<'_> {
                  \x20   uint remu_wave_half = (remu_thread_index >> 5u) & 1u;\n\
                  \x20   uint remu_wave_lane = remu_lane + (remu_wave_half << 5u);\n",
             );
+            if self.needs_split_wave64_pair_rendezvous() {
+                // Two parity banks of one atomic epoch/nonzero record per Metal SIMD32 half.
+                // The sole whole-group barrier is in this uniform kernel prologue; dynamic
+                // scalar branches rendezvous only the two halves of their guest wave64.
+                let _ = writeln!(
+                    source,
+                    "    threadgroup atomic_uint remu_wave_pair_states[{}];",
+                    super::SPLIT_WAVE64_PAIR_STATE_SLOTS
+                );
+                source.push_str(
+                    "    uint remu_wave_pair_epoch = 0u;\n\
+                     \x20   uint remu_thread_count = remu_group_size.x * remu_group_size.y * remu_group_size.z;\n\
+                     \x20   for (uint remu_wave_pair_init = remu_thread_index; remu_wave_pair_init < 64u; remu_wave_pair_init += remu_thread_count) {\n\
+                     \x20       atomic_store_explicit(&remu_wave_pair_states[remu_wave_pair_init], 0u, memory_order_relaxed);\n\
+                     \x20   }\n\
+                     \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+                );
+            }
             if self
                 .program
                 .instructions
@@ -526,6 +542,12 @@ impl Compiler<'_> {
                 self.emit_compute_system_registers(&mut source);
             }
             MetalShaderStage::Mesh => {
+                let has_linked_geometry_stage =
+                    self.program.instructions.iter().any(|instruction| {
+                        self.program
+                            .linked_transfer_target(instruction.pc)
+                            .is_some()
+                    });
                 // Default w=0 so threads that never EXP are hardware-clipped. The previous
                 // (0,0,0,1) default mapped to NDC center and produced a central additive haze
                 // whenever GS_ALLOC reserved more vertices than lanes that successfully exported.
@@ -539,13 +561,54 @@ impl Compiler<'_> {
                      \x20   uint remu_mesh_input_primitive_count_encoded = (remu_mesh_counts >> 8u) & 0xffu;\n\
                      \x20   uint remu_mesh_input_vertex_count = remu_mesh_input_vertex_count_encoded == 0u ? 256u : remu_mesh_input_vertex_count_encoded;\n\
                      \x20   uint remu_mesh_input_primitive_count = remu_mesh_input_primitive_count_encoded == 0u ? 256u : remu_mesh_input_primitive_count_encoded;\n\
-                     \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 258u + remu_thread_index] : 0x80000000u;\n\
-                     \x20   if (remu_thread_index == 0u) {\n\
-                     \x20       atomic_store_explicit(&remu_mesh_output_vertex_count, 0u, memory_order_relaxed);\n\
-                     \x20       atomic_store_explicit(&remu_mesh_output_primitive_count, 0u, memory_order_relaxed);\n\
-                     \x20   }\n\
-                     \x20   threadgroup_barrier(mem_flags::mem_threadgroup);\n",
+                     \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 258u + remu_thread_index] : 0x80000000u;\n",
                 );
+                // GS_ALLOC_REQ reserves output slots, but culled or otherwise null primitives do
+                // not necessarily execute EXP PRIM. AMD hardware treats those slots as null.
+                // Metal has no null-primitive flag and consumes every index below the published
+                // primitive count, so leaving an unexported slot unwritten feeds undefined
+                // indices to the rasterizer. Initialize every possible slot to a degenerate
+                // triangle; a live EXP PRIM below overwrites its own three indices.
+                let _ = writeln!(
+                    source,
+                    "    for (uint remu_null_primitive = remu_thread_index; remu_null_primitive < {}u; remu_null_primitive += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
+                     \x20       remu_mesh.set_index(remu_null_primitive * 3u + 0u, 0u);\n\
+                     \x20       remu_mesh.set_index(remu_null_primitive * 3u + 1u, 0u);\n\
+                     \x20       remu_mesh.set_index(remu_null_primitive * 3u + 2u, 0u);\n\
+                     \x20   }}",
+                    self.options.mesh_max_primitive_count
+                );
+                if self.options.render_target_array_length > 1 {
+                    let _ = writeln!(
+                        source,
+                        "    for (uint remu_null_vertex = remu_thread_index; remu_null_vertex < {}u; remu_null_vertex += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
+                         \x20       remu_mesh_render_target_indices[remu_null_vertex] = 0u;\n\
+                         \x20   }}",
+                        self.options.mesh_max_vertex_count
+                    );
+                    let _ = writeln!(
+                        source,
+                        "    for (uint remu_null_primitive = remu_thread_index; remu_null_primitive < {}u; remu_null_primitive += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
+                         \x20       remu_mesh_primitive_source_vertices[remu_null_primitive] = 0u;\n\
+                         \x20   }}",
+                        self.options.mesh_max_primitive_count
+                    );
+                }
+                if !self.options.ngg_primgen_passthrough {
+                    // Default GFX10 NGG input ABI. Unlike passthrough mode, SPI supplies six
+                    // packed 16-bit ES vertex offsets in v0/v1/v4, the primitive ID in v2 and
+                    // the GS invocation ID in v3. No-GS NGG lowering consumes the offsets as
+                    // local vertex indices; an actual linked GS consumes dword ESGS offsets.
+                    // The latter currently uses the captured four-dword item layout.
+                    let offset_shift = if has_linked_geometry_stage { 2 } else { 0 };
+                    let _ = writeln!(
+                        source,
+                        "    uint remu_mesh_gs_vtx_offset_0 = (((remu_mesh_primitive >> 0u) & 0x1ffu) << {offset_shift}u)\n\
+                         \x20       | (((remu_mesh_primitive >> 10u) & 0x1ffu) << {high_shift}u);\n\
+                         \x20   uint remu_mesh_gs_vtx_offset_1 = ((remu_mesh_primitive >> 20u) & 0x1ffu) << {offset_shift}u;",
+                        high_shift = 16 + offset_shift,
+                    );
+                }
                 if self.options.render_target_array_length > 1 {
                     let _ = writeln!(
                         source,
@@ -557,8 +620,14 @@ impl Compiler<'_> {
                 // - lane ID as `(s3[27:24] << log2(wave)) + v_mbcnt`
                 // - wave count as `s3[31:28]`, then `(1 << count) - 1` as the reduce mask
                 //   that loads per-wave totals from LDS (Void Terrarium soft/main particles).
-                // Bits [15:0] still carry the meshlet vertex/primitive counts. Clear [31:24]
-                // before packing so stale meshlet high bits cannot override the wave fields.
+                // Bytes 0/1 are the ES/GS invocation counts for the *current guest wave*, not
+                // workgroup-wide totals. Repeating a small meshlet's totals in every wave makes
+                // the second wave run the first few ES/GS lanes again with out-of-range inputs;
+                // Silent Hill's two-wave LUT quad then polluted the NGG primitive flags and
+                // allocated 10 vertices / 32 primitives instead of 6 / 2. Byte 2 is the GS wave
+                // id supplied by hardware; preserve the meshlet-provided value for now. Clear
+                // [31:24] before packing so stale meshlet high bits cannot override the wave
+                // fields.
                 // The wave fields must use the guest's architectural wave size: wave64 NGG
                 // exports (Poppy Playtime UI/LUT quads) recover their meshlet thread index as
                 // `s3[27:24] * 64 + v_mbcnt`, so packing SIMD32 halves there sent every
@@ -571,20 +640,46 @@ impl Compiler<'_> {
                 let _ = write!(
                     source,
                     "    {{\n\
+                     \x20       uint remu_mesh_wave_index = remu_thread_index >> {wave_shift}u;\n\
+                     \x20       uint remu_mesh_wave_base = remu_mesh_wave_index << {wave_shift}u;\n\
+                     \x20       uint remu_mesh_wave_vertex_count = min(remu_mesh_input_vertex_count > remu_mesh_wave_base ? remu_mesh_input_vertex_count - remu_mesh_wave_base : 0u, {wave_round}u + 1u);\n\
+                     \x20       uint remu_mesh_wave_primitive_count = min(remu_mesh_input_primitive_count > remu_mesh_wave_base ? remu_mesh_input_primitive_count - remu_mesh_wave_base : 0u, {wave_round}u + 1u);\n\
                      \x20       uint remu_mesh_wave_count = ((remu_group_size.x * remu_group_size.y * remu_group_size.z) + {wave_round}u) >> {wave_shift}u;\n\
-                     \x20       s[3] = (remu_mesh_counts & 0x00ffffffu)\n\
-                     \x20           | (((remu_thread_index >> {wave_shift}u) & 0xfu) << 24u)\n\
+                     \x20       s[3] = (remu_mesh_counts & 0x00ff0000u)\n\
+                     \x20           | (remu_mesh_wave_vertex_count & 0xffu)\n\
+                     \x20           | ((remu_mesh_wave_primitive_count & 0xffu) << 8u)\n\
+                     \x20           | ((remu_mesh_wave_index & 0xfu) << 24u)\n\
                      \x20           | ((remu_mesh_wave_count & 0xfu) << 28u);\n\
                      \x20   }}\n",
                 );
                 if contains_register_reference(&self.body, 'v', 0) {
-                    source.push_str("    v[0] = remu_mesh_primitive;\n");
+                    if !self.options.ngg_primgen_passthrough {
+                        source.push_str("    v[0] = remu_mesh_gs_vtx_offset_0;\n");
+                    } else {
+                        source.push_str("    v[0] = remu_mesh_primitive;\n");
+                    }
                 }
                 if contains_register_reference(&self.body, 'v', 1) {
-                    source.push_str("    v[1] = remu_mesh_primitive_base + remu_thread_index;\n");
+                    if !self.options.ngg_primgen_passthrough {
+                        source.push_str("    v[1] = remu_mesh_gs_vtx_offset_1;\n");
+                    } else {
+                        source
+                            .push_str("    v[1] = remu_mesh_primitive_base + remu_thread_index;\n");
+                    }
                 }
                 if contains_register_reference(&self.body, 'v', 2) {
-                    source.push_str("    v[2] = 0u;\n");
+                    if !self.options.ngg_primgen_passthrough {
+                        source
+                            .push_str("    v[2] = remu_mesh_primitive_base + remu_thread_index;\n");
+                    } else {
+                        source.push_str("    v[2] = 0u;\n");
+                    }
+                }
+                if contains_register_reference(&self.body, 'v', 3) {
+                    source.push_str("    v[3] = 0u;\n");
+                }
+                if contains_register_reference(&self.body, 'v', 4) {
+                    source.push_str("    v[4] = 0u;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 5) {
                     source.push_str(
@@ -630,12 +725,22 @@ impl Compiler<'_> {
         }
         match self.options.stage {
             MetalShaderStage::Vertex | MetalShaderStage::Pixel => {
-                if self.options.stage == MetalShaderStage::Vertex && self.options.force_position_w1 {
-                    // PA_CL_VTE_CNTL.VTX_W0_FMT: Gen5 replaces the exported W with 1.0 before
-                    // clipping. Float4 vertex buffers that only carry XY commonly leave W=0.
-                    source.push_str("    remu_out.position.w = 1.0f;\n");
+                if self.options.stage == MetalShaderStage::Vertex {
+                    append_vertex_position_format_conversion(
+                        &mut source,
+                        "remu_out.position",
+                        self.options.viewport_transform_control,
+                        None,
+                    );
                 }
                 if self.options.stage == MetalShaderStage::Pixel {
+                    // EXEC is the guest fragment-live mask. Apply the architectural kill before
+                    // the diagnostic write so a fragment that executes shader arithmetic but is
+                    // discarded at the export boundary cannot be reported as a committed MRT
+                    // pixel. Forced-color diagnostics intentionally bypass the guest kill.
+                    if !self.options.diagnostic_force_pixel_color {
+                        source.push_str("    if (!exec) discard_fragment();\n");
+                    }
                     if self.options.diagnostic_capture_pixel_output
                         && let Some(output) = self.options.pixel_outputs.first()
                     {
@@ -711,8 +816,6 @@ impl Compiler<'_> {
                                 output.guest_slot
                             );
                         }
-                    } else {
-                        source.push_str("    if (!exec) discard_fragment();\n");
                     }
                 } else if self.options.diagnostic_force_vertex_pattern {
                     source.push_str(
@@ -784,49 +887,89 @@ impl Compiler<'_> {
             MetalShaderStage::Mesh => {
                 let _ = writeln!(
                     source,
-                    "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
-                     \x20   uint remu_mesh_output_vertices = min(atomic_load_explicit(&remu_mesh_output_vertex_count, memory_order_relaxed), {}u);\n\
-                     \x20   uint remu_mesh_output_primitives = min(atomic_load_explicit(&remu_mesh_output_primitive_count, memory_order_relaxed), {}u);",
-                    self.options.mesh_max_vertex_count, self.options.mesh_max_primitive_count
+                    "    uint remu_mesh_output_primitives = min(remu_mesh_output_primitive_count, {}u);",
+                    self.options.mesh_max_primitive_count
                 );
                 if self.options.render_target_array_length > 1 {
-                    source.push_str(
-                        "    if (remu_thread_index < remu_mesh_output_primitives) {\n\
-                         \x20       RemuPrimitiveOut remu_primitive_out = {};\n\
+                    let _ = writeln!(
+                        source,
+                        "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                         \x20   if (remu_thread_index < {}u) {{\n\
+                         \x20       RemuPrimitiveOut remu_primitive_out = {{}};\n\
                          \x20       uint remu_primitive_source_vertex = remu_mesh_primitive_source_vertices[remu_thread_index];\n\
                          \x20       remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
                          \x20       remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n\
-                         \x20   }\n",
+                         \x20   }}",
+                        self.options.mesh_max_primitive_count
                     );
                 }
-                // Metal mesh has no set_vertex_count; only set_primitive_count exists.
-                // Vertex occupancy comes from set_vertex + index references.
-                // When EXP is gated by a compacted vertex VGPR, publish staged payloads by that
-                // index — remu_out lives on the exporting thread, which is usually not the same
-                // as remu_thread_index == vertex_id.
-                if self.options.force_position_w1 {
-                    // PA_CL_VTE_CNTL.VTX_W0_FMT applies after position export, before clip.
-                    if self.mesh_export_vertex_vgpr.is_some() {
-                        source.push_str(
-                            "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh_staged_vertices[remu_thread_index].position.w = 1.0f;\n",
+                // Compacted outputs were published directly at each EXP. Non-compacted mesh
+                // shaders retain one vertex per lane and publish here after position conversion.
+                if self.mesh_export_vertex_vgpr.is_none() {
+                    append_vertex_position_format_conversion(
+                        &mut source,
+                        "remu_out.position",
+                        self.options.viewport_transform_control,
+                        None,
+                    );
+                }
+                if self.options.diagnostic_capture_vertex_position {
+                    let diagnostic_enable_index = self
+                        .evaluation
+                        .initial_scalar_registers
+                        .len()
+                        .saturating_add(
+                            self.evaluation
+                                .global_memory_bindings
+                                .len()
+                                .saturating_mul(4),
                         );
-                    } else {
-                        source.push_str("    remu_out.position.w = 1.0f;\n");
-                    }
+                    let position = "remu_out.position";
+                    let _ = writeln!(
+                        source,
+                        "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_thread_index < 24u) {{\n\
+                         \x20       uint remu_debug_base = remu_thread_index * 24u;\n\
+                         \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>({position}.x);\n\
+                         \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>({position}.y);\n\
+                         \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>({position}.z);\n\
+                         \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>({position}.w);\n\
+                         \x20       remu_debug_position[remu_debug_base + 4u] = v[0];\n\
+                         \x20       remu_debug_position[remu_debug_base + 5u] = v[1];\n\
+                         \x20       remu_debug_position[remu_debug_base + 6u] = v[2];\n\
+                         \x20       remu_debug_position[remu_debug_base + 7u] = v[3];\n\
+                         \x20       remu_debug_position[remu_debug_base + 8u] = v[4];\n\
+                         \x20       remu_debug_position[remu_debug_base + 9u] = v[5];\n\
+                         \x20       remu_debug_position[remu_debug_base + 10u] = v[6];\n\
+                         \x20       remu_debug_position[remu_debug_base + 11u] = v[7];\n\
+                         \x20       remu_debug_position[remu_debug_base + 12u] = v[8];\n\
+                         \x20       remu_debug_position[remu_debug_base + 13u] = v[9];\n\
+                         \x20       remu_debug_position[remu_debug_base + 14u] = v[10];\n\
+                         \x20       remu_debug_position[remu_debug_base + 15u] = v[11];\n\
+                         \x20       remu_debug_position[remu_debug_base + 16u] = v[12];\n\
+                         \x20       remu_debug_position[remu_debug_base + 17u] = v[13];\n\
+                         \x20       remu_debug_position[remu_debug_base + 18u] = v[14];\n\
+                         \x20       remu_debug_position[remu_debug_base + 19u] = v[15];\n\
+                         \x20       remu_debug_position[remu_debug_base + 20u] = s[2];\n\
+                         \x20       remu_debug_position[remu_debug_base + 21u] = s[4];\n\
+                         \x20       remu_debug_position[remu_debug_base + 22u] = s[107];\n\
+                         \x20       remu_debug_position[remu_debug_base + 23u] = s[124];\n\
+                         \x20   }}"
+                    );
                 }
                 if self.mesh_export_vertex_vgpr.is_some() {
                     source.push_str(
-                        "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_mesh_staged_vertices[remu_thread_index]);\n\
-                         \x20   if (remu_thread_index == 0u) {\n\
+                        "    if (remu_thread_index == 0u) {\n\
                          \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
                          \x20   }\n",
                     );
                 } else {
-                    source.push_str(
-                        "    if (remu_thread_index < remu_mesh_output_vertices) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                         \x20   if (remu_thread_index == 0u) {\n\
+                    let _ = writeln!(
+                        source,
+                        "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                         \x20   if (remu_thread_index == 0u) {{\n\
                          \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
-                         \x20   }\n",
+                         \x20   }}",
+                        self.options.mesh_max_vertex_count
                     );
                 }
             }
@@ -835,6 +978,49 @@ impl Compiler<'_> {
         scalarize_register_state(&source)
     }
 }
+
+/// Converts the guest VTE position representation into the homogeneous clip coordinates Metal
+/// expects. AMD's setup engine can accept either W0 or 1/W0 and optionally pre-divided X/Y/Z;
+/// Metal always accepts W0 and performs its own perspective divide.
+fn append_vertex_position_format_conversion(
+    source: &mut String,
+    position: &str,
+    viewport_transform_control: u32,
+    guard: Option<&str>,
+) {
+    const VTX_XY_FMT: u32 = 1 << 8;
+    const VTX_Z_FMT: u32 = 1 << 9;
+    const VTX_W0_FMT: u32 = 1 << 10;
+
+    let xy_predivided = viewport_transform_control & VTX_XY_FMT != 0;
+    let z_predivided = viewport_transform_control & VTX_Z_FMT != 0;
+    let w_is_w0 = viewport_transform_control & VTX_W0_FMT != 0;
+    if !xy_predivided && !z_predivided && w_is_w0 {
+        return;
+    }
+
+    if let Some(guard) = guard {
+        let _ = writeln!(source, "    if ({guard}) {{");
+    }
+    let indent = if guard.is_some() { "        " } else { "    " };
+    let w0 = if w_is_w0 {
+        format!("{position}.w")
+    } else {
+        format!("1.0f / {position}.w")
+    };
+    let _ = writeln!(source, "{indent}float remu_position_w0 = {w0};");
+    if xy_predivided {
+        let _ = writeln!(source, "{indent}{position}.xy *= remu_position_w0;");
+    }
+    if z_predivided {
+        let _ = writeln!(source, "{indent}{position}.z *= remu_position_w0;");
+    }
+    let _ = writeln!(source, "{indent}{position}.w = remu_position_w0;");
+    if guard.is_some() {
+        source.push_str("    }\n");
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct RegisterReferences {
     pub(crate) scalar: BTreeSet<u32>,

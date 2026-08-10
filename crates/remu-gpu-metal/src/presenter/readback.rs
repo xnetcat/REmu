@@ -178,8 +178,7 @@ impl MetalPresenter {
         if !crate::presenter::tiler::gpu_tiler_owns_descriptor(resident.descriptor) {
             return Err(format!(
                 "Phase 1G: refusing CPU texture writeback for tile={} format={:?} — GPU tiler does not own this descriptor",
-                resident.descriptor.tile_mode,
-                resident.descriptor.pixel_format
+                resident.descriptor.tile_mode, resident.descriptor.pixel_format
             ));
         }
         let alias_ranges = resident.write_watch.alias_ranges();
@@ -856,7 +855,7 @@ fn diagnostic_texture_numeric_components(
     }
 }
 
-fn diagnostic_texture_numeric_range(
+pub(super) fn diagnostic_texture_numeric_range(
     plane: &[u8],
     descriptor: GuestTextureDescriptor,
 ) -> Option<DiagnosticTextureNumericRange> {

@@ -11,15 +11,14 @@ use std::time::Instant;
 
 use super::{
     CompiledComputePipeline, CompiledShaderPair, ComputePipelineKey, GraphicsPipelineKey,
-    MetalPresenter, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
-    PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
-    PersistentRenderPipelineArchive, PipelineCompileCandidate, ProgramIdentity,
-    RenderPipelineArchiveState, ShaderCompileRequest, ShaderCompileResult, ShaderFunctionCache,
-    ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_disable_blending,
-    dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
-    dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video, image_component_class,
-    metal_color_write_mask, PA_CL_VTE_CNTL_VTX_W0_FMT, register_value,
-    speculative_pipeline_compile_in_flight_capacity, video_target_binding_summary,
+    MetalPresenter, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED,
+    PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL, PersistentRenderPipelineArchive,
+    PipelineCompileCandidate, ProgramIdentity, RenderPipelineArchiveState, ShaderCompileRequest,
+    ShaderCompileResult, ShaderFunctionCache, ShaderFunctionCacheEntry, ShaderFunctionStageCache,
+    diagnostic_disable_blending, dump_msl_compute_filter_matches,
+    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
+    evaluation_samples_large_linear_video, image_component_class, metal_color_write_mask,
+    register_value, speculative_pipeline_compile_in_flight_capacity, video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -37,12 +36,12 @@ pub(crate) use self::program::{
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, ngg_export_uses_general_lds,
-    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
-    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    program_uses_lds, reconcile_pixel_input_controls_with_export_producers,
-    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
+    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask, pixel_scalars,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
+    reconcile_pixel_input_controls_with_export_producers, rectangle_coordinate_parameter_mask,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
+    vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
 pub(crate) use self::program::{
@@ -312,6 +311,7 @@ impl MetalPresenter {
             dispatch.launch.lds_size_bytes,
             dispatch.launch.wave_lane_count,
         );
+        options.compute_threadgroup_size = key.compute_threadgroup_size;
         options.scratch_size_bytes = dispatch.launch.scratch_size_bytes;
         options.allocated_vector_register_count = key.allocated_vector_register_count;
         let lowering_started = Instant::now();
@@ -398,6 +398,37 @@ impl MetalPresenter {
                 return Err("draw has pixel resources but no decoded pixel shader".to_owned());
             }
         };
+        let invalid_image_dump_directory = std::env::var_os("REMU_DUMP_INVALID_IMAGE_MSL_DIR")
+            .filter(|_| {
+                pixel_evaluation.image_bindings.iter().any(|binding| {
+                    !image_resource_descriptor_is_null(&binding.resource_descriptor)
+                        && binding
+                            .resource_descriptor
+                            .get(3)
+                            .is_some_and(|word| word >> 28 == 0)
+                })
+            });
+        if let Some(directory) = invalid_image_dump_directory.as_ref() {
+            if let Err(error) = dump_shader_pair_ir(
+                Path::new(directory),
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                &export.program.instructions,
+                &pixel_program.instructions,
+            ) {
+                eprintln!(
+                    "[REMu][METAL] could not dump invalid-image shader IR for es={:#x} ps={:#x}: {error}",
+                    draw.export_shader_address, draw.pixel_shader_address
+                );
+            } else {
+                eprintln!(
+                    "[REMu][METAL][IMAGE-IR] dumped non-image SRD shader es={:#x} ps={:#x} bindings={:?}",
+                    draw.export_shader_address,
+                    draw.pixel_shader_address,
+                    pixel_evaluation.image_bindings,
+                );
+            }
+        }
         // Emit decoded IR before either stage is lowered. Keeping this ahead of `compile_msl`
         // makes the one-shot dump useful for precisely the shaders that fail translation instead
         // of only recording pairs that already compiled successfully.
@@ -481,8 +512,8 @@ impl MetalPresenter {
         pixel_options.scratch_size_bytes = key.wave_state.pixel_scratch_bytes_per_lane();
         pixel_options.render_target_array_length = key.render_target_array_length;
         pixel_options.pixel_depth_export = key.pixel_depth_export;
-        pixel_options.pixel_input_controls = pixel_input_controls
-            .map(remu_shader_metal::PixelInputControl::from_register);
+        pixel_options.pixel_input_controls =
+            pixel_input_controls.map(remu_shader_metal::PixelInputControl::from_register);
         pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
         pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
         let pixel_msl =
@@ -570,8 +601,7 @@ impl MetalPresenter {
             .scratch_bytes_per_lane(vertex_options.wave_lane_count);
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
-        vertex_options.force_position_w1 =
-            key.viewport_transform_control & PA_CL_VTE_CNTL_VTX_W0_FMT != 0;
+        vertex_options.viewport_transform_control = key.viewport_transform_control;
         vertex_options.diagnostic_force_visible_clip_depth =
             key.diagnostics.force_visible_clip_depth;
         vertex_options.diagnostic_force_vertex_pattern = key.diagnostics.force_vertex_pattern;
@@ -580,11 +610,6 @@ impl MetalPresenter {
         let vertex_msl = if uses_mesh_stage {
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
                 .map_err(|error| format!("mesh lowering: {error}"))?
-        } else if key.render_target_array_length > 1 {
-            remu_shader_metal::compile_layered_rectangle_vertex(
-                pixel_msl.interpolated_attribute_count,
-                key.render_target_array_length,
-            )
         } else if uses_procedural_rectangle_stage {
             let coordinate_parameter_mask =
                 rectangle_coordinate_parameter_mask(pixel_program, &key.pixel_input_controls)
@@ -623,6 +648,20 @@ impl MetalPresenter {
                     draw.export_shader_address, draw.pixel_shader_address
                 );
             }
+        }
+        if let Some(directory) = invalid_image_dump_directory.as_ref()
+            && let Err(error) = dump_shader_pair_msl(
+                Path::new(directory),
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                &vertex_msl.source,
+                &pixel_msl.source,
+            )
+        {
+            eprintln!(
+                "[REMu][METAL] could not dump invalid-image MSL for es={:#x} ps={:#x}: {error}",
+                draw.export_shader_address, draw.pixel_shader_address
+            );
         }
         if let Some(directory) = std::env::var_os("REMU_DUMP_VIDEO_MSL_DIR")
             && evaluation_samples_large_linear_video(pixel_evaluation)

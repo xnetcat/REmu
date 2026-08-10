@@ -1,7 +1,76 @@
-# Silent Hill present / UI / 3D — tiler + mesh LDS + mode-5 BC mips + stencil latch + sample-path (2026-08-06)
+# Silent Hill present / UI / 3D — compositor investigation (updated 2026-08-10)
 
-**Tip:** `main` @ `884a372` — composite `800e73` zeros via EyeAdapt ES T# ≠ live `800b44` write VA;
-same-format owned-supersession sample bind shipped (not sufficient alone). efc title BG still not assessable.
+**Tip:** `main` @ `0f98ab68` plus uncommitted diagnostics. The title UI is assessable, but its
+3D background is black. The content-warning hallway is 2D and is not a 3D checkpoint.
+Silent Hill 2 is an Unreal Engine 5 title, not Unity; the run overlay also contains
+`ps5engine.ini` and `ue4commandline.txt`. Treat it as a renderer test case, not proof of a
+Unity-specific shared failure. See the [official PlayStation/Bloober announcement](https://blog.playstation.com/2022/10/19/silent-hill-2-remake-revealed-first-gameplay-details-and-design-changes-announced/).
+
+## 2026-08-10 log-only forensic correction (no new game run)
+
+- The recognizable but spatially decomposed 3D scene was restored by clean commit `3f9e559`, not
+  by the later compositor experiments. An empty same-address R32Float sampling shadow had stolen
+  authority from the native Depth32Float DB at `801ac2`. Keeping Depth32Float authoritative made
+  `depth_native` rise from 0 to 469 and made post-BasePass `800c7e` scene color nonzero
+  (`804345`, `magnitude_nz≈0x13b220`). See `runs/silent-hill-title-bg-depthfix/EVIDENCE.txt`.
+- Re-reading archived clean `composite4` draw 30370 changes the remaining attribution. Its
+  `800dbb`/`800e73` pixel shader executed on 746,496 pixels and exported only the expected
+  `±0.000976` dither while the BGRA8 target remained `(0,0,0,1)`. The shader is straight-line at
+  this stage; this is not an `800e73` EXEC/control-flow or target-conversion loss.
+- `800e73`'s final color lookup samples tex3, a 32×32×32 RGB10A2Unorm 3D color-grading LUT at
+  `803b680000`. The preserved native capture proves every one of its 32 depth planes has RGB
+  min=max=0 and A min=max=1. A valid HDR scene therefore becomes black at the final lookup.
+- The immediately preceding draw generates that LUT: sequence 24345, `800aed`/`800d700`, four
+  vertices, 32 instances/layers, target `803b680000`. Its archived generated mesh shader allocated
+  `threadgroup atomic_uint remu_lds_storage[544]` (2,176 bytes), but guest GS_RSRC2 `0x008b0000`
+  requests 2,176 **dwords** (8,704 bytes) and the shader accesses through byte `0x1d20`. Bounds
+  guards therefore suppressed the relevant LDS payload writes/reads and left mesh positions zero,
+  so the LUT retained its opaque-black clear value.
+- The factor-of-four fix is architectural: SDK `ShShaderResource2Gs::getLdsSize()` returns a dword
+  count, and AMD documents shader LDS allocation granularity in dwords. The current dirty tree also
+  corrects three downstream NGG issues exposed after restoring the payload: unsigned SOPK immediate
+  zero-extension, per-guest-wave ES/GS invocation counts, and linked-continuation GS input-VGPR
+  reseeding. Focused offline tests pass; because no clean game run was made, these changes are not
+  yet compatibility evidence.
+- This supersedes the recommendation to spend the next run on EyeAdapt or `remu_s_31`. The first
+  failing resource with direct clean evidence is the all-black generated LUT and its NGG writer.
+  Do not add a title/address workaround and do not apply/pop the GitHub Desktop stash; inspect it
+  read-only as `stash@{0}`.
+
+AMD's public register reference describes `LDS_SIZE` allocations in dwords:
+[CIK 3D registers](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/CIK_3D_registers_v2.pdf).
+
+## 2026-08-09 correction and continuation
+
+- The correct live checkpoint is the NEW GAME screen's 3D background. Eight finite Cross pulses
+  at 8, 12, 16, 20, 24, 28, 32, and 36 seconds reached it without entering the game.
+  Reproduce with `REMU_AUTO_CROSS=8,12,16,20,24,28,32,36` and
+  `REMU_AUTO_CROSS_REPEAT_MS=0`; do not use the default repeating pulse.
+- Draw sequence and shader occurrence are not stable selectors: clean runs placed the relevant
+  compositor at draws 17289, 20057, and 24492. An address-range selector was added so internal
+  title targets can be selected without accidentally capturing startup/scanout occurrences.
+- A bounded dirty-tree diagnostic run selected `800dbb`/`800e73` draw 22555. Its export-stage
+  EyeAdapt texture at `8043330000` was a live, readable, GPU-written RGBA32Float resident. Native
+  texel X was `0x3eb851f6` (`0.3600003`); mesh register `v6`, which supplies `param1.x`, was the
+  identical `0x3eb851f6`. The guest-RAM shadow was zero, as expected for a GPU-owned internal image.
+- Therefore shader compilation, mesh texture binding, native residency, and this `ImageLoad` are
+  working. The earlier `attr1≈0`/history-address theory was inferred from the final epsilon and is
+  superseded by direct register evidence; history address rotation alone is not a root cause.
+- That selected compositor still wrote opaque RGB black because its main HDR tex0 was all zero.
+  It occurred before the later title BasePass peak (for example draw 29158), so it is transitional
+  and does not supersede the clean later `composite3` evidence that tex0 can be nonzero.
+- This EyeAdapt result remains valid, but the 2026-08-10 archived-LUT evidence supersedes the next
+  step below: diagnose/fix the earlier LUT writer before requesting another compositor capture.
+  Do not add a title-, address-, or game-specific workaround.
+
+Engine/platform references: Epic documents that auto exposure uses prior-frame exposure history;
+Apple requires shader-read usage and correct stage resource preparation, both satisfied by the
+captured resident; AMD's RDNA ISA remains the instruction-level source for `ImageLoad` semantics.
+See [Epic auto exposure](https://dev.epicgames.com/documentation/unreal-engine/auto-exposure-eye-adaptation?application_version=4.27),
+[Apple resource synchronization](https://developer.apple.com/documentation/metal/resource-synchronization),
+[Apple shader-read usage](https://developer.apple.com/documentation/metal/mtltextureusage/shaderread),
+[Apple mesh resource preparation](https://developer.apple.com/documentation/metal/mesh-and-object-shader-resource-preparation-commands),
+and the [AMD RDNA ISA reference](https://gpuopen.com/wp-content/uploads/2019/08/RDNA_Shader_ISA_7July2019.pdf).
 
 ## Closed gates
 
@@ -9,7 +78,7 @@ same-format owned-supersession sample bind shipped (not sufficient alone). efc t
 | --- | --- |
 | Compositor tiler ownership (mode 1/5/9 + BC single-level) | Splash HEXA DRIVE / KONAMI with `REMU_CAPTURE_FRAMES=1` |
 | Matrix `captured_frames=0` misconception | Often capture-off — not present failure |
-| NGG mesh LDS over-allocation (`f28cee1`) | SDK `ShShaderResource2Gs::getLdsSize`; title mesh TG overflow gone |
+| Hardcoded NGG mesh LDS over-allocation (`f28cee1`) | Register-derived allocation removed the original Metal TG overflow, but the getter's dword result was mislabeled as bytes; the LUT writer was consequently under-allocated by 4×. |
 | Mode-5 compressed mip-chain GPU tiler (`8e4ed20`) | Live refuse count **0** (was ~10 @ `f28cee1`) |
 | Latched `STENCIL_ENABLE` aborting color MRTs (`0a22e15`) | Prior “stencil-only” refuses on CB-backed posts gone; depth decode returns `Ok(None)` |
 | Non-null TYPE-0 IMAGE-FALLBACK → opaque black | Loud `[IMAGE-REFUSE] reason=non-null-type-0-buffer-srd` instead of silent black 1×1 |
@@ -28,16 +97,18 @@ same-format owned-supersession sample bind shipped (not sufficient alone). efc t
 | ES UV ±0.6 / “missing +0.5” | **Guest intent** — ViewSize 1152×648 / BufferSize 1920×1080, bias 0; oversized tri → screen UV [0,0.6]; PS samples raw attr0 (ISA). Not CB scramble / sample-VGPR bug. `UV-TEX0-ATTR.txt`. |
 | tex0 “780×438” vs 1920×1080 | **Diagnostic misread** — `TARGET-DRAW-TEXTURES` used `{:x?}` (1920→`780`, 1080→`438`). SRD+PPM are 1920×1080; `800c7e` fills TL 1152×648. |
 | Nonzero tonemap reaches composite sample VA | Clean `composite3`: title `800e73` tex0 `80c2d4` RG11B10 **mag≈685651**; TARGET still opaque black. |
-| `800e73` near-zero exports class | Filmic path × `attr1[0]` (ES `800dbb` 1×1 EyeAdapt read) + `remu_s_31`; epsilon `±1e-3` matches `fma(..., 0x3B2ED4E7)` with **attr1≈0**. |
+| `800e73` near-zero exports (historical inference) | Filmic path uses `attr1[0]` (ES `800dbb` EyeAdapt read) and `remu_s_31`; epsilon suggested **attr1≈0**, but direct 2026-08-09 `v6` capture supersedes that inference for the measured draw. |
 | `800b44` EyeAdapt writer itself | Clean `eyeadapt`: draw **34617** → 1×1 RGBA32Float exports **`[0.18, 0.18, 1, 1]`**. |
 | Same-format sample after owned-byte supersession | `884a372` + unit test; live `composite4` still epsilon — **not** the sole closer. |
+| `800dbb` EyeAdapt native load | 2026-08-09 diagnostic draw 22555: native texel X and captured mesh `v6` both **`0x3eb851f6`**; resource is `Live`/readable/GPU-written. Prior attr1/history theory superseded. |
+| Final composite's 3D LUT | Archived clean `composite4` draw 30370: tex3 `803b680` is D3 32³ RGB10A2; all 32 planes are exactly **`[0,0,0,1]`**. `800e73` samples it last, so its dither-only black export is expected. |
 
 ## Live progression (capture on)
 
 | Stage | Assessable? |
 | --- | --- |
 | Splash logos | Yes |
-| Content-warning + **ruined hallway 3D** | Yes |
+| Content-warning + ruined hallway | Yes, but **2D** — not a 3D checkpoint |
 | Title UI (NEW GAME / OPTIONS / CONTROLS) | Yes (prior clean runs + `depthfix` efc) |
 | Title **3D background** | **No** — `composite4` @ `884a372`: `800e73` TARGET `rgb_nonzero=0`, pixel_outputs ±1e-3; efc center black |
 
@@ -68,21 +139,19 @@ same-format owned-supersession sample bind shipped (not sufficient alone). efc t
 15. **UV/attr0 via mesh BufferLoad V#** — SLoad heap span `0x200` (`37589c3`); tonemap5c mag≠0.
 16. **UV ±0.6 is intentional ViewSize/BufferSize** (`UV-TEX0-ATTR.txt`).
 17. **tex0 “780×438” was `{:x?}` Debug** on 1920×1080 descriptors.
-18. **`800bf4`→`800e73`→`800da3`→efc black despite lit tonemap** (clean `composite3`/`4`,
-    `eyeadapt`): HDR tex0 is bound and nonzero; `800e73` TARGET stays opaque black with
-    pixel_outputs ±1e-3. ES `800dbb` reads EyeAdapt 1×1 into `param1.x`/`attr1[0]` which
-    scales the filmic combine — **attr1≈0**. Live `800b44` writes valid exposure **0.18** to
-    its COLOR VA, but title ES user T# often names a **different** 1×1 (e.g. `composite4`:
-    ES `804327` vs PERF writer `803b67`; `composite3`: ES `803b67` vs writer `80466d`).
-    `884a372` closes same-format `serves_reads()` false-negatives after neighbour owned-byte
-    theft; live still epsilon → **ES EyeAdapt T# / history-buffer identity** is the open
-    composite blocker (not “tonemap never reaches composite”).
+18. **`800bf4`→`800e73`→`800da3`→efc remains black despite lit tonemap** (clean
+    `composite3`/`4`, `eyeadapt`). EyeAdapt residency is working for the directly measured draw.
+19. **Clean `composite4` identifies the first decisive downstream zero:** `800e73` samples an
+    all-black 32³ color LUT generated immediately beforehand by `800aed`/`800d700`. Its mesh LDS
+    was allocated as 2,176 bytes although GS_RSRC2 requests 2,176 dwords; guest accesses through
+    byte `0x1d20` were guarded out. The old generated MSL therefore could not publish valid LUT
+    geometry. Unsigned SOPK, per-wave merged counts, and the linked GS VGPR ABI are additional
+    general NGG corrections in the current uncommitted work, not clean live evidence yet.
 
 ## Anti-claims
 
 - Do not treat matrix `captured_frames=0` as black present when capture was unset.
-- Hallway on the content-warning screen and title UI are **not** title-background 3D closure
-  (“success is not the hallway”).
+- The content-warning hallway is **2D**. It and the title UI are not title-background 3D closure.
 - Closing mode-5 BC mip refuses ≠ title-background 3D closure (proven @ `8e4ed20`).
 - Closing latched-stencil color-MRT aborts ≠ title-background 3D closure (proven @ `0a22e15`).
 - Closing type-0 refuse + BGRA↔RGBA authority ≠ title-background 3D closure (proven live: BG still black with ALIAS-VIEW).
@@ -108,6 +177,11 @@ same-format owned-supersession sample bind shipped (not sufficient alone). efc t
 - ES UV PARAM0 ±0.6 ≠ missing-+0.5 CB bug (ViewSize/BufferSize + oversized tri; ISA samples raw attr0).
 - TARGET dump `width: 780` under `{:x?}` ≠ half-res tex0 (decimal 1920; PPM 1920×1080).
 - Lit composite tex0 + `800b44` writing 0.18 ≠ ES EyeAdapt T# is that write VA (`composite4`).
+- Different EyeAdapt history VAs ≠ a broken load: direct native texel→mesh-register evidence wins.
+- An early `800e73` whose HDR tex0 is zero ≠ the stable post-BasePass compositor.
+- A nonzero HDR tex0 ≠ a nonblack final composite when the last 3D LUT is `[0,0,0,1]` everywhere.
+- The old `f28cee1` `getLdsSize` decode removed one over-allocation but did **not** finish LDS
+  correctness: its returned count is dwords, not bytes.
 - `884a372` same-format owned-supersession bind ≠ title-BG closure (live `composite4` still ε).
 - Dirty-tree runs are not evidence.
 - Do not claim FPS unless launch loadavg 1-minute < 5 and a timed interactive measurement is taken.
@@ -115,20 +189,22 @@ same-format owned-supersession sample bind shipped (not sufficient alone). efc t
 
 ## Next recommended blockers
 
-1. **ES EyeAdapt T# vs `800b44` COLOR VA** — why mesh ES user SRD names a 1×1 that is not the
-   live writer (stale history slot / dropped copy / user-SGPR refresh / CB decode). Prove with
-   same-run dump of ES scalars + `800b44` TARGET address + Metal occupancy of both VAs.
-2. **`remu_s_31` @ `b2+0x878`** — secondary scale on HDR/bloom before `attr1`; dump full
-   `0x1690` global (diagnostic head is 256B only).
-3. **Scene-color TL quality** — `8071ca` sparse G / noise after exposure scale works.
-4. Parallel if SH stalls: DeS `sceAcmBatchStartBuffers`; Dreaming Sarah / Void null-SIGSEGV.
+1. **Stabilize the general LUT-writer fixes offline** — isolate and review the LDS dword→byte
+   conversion, unsigned SOPK compare, per-wave merged counts, and linked GS continuation ABI.
+2. **Regenerate/replay the captured `800aed` translation offline** — require 8,704 bytes of LDS,
+   six vertices/two primitives for the small quad, nonzero positions/param0, and all 32 layers.
+3. **Separate unrelated wave64 experiments** — the pairwise rendezvous attempt caused a Metal
+   command-buffer Error and is not evidence for this mesh writer; do not ship it with the LUT fix.
+4. **Only when game testing is allowed again:** validate one clean title run by capturing the LUT
+   writer target first, then the following `800e73` target. Do not return to EyeAdapt/remu_s31
+   unless the LUT is nonblack and the composite is still black.
 
 ## Commits (this continuation)
 
 | Commit | Concern |
 | --- | --- |
 | `b3c5b5b`…`1d5d4b3` | GPU-tiler mode-1/5/9 (+ BC) sampled ownership |
-| `f28cee1` | NGG mesh LDS from `ShShaderResource2Gs::getLdsSize` |
+| `f28cee1` | Replaced hardcoded NGG mesh LDS; its first `getLdsSize` decode mislabeled dwords as bytes. |
 | `8e4ed20` | Mode-5 compressed mip-chain GPU-tiler ownership |
 | `0a22e15` | Latched `STENCIL_ENABLE` must not abort color MRTs |
 | `3c025bd` | Type-0 refuse + BGRA↔RGBA sample authority |
@@ -160,3 +236,23 @@ same-format owned-supersession sample bind shipped (not sufficient alone). efc t
 - Unit: `same_address_same_format_sample_survives_partial_owned_supersession` + BGRA color-view sibling
 - Live clean `composite4` @ `884a372`: `800e73` still ε / `rgb_nonzero=0`; ES T# `804327` ≠ writer `803b67`
 - Live clean `eyeadapt`: `800b44` exports `[0.18,0.18,1,1]`
+- 2026-08-09 bounded dirty diagnostic: draw 22555 native EyeAdapt X = mesh `v6` = `0x3eb851f6`;
+  target opaque RGB black; HDR tex0 zero; later BasePass-class peak at draw 29158. Diagnostic only,
+  not regression/compatibility evidence.
+- Focused unit tests: mesh diagnostic capture, address-range target selection, and same-address
+  same-format resident sampling all pass.
+- 2026-08-10 log-only/offline checks (no game process):
+  `silent_hill_lut_draw_lds_covers_its_captured_vertex_payload`,
+  `unsigned_sopk_compare_zero_extends_its_immediate`,
+  `packs_wave64_merged_wave_info_for_split_ngg_mesh_exports`,
+  `proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole`,
+  `lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocation`, and
+  `selects_the_gfx10_ngg_input_vgpr_layout_from_primgen_passthrough` pass on the dirty tree.
+- Full `cargo test -p remu-shader-metal`: **174/176 pass**. The two known irreducible-control-flow
+  dispatcher tests still fail; this is not a green package gate and is unrelated to the focused
+  LUT checks above.
+
+New gated diagnostic controls are `REMU_DUMP_TARGET_ADDRESS_MIN` /
+`REMU_DUMP_TARGET_ADDRESS_MAX` (inclusive hexadecimal bounds) and
+`REMU_DIAGNOSTIC_CAPTURE_VERTEX_POSITION=1`. Mesh captures bind buffer 28 and record position plus
+`v0..v19` by Metal mesh-local thread; non-mesh captures retain the prior guest-index behavior.

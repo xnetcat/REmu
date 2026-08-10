@@ -1469,6 +1469,8 @@ static KERNEL_MEMORY_READABLE_RANGES: OnceLock<RwLock<Arc<[(u64, u64)]>>> = Once
 #[cfg(target_os = "macos")]
 static KERNEL_MEMORY_READABLE_RANGES_GENERATION: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+pub(crate) use guest_signal::PendingGuestException;
 #[allow(unused_imports)] // some re-exports are only reached from the x86_64 probe entry path
 pub(crate) use guest_signal::{
     GuestExceptionDeliveryState, apply_host_priority, clear_installed_guest_handler,
@@ -1477,8 +1479,6 @@ pub(crate) use guest_signal::{
     guest_sigprocmask, install_guest_signal_delivery, publish_installed_guest_handler,
     queue_and_interrupt_guest_exception, register_current_host_pthread, unregister_host_pthread,
 };
-#[cfg(test)]
-pub(crate) use guest_signal::PendingGuestException;
 
 #[derive(Debug)]
 struct ImportTelemetry {
@@ -4644,7 +4644,9 @@ fn dispatch_stateless_import(
         "uodLYyUip20" => guest_fclose(arguments[0]),
         "lbB+UlZqVG0" => guest_fread(arguments[0], arguments[1], arguments[2], arguments[3]),
         "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => inert_ok(nid),
-        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => inert_value(nid, arguments[0]),
+        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => {
+            inert_value(nid, arguments[0])
+        }
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
         "tcVi5SivF7Q" => guest_sprintf(arguments),
         "QrZZdJ8XsX0" => guest_fputs(arguments[0]),
@@ -4657,14 +4659,24 @@ fn dispatch_stateless_import(
         "9BcDykPmo1I" => guest_errno_address(),
         "HQOwnfMGipQ" => guest_net_errno_address(),
         "Q4qBuN-c0ZM" => guest_net_unavailable(45),
-        "dgJBaeJnGpo" => inert_value(nid, NEXT_NET_POOL_HANDLE.fetch_add(1, Ordering::Relaxed) as u64),
+        "dgJBaeJnGpo" => inert_value(
+            nid,
+            NEXT_NET_POOL_HANDLE.fetch_add(1, Ordering::Relaxed) as u64,
+        ),
         "hdpVEUDFW3s" => inert_value(nid, NEXT_SSL_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64),
-        "3JCe3lCbQ8A" | "A9cVMUtEp4Y" | "0gYjPTR-6cY" => {
-            inert_value(nid, NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64)
-        }
+        "3JCe3lCbQ8A" | "A9cVMUtEp4Y" | "0gYjPTR-6cY" => inert_value(
+            nid,
+            NEXT_HTTP_CONTEXT.fetch_add(1, Ordering::Relaxed) as u64,
+        ),
         "+o9816YQhqQ" => np_web_api2_initialize(arguments),
-        "cK6bYHf-Q5E" | "-hJRce8wn1U" => { remu_gpu::note_inert(nid); guest_zeroed_constructor(arguments[0], 8) },
-        "WSOuge5IsCg" => { remu_gpu::note_inert(nid); guest_zeroed_constructor(arguments[0], 0x28) },
+        "cK6bYHf-Q5E" | "-hJRce8wn1U" => {
+            remu_gpu::note_inert(nid);
+            guest_zeroed_constructor(arguments[0], 8)
+        }
+        "WSOuge5IsCg" => {
+            remu_gpu::note_inert(nid);
+            guest_zeroed_constructor(arguments[0], 0x28)
+        }
         "TRO721eVt4g" => agc_dcb_reset_queue(arguments),
         "ZvwO9euwYzc" => agc_dcb_set_registers_indirect(arguments, AGC_R_CX_REGS_INDIRECT),
         "-HOOCn0JY48" => agc_dcb_set_registers_indirect(arguments, AGC_R_SH_REGS_INDIRECT),
@@ -4697,11 +4709,20 @@ fn dispatch_stateless_import(
         "yDBwVAolDgg" => guest_kernel_is_stack(arguments),
         "Qs0wWulgl7U" => inert_ok("Qs0wWulgl7U"),
         "RaqxZIf6DvE" => inert_ok("RaqxZIf6DvE"),
-        "rbknaUjpqWo" => { remu_gpu::note_inert(nid); write_output_u64(arguments[1], 0) },
+        "rbknaUjpqWo" => {
+            remu_gpu::note_inert(nid);
+            write_output_u64(arguments[1], 0)
+        }
         "XDncXQIJUSk" => np_get_online_id(arguments),
         "JT+t00a3TxA" => np_get_account_country(arguments[1]),
-        "eQH7nWPcAgc" => { remu_gpu::note_inert(nid); write_output_i32(arguments[1], 1) },
-        "e-ZuhGEoeC4" => { remu_gpu::note_inert(nid); write_output_i32(arguments[1], 0) },
+        "eQH7nWPcAgc" => {
+            remu_gpu::note_inert(nid);
+            write_output_i32(arguments[1], 1)
+        }
+        "e-ZuhGEoeC4" => {
+            remu_gpu::note_inert(nid);
+            write_output_i32(arguments[1], 0)
+        }
         "1xxcMiGu2fo" => user_service_get_user_name(arguments),
         "woNpu+45RLk" => user_service_get_age_level(arguments),
         "-sD02mFDBh4" => user_service_get_game_presets(arguments),
@@ -4753,7 +4774,7 @@ fn dispatch_stateless_import(
         "6XG4B33N09g" => {
             std::thread::yield_now();
             0
-        },
+        }
         "lLMT9vJAck0" | "QBi7HCK03hw" => guest_clock_gettime(arguments[0], arguments[1]),
         "n88vx3C5nW8" => guest_posix_gettimeofday(arguments[0]),
         "ejekcaNQNq0" => guest_kernel_gettimeofday(arguments[0]),
@@ -5053,7 +5074,9 @@ fn dispatch_probe_import(
         "rcQCUr0EaRU" => guest_toupper_table(state),
         "9rMML086SEE" | "hEQ2Yi4PJXA" => guest_global_locale(state),
         "kALvdgEv5ME" | "9nf8joUTSaQ" | "Q1BL70XVV0o" => inert_ok(nid),
-        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => inert_value(nid, arguments[0]),
+        "hqi8yMOCmG0" | "p6LrHjIQMdk" | "QW2jL1J5rwY" | "P8F2oavZXtY" => {
+            inert_value(nid, arguments[0])
+        }
         // libc time returns Unix seconds and optionally stores the same value through its pointer.
         "wLlFkwG9UcQ" => guest_time(arguments[0]),
         // Preserve the SysV variadic register layout for the integer/pointer formats used by the
@@ -5543,10 +5566,7 @@ fn kernel_get_event_data(event: u64) -> u64 {
 }
 
 /// POSIX `pthread_setschedparam` — same ABI as `scePthreadSetschedparam`.
-fn pthread_set_schedule_parameters(
-    arguments: [u64; 6],
-    state: &mut ProbeDispatchState,
-) -> u64 {
+fn pthread_set_schedule_parameters(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     // Return POSIX errno (not SCE_KERNEL_ERROR_*) for the libc import.
     let result = pthread_set_schedule_param(arguments, state);
     if result == 0 {
@@ -8338,7 +8358,6 @@ const SCE_KERNEL_ERROR_TIMED_OUT: u32 = 0x8002_003c;
 const SCE_KERNEL_ERROR_NOT_IMPLEMENTED: u32 = 0x8002_004e;
 const SCE_KERNEL_STAT_SIZE: usize = 120;
 
-
 /// Returns success after recording that this NID/path did not perform the real work.
 ///
 /// Phase 0 instrumentation for CORE-MECHANISMS Group 8: every fabricated-success arm calls
@@ -9195,9 +9214,7 @@ fn write_abi_gap_summary() {
             } else {
                 "unknown"
             });
-            eprintln!(
-                "[REMu][REPORT] fabricated success key={key} name={name} calls={count}"
-            );
+            eprintln!("[REMu][REPORT] fabricated success key={key} name={name} calls={count}");
         }
         if ranked.len() > MAXIMUM_REPORTED_INERT {
             eprintln!(

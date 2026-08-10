@@ -17,10 +17,9 @@ use super::{
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
-    resident_is_depth_array_face, sampled_alias_descriptor,
-    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
-    texture_element_layout, trace_image_descriptors, trace_resident_texture_removal,
-    trace_target_sampling, trace_video_target_consumers,
+    resident_is_depth_array_face, sampled_alias_descriptor, sampled_texture_uses_exact_mode5_mips,
+    sampled_texture_uses_exact_mode27_mips, texture_element_layout, trace_image_descriptors,
+    trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -695,11 +694,7 @@ pub(crate) fn create_sampled_guest_texture_from_guest_gpu(
     let view = GpuTilerView {
         texture_type: descriptor.texture_type,
         layer_count: descriptor.layer_count,
-        mip_level_count: if exact_guest_mips {
-            mip_level_count
-        } else {
-            1
-        },
+        mip_level_count: if exact_guest_mips { mip_level_count } else { 1 },
     };
     encode_gpu_upload_from_guest_view(device, command_buffer, guest, &texture, view)?;
     if !exact_guest_mips && mip_level_count > 1 {

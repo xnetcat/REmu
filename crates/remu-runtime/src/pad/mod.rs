@@ -474,7 +474,7 @@ pub(crate) fn pad_read_state(arguments: [u64; 6]) -> u64 {
         write_guest_u32(output + 0x24, 0.0_f32.to_bits());
         // Angular velocity stays zero while stationary; deadband would also zero small values.
         remu_gpu::note_inert("pad:fabricated-stationary-imu");
-    let _ = state.angular_velocity_deadband;
+        let _ = state.angular_velocity_deadband;
         let _ = state.tilt_correction;
         let _ = state.angular_velocity_bias_correction;
     }

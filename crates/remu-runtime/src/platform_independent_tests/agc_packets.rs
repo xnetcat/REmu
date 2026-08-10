@@ -4,10 +4,10 @@
 use super::{
     AGC_IT_NOP, AGC_IT_SET_CONTEXT_REG_INDIRECT, AGC_IT_SET_SH_REG, AGC_IT_SET_SH_REG_INDIRECT,
     AGC_IT_SET_UCONFIG_REG, AGC_IT_SET_UCONFIG_REG_INDEX, AGC_IT_SET_UCONFIG_REG_INDIRECT,
-    AGC_VGT_INDEX_TYPE, AgcGraphicsState, AgcShaderRegistry, VideoOutBufferAttributes,
+    AGC_VGT_INDEX_TYPE, AgcDmaData, AgcGraphicsState, AgcShaderRegistry, VideoOutBufferAttributes,
     VideoOutState, agc_apply_submission_registers, agc_pm4, compute_graphics_state,
-    AgcDmaData, decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire,
-    decode_agc_memory_wait, low_u32,
+    decode_agc_dma_data, decode_agc_event_write, decode_agc_memory_acquire, decode_agc_memory_wait,
+    low_u32,
 };
 
 fn append_native_memory_dma(
@@ -234,7 +234,13 @@ fn decodes_native_32_bit_wait_reference_before_its_control_word() {
             crate::AGC_R_WAIT_MEM_32,
             false
         ),
-        Some(remu_gpu::GpuMemoryWait::memory(label_address, 1, u64::from(u32::MAX), 3, false))
+        Some(remu_gpu::GpuMemoryWait::memory(
+            label_address,
+            1,
+            u64::from(u32::MAX),
+            3,
+            false
+        ))
     );
 }
 
@@ -602,11 +608,20 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
 
     assert_eq!(
         receiver.recv().expect("release event"),
-        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease::label(label_address, remu_gpu::GpuMemoryReleaseValue::Immediate64(0x0123_4567_89ab_cdef)))
+        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease::label(
+            label_address,
+            remu_gpu::GpuMemoryReleaseValue::Immediate64(0x0123_4567_89ab_cdef)
+        ))
     );
     assert_eq!(
         receiver.recv().expect("wait event"),
-        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait::memory(label_address, 0x0123_4567_89ab_cdef, u64::MAX, 3, true))
+        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait::memory(
+            label_address,
+            0x0123_4567_89ab_cdef,
+            u64::MAX,
+            3,
+            true
+        ))
     );
     assert_eq!(submission_count, 1);
     assert!(receiver.try_recv().is_err());
@@ -662,11 +677,20 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
 
     assert_eq!(
         receiver.recv().expect("indirect release event"),
-        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease::label(label_address, remu_gpu::GpuMemoryReleaseValue::Immediate32(1)))
+        remu_gpu::GpuEvent::MemoryRelease(remu_gpu::GpuMemoryRelease::label(
+            label_address,
+            remu_gpu::GpuMemoryReleaseValue::Immediate32(1)
+        ))
     );
     assert_eq!(
         receiver.recv().expect("following wait event"),
-        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait::memory(label_address, 1, u64::from(u32::MAX), 3, false))
+        remu_gpu::GpuEvent::MemoryWait(remu_gpu::GpuMemoryWait::memory(
+            label_address,
+            1,
+            u64::from(u32::MAX),
+            3,
+            false
+        ))
     );
     assert_eq!(submission_count, 1);
     assert!(receiver.try_recv().is_err());

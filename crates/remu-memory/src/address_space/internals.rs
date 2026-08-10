@@ -254,7 +254,7 @@ impl GuestAddressSpace {
     }
 
     pub(super) fn map_host_shared(
-        &self,
+        &mut self,
         start: u64,
         size: u64,
         protection: GuestProtection,
@@ -297,7 +297,56 @@ impl GuestAddressSpace {
         }
         debug_assert_eq!(result, pointer);
         register_shared_mapping_range(start, size, backing, backing_offset);
+        self.arm_diagnostic_cpu_write_watch(start, size, protection);
         Ok(())
+    }
+
+    /// Arms the env-selected range at mapping time, before guest initialization can touch it.
+    ///
+    /// Ordinary GPU residency watches are intentionally lazy. This diagnostic is not: it exists
+    /// specifically to catch a store which precedes the first texture descriptor referencing the
+    /// allocation. The protected range is clipped to this mapping, and mapping replacement retires
+    /// it through the normal write-watch registry before a replacement watch is installed.
+    fn arm_diagnostic_cpu_write_watch(
+        &mut self,
+        mapping_start: u64,
+        mapping_size: u64,
+        protection: GuestProtection,
+    ) {
+        self.diagnostic_write_watches
+            .retain(|watch| !watch.is_retired());
+        let Some((requested_start, requested_end)) =
+            crate::write_watch::guest_cpu_write_trace_range()
+        else {
+            return;
+        };
+        if !protection.contains(GuestProtection::READ_WRITE) {
+            return;
+        }
+        let mapping_end = mapping_start.saturating_add(mapping_size);
+        let watch_start = mapping_start.max(requested_start);
+        let watch_end = mapping_end.min(requested_end);
+        if watch_start >= watch_end
+            || self
+                .diagnostic_write_watches
+                .iter()
+                .any(|watch| watch.range() == (watch_start, watch_end - watch_start))
+        {
+            return;
+        }
+        // SAFETY: the intersection belongs to the readable/writable mapping installed directly
+        // above. Guest mappings and protection changes retire the watch before mutating its pages.
+        match unsafe { CpuWriteWatch::new(watch_start, watch_end - watch_start) } {
+            Ok(watch) => {
+                eprintln!(
+                    "[REMu][WATCH] armed guest CPU write trace addr=0x{watch_start:x}..0x{watch_end:x}"
+                );
+                self.diagnostic_write_watches.push(watch);
+            }
+            Err(error) => eprintln!(
+                "[REMu][WATCH] could not arm guest CPU write trace addr=0x{watch_start:x}..0x{watch_end:x}: {error}"
+            ),
+        }
     }
 
     pub(super) fn remove_metadata_range(&mut self, start: u64, end: u64) {

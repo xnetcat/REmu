@@ -30,10 +30,12 @@ impl Compiler<'_> {
             EXEC_LO => self.store_exec_mask(condition),
             register if register < SCALAR_REGISTER_COUNT => {
                 self.line(3, &format!("s[{register}] = {low};"));
-                // Wave32 lane masks occupy a single SGPR. Writing the high half as 0
-                // would clobber the adjacent SGPR — on NGG mesh that is often s[3],
-                // which carries packed wave index/count used by the export reduce.
-                if self.split_wave64() && register + 1 < SCALAR_REGISTER_COUNT {
+                // Wave32 lane masks occupy a single SGPR. Writing a high half there would
+                // clobber the adjacent SGPR — on NGG mesh that is often s[3], which carries
+                // packed wave index/count used by the export reduce. Wave64 masks are pairs even
+                // when a non-threadgroup Metal stage can execute only their local SIMD32 half;
+                // clear that absent high half before subsequent B64 scalar mask operations.
+                if self.uses_wave64_lane_mask_pairs() && register + 1 < SCALAR_REGISTER_COUNT {
                     self.line(3, &format!("s[{}] = {high};", register + 1));
                 }
             }
@@ -42,8 +44,8 @@ impl Compiler<'_> {
     }
 
     pub(crate) fn store_exec_mask(&mut self, condition: &str) {
-        let (low, high) = self.ballot_words(condition);
         self.line(3, &format!("exec = {condition};"));
+        let (low, high) = self.ballot_words(condition);
         self.line(3, &format!("s[{EXEC_LO}] = {low};"));
         self.line(3, &format!("s[{EXEC_HI}] = {high};"));
     }
@@ -90,17 +92,27 @@ impl Compiler<'_> {
         }
         let destination = destination_scalar(instruction)?;
         if instruction.encoding == ShaderEncoding::Sopk {
-            let immediate = u16::try_from(instruction.words[0] & 0xffff)
-                .expect("masked immediate fits u16")
-                .cast_signed();
+            let immediate =
+                u16::try_from(instruction.words[0] & 0xffff).expect("masked immediate fits u16");
             if name.starts_with("SCmpk") {
+                // SOPK's unsigned compares are the exception to the normally signed SIMM16
+                // encoding: AMDGPU zero-extends IMM16 for every S_CMPK_*_U32 opcode. This is
+                // observable in NGG's `s_cmpk_le_u32 packed_counts, 0xffff` empty-workaround
+                // check; sign extension turns the limit into UINT_MAX and collapses non-empty
+                // output allocations to the workaround's one-vertex/one-primitive fallback.
+                let immediate = if name.ends_with("U32") {
+                    u32::from(immediate)
+                } else {
+                    u32::from_ne_bytes(i32::from(immediate.cast_signed()).to_ne_bytes())
+                };
                 return self.emit_scalar_compare_values(
                     name,
                     "SCmpk",
                     &format!("s[{destination}]"),
-                    &format_u32(u32::from_ne_bytes(i32::from(immediate).to_ne_bytes())),
+                    &format_u32(immediate),
                 );
             }
+            let immediate = immediate.cast_signed();
             let value = match name {
                 "SMovkI32" => format_u32(u32::from_ne_bytes(i32::from(immediate).to_ne_bytes())),
                 "SAddkI32" => format!(
@@ -533,7 +545,21 @@ impl Compiler<'_> {
         };
         let result = self.temp("ulong", &value);
         self.store_scalar_pair(destination, &result);
-        if self.split_wave64()
+        if self.split_wave64_is_whole_compute_threadgroup()
+            && self.uses_lds_memory()
+            && name == "SMovB64"
+            && destination == EXEC_LO
+            && instruction.sources.first().is_some_and(|source| {
+                source.kind == OperandKind::EncodedConstant && source.value == 193
+            })
+        {
+            // This guest workgroup is exactly one wave64 (or a partial final wave), so every
+            // thread reaches the architectural full-EXEC reconvergence together. Unlike a
+            // SIMD-local barrier, Metal's whole-threadgroup barrier publishes LDS writes from
+            // both host SIMD32 halves before either half performs the following reads.
+            self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
+        } else if self.options.stage == crate::MetalShaderStage::Compute
+            && self.split_wave64()
             && self.uses_lds_memory()
             && name == "SMovB64"
             && destination == EXEC_LO
@@ -544,8 +570,61 @@ impl Compiler<'_> {
             // One guest wave64 executes in lockstep, but Metal realizes it as two independent
             // SIMD32 groups. Guest shaders can use an EXEC=-1 restore as their wave reconvergence
             // point and immediately consume LDS values produced on either side of the preceding
-            // branch without an S_BARRIER. Synchronize the host halves here so the high half
-            // cannot read the low half's shared tile (or vice versa) before its stores complete.
+            // branch without an S_BARRIER. A whole-threadgroup barrier is invalid here because
+            // independent guest waves may be in different branches or loop iterations. First
+            // finish every lane's local SIMD32 LDS accesses, then rendezvous only the paired half
+            // through the same double-buffered epoch records used by scalar mask branches.
+            let rendezvous = self.next_temp;
+            self.next_temp += 1;
+            let prefix = format!("remu_wave_memory_{rendezvous}");
+            self.line(3, "simdgroup_barrier(mem_flags::mem_threadgroup);");
+            self.line(3, "remu_wave_pair_epoch += 1u;");
+            self.line(
+                3,
+                &format!(
+                    "uint {prefix}_slot = ((remu_wave_pair_epoch & 1u) << 5u) + (remu_wave_index << 1u) + remu_wave_half;"
+                ),
+            );
+            self.line(
+                3,
+                &format!(
+                    "bool {prefix}_has_partner = ((remu_wave_index << 6u) + ((remu_wave_half ^ 1u) << 5u)) < remu_thread_count;"
+                ),
+            );
+            self.line(3, &format!("uint {prefix}_remote = 0u;"));
+            self.line(3, "if (remu_lane == 0u) {");
+            self.line(
+                4,
+                &format!(
+                    "atomic_store_explicit(&remu_wave_pair_states[{prefix}_slot], remu_wave_pair_epoch << 1u, memory_order_relaxed);"
+                ),
+            );
+            self.line(3, "}");
+            self.line(3, &format!("if ({prefix}_has_partner) {{"));
+            self.line(4, "do {");
+            self.line(
+                5,
+                &format!(
+                    "{prefix}_remote = atomic_load_explicit(&remu_wave_pair_states[{prefix}_slot ^ 1u], memory_order_relaxed);"
+                ),
+            );
+            self.line(
+                4,
+                &format!("}} while (({prefix}_remote >> 1u) != remu_wave_pair_epoch);"),
+            );
+            self.line(3, "}");
+            self.line(3, "simdgroup_barrier(mem_flags::mem_threadgroup);");
+        } else if self.split_wave64()
+            && self.uses_lds_memory()
+            && name == "SMovB64"
+            && destination == EXEC_LO
+            && instruction.sources.first().is_some_and(|source| {
+                source.kind == OperandKind::EncodedConstant && source.value == 193
+            })
+        {
+            // Mesh kernels retain the converged whole-threadgroup rendezvous used before the
+            // compute-only paired-half experiment. A pairwise atomic spin is not scheduling-safe
+            // for mesh threadgroups on Apple GPUs and caused command buffers to enter Error.
             self.line(3, "threadgroup_barrier(mem_flags::mem_threadgroup);");
         }
         if sets_scc {

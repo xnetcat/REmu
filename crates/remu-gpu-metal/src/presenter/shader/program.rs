@@ -76,6 +76,11 @@ pub(crate) fn compute_pipeline_key(
         // negative cache entries; an allocator cannot recycle a dropped Program into this key.
         program_identity: ProgramIdentity(Arc::clone(program)),
         lds_size_bytes: dispatch.launch.lds_size_bytes,
+        compute_threadgroup_size: dispatch
+            .launch
+            .threads_per_group
+            .into_iter()
+            .fold(1_u32, u32::saturating_mul),
         scratch_size_bytes: dispatch.launch.scratch_size_bytes,
         wave_lane_count: dispatch.launch.wave_lane_count,
         allocated_vector_register_count: compute_allocated_vector_register_count(

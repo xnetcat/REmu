@@ -27,6 +27,28 @@ fn lowers_observed_64_bit_and_not_scalar_operation() {
 }
 
 #[test]
+fn unsigned_sopk_compare_zero_extends_its_immediate() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x34,
+            encoding: ShaderEncoding::Sopk,
+            opcode: Opcode::Known("SCmpkLeU32"),
+            words: vec![0xb704_ffff],
+            sources: vec![Operand {
+                kind: OperandKind::EncodedConstant,
+                value: u32::from(u16::MAX),
+            }],
+            destinations: vec![Operand::scalar(4)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+
+    assert!(shader.source.contains("(remu_s_4) <= (0xFFFFu)"));
+    assert!(!shader.source.contains("0xFFFFFFFFu"));
+}
+
+#[test]
 fn hardware_register_writes_do_not_fabricate_an_sgpr_destination() {
     for (name, sources, words) in [
         (

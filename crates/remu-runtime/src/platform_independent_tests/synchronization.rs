@@ -800,7 +800,11 @@ fn mutex_stack_handle_copies_share_one_control_block() {
     assert_ne!(slot_a, address);
 
     assert_eq!(crate::guest_mutex_lock(slot_a, false), 0);
-    assert_eq!(crate::guest_mutex_lock(slot_b, false), 0, "recursive via handle copy");
+    assert_eq!(
+        crate::guest_mutex_lock(slot_b, false),
+        0,
+        "recursive via handle copy"
+    );
     assert_eq!(crate::guest_mutex_unlock(slot_b), 0);
     assert_eq!(crate::guest_mutex_unlock(address), 0);
     assert_eq!(crate::guest_mutex_destroy(slot_a), 0);
@@ -846,8 +850,14 @@ fn mutex_init_overwrites_a_stack_handle_copy_without_touching_canonical_storage(
         "init into a handle-copy slot must succeed"
     );
     assert_ne!(stack_copy, 0);
-    assert_ne!(stack_copy, original, "overwrite publishes a distinct control block");
-    assert_eq!(storage, original, "canonical storage keeps the original handle");
+    assert_ne!(
+        stack_copy, original,
+        "overwrite publishes a distinct control block"
+    );
+    assert_eq!(
+        storage, original,
+        "canonical storage keeps the original handle"
+    );
 
     assert_eq!(crate::guest_mutex_lock(stack_slot, false), 0);
     assert_eq!(crate::guest_mutex_unlock(stack_slot), 0);
@@ -915,7 +925,10 @@ fn mutex_static_initializer_materializes_a_control_block_on_first_lock() {
     let mut storage = 0_u64;
     let address = (&raw mut storage).addr() as u64;
     assert_eq!(crate::guest_mutex_lock(address, false), 0);
-    assert_ne!(storage, 0, "PTHREAD_MUTEX_INITIALIZER publishes a real handle");
+    assert_ne!(
+        storage, 0,
+        "PTHREAD_MUTEX_INITIALIZER publishes a real handle"
+    );
     assert_eq!(crate::guest_mutex_unlock(address), 0);
     assert_eq!(crate::guest_mutex_destroy(address), 0);
     assert_eq!(storage, 0);
@@ -945,15 +958,15 @@ fn kernel_semaphore_create_writes_a_pointer_sized_handle() {
     // Leave upper bytes non-zero so a 4-byte write would leave a torn pointer-sized slot.
     storage = 0xffff_ffff_ffff_ffff;
     assert_eq!(
-        crate::dispatch_guest_sync_import(
-            "188x57JYp0g",
-            [output, 0, 0, 0, 1, 1],
-            None
-        ),
+        crate::dispatch_guest_sync_import("188x57JYp0g", [output, 0, 0, 0, 1, 1], None),
         0
     );
     assert_ne!(storage, 0);
-    assert_eq!(storage >> 32, 0, "create must clear the full 8-byte SceKernelSema slot");
+    assert_eq!(
+        storage >> 32,
+        0,
+        "create must clear the full 8-byte SceKernelSema slot"
+    );
     let handle = storage as u32;
     assert_eq!(
         crate::dispatch_guest_sync_import("R1Jvn8bSCW8", [storage, 0, 0, 0, 0, 0], None),

@@ -3,8 +3,8 @@
 
 use super::{
     CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
-    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter, RangeSet,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
+    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RangeSet, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
@@ -131,13 +131,7 @@ impl MetalPresenter {
                                  outcome: &str| {
                 let (
                     Some(trace),
-                    Some((
-                        before_gpu_owned,
-                        dirty,
-                        precise,
-                        dirty_pages,
-                        watch_generations_before,
-                    )),
+                    Some((before_gpu_owned, dirty, precise, dirty_pages, watch_generations_before)),
                 ) = (alias_trace.as_ref(), alias_trace_state.as_ref())
                 else {
                     return;
@@ -1345,4 +1339,3 @@ pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(
         })
         .collect()
 }
-

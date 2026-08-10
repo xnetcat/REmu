@@ -196,6 +196,54 @@ fn synchronizes_split_wave64_lds_at_full_exec_reconvergence() {
     assert!(
         shader
             .source
+            .contains("threadgroup atomic_uint remu_wave_pair_states[64]")
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        1,
+        "only the uniform state initialization may synchronize the whole threadgroup"
+    );
+
+    let mut one_wave_options = MetalCompileOptions::compute_wave(2_048, 64);
+    one_wave_options.compute_threadgroup_size = 64;
+    let one_wave = compile_msl(&program, &empty_evaluation(), &one_wave_options)
+        .expect("one-wave compute LDS reconvergence should lower");
+    assert_eq!(
+        one_wave
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        1,
+        "a one-wave workgroup uses one whole-group barrier at full-EXEC reconvergence"
+    );
+    assert!(
+        !one_wave
+            .source
+            .contains("simdgroup_barrier(mem_flags::mem_threadgroup)"),
+        "a SIMD-local barrier cannot publish LDS writes to the other half"
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("simdgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        2,
+        "the two guest-wave halves bracket their LDS rendezvous with local SIMD barriers"
+    );
+
+    let mut mesh_options = MetalCompileOptions::mesh(0, 2_048, 64, 64, 64);
+    mesh_options.wave_lane_count = 64;
+    let mesh = compile_msl(&program, &empty_evaluation(), &mesh_options)
+        .expect("split wave64 mesh LDS reconvergence should retain its converged barrier");
+    assert!(
+        !mesh.source.contains("remu_wave_pair_states"),
+        "pairwise atomic spinning is not scheduling-safe in a Metal mesh threadgroup"
+    );
+    assert!(
+        mesh.source
             .contains("threadgroup_barrier(mem_flags::mem_threadgroup)")
     );
 }
@@ -247,7 +295,7 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -263,7 +311,9 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes: 2_048,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 64,
             allocated_vector_register_count: 256,
@@ -447,7 +497,7 @@ fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -463,7 +513,9 @@ fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes: 0,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: 256,

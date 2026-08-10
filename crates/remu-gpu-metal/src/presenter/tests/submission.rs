@@ -670,7 +670,10 @@ fn post_flip_release_mem_precedes_the_exact_flip_completion() {
     presenter
         .execute_guest_memory_release(
             OrderedEventSource::GuestQueue(0),
-            GpuMemoryRelease::label(release_address, GpuMemoryReleaseValue::Immediate32(0xfeed_beef)),
+            GpuMemoryRelease::label(
+                release_address,
+                GpuMemoryReleaseValue::Immediate32(0xfeed_beef),
+            ),
         )
         .expect("post-flip release enters the same guest batch");
     presenter
@@ -2470,10 +2473,14 @@ fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
         presenter.guest_memory_waits.observe_unsatisfied(key),
         GuestMemoryWaitRecovery::None
     );
-    let pending = [
-        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(7))))
-        .expect("pin release label mapping"),
-    ];
+    let pending =
+        [
+            pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+                address,
+                GpuMemoryReleaseValue::Immediate32(7),
+            )))
+            .expect("pin release label mapping"),
+        ];
 
     let error = presenter
         .publish_terminal_guest_memory_writes(
@@ -2520,12 +2527,17 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
         .clone();
     let (_completion_space, completion_address) = mapped_test_label();
     let invalid = PendingGuestMemoryWrite {
-        operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(2, GpuMemoryReleaseValue::Immediate32(1))),
+        operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            2,
+            GpuMemoryReleaseValue::Immediate32(1),
+        )),
         mapping_identity: None,
         write_watch: None,
         publishes_guest_memory_authority: false,
     };
-    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(completion_address, GpuMemoryReleaseValue::Immediate32(9))))
+    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+        GpuMemoryRelease::label(completion_address, GpuMemoryReleaseValue::Immediate32(9)),
+    ))
     .expect("pin completion label mapping");
     for memory_writes in [vec![invalid], vec![completion]] {
         let command_buffer = queue.new_command_buffer().to_owned();
@@ -2600,7 +2612,12 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: vec![
-                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(completion_address, GpuMemoryReleaseValue::Immediate32(9))))
+                pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+                    GpuMemoryRelease::label(
+                        completion_address,
+                        GpuMemoryReleaseValue::Immediate32(9),
+                    ),
+                ))
                 .expect("pin completion label mapping"),
             ],
             resident_write_footprint: Vec::new(),
@@ -2648,7 +2665,12 @@ fn fill_committed_guest_batch_budget(
         command_buffer.commit();
         let memory_writes = if index == 0 {
             vec![
-                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(label_address, GpuMemoryReleaseValue::Immediate32(label_value))))
+                pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+                    GpuMemoryRelease::label(
+                        label_address,
+                        GpuMemoryReleaseValue::Immediate32(label_value),
+                    ),
+                ))
                 .expect("pin oldest completion label"),
             ]
         } else {
@@ -3038,7 +3060,12 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
             global_writebacks: Vec::new(),
             guest_write_ranges: Vec::new(),
             memory_writes: vec![
-                pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(completion_address, GpuMemoryReleaseValue::Immediate32(9))))
+                pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+                    GpuMemoryRelease::label(
+                        completion_address,
+                        GpuMemoryReleaseValue::Immediate32(9),
+                    ),
+                ))
                 .expect("pin later completion label"),
             ],
             resident_write_footprint: Vec::new(),
@@ -3210,8 +3237,12 @@ fn ordered_guest_label_writes_publish_only_the_declared_values() {
     let (_label_space, release_address) = mapped_test_label();
     let words_address = release_address + 16;
     let fill_address = release_address + 32;
-    let release = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(release_address, GpuMemoryReleaseValue::Immediate64(0x1122_3344_5566_7788))))
-    .expect("pin release destination");
+    let release =
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            release_address,
+            GpuMemoryReleaseValue::Immediate64(0x1122_3344_5566_7788),
+        )))
+        .expect("pin release destination");
     let write = pin_guest_memory_write(GuestMemoryWriteOperation::Write(GpuMemoryWrite {
         address: words_address,
         values: vec![3, 5, 8],
@@ -3260,8 +3291,12 @@ fn payload_then_label_publishes_with_release_ordering() {
         dword_count: 8,
     })
     .expect("pin payload fill");
-    let release = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(label_address, GpuMemoryReleaseValue::Immediate64(0xabcd_ef01_2345_6789))))
-    .expect("pin release label");
+    let release =
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            label_address,
+            GpuMemoryReleaseValue::Immediate64(0xabcd_ef01_2345_6789),
+        )))
+        .expect("pin release label");
     assert!(fill.mapping_identity.is_some());
     assert!(release.mapping_identity.is_some());
     apply_pending_guest_memory_writes(&[fill, release]).expect("payload then label");
@@ -3278,7 +3313,10 @@ fn payload_then_label_publishes_with_release_ordering() {
 #[test]
 fn pixel_pipe_release_trace_follows_the_exact_deferred_write_to_publication() {
     let (_label_space, release_address) = mapped_test_label();
-    let release = GpuMemoryRelease::label(release_address, GpuMemoryReleaseValue::Immediate64(0x8000_0000_02ff_ffff));
+    let release = GpuMemoryRelease::label(
+        release_address,
+        GpuMemoryReleaseValue::Immediate64(0x8000_0000_02ff_ffff),
+    );
     let trace = remu_gpu::PixelPipeStatReleaseTrace {
         dump_sequence: 47,
         pair_index: 15,
@@ -3343,8 +3381,12 @@ fn deferred_shared_guest_write_rejects_reused_mapping() {
             0,
         )
         .expect("original shared mapping");
-    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(address.get(), GpuMemoryReleaseValue::Immediate32(0xdead_beef))))
-    .expect("pin original shared mapping");
+    let pending =
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            address.get(),
+            GpuMemoryReleaseValue::Immediate32(0xdead_beef),
+        )))
+        .expect("pin original shared mapping");
 
     address_space
         .unmap(address, GUEST_PAGE_SIZE)
@@ -3385,8 +3427,12 @@ fn deferred_anonymous_guest_write_rejects_reused_mapping() {
             GuestProtection::READ_WRITE,
         )
         .expect("original anonymous mapping");
-    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(address.get(), GpuMemoryReleaseValue::Immediate32(0xdead_beef))))
-    .expect("pin original anonymous mapping");
+    let pending =
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            address.get(),
+            GpuMemoryReleaseValue::Immediate32(0xdead_beef),
+        )))
+        .expect("pin original anonymous mapping");
 
     address_space
         .unmap(address, GUEST_PAGE_SIZE)
@@ -3463,7 +3509,10 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         .send(GpuEvent::QueueSubmission {
             queue_id: 33,
             events: vec![
-                GpuEvent::MemoryRelease(GpuMemoryRelease::label(0x3000, GpuMemoryReleaseValue::Immediate32(1))),
+                GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                    0x3000,
+                    GpuMemoryReleaseValue::Immediate32(1),
+                )),
                 GpuEvent::SubmissionBoundary(2),
             ],
         })
@@ -3629,6 +3678,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
     let key = ComputePipelineKey {
         program_identity: ProgramIdentity(program),
         lds_size_bytes: 0,
+        compute_threadgroup_size: 64,
         scratch_size_bytes: 0,
         wave_lane_count: 64,
         allocated_vector_register_count: 4,
@@ -3817,7 +3867,10 @@ fn blocked_wait_ingests_past_backpressure_only_until_a_runnable_queue_is_found()
     sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 33,
-            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(wait.address, GpuMemoryReleaseValue::Immediate32(1)))],
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                wait.address,
+                GpuMemoryReleaseValue::Immediate32(1),
+            ))],
         })
         .expect("queue independent producer");
     sender
@@ -3901,7 +3954,10 @@ fn blocked_wait_dependencies_are_ingested_before_periodic_retry_clears_block_sta
     sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 33,
-            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(wait.address, GpuMemoryReleaseValue::Immediate32(1)))],
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                wait.address,
+                GpuMemoryReleaseValue::Immediate32(1),
+            ))],
         })
         .expect("queue compute producer behind the ordinary ingress cap");
 
@@ -4000,7 +4056,10 @@ fn unpolled_wait_front_does_not_hide_a_third_queue_dependency() {
     sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 34,
-            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(graphics_wait.address, GpuMemoryReleaseValue::Immediate32(1)))],
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                graphics_wait.address,
+                GpuMemoryReleaseValue::Immediate32(1),
+            ))],
         })
         .expect("queue producer behind two wait fronts");
 
@@ -4063,7 +4122,10 @@ fn blocked_wait_dependency_ingress_finds_a_producer_beyond_any_fixed_chunk_reser
     sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 33,
-            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(wait.address, GpuMemoryReleaseValue::Immediate32(1)))],
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                wait.address,
+                GpuMemoryReleaseValue::Immediate32(1),
+            ))],
         })
         .expect("queue producer beyond the old fixed dependency reserve");
 
@@ -4189,7 +4251,9 @@ fn terminal_guest_memory_publication_wakes_the_exact_parked_wait() {
         event,
         QueueBlockReason::GuestMemoryWaitPendingTerminal(wait),
     );
-    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(1))))
+    let pending = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+        GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(1)),
+    ))
     .expect("pin terminal release");
 
     presenter
@@ -4234,7 +4298,10 @@ fn blocked_wait_diagnostics_report_both_edges_of_a_cross_queue_cycle() {
                 queue_id,
                 events: vec![
                     GpuEvent::MemoryWait(wait),
-                    GpuEvent::MemoryRelease(GpuMemoryRelease::label(producer_address, GpuMemoryReleaseValue::Immediate32(1))),
+                    GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                        producer_address,
+                        GpuMemoryReleaseValue::Immediate32(1),
+                    )),
                 ],
             })
             .expect("queue cyclic wait and producer");
@@ -4513,7 +4580,10 @@ fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
         .send(GpuEvent::QueueSubmission {
             queue_id: 33,
             events: vec![
-                GpuEvent::MemoryRelease(GpuMemoryRelease::label(wait.address, GpuMemoryReleaseValue::Immediate32(1))),
+                GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                    wait.address,
+                    GpuMemoryReleaseValue::Immediate32(1),
+                )),
                 GpuEvent::SubmissionBoundary(2),
             ],
         })
@@ -4625,7 +4695,10 @@ fn guest_wait_never_reuses_a_producer_from_before_its_registration() {
 
 #[test]
 fn immediate64_release_matches_qword_and_each_dword_wait_exactly() {
-    let release = GpuMemoryRelease::label(0x7000_4000, GpuMemoryReleaseValue::Immediate64(0x8877_6655_4433_2211));
+    let release = GpuMemoryRelease::label(
+        0x7000_4000,
+        GpuMemoryReleaseValue::Immediate64(0x8877_6655_4433_2211),
+    );
     let wait = |address, is_64_bit| GpuMemoryWait::memory(address, 0, u64::MAX, 0, is_64_bit);
     assert_eq!(
         release_value_for_wait(release, wait(release.address, true)),
@@ -4818,7 +4891,9 @@ fn per_queue_terminal_fronts_retire_independently_and_remain_fifo_within_a_queue
     let (_label_space, address) = mapped_test_label();
     let mut q41_buffers = Vec::new();
     for value in [1, 2] {
-        let write = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(value))))
+        let write = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(value)),
+        ))
         .expect("pin ordered q41 label");
         q41_buffers.push(committed_per_queue_test_batch(
             &mut presenter,
@@ -4933,13 +5008,18 @@ fn per_queue_required_drain_has_one_deadline_and_continues_after_terminal_error(
     enable_per_queue_batches(&mut presenter);
 
     let invalid = PendingGuestMemoryWrite {
-        operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(2, GpuMemoryReleaseValue::Immediate32(1))),
+        operation: GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            2,
+            GpuMemoryReleaseValue::Immediate32(1),
+        )),
         mapping_identity: None,
         write_watch: None,
         publishes_guest_memory_authority: false,
     };
     let (_label_space, completion_address) = mapped_test_label();
-    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(completion_address, GpuMemoryReleaseValue::Immediate32(9))))
+    let completion = pin_guest_memory_write(GuestMemoryWriteOperation::Release(
+        GpuMemoryRelease::label(completion_address, GpuMemoryReleaseValue::Immediate32(9)),
+    ))
     .expect("pin later queue completion label");
     let first = committed_per_queue_test_batch(&mut presenter, 0, vec![invalid], None);
     let later = committed_per_queue_test_batch(&mut presenter, 41, vec![completion], None);
@@ -5498,7 +5578,10 @@ fn disjoint_direct_draw_admission_is_default_disabled() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(label, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            label,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
@@ -5564,7 +5647,10 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(label, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            label,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
@@ -5666,7 +5752,10 @@ fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(shared_address, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            shared_address,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
@@ -5724,7 +5813,10 @@ fn same_queue_wait_reg_mem_elides_the_redundant_self_event() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(label, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            label,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
@@ -5777,7 +5869,10 @@ fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(label, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            label,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
@@ -6025,7 +6120,10 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(label, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            label,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
@@ -6211,7 +6309,10 @@ fn shared_event_checkpoint_collects_resident_global_and_terminal_writes() {
         physical_identity: zero_copy_identity,
     });
     batch.memory_writes.push(
-        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(address + 128, GpuMemoryReleaseValue::Immediate32(7))))
+        pin_guest_memory_write(GuestMemoryWriteOperation::Release(GpuMemoryRelease::label(
+            address + 128,
+            GpuMemoryReleaseValue::Immediate32(7),
+        )))
         .expect("terminal label mapping is pinned"),
     );
     batch.record_resident_write_footprint(
@@ -6386,8 +6487,14 @@ fn exact_registered_waits_chain_without_intermediate_host_acknowledgements() {
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
         events: vec![
-            GpuEvent::MemoryRelease(GpuMemoryRelease::label(first_label, GpuMemoryReleaseValue::Immediate32(1))),
-            GpuEvent::MemoryRelease(GpuMemoryRelease::label(second_label, GpuMemoryReleaseValue::Immediate32(1))),
+            GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                first_label,
+                GpuMemoryReleaseValue::Immediate32(1)
+            )),
+            GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                second_label,
+                GpuMemoryReleaseValue::Immediate32(1)
+            )),
         ],
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
@@ -7217,7 +7324,10 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
     }));
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 41,
-        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(label, GpuMemoryReleaseValue::Immediate32(1)))],
+        events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+            label,
+            GpuMemoryReleaseValue::Immediate32(1)
+        ))],
     }));
 
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);

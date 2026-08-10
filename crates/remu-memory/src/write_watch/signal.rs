@@ -416,14 +416,22 @@ fn try_handle_write_fault(
     // allocator failure names this page, one crash can identify which guest code first took CPU
     // write ownership after the last GPU snapshot. Recording the whole page is intentional — the
     // signal layer cannot observe subsequent stores while it is disarmed.
-    if crate::guest_write_journal::guest_cpu_page_journal_armed() {
+    let trace_guest_cpu_write = super::diagnostic::guest_cpu_write_trace_matches(fault_address);
+    if trace_guest_cpu_write || crate::guest_write_journal::guest_cpu_page_journal_armed() {
         let (report, _) = state();
-        crate::guest_write_journal::record_guest_cpu_page_open(
-            page_address,
-            page_size,
-            fault_address,
-            report.program_counter,
-        );
+        if trace_guest_cpu_write {
+            let mut buffer = DiagnosticBuffer::new();
+            super::diagnostic::format_guest_cpu_write_trace(report, &mut buffer);
+            write_signal_diagnostic_bytes(buffer.as_slice());
+        }
+        if crate::guest_write_journal::guest_cpu_page_journal_armed() {
+            crate::guest_write_journal::record_guest_cpu_page_open(
+                page_address,
+                page_size,
+                fault_address,
+                report.program_counter,
+            );
+        }
     }
     true
 }

@@ -11,28 +11,105 @@ use super::{
     collect_shared_event_global_versions, compute_pipeline_key, compute_program_can_split_wave64,
     create_global_argument_buffer, decode_image_descriptor,
     diagnostic_compute_texture_dispatch_is_eligible,
-    diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_texture_writer_enabled,
-    dump_msl_compute_filter_matches, image_resource_descriptor_is_null, is_storage_image_opcode,
-    is_writable_image_opcode, read_texture_linear, rearm_color_metadata_clear,
+    diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_overlapping_texture_writers,
+    diagnostic_target_after_mrt_ready, diagnostic_texture_numeric_range, diagnostic_texture_writer,
+    diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    metal_uncompressed_bytes_per_pixel, read_texture_linear, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible,
-    shader_scalar_metadata_for_registers, storage_image_requires_mip_hierarchy,
-    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
-    wave64_split_blockers,
+    resident_same_image_sample_is_eligible, shader_scalar_metadata_for_registers,
+    storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
-use metal::{MTLResourceUsage, MTLSize};
+use metal::{MTLPixelFormat, MTLResourceOptions, MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+const DIAGNOSTIC_COMPUTE_TRACE_CHECKPOINTS: usize = 8;
+const DIAGNOSTIC_COMPUTE_TRACE_THREADS: usize = 64;
+const DIAGNOSTIC_COMPUTE_TRACE_RECORD_DWORDS: usize = 128;
+const DIAGNOSTIC_COMPUTE_TRACE_BYTES: usize = DIAGNOSTIC_COMPUTE_TRACE_CHECKPOINTS
+    * DIAGNOSTIC_COMPUTE_TRACE_THREADS
+    * DIAGNOSTIC_COMPUTE_TRACE_RECORD_DWORDS
+    * size_of::<u32>();
+
+fn diagnostic_compute_state_trace_matches(shader_address: u64) -> bool {
+    std::env::var("REMU_TRACE_COMPUTE_STATE_CS")
+        .ok()
+        .and_then(|value| u64::from_str_radix(value.trim().trim_start_matches("0x"), 16).ok())
+        == Some(shader_address)
+}
+
+fn diagnostic_compute_state_trace_has_scene_input(
+    evaluation: &remu_shader::ShaderEvaluation,
+) -> bool {
+    let (width, height) = diagnostic_compute_texture_extent().unwrap_or((1_920, 1_080));
+    evaluation.image_bindings.iter().any(|binding| {
+        binding.pc == 0x220
+            && decode_image_descriptor(&binding.resource_descriptor).is_ok_and(|descriptor| {
+                descriptor.guest.width == width && descriptor.guest.height == height
+            })
+    })
+}
 
 fn storage_image_requires_exact_preacquire(
     opcode: remu_shader::Opcode,
     has_read_compatible_resident: bool,
 ) -> bool {
     is_writable_image_opcode(opcode) || !has_read_compatible_resident
+}
+
+fn diagnostic_compute_readback_descriptor(
+    mut descriptor: super::super::GuestTextureDescriptor,
+    native_format: MTLPixelFormat,
+) -> Result<super::super::GuestTextureDescriptor, String> {
+    if descriptor.pixel_format == native_format {
+        return Ok(descriptor);
+    }
+    let native_bytes_per_pixel =
+        metal_uncompressed_bytes_per_pixel(native_format).ok_or_else(|| {
+            format!("native format {native_format:?} has no exact uncompressed readback layout")
+        })?;
+    if native_bytes_per_pixel != descriptor.bytes_per_pixel {
+        return Err(format!(
+            "native format {native_format:?} uses {native_bytes_per_pixel} bytes per pixel, guest view {:?} uses {}",
+            descriptor.pixel_format, descriptor.bytes_per_pixel,
+        ));
+    }
+    descriptor.pixel_format = native_format;
+    Ok(descriptor)
+}
+
+fn parse_diagnostic_compute_texture_extent(value: &str) -> Option<(u32, u32)> {
+    let (width, height) = value.split_once('x')?;
+    let width = width.parse().ok()?;
+    let height = height.parse().ok()?;
+    (width != 0 && height != 0).then_some((width, height))
+}
+
+fn diagnostic_compute_texture_extent() -> Option<(u32, u32)> {
+    static EXTENT: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *EXTENT.get_or_init(|| {
+        std::env::var("REMU_DUMP_COMPUTE_TEXTURE_EXTENT")
+            .ok()
+            .and_then(|value| parse_diagnostic_compute_texture_extent(&value))
+    })
+}
+
+fn diagnostic_compute_texture_dump_limit() -> usize {
+    static LIMIT: OnceLock<usize> = OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("REMU_DUMP_COMPUTE_TEXTURE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1)
+            .clamp(1, 16)
+    })
 }
 
 impl MetalPresenter {
@@ -250,6 +327,23 @@ impl MetalPresenter {
             activity_stamp,
             &[],
         )?;
+        // Some compute passes bind the same guest image as both a read source and a write
+        // destination. Snapshot the producer before this dispatch replaces the writer-map entry;
+        // the post-dispatch texture dump otherwise attributes an input to the pass consuming it.
+        let diagnostic_dump_input_writers =
+            std::env::var_os("REMU_DUMP_COMPUTE_TEXTURE_DIR").map(|_| {
+                textures
+                    .iter()
+                    .map(|texture| {
+                        (!texture.writable).then(|| {
+                            (
+                                diagnostic_texture_writer(texture.descriptor.guest),
+                                diagnostic_overlapping_texture_writers(texture.descriptor.guest),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            });
         // Scene-color CS (e.g. SH 800c7e) may ImageLoad GBuffers that never appear in the
         // sampled-only writer lineage. Dump every image SRD once per filtered CS so missing
         // vs dummy-1x1 vs real half-res color is attributable without fabricating binds.
@@ -260,10 +354,9 @@ impl MetalPresenter {
             static LOGGED_LATE_COMPUTE_IMAGES: AtomicUsize = AtomicUsize::new(0);
             let early_slot = LOGGED_COMPUTE_IMAGES.fetch_add(1, Ordering::Relaxed);
             let min_dispatch = diagnostic_dump_compute_texture_minimum_dispatch();
-            let late_eligible = diagnostic_compute_texture_dispatch_is_eligible(
-                dispatch.sequence,
-                min_dispatch,
-            ) && min_dispatch > 0;
+            let late_eligible =
+                diagnostic_compute_texture_dispatch_is_eligible(dispatch.sequence, min_dispatch)
+                    && min_dispatch > 0;
             let late_slot = if late_eligible {
                 Some(LOGGED_LATE_COMPUTE_IMAGES.fetch_add(1, Ordering::Relaxed))
             } else {
@@ -276,8 +369,7 @@ impl MetalPresenter {
                     .image_bindings
                     .iter()
                     .map(|binding| {
-                        let decoded =
-                            decode_image_descriptor(&binding.resource_descriptor).ok();
+                        let decoded = decode_image_descriptor(&binding.resource_descriptor).ok();
                         let uploaded = decoded.as_ref().and_then(|descriptor| {
                             textures.iter().find_map(|texture| {
                                 (texture.descriptor.guest.address == descriptor.guest.address
@@ -349,6 +441,25 @@ impl MetalPresenter {
             .checked_mul(4)
             .and_then(|count| u64::try_from(count).ok())
             .ok_or("compute scalar byte count overflow")?;
+        let diagnostic_compute_trace =
+            diagnostic_compute_state_trace_matches(dispatch.shader_address).then(|| {
+                device.new_buffer(
+                    u64::try_from(DIAGNOSTIC_COMPUTE_TRACE_BYTES)
+                        .expect("diagnostic compute trace byte count fits u64"),
+                    MTLResourceOptions::StorageModeShared,
+                )
+            });
+        if let Some(buffer) = diagnostic_compute_trace.as_ref() {
+            // A skipped conditional checkpoint must remain distinguishable from a valid record
+            // whose register payload happens to be zero.
+            unsafe {
+                std::ptr::write_bytes(
+                    buffer.contents().cast::<u8>(),
+                    0,
+                    DIAGNOSTIC_COMPUTE_TRACE_BYTES,
+                );
+            }
+        }
         let mut pending_writebacks = Vec::new();
         collect_pending_global_writebacks(&buffers, evaluation, &mut pending_writebacks)?;
         let mut pending_guest_write_ranges = Vec::new();
@@ -380,6 +491,9 @@ impl MetalPresenter {
             let encoder = batch.ensure_compute_encoder();
             encoder.set_label(&format!("REMu Gen5 compute {:#x}", dispatch.shader_address));
             encoder.set_compute_pipeline_state(&pipeline);
+            if let Some(buffer) = diagnostic_compute_trace.as_ref() {
+                encoder.set_buffer(30, Some(buffer), 0);
+            }
             if let (Some(index), Some(argument_buffer)) = (
                 bindings.global_argument_buffer_index,
                 global_argument_buffer.as_ref(),
@@ -523,18 +637,99 @@ impl MetalPresenter {
                 self.note_pending_flip_target_write(texture.descriptor.guest);
             }
         }
-        if let Some(directory) = std::env::var_os("REMU_DUMP_COMPUTE_TEXTURE_DIR")
-            && dump_msl_compute_filter_matches(dispatch.shader_address)
+        if let Some(buffer) = diagnostic_compute_trace.as_ref()
+            && diagnostic_target_after_mrt_ready()
+            && diagnostic_compute_state_trace_has_scene_input(evaluation)
             && diagnostic_compute_texture_dispatch_is_eligible(
                 dispatch.sequence,
                 diagnostic_dump_compute_texture_minimum_dispatch(),
             )
-            && textures.iter().any(|texture| {
-                texture.descriptor.guest.width >= 1_000 && texture.descriptor.guest.height >= 500
+            && diagnostic_compute_texture_extent().map_or(true, |(width, height)| {
+                textures.iter().any(|texture| {
+                    texture.descriptor.guest.width == width
+                        && texture.descriptor.guest.height == height
+                })
             })
             && {
+                static COMPUTE_STATE_TRACES: AtomicUsize = AtomicUsize::new(0);
+                COMPUTE_STATE_TRACES.fetch_add(1, Ordering::Relaxed) == 0
+            }
+        {
+            self.wait_for_guest_command_batches()?;
+            let directory = std::env::var_os("REMU_TRACE_COMPUTE_STATE_DIR")
+                .map_or_else(|| std::path::PathBuf::from("/private/tmp"), Into::into);
+            std::fs::create_dir_all(&directory)
+                .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
+            let path = directory.join(format!(
+                "compute-state-{}-cs-{:x}.bin",
+                dispatch.sequence, dispatch.shader_address
+            ));
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.contents().cast::<u8>(),
+                    DIAGNOSTIC_COMPUTE_TRACE_BYTES,
+                )
+            };
+            std::fs::write(&path, bytes)
+                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            let words = unsafe {
+                std::slice::from_raw_parts(
+                    buffer.contents().cast::<u32>(),
+                    DIAGNOSTIC_COMPUTE_TRACE_BYTES / size_of::<u32>(),
+                )
+            };
+            let checkpoints = (0..DIAGNOSTIC_COMPUTE_TRACE_CHECKPOINTS)
+                .map(|checkpoint| {
+                    let records = &words[checkpoint
+                        * DIAGNOSTIC_COMPUTE_TRACE_THREADS
+                        * DIAGNOSTIC_COMPUTE_TRACE_RECORD_DWORDS..];
+                    let present = (0..DIAGNOSTIC_COMPUTE_TRACE_THREADS)
+                        .filter(|&thread| {
+                            records[thread * DIAGNOSTIC_COMPUTE_TRACE_RECORD_DWORDS] != 0
+                        })
+                        .count();
+                    let active = (0..DIAGNOSTIC_COMPUTE_TRACE_THREADS)
+                        .filter(|&thread| {
+                            records[thread * DIAGNOSTIC_COMPUTE_TRACE_RECORD_DWORDS + 1] != 0
+                        })
+                        .count();
+                    let pc = records.first().copied().unwrap_or_default();
+                    (pc, present, active)
+                })
+                .collect::<Vec<_>>();
+            eprintln!(
+                "[REMu][METAL][COMPUTE-STATE-TRACE] seq={} cs={:#x} checkpoints={checkpoints:?} path={}",
+                dispatch.sequence,
+                dispatch.shader_address,
+                path.display(),
+            );
+        }
+        if let Some(directory) = std::env::var_os("REMU_DUMP_COMPUTE_TEXTURE_DIR")
+            && dump_msl_compute_filter_matches(dispatch.shader_address)
+            && diagnostic_target_after_mrt_ready()
+            && diagnostic_compute_state_trace_has_scene_input(evaluation)
+            && diagnostic_compute_texture_dispatch_is_eligible(
+                dispatch.sequence,
+                diagnostic_dump_compute_texture_minimum_dispatch(),
+            )
+            && diagnostic_compute_texture_extent().map_or_else(
+                || {
+                    textures.iter().any(|texture| {
+                        texture.descriptor.guest.width >= 1_000
+                            && texture.descriptor.guest.height >= 500
+                    })
+                },
+                |(width, height)| {
+                    textures.iter().any(|texture| {
+                        texture.descriptor.guest.width == width
+                            && texture.descriptor.guest.height == height
+                    })
+                },
+            )
+            && {
                 static MATCHING_COMPUTE_DUMPS: AtomicUsize = AtomicUsize::new(0);
-                MATCHING_COMPUTE_DUMPS.fetch_add(1, Ordering::Relaxed) == 0
+                MATCHING_COMPUTE_DUMPS.fetch_add(1, Ordering::Relaxed)
+                    < diagnostic_compute_texture_dump_limit()
             }
         {
             self.wait_for_guest_command_batches()?;
@@ -543,25 +738,66 @@ impl MetalPresenter {
                 .map_err(|error| format!("could not create {}: {error}", directory.display()))?;
             for (index, texture) in textures.iter().enumerate() {
                 let descriptor = texture.descriptor.guest;
-                let bytes = read_texture_linear(&device, &queue, &texture.texture, descriptor)
-                    .map_err(|error| {
-                        format!(
-                            "compute texture {index} at {:#x} readback: {error}",
-                            descriptor.address
-                        )
-                    })?;
+                let native_descriptor = diagnostic_compute_readback_descriptor(
+                    descriptor,
+                    texture.texture.pixel_format(),
+                );
+                let bytes = native_descriptor.and_then(|native_descriptor| {
+                    read_texture_linear(&device, &queue, &texture.texture, native_descriptor)
+                        .map(|bytes| (native_descriptor, bytes))
+                });
+                let (native_descriptor, bytes) = match bytes {
+                    Ok(result) => result,
+                    Err(error) => {
+                        eprintln!(
+                            "[REMu][METAL][COMPUTE-TEXTURE-DUMP] seq={} cs={:#x} index={index} address={:#x} guest_format={:?} native_format={:?} error={error}",
+                            dispatch.sequence,
+                            dispatch.shader_address,
+                            descriptor.address,
+                            descriptor.pixel_format,
+                            texture.texture.pixel_format(),
+                        );
+                        continue;
+                    }
+                };
                 let access = if texture.writable { "write" } else { "read" };
                 let path = directory.join(format!(
-                    "compute-{}-cs-{:x}-{access}-{index}-{:x}-{}x{}-{:?}.bin",
+                    "compute-{}-cs-{:x}-{access}-{index}-{:x}-{}x{}-{:?}-native-{:?}.bin",
                     dispatch.sequence,
                     dispatch.shader_address,
                     descriptor.address,
                     descriptor.width,
                     descriptor.height,
                     descriptor.pixel_format,
+                    native_descriptor.pixel_format,
                 ));
-                std::fs::write(&path, bytes)
-                    .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+                let nonzero_bytes = bytes.iter().filter(|&&byte| byte != 0).count();
+                let numeric = diagnostic_texture_numeric_range(&bytes, native_descriptor);
+                let (writer, overlapping_writers) = diagnostic_dump_input_writers
+                    .as_ref()
+                    .and_then(|writers| writers.get(index))
+                    .and_then(Option::as_ref)
+                    .cloned()
+                    .unwrap_or_default();
+                eprintln!(
+                    "[REMu][METAL][COMPUTE-TEXTURE-DUMP] seq={} cs={:#x} access={access} index={index} address={:#x} extent={}x{} guest_format={:?} native_format={:?} bytes={} nonzero={} numeric={numeric:?} writer={writer:?} overlapping_writers={overlapping_writers:?} path={}",
+                    dispatch.sequence,
+                    dispatch.shader_address,
+                    descriptor.address,
+                    descriptor.width,
+                    descriptor.height,
+                    descriptor.pixel_format,
+                    native_descriptor.pixel_format,
+                    bytes.len(),
+                    nonzero_bytes,
+                    path.display(),
+                );
+                if let Err(error) = std::fs::write(&path, bytes) {
+                    eprintln!(
+                        "[REMu][METAL][COMPUTE-TEXTURE-DUMP] could not write {}: {error}",
+                        path.display()
+                    );
+                }
             }
         }
         if let (Some(started), Some(encoding_started), Some(encoding_finished)) = (
@@ -593,7 +829,12 @@ impl MetalPresenter {
 
 #[cfg(test)]
 mod tests {
-    use super::storage_image_requires_exact_preacquire;
+    use super::{
+        diagnostic_compute_readback_descriptor, parse_diagnostic_compute_texture_extent,
+        storage_image_requires_exact_preacquire,
+    };
+    use crate::presenter::GuestTextureDescriptor;
+    use metal::MTLPixelFormat;
     use remu_shader::Opcode;
 
     #[test]
@@ -618,5 +859,33 @@ mod tests {
             Opcode::Known("ImageAtomicAdd"),
             true,
         ));
+    }
+
+    #[test]
+    fn compute_dump_reads_compatible_native_depth_storage_without_dropping_dispatch() {
+        let guest = GuestTextureDescriptor {
+            address: 0x1234,
+            width: 1920,
+            height: 1080,
+            pitch: 1920,
+            tile_mode: 24,
+            pixel_format: MTLPixelFormat::R32Float,
+            bytes_per_pixel: 4,
+        };
+        let native = diagnostic_compute_readback_descriptor(guest, MTLPixelFormat::Depth32Float)
+            .expect("R32 and Depth32 have the same exact readback layout");
+        assert_eq!(native.pixel_format, MTLPixelFormat::Depth32Float);
+        assert_eq!(native.bytes_per_pixel, guest.bytes_per_pixel);
+    }
+
+    #[test]
+    fn compute_dump_extent_filter_requires_two_positive_dimensions() {
+        assert_eq!(
+            parse_diagnostic_compute_texture_extent("1920x1080"),
+            Some((1920, 1080))
+        );
+        for invalid in ["", "1920", "1920X1080", "0x1080", "1920x0", "ax1080"] {
+            assert_eq!(parse_diagnostic_compute_texture_extent(invalid), None);
+        }
     }
 }

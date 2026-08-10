@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 mod fabricated_success;
-pub use fabricated_success::{
-    fabricated_success_counts, fabricated_success_total, note_inert,
-};
+pub use fabricated_success::{fabricated_success_counts, fabricated_success_total, note_inert};
 
 mod channel;
 pub use channel::clear_thread_local_event_sink;
@@ -82,8 +80,7 @@ pub use counters::{
 mod resource;
 pub use resource::{
     GpuAdapter, GpuColorTarget, GpuHostImage, GpuProbe, GpuProbeError, GpuRegister,
-    agc_color_attrib2_extent,
-    GpuScanoutTarget, GraphicsApi, IndexedDraw, ShaderSnapshot,
+    GpuScanoutTarget, GraphicsApi, IndexedDraw, ShaderSnapshot, agc_color_attrib2_extent,
 };
 
 mod dialog;

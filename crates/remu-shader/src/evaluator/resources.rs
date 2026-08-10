@@ -646,8 +646,8 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 let sequence =
                     LOGGED_REGULAR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if sequence <= 16 || sequence.is_power_of_two() {
-                    let words =
-                        buffer_descriptor_words(registers, control.scalar_resource).unwrap_or_default();
+                    let words = buffer_descriptor_words(registers, control.scalar_resource)
+                        .unwrap_or_default();
                     eprintln!(
                         "[REMu][SHADER][MESH-V#] sequence={sequence} pc={:#x} \
                          unpatched RegularBuffer-style V# words={words:08x?} base={:#x} \

@@ -196,7 +196,6 @@ pub(crate) fn decode_agc_dma_data(
     }))
 }
 
-
 pub(crate) fn decode_agc_memory_acquire(packet_address: u64) -> remu_gpu::GpuMemoryAcquire {
     let coher_control = read_guest_u32(packet_address + 4);
     let size_units = u64::from(read_guest_u32(packet_address + 8))
@@ -271,7 +270,6 @@ pub(super) fn decode_agc_memory_release(
     })
     .filter(|_| address != 0)
 }
-
 
 pub(crate) fn decode_agc_memory_wait(
     packet_address: u64,

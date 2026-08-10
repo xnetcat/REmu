@@ -134,6 +134,10 @@ pub struct NggRegisters {
     pub gs_max_vert_out: u32,
     /// `GE_MAX_OUTPUT_PER_SUBGROUP`: the per-subgroup output-vertex cap after amplification.
     pub ge_max_output_per_subgroup: u32,
+    /// `VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_EN`: selects the packed-primitive VGPR0 ABI.
+    /// When false, GFX10 supplies three packed 16-bit vertex offsets in VGPR0/VGPR1 and the
+    /// primitive ID in VGPR2 instead.
+    pub primgen_passthrough: bool,
 }
 
 impl NggRegisters {
@@ -151,12 +155,13 @@ impl NggRegisters {
     /// Guest LDS reservation in bytes for one NGG threadgroup, from `PGM_RSRC2.LDS_SIZE`.
     ///
     /// SDK `ShShaderResource2Gs::getLdsSize()` (registerstructs.h:12154-12157):
-    /// `((m_regs[0].m_value & 0x07f80000u) >> 12)`. The 8-bit field in bits `[26:19]` is already
-    /// scaled by the getter into a byte count with a 128-byte granule (field `1` → 128 bytes;
-    /// field `0x80` → 16 KiB; field `0xff` → 32640).
+    /// `((m_regs[0].m_value & 0x07f80000u) >> 12)`. That getter returns a dword count: the
+    /// 8-bit field in bits `[26:19]` is scaled by the GFX10 allocation granule of 128 dwords.
+    /// Convert those dwords to bytes before sizing Metal threadgroup memory (field `1` → 512
+    /// bytes; field `0x40` → 32 KiB).
     #[must_use]
     pub const fn lds_size_bytes(self) -> u32 {
-        (self.pgm_rsrc2 & 0x07f8_0000) >> 12
+        ((self.pgm_rsrc2 & 0x07f8_0000) >> 12) * 4
     }
 
     /// Maximum geometry output vertices, from `VGT_GS_MAX_VERT_OUT`.
@@ -189,11 +194,14 @@ pub struct MetalCompileOptions {
     /// vector or either clip/cull-distance vector depending on this register. Keeping the raw
     /// value in the compile options makes that mapping part of the generated Metal interface.
     pub vertex_output_control: u32,
-    /// When set, `PA_CL_VTE_CNTL.VTX_W0_FMT` forces clip-space W to 1.0 after position export.
+    /// Raw `PA_CL_VTE_CNTL` state used to convert the guest position export into Metal clip
+    /// coordinates.
     ///
-    /// UE fullscreen NGG covers often store XY in a float4 vertex buffer with W=0. On Gen5 the
-    /// VTE bit replaces that W with 1.0 before clipping; without it Metal rejects the triangle.
-    pub force_position_w1: bool,
+    /// `VTX_W0_FMT` says whether the exported W is W0 (set) or 1/W0 (clear); it does not force
+    /// W to one. `VTX_XY_FMT` and `VTX_Z_FMT` say whether those components were already
+    /// multiplied by 1/W0. Metal always performs the perspective divide itself, so translated
+    /// shaders must undo only the guest's pre-divided components and preserve the real W0.
+    pub viewport_transform_control: u32,
     /// Number of active color/depth target layers. A guest misc position export selects the
     /// layer; procedural volume draws fall back to their instance index.
     pub render_target_array_length: u32,
@@ -228,6 +236,8 @@ pub struct MetalCompileOptions {
     /// Total Metal threads used to execute one NGG subgroup. Guest wave32 numbering is derived
     /// from this value, so a 96-thread subgroup executes three architectural waves.
     pub mesh_threadgroup_size: u32,
+    /// Whether GFX10 primitive generation uses its packed passthrough input-VGPR ABI.
+    pub ngg_primgen_passthrough: bool,
     /// Bytes of guest LDS allocated to each compute workgroup.
     ///
     /// A non-zero, dword-aligned value is required only when the program contains an LDS memory
@@ -236,6 +246,13 @@ pub struct MetalCompileOptions {
     /// guest allocations are rejected instead of being silently wrapped or spilled with different
     /// synchronization semantics.
     pub lds_size_bytes: u32,
+    /// Total threads in one compute workgroup.
+    ///
+    /// A wave64 compute workgroup containing at most one architectural wave can use Metal's
+    /// whole-threadgroup barrier to make LDS writes visible between its two SIMD32 halves. Larger
+    /// workgroups cannot use that lowering at wave-local reconvergence points because independent
+    /// guest waves may reach them at different times. Non-compute stages leave this at zero.
+    pub compute_threadgroup_size: u32,
     /// Lane-private scratch allocation in bytes for one shader invocation.
     ///
     /// Compute callers derive this from `COMPUTE_TMPRING_SIZE.WAVESIZE`; graphics callers from
@@ -271,7 +288,8 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Vertex,
             required_vertex_output_count,
             vertex_output_control: 0,
-            force_position_w1: false,
+            // Canonical clip-space position: X/Y/Z are not pre-divided and W contains W0.
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -287,7 +305,9 @@ impl MetalCompileOptions {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes: 0,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -305,7 +325,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Pixel,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs,
             pixel_depth_export: false,
@@ -321,7 +341,9 @@ impl MetalCompileOptions {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes: 0,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -335,7 +357,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -351,7 +373,9 @@ impl MetalCompileOptions {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -365,7 +389,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Compute,
             required_vertex_output_count: 0,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -381,7 +405,9 @@ impl MetalCompileOptions {
             mesh_max_vertex_count: 0,
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
+            ngg_primgen_passthrough: false,
             lds_size_bytes,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -409,7 +435,7 @@ impl MetalCompileOptions {
             stage: MetalShaderStage::Mesh,
             required_vertex_output_count,
             vertex_output_control: 0,
-            force_position_w1: false,
+            viewport_transform_control: 1 << 10,
             render_target_array_length: 1,
             pixel_outputs: Vec::new(),
             pixel_depth_export: false,
@@ -425,7 +451,9 @@ impl MetalCompileOptions {
             mesh_max_vertex_count,
             mesh_max_primitive_count,
             mesh_threadgroup_size,
+            ngg_primgen_passthrough: false,
             lds_size_bytes,
+            compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
@@ -465,6 +493,7 @@ impl MetalCompileOptions {
         Self {
             allocated_vector_register_count,
             ngg_registers_proven: true,
+            ngg_primgen_passthrough: registers.primgen_passthrough,
             ..Self::mesh(
                 required_vertex_output_count,
                 registers.lds_size_bytes(),
@@ -544,81 +573,6 @@ pub fn compile_msl(
     options: &MetalCompileOptions,
 ) -> Result<MetalShader, MetalCompileError> {
     Compiler::new(program, evaluation, options)?.compile()
-}
-
-/// Builds the fixed-function equivalent of the common fused ES/GS rectangle expansion used for
-/// layered volume generation. Prospero runs the export half through LDS and transfers to a
-/// geometry half with `S_SETPC`; Metal has neither graphics-stage LDS nor geometry shaders, so the
-/// equivalent four-vertex strip is emitted directly and each instance is routed to one layer.
-/// Metal's render-target rows run opposite to the guest rectangle's interpolated Y coordinate,
-/// so the synthesized parameter reverses Y while preserving the strip's position and winding.
-#[must_use]
-pub fn compile_layered_rectangle_vertex(
-    interpolated_attribute_count: u32,
-    render_target_array_length: u32,
-) -> MetalShader {
-    assert!(render_target_array_length > 1);
-    let mut source = String::from(
-        "#include <metal_stdlib>\nusing namespace metal;\n\n\
-         struct RemuVsOut {\n\
-         \x20   float4 position [[position]];\n\
-         \x20   uint render_target_array_index [[render_target_array_index]];\n",
-    );
-    for location in 0..interpolated_attribute_count {
-        let _ = writeln!(
-            source,
-            "    float4 param{location} [[user(locn{location})]];"
-        );
-    }
-    source.push_str(
-        "};\n\n\
-         vertex RemuVsOut remu_main(\n\
-         \x20   uint remu_vertex_id [[vertex_id]],\n\
-         \x20   uint remu_instance_id [[instance_id]]\n\
-         ) {\n\
-         \x20   RemuVsOut remu_out = {};\n\
-         \x20   uint remu_corner = remu_vertex_id & 3u;\n\
-         \x20   float2 remu_uv = float2(float(remu_corner & 1u), float((remu_corner >> 1u) & 1u));\n\
-         \x20   remu_out.position = float4(remu_uv * 2.0f - 1.0f, 0.5f, 1.0f);\n",
-    );
-    let _ = writeln!(
-        source,
-        "    remu_out.render_target_array_index = min(remu_instance_id, {}u);",
-        render_target_array_length - 1
-    );
-    let _ = writeln!(
-        source,
-        "    float remu_layer = (float(remu_instance_id) + 0.5f) / {}.0f;",
-        render_target_array_length
-    );
-    for location in 0..interpolated_attribute_count {
-        let _ = writeln!(
-            source,
-            "    remu_out.param{location} = float4(remu_uv.x, 1.0f - remu_uv.y, remu_layer, 1.0f);"
-        );
-    }
-    source.push_str("    return remu_out;\n}\n");
-    MetalShader {
-        source,
-        entry_point: "remu_main".to_owned(),
-        stage: MetalShaderStage::Vertex,
-        bindings: MetalBindingLayout {
-            global_buffer_count: 0,
-            global_argument_buffer_index: None,
-            initial_scalar_buffer_index: 0,
-            sampler_argument_buffer_index: None,
-            texture_count: 0,
-            sampler_count: 0,
-            threadgroup_memory_bytes: 0,
-        },
-        vertex_inputs: Vec::new(),
-        interpolated_attribute_count,
-        register_footprint: MetalRegisterFootprint {
-            scalar_values: 0,
-            vector_values: 0,
-            direct_control_flow: true,
-        },
-    }
 }
 
 /// Builds the fixed-function equivalent of a procedural Gen5 rectangle export stage.

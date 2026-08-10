@@ -566,9 +566,8 @@ impl GuestPhysicalBacking {
         let mut value = None;
         if !self.with_write_pointer_at(offset, 4, |pointer| {
             // SAFETY: the window covers four aligned bytes of this live backing mapping.
-            value = Some(unsafe {
-                AtomicU32::from_ptr(pointer.cast::<u32>()).load(Ordering::Acquire)
-            });
+            value =
+                Some(unsafe { AtomicU32::from_ptr(pointer.cast::<u32>()).load(Ordering::Acquire) });
         }) {
             return None;
         }
@@ -583,9 +582,8 @@ impl GuestPhysicalBacking {
         let mut value = None;
         if !self.with_write_pointer_at(offset, 8, |pointer| {
             // SAFETY: the window covers eight aligned bytes of this live backing mapping.
-            value = Some(unsafe {
-                AtomicU64::from_ptr(pointer.cast::<u64>()).load(Ordering::Acquire)
-            });
+            value =
+                Some(unsafe { AtomicU64::from_ptr(pointer.cast::<u64>()).load(Ordering::Acquire) });
         }) {
             return None;
         }
@@ -649,7 +647,10 @@ impl GuestPhysicalBacking {
         &self,
         offset: u64,
         byte_count: usize,
-    ) -> Option<(u64 /* aligned_offset */, usize /* mapping_length */)> {
+    ) -> Option<(
+        u64,   /* aligned_offset */
+        usize, /* mapping_length */
+    )> {
         let end = offset.checked_add(u64::try_from(byte_count).ok()?)?;
         if byte_count == 0 || end > self.size() {
             return None;

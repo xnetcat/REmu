@@ -77,13 +77,17 @@ impl TlsStoreScanPlan {
     }
 
     fn slot_capacity(&self) -> Result<u64, LinkError> {
-        self.images.iter().try_fold(0_u64, |count, image| {
-            count
-                .checked_add(u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?)
-                .ok_or(LinkError::AddressOverflow)
-        })?
-        .checked_add(PER_SITE_FS_HELPER_CUSHION)
-        .ok_or(LinkError::AddressOverflow)
+        self.images
+            .iter()
+            .try_fold(0_u64, |count, image| {
+                count
+                    .checked_add(
+                        u64::try_from(image.len()).map_err(|_| LinkError::AddressOverflow)?,
+                    )
+                    .ok_or(LinkError::AddressOverflow)
+            })?
+            .checked_add(PER_SITE_FS_HELPER_CUSHION)
+            .ok_or(LinkError::AddressOverflow)
     }
 }
 
@@ -510,13 +514,7 @@ fn write_destination_slot(slot: &mut [u8], mut cursor: usize, destination: u8) -
         return cursor;
     };
     let saved_offset = (TLS_HELPER_SAVED_REGISTERS.len() - 1 - saved_index) * 8;
-    slot[cursor..cursor + 5].copy_from_slice(&[
-        0x48,
-        0x89,
-        0x44,
-        0x24,
-        saved_offset as u8,
-    ]);
+    slot[cursor..cursor + 5].copy_from_slice(&[0x48, 0x89, 0x44, 0x24, saved_offset as u8]);
     cursor += 5;
     cursor
 }
@@ -1020,7 +1018,10 @@ mod tests {
             "load helper must preserve vector/flags and undo its own red-zone skip: {mnemonics:?}"
         );
         // Plain ret after `add rsp,128` — not `ret 128` (that contract is site-side lea only).
-        assert_eq!(&slot[encoded - 8..encoded], &[0x48, 0x81, 0xc4, 0x80, 0, 0, 0, 0xc3]);
+        assert_eq!(
+            &slot[encoded - 8..encoded],
+            &[0x48, 0x81, 0xc4, 0x80, 0, 0, 0, 0xc3]
+        );
     }
 
     #[test]
