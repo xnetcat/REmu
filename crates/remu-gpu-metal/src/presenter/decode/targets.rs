@@ -50,8 +50,8 @@ pub(crate) fn decode_render_target_format(
         (5, 4, 0) => (MTLPixelFormat::RG16Uint, 4),
         (5, 5, 0) => (MTLPixelFormat::RG16Sint, 4),
         (5, 7, 0) => (MTLPixelFormat::RG16Float, 4),
-        // Metal's RG11B10Float is bit-compatible only with AMD 10_11_11_FLOAT. The reversed
-        // 11_11_10 layout requires repacking and an R/B selector remap; treating it as the same
+        // Metal's RG11B10Float is bit-compatible only with AMD 11_11_10_FLOAT. The reversed
+        // 10_11_11 layout requires repacking and an R/B selector remap; treating it as the same
         // attachment silently exchanges both component widths and positions.
         (6, 7, 0) => (MTLPixelFormat::RG11B10Float, 4),
         // Gen5 2_10_10_10 places a 2-bit red component in the low bits and cannot be represented
@@ -639,12 +639,25 @@ fn metal_compare_function(value: u32) -> MTLCompareFunction {
     }
 }
 
-fn metal_stencil_operation(value: u32, field: &str) -> Result<MTLStencilOperation, String> {
+fn metal_stencil_operation(
+    value: u32,
+    field: &str,
+    test_value: u32,
+    operation_value: u32,
+) -> Result<MTLStencilOperation, String> {
     // SDK CxStencilOpControl ops. Metal covers Keep/Zero/Replace/Inc/Dec/Invert only.
     match value & 0xf {
         0 => Ok(MTLStencilOperation::Keep),
         1 => Ok(MTLStencilOperation::Zero),
-        3 | 4 => Ok(MTLStencilOperation::Replace),
+        3 => Ok(MTLStencilOperation::Replace),
+        // AMD distinguishes REPLACE_TEST (the comparison reference) from REPLACE_OP (the
+        // independent STENCILOPVAL in bits 31:24). Metal has one reference value for both the
+        // comparison and Replace operation, so the latter is exact only when both guest values
+        // agree. Silently using STENCILTESTVAL here can corrupt later stencil-masked geometry.
+        4 if test_value == operation_value => Ok(MTLStencilOperation::Replace),
+        4 => Err(format!(
+            "stencil {field} REPLACE_OP value {operation_value:#x} differs from comparison value {test_value:#x} and has no exact Metal state"
+        )),
         5 => Ok(MTLStencilOperation::IncrementClamp),
         6 => Ok(MTLStencilOperation::DecrementClamp),
         7 => Ok(MTLStencilOperation::Invert),
@@ -661,25 +674,64 @@ fn decode_stencil_state(
     control: u32,
 ) -> Result<DecodedStencilState, String> {
     let enabled = control & 1 != 0;
+    if !enabled {
+        // Disabled stencil state is architecturally inert. Stale operation nibbles must not
+        // reject an otherwise valid depth draw merely because Metal cannot represent them.
+        return Ok(DecodedStencilState::default());
+    }
     let separate_back = control & 0x80 != 0;
     let op_control = register_value(context_registers, DB_STENCIL_CONTROL).unwrap_or(0);
     let front_ref_mask = register_value(context_registers, DB_STENCILREFMASK).unwrap_or(0);
     let back_ref_mask =
         register_value(context_registers, DB_STENCILREFMASK_BF).unwrap_or(front_ref_mask);
+    let front_test_value = front_ref_mask & 0xff;
+    let front_operation_value = (front_ref_mask >> 24) & 0xff;
     let front = DecodedStencilFace {
         compare: metal_compare_function((control >> 8) & 0x7),
-        stencil_fail: metal_stencil_operation(op_control, "fail")?,
-        depth_pass: metal_stencil_operation(op_control >> 4, "zpass")?,
-        depth_fail: metal_stencil_operation(op_control >> 8, "zfail")?,
+        stencil_fail: metal_stencil_operation(
+            op_control,
+            "fail",
+            front_test_value,
+            front_operation_value,
+        )?,
+        depth_pass: metal_stencil_operation(
+            op_control >> 4,
+            "zpass",
+            front_test_value,
+            front_operation_value,
+        )?,
+        depth_fail: metal_stencil_operation(
+            op_control >> 8,
+            "zfail",
+            front_test_value,
+            front_operation_value,
+        )?,
         read_mask: (front_ref_mask >> 8) & 0xff,
         write_mask: (front_ref_mask >> 16) & 0xff,
     };
     let back = if separate_back {
+        let back_test_value = back_ref_mask & 0xff;
+        let back_operation_value = (back_ref_mask >> 24) & 0xff;
         DecodedStencilFace {
             compare: metal_compare_function((control >> 20) & 0x7),
-            stencil_fail: metal_stencil_operation(op_control >> 12, "fail-back")?,
-            depth_pass: metal_stencil_operation(op_control >> 16, "zpass-back")?,
-            depth_fail: metal_stencil_operation(op_control >> 20, "zfail-back")?,
+            stencil_fail: metal_stencil_operation(
+                op_control >> 12,
+                "fail-back",
+                back_test_value,
+                back_operation_value,
+            )?,
+            depth_pass: metal_stencil_operation(
+                op_control >> 16,
+                "zpass-back",
+                back_test_value,
+                back_operation_value,
+            )?,
+            depth_fail: metal_stencil_operation(
+                op_control >> 20,
+                "zfail-back",
+                back_test_value,
+                back_operation_value,
+            )?,
             read_mask: (back_ref_mask >> 8) & 0xff,
             write_mask: (back_ref_mask >> 16) & 0xff,
         }
@@ -691,7 +743,7 @@ fn decode_stencil_state(
         separate_back,
         front,
         back,
-        front_reference: front_ref_mask & 0xff,
+        front_reference: front_test_value,
         back_reference: back_ref_mask & 0xff,
     })
 }

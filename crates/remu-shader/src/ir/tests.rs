@@ -206,6 +206,56 @@ fn branched_programs_keep_conservative_shader_inputs() {
 }
 
 #[test]
+fn s_addk_i32_condition_liveness_reads_its_old_destination_and_kills_old_scc() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopk,
+                opcode: Opcode::from_static("SAddkI32"),
+                words: vec![0xb784_0001],
+                sources: vec![Operand {
+                    kind: OperandKind::EncodedConstant,
+                    value: 1,
+                }],
+                destinations: vec![Operand::scalar(4)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::from_static("SCbranchScc1"),
+                words: vec![0xbf85_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+
+    assert!(
+        program
+            .evaluation_live_scalar_register_indices(0)
+            .contains(&4),
+        "the old destination value determines the new SCC"
+    );
+    assert!(
+        !program.evaluation_live_scalar_condition(0),
+        "S_ADDK_I32 overwrites rather than reads the old SCC"
+    );
+}
+
+#[test]
 fn links_setpc_to_a_separately_allocated_lower_address() {
     let front = Program::new(
         0x0080_7b55_0000,

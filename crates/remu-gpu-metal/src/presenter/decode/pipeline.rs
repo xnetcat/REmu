@@ -9,8 +9,8 @@ use super::{
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
     GraphicsWaveState, MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits,
     PA_CL_VS_OUT_CNTL, PA_CL_VTE_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
-    RenderTargetPipelineState, SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_GS_INSTANCE_CNT,
-    VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
+    RenderTargetPipelineState, SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_ESGS_RING_ITEMSIZE,
+    VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
     diagnostic_capture_pixel_output, diagnostic_capture_vertex_position, diagnostic_dump_gbuffer,
     diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer, diagnostic_dump_target_address,
@@ -413,9 +413,42 @@ pub(crate) fn decode_ngg_subgroup_limits_with_uc(
         let verts = ge_vert_group.max(1);
         verts | (prims << 11) | (prims << 22)
     });
-    let max_vert_out = max_vert_out.unwrap_or(ge_vert_group.max(1));
-    let max_output = max_output.unwrap_or(ge_vert_group.max(1));
-    let subgroup_control = subgroup_control.unwrap_or(ge_vert_group.max(1));
+    // UcGeCntl contains *input* primitive/vertex group sizes only. It cannot stand in for either
+    // the API-GS output count or GE_NGG_SUBGRP_CNTL.PRIM_AMP_FACTOR. With no API GS, NGG has an
+    // exact amplification factor of one. With a GS, hardware derives PRIM_AMP_FACTOR from
+    // VGT_GS_MAX_VERT_OUT, so that Cx register must be present rather than inventing a value from
+    // VERT_GRP_SIZE.
+    let max_vert_out = if gs_enabled {
+        max_vert_out.ok_or_else(|| {
+            "GS-enabled UcGeCntl fallback is missing VGT_GS_MAX_VERT_OUT; input VERT_GRP_SIZE cannot prove primitive amplification"
+                .to_owned()
+        })?
+    } else {
+        // VGT_GS_MAX_VERT_OUT is inactive without an API GS. Ignore a stale/default Cx value;
+        // carrying it into the common validator can incorrectly cap passthrough output.
+        0
+    };
+    let derived_primitive_amplification = if gs_enabled {
+        let vertices = max_vert_out & 0x7ff;
+        if vertices == 0 || vertices > 0x1ff {
+            return Err(format!(
+                "GS-enabled VGT_GS_MAX_VERT_OUT={vertices} cannot encode GE_NGG_SUBGRP_CNTL.PRIM_AMP_FACTOR"
+            ));
+        }
+        vertices
+    } else {
+        1
+    };
+    let subgroup_control = subgroup_control.unwrap_or(derived_primitive_amplification);
+    let max_output = max_output.unwrap_or_else(|| {
+        if gs_enabled {
+            ge_prim_group
+                .max(1)
+                .saturating_mul(derived_primitive_amplification)
+        } else {
+            ge_vert_group.max(1)
+        }
+    });
     if subgroup_control >> 9 != 0 {
         return Err(format!(
             "non-zero GE_NGG_SUBGRP_CNTL.THDS_PER_SUBGRP is not represented: {subgroup_control:#010x}"
@@ -522,6 +555,8 @@ pub(crate) fn decode_ngg_registers_from_state(
         .ok_or("NGG state is missing VGT_GS_MAX_VERT_OUT")?;
     let ge_max_output_per_subgroup = register_value(context_registers, GE_MAX_OUTPUT_PER_SUBGROUP)
         .ok_or("NGG state is missing GE_MAX_OUTPUT_PER_SUBGROUP")?;
+    let esgs_ring_itemsize =
+        register_value(context_registers, VGT_ESGS_RING_ITEMSIZE).unwrap_or_default();
     let primgen_passthrough = register_value(context_registers, CX_VGT_SHADER_STAGES_EN)
         .is_some_and(|stages| stages & 0x0200_0000 != 0);
     Ok(remu_shader_metal::NggRegisters {
@@ -529,6 +564,7 @@ pub(crate) fn decode_ngg_registers_from_state(
         pgm_rsrc2,
         gs_max_vert_out,
         ge_max_output_per_subgroup,
+        esgs_ring_itemsize,
         primgen_passthrough,
     })
 }

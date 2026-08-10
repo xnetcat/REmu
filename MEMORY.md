@@ -42,10 +42,13 @@ registers/packets that state intent.
   `803b680`; all 32 native planes are exactly `[0,0,0,1]`. Its immediately preceding
   `800aed`/`800d700` writer allocated 2,176 bytes of LDS for a 2,176-dword (8,704-byte) request;
   accesses through byte `0x1d20` were guarded out and mesh positions stayed zero.
-- **Remaining:** stabilize the general NGG corrections offline (LDS units, unsigned SOPK,
-  per-wave counts, linked GS VGPR ABI). Focused dirty-tree tests pass, but this is not clean live
-  compatibility evidence. EyeAdapt/remu_s31 is no longer the first blocker. No game/address
-  heuristic.
+- **Offline architecture audit:** the dirty tree now also fixes passthrough PrimitiveID `v2`,
+  no-GS primitive amplification (`1`, never `UcGeCntl.VERT_GRP_SIZE`), dynamic
+  `VGT_ESGS_RING_ITEMSIZE`, exact helper+LDS memory accounting, the GFX10 SOPK/bitreplicate tables,
+  and `S_ADDK_I32` SCC. Focused tests pass. Remaining proven gaps include split-wave64 masks,
+  barriers/LDS ordering, GS instancing, array base layers, layered target views, and writable
+  D3/array authority. No game was run; this is not live compatibility evidence.
+- Architecture audit: `docs/notes/gpu-3d-architecture-audit-20260810.md`.
 - Handoff: `docs/notes/sh-present-20260806-handoff/README.md`.
 - **Anti-claim:** 2D hallway/title UI, an early zero-HDR composite, different rotating EyeAdapt
   VAs, or a dirty-tree diagnostic ≠ title-background 3D closure or clean compatibility evidence.

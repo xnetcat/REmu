@@ -148,6 +148,9 @@ pub(super) const GE_MAX_OUTPUT_PER_SUBGROUP: u32 = 0x1ff;
 /// GFX10 `VGT_GS_ONCHIP_CNTL`.
 pub(super) const VGT_GS_ONCHIP_CNTL: u32 = 0x291;
 
+/// GFX10 `VGT_ESGS_RING_ITEMSIZE` (Cx 0x2ab), in dwords per ES vertex.
+pub(super) const VGT_ESGS_RING_ITEMSIZE: u32 = 0x2ab;
+
 /// GFX10 `VGT_GS_OUT_PRIM_TYPE`.
 pub(super) const VGT_GS_OUT_PRIM_TYPE: u32 = 0x29b;
 
@@ -224,9 +227,7 @@ pub(super) fn decode_scissor(
     target_height: u32,
 ) -> Result<GuestScissor, String> {
     let mut bounds = [0_i64, 0, i64::from(target_width), i64::from(target_height)];
-    let window_scissor_tl = register_value(&draw.context_registers, 0x081);
-    let enable_window_offset = window_scissor_tl.is_none_or(|value| value & 0x8000_0000 == 0);
-    let (window_offset_x, window_offset_y) = if enable_window_offset {
+    let (window_offset_x, window_offset_y) =
         register_value(&draw.context_registers, 0x080).map_or((0_i64, 0_i64), |value| {
             (
                 i64::from(i16::from_ne_bytes(
@@ -240,11 +241,8 @@ pub(super) fn decode_scissor(
                         .to_ne_bytes(),
                 )),
             )
-        })
-    } else {
-        (0, 0)
-    };
-    intersect_scissor_pair(draw, 0x00c, 0x00d, 0, 0, true, &mut bounds);
+        });
+    intersect_screen_scissor_pair(draw, 0x00c, 0x00d, &mut bounds);
     intersect_scissor_pair(
         draw,
         0x081,
@@ -286,6 +284,46 @@ pub(super) fn decode_scissor(
     }))
 }
 
+/// Intersects `PA_SC_SCREEN_SCISSOR_TL/BR` with the active bounds.
+///
+/// Unlike the window, generic, and viewport scissors, the screen-scissor coordinates are signed
+/// 16-bit fields. AMD specifies that negative coordinates clamp to zero. Preserve the sign here
+/// and let [`decode_scissor`] perform that final framebuffer clamp; masking bit 15 off turns `-1`
+/// into `32767` and can incorrectly suppress the whole draw.
+fn intersect_screen_scissor_pair(
+    draw: &IndexedDraw,
+    top_left_register: u32,
+    bottom_right_register: u32,
+    bounds: &mut [i64; 4],
+) {
+    let (Some(top_left), Some(bottom_right)) = (
+        register_value(&draw.context_registers, top_left_register),
+        register_value(&draw.context_registers, bottom_right_register),
+    ) else {
+        return;
+    };
+    if top_left == 0 && bottom_right == 0 {
+        return;
+    }
+    let signed_component = |value: u32| {
+        i64::from(i16::from_ne_bytes(
+            u16::try_from(value & 0xffff)
+                .expect("masked screen-scissor component fits u16")
+                .to_ne_bytes(),
+        ))
+    };
+    let pair = [
+        signed_component(top_left),
+        signed_component(top_left >> 16),
+        signed_component(bottom_right),
+        signed_component(bottom_right >> 16),
+    ];
+    bounds[0] = bounds[0].max(pair[0]);
+    bounds[1] = bounds[1].max(pair[1]);
+    bounds[2] = bounds[2].min(pair[2]);
+    bounds[3] = bounds[3].min(pair[3]);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn intersect_scissor_pair(
     draw: &IndexedDraw,
@@ -305,6 +343,13 @@ pub(super) fn intersect_scissor_pair(
     if ignore_all_zero && top_left == 0 && bottom_right == 0 {
         return;
     }
+    // Window, generic, and viewport scissors each carry their own WINDOW_OFFSET_DISABLE bit.
+    // One scissor's flag cannot govern the other two.
+    let (offset_x, offset_y) = if top_left & 0x8000_0000 == 0 {
+        (offset_x, offset_y)
+    } else {
+        (0, 0)
+    };
     let pair = [
         i64::from(top_left & 0x7fff) + offset_x,
         i64::from((top_left >> 16) & 0x7fff) + offset_y,

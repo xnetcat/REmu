@@ -184,6 +184,49 @@ impl Compiler<'_> {
             .count()
     }
 
+    /// Threadgroup storage emitted independently of the per-site `V_READFIRSTLANE` records.
+    ///
+    /// Metal applies one memory limit to guest LDS and every compiler-generated helper array.
+    /// Keeping this accounting beside the declarations prevents a valid 32-KiB guest allocation
+    /// from being combined with layer or split-wave state into an invalid pipeline.
+    fn threadgroup_memory_base_bytes(&self) -> Option<usize> {
+        let guest_lds_bytes = if self.uses_lds_memory() {
+            usize::try_from(self.options.lds_size_bytes).ok()?
+        } else {
+            0
+        };
+        let mesh_layer_bytes = if self.options.stage == MetalShaderStage::Mesh
+            && self.options.render_target_array_length > 1
+        {
+            usize::try_from(self.options.mesh_max_vertex_count)
+                .ok()?
+                .checked_add(usize::try_from(self.options.mesh_max_primitive_count).ok()?)?
+                .checked_mul(size_of::<u32>())?
+        } else {
+            0
+        };
+        let split_pair_bytes = if self.needs_split_wave64_pair_rendezvous() {
+            SPLIT_WAVE64_PAIR_STATE_BYTES
+        } else {
+            0
+        };
+        let readlane_bytes = if self.split_wave64()
+            && self
+                .program
+                .instructions
+                .iter()
+                .any(|instruction| instruction.opcode.is("VReadlaneB32"))
+        {
+            MAX_METAL_THREADGROUP_THREADS * size_of::<u32>()
+        } else {
+            0
+        };
+        guest_lds_bytes
+            .checked_add(mesh_layer_bytes)?
+            .checked_add(split_pair_bytes)?
+            .checked_add(readlane_bytes)
+    }
+
     /// Returns the number of half-wave exchange records when every static `V_READFIRSTLANE` owns
     /// disjoint storage.
     ///
@@ -199,30 +242,25 @@ impl Compiler<'_> {
         let site_count = self.readfirstlane_site_count();
         let slot_count = site_count.checked_mul(SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP)?;
         let readfirstlane_bytes = slot_count.checked_mul(2 * size_of::<u32>())?;
-        let readlane_bytes = if self
-            .program
-            .instructions
-            .iter()
-            .any(|instruction| instruction.opcode.is("VReadlaneB32"))
-        {
-            MAX_METAL_THREADGROUP_THREADS * size_of::<u32>()
-        } else {
-            0
-        };
-        let mesh_layer_bytes = if self.options.stage == MetalShaderStage::Mesh
-            && self.options.render_target_array_length > 1
-        {
-            64 * size_of::<u32>()
-        } else {
-            0
-        };
-        let total_bytes = usize::try_from(self.options.lds_size_bytes)
-            .ok()?
-            .checked_add(readfirstlane_bytes)?
-            .checked_add(readlane_bytes)?
-            .checked_add(mesh_layer_bytes)?;
+        let total_bytes = self
+            .threadgroup_memory_base_bytes()?
+            .checked_add(readfirstlane_bytes)?;
         (site_count != 0 && total_bytes <= METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
             .then_some(slot_count)
+    }
+
+    fn total_threadgroup_memory_bytes(&self) -> Option<usize> {
+        let mut total = self.threadgroup_memory_base_bytes()?;
+        if self.split_wave64() && self.readfirstlane_site_count() != 0 {
+            let slots = self
+                .disjoint_readfirstlane_slot_count()
+                // The cyclic/memory-limited fallback declaration reserves one record for every
+                // possible SIMD32 half in a 1,024-thread Metal group, not merely one guest-wave
+                // pair. Keep validation identical to the emitted arrays.
+                .unwrap_or(MAX_METAL_THREADGROUP_THREADS / 32);
+            total = total.checked_add(slots.checked_mul(2 * size_of::<u32>())?)?;
+        }
+        Some(total)
     }
 
     fn disjoint_readfirstlane_site_base(&self, pc: u32) -> Option<usize> {

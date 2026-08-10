@@ -1,6 +1,6 @@
 # Silent Hill present / UI / 3D — compositor investigation (updated 2026-08-10)
 
-**Tip:** `main` @ `0f98ab68` plus uncommitted diagnostics. The title UI is assessable, but its
+**Tip:** `main` @ `9f303f98` plus the uncommitted 2026-08-10 architecture-audit changes. The title UI is assessable, but its
 3D background is black. The content-warning hallway is 2D and is not a 3D checkpoint.
 Silent Hill 2 is an Unreal Engine 5 title, not Unity; the run overlay also contains
 `ps5engine.ini` and `ue4commandline.txt`. Treat it as a renderer test case, not proof of a
@@ -28,14 +28,21 @@ Unity-specific shared failure. See the [official PlayStation/Bloober announcemen
   so the LUT retained its opaque-black clear value.
 - The factor-of-four fix is architectural: SDK `ShShaderResource2Gs::getLdsSize()` returns a dword
   count, and AMD documents shader LDS allocation granularity in dwords. The current dirty tree also
-  corrects three downstream NGG issues exposed after restoring the payload: unsigned SOPK immediate
-  zero-extension, per-guest-wave ES/GS invocation counts, and linked-continuation GS input-VGPR
-  reseeding. Focused offline tests pass; because no clean game run was made, these changes are not
-  yet compatibility evidence.
+  corrects downstream NGG issues exposed after restoring the payload: unsigned SOPK immediate
+  zero-extension, per-guest-wave ES/GS invocation counts, linked-continuation GS input-VGPR
+  reseeding, passthrough PrimitiveID placement, `UcGeCntl` amplification, and dynamic linked-ES/GS
+  vertex stride. Focused offline tests pass; because no clean game run was made, these changes are
+  not yet compatibility evidence.
 - This supersedes the recommendation to spend the next run on EyeAdapt or `remu_s_31`. The first
   failing resource with direct clean evidence is the all-black generated LUT and its NGG writer.
   Do not add a title/address workaround and do not apply/pop the GitHub Desktop stash; inspect it
   read-only as `stash@{0}`.
+
+The follow-up whole-renderer audit is recorded in
+`../gpu-3d-architecture-audit-20260810.md`. It additionally corrected the passthrough PrimitiveID
+VGPR, the `UcGeCntl` amplification alias, dynamic linked-ES/GS item stride, threadgroup-memory
+accounting, GFX10 scalar opcode tables, and `S_ADDK_I32` SCC. It also records the remaining
+split-wave64, GS-instancing, and layered texture/target gaps. No game was run for that audit.
 
 AMD's public register reference describes `LDS_SIZE` allocations in dwords:
 [CIK 3D registers](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/programmer-references/CIK_3D_registers_v2.pdf).
@@ -189,12 +196,14 @@ and the [AMD RDNA ISA reference](https://gpuopen.com/wp-content/uploads/2019/08/
 
 ## Next recommended blockers
 
-1. **Stabilize the general LUT-writer fixes offline** — isolate and review the LDS dword→byte
-   conversion, unsigned SOPK compare, per-wave merged counts, and linked GS continuation ABI.
+1. **Review the general LUT-writer patch as one architectural unit** — LDS dword→byte conversion,
+   per-wave merged counts, fixed/dynamic GS input ABI, correct GFX10 scalar decode, and exact Metal
+   threadgroup-memory accounting now have focused offline coverage.
 2. **Regenerate/replay the captured `800aed` translation offline** — require 8,704 bytes of LDS,
    six vertices/two primitives for the small quad, nonzero positions/param0, and all 32 layers.
-3. **Separate unrelated wave64 experiments** — the pairwise rendezvous attempt caused a Metal
-   command-buffer Error and is not evidence for this mesh writer; do not ship it with the LUT fix.
+3. **Resolve or reject unsafe split-wave64 shapes** — mask branches, SCC, cross-half LDS ordering,
+   and dynamically divergent whole-threadgroup barriers remain open. The pairwise rendezvous
+   attempt caused a Metal command-buffer Error and is not evidence for this mesh writer.
 4. **Only when game testing is allowed again:** validate one clean title run by capturing the LUT
    writer target first, then the following `800e73` target. Do not return to EyeAdapt/remu_s31
    unless the LUT is nonblack and the composite is still black.
@@ -248,7 +257,7 @@ and the [AMD RDNA ISA reference](https://gpuopen.com/wp-content/uploads/2019/08/
   `proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole`,
   `lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocation`, and
   `selects_the_gfx10_ngg_input_vgpr_layout_from_primgen_passthrough` pass on the dirty tree.
-- Full `cargo test -p remu-shader-metal`: **174/176 pass**. The two known irreducible-control-flow
+- Full `cargo test -p remu-shader-metal`: **177/179 pass**. The two known irreducible-control-flow
   dispatcher tests still fail; this is not a green package gate and is unrelated to the focused
   LUT checks above.
 

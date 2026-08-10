@@ -19,6 +19,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
             pgm_rsrc2: 0,
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            esgs_ring_itemsize: 0,
             primgen_passthrough: false,
         }
         .allocated_vgprs_wave32(),
@@ -31,6 +32,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
             pgm_rsrc2: 0,
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            esgs_ring_itemsize: 0,
             primgen_passthrough: false,
         }
         .allocated_vgprs_wave32(),
@@ -45,6 +47,7 @@ fn pgm_rsrc1_vgprs_follows_the_sdk_shshaderresource1_layout() {
             pgm_rsrc2: 0,
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            esgs_ring_itemsize: 0,
             primgen_passthrough: false,
         }
         .allocated_vgprs_wave32(),
@@ -68,6 +71,7 @@ fn gs_max_vert_out_is_the_eleven_bit_vgt_field() {
                 pgm_rsrc2: 0,
                 gs_max_vert_out: raw,
                 ge_max_output_per_subgroup: 0,
+                esgs_ring_itemsize: 0,
                 primgen_passthrough: false,
             }
             .gs_max_output_vertices(),
@@ -93,6 +97,7 @@ fn subgroup_vertex_cap_is_the_ten_bit_ge_max_output_field() {
                 pgm_rsrc2: 0,
                 gs_max_vert_out: 0,
                 ge_max_output_per_subgroup: raw,
+                esgs_ring_itemsize: 0,
                 primgen_passthrough: false,
             }
             .max_verts_per_subgroup(),
@@ -121,6 +126,7 @@ fn pgm_rsrc2_lds_size_follows_the_sdk_shshaderresource2gs_layout() {
                 pgm_rsrc2: field << 19,
                 gs_max_vert_out: 0,
                 ge_max_output_per_subgroup: 0,
+                esgs_ring_itemsize: 0,
                 primgen_passthrough: false,
             }
             .lds_size_bytes(),
@@ -134,6 +140,7 @@ fn pgm_rsrc2_lds_size_follows_the_sdk_shshaderresource2gs_layout() {
             pgm_rsrc2: 0xF807_FFFF | (0x40 << 19),
             gs_max_vert_out: 0,
             ge_max_output_per_subgroup: 0,
+            esgs_ring_itemsize: 0,
             primgen_passthrough: false,
         }
         .lds_size_bytes(),
@@ -153,6 +160,7 @@ fn silent_hill_lut_draw_lds_covers_its_captured_vertex_payload() {
         pgm_rsrc2: 0x008b_0000,
         gs_max_vert_out: 0,
         ge_max_output_per_subgroup: 0,
+        esgs_ring_itemsize: 0,
         primgen_passthrough: false,
     }
     .lds_size_bytes();
@@ -170,6 +178,7 @@ fn mesh_options_derive_capacities_and_vgpr_allocation_from_registers() {
         pgm_rsrc2: 0x08 << 19,
         gs_max_vert_out: 200,
         ge_max_output_per_subgroup: 96,
+        esgs_ring_itemsize: 5,
         primgen_passthrough: false,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(4, 64, registers);
@@ -185,6 +194,7 @@ fn mesh_options_derive_capacities_and_vgpr_allocation_from_registers() {
          exists in the SDK register structs)"
     );
     assert_eq!(options.mesh_threadgroup_size, 64);
+    assert_eq!(options.ngg_esgs_ring_itemsize, 5);
     assert_eq!(
         options.allocated_vector_register_count, 128,
         "PGM_RSRC1.VGPRS = 15 allocates (15+1)<<3 = 128 wave32 registers"
@@ -200,6 +210,7 @@ fn zero_subgroup_cap_falls_back_to_gs_max_vert_out() {
         pgm_rsrc2: 0,
         gs_max_vert_out: 128,
         ge_max_output_per_subgroup: 0,
+        esgs_ring_itemsize: 0,
         primgen_passthrough: false,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(0, 32, registers);
@@ -217,6 +228,7 @@ fn derived_capacities_stay_inside_the_metal_validation_window() {
         pgm_rsrc2: 0,
         gs_max_vert_out: 0x7ff,
         ge_max_output_per_subgroup: 0x3ff,
+        esgs_ring_itemsize: 0,
         primgen_passthrough: false,
     };
     let options = MetalCompileOptions::mesh_from_ngg_registers(0, 256, registers);

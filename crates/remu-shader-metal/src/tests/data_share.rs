@@ -468,6 +468,7 @@ fn proven_ngg_registers_lower_empty_workaround_without_the_snapshot_peephole() {
             pgm_rsrc2: 0x20 << 19,
             gs_max_vert_out: 64,
             ge_max_output_per_subgroup: 64,
+            esgs_ring_itemsize: 0,
             primgen_passthrough: false,
         },
     );
@@ -590,6 +591,7 @@ fn proven_ngg_registers_publish_compacted_vertex_exports_by_compacted_id() {
             pgm_rsrc2: 0x20 << 19,
             gs_max_vert_out: 64,
             ge_max_output_per_subgroup: 64,
+            esgs_ring_itemsize: 0,
             primgen_passthrough: false,
         },
     );
@@ -805,18 +807,30 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
     let linked = remu_shader::link_program_continuation(&front, &continuation)
         .expect("exact fused front/back pair");
 
-    let shader = compile_msl(
+    let missing_stride = compile_msl(
         &linked,
         &empty_evaluation(),
         &MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96),
     )
-    .expect("linked NGG program should lower as one mesh function");
+    .expect_err("linked ES/GS must not invent a vertex-item stride");
+    assert!(
+        missing_stride
+            .to_string()
+            .contains("missing VGT_ESGS_RING_ITEMSIZE")
+    );
+
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96);
+    // The captured fused stage uses four dwords per ES vertex. This must come from
+    // VGT_ESGS_RING_ITEMSIZE rather than being hardcoded in lowering.
+    options.ngg_esgs_ring_itemsize = 4;
+    let shader = compile_msl(&linked, &empty_evaluation(), &options)
+        .expect("linked NGG program should lower as one mesh function");
 
     assert_eq!(shader.stage, MetalShaderStage::Mesh);
     assert!(shader.register_footprint.direct_control_flow);
     assert!(
         shader.source.contains(
-            "uint remu_mesh_gs_vtx_offset_0 = (((remu_mesh_primitive >> 0u) & 0x1ffu) << 2u"
+            "uint remu_mesh_gs_vtx_offset_0 = ((((remu_mesh_primitive >> 0u) & 0x1ffu) * 4u)"
         ),
         "a linked ES/GS stage must receive packed 16-bit dword offsets in the GFX9-11 GS ABI"
     );
@@ -979,7 +993,25 @@ fn selects_the_gfx10_ngg_input_vgpr_layout_from_primgen_passthrough() {
             .source
             .contains("remu_v_0 = remu_mesh_primitive;")
     );
+    assert!(passthrough.source.contains("remu_v_1 = 0u;"));
+    assert!(
+        passthrough
+            .source
+            .contains("remu_v_2 = remu_mesh_primitive_base + remu_thread_index;")
+    );
     assert!(!passthrough.source.contains("remu_mesh_gs_vtx_offset_0"));
+}
+
+#[test]
+fn mesh_layer_helpers_count_against_the_guest_lds_limit() {
+    let program = decoded_ds_program(0x1234, false);
+    let mut options = MetalCompileOptions::mesh(0, 32 * 1024, 256, 256, 64);
+    options.render_target_array_length = 2;
+
+    let error = compile_msl(&program, &empty_evaluation(), &options)
+        .expect_err("full guest LDS leaves no room for layered mesh helper arrays");
+    assert!(error.to_string().contains("compiler-generated state"));
+    assert!(error.to_string().contains("34816 bytes"));
 }
 
 #[test]

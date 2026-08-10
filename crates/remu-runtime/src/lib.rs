@@ -133,8 +133,11 @@ pub(crate) use agc_flip::{
     AgcVideoOutTarget, agc_dcb_draw_index_auto, agc_dcb_draw_index_offset, agc_dcb_set_flip,
     agc_dcb_set_index_buffer, agc_dcb_set_index_size, agc_dcb_set_num_instances,
     agc_submit_ordered_video_out_flip, agc_video_out_target, agc_video_out_target_for_address,
-    queue_agc_event_write, queue_video_out_flip, refresh_completed_video_out_flips,
-    request_agc_compute_submission_completion, request_agc_submission_completion,
+    queue_agc_event_write, queue_agc_event_write_unlocked, queue_video_out_flip,
+    queue_video_out_flip_for_video_out, refresh_completed_video_out_flips,
+    request_agc_compute_submission_completion,
+    request_agc_compute_submission_completion_for_sequence, request_agc_submission_completion,
+    request_agc_submission_completion_for_sequence,
     video_out_add_flip_event, video_out_add_vblank_event, video_out_register_buffers2,
 };
 pub(crate) use agc_registers::{
@@ -1074,7 +1077,7 @@ pub(crate) struct SaveDataTransaction {
     pub(crate) staging_path: PathBuf,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct VideoOutState {
     is_open: bool,
     user_id: i32,
@@ -3441,6 +3444,10 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         // handler takes its own brief read lock for the port check (plan C5).
         return ProbeImportReturn::integer(av::video_out_wait_vblank(call_args));
     }
+    if let Some(result) = dispatch_unlocked_agc_submission_import(nid, call_args) {
+        remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Stateful);
+        return ProbeImportReturn::integer(result);
+    }
     // Most hot imports return above without consuming stack arguments. Reading them lazily avoids
     // six guest-memory loads on every timer, synchronization, numeric, audio, and pad call while
     // preserving the complete ABI frame for the less common dispatch paths below.
@@ -4785,6 +4792,44 @@ fn dispatch_stateless_import(
         "+BzXYkqYeLE" => pthread_set_specific(arguments),
         _ => return None,
     })
+}
+
+/// Returns whether a live import submits an already-built AGC command buffer.
+///
+/// These calls are routed before `PROBE_DISPATCH`: command parsing owns AGC state and guest memory,
+/// not the process-wide service registry, and can take milliseconds on resource-heavy frames.
+pub(crate) fn is_unlocked_agc_submission_import(nid: &str) -> bool {
+    matches!(
+        nid,
+        "UglJIZjGssM"
+            | "6UzEidRZwkg"
+            | "gSRnr79F8tQ"
+            | "HF3YllT3mXU"
+            | "AhGvpITrf4M"
+            | "+T8Xo6LtFJI"
+    )
+}
+
+/// Serializes command-buffer translation without retaining the process service lock.
+///
+/// Multi-buffer imports must remain atomic relative to other graphics and compute submissions,
+/// but parsing only owns the AGC register state and guest command memory. A dedicated lock keeps
+/// that ordering while allowing audio, input, timers, and other process services to make progress.
+static AGC_SUBMISSION_TRANSLATION: Mutex<()> = Mutex::new(());
+
+pub(crate) fn dispatch_unlocked_agc_submission_import(
+    nid: &str,
+    arguments: [u64; 6],
+) -> Option<u64> {
+    if !is_unlocked_agc_submission_import(nid) {
+        return None;
+    }
+    assert_wait_is_off_the_dispatch_lock("AGC submission translation");
+    let _translation = AGC_SUBMISSION_TRANSLATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    agc_submission::dispatch_unlocked_submission(nid, arguments)
+        .or_else(|| agc_driver::dispatch_unlocked_submission(nid, arguments))
 }
 
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]

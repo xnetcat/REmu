@@ -49,6 +49,34 @@ fn unsigned_sopk_compare_zero_extends_its_immediate() {
 }
 
 #[test]
+fn s_addk_i32_lowers_its_signed_overflow_condition() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x38,
+            encoding: ShaderEncoding::Sopk,
+            opcode: Opcode::Known("SAddkI32"),
+            words: vec![0xb784_0001],
+            sources: vec![Operand {
+                kind: OperandKind::EncodedConstant,
+                value: 1,
+            }],
+            destinations: vec![Operand::scalar(4)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+
+    assert!(shader.source.contains("0x80000000u"));
+    assert!(shader.source.contains(" ^ "));
+    assert_eq!(
+        shader.source.matches("scc = ").count(),
+        2,
+        "S_ADDK_I32 must write SCC in addition to its initialized value:\n{}",
+        shader.source
+    );
+}
+
+#[test]
 fn hardware_register_writes_do_not_fabricate_an_sgpr_destination() {
     for (name, sources, words) in [
         (
@@ -60,7 +88,7 @@ fn hardware_register_writes_do_not_fabricate_an_sgpr_destination() {
                 },
                 Operand::scalar(5),
             ],
-            vec![0xb905_f801],
+            vec![0xb985_f801],
         ),
         (
             "SSetregImm32B32",
@@ -74,7 +102,7 @@ fn hardware_register_writes_do_not_fabricate_an_sgpr_destination() {
                     value: 0x1122_3344,
                 },
             ],
-            vec![0xb985_f801, 0x1122_3344],
+            vec![0xba85_f801, 0x1122_3344],
         ),
     ] {
         let shader = compile_vector_instruction(
@@ -145,7 +173,7 @@ fn wave_mode_and_scheduling_hints_lower_to_nothing_but_reading_one_refuses() {
             pc: 0x1000,
             encoding: ShaderEncoding::Sopk,
             opcode: Opcode::Known("SGetregB32"),
-            words: vec![0xb805_f801],
+            words: vec![0xb905_f801],
             sources: vec![Operand {
                 kind: OperandKind::EncodedConstant,
                 value: 0xf801,

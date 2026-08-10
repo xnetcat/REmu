@@ -29,6 +29,7 @@ use crate::{
     capture_agc_gpu_events, process_guest_range_is_readable, queue_agc_event_write,
     queue_video_out_flip, request_agc_submission_completion, sce_kernel_error,
 };
+use crate::agc_submission::submit_graphics_unlocked;
 
 const AGC_ERROR_ALIGNMENT: u64 = 0x8a6c_0002;
 const AGC_ERROR_INVALID_SUBMIT_QUEUE: u64 = 0x8a6c_0009;
@@ -115,6 +116,82 @@ fn dispatch_submission(
         "+T8Xo6LtFJI" => agr_submit_multi_dcbs(arguments, state),
         _ => return None,
     })
+}
+
+pub(crate) fn dispatch_unlocked_submission(
+    nid: &str,
+    arguments: [u64; 6],
+) -> Option<u64> {
+    Some(match nid {
+        "AhGvpITrf4M" => agr_submit_dcb_unlocked(arguments),
+        "+T8Xo6LtFJI" => agr_submit_multi_dcbs_unlocked(arguments),
+        _ => return None,
+    })
+}
+
+fn agr_submit_dcb_unlocked(arguments: [u64; 6]) -> u64 {
+    let queue = low_u32(arguments[0]);
+    let command_address = arguments[1];
+    let dword_count = low_u32(arguments[2]);
+    if let Err(error) = check_submission(queue, command_address, dword_count) {
+        return error;
+    }
+    if dword_count == 0 {
+        remu_gpu::note_inert("agc:SubmitDcb-zero-dwords");
+        return 0;
+    }
+    match submit_graphics_unlocked(u64::from(queue), command_address, dword_count) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("[REMu][AGC] rejected graphics submission: {error}");
+            AGC_ERROR_UNEXPECTED_PARAMETER
+        }
+    }
+}
+
+fn agr_submit_multi_dcbs_unlocked(arguments: [u64; 6]) -> u64 {
+    let queue = low_u32(arguments[0]);
+    let count = low_u32(arguments[1]);
+    let addresses = arguments[2];
+    let sizes = arguments[3];
+    if queue > MAX_GRAPHICS_QUEUE {
+        return AGC_ERROR_INVALID_SUBMIT_QUEUE;
+    }
+    if count == 0 {
+        remu_gpu::note_inert("agc:SubmitMultiDcbs-zero-count");
+        return 0;
+    }
+    if addresses == 0 || sizes == 0 {
+        return AGC_ERROR_PARAMETER_NULL;
+    }
+    if !guest_range_is_readable(addresses, u64::from(count) * 8)
+        || !guest_range_is_readable(sizes, u64::from(count) * 4)
+    {
+        return AGC_ERROR_OUT_OF_BOUNDS;
+    }
+    for index in 0..u64::from(count) {
+        let command_address = read_u64(addresses + index * 8);
+        let dword_count = read_u32(sizes + index * 4);
+        if let Err(error) = check_submission(queue, command_address, dword_count) {
+            return error;
+        }
+    }
+    for index in 0..u64::from(count) {
+        let command_address = read_u64(addresses + index * 8);
+        let dword_count = read_u32(sizes + index * 4);
+        if dword_count == 0 {
+            continue;
+        }
+        if let Err(error) =
+            submit_graphics_unlocked(u64::from(queue), command_address, dword_count)
+        {
+            eprintln!(
+                "[REMu][AGC] rejected graphics submission {index} of {count}: {error}"
+            );
+            return AGC_ERROR_UNEXPECTED_PARAMETER;
+        }
+    }
+    0
 }
 
 fn dispatch_event_queue(

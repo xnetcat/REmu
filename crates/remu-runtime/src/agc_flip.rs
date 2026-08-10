@@ -195,7 +195,21 @@ pub(crate) fn queue_video_out_flip(
     buffer_index: u32,
     flip_argument: u64,
 ) {
-    let Some(&display_address) = state.video_out.display_buffers.get(buffer_index as usize) else {
+    queue_video_out_flip_for_video_out(
+        &state.video_out,
+        handle,
+        buffer_index,
+        flip_argument,
+    );
+}
+
+pub(crate) fn queue_video_out_flip_for_video_out(
+    video_out: &VideoOutState,
+    handle: u32,
+    buffer_index: u32,
+    flip_argument: u64,
+) {
+    let Some(&display_address) = video_out.display_buffers.get(buffer_index as usize) else {
         eprintln!("[REMu][VIDEO] ignored flip for unregistered buffer index {buffer_index}");
         return;
     };
@@ -308,6 +322,11 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
 }
 
 pub(crate) fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: u32) {
+    let _ = state;
+    queue_agc_event_write_unlocked(event_type);
+}
+
+pub(crate) fn queue_agc_event_write_unlocked(event_type: u32) {
     let (_h, events) = crate::event_state::lock_event_state_for_read();
     let registrations = events
         .kernel_event_registrations
@@ -318,20 +337,17 @@ pub(crate) fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: 
         .collect::<Vec<_>>();
     drop(events);
     for (equeue, ident, filter, user_data) in registrations {
-        queue_kernel_event(
-            state,
-            KernelQueuedEvent {
-                equeue,
-                ident,
-                filter,
-                flags: 0,
-                fflags: 1,
-                data: u64::from(event_type),
-                user_data,
-                agc_graphics_completions: 0,
-                agc_user_interrupts: 0,
-            },
-        );
+        crate::event_state::queue_kernel_event(KernelQueuedEvent {
+            equeue,
+            ident,
+            filter,
+            flags: 0,
+            fflags: 1,
+            data: u64::from(event_type),
+            user_data,
+            agc_graphics_completions: 0,
+            agc_user_interrupts: 0,
+        });
     }
     notify_kernel_equeue_waiters();
 }
@@ -339,9 +355,20 @@ pub(crate) fn queue_agc_event_write(state: &mut ProbeDispatchState, event_type: 
 pub(crate) fn request_agc_submission_completion(
     state: &mut ProbeDispatchState,
     queue_id: u64,
+    events: Vec<remu_gpu::GpuEvent>,
+) -> bool {
+    request_agc_submission_completion_for_sequence(
+        state.agc_submission_count,
+        queue_id,
+        events,
+    )
+}
+
+pub(crate) fn request_agc_submission_completion_for_sequence(
+    sequence: u64,
+    queue_id: u64,
     mut events: Vec<remu_gpu::GpuEvent>,
 ) -> bool {
-    let sequence = state.agc_submission_count;
     annotate_submission_flips(&mut events, sequence);
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
@@ -358,9 +385,20 @@ pub(crate) fn request_agc_submission_completion(
 pub(crate) fn request_agc_compute_submission_completion(
     state: &mut ProbeDispatchState,
     owner: u64,
+    events: Vec<remu_gpu::GpuEvent>,
+) -> bool {
+    request_agc_compute_submission_completion_for_sequence(
+        state.agc_submission_count,
+        owner,
+        events,
+    )
+}
+
+pub(crate) fn request_agc_compute_submission_completion_for_sequence(
+    sequence: u64,
+    owner: u64,
     mut events: Vec<remu_gpu::GpuEvent>,
 ) -> bool {
-    let sequence = state.agc_submission_count;
     annotate_submission_flips(&mut events, sequence);
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
     // Backend queue zero is reserved for graphics. Compute completion is delivered exclusively

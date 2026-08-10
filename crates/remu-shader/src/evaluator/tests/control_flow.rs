@@ -628,7 +628,7 @@ fn s_call_enters_the_subroutine_and_the_indirect_return_resumes_the_call_site() 
         0x1000,
         &[
             0xb000_0005, // s_movk_i32 s0, 5
-            0xba0a_0002, // s_call_b64 s[10:11], +2 (subroutine at pc 16)
+            0xbb0a_0002, // s_call_b64 s[10:11], +2 (subroutine at pc 16)
             0xb001_0009, // s_movk_i32 s1, 9 (return continuation)
             0xbf81_0000, // s_endpgm
             0xb000_002a, // s_movk_i32 s0, 42 (subroutine body)

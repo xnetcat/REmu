@@ -469,6 +469,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 mesh_max_primitive_count: 0,
                 mesh_threadgroup_size: 0,
                 ngg_primgen_passthrough: false,
+                ngg_esgs_ring_itemsize: 0,
                 lds_size_bytes: 0,
                 compute_threadgroup_size: 0,
                 scratch_size_bytes: 0,

@@ -312,6 +312,7 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes: 2_048,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
@@ -383,7 +384,7 @@ fn acyclic_wave64_readfirstlane_sites_use_disjoint_exchange_records() {
 }
 
 #[test]
-fn memory_heavy_acyclic_readfirstlane_retains_shared_records() {
+fn declared_but_unused_lds_does_not_consume_threadgroup_memory() {
     let program = Program::new(
         0x1000,
         vec![Instruction {
@@ -401,7 +402,7 @@ fn memory_heavy_acyclic_readfirstlane_retains_shared_records() {
         &empty_evaluation(),
         &MetalCompileOptions::compute_wave(32 * 1_024, 64),
     )
-    .expect("memory-heavy readfirstlane should lower with shared records");
+    .expect("unused declared LDS should not block disjoint readfirstlane records");
 
     assert!(
         shader
@@ -413,8 +414,32 @@ fn memory_heavy_acyclic_readfirstlane_retains_shared_records() {
             .source
             .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
             .count(),
-        2
+        1,
+        "one static site with disjoint records needs no record-reuse barrier"
     );
+}
+
+#[test]
+fn readfirstlane_fallback_arrays_count_against_used_lds() {
+    let mut instructions = vec![decoded_ds_program(0, false).instructions[0].clone()];
+    instructions.push(Instruction {
+        pc: instructions[0].pc + 8,
+        encoding: ShaderEncoding::Vop1,
+        opcode: Opcode::Known("VReadfirstlaneB32"),
+        words: vec![0],
+        sources: vec![Operand::vector(4)],
+        destinations: vec![Operand::scalar(44)],
+        control: None,
+    });
+    let error = compile_msl(
+        &Program::new(0x1000, instructions),
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(32 * 1_024 - 128, 64),
+    )
+    .expect_err("the emitted 32-entry value and active arrays exceed the remaining LDS budget");
+
+    assert!(error.to_string().contains("32896 bytes"));
+    assert!(error.to_string().contains("compiler-generated state"));
 }
 
 #[test]
@@ -514,6 +539,7 @@ fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes: 0,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,

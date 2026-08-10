@@ -69,11 +69,14 @@ all exactly `[0,0,0,1]`. The preceding `800aed`/`800d700` draw generates that LU
 why valid HDR scene input is reduced to dither-only black and supersedes EyeAdapt/remu_s31 as the
 first failing stage.
 
-**Remaining title-3D blocker:** stabilize the general NGG LUT-writer corrections offline: LDS
-dword→byte sizing, unsigned SOPK immediate zero-extension, per-wave merged ES/GS counts, and
-linked-continuation GS VGPR reseeding. Focused unit tests pass on the dirty tree, but no clean live
-validation exists and no game/address-specific workaround is justified. See
-`docs/notes/sh-present-20260806-handoff/` for the evidence and exact next steps.
+**2026-08-10 architecture audit (no game run):** the general LUT-writer fixes now also correct the
+GFX10 passthrough PrimitiveID VGPR, derive no-GS amplification as one instead of aliasing
+`UcGeCntl.VERT_GRP_SIZE`, carry `VGT_ESGS_RING_ITEMSIZE` into linked GS offsets, and count all
+compiler-generated threadgroup arrays. The GFX10 scalar decoder table and `S_ADDK_I32` SCC were
+also corrected. Focused offline tests pass. The audit found additional cross-game gaps in split
+wave64 execution, GS instancing, array base layers, layered target views, and writable D3/array
+authority. No clean live validation exists and no game/address-specific workaround is justified.
+See `docs/notes/gpu-3d-architecture-audit-20260810.md` and the compositor handoff.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

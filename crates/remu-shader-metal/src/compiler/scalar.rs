@@ -113,16 +113,23 @@ impl Compiler<'_> {
                 );
             }
             let immediate = immediate.cast_signed();
+            let immediate_bits = u32::from_ne_bytes(i32::from(immediate).to_ne_bytes());
+            if name == "SAddkI32" {
+                let immediate = format_u32(immediate_bits);
+                let old = self.temp("uint", &format!("s[{destination}]"));
+                let result = self.temp("uint", &format!("({old} + {immediate})"));
+                self.store_scalar(destination, &result);
+                self.line(
+                    3,
+                    &format!(
+                        "scc = (({old} ^ {result}) & ({immediate} ^ {result}) & 0x80000000u) != 0u;"
+                    ),
+                );
+                return Ok(());
+            }
             let value = match name {
-                "SMovkI32" => format_u32(u32::from_ne_bytes(i32::from(immediate).to_ne_bytes())),
-                "SAddkI32" => format!(
-                    "(s[{destination}] + {})",
-                    format_u32(u32::from_ne_bytes(i32::from(immediate).to_ne_bytes()))
-                ),
-                "SMulkI32" => format!(
-                    "(s[{destination}] * {})",
-                    format_u32(u32::from_ne_bytes(i32::from(immediate).to_ne_bytes()))
-                ),
+                "SMovkI32" => format_u32(immediate_bits),
+                "SMulkI32" => format!("(s[{destination}] * {})", format_u32(immediate_bits)),
                 _ => return Err(format!("unsupported scalar immediate opcode {name}")),
             };
             self.store_scalar(destination, &value);

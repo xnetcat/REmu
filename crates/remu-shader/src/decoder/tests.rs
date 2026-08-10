@@ -1321,9 +1321,9 @@ fn decodes_hardware_register_sopk_opcodes_including_the_immediate_form() {
     // S_GETREG_B32 / S_SETREG_B32 are single dword; S_SETREG_IMM32_B32 carries a trailing literal
     // and must frame as two dwords or every following instruction decodes at the wrong address.
     for (opcode, name, dwords) in [
-        (0x11u32, "SGetregB32", 1usize),
-        (0x12, "SSetregB32", 1),
-        (0x13, "SSetregImm32B32", 2),
+        (0x12u32, "SGetregB32", 1usize),
+        (0x13, "SSetregB32", 1),
+        (0x15, "SSetregImm32B32", 2),
     ] {
         let word = 0xb000_0000 | (opcode << 23);
         let frame = decode_frame(0, &[word, 0xdead_beef]).expect("SOPK hwreg frame");
@@ -1484,14 +1484,14 @@ fn decodes_benign_sopk_hints_and_scalar_waitcnt_shapes() {
         &[
             0xb080_1234, // s_version 0x1234
             0xb105_0007, // s_cmovk_i32 s5, 7
-            0xb885_f801, // s_getreg_b32 s5, hwreg(...)
-            0xb905_f801, // s_setreg_b32 hwreg(...), s5
-            0xb985_f801, // s_setreg_imm32_b32 hwreg(...), 0x11223344
+            0xb905_f801, // s_getreg_b32 s5, hwreg(...)
+            0xb985_f801, // s_setreg_b32 hwreg(...), s5
+            0xba85_f801, // s_setreg_imm32_b32 hwreg(...), 0x11223344
             0x1122_3344,
-            0xbafd_0000, // s_waitcnt_vscnt null, 0
-            0xbb05_0001, // s_waitcnt_vmcnt s5, 1
-            0xbbfd_0002, // s_waitcnt_expcnt null, 2
-            0xbc05_0003, // s_waitcnt_lgkmcnt s5, 3
+            0xbbfd_0000, // s_waitcnt_vscnt null, 0
+            0xbc05_0001, // s_waitcnt_vmcnt s5, 1
+            0xbcfd_0002, // s_waitcnt_expcnt null, 2
+            0xbd05_0003, // s_waitcnt_lgkmcnt s5, 3
             0xbf81_0000, // s_endpgm
         ],
     )
@@ -1580,7 +1580,7 @@ fn decodes_the_sop1_unary_and_relative_move_batch() {
         (0xbe85_3003, "SMovreldB32"),         // s_movreld_b32 s5, s3
         (0xbe84_3102, "SMovreldB64"),         // s_movreld_b64 s[4:5], s[2:3]
         (0xbe85_3403, "SAbsI32"),             // s_abs_i32 s5, s3
-        (0xbe84_3603, "SBitreplicateB64B32"), // s_bitreplicate_b64_b32 s[4:5], s3
+        (0xbe84_3b03, "SBitreplicateB64B32"), // s_bitreplicate_b64_b32 s[4:5], s3
     ];
     for &(word, name) in cases {
         let program =
@@ -1600,7 +1600,7 @@ fn decodes_s_call_and_scans_past_endpgm_to_its_forward_subroutine() {
     // s_call_b64 s[10:11], +2 jumps over the endpgm to the subroutine; the decoder must keep
     // scanning to the call target exactly as it does for forward branches.
     let words = [
-        0xba0a_0001, // s_call_b64 s[10:11], +1 (target pc 8)
+        0xbb0a_0001, // s_call_b64 s[10:11], +1 (target pc 8)
         0xbf81_0000, // s_endpgm at pc 4
         0xb005_002a, // s_movk_i32 s5, 42 at pc 8
         0xbf81_0000, // s_endpgm

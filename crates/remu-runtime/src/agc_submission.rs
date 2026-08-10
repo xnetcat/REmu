@@ -33,7 +33,7 @@ pub(crate) use self::decode::{
 };
 pub(crate) use self::driver::{
     agc_driver_submit_acb, agc_driver_submit_dcb, agc_driver_submit_multi_acbs,
-    agc_driver_submit_multi_dcbs,
+    agc_driver_submit_multi_dcbs, dispatch_unlocked_submission, submit_graphics_unlocked,
 };
 pub(crate) use self::flow::agc_read_mapped_u64;
 #[cfg(test)]

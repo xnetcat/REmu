@@ -16,13 +16,13 @@ use super::{
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_INFO, CB_COLOR0_VIEW, CB_TARGET_MASK,
     ColorOperationMode, DB_DEPTH_CLEAR, DB_DEPTH_CONTROL, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE,
-    DB_RENDER_CONTROL, DB_Z_INFO, DecodedDepthBias, DecodedDepthTarget, DecodedRasterState,
-    DecodedStencilState, GuestScissor, GuestTextureDescriptor, MetalPresenter,
-    NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType, NggSubgroupLimits, PA_SU_SC_MODE_CNTL,
-    RenderTargetPipelineState, SPI_PS_INPUT_CNTL_0, append_color_target_registers,
-    append_depth_target_registers, apply_transparent_premultiplied_fill_clear,
-    color_operation_is_raster_noop, common_render_target_array_length,
-    consume_color_metadata_clear, consume_depth_metadata_clear,
+    DB_RENDER_CONTROL, DB_STENCIL_CONTROL, DB_STENCILREFMASK, DB_Z_INFO, DecodedDepthBias,
+    DecodedDepthTarget, DecodedRasterState, DecodedStencilState, GuestScissor,
+    GuestTextureDescriptor, MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggOutputPrimitiveType,
+    NggSubgroupLimits, PA_SU_SC_MODE_CNTL, RenderTargetPipelineState, SPI_PS_INPUT_CNTL_0,
+    append_color_target_registers, append_depth_target_registers,
+    apply_transparent_premultiplied_fill_clear, color_operation_is_raster_noop,
+    common_render_target_array_length, consume_color_metadata_clear, consume_depth_metadata_clear,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_fast_clear_color,
     decode_graphics_wave_state, decode_metal_blend_attachment, decode_ngg_registers_from_state,
@@ -87,6 +87,64 @@ fn programs_full_scissor_after_a_restricted_draw() {
             .is_none(),
         "empty guest scissors remain draw suppression instead of invalid Metal rectangles"
     );
+}
+
+#[test]
+fn clamps_signed_screen_scissor_coordinates_instead_of_dropping_bit_15() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.context_registers = vec![
+        GpuRegister {
+            offset: 0x00c,
+            // PA_SC_SCREEN_SCISSOR_TL: X=-20, Y=-10 (signed 16-bit components).
+            value: 0xfff6_ffec,
+        },
+        GpuRegister {
+            offset: 0x00d,
+            value: (70 << 16) | 80,
+        },
+    ];
+
+    let scissor = decode_scissor(&draw, 100, 100).expect("signed screen scissor decodes");
+    let GuestScissor::Rect(rect) = scissor else {
+        panic!("negative top-left must clamp to zero without suppressing the draw");
+    };
+    assert_eq!((rect.x, rect.y, rect.width, rect.height), (0, 0, 80, 70));
+}
+
+#[test]
+fn applies_window_offset_disable_independently_for_each_scissor() {
+    let mut draw = indexed_draw(0, 0, 3);
+    draw.context_registers = vec![
+        GpuRegister {
+            offset: 0x080,
+            value: (50 << 16) | 50,
+        },
+        GpuRegister {
+            offset: 0x081,
+            value: 0,
+        },
+        GpuRegister {
+            offset: 0x082,
+            value: (150 << 16) | 150,
+        },
+        GpuRegister {
+            offset: 0x090,
+            // Generic scissor disables the offset independently of the window scissor.
+            value: 0x8000_0000 | (10 << 16) | 10,
+        },
+        GpuRegister {
+            offset: 0x091,
+            value: (100 << 16) | 100,
+        },
+    ];
+    draw.context_registers
+        .sort_by_key(|register| register.offset);
+
+    let scissor = decode_scissor(&draw, 200, 200).expect("independent scissor flags decode");
+    let GuestScissor::Rect(rect) = scissor else {
+        panic!("expected intersected window and generic scissors");
+    };
+    assert_eq!((rect.x, rect.y, rect.width, rect.height), (50, 50, 50, 50));
 }
 
 #[test]
@@ -591,6 +649,55 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
 }
 
 #[test]
+fn ignores_stale_stencil_operations_when_stencil_testing_is_disabled() {
+    let mut draw = indexed_draw(0, 0, 0);
+    append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0x76);
+    draw.context_registers.push(GpuRegister {
+        offset: DB_STENCIL_CONTROL,
+        value: 0x00aa_aaaa,
+    });
+    draw.context_registers
+        .sort_by_key(|register| register.offset);
+
+    let depth = decode_depth_target(&draw)
+        .expect("disabled stencil ignores stale unrepresentable ops")
+        .expect("depth target remains active");
+    assert!(!depth.stencil.enabled);
+}
+
+#[test]
+fn refuses_distinct_stencil_replace_operation_value_instead_of_using_test_value() {
+    let mut draw = indexed_draw(0, 0, 0);
+    // Stencil and depth enabled; both compare functions are Always.
+    append_depth_target_registers(
+        &mut draw,
+        0x0070_1412_0000,
+        1_920,
+        1_080,
+        0xa000_0003,
+        0x777,
+    );
+    draw.context_registers.extend([
+        GpuRegister {
+            offset: DB_STENCIL_CONTROL,
+            // Front-face depth-pass operation is AMD REPLACE_OP.
+            value: 4 << 4,
+        },
+        GpuRegister {
+            offset: DB_STENCILREFMASK,
+            // STENCILOPVAL=0xaa, STENCILTESTVAL=0x55.
+            value: 0xaa_ff_ff55,
+        },
+    ]);
+    draw.context_registers
+        .sort_by_key(|register| register.offset);
+
+    let error =
+        decode_depth_target(&draw).expect_err("independent replace value is not Metal-exact");
+    assert!(error.contains("REPLACE_OP value 0xaa differs from comparison value 0x55"));
+}
+
+#[test]
 fn decodes_explicit_guest_depth_clear_without_depth_test() {
     let mut draw = indexed_draw(0, 0, 0);
     append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0);
@@ -721,12 +828,20 @@ fn blend_bypass_in_cb_color_info_disables_metal_blend() {
 
 #[test]
 fn derives_ngg_subgroup_limits_from_uc_ge_cntl_when_cx_sizing_absent() {
-    // UcGeCntl: PRIM_GRP_SIZE=8, VERT_GRP_SIZE=16 → packed fields used by the limits builder.
+    // UcGeCntl: PRIM_GRP_SIZE=8, VERT_GRP_SIZE=16. With no API GS, output amplification is
+    // exactly one; VERT_GRP_SIZE is an input limit and must never be reused as PRIM_AMP_FACTOR.
     let limits = decode_ngg_subgroup_limits_with_uc(
-        &[GpuRegister {
-            offset: 0x2d5,
-            value: 0x2000,
-        }],
+        &[
+            GpuRegister {
+                offset: 0x2ce,
+                // Stale VGT_GS_MAX_VERT_OUT must be inert when GS_EN is clear.
+                value: 1,
+            },
+            GpuRegister {
+                offset: 0x2d5,
+                value: 0x2000,
+            },
+        ],
         &[GpuRegister {
             offset: 0x25b,
             value: 8 | (16 << 9),
@@ -736,6 +851,55 @@ fn derives_ngg_subgroup_limits_from_uc_ge_cntl_when_cx_sizing_absent() {
     .expect("UcGeCntl-derived NGG is present");
     assert_eq!(limits.es_vertices_per_subgroup, 16);
     assert_eq!(limits.gs_primitives_per_subgroup, 8);
+    assert_eq!(limits.gs_max_vertices_out, 0);
+    assert_eq!(limits.primitive_amplification_factor, 1);
+    assert_eq!(limits.max_output_primitives_per_subgroup, 8);
+}
+
+#[test]
+fn derives_gs_amplification_from_gs_max_vert_out_not_uc_vertex_group_size() {
+    let limits = decode_ngg_subgroup_limits_with_uc(
+        &[
+            GpuRegister {
+                offset: 0x2ce,
+                value: 24,
+            },
+            GpuRegister {
+                offset: 0x2d5,
+                // ES_EN plus GS_EN.
+                value: 0x2020,
+            },
+        ],
+        &[GpuRegister {
+            offset: 0x25b,
+            value: 4 | (16 << 9),
+        }],
+    )
+    .expect("GS amplification is proven by VGT_GS_MAX_VERT_OUT")
+    .expect("UcGeCntl-derived NGG is present");
+
+    assert_eq!(limits.es_vertices_per_subgroup, 16);
+    assert_eq!(limits.gs_primitives_per_subgroup, 4);
+    assert_eq!(limits.gs_max_vertices_out, 24);
+    assert_eq!(limits.primitive_amplification_factor, 24);
+    assert_eq!(limits.max_output_vertices_per_subgroup, 96);
+    assert_eq!(limits.max_output_primitives_per_subgroup, 96);
+}
+
+#[test]
+fn refuses_gs_amplification_when_only_uc_input_group_sizes_are_known() {
+    let error = decode_ngg_subgroup_limits_with_uc(
+        &[GpuRegister {
+            offset: 0x2d5,
+            value: 0x2020,
+        }],
+        &[GpuRegister {
+            offset: 0x25b,
+            value: 4 | (16 << 9),
+        }],
+    )
+    .expect_err("UcGeCntl input sizes do not prove an API-GS output count");
+    assert!(error.contains("missing VGT_GS_MAX_VERT_OUT"));
 }
 
 #[test]
@@ -1847,6 +2011,11 @@ fn decodes_captured_ngg_subgroup_limits_and_derives_ninety_six_threads() {
             value: 24,
         },
         GpuRegister {
+            offset: 0x2d5,
+            // ES_EN plus GS_EN: VGT_GS_MAX_VERT_OUT is active for this captured GS stage.
+            value: 0x2020,
+        },
+        GpuRegister {
             offset: 0x2e4,
             value: 1 << 2,
         },
@@ -1892,6 +2061,10 @@ fn captures_proven_ngg_compile_registers_from_the_live_draw_state() {
                 value: 96,
             },
             GpuRegister {
+                offset: 0x2ab,
+                value: 4,
+            },
+            GpuRegister {
                 offset: 0x2ce,
                 value: 24,
             },
@@ -1913,6 +2086,7 @@ fn captures_proven_ngg_compile_registers_from_the_live_draw_state() {
     assert_eq!(registers.lds_size_bytes(), 32768);
     assert_eq!(registers.gs_max_vert_out, 24);
     assert_eq!(registers.ge_max_output_per_subgroup, 96);
+    assert_eq!(registers.esgs_ring_itemsize, 4);
     assert!(registers.primgen_passthrough);
     assert_eq!(registers.max_verts_per_subgroup(), 96);
 }

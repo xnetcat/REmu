@@ -75,6 +75,46 @@ fn unsigned_sopk_compare_zero_extends_its_immediate() {
 }
 
 #[test]
+fn s_addk_i32_sets_scc_only_on_signed_overflow() {
+    let mut operation = instruction(
+        0,
+        ShaderEncoding::Sopk,
+        "SAddkI32",
+        vec![Operand {
+            kind: OperandKind::EncodedConstant,
+            value: 1,
+        }],
+        vec![Operand::scalar(4)],
+        None,
+    );
+
+    for (left, immediate, expected, overflow) in [
+        (0x7fff_ffff_u32, 0x0001_u32, 0x8000_0000_u32, true),
+        (0x8000_0000, 0xffff, 0x7fff_ffff, true),
+        (1, 0xffff, 0, false),
+        (0x7fff_ffff, 0xffff, 0x7fff_fffe, false),
+    ] {
+        operation.sources[0].value = immediate;
+        let mut registers = [0_u32; SCALAR_REGISTER_COUNT];
+        registers[4] = left;
+        let mut exec_mask = u64::MAX;
+        let mut scalar_condition = !overflow;
+
+        execute_scalar_alu(
+            &operation,
+            0x1000,
+            &mut registers,
+            &mut exec_mask,
+            &mut scalar_condition,
+        )
+        .expect("S_ADDK_I32 evaluates");
+
+        assert_eq!(registers[4], expected);
+        assert_eq!(scalar_condition, overflow);
+    }
+}
+
+#[test]
 fn s_bcnt1_i32_b64_counts_the_source_pair_and_updates_scc() {
     let instruction = instruction(
         0,

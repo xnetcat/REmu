@@ -4,11 +4,246 @@
 use crate::{
     AgcSubmissionError, GuestImportTracePhase, GuestImportTracePhaseGuard, ProbeDispatchState,
     agc_command_abi, capture_agc_gpu_events, low_u32, queue_agc_event_write, queue_video_out_flip,
-    read_guest_u32, read_guest_u64, request_agc_compute_submission_completion,
-    request_agc_submission_completion, trace_agc_programs, trace_logarithmic_sequence,
+    queue_agc_event_write_unlocked, queue_video_out_flip_for_video_out, read_guest_u32,
+    read_guest_u64, request_agc_compute_submission_completion,
+    request_agc_compute_submission_completion_for_sequence, request_agc_submission_completion,
+    request_agc_submission_completion_for_sequence, trace_agc_programs,
+    trace_logarithmic_sequence,
 };
 
 use super::{AgcSubmissionContext, agc_parse_graphics_submission, agc_parse_submission};
+
+fn unlocked_submission_snapshot() -> (crate::VideoOutState, u64) {
+    let dispatch = crate::PROBE_DISPATCH
+        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let state = crate::lock_probe_dispatch_for_write(dispatch);
+    (
+        state.video_out.clone(),
+        state.agc_submission_count,
+    )
+}
+
+fn publish_unlocked_submission_count(sequence: u64) {
+    let dispatch = crate::PROBE_DISPATCH
+        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let mut state = crate::lock_probe_dispatch_for_write(dispatch);
+    state.agc_submission_count = state.agc_submission_count.max(sequence);
+}
+
+pub(crate) fn submit_graphics_unlocked(
+    queue_id: u64,
+    command_address: u64,
+    dword_count: u32,
+) -> Result<(), String> {
+    let (video_out, previous_submission_count) = unlocked_submission_snapshot();
+    let mut submission_count = previous_submission_count;
+    let mut flips = Vec::new();
+    let mut event_writes = Vec::new();
+    let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+    let crate::agc_dispatch_state::AgcState {
+        graphics,
+        shader_registry,
+        ..
+    } = &mut *agc;
+    let (result, gpu_events) = {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcDcbParse);
+        capture_agc_gpu_events(|| {
+            agc_parse_graphics_submission(
+                command_address,
+                dword_count,
+                &mut AgcSubmissionContext {
+                    graphics,
+                    shaders: shader_registry,
+                    video_out: &video_out,
+                    submission_count: &mut submission_count,
+                    flips: &mut flips,
+                    event_writes: &mut event_writes,
+                },
+            )
+        })
+    };
+    drop(agc);
+    result.map_err(|error| error.to_string())?;
+    publish_unlocked_submission_count(submission_count);
+    agc_command_abi::track_graphics_submission(command_address, dword_count);
+    if !request_agc_submission_completion_for_sequence(submission_count, queue_id, gpu_events) {
+        return Err("presenter is unavailable".to_owned());
+    }
+    for (handle, buffer_index, flip_argument) in flips {
+        queue_video_out_flip_for_video_out(
+            &video_out,
+            handle,
+            buffer_index,
+            flip_argument,
+        );
+    }
+    for event_type in event_writes {
+        queue_agc_event_write_unlocked(event_type);
+    }
+    Ok(())
+}
+
+pub(crate) fn submit_compute_unlocked(
+    owner: u32,
+    command_address: u64,
+    dword_count: u32,
+) -> Result<(), String> {
+    let (command_address, dword_count) = agc_resolve_acb_descriptor(command_address, dword_count)
+        .map_err(|error| error.to_string())?;
+    let (video_out, previous_submission_count) = unlocked_submission_snapshot();
+    let mut submission_count = previous_submission_count;
+    let mut flips = Vec::new();
+    let mut event_writes = Vec::new();
+    let (_agc_hierarchy, mut agc) = crate::agc_dispatch_state::lock_agc_for_write();
+    let crate::agc_dispatch_state::AgcState {
+        compute_queues,
+        shader_registry,
+        ..
+    } = &mut *agc;
+    let graphics = compute_queues.entry(owner).or_default();
+    let (result, gpu_events) = {
+        let _phase = GuestImportTracePhaseGuard::enter(GuestImportTracePhase::AgcAcbParse);
+        capture_agc_gpu_events(|| {
+            agc_parse_submission(
+                command_address,
+                dword_count,
+                &mut AgcSubmissionContext {
+                    graphics,
+                    shaders: shader_registry,
+                    video_out: &video_out,
+                    submission_count: &mut submission_count,
+                    flips: &mut flips,
+                    event_writes: &mut event_writes,
+                },
+            )
+        })
+    };
+    drop(agc);
+    result.map_err(|error| error.to_string())?;
+    publish_unlocked_submission_count(submission_count);
+    if !request_agc_compute_submission_completion_for_sequence(
+        submission_count,
+        u64::from(owner),
+        gpu_events,
+    ) {
+        return Err("presenter is unavailable".to_owned());
+    }
+    for (handle, buffer_index, flip_argument) in flips {
+        queue_video_out_flip_for_video_out(
+            &video_out,
+            handle,
+            buffer_index,
+            flip_argument,
+        );
+    }
+    for event_type in event_writes {
+        queue_agc_event_write_unlocked(event_type);
+    }
+    Ok(())
+}
+
+pub(crate) fn dispatch_unlocked_submission(
+    nid: &str,
+    arguments: [u64; 6],
+) -> Option<u64> {
+    Some(match nid {
+        "UglJIZjGssM" => agc_driver_submit_dcb_unlocked(arguments),
+        "6UzEidRZwkg" => agc_driver_submit_multi_dcbs_unlocked(arguments),
+        "gSRnr79F8tQ" => agc_driver_submit_acb_unlocked(arguments),
+        "HF3YllT3mXU" => agc_driver_submit_multi_acbs_unlocked(arguments),
+        _ => return None,
+    })
+}
+
+fn agc_driver_submit_dcb_unlocked(arguments: [u64; 6]) -> u64 {
+    let packet = arguments[0];
+    if packet == 0 {
+        eprintln!("[REMu][AGC] rejected DCB submission: null packet");
+        return u64::MAX;
+    }
+    let command_address = read_guest_u64(packet);
+    let dword_count = read_guest_u32(packet + 8);
+    if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        eprintln!(
+            "[REMu][AGC] rejected DCB submission: packet={packet:#x} commands={command_address:#x} dwords={dword_count} args={:#x},{:#x},{:#x}",
+            arguments[1], arguments[2], arguments[3]
+        );
+        return u64::MAX;
+    }
+    match submit_graphics_unlocked(0, command_address, dword_count) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("[REMu][AGC] rejected DCB submission: {error}");
+            u64::MAX
+        }
+    }
+}
+
+fn agc_driver_submit_multi_dcbs_unlocked(arguments: [u64; 6]) -> u64 {
+    let addresses = arguments[0];
+    let sizes = arguments[1];
+    let count = low_u32(arguments[2]);
+    if addresses == 0 || sizes == 0 || count == 0 || count > 4096 {
+        return u64::MAX;
+    }
+    for index in 0..count {
+        let command_address = read_guest_u64(addresses + u64::from(index) * 8);
+        let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
+        if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+            continue;
+        }
+        if let Err(error) = submit_graphics_unlocked(0, command_address, dword_count) {
+            eprintln!("[REMu][AGC] rejected DCB {index} in multi-submission: {error}");
+            return u64::MAX;
+        }
+    }
+    0
+}
+
+fn agc_driver_submit_acb_unlocked(arguments: [u64; 6]) -> u64 {
+    let owner = low_u32(arguments[0]);
+    let packet = arguments[1];
+    if packet == 0 {
+        eprintln!("[REMu][AGC] rejected ACB submission for owner {owner}: null packet");
+        return u64::MAX;
+    }
+    let command_address = read_guest_u64(packet);
+    let dword_count = read_guest_u32(packet + 8);
+    if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+        return u64::MAX;
+    }
+    match submit_compute_unlocked(owner, command_address, dword_count) {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("[REMu][AGC] rejected ACB submission for owner {owner}: {error}");
+            u64::MAX
+        }
+    }
+}
+
+fn agc_driver_submit_multi_acbs_unlocked(arguments: [u64; 6]) -> u64 {
+    let owner = low_u32(arguments[0]);
+    let addresses = arguments[1];
+    let sizes = arguments[2];
+    let count = low_u32(arguments[3]);
+    if addresses == 0 || sizes == 0 || count == 0 || count > 4096 {
+        return u64::MAX;
+    }
+    for index in 0..count {
+        let command_address = read_guest_u64(addresses + u64::from(index) * 8);
+        let dword_count = read_guest_u32(sizes + u64::from(index) * 4);
+        if command_address == 0 || dword_count == 0 || dword_count > 1_000_000 {
+            return u64::MAX;
+        }
+        if let Err(error) = submit_compute_unlocked(owner, command_address, dword_count) {
+            eprintln!(
+                "[REMu][AGC] rejected ACB {index} for owner {owner} in multi-submission: {error}"
+            );
+            return u64::MAX;
+        }
+    }
+    0
+}
 
 pub(crate) fn agc_driver_submit_dcb(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     let packet = arguments[0];

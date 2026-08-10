@@ -139,6 +139,7 @@ fn scalar_instruction_defines_condition(instruction: &Instruction) -> bool {
                 | "SLshl2AddU32"
                 | "SLshl3AddU32"
                 | "SLshl4AddU32"
+                | "SAddkI32"
                 | "SAndSaveexecB32"
                 | "SOrSaveexecB32"
                 | "SXorSaveexecB32"

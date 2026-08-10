@@ -134,6 +134,9 @@ pub struct NggRegisters {
     pub gs_max_vert_out: u32,
     /// `GE_MAX_OUTPUT_PER_SUBGROUP`: the per-subgroup output-vertex cap after amplification.
     pub ge_max_output_per_subgroup: u32,
+    /// `VGT_ESGS_RING_ITEMSIZE`: dwords reserved for one ES vertex in linked ES/GS LDS.
+    /// GFX9-11 hardware scales the packed GS input offsets by this value.
+    pub esgs_ring_itemsize: u32,
     /// `VGT_SHADER_STAGES_EN.PRIMGEN_PASSTHRU_EN`: selects the packed-primitive VGPR0 ABI.
     /// When false, GFX10 supplies three packed 16-bit vertex offsets in VGPR0/VGPR1 and the
     /// primitive ID in VGPR2 instead.
@@ -173,7 +176,8 @@ impl NggRegisters {
         self.gs_max_vert_out & 0x7ff
     }
 
-    /// Maximum per-subgroup output vertices after amplification, from `GE_NGG_SUBGRP_CNTL`.
+    /// Maximum per-subgroup output vertices after amplification, from
+    /// `GE_MAX_OUTPUT_PER_SUBGROUP`.
     ///
     /// SDK `CxGeMaxOutputPerSubgroup::getMaxVertsPerSubgroup()` (registerstructs.h:6241-6246): the
     /// 10-bit field `value & 0x3ff`.
@@ -238,6 +242,9 @@ pub struct MetalCompileOptions {
     pub mesh_threadgroup_size: u32,
     /// Whether GFX10 primitive generation uses its packed passthrough input-VGPR ABI.
     pub ngg_primgen_passthrough: bool,
+    /// Dword stride applied to packed GFX9-11 GS input offsets for a linked ES/GS program.
+    /// Zero means the register was not proven and is valid only for a no-GS NGG stage.
+    pub ngg_esgs_ring_itemsize: u32,
     /// Bytes of guest LDS allocated to each compute workgroup.
     ///
     /// A non-zero, dword-aligned value is required only when the program contains an LDS memory
@@ -306,6 +313,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes: 0,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
@@ -342,6 +350,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes: 0,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
@@ -374,6 +383,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
@@ -406,6 +416,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
@@ -452,6 +463,7 @@ impl MetalCompileOptions {
             mesh_max_primitive_count,
             mesh_threadgroup_size,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,
@@ -467,8 +479,8 @@ impl MetalCompileOptions {
     /// The Metal-side maxima are `1..=256` (validated in `compiler/driver.rs`), while the guest
     /// fields are wider (11-bit vertices, 6-bit VGPR granule up to 512), so each derived quantity
     /// is clamped into the Metal window. Sizing the vertex records by the per-subgroup cap
-    /// (`GE_NGG_SUBGRP_CNTL`) matches the amplified output one Metal threadgroup exposes; a stage
-    /// that never programmed that register falls back to `VGT_GS_MAX_VERT_OUT`.
+    /// (`GE_MAX_OUTPUT_PER_SUBGROUP`) matches the amplified output one Metal threadgroup exposes;
+    /// a stage that never programmed that register falls back to `VGT_GS_MAX_VERT_OUT`.
     ///
     /// Primitive capacity is bounded by the vertex capacity: the SDK register structs surfaced in
     /// this payload expose a per-subgroup *vertex* cap but no per-subgroup *primitive* cap, and a
@@ -494,6 +506,7 @@ impl MetalCompileOptions {
             allocated_vector_register_count,
             ngg_registers_proven: true,
             ngg_primgen_passthrough: registers.primgen_passthrough,
+            ngg_esgs_ring_itemsize: registers.esgs_ring_itemsize & 0x7fff,
             ..Self::mesh(
                 required_vertex_output_count,
                 registers.lds_size_bytes(),

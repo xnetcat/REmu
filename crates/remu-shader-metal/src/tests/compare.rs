@@ -165,6 +165,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             mesh_max_primitive_count: 0,
             mesh_threadgroup_size: 0,
             ngg_primgen_passthrough: false,
+            ngg_esgs_ring_itemsize: 0,
             lds_size_bytes: 0,
             compute_threadgroup_size: 0,
             scratch_size_bytes: 0,

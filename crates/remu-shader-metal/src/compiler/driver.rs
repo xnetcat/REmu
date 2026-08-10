@@ -311,7 +311,7 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        Ok(Self {
+        let compiler = Self {
             program,
             evaluation,
             options,
@@ -327,7 +327,17 @@ impl<'a> Compiler<'a> {
                 .ngg_registers_proven
                 .then_some(mesh_export_vertex_vgpr)
                 .flatten(),
-        })
+        };
+        let total_threadgroup_memory = compiler.total_threadgroup_memory_bytes();
+        if total_threadgroup_memory.is_none_or(|bytes| bytes > METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
+        {
+            return Err(MetalCompileError::InvalidInterface(format!(
+                "guest LDS plus compiler-generated state need {} bytes of threadgroup memory, exceeding Metal's {}-byte limit",
+                total_threadgroup_memory.unwrap_or(usize::MAX),
+                METAL_THREADGROUP_MEMORY_LIMIT_BYTES
+            )));
+        }
+        Ok(compiler)
     }
 
     pub(crate) fn compile(mut self) -> Result<MetalShader, MetalCompileError> {

@@ -56,7 +56,7 @@ pub(crate) fn decode_sop1(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
         0x30 => Some("SMovreldB32"),
         0x31 => Some("SMovreldB64"),
         0x34 => Some("SAbsI32"),
-        0x36 => Some("SBitreplicateB64B32"),
+        0x3b => Some("SBitreplicateB64B32"),
         0x37 => Some("SAndn1SaveexecB64"),
         0x38 => Some("SOrn1SaveexecB64"),
         0x3c => Some("SAndSaveexecB32"),
@@ -267,17 +267,17 @@ pub(crate) fn decode_sopk(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
         // cross-check: s_getreg_b32 / s_setreg_b32 / s_setreg_imm32_b32 in libSceShaderIsaP.dll;
         // OP numbers follow the RDNA2 (GFX10) SOPK block. S_SETREG_IMM32_B32 carries a trailing
         // 32-bit literal, so it frames as two dwords.
-        0x11 => Some("SGetregB32"),
-        0x12 => Some("SSetregB32"),
-        0x13 => Some("SSetregImm32B32"),
-        // S_CALL_B64 (20) links the return address and takes a static relative target; the
-        // scalar wait counts (21-24) only park the wave. RDNA2 SOPK numbering continues the
+        0x12 => Some("SGetregB32"),
+        0x13 => Some("SSetregB32"),
+        0x15 => Some("SSetregImm32B32"),
+        // S_CALL_B64 (22) links the return address and takes a static relative target; the
+        // scalar wait counts (23-26) only park the wave. RDNA2 SOPK numbering continues the
         // block above; every mnemonic is present in libSceShaderIsaP.dll.
-        0x14 => Some("SCallB64"),
-        0x15 => Some("SWaitcntVscnt"),
-        0x16 => Some("SWaitcntVmcnt"),
-        0x17 => Some("SWaitcntExpcnt"),
-        0x18 => Some("SWaitcntLgkmcnt"),
+        0x16 => Some("SCallB64"),
+        0x17 => Some("SWaitcntVscnt"),
+        0x18 => Some("SWaitcntVmcnt"),
+        0x19 => Some("SWaitcntExpcnt"),
+        0x1a => Some("SWaitcntLgkmcnt"),
         _ => None,
     };
     // S_SETREG_IMM32_B32 is the one SOPK instruction that carries a 32-bit literal.
@@ -286,7 +286,7 @@ pub(crate) fn decode_sopk(_pc: u32, word: u32) -> Result<Frame, DecodeError> {
         RawOpcodeFamily::Sopk,
         code,
         name,
-        1 + usize::from(code == 0x13),
+        1 + usize::from(code == 0x15),
     ))
 }
 

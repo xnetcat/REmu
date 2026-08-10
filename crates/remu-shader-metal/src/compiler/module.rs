@@ -548,6 +548,17 @@ impl Compiler<'_> {
                             .linked_transfer_target(instruction.pc)
                             .is_some()
                     });
+                if has_linked_geometry_stage && self.options.ngg_primgen_passthrough {
+                    return Err(MetalCompileError::InvalidInterface(
+                        "linked ES/GS cannot use the no-GS NGG passthrough input ABI".into(),
+                    ));
+                }
+                if has_linked_geometry_stage && self.options.ngg_esgs_ring_itemsize == 0 {
+                    return Err(MetalCompileError::InvalidInterface(
+                        "linked ES/GS is missing VGT_ESGS_RING_ITEMSIZE; refusing an invented vertex stride"
+                            .into(),
+                    ));
+                }
                 // Default w=0 so threads that never EXP are hardware-clipped. The previous
                 // (0,0,0,1) default mapped to NDC center and produced a central additive haze
                 // whenever GS_ALLOC reserved more vertices than lanes that successfully exported.
@@ -599,14 +610,17 @@ impl Compiler<'_> {
                     // packed 16-bit ES vertex offsets in v0/v1/v4, the primitive ID in v2 and
                     // the GS invocation ID in v3. No-GS NGG lowering consumes the offsets as
                     // local vertex indices; an actual linked GS consumes dword ESGS offsets.
-                    // The latter currently uses the captured four-dword item layout.
-                    let offset_shift = if has_linked_geometry_stage { 2 } else { 0 };
+                    // Hardware scales every packed local index by VGT_ESGS_RING_ITEMSIZE.
+                    let itemsize = if has_linked_geometry_stage {
+                        self.options.ngg_esgs_ring_itemsize
+                    } else {
+                        1
+                    };
                     let _ = writeln!(
                         source,
-                        "    uint remu_mesh_gs_vtx_offset_0 = (((remu_mesh_primitive >> 0u) & 0x1ffu) << {offset_shift}u)\n\
-                         \x20       | (((remu_mesh_primitive >> 10u) & 0x1ffu) << {high_shift}u);\n\
-                         \x20   uint remu_mesh_gs_vtx_offset_1 = ((remu_mesh_primitive >> 20u) & 0x1ffu) << {offset_shift}u;",
-                        high_shift = 16 + offset_shift,
+                        "    uint remu_mesh_gs_vtx_offset_0 = ((((remu_mesh_primitive >> 0u) & 0x1ffu) * {itemsize}u) & 0xffffu)\n\
+                         \x20       | (((((remu_mesh_primitive >> 10u) & 0x1ffu) * {itemsize}u) & 0xffffu) << 16u);\n\
+                         \x20   uint remu_mesh_gs_vtx_offset_1 = (((remu_mesh_primitive >> 20u) & 0x1ffu) * {itemsize}u) & 0xffffu;",
                     );
                 }
                 if self.options.render_target_array_length > 1 {
@@ -663,17 +677,16 @@ impl Compiler<'_> {
                     if !self.options.ngg_primgen_passthrough {
                         source.push_str("    v[1] = remu_mesh_gs_vtx_offset_1;\n");
                     } else {
-                        source
-                            .push_str("    v[1] = remu_mesh_primitive_base + remu_thread_index;\n");
+                        // GFX10-11 passthrough packs all vertex indices and edge flags in v0.
+                        // v1 is not the primitive-ID input; keep an explicitly referenced but
+                        // architecturally unused component deterministic.
+                        source.push_str("    v[1] = 0u;\n");
                     }
                 }
                 if contains_register_reference(&self.body, 'v', 2) {
-                    if !self.options.ngg_primgen_passthrough {
-                        source
-                            .push_str("    v[2] = remu_mesh_primitive_base + remu_thread_index;\n");
-                    } else {
-                        source.push_str("    v[2] = 0u;\n");
-                    }
+                    // The fixed GFX9-11 merged-GS ABI keeps PrimitiveID in v2 in both ordinary
+                    // and NGG passthrough mode. Only the vertex-offset payload moves into v0.
+                    source.push_str("    v[2] = remu_mesh_primitive_base + remu_thread_index;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 3) {
                     source.push_str("    v[3] = 0u;\n");

@@ -12,6 +12,36 @@ use super::{
 };
 
 #[test]
+fn live_agc_submissions_are_classified_for_pre_dispatch_translation() {
+    for nid in [
+        "UglJIZjGssM",
+        "6UzEidRZwkg",
+        "gSRnr79F8tQ",
+        "HF3YllT3mXU",
+        "AhGvpITrf4M",
+        "+T8Xo6LtFJI",
+    ] {
+        assert!(
+            crate::is_unlocked_agc_submission_import(nid),
+            "submission import {nid} must not hold the process-wide dispatch lock while parsing"
+        );
+    }
+    assert!(!crate::is_unlocked_agc_submission_import("not-an-agc-submit"));
+}
+
+#[test]
+fn unlocked_agc_dispatch_accepts_an_empty_driver_submission_without_global_state() {
+    assert_eq!(
+        crate::dispatch_unlocked_agc_submission_import("AhGvpITrf4M", [0; 6]),
+        Some(0)
+    );
+    assert_eq!(
+        crate::dispatch_unlocked_agc_submission_import("not-an-agc-submit", [0; 6]),
+        None
+    );
+}
+
+#[test]
 fn gpu_publication_waits_until_the_dispatch_state_can_be_released() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
@@ -439,6 +469,41 @@ fn agc_completion_tracking_requires_a_published_queue_submission() {
             events,
         }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(42)]
     ));
+    remu_gpu::clear_thread_local_event_sink();
+}
+
+#[test]
+fn unlocked_agc_publication_uses_its_explicit_submission_sequence() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remu_gpu::clear_thread_local_event_sink();
+    crate::event_state::reset_event_state_for_tests();
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_thread_local_event_sink(sender);
+
+    assert!(crate::request_agc_submission_completion_for_sequence(
+        0x1234,
+        7,
+        Vec::new(),
+    ));
+    assert!(matches!(
+        receiver.recv(),
+        Ok(remu_gpu::GpuEvent::QueueSubmission {
+            queue_id: 7,
+            events,
+        }) if events == [remu_gpu::GpuEvent::SubmissionBoundary(0x1234)]
+    ));
+    assert_eq!(
+        crate::event_state::with_event_state(|events| {
+            events
+                .pending_agc_completions
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        }),
+        [(0x1234, 7)]
+    );
     remu_gpu::clear_thread_local_event_sink();
 }
 

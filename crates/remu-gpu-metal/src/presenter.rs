@@ -68,16 +68,17 @@ use self::decode::{
 use self::decode::{
     CB_COLOR0_ATTRIB, CB_COLOR0_ATTRIB2, CB_COLOR0_ATTRIB3, CB_COLOR0_BASE, CB_COLOR0_BASE_EXT,
     CB_COLOR0_CLEAR_WORD0, CB_COLOR0_CLEAR_WORD1, CB_COLOR0_CMASK, CB_COLOR0_INFO, CB_COLOR0_VIEW,
-    DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_Z_READ_BASE,
-    DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI, SPI_PS_INPUT_CNTL_0,
-    VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR, VIDEO_OUT_TILING_MODE_TILE,
-    apply_transparent_premultiplied_fill_clear, common_render_target_array_length,
-    decode_fast_clear_color, decode_graphics_wave_state, decode_ngg_registers_from_state,
-    decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc,
-    decode_render_targets_from_registers, decode_scanout_target, disabled_metal_blend_attachment,
-    graphics_shader_resource_key, initial_depth_clear_value,
-    is_transparent_premultiplied_fill_blend, metal_primitive_topology_class,
-    ngg_fullscreen_cover_draw, pixel_input_controls, raw_video_out_layout_is_linear,
+    DB_DEPTH_CLEAR, DB_DEPTH_VIEW, DB_HTILE_DATA_BASE, DB_RENDER_CONTROL, DB_STENCIL_CONTROL,
+    DB_STENCILREFMASK, DB_Z_READ_BASE, DB_Z_READ_BASE_HI, DB_Z_WRITE_BASE, DB_Z_WRITE_BASE_HI,
+    SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
+    VIDEO_OUT_TILING_MODE_TILE, apply_transparent_premultiplied_fill_clear,
+    common_render_target_array_length, decode_fast_clear_color, decode_graphics_wave_state,
+    decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
+    decode_ngg_subgroup_limits_with_uc, decode_render_targets_from_registers,
+    decode_scanout_target, disabled_metal_blend_attachment, graphics_shader_resource_key,
+    initial_depth_clear_value, is_transparent_premultiplied_fill_blend,
+    metal_primitive_topology_class, ngg_fullscreen_cover_draw, pixel_input_controls,
+    raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;

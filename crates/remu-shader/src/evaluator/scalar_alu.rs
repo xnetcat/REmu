@@ -77,7 +77,9 @@ pub(crate) fn execute_scalar_alu(
             i32::from(low_u16(instruction.sources[0].value).cast_signed()).cast_unsigned();
         let current = registers[destination as usize];
         registers[destination as usize] = if instruction.opcode.is("SAddkI32") {
-            current.wrapping_add(immediate)
+            let result = current.wrapping_add(immediate);
+            *scalar_condition = ((current ^ result) & (immediate ^ result) & 0x8000_0000) != 0;
+            result
         } else {
             current
                 .cast_signed()
