@@ -11,6 +11,8 @@ use crate::{guest_output_pointer, low_u32, write_guest_u32};
 use self::abi::{AcmError, return_error};
 
 mod abi;
+mod batch;
+mod builders;
 
 pub(crate) const SDK10_ACM_NIDS: [&str; 13] = [
     "ZIXln2K3XMk",
