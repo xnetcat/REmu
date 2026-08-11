@@ -317,6 +317,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
         "fMP5NHUOaMk" => "sceSysmoduleIsLoaded",
         "YJtKLttI9fM" => "sceGameUpdateInitialize",
         "jO8DM8oyego" => "sceNpEntitlementAccessInitialize",
+        "TFyU+KFBv54" => "sceNpEntitlementAccessGetAddcontEntitlementInfoList",
         "ysmw6J-P8Ak" => "sceNpSessionSignalingInitialize",
         "sk54bi6FtYM" => "sceNpWebApi2CreateUserContext",
         "3Zl8BePTh9Y" => "sceNpCheckCallback",
