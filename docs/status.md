@@ -73,11 +73,12 @@ first failing stage.
 GFX10 passthrough PrimitiveID VGPR, derive no-GS amplification as one instead of aliasing
 `UcGeCntl.VERT_GRP_SIZE`, carry `VGT_ESGS_RING_ITEMSIZE` into linked GS offsets, and count all
 compiler-generated threadgroup arrays. The GFX10 scalar decoder table and `S_ADDK_I32` SCC were
-also corrected. Focused offline tests pass. Absolute array base layers and exact single-level
-mode-27 writable 2D-array authority are now implemented; the remaining cross-game gaps include
-split wave64 execution, GS instancing, layered target views, writable D3 images, and layered/mipped
-array residency. No clean live validation exists and no game/address-specific workaround is
-justified.
+also corrected. Focused offline tests pass. At that audit, the additional cross-game gaps included
+split wave64 execution, GS instancing, array base layers, layered target views, and writable
+D3/array authority. `09a30708` subsequently added exact uncompressed mode-27 type-13 layered mip
+arrays, including absolute base slices; mode-9 arrays, compressed/MSAA/3D layered mip shapes,
+layered targets, and writable D3 remain open. No clean live validation exists and no
+game/address-specific workaround is justified.
 See `docs/notes/gpu-3d-architecture-audit-20260810.md` and the compositor handoff.
 
 **2026-08-10 CPU/GPU front-end performance rewrite (offline; no game run):** all six live AGC
@@ -100,7 +101,7 @@ for this title's cold inline command buffers: the SDK documents that result when
 attached, and the title immediately clears and attaches one. Returning fabricated success there
 would hide a valid lifecycle transition and would not remove the calls.
 
-**Last clean bounded run (`72175efc`, 2026-08-11):** artifact
+**Earlier clean bounded run (`72175efc`, 2026-08-11):** artifact
 `/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T141911Z-PPSA01342-app0`.
 The title submitted 2,050 ACM batches, retired 2,048, failed none, and completed 681 convolution
 jobs covering 697,344 samples. It then reached its main loop, submitted eight AGC command buffers,
@@ -108,7 +109,7 @@ compiled eight compute pipelines, and reached one draw. It produced no real Vide
 captured frame before a host fiber-resume SIGSEGV. This is progress beyond the old
 "ACM-blocked / no AGC" checkpoint, not a UI, 3D, FPS, or playability claim.
 
-**Latest sparse performance/acceptance run (`7b2deea3`, 2026-08-11):** artifact
+**Sparse performance/acceptance run (`7b2deea3`, 2026-08-11):** artifact
 `/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T160445Z-PPSA01342-app0`.
 The title reached its main loop in 18.613 seconds instead of 51.888 seconds in the prior artifact,
 and reached its first AGC submission in 22.374 seconds instead of 55.456 seconds. It completed
@@ -122,7 +123,7 @@ below-RSP dump and fiber identity trace are required to distinguish that from an
 control transfer. The signature is different from the earlier native `remu_fiber_long_jmp`
 failure.
 
-**Latest diagnostic acceptance run (`a8f2b713`, 2026-08-11):** artifact
+**Most advanced diagnostic acceptance run (`a8f2b713`, 2026-08-11):** artifact
 `/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T164916Z-PPSA01342-app0`.
 This clean-tree run reached the main loop in 16.481 seconds and the first AGC submission in 20.194
 seconds. It parsed 35 complete submissions, the backend completed through submission 21, the AGC
@@ -140,6 +141,19 @@ without an API error. This is one clean observation, not proof that a timing-sen
 closed: `REMU_TRACE_FIBER=1` emitted 47,891 synchronized log records and the guest-write journal was
 also enabled, so the run is intentionally not a performance benchmark.
 
+**Latest clean run (`b79aac96`, 2026-08-11):** artifact
+`/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T191410Z-PPSA01342-app0`.
+It crashed after 39 seconds at host PC zero before reproducing the preceding artifact's Metal draw
+or queued-flip progress; it produced no present, captured frame, or FPS sample. Offline
+symbolication identifies a zero return consumed by `remu_fiber_long_jmp` on
+`BPE JobWorkerThread CPU8`. The register file and crash journal prove a torn context load: the
+long jump restored a valid stack pointer from the context, while the same field read back as zero
+in the synchronous crash dump and the later-loaded return target was zero. This establishes
+concurrent clearing, but it does not uniquely identify whether the consumed record came from the
+run-chain context or the object-resident resume path. Because this run ended before comparable GPU
+progress, it does not supersede the `a8f2b713` renderer checkpoint and does not show that the title
+renders.
+
 The run exposed three renderer gaps that are now fixed offline but not yet game-validated.
 Ordinary VOP1/VOP2 FP16 lowering called `remu_f16_to_f32_bits` without emitting its definition;
 `3388ef32` now includes the FP16 helper prelude for every supported ordinary FP16 opcode as well as
@@ -152,15 +166,28 @@ hierarchy while retaining the distinct mode-9 address equation, full allocation 
 GPU-side alias reconstruction, exact promotion/writeback, and loud BC/array/MSAA gates. The Metal
 suite passes 529 tests with five intentionally ignored legacy-oracle tests.
 
-`420b6ae9` closes the adjacent absolute-array-view hole. `BASE_ARRAY` now remains distinct from the
-allocation address through descriptor spans, sampled/depth/shared-event identities, Metal tiler
-planning, residency, readback, rematerialization, and writeback. Metal slices stay local to the
-selected view while mode-27 addressing uses the absolute guest slice. Exact uncompressed,
-single-level mode-27 type-13 storage views are writable and publish only their selected faces;
-same-allocation subview conflicts, CPU/GPU dirty merges, partial authority, remaps, and comparison
-depth typing are either handled exactly or refused before stale guest RAM can be uploaded. Layered
-mode-9/27 mip chains, compressed arrays, and writable D3 remain loud until their layouts and
-authority models are implemented.
+`420b6ae9` closed the adjacent absolute-array-view hole for single-level views. `BASE_ARRAY` remains
+distinct from the allocation address through descriptor spans, sampled/depth/shared-event
+identities, Metal tiler planning, residency, readback, rematerialization, and writeback. Metal
+slices stay local to the selected view while mode-27 addressing uses the absolute guest slice.
+
+`09a30708` extends that exact path to uncompressed mode-27 type-13 layered mip arrays. The selected
+span is the full slice-major mip chain for each absolute `BASE_ARRAY` slice; planner addresses use
+the absolute guest slice while Metal layers remain local. Descriptor, sampled, depth, resident,
+and shared-event identities retain both the selected array base and the underlying mip count.
+Residency and upload cover the exact layered mip view, writable storage creates and preserves the
+complete hierarchy, publish/writeback touch only the selected levels and slices, and
+rematerialization copies the corresponding subresources. First creation orders overlapping
+GPU-authored tenants before reading guest RAM, and source write-watch validation refreshes or
+refuses CPU-dirty/remapped storage instead of reusing a stale Metal texture. Same-allocation
+subview conflicts, partial authority, comparison depth typing, and dirty CPU/GPU merges remain
+exact or loud. Mode-9 arrays, compressed layered mips, MSAA arrays, and 3D layered mip shapes remain
+unsupported and fail before a short span or stale upload can be admitted.
+
+Verification for `09a30708` is green: focused mode-27 array tests 15/15, focused extent tests 15/15,
+and the full serial Metal suite 541 passed, 0 failed, with 5 intentionally ignored. Strict clippy,
+format, and diff checks also pass. These are offline implementation checks; no post-commit game run
+exists, so they are not evidence that Demon's Souls UI, 3D, presentation, or performance is fixed.
 
 The same acceptance run also demonstrated that sparse work could disappear from structured
 telemetry: the one real Metal draw landed between the 500-millisecond live-title reset and the
@@ -177,11 +204,19 @@ Two evidence-backed blockers from that run are now fixed in code but have not be
   resource discovery, so a skipped block's own `S_LOAD_DWORDX8` supplies the real T# rather than
   the evaluator copying the initial pointer into an eight-dword descriptor. Nonzero-address
   FORMAT/TYPE 0 remains an error; it was not reinterpreted as a typeless image.
-- **Migrating fiber resume (`dc57398f`):** the crash restored `rsp=0` from a saved context located
-  on a fiber stack that another worker was actively using. Suspended callee-saved state now lives
-  in stable storage inside the opaque 256-byte `SceFiber`; resume validates its canonical pointer,
-  return frame, and declared stack bounds after atomically claiming the fiber. The fresh-entry
-  trampoline also consumes all handoff fields before publishing the outgoing stack as idle.
+- **Migrating fiber resume (`dc57398f`, hardened by `d6160073`):** the first crash restored `rsp=0`
+  from a saved context located on a fiber stack that another worker was actively using. Suspended
+  callee-saved state therefore moved into the opaque 256-byte `SceFiber`, with canonical-pointer,
+  return-frame, and declared-stack validation. The later `b79aac96` crash proved that a long-jump
+  context could still be cleared concurrently, but could not distinguish the run-chain record from
+  the object-resident resume record. `d6160073` hardens both scoped possibilities: the run-chain
+  `FiberContext` now has stable heap ownership, while object resume atomically validates and
+  consumes the exact published pointer once instead of validating and then rereading guest memory.
+  Long jumps retain source tags in RSI for fiber resume, entry return, and return-to-thread, so a
+  future crash can identify which ownership path supplied the record without hot-path logging.
+  These changes and their focused regressions narrow the observed race; there is no post-fix game
+  run, and they do not prove that an abandoned caller frame cannot be cleared or that the PC-zero
+  failure is closed.
 
 The remaining pre-crash import failures were audited separately. Cold AMPR reset `EPERM`, unknown
 PlayGo chunk probes, User Service `NO_EVENT`, and optional file misses are expected and leave guest
@@ -819,7 +854,7 @@ mapping registries.
 | --- | --- | --- |
 | CPU, loader, linker | x86-64 guest execution behind a native CPU backend under Rosetta; SELF/ELF mapping, observed relocations, AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines with synthetic coverage. | Continue source-backed HLE import closure. The AArch64 translator stays deferred until a milestone requires it. |
 | AGC / PM4 ordering | Native Gen5 command routing, type-2 packets, clear state, packet predication, targetless scanout association, compute submission, ordered memory copy/write/release/wait events, submission boundaries, and a bounded backpressured event channel with an ordered shader-compile gate. | Execution-side `SET_PREDICATION` semantics, then source-backed release/wait, cache visibility, fence writes, and graphics-equeue completion. |
-| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, AddrLib-compatible GFX10 `SW_4KB_S` packed mip/array/cube upload, exact `SW_64KB_S` 2D mip chains, absolute `BASE_ARRAY` selection with local Metal slices/absolute guest swizzles, exact single-level mode-27 writable 2D arrays, MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts; layered 64K mip arrays and writable D3 authority when guest formats exercise them. |
+| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, AddrLib-compatible GFX10 `SW_4KB_S` packed mip/array/cube upload, exact `SW_64KB_S` 2D mip chains, and exact uncompressed mode-27 type-13 layered mip arrays with `BASE_ARRAY`-local Metal views, absolute guest slices, and selected-subresource authority. Also implemented: MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts; mode-9 arrays, compressed/MSAA layered mip arrays, 3D layered mips, and writable D3 authority when guest formats exercise them. |
 | Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, `MAP_NO_COALESCE` identity preservation, release-time alias invalidation, shared-mapping identity tracking, CPU write-watch retirement across remaps, and commit-on-protect reserve+commit semantics: `sceKernelMprotect` over a reserved range and flexible mappings commit zero-filled memory into a virtually-keyed shared backing, so GPU residency and write-watching resolve them exactly like direct-memory views, decommit zeroes pages before release, and guest-visible `VirtualQuery` categories are unchanged. The backing is keyed by virtual placement — a deliberate scope decision: this memory class never exposes a physical address to the guest, so physical aliasing of it is unrepresentable by construction, unlike direct memory, which keeps its own physically-keyed backing object. All with synthetic coverage. | Coalesce adjacent contiguous shared-registry records at registration: commit-heavy titles insert one record per `mprotect`, and resolution currently scans records linearly per watch creation and arms one watch segment per record. Mapping lifecycle counters and exact query error/flag behavior for all exercised cases. Memory-pool NIDs (`sceKernelMemoryPoolReserve`/`Commit`/`Expand`/`Move`/…) stay loudly unimplemented until designed: pools deal in guest-physical block addresses (`Expand` returns one, `Move` re-points committed blocks without copying), so they need physically-keyed backing and must not silently reuse the virtually-keyed commit path. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, `CB_COLOR_CONTROL` resolve/eliminate-fast-clear/FMASK-decompression command handling, seeded AGC register defaults (Phase 1D), stencil/depth-bias/`CB_COLOR_INFO` blend-bypass/`UcGeCntl` NGG decode, and translated shader pipelines with cached construction. | Combined depth/stencil surface formats; remaining multisampling behavior; full structural pipeline-cache identity. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, zero-copy global bindings, wave64 ballot handling on SIMD32, and observed compute geometry, with offline Metal compilation tests. | Complete the remaining RDNA2 instruction/resource/control-flow surface and eliminate residual per-draw Metal buffer churn without weakening guest-memory visibility. |
