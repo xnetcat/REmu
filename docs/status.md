@@ -157,8 +157,22 @@ Two evidence-backed blockers from that run are now fixed in code but have not be
   return frame, and declared stack bounds after atomically claiming the fiber. The fresh-entry
   trampoline also consumes all handoff fields before publishing the outgoing stack as idle.
 
+The remaining pre-crash import failures were audited separately. Cold AMPR reset `EPERM`, unknown
+PlayGo chunk probes, User Service `NO_EVENT`, and optional file misses are expected and leave guest
+outputs untouched. The private `sceUserServiceGetPlatformPrivacyWs1` NID had been wired to the
+different public Setting signature; `748e6500` now accepts the initial user ID and reports the
+private output as unsupported instead of fabricating 0 or 1. The title's zero-length add-on
+entitlement count query is now served as the exact local result `hitNum=0` (`989fc23c`), including
+the library's initialization/error family and fixed-size boot output. Neither change is presented
+as the cause of the prior graphics failure.
+
+If corruption persists, `d0650358` makes the next sparse run more diagnostic: register-anchored
+write matching includes publications on the following page, and the crash journal inventories the
+fill byte inferred from poison-shaped addresses such as the observed `0x03` pattern.
+
 Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 14/14, and
-`-D warnings` lint for both changed packages. The full x86 runtime suite is 754/755: the remaining
+`remu-memory` 94/94 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
+suite is 754/755: the remaining
 `links_relative_and_import_relocations_into_fixed_memory` TLS decode assertion reproduces alone and
 does not touch the changed fiber or shader paths. The next acceptance point is a sparse clean run
 that passes both prior failures and reaches a real VideoOut flip/frame; until then Demon’s Souls is
