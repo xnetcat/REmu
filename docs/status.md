@@ -73,9 +73,11 @@ first failing stage.
 GFX10 passthrough PrimitiveID VGPR, derive no-GS amplification as one instead of aliasing
 `UcGeCntl.VERT_GRP_SIZE`, carry `VGT_ESGS_RING_ITEMSIZE` into linked GS offsets, and count all
 compiler-generated threadgroup arrays. The GFX10 scalar decoder table and `S_ADDK_I32` SCC were
-also corrected. Focused offline tests pass. The audit found additional cross-game gaps in split
-wave64 execution, GS instancing, array base layers, layered target views, and writable D3/array
-authority. No clean live validation exists and no game/address-specific workaround is justified.
+also corrected. Focused offline tests pass. Absolute array base layers and exact single-level
+mode-27 writable 2D-array authority are now implemented; the remaining cross-game gaps include
+split wave64 execution, GS instancing, layered target views, writable D3 images, and layered/mipped
+array residency. No clean live validation exists and no game/address-specific workaround is
+justified.
 See `docs/notes/gpu-3d-architecture-audit-20260810.md` and the compositor handoff.
 
 **2026-08-10 CPU/GPU front-end performance rewrite (offline; no game run):** all six live AGC
@@ -89,7 +91,7 @@ coalesced ranges. Release builds use one codegen unit with ThinLTO. Focused unit
 contract; this is not yet an FPS claim because the requested no-game constraint prevents a clean
 before/after title benchmark.
 
-## Demon's Souls bring-up (updated 2026-08-11) — first draw in a prior run, no flip/frame yet
+## Demon's Souls bring-up (updated 2026-08-11) — one Metal draw and real flip queued, no present/frame
 
 The complete CPU ACM engine is no longer the title's first blocker. Its context, batch, command,
 buffer, execution, wait, statistics, and teardown paths are implemented with SDK-shaped errors and
@@ -119,6 +121,53 @@ hypothesis, not a captured fact: the old diagnostic dumped only at and above RSP
 below-RSP dump and fiber identity trace are required to distinguish that from another zero-target
 control transfer. The signature is different from the earlier native `remu_fiber_long_jmp`
 failure.
+
+**Latest diagnostic acceptance run (`a8f2b713`, 2026-08-11):** artifact
+`/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T164916Z-PPSA01342-app0`.
+This clean-tree run reached the main loop in 16.481 seconds and the first AGC submission in 20.194
+seconds. It parsed 35 complete submissions, the backend completed through submission 21, the AGC
+front end emitted 14 draws, and Metal encoded one procedural draw at 35.294 seconds. That draw
+remained in an open batch: committed batches, presents, and captured frames were still zero. The
+title also emitted a real `sceAgcDcbSetFlip`; its flip event was captured and queued, but the
+backlogged presenter had not accepted it before the 45-second diagnostic timeout. The final state
+still had 1,071 ordered work items and 14 submissions outstanding, with progress only 683
+milliseconds old, so this was slow forward progress rather than a GPU deadlock.
+
+The prior PC-zero fiber failure did not recur in this execution. All 15,536 complete resume records
+used the stable in-object context, an aligned saved RSP inside the declared non-overlapping stack,
+and one of the two expected nonzero host return sites; 30 fibers also migrated across host threads
+without an API error. This is one clean observation, not proof that a timing-sensitive failure is
+closed: `REMU_TRACE_FIBER=1` emitted 47,891 synchronized log records and the guest-write journal was
+also enabled, so the run is intentionally not a performance benchmark.
+
+The run exposed three renderer gaps that are now fixed offline but not yet game-validated.
+Ordinary VOP1/VOP2 FP16 lowering called `remu_f16_to_f32_bits` without emitting its definition;
+`3388ef32` now includes the FP16 helper prelude for every supported ordinary FP16 opcode as well as
+VOP3P. The four compute shaders that exhausted the 1,048,576-instruction resource-evaluation limit
+used Mesa-shaped divergent loops whose outward SCC exit was derived from EXEC. `d47291ef` adds a
+CFG/reaching-taint analysis that converges those loops without weakening exact scalar counted-loop
+evaluation; its 178-test shader suite and strict lint pass. The refused Demon’s Souls mip resources
+were mode 9 (`SW_64KB_S`), not mode 27. `8abf9e7a` implements their Sony-compatible thin-64K
+hierarchy while retaining the distinct mode-9 address equation, full allocation spans, ordered
+GPU-side alias reconstruction, exact promotion/writeback, and loud BC/array/MSAA gates. The Metal
+suite passes 529 tests with five intentionally ignored legacy-oracle tests.
+
+`420b6ae9` closes the adjacent absolute-array-view hole. `BASE_ARRAY` now remains distinct from the
+allocation address through descriptor spans, sampled/depth/shared-event identities, Metal tiler
+planning, residency, readback, rematerialization, and writeback. Metal slices stay local to the
+selected view while mode-27 addressing uses the absolute guest slice. Exact uncompressed,
+single-level mode-27 type-13 storage views are writable and publish only their selected faces;
+same-allocation subview conflicts, CPU/GPU dirty merges, partial authority, remaps, and comparison
+depth typing are either handled exactly or refused before stale guest RAM can be uploaded. Layered
+mode-9/27 mip chains, compressed arrays, and writable D3 remain loud until their layouts and
+authority models are implemented.
+
+The same acceptance run also demonstrated that sparse work could disappear from structured
+telemetry: the one real Metal draw landed between the 500-millisecond live-title reset and the
+five-second JSON publication. `d8ba87c2` now accumulates draw, compute, flip, presentation, batch,
+barrier, GPU-time, latency, audio, render-pass, and command-buffer-flush deltas across the complete
+published window while leaving point-in-time gauges unchanged. The next acceptance artifact can
+therefore distinguish “one sparse event” from a true zero-rate window.
 
 Two evidence-backed blockers from that run are now fixed in code but have not been game-validated:
 
@@ -155,13 +204,13 @@ resume transfer identity. Tests cover a returning entry, repeated cross-thread m
 nested return frame, and migration through a real generated import stub/trampoline; all pass, so
 there is not yet evidence for another speculative fiber behavior change.
 
-Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 17/17, and
+Focused verification is green: `remu-shader` 178/178 tests, optimized x86 fiber tests 17/17, and
 `remu-memory` 99/99 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
 suite is 762/762. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
 dynamic data rather than its live FS function; `36593f56` gives the seeded decoder authenticated
 control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
-sparse clean run that passes both prior failures and reaches a real VideoOut flip/frame; until then
-Demon's Souls is not considered rendering.
+sparse, untraced run that drains the already-observed real flip through presenter acceptance and
+completes a present/frame; until then Demon's Souls is not considered rendering.
 
 **2026-08-11 Metal release cleanup (offline; no game run):** the optimized Metal package now builds
 without the previous 41 unused/dead-code warnings. An obsolete captured global byte-cache shell,
@@ -770,12 +819,12 @@ mapping registries.
 | --- | --- | --- |
 | CPU, loader, linker | x86-64 guest execution behind a native CPU backend under Rosetta; SELF/ELF mapping, observed relocations, AMD64 DTV slots, per-thread `__tls_get_addr`, TLS clone rebasing, and import trampolines with synthetic coverage. | Continue source-backed HLE import closure. The AArch64 translator stays deferred until a milestone requires it. |
 | AGC / PM4 ordering | Native Gen5 command routing, type-2 packets, clear state, packet predication, targetless scanout association, compute submission, ordered memory copy/write/release/wait events, submission boundaries, and a bounded backpressured event channel with an ordered shader-compile gate. | Execution-side `SET_PREDICATION` semantics, then source-backed release/wait, cache visibility, fence writes, and graphics-equeue completion. |
-| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, AddrLib-compatible GFX10 `SW_4KB_S` packed mip/array/cube upload, MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts when guest formats exercise them. |
+| Metal resources / readback | Persistent guest textures backed by either direct-memory views or committed (reserve-then-commit / flexible) guest memory, direct private scanout targets, command-batch completion, shared staging-buffer readback, exact packed rows, AddrLib-compatible GFX10 `SW_4KB_S` packed mip/array/cube upload, exact `SW_64KB_S` 2D mip chains, absolute `BASE_ARRAY` selection with local Metal slices/absolute guest swizzles, exact single-level mode-27 writable 2D arrays, MSAA resolve targets, supported depth readback, and GPU-side assembly of layered depth-sample views (shadow cubemaps/cascades rendered as per-face 2D depth targets and bound through one layered SRD are blit-assembled into a cached depth-format array inside the guest batch instead of round-tripping every face through guest memory each frame). Covered by GPU tests. | Bounded asynchronous capture tickets and a reusable staging pool; explicit block-compressed and combined depth/stencil layouts; layered 64K mip arrays and writable D3 authority when guest formats exercise them. |
 | Guest virtual/direct memory | Fixed/hinted mappings, physical allocation splits, coherent aliases, strict range unmap/protect, `MAP_NO_COALESCE` identity preservation, release-time alias invalidation, shared-mapping identity tracking, CPU write-watch retirement across remaps, and commit-on-protect reserve+commit semantics: `sceKernelMprotect` over a reserved range and flexible mappings commit zero-filled memory into a virtually-keyed shared backing, so GPU residency and write-watching resolve them exactly like direct-memory views, decommit zeroes pages before release, and guest-visible `VirtualQuery` categories are unchanged. The backing is keyed by virtual placement — a deliberate scope decision: this memory class never exposes a physical address to the guest, so physical aliasing of it is unrepresentable by construction, unlike direct memory, which keeps its own physically-keyed backing object. All with synthetic coverage. | Coalesce adjacent contiguous shared-registry records at registration: commit-heavy titles insert one record per `mprotect`, and resolution currently scans records linearly per watch creation and arms one watch segment per record. Mapping lifecycle counters and exact query error/flag behavior for all exercised cases. Memory-pool NIDs (`sceKernelMemoryPoolReserve`/`Commit`/`Expand`/`Move`/…) stay loudly unimplemented until designed: pools deal in guest-physical block addresses (`Expand` returns one, `Move` re-points committed blocks without copying), so they need physically-keyed backing and must not silently reuse the virtually-keyed commit path. |
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, `CB_COLOR_CONTROL` resolve/eliminate-fast-clear/FMASK-decompression command handling, seeded AGC register defaults (Phase 1D), stencil/depth-bias/`CB_COLOR_INFO` blend-bypass/`UcGeCntl` NGG decode, and translated shader pipelines with cached construction. | Combined depth/stencil surface formats; remaining multisampling behavior; full structural pipeline-cache identity. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, zero-copy global bindings, wave64 ballot handling on SIMD32, and observed compute geometry, with offline Metal compilation tests. | Complete the remaining RDNA2 instruction/resource/control-flow surface and eliminate residual per-draw Metal buffer churn without weakening guest-memory visibility. |
 | Presentation / frame capture | Guest display size independent of host drawable size; opt-in headless Metal; interactive runs as a regular app bundle; direct scanout without routine GPU-to-CPU round trips; asynchronous shader compilation with strict event ordering; on-disk Metal library and pipeline caches; live title-bar performance statistics. | Resolve early post-boot output into the first real scene and use completed-presentation and guest-flip rates to measure pacing. |
-| Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes/condvars/rwlocks/semaphores keyed by SDK control-block handles (Phase 1A closed — Scream mutex path passes); guest `fs:` TLS via seeded decode + helpers + SIGSEGV backstop (Phase 1B closed); ordered guest label/HLE word publication with release stores + payload→label fence (Phase 1C closed); complete 13-NID asynchronous CPU ACM engine with checked contexts, batches, waits, statistics, FFT/IFFT, panning, and convolution; video-out attributes; save-data basics; NP service objects. | Reach and validate the first real Demon’s Souls VideoOut/AGC flip after the current offline fixes; cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
+| Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes/condvars/rwlocks/semaphores keyed by SDK control-block handles (Phase 1A closed — Scream mutex path passes); guest `fs:` TLS via seeded decode + helpers + SIGSEGV backstop (Phase 1B closed); ordered guest label/HLE word publication with release stores + payload→label fence (Phase 1C closed); complete 13-NID asynchronous CPU ACM engine with checked contexts, batches, waits, statistics, FFT/IFFT, panning, and convolution; video-out attributes; save-data basics; NP service objects. | Drain the observed Demon’s Souls AGC flip through presenter acceptance and a completed frame; cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
 | Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Crackling from 15–17% audio underruns under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
 | Video / Bink | Initial AvPlayer MP4/H.264 and audio decode through ffmpeg pipes, stream enumeration, play/pause/resume/seek/loop/trick-speed state, media-clock frame gating, NV12 buffers, and deferred event callbacks, covered by generated fixtures. | Present the Unity title's intro frames and resolve its preparation/pause transition; Bink has no compatibility claim yet. |
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |
