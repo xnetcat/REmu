@@ -24,7 +24,9 @@ mod guest_space;
 pub(crate) use guest_space::{forget_guest_reservation, publish_guest_reservation};
 
 mod page;
-use page::{HOST_PAGE_SIZE, align_down, align_up, host_page_size, host_page_size_infallible};
+#[cfg(test)]
+use page::host_page_size;
+use page::{align_down, align_up, host_page_size_infallible, initialize_host_page_size};
 
 mod signal;
 pub use signal::{GuestFaultDeliveryHandler, GuestFsFaultHandler, GuestReadMaterializer};
@@ -246,15 +248,7 @@ impl CpuWriteWatch {
                 "CPU write watch range overflows",
             )
         })?;
-        let page_size = host_page_size()?;
-        let recorded_page_size = HOST_PAGE_SIZE.load(Ordering::Acquire);
-        if recorded_page_size == 0 {
-            HOST_PAGE_SIZE.store(page_size, Ordering::Release);
-        } else if recorded_page_size != page_size {
-            return Err(io::Error::other(
-                "host page size changed after CPU write-watch initialization",
-            ));
-        }
+        let page_size = initialize_host_page_size()?;
         let page_start = align_down(address, page_size);
         let page_end = align_up(range_end, page_size).ok_or_else(|| {
             io::Error::new(

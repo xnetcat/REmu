@@ -66,6 +66,18 @@ pub(super) fn host_page_size() -> io::Result<u64> {
     Ok(page_size)
 }
 
+/// Resolves and publishes the immutable host page size before signal handlers may consume it.
+pub(super) fn initialize_host_page_size() -> io::Result<u64> {
+    let page_size = host_page_size()?;
+    match HOST_PAGE_SIZE.compare_exchange(0, page_size, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => Ok(page_size),
+        Err(recorded) if recorded == page_size => Ok(recorded),
+        Err(_) => Err(io::Error::other(
+            "host page size changed after write-watch initialization",
+        )),
+    }
+}
+
 pub(super) fn host_page_size_infallible() -> u64 {
     HOST_PAGE_SIZE.load(Ordering::Acquire)
 }
@@ -78,5 +90,18 @@ pub(super) const fn align_up(value: u64, alignment: u64) -> Option<u64> {
     match value.checked_add(alignment - 1) {
         Some(sum) => Some(sum & !(alignment - 1)),
         None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{host_page_size_infallible, initialize_host_page_size};
+
+    #[test]
+    fn page_geometry_is_published_before_a_fault_handler_can_read_it() {
+        let page_size = initialize_host_page_size().expect("host page geometry");
+        assert!(page_size.is_power_of_two());
+        assert_eq!(host_page_size_infallible(), page_size);
+        assert_eq!(initialize_host_page_size().unwrap(), page_size);
     }
 }

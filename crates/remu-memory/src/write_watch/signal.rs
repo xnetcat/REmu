@@ -7,14 +7,14 @@ use std::ffi::c_void;
 use std::io;
 use std::mem::MaybeUninit;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
 use super::diagnostic::{
     DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace, format_fault_registers,
-    format_fault_report, format_fault_stack_words,
+    format_fault_report, format_fault_stack_preceding_words, format_fault_stack_words,
 };
 use super::guest_space::contains_guest_address;
-use super::page::{align_down, host_page_size_infallible};
+use super::page::{align_down, host_page_size_infallible, initialize_host_page_size};
 use super::snapshot::{ACTIVE_HANDLERS, WATCH_SNAPSHOT};
 
 static RECOVERED_DISARMED_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -111,6 +111,13 @@ enum FaultAccess {
 
 static HANDLER_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
 
+/// A private pipe lets the kernel validate and copy a best-effort crash stack window. Passing an
+/// unmapped source to `write` returns EFAULT instead of recursively faulting inside the handler.
+static DIAGNOSTIC_COPY_PIPE_RESULT: OnceLock<Result<(), i32>> = OnceLock::new();
+static DIAGNOSTIC_COPY_READ_FD: AtomicI32 = AtomicI32::new(-1);
+static DIAGNOSTIC_COPY_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+static DIAGNOSTIC_COPY_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 struct PreviousAction(std::cell::UnsafeCell<MaybeUninit<libc::sigaction>>);
 
 // SAFETY: installation initializes the slot before a watched page is published and the stored
@@ -148,10 +155,46 @@ static PREVIOUS_SIGSEGV: PreviousAction = PreviousAction::new();
 pub fn install_fault_handlers() -> io::Result<()> {
     // Resolve the journal's enable flag here so the handler never reads the environment.
     let _ = crate::guest_write_journal_enabled();
+    // Stack diagnostics need page geometry even when this is an early fault before the first CPU
+    // watch. Resolve it here, outside signal context, before publishing either handler.
+    let _ = initialize_host_page_size()?;
     let result = HANDLER_RESULT.get_or_init(|| {
+        initialize_diagnostic_copy_pipe()
+            .map_err(|error| error.raw_os_error().unwrap_or(libc::EIO))?;
         // SAFETY: the static previous-action slots outlive the process and the installed callback
         // has the SA_SIGINFO ABI required by sigaction.
         unsafe { install_fault_handlers_once() }
+    });
+    result.map_err(io::Error::from_raw_os_error)
+}
+
+/// Creates the pipe used to make invalid crash-stack reads fail with EFAULT.
+fn initialize_diagnostic_copy_pipe() -> io::Result<()> {
+    let result = DIAGNOSTIC_COPY_PIPE_RESULT.get_or_init(|| {
+        let mut fds = [-1_i32; 2];
+        // SAFETY: `fds` has the two writable integer slots required by pipe(2).
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO));
+        }
+        for fd in fds {
+            // SAFETY: both descriptors were returned by pipe and remain owned by the process.
+            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+                let error = io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO);
+                // SAFETY: these are the two live descriptors returned above.
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                return Err(error);
+            }
+        }
+        DIAGNOSTIC_COPY_READ_FD.store(fds[0], Ordering::Release);
+        DIAGNOSTIC_COPY_WRITE_FD.store(fds[1], Ordering::Release);
+        Ok(())
     });
     result.map_err(io::Error::from_raw_os_error)
 }
@@ -517,7 +560,7 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
     // emulator publication that covers the faulting bytes before the process dies. The register
     // values anchor the dump: a poisoned dereference faults on the derived garbage pointer, while
     // the corrupted slot it was loaded from is still in the interrupted register file.
-    let mut anchors = [0_u64; REGISTER_COUNT];
+    let mut anchors = [0_u64; REGISTER_COUNT + 1];
     let mut anchor_count = 0;
     if let Some(registers) = registers.as_ref() {
         for register in registers {
@@ -529,19 +572,33 @@ fn write_fault_diagnostic((report, registers): FaultState, reason: FaultReason) 
             anchors[anchor_count] = register.value;
             anchor_count += 1;
         }
+        // x86 reports a `ret` to zero after consuming the target and advancing RSP. Preserve that
+        // exact slot as a crash-journal/raw-memory anchor; the ordinary RSP exclusion above still
+        // avoids noisy matches for every other fault.
+        if reason == FaultReason::NullAddress
+            && report.program_counter == 0
+            && let Some(stack_pointer) = registers
+                .iter()
+                .find(|register| register.name == b"rsp")
+                .map(|register| register.value)
+        {
+            anchors[anchor_count] = stack_pointer.saturating_sub(8);
+            anchor_count += 1;
+        }
     }
     crate::dump_guest_write_journal(report.address, &anchors[..anchor_count]);
 }
 
-/// Emits the mapped remainder of the interrupted stack page for offline symbolication.
+/// Emits bounded words around the interrupted stack pointer for offline symbolication.
 ///
-/// The signal frame itself proves that bytes below the interrupted stack pointer are mapped, but
-/// a pointer exactly at a page boundary may legally name an unmapped next page. Requiring a
-/// nonzero in-page offset and never crossing that page keeps this last-chance read bounded. The
-/// handler deliberately uses unaligned volatile reads because the corrupted frame may no longer
-/// satisfy the ABI alignment rule.
+/// A pointer exactly at a page boundary may legally name an unmapped adjacent page, so both sides
+/// remain inside the page containing RSP. The handler deliberately uses unaligned reads because a
+/// corrupted frame may no longer satisfy the ABI alignment rule.
 fn write_interrupted_stack_diagnostic(registers: &[FaultRegister]) {
     const MAX_STACK_WORDS: usize = 48;
+    const PRECEDING_WORDS_PER_LINE: usize = 32;
+    const MAX_PRECEDING_STACK_WORDS: usize = 64;
+    const MAX_STACK_BYTES: usize = (MAX_PRECEDING_STACK_WORDS + MAX_STACK_WORDS) * 8;
     let Some(stack_pointer) = registers
         .iter()
         .find(|register| register.name == b"rsp" || register.name == b"sp")
@@ -553,24 +610,140 @@ fn write_interrupted_stack_diagnostic(registers: &[FaultRegister]) {
         return;
     };
     let page_size = host_page_size_infallible() as usize;
-    let in_page_offset = stack_pointer_usize & (page_size - 1);
-    if in_page_offset == 0 {
+    let Some(window) = stack_diagnostic_window(stack_pointer_usize, page_size) else {
+        return;
+    };
+    let preceding_word_count = window.preceding_words;
+    let total_word_count = preceding_word_count + window.following_words.min(MAX_STACK_WORDS);
+    let mut copied = [0_u8; MAX_STACK_BYTES];
+    if DIAGNOSTIC_COPY_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return;
     }
-    let available_words = (page_size - in_page_offset) / std::mem::size_of::<u64>();
-    let word_count = available_words.min(MAX_STACK_WORDS);
+    if !copy_process_bytes(
+        window.preceding_start,
+        &mut copied[..total_word_count * std::mem::size_of::<u64>()],
+    ) {
+        // A failed or partial pipe operation may leave unread bytes. Keep this best-effort path
+        // disabled for the rest of the process rather than risk mixing two crash windows.
+        return;
+    }
+    if preceding_word_count != 0 {
+        let preceding_start = window.preceding_start;
+        let mut preceding_words = [0_u64; MAX_PRECEDING_STACK_WORDS];
+        for (index, word) in preceding_words[..preceding_word_count]
+            .iter_mut()
+            .enumerate()
+        {
+            *word = copied_word(&copied, index);
+        }
+        for (chunk_index, words) in preceding_words[..preceding_word_count]
+            .chunks(PRECEDING_WORDS_PER_LINE)
+            .enumerate()
+        {
+            let chunk_start = preceding_start + chunk_index * PRECEDING_WORDS_PER_LINE * 8;
+            let mut buffer = DiagnosticBuffer::new();
+            format_fault_stack_preceding_words(
+                stack_pointer,
+                chunk_start as u64,
+                words,
+                &mut buffer,
+            );
+            write_signal_diagnostic_bytes(buffer.as_slice());
+        }
+    }
+    let word_count = window.following_words.min(MAX_STACK_WORDS);
     if word_count == 0 {
+        DIAGNOSTIC_COPY_CLAIMED.store(false, Ordering::Release);
         return;
     }
     let mut words = [0_u64; MAX_STACK_WORDS];
     for (index, word) in words[..word_count].iter_mut().enumerate() {
-        // SAFETY: the interrupted stack pointer lies in the mapped stack page used to enter this
-        // handler, and `word_count` is bounded to the remainder of that same page.
-        *word = unsafe { std::ptr::read_volatile((stack_pointer_usize + index * 8) as *const u64) };
+        *word = copied_word(&copied, preceding_word_count + index);
     }
     let mut buffer = DiagnosticBuffer::new();
     format_fault_stack_words(stack_pointer, &words[..word_count], &mut buffer);
     write_signal_diagnostic_bytes(buffer.as_slice());
+    DIAGNOSTIC_COPY_CLAIMED.store(false, Ordering::Release);
+}
+
+/// Copies bytes through the pre-created diagnostic pipe in async-signal-safe chunks.
+///
+/// The kernel performs the source validation for write(2). An invalid or unreadable saved stack
+/// pointer therefore returns false rather than becoming a nested SIGSEGV in this handler.
+fn copy_process_bytes(source: usize, output: &mut [u8]) -> bool {
+    const COPY_CHUNK_BYTES: usize = 512;
+    let read_fd = DIAGNOSTIC_COPY_READ_FD.load(Ordering::Acquire);
+    let write_fd = DIAGNOSTIC_COPY_WRITE_FD.load(Ordering::Acquire);
+    if read_fd < 0 || write_fd < 0 {
+        return false;
+    }
+    let mut copied = 0;
+    while copied < output.len() {
+        let chunk = (output.len() - copied).min(COPY_CHUNK_BYTES);
+        let Some(source_address) = source.checked_add(copied) else {
+            return false;
+        };
+        // SAFETY: write(2) accepts an arbitrary userspace source and returns EFAULT if the kernel
+        // cannot copy from it. The private blocking pipe is empty before each <=512-byte chunk.
+        let written = unsafe { libc::write(write_fd, source_address as *const c_void, chunk) };
+        if written != chunk as isize {
+            return false;
+        }
+        // SAFETY: this output slice is writable for `chunk` bytes and the pipe now contains the
+        // complete chunk written immediately above.
+        let read = unsafe {
+            libc::read(
+                read_fd,
+                output[copied..copied + chunk].as_mut_ptr().cast(),
+                chunk,
+            )
+        };
+        if read != chunk as isize {
+            return false;
+        }
+        copied += chunk;
+    }
+    true
+}
+
+fn copied_word(bytes: &[u8], index: usize) -> u64 {
+    let offset = index * std::mem::size_of::<u64>();
+    // SAFETY: callers populate a complete byte window and request only words inside that window;
+    // read_unaligned is required because the captured guest RSP may not satisfy ABI alignment.
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(offset).cast::<u64>()) }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StackDiagnosticWindow {
+    preceding_start: usize,
+    preceding_words: usize,
+    following_words: usize,
+}
+
+/// Computes a bounded stack window without ever crossing RSP's current mapped page.
+fn stack_diagnostic_window(
+    stack_pointer: usize,
+    page_size: usize,
+) -> Option<StackDiagnosticWindow> {
+    if !page_size.is_power_of_two() {
+        return None;
+    }
+    let in_page_offset = stack_pointer & (page_size - 1);
+    // RSP at a boundary names the first byte of the next page. The preceding page may already be
+    // unmapped after a `ret`, and the next page is not proven mapped either, so do not probe it
+    // from signal context.
+    if in_page_offset == 0 {
+        return None;
+    }
+    let preceding_words = (in_page_offset / 8).min(64);
+    Some(StackDiagnosticWindow {
+        preceding_start: stack_pointer - preceding_words * 8,
+        preceding_words,
+        following_words: ((page_size - in_page_offset) / 8).min(48),
+    })
 }
 
 /// Reads the interrupted instruction pointer and integer registers out of the machine context.
@@ -818,5 +991,53 @@ unsafe fn chain_previous_action(
             // SAFETY: forward the signal number supplied by the kernel.
             unsafe { callback(signal) };
         }
+    }
+}
+
+#[cfg(test)]
+mod stack_diagnostic_tests {
+    use super::{
+        StackDiagnosticWindow, copy_process_bytes, initialize_diagnostic_copy_pipe,
+        stack_diagnostic_window,
+    };
+
+    #[test]
+    fn centers_the_demons_souls_stack_window_without_crossing_its_page() {
+        assert_eq!(
+            stack_diagnostic_window(0x7108_803f00, 0x4000),
+            Some(StackDiagnosticWindow {
+                preceding_start: 0x7108_803d00,
+                preceding_words: 64,
+                following_words: 32,
+            })
+        );
+    }
+
+    #[test]
+    fn handles_page_boundaries_and_refuses_uninitialized_geometry() {
+        assert_eq!(stack_diagnostic_window(0x7108_804000, 0x4000), None);
+        assert_eq!(
+            stack_diagnostic_window(0x7108_803f03, 0x4000),
+            Some(StackDiagnosticWindow {
+                preceding_start: 0x7108_803d03,
+                preceding_words: 64,
+                following_words: 31,
+            }),
+            "misaligned corrupted stacks still use unaligned, page-clamped reads"
+        );
+        assert_eq!(stack_diagnostic_window(0x7108_804000, 0), None);
+    }
+
+    #[test]
+    fn kernel_copy_rejects_an_unmapped_stack_without_dereferencing_it() {
+        initialize_diagnostic_copy_pipe().expect("diagnostic copy pipe");
+        let source = *b"xunaligned-stack-window";
+        let mut copied = [0_u8; 16];
+        assert!(copy_process_bytes(source.as_ptr().addr() + 1, &mut copied,));
+        assert_eq!(&copied, &source[1..17]);
+
+        let mut refused = [0_u8; 8];
+        assert!(!copy_process_bytes(1, &mut refused));
+        assert_eq!(refused, [0; 8]);
     }
 }
