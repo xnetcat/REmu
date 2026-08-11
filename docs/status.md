@@ -132,11 +132,11 @@ fill byte inferred from poison-shaped addresses such as the observed `0x03` patt
 
 Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 14/14, and
 `remu-memory` 94/94 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
-suite is 754/755: the remaining
-`links_relative_and_import_relocations_into_fixed_memory` TLS decode assertion reproduces alone and
-does not touch the changed fiber or shader paths. The next acceptance point is a sparse clean run
-that passes both prior failures and reaches a real VideoOut flip/frame; until then Demon’s Souls is
-not considered rendering.
+suite is 756/756. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
+dynamic data rather than its live FS function; `36593f56` gives the seeded decoder authenticated
+control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
+sparse clean run that passes both prior failures and reaches a real VideoOut flip/frame; until then
+Demon’s Souls is not considered rendering.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
