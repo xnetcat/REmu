@@ -89,6 +89,41 @@ coalesced ranges. Release builds use one codegen unit with ThinLTO. Focused unit
 contract; this is not yet an FPS claim because the requested no-game constraint prevents a clean
 before/after title benchmark.
 
+## Demon's Souls bring-up (updated 2026-08-11) — first draw, no flip/frame yet
+
+The complete CPU ACM engine is no longer the title's first blocker. Its context, batch, command,
+buffer, execution, wait, statistics, and teardown paths are implemented with SDK-shaped errors and
+bounded asynchronous state. The frequent `sceAmprCommandBufferReset` `EPERM` results are expected
+for this title's cold inline command buffers: the SDK documents that result when no buffer is
+attached, and the title immediately clears and attaches one. Returning fabricated success there
+would hide a valid lifecycle transition and would not remove the calls.
+
+**Last clean bounded run (`72175efc`, 2026-08-11):** the title reached its main loop, submitted
+eight AGC command buffers, compiled eight compute pipelines, and reached one draw. It produced no
+VideoOut flip and no captured frame before a host fiber-resume SIGSEGV. This is progress beyond the
+old "ACM-blocked / no AGC" checkpoint, not a UI, 3D, FPS, or playability claim.
+
+Two evidence-backed blockers from that run are now fixed in code but have not been game-validated:
+
+- **Compute image resource discovery (`56a23331`):** the failed `ImageStore` was given
+  `[0x40300090, 0x70, 0, ...]`, which is the two-dword user-data pointer `0x7040300090`, not a
+  GFX10 image descriptor. Forward SCC branches now retain their non-taken path for supplemental
+  resource discovery, so a skipped block's own `S_LOAD_DWORDX8` supplies the real T# rather than
+  the evaluator copying the initial pointer into an eight-dword descriptor. Nonzero-address
+  FORMAT/TYPE 0 remains an error; it was not reinterpreted as a typeless image.
+- **Migrating fiber resume (`dc57398f`):** the crash restored `rsp=0` from a saved context located
+  on a fiber stack that another worker was actively using. Suspended callee-saved state now lives
+  in stable storage inside the opaque 256-byte `SceFiber`; resume validates its canonical pointer,
+  return frame, and declared stack bounds after atomically claiming the fiber. The fresh-entry
+  trampoline also consumes all handoff fields before publishing the outgoing stack as idle.
+
+Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 14/14, and
+`-D warnings` lint for both changed packages. The full x86 runtime suite is 754/755: the remaining
+`links_relative_and_import_relocations_into_fixed_memory` TLS decode assertion reproduces alone and
+does not touch the changed fiber or shader paths. The next acceptance point is a sparse clean run
+that passes both prior failures and reaches a real VideoOut flip/frame; until then Demon’s Souls is
+not considered rendering.
+
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
 Guest exception delivery with Orbis `ucontext_t` (mcontext at `+0x40`); interruptive
