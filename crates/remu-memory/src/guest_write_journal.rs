@@ -342,13 +342,24 @@ pub const fn address_looks_poisoned(address: u64) -> bool {
     high[1] == first && high[2] == first && high[3] == first && high[4] == first
 }
 
+/// Returns the repeated byte inferred from a poisoned pointer-shaped address.
+#[must_use]
+pub const fn address_poison_byte(address: u64) -> Option<u8> {
+    if address_looks_poisoned(address) {
+        Some((address >> 24) as u8)
+    } else {
+        None
+    }
+}
+
 /// Bytes around the faulting address inside which an entry still counts as circumstantial.
 const NEAR_FAULT_WINDOW: u64 = 64 * 1024;
 
 /// Bytes past a register value inside which an entry names the structure that register points at.
-/// The corrupted-slot loads seen so far are `[reg]`, `[reg+8]`, `[reg+0x118]` and `[reg+0x3e8]`,
-/// so one page bounds the plausible field offsets.
-const REGISTER_ANCHOR_WINDOW: u64 = 0x1000;
+/// The corrupted-slot loads seen so far include a publication beginning exactly one page past an
+/// object register. Four pages retain those nearby fields while keeping the signal-time scan
+/// bounded; the interval remains half-open so a write beginning at its end is not misclassified.
+const REGISTER_ANCHOR_WINDOW: u64 = 0x4000;
 
 /// Register values below this cannot be guest heap and only produce noise matches.
 const ANCHOR_FLOOR: u64 = 0x10000;
@@ -442,9 +453,11 @@ fn dump_guest_write_journal_locked(fault_address: u64, anchors: &[u64]) {
         }
     }
 
-    // Inventory of every uniform fill the emulator applied, newest first. A poison crash whose
-    // victim holds 0x40s while this inventory is empty proves the fill came from guest stores the
-    // journal cannot see, which redirects the whole investigation.
+    // Inventory of every relevant uniform fill the emulator applied, newest first. In addition
+    // to the historically common 0x40 and bulk-zero patterns, infer the byte directly from this
+    // crash's poisoned address; Demon’s Souls has also produced uniform 0x03 pointers.
+    let inferred_poison = address_poison_byte(fault_address).map(u32::from);
+    let mut poison_fills = 0_u64;
     let mut forty_fills = 0_u64;
     let mut bulk_zero_fills = 0_u64;
     for sequence in (live_from..recorded).rev() {
@@ -452,6 +465,12 @@ fn dump_guest_write_journal_locked(fault_address: u64, anchors: &[u64]) {
             continue;
         };
         let uniform = entry.uniform & !SAMPLED_PAYLOAD;
+        if entry.byte_count >= 8 && inferred_poison == Some(uniform) {
+            poison_fills += 1;
+            if poison_fills <= 96 {
+                emit_entry(b"fill-poison", &entry, None, &mut buffer);
+            }
+        }
         if uniform == 0x40 {
             forty_fills += 1;
             if forty_fills <= 96 {
@@ -470,6 +489,8 @@ fn dump_guest_write_journal_locked(fault_address: u64, anchors: &[u64]) {
     buffer.push_signed(covering.try_into().unwrap_or(i64::MAX));
     buffer.push_bytes(b" matched=");
     buffer.push_signed(matched.try_into().unwrap_or(i64::MAX));
+    buffer.push_bytes(b" fillpoison=");
+    buffer.push_signed(poison_fills.try_into().unwrap_or(i64::MAX));
     buffer.push_bytes(b" fill40=");
     buffer.push_signed(forty_fills.try_into().unwrap_or(i64::MAX));
     buffer.push_bytes(b" fillzero=");
@@ -699,8 +720,9 @@ fn write_diagnostic(_buffer: &DiagnosticBuffer) {}
 mod tests {
     use super::{
         CAPACITY, ENABLED, ENABLED_YES, GuestWriteSite, JournalEntry, MIXED_PAYLOAD, NEXT_SEQUENCE,
-        SAMPLED_PAYLOAD, address_looks_poisoned, payload_prefix, read_slot,
-        record_guest_cpu_page_open, record_guest_write, slots_for_recording, uniform_byte,
+        REGISTER_ANCHOR_WINDOW, SAMPLED_PAYLOAD, address_looks_poisoned, address_poison_byte,
+        payload_prefix, read_slot, record_guest_cpu_page_open, record_guest_write,
+        slots_for_recording, uniform_byte,
     };
     use std::sync::atomic::Ordering;
 
@@ -710,12 +732,15 @@ mod tests {
 
     #[test]
     fn recognizes_pointers_assembled_from_a_repeated_fill_byte() {
+        assert_eq!(address_poison_byte(0x0303_0303_0309_0be3), Some(0x03));
+        assert_eq!(address_poison_byte(0x4040_4040_4040_4158), Some(0x40));
         assert!(address_looks_poisoned(0x4040_4040_4040_4158));
         assert!(address_looks_poisoned(0x4040_4040_4040_40a0));
         assert!(address_looks_poisoned(0x0000_0000_0000_00a0));
         assert!(!address_looks_poisoned(0x0000_0071_c13c_4a80));
         assert!(!address_looks_poisoned(0x0000_0090_0c1c_0320));
         assert!(!address_looks_poisoned(0x0000_7f00_1234_5678));
+        assert_eq!(address_poison_byte(0x0000_7f00_1234_5678), None);
     }
 
     #[test]
@@ -751,6 +776,27 @@ mod tests {
         assert!(entry.covers(0x900c_1c00_00 + 0xfff));
         assert!(!entry.covers(0x900c_1c00_00 + 0x1000));
         assert!(!entry.covers(0x900c_1c00_00 - 1));
+    }
+
+    #[test]
+    fn register_anchor_window_includes_fields_on_the_next_page_but_not_its_end() {
+        let anchor = 0x8003_1126_d8;
+        let publication = JournalEntry {
+            sequence: 0,
+            site: GuestWriteSite::DmaCopy,
+            address: anchor + 0x1000,
+            byte_count: 8,
+            payload: 0,
+            uniform: MIXED_PAYLOAD,
+            submission: 0,
+        };
+        assert!(publication.intersects(anchor, anchor + REGISTER_ANCHOR_WINDOW));
+
+        let at_end = JournalEntry {
+            address: anchor + REGISTER_ANCHOR_WINDOW,
+            ..publication
+        };
+        assert!(!at_end.intersects(anchor, anchor + REGISTER_ANCHOR_WINDOW));
     }
 
     #[test]
