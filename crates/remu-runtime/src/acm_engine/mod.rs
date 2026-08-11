@@ -618,7 +618,7 @@ fn execute_plan_with_elapsed(
             }
             Command::Fft(job) => pending.extend(dsp::execute_fft(job)?),
             Command::Panner(job) => pending.extend(dsp::execute_panner(job)?),
-            Command::Convolution(_) => {}
+            Command::Convolution(job) => pending.extend(dsp::execute_convolution(job)?),
             #[cfg(test)]
             Command::TestWrite(write) => pending.push(write.clone()),
             #[cfg(test)]
