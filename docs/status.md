@@ -372,7 +372,10 @@ GPU-to-guest writebacks into such storage could not land — but it is not proof
 recorded consumer sites remain the checklist: this entry closes when sustained interactive
 progress shows none of them faulting, not because the crash stopped appearing in short runs.
 
-### The Bluepoint title idles at startup without its fiber ABI
+### Historical Bluepoint startup chronology (superseded by the 2026-08-11 status above)
+
+This section preserves the sequence of blockers found during bring-up. Statements about the title
+having no draws or lacking ACM describe their dated checkpoint; they are not the current result.
 
 A third title (Bluepoint's BPE engine) previously aborted about three seconds into startup, inside
 its own `PS5PlatformPageAllocator`. Three unserved imports caused it, each one a call whose result
@@ -419,11 +422,11 @@ file-loader, and task-manager pipeline.
 The title now runs to roughly ninety thousand imports. It configures its display — 1920x1080
 through `sceVideoOutSetBufferAttribute2` and `sceVideoOutRegisterBuffers2` — and brings up audio.
 
-`sceAcmContextCreate`/`Destroy` are served: an ACM context is an opaque handle the guest hands back
-to the batch entry points, so issuing a distinct live id is that call's whole contract. The
-signal-processing batch entry points stay unimplemented. This removed a spurious failure but was
-not a blocker: the engine creates a context, immediately destroys it, unloads the module, and
-finalizes Ajm either way, which reads as a capability probe rather than a failed path.
+At this checkpoint only `sceAcmContextCreate`/`Destroy` were served: an ACM context is an opaque
+handle the guest hands back to the batch entry points, so issuing a distinct live id was that
+call's whole contract. The signal-processing batch entry points were still unimplemented. The
+later trace below disproved the initial capability-probe interpretation and led to the complete ACM
+engine recorded in the current status above.
 
 One APR defect was a REmu performance bug rather than a missing ABI. The successful branch of
 path resolution logged unconditionally while every other trace in that module is gated. A title
@@ -444,16 +447,16 @@ configured.
 Every import this title reaches is now served: a run reports zero unimplemented NIDs. Nine were
 added, each one unblocking the next: `sceKernelSetPrtAperture` (which records an aperture over the
 partially-resident-texture window and is real bookkeeping, not a stub),
-`sceUserServiceGetPlatformPrivacySetting`, `sceVideoOutColorSettingsSetGamma_` (whose value arrives
+`sceUserServiceGetPlatformPrivacyWs1`, `sceVideoOutColorSettingsSetGamma_` (whose value arrives
 in the first floating-point register), `sceSystemGestureOpen`,
 `sceSystemGestureInitializePrimitiveTouchRecognizer`, `sceSystemGestureCreateTouchRecognizer`,
 `sceNetCtlInit`, `sceNetCtlGetState`, and `sceNpRegisterStateCallbackA`. The last five model
 hardware this host does not have; each reports the state that is actually true here — no touch
 occurs, no network link exists — rather than a placeholder, and that is recorded on each call.
 
-The title still submits no draws. Differencing against SharpEmu, which reaches menus and gameplay
-on this title, located the divergence. SharpEmu was built from its `main` at `5f1bd5a` and run on
-the same dump with `--trace-imports`.
+At this checkpoint the title still submitted no draws. Differencing against SharpEmu, which reaches
+menus and gameplay on this title, located the divergence. SharpEmu was built from its `main` at
+`5f1bd5a` and run on the same dump with `--trace-imports`.
 
 The gross measure first: SharpEmu issues 17.5 million guest import calls in 150 seconds where REmu
 issues about 110 thousand in 120. REmu's guest is barely executing by comparison, so the plateau is
@@ -514,7 +517,7 @@ so a call that legitimately fails often cannot bury the rest; the environment va
 the bound instead of enabling the report. A whole run of this title reports four failures, none of
 which is its blocker.
 
-The title still submits no draws.
+At that historical checkpoint the title still submitted no draws.
 
 The auditor under-report is fixed (2026-08-03): `scripts/audit-import-coverage.py` walks every
 dispatch chain (including `dispatch_stateless_import`, which serves the fiber family and platform
