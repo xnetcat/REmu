@@ -329,7 +329,7 @@ fn an_uninitialized_or_finalized_fiber_cannot_be_run() {
 
 #[test]
 fn opt_param_initialize_publishes_the_magic_initialize_checks_for() {
-    let mut opt_param = [0_u64; 2];
+    let mut opt_param = [u64::MAX; SCE_FIBER_OPT_PARAM_SIZE / std::mem::size_of::<u64>()];
     let address = opt_param.as_mut_ptr().addr() as u64;
     assert_eq!(opt_param_initialize(0), fiber_error(SCE_FIBER_ERROR_NULL));
     assert_eq!(
@@ -338,6 +338,15 @@ fn opt_param_initialize_publishes_the_magic_initialize_checks_for() {
     );
     assert_eq!(opt_param_initialize(address), 0);
     assert_eq!(read_guest_u32(address), FIBER_OPT_PARAM_MAGIC);
+    assert_eq!(
+        read_guest_u32(address + 4),
+        0,
+        "the initialized debug-option field must default to disabled"
+    );
+    assert!(
+        opt_param[1..].iter().all(|word| *word == 0),
+        "initialization must not leave caller garbage in the public option object"
+    );
 
     // An opt param the guest never initialized is rejected rather than trusted.
     let fiber = FiberObject::default();
@@ -360,6 +369,45 @@ fn opt_param_initialize_publishes_the_magic_initialize_checks_for() {
     );
     stack_arguments[0] = address;
     assert_eq!(initialize(arguments, stack_arguments), 0);
+}
+
+#[test]
+fn context_memory_is_untouched_unless_the_sdk_debug_option_requests_a_size_check() {
+    let fiber = FiberObject::default();
+    let mut stack = FiberStack::new();
+    stack.0.fill(0xa5);
+    let name = c"n";
+    let arguments = [
+        fiber.address(),
+        name.as_ptr().addr() as u64,
+        yields_once as *const () as usize as u64,
+        0,
+        stack.address(),
+        FiberStack::size(),
+    ];
+
+    assert_eq!(initialize(arguments, [0; 6]), 0);
+    assert_eq!(
+        &stack.0[..8],
+        &[0xa5; 8],
+        "a default fiber owns every byte of the context range it supplied"
+    );
+    assert!(stack_intact(fiber.address()));
+
+    let mut opt_param = [0_u64; SCE_FIBER_OPT_PARAM_SIZE / std::mem::size_of::<u64>()];
+    let opt_param_address = opt_param.as_mut_ptr().addr() as u64;
+    assert_eq!(opt_param_initialize(opt_param_address), 0);
+    write_guest_u32(
+        opt_param_address + 4,
+        SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE,
+    );
+    let mut stack_arguments = [0_u64; 6];
+    stack_arguments[0] = opt_param_address;
+    assert_eq!(initialize(arguments, stack_arguments), 0);
+    assert_eq!(read_guest_u64(stack.address()), FIBER_STACK_GUARD);
+    assert!(stack_intact(fiber.address()));
+    write_guest_u64(stack.address(), 0);
+    assert!(!stack_intact(fiber.address()));
 }
 
 #[test]
