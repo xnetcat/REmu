@@ -227,6 +227,64 @@ impl MetalPresenter {
         if let Some(window) = self.window.as_ref() {
             window.set_title(&title);
         }
+        // The live title resets every 500 ms, while structured telemetry is published every five
+        // seconds. Open the optional log on the first live slice and accumulate every resettable
+        // counter before that reset so sparse work remains visible in the declared window.
+        if !self.telemetry_log_attempted {
+            self.telemetry_log_attempted = true;
+            let device_name = self
+                .device
+                .as_ref()
+                .map(|device| device.name().to_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            self.telemetry_log =
+                super::super::telemetry::TelemetryLog::open_in_run_directory(&device_name);
+        }
+        if let Some(log) = self.telemetry_log.as_mut() {
+            use super::super::telemetry::TelemetryLiveSlice;
+            let transitions = &self.statistics.render_pass_key_transitions;
+            log.add_live_slice(TelemetryLiveSlice {
+                guest_flips: self.statistics.guest_flips,
+                completed_presents: self.statistics.completed_presents,
+                submitted_guest_batches: self.statistics.submitted_guest_batches,
+                coalesced_pipeline_barriers: self.statistics.coalesced_pipeline_barriers,
+                encoded_draws: self.statistics.encoded_draws,
+                encoded_compute_dispatches: self.statistics.encoded_compute_dispatches,
+                encoded_render_passes: self.statistics.encoded_render_passes,
+                gpu_execution_time: self.statistics.gpu_execution_time,
+                presentation_queue_latency: self.statistics.presentation_queue_latency,
+                audio_output_frames: interval_audio_output,
+                audio_underrun_frames: interval_underruns,
+                render_pass_ends_for_compute: self.statistics.render_pass_ends_for_compute,
+                render_pass_ends_for_target_change: self
+                    .statistics
+                    .render_pass_ends_for_target_change,
+                render_pass_ends_for_color_operation: self
+                    .statistics
+                    .render_pass_ends_for_color_operation,
+                render_pass_ends_for_batch_flush: self.statistics.render_pass_ends_for_batch_flush,
+                batch_flushes_from_event_loop: self.statistics.batch_flushes_from_event_loop,
+                batch_flushes_for_guest_memory_write: self
+                    .statistics
+                    .batch_flushes_for_guest_memory_write,
+                batch_flushes_for_blocked_wait: self.statistics.batch_flushes_for_blocked_wait,
+                batch_flushes_for_shared_event_host_effect: self
+                    .statistics
+                    .batch_flushes_for_shared_event_host_effect,
+                batch_flushes_for_flip_snapshot: self.statistics.batch_flushes_for_flip_snapshot,
+                batch_flushes_for_work_capacity: self.statistics.batch_flushes_for_work_capacity,
+                batch_flushes_for_command_processor_barrier: self
+                    .statistics
+                    .batch_flushes_for_command_processor_barrier,
+                batch_flushes_for_cpu_synchronization: self
+                    .statistics
+                    .batch_flushes_for_cpu_synchronization,
+                render_pass_key_target_count: transitions.target_count,
+                render_pass_key_target_address: transitions.target_address,
+                render_pass_key_depth_presence: transitions.depth_presence,
+                render_pass_key_depth_address: transitions.depth_address,
+            });
+        }
         if self.statistics.last_logged.elapsed() >= Duration::from_secs(5) {
             eprintln!("[REMu][PERF] {title}");
             let dispatch_window_ms = self.statistics.last_logged.elapsed().as_millis();
@@ -1121,18 +1179,11 @@ impl MetalPresenter {
                 eprintln!("[REMu][PERF-TEXTURE-TOP] {top}");
                 top
             };
-            // Structured record for this declared window (plan E4 + K3), assembled from the same
-            // sampled values the title and PERF lines above printed.
-            if !self.telemetry_log_attempted {
-                self.telemetry_log_attempted = true;
-                let device_name = self
-                    .device
-                    .as_ref()
-                    .map(|device| device.name().to_owned())
-                    .unwrap_or_else(|| "unknown".to_owned());
-                self.telemetry_log =
-                    super::super::telemetry::TelemetryLog::open_in_run_directory(&device_name);
-            }
+            // Structured record for this declared window (plan E4 + K3). Rates below use the
+            // complete five-second counter window; gauges such as queue depth, resident textures,
+            // memory, and pipeline population are point-in-time snapshots at publication.
+            let telemetry_window =
+                Duration::from_millis(u64::try_from(dispatch_window_ms).unwrap_or(u64::MAX));
             let telemetry_committed_batches =
                 u64::try_from(self.committed_guest_batch_count()).unwrap_or(0);
             let telemetry_textures = u64::try_from(self.sampled_texture_cache.len()).unwrap_or(0);
@@ -1140,6 +1191,7 @@ impl MetalPresenter {
             let telemetry_compiling = u64::try_from(self.compiling_shader_pairs.len()).unwrap_or(0);
             if let Some(log) = self.telemetry_log.as_mut() {
                 use super::super::telemetry::{PerfChannelSample, TelemetryValue};
+                let telemetry_sample = log.take_window_sample(telemetry_window);
                 let mean_ns = |histogram: &remu_gpu::DispatchLatencyHistogram| {
                     if histogram.count == 0 {
                         0
@@ -1158,20 +1210,38 @@ impl MetalPresenter {
                         "window_ms",
                         TelemetryValue::from(u64::try_from(dispatch_window_ms).unwrap_or(u64::MAX)),
                     ),
-                    ("fps", TelemetryValue::from(flip_rate)),
-                    ("present_per_s", TelemetryValue::from(present_rate)),
-                    ("gpu_percent", TelemetryValue::from(gpu_utilization)),
+                    ("fps", TelemetryValue::from(telemetry_sample.fps)),
+                    (
+                        "present_per_s",
+                        TelemetryValue::from(telemetry_sample.present_per_s),
+                    ),
+                    (
+                        "gpu_percent",
+                        TelemetryValue::from(telemetry_sample.gpu_percent),
+                    ),
                     (
                         "present_latency_ms",
-                        TelemetryValue::from(presentation_latency_milliseconds),
+                        TelemetryValue::from(telemetry_sample.presentation_latency_ms),
                     ),
-                    ("draw_per_s", TelemetryValue::from(draw_rate)),
-                    ("render_pass_per_s", TelemetryValue::from(render_pass_rate)),
-                    ("compute_per_s", TelemetryValue::from(compute_rate)),
-                    ("guest_batch_per_s", TelemetryValue::from(guest_batch_rate)),
+                    (
+                        "draw_per_s",
+                        TelemetryValue::from(telemetry_sample.draw_per_s),
+                    ),
+                    (
+                        "render_pass_per_s",
+                        TelemetryValue::from(telemetry_sample.render_pass_per_s),
+                    ),
+                    (
+                        "compute_per_s",
+                        TelemetryValue::from(telemetry_sample.compute_per_s),
+                    ),
+                    (
+                        "guest_batch_per_s",
+                        TelemetryValue::from(telemetry_sample.guest_batch_per_s),
+                    ),
                     (
                         "pipeline_barrier_per_s",
-                        TelemetryValue::from(pipeline_barrier_rate),
+                        TelemetryValue::from(telemetry_sample.pipeline_barrier_per_s),
                     ),
                     (
                         "committed_batches",
@@ -1201,10 +1271,13 @@ impl MetalPresenter {
                         "pipelines_compiling",
                         TelemetryValue::from(telemetry_compiling),
                     ),
-                    ("audio_out_per_s", TelemetryValue::from(audio_output_rate)),
+                    (
+                        "audio_out_per_s",
+                        TelemetryValue::from(telemetry_sample.audio_output_per_s),
+                    ),
                     (
                         "audio_underrun_percent",
-                        TelemetryValue::from(audio_underrun_percent),
+                        TelemetryValue::from(telemetry_sample.audio_underrun_percent),
                     ),
                     ("rss_mib", TelemetryValue::from(rss_mib)),
                     ("footprint_mib", TelemetryValue::from(footprint_mib)),
@@ -1249,47 +1322,22 @@ impl MetalPresenter {
                 // Plan K3: the nineteen audit PERF channels join the same declared window.
                 fields.extend(
                     PerfChannelSample {
-                        rp_end_compute_per_s: f64::from(
-                            self.statistics.render_pass_ends_for_compute,
-                        ) / seconds,
-                        rp_end_key_per_s: f64::from(
-                            self.statistics.render_pass_ends_for_target_change,
-                        ) / seconds,
-                        rp_end_color_op_per_s: f64::from(
-                            self.statistics.render_pass_ends_for_color_operation,
-                        ) / seconds,
-                        rp_end_flush_per_s: f64::from(
-                            self.statistics.render_pass_ends_for_batch_flush,
-                        ) / seconds,
-                        cb_flush_tick_per_s: f64::from(
-                            self.statistics.batch_flushes_from_event_loop,
-                        ) / seconds,
-                        cb_flush_memory_per_s: f64::from(
-                            self.statistics.batch_flushes_for_guest_memory_write,
-                        ) / seconds,
-                        cb_flush_wait_per_s: f64::from(
-                            self.statistics.batch_flushes_for_blocked_wait,
-                        ) / seconds,
-                        cb_flush_shared_host_per_s: f64::from(
-                            self.statistics.batch_flushes_for_shared_event_host_effect,
-                        ) / seconds,
-                        cb_flush_flip_per_s: f64::from(
-                            self.statistics.batch_flushes_for_flip_snapshot,
-                        ) / seconds,
-                        cb_flush_capacity_per_s: f64::from(
-                            self.statistics.batch_flushes_for_work_capacity,
-                        ) / seconds,
-                        cb_flush_pfp_per_s: f64::from(
-                            self.statistics.batch_flushes_for_command_processor_barrier,
-                        ) / seconds,
-                        cb_flush_sync_per_s: f64::from(
-                            self.statistics.batch_flushes_for_cpu_synchronization,
-                        ) / seconds,
-                        rp_key_target_count_per_s: f64::from(transitions.target_count) / seconds,
-                        rp_key_target_addr_per_s: f64::from(transitions.target_address) / seconds,
-                        rp_key_depth_presence_per_s: f64::from(transitions.depth_presence)
-                            / seconds,
-                        rp_key_depth_addr_per_s: f64::from(transitions.depth_address) / seconds,
+                        rp_end_compute_per_s: telemetry_sample.rp_end_compute_per_s,
+                        rp_end_key_per_s: telemetry_sample.rp_end_key_per_s,
+                        rp_end_color_op_per_s: telemetry_sample.rp_end_color_op_per_s,
+                        rp_end_flush_per_s: telemetry_sample.rp_end_flush_per_s,
+                        cb_flush_tick_per_s: telemetry_sample.cb_flush_tick_per_s,
+                        cb_flush_memory_per_s: telemetry_sample.cb_flush_memory_per_s,
+                        cb_flush_wait_per_s: telemetry_sample.cb_flush_wait_per_s,
+                        cb_flush_shared_host_per_s: telemetry_sample.cb_flush_shared_host_per_s,
+                        cb_flush_flip_per_s: telemetry_sample.cb_flush_flip_per_s,
+                        cb_flush_capacity_per_s: telemetry_sample.cb_flush_capacity_per_s,
+                        cb_flush_pfp_per_s: telemetry_sample.cb_flush_pfp_per_s,
+                        cb_flush_sync_per_s: telemetry_sample.cb_flush_sync_per_s,
+                        rp_key_target_count_per_s: telemetry_sample.rp_key_target_count_per_s,
+                        rp_key_target_addr_per_s: telemetry_sample.rp_key_target_addr_per_s,
+                        rp_key_depth_presence_per_s: telemetry_sample.rp_key_depth_presence_per_s,
+                        rp_key_depth_addr_per_s: telemetry_sample.rp_key_depth_addr_per_s,
                         pipeline_ready_graphics: u64::try_from(self.compiled_shader_pairs.len())
                             .unwrap_or(0),
                         pipeline_ready_compute: u64::try_from(

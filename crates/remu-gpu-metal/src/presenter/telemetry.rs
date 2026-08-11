@@ -4,10 +4,11 @@
 //! Structured per-window performance records (plan E4 + K3).
 //!
 //! One JSON object per declared measurement window is appended to `telemetry.jsonl` in the run
-//! directory, and `run.json` describes the run once. Every number comes from the same sampler
-//! the window title and `[REMu][PERF*]` lines display, so the two can never disagree. The JSON
-//! is hand-assembled from a flat field list: values are numbers and pre-escaped identifiers
-//! only, which keeps the workspace free of a serialization dependency for data this simple.
+//! directory, and `run.json` describes the run once. Live window-title rates use a short refresh
+//! interval; published records accumulate those slices across the declared telemetry window so
+//! sparse work cannot disappear between records. The JSON is hand-assembled from a flat field
+//! list: values are numbers and pre-escaped identifiers only, which keeps the workspace free of a
+//! serialization dependency for data this simple.
 //!
 //! Plan K3 folds the nineteen audit PERF channels (previously eprintln!-only) into the same
 //! record. The title `PERF` rates stay in the E4 core fields; the other eighteen channels land
@@ -159,10 +160,215 @@ fn telemetry_run_directory() -> Option<PathBuf> {
     directory.is_dir().then_some(directory)
 }
 
+/// One short live-title slice folded into the next published telemetry record.
+#[derive(Clone, Copy, Default)]
+pub(super) struct TelemetryLiveSlice {
+    pub(super) guest_flips: u32,
+    pub(super) completed_presents: u32,
+    pub(super) submitted_guest_batches: u32,
+    pub(super) coalesced_pipeline_barriers: u32,
+    pub(super) encoded_draws: u32,
+    pub(super) encoded_compute_dispatches: u32,
+    pub(super) encoded_render_passes: u32,
+    pub(super) gpu_execution_time: std::time::Duration,
+    pub(super) presentation_queue_latency: std::time::Duration,
+    pub(super) audio_output_frames: u64,
+    pub(super) audio_underrun_frames: u64,
+    pub(super) render_pass_ends_for_compute: u32,
+    pub(super) render_pass_ends_for_target_change: u32,
+    pub(super) render_pass_ends_for_color_operation: u32,
+    pub(super) render_pass_ends_for_batch_flush: u32,
+    pub(super) batch_flushes_from_event_loop: u32,
+    pub(super) batch_flushes_for_guest_memory_write: u32,
+    pub(super) batch_flushes_for_blocked_wait: u32,
+    pub(super) batch_flushes_for_shared_event_host_effect: u32,
+    pub(super) batch_flushes_for_flip_snapshot: u32,
+    pub(super) batch_flushes_for_work_capacity: u32,
+    pub(super) batch_flushes_for_command_processor_barrier: u32,
+    pub(super) batch_flushes_for_cpu_synchronization: u32,
+    pub(super) render_pass_key_target_count: u32,
+    pub(super) render_pass_key_target_address: u32,
+    pub(super) render_pass_key_depth_presence: u32,
+    pub(super) render_pass_key_depth_address: u32,
+}
+
+/// Derived rates for one complete declared telemetry window.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct TelemetryWindowSample {
+    pub(super) fps: f64,
+    pub(super) present_per_s: f64,
+    pub(super) gpu_percent: f64,
+    pub(super) presentation_latency_ms: f64,
+    pub(super) draw_per_s: f64,
+    pub(super) render_pass_per_s: f64,
+    pub(super) compute_per_s: f64,
+    pub(super) guest_batch_per_s: f64,
+    pub(super) pipeline_barrier_per_s: f64,
+    pub(super) audio_output_per_s: f64,
+    pub(super) audio_underrun_percent: f64,
+    pub(super) rp_end_compute_per_s: f64,
+    pub(super) rp_end_key_per_s: f64,
+    pub(super) rp_end_color_op_per_s: f64,
+    pub(super) rp_end_flush_per_s: f64,
+    pub(super) cb_flush_tick_per_s: f64,
+    pub(super) cb_flush_memory_per_s: f64,
+    pub(super) cb_flush_wait_per_s: f64,
+    pub(super) cb_flush_shared_host_per_s: f64,
+    pub(super) cb_flush_flip_per_s: f64,
+    pub(super) cb_flush_capacity_per_s: f64,
+    pub(super) cb_flush_pfp_per_s: f64,
+    pub(super) cb_flush_sync_per_s: f64,
+    pub(super) rp_key_target_count_per_s: f64,
+    pub(super) rp_key_target_addr_per_s: f64,
+    pub(super) rp_key_depth_presence_per_s: f64,
+    pub(super) rp_key_depth_addr_per_s: f64,
+}
+
+/// Counts short live-title slices until the next published telemetry record.
+///
+/// The presenter refreshes its title every 500 ms but records telemetry every five seconds. This
+/// separate accumulator preserves sparse work while allowing the live counters to keep their
+/// responsive reset cadence.
+#[derive(Default)]
+pub(super) struct TelemetryWindowCounters {
+    guest_flips: u64,
+    completed_presents: u64,
+    submitted_guest_batches: u64,
+    coalesced_pipeline_barriers: u64,
+    encoded_draws: u64,
+    encoded_compute_dispatches: u64,
+    encoded_render_passes: u64,
+    gpu_execution_time: std::time::Duration,
+    presentation_queue_latency: std::time::Duration,
+    audio_output_frames: u64,
+    audio_underrun_frames: u64,
+    render_pass_ends_for_compute: u64,
+    render_pass_ends_for_target_change: u64,
+    render_pass_ends_for_color_operation: u64,
+    render_pass_ends_for_batch_flush: u64,
+    batch_flushes_from_event_loop: u64,
+    batch_flushes_for_guest_memory_write: u64,
+    batch_flushes_for_blocked_wait: u64,
+    batch_flushes_for_shared_event_host_effect: u64,
+    batch_flushes_for_flip_snapshot: u64,
+    batch_flushes_for_work_capacity: u64,
+    batch_flushes_for_command_processor_barrier: u64,
+    batch_flushes_for_cpu_synchronization: u64,
+    render_pass_key_target_count: u64,
+    render_pass_key_target_address: u64,
+    render_pass_key_depth_presence: u64,
+    render_pass_key_depth_address: u64,
+}
+
+impl TelemetryWindowCounters {
+    pub(super) fn add_live_slice(&mut self, slice: TelemetryLiveSlice) {
+        macro_rules! add_count {
+            ($field:ident) => {
+                self.$field = self.$field.saturating_add(u64::from(slice.$field));
+            };
+        }
+        add_count!(guest_flips);
+        add_count!(completed_presents);
+        add_count!(submitted_guest_batches);
+        add_count!(coalesced_pipeline_barriers);
+        add_count!(encoded_draws);
+        add_count!(encoded_compute_dispatches);
+        add_count!(encoded_render_passes);
+        add_count!(render_pass_ends_for_compute);
+        add_count!(render_pass_ends_for_target_change);
+        add_count!(render_pass_ends_for_color_operation);
+        add_count!(render_pass_ends_for_batch_flush);
+        add_count!(batch_flushes_from_event_loop);
+        add_count!(batch_flushes_for_guest_memory_write);
+        add_count!(batch_flushes_for_blocked_wait);
+        add_count!(batch_flushes_for_shared_event_host_effect);
+        add_count!(batch_flushes_for_flip_snapshot);
+        add_count!(batch_flushes_for_work_capacity);
+        add_count!(batch_flushes_for_command_processor_barrier);
+        add_count!(batch_flushes_for_cpu_synchronization);
+        add_count!(render_pass_key_target_count);
+        add_count!(render_pass_key_target_address);
+        add_count!(render_pass_key_depth_presence);
+        add_count!(render_pass_key_depth_address);
+        self.gpu_execution_time = self
+            .gpu_execution_time
+            .saturating_add(slice.gpu_execution_time);
+        self.presentation_queue_latency = self
+            .presentation_queue_latency
+            .saturating_add(slice.presentation_queue_latency);
+        self.audio_output_frames = self
+            .audio_output_frames
+            .saturating_add(slice.audio_output_frames);
+        self.audio_underrun_frames = self
+            .audio_underrun_frames
+            .saturating_add(slice.audio_underrun_frames);
+    }
+
+    pub(super) fn take_sample(&mut self, elapsed: std::time::Duration) -> TelemetryWindowSample {
+        let counters = std::mem::take(self);
+        let seconds = elapsed.as_secs_f64();
+        let per_second = |count: u64| {
+            if seconds > 0.0 {
+                count as f64 / seconds
+            } else {
+                0.0
+            }
+        };
+        let gpu_percent = if seconds > 0.0 {
+            (counters.gpu_execution_time.as_secs_f64() * 100.0 / seconds).clamp(0.0, 100.0)
+        } else {
+            0.0
+        };
+        let presentation_latency_ms = if counters.completed_presents == 0 {
+            0.0
+        } else {
+            counters.presentation_queue_latency.as_secs_f64() * 1_000.0
+                / counters.completed_presents as f64
+        };
+        let audio_underrun_percent = if counters.audio_output_frames == 0 {
+            0.0
+        } else {
+            counters.audio_underrun_frames as f64 * 100.0 / counters.audio_output_frames as f64
+        };
+        TelemetryWindowSample {
+            fps: per_second(counters.guest_flips),
+            present_per_s: per_second(counters.completed_presents),
+            gpu_percent,
+            presentation_latency_ms,
+            draw_per_s: per_second(counters.encoded_draws),
+            render_pass_per_s: per_second(counters.encoded_render_passes),
+            compute_per_s: per_second(counters.encoded_compute_dispatches),
+            guest_batch_per_s: per_second(counters.submitted_guest_batches),
+            pipeline_barrier_per_s: per_second(counters.coalesced_pipeline_barriers),
+            audio_output_per_s: per_second(counters.audio_output_frames),
+            audio_underrun_percent,
+            rp_end_compute_per_s: per_second(counters.render_pass_ends_for_compute),
+            rp_end_key_per_s: per_second(counters.render_pass_ends_for_target_change),
+            rp_end_color_op_per_s: per_second(counters.render_pass_ends_for_color_operation),
+            rp_end_flush_per_s: per_second(counters.render_pass_ends_for_batch_flush),
+            cb_flush_tick_per_s: per_second(counters.batch_flushes_from_event_loop),
+            cb_flush_memory_per_s: per_second(counters.batch_flushes_for_guest_memory_write),
+            cb_flush_wait_per_s: per_second(counters.batch_flushes_for_blocked_wait),
+            cb_flush_shared_host_per_s: per_second(
+                counters.batch_flushes_for_shared_event_host_effect,
+            ),
+            cb_flush_flip_per_s: per_second(counters.batch_flushes_for_flip_snapshot),
+            cb_flush_capacity_per_s: per_second(counters.batch_flushes_for_work_capacity),
+            cb_flush_pfp_per_s: per_second(counters.batch_flushes_for_command_processor_barrier),
+            cb_flush_sync_per_s: per_second(counters.batch_flushes_for_cpu_synchronization),
+            rp_key_target_count_per_s: per_second(counters.render_pass_key_target_count),
+            rp_key_target_addr_per_s: per_second(counters.render_pass_key_target_address),
+            rp_key_depth_presence_per_s: per_second(counters.render_pass_key_depth_presence),
+            rp_key_depth_addr_per_s: per_second(counters.render_pass_key_depth_address),
+        }
+    }
+}
+
 /// The open per-window record stream, plus the sequence number stamped into each record.
 pub(super) struct TelemetryLog {
     file: File,
     sequence: u64,
+    window_counters: TelemetryWindowCounters,
 }
 
 impl TelemetryLog {
@@ -176,7 +382,11 @@ impl TelemetryLog {
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(file) => {
                 eprintln!("[REMu][TELEMETRY] recording windows to {}", path.display());
-                Some(Self { file, sequence: 0 })
+                Some(Self {
+                    file,
+                    sequence: 0,
+                    window_counters: TelemetryWindowCounters::default(),
+                })
             }
             Err(error) => {
                 eprintln!(
@@ -186,6 +396,17 @@ impl TelemetryLog {
                 None
             }
         }
+    }
+
+    pub(super) fn add_live_slice(&mut self, slice: TelemetryLiveSlice) {
+        self.window_counters.add_live_slice(slice);
+    }
+
+    pub(super) fn take_window_sample(
+        &mut self,
+        elapsed: std::time::Duration,
+    ) -> TelemetryWindowSample {
+        self.window_counters.take_sample(elapsed)
     }
 
     /// Appends one record, stamping schema, sequence and wall clock.
@@ -837,10 +1058,83 @@ impl PerfChannelSample {
 #[cfg(test)]
 mod tests {
     use super::{
-        AUDIT_PERF_CHANNELS, K3_CHANNEL_MARKER_FIELDS, PerfChannelSample, TelemetryValue,
-        telemetry_record_json,
+        AUDIT_PERF_CHANNELS, K3_CHANNEL_MARKER_FIELDS, PerfChannelSample, TelemetryLiveSlice,
+        TelemetryValue, TelemetryWindowCounters, telemetry_record_json,
     };
     use std::collections::HashSet;
+    use std::time::Duration;
+
+    #[test]
+    fn five_second_core_sample_keeps_sparse_work_and_resets_after_publication() {
+        let mut counters = TelemetryWindowCounters::default();
+        counters.add_live_slice(TelemetryLiveSlice {
+            guest_flips: 1,
+            completed_presents: 2,
+            submitted_guest_batches: 5,
+            coalesced_pipeline_barriers: 6,
+            encoded_draws: 1,
+            encoded_compute_dispatches: 3,
+            encoded_render_passes: 4,
+            gpu_execution_time: Duration::from_millis(250),
+            presentation_queue_latency: Duration::from_millis(30),
+            audio_output_frames: 100,
+            audio_underrun_frames: 25,
+            render_pass_ends_for_compute: 10,
+            render_pass_ends_for_target_change: 11,
+            render_pass_ends_for_color_operation: 12,
+            render_pass_ends_for_batch_flush: 13,
+            batch_flushes_from_event_loop: 14,
+            batch_flushes_for_guest_memory_write: 15,
+            batch_flushes_for_blocked_wait: 16,
+            batch_flushes_for_shared_event_host_effect: 17,
+            batch_flushes_for_flip_snapshot: 18,
+            batch_flushes_for_work_capacity: 19,
+            batch_flushes_for_command_processor_barrier: 20,
+            batch_flushes_for_cpu_synchronization: 21,
+            render_pass_key_target_count: 22,
+            render_pass_key_target_address: 23,
+            render_pass_key_depth_presence: 24,
+            render_pass_key_depth_address: 25,
+        });
+        for _ in 0..9 {
+            counters.add_live_slice(TelemetryLiveSlice::default());
+        }
+
+        let sample = counters.take_sample(Duration::from_secs(5));
+        assert_eq!(sample.fps, 0.2);
+        assert_eq!(sample.present_per_s, 0.4);
+        assert_eq!(sample.gpu_percent, 5.0);
+        assert_eq!(sample.presentation_latency_ms, 15.0);
+        assert_eq!(sample.draw_per_s, 0.2);
+        assert_eq!(sample.render_pass_per_s, 0.8);
+        assert_eq!(sample.compute_per_s, 0.6);
+        assert_eq!(sample.guest_batch_per_s, 1.0);
+        assert_eq!(sample.pipeline_barrier_per_s, 1.2);
+        assert_eq!(sample.audio_output_per_s, 20.0);
+        assert_eq!(sample.audio_underrun_percent, 25.0);
+        assert_eq!(sample.rp_end_compute_per_s, 2.0);
+        assert_eq!(sample.rp_end_key_per_s, 2.2);
+        assert_eq!(sample.rp_end_color_op_per_s, 2.4);
+        assert_eq!(sample.rp_end_flush_per_s, 2.6);
+        assert_eq!(sample.cb_flush_tick_per_s, 2.8);
+        assert_eq!(sample.cb_flush_memory_per_s, 3.0);
+        assert_eq!(sample.cb_flush_wait_per_s, 3.2);
+        assert_eq!(sample.cb_flush_shared_host_per_s, 3.4);
+        assert_eq!(sample.cb_flush_flip_per_s, 3.6);
+        assert_eq!(sample.cb_flush_capacity_per_s, 3.8);
+        assert_eq!(sample.cb_flush_pfp_per_s, 4.0);
+        assert_eq!(sample.cb_flush_sync_per_s, 4.2);
+        assert_eq!(sample.rp_key_target_count_per_s, 4.4);
+        assert_eq!(sample.rp_key_target_addr_per_s, 4.6);
+        assert_eq!(sample.rp_key_depth_presence_per_s, 4.8);
+        assert_eq!(sample.rp_key_depth_addr_per_s, 5.0);
+
+        assert_eq!(
+            counters.take_sample(Duration::from_secs(5)),
+            Default::default(),
+            "publication must reset the five-second counters"
+        );
+    }
 
     #[test]
     fn a_record_serializes_every_value_kind_on_one_line() {
