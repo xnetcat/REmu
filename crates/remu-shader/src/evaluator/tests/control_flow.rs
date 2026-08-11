@@ -82,6 +82,98 @@ fn preserves_initial_image_descriptors_for_statically_inactive_blocks() {
 }
 
 #[test]
+fn forward_scalar_discovery_loads_an_inactive_image_descriptor_over_its_user_pointer() {
+    let pointer = 0x0000_0070_4030_0090_u64;
+    let descriptor: [u32; 8] = [
+        0x1234_5000,
+        0x0000_0070,
+        0x00ff_00ff,
+        0x9008_1000,
+        0,
+        0,
+        0,
+        0,
+    ];
+    let mut memory = TestMemory::default();
+    let bytes = descriptor
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect::<Vec<_>>();
+    memory.write(pointer, &bytes);
+
+    let scalar_load = instruction(
+        8,
+        ShaderEncoding::Smem,
+        "SLoadDwordx8",
+        vec![Operand::scalar(0)],
+        (0..8).map(Operand::scalar).collect(),
+        Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+            destination_count: 8,
+            immediate_offset_bytes: 0,
+            dynamic_offset_register: None,
+        })),
+    );
+    let compare = instruction(
+        0,
+        ShaderEncoding::Sopk,
+        "SCmpkEqI32",
+        vec![Operand {
+            kind: OperandKind::EncodedConstant,
+            value: 1,
+        }],
+        vec![Operand::scalar(8)],
+        None,
+    );
+    let mut branch = instruction(
+        4,
+        ShaderEncoding::Sopp,
+        "SCbranchScc1",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    branch.words[0] = 4;
+    let image = instruction(
+        16,
+        ShaderEncoding::Mimg,
+        "ImageStore",
+        Vec::new(),
+        Vec::new(),
+        Some(InstructionControl::Image(ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 0,
+            dimension: 1,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+            unorm: false,
+        })),
+    );
+    let mut user_data = vec![pointer as u32, (pointer >> 32) as u32];
+    user_data.resize(8, 0);
+    user_data.push(1);
+    let shader = state(
+        vec![compare, branch, scalar_load, image, end(24)],
+        user_data,
+    );
+
+    let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
+        .expect("the skipped-block scalar load must supply the inactive image descriptor");
+
+    assert_eq!(evaluation.image_bindings.len(), 1);
+    assert_eq!(
+        evaluation.image_bindings[0].resource_descriptor.as_slice(),
+        descriptor
+    );
+}
+
+#[test]
 fn bounds_vector_controlled_backward_loops_during_scalar_discovery() {
     let mut branch = instruction(
         4,
