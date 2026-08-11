@@ -12,13 +12,14 @@ use std::time::{Duration, Instant};
 use crate::{guest_output_pointer, low_u32, write_guest_bytes, write_guest_u32};
 
 use self::abi::{AcmError, SceAcmBatchInfo, checked_span, read_array, read_pod, return_error};
-use self::batch::{AcmStatistics, BatchPlan, Command, PendingWrite, decode_buffers};
+use self::batch::{AcmStatistics, BatchPlan, Command, FftDirection, PendingWrite, decode_buffers};
 
 mod abi;
 mod batch;
 mod builders;
 mod dsp;
 
+#[cfg(test)]
 pub(crate) const SDK10_ACM_NIDS: [&str; 13] = [
     "ZIXln2K3XMk",
     "jBgBjAj02R8",
@@ -35,6 +36,7 @@ pub(crate) const SDK10_ACM_NIDS: [&str; 13] = [
     "PVx9oQUaDdk",
 ];
 
+#[cfg(test)]
 pub(crate) fn owns_nid(nid: &str) -> bool {
     SDK10_ACM_NIDS.contains(&nid)
 }
@@ -52,20 +54,36 @@ enum BatchStatus {
     Running,
     Retired,
     Failed(AcmError),
+    #[cfg(any(test, target_arch = "x86_64"))]
     Cancelled,
 }
 
 struct BatchState {
     context: u32,
-    plan: BatchPlan,
+    plan: Option<BatchPlan>,
     status: BatchStatus,
     waiter_active: bool,
+    submitted: Instant,
 }
 
 #[derive(Clone, Copy)]
 struct ExecutionSample {
     ended: Instant,
     duration: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AcmTelemetrySnapshot {
+    submitted: u64,
+    retired: u64,
+    failed: u64,
+    fft: u64,
+    ifft: u64,
+    panner: u64,
+    convolution: u64,
+    samples: u64,
+    queue_age_ns: u64,
+    execution_ns: u64,
 }
 
 #[derive(Default)]
@@ -77,6 +95,8 @@ struct EngineState {
     contexts: BTreeMap<u32, ContextState>,
     batches: BTreeMap<u32, BatchState>,
     history: VecDeque<ExecutionSample>,
+    telemetry: AcmTelemetrySnapshot,
+    failure_counts: BTreeMap<(&'static str, u32), u64>,
     #[cfg(test)]
     execution_tags: Vec<u64>,
 }
@@ -215,11 +235,11 @@ impl AcmEngine {
         if error != 0 || guest_output_pointer(output, std::mem::size_of::<u32>()).is_none() {
             return return_error(AcmError::InvalidParameter);
         }
-        if !self
+        if self
             .lock()
             .contexts
             .get(&context)
-            .is_some_and(|context| !context.destroying)
+            .is_none_or(|context| context.destroying)
         {
             return return_error(AcmError::InvalidContext);
         }
@@ -229,10 +249,10 @@ impl AcmEngine {
         };
 
         let mut state = self.lock();
-        if !state
+        if state
             .contexts
             .get(&context)
-            .is_some_and(|context| !context.destroying)
+            .is_none_or(|context| context.destroying)
         {
             return return_error(AcmError::InvalidContext);
         }
@@ -245,11 +265,14 @@ impl AcmEngine {
             batch,
             BatchState {
                 context,
-                plan,
+                plan: Some(plan),
                 status: BatchStatus::Pending,
                 waiter_active: false,
+                submitted: Instant::now(),
             },
         );
+        state.telemetry.submitted = state.telemetry.submitted.saturating_add(1);
+        let telemetry = state.telemetry;
         state
             .contexts
             .get_mut(&context)
@@ -258,6 +281,7 @@ impl AcmEngine {
             .push_back(batch);
         drop(state);
         write_guest_u32(output, batch);
+        log_progress("submitted", telemetry);
         self.core.changed.notify_all();
         0
     }
@@ -337,6 +361,7 @@ impl AcmEngine {
         }
     }
 
+    #[cfg(test)]
     fn execute_next(&self) -> bool {
         execute_selected(&self.core, None)
     }
@@ -396,6 +421,11 @@ impl AcmEngine {
         self.lock().history.len()
     }
 
+    #[cfg(test)]
+    fn telemetry_for_test(&self) -> AcmTelemetrySnapshot {
+        self.lock().telemetry
+    }
+
     fn start_workers(&self) {
         let mut workers = self
             .workers
@@ -413,11 +443,11 @@ impl AcmEngine {
         }
     }
 
+    #[cfg(any(test, target_arch = "x86_64"))]
     fn reset(&self) {
-        let generation;
         let mut state = self.lock();
         state.stopping = true;
-        generation = state.generation.wrapping_add(1);
+        let generation = state.generation.wrapping_add(1);
         state.generation = generation;
         for batch in state.batches.values_mut() {
             batch.status = BatchStatus::Cancelled;
@@ -455,7 +485,82 @@ struct ExecutionClaim {
     batch: u32,
     generation: u64,
     plan: BatchPlan,
+    #[cfg(test)]
     tag: Option<u64>,
+    queue_age: Duration,
+}
+
+#[derive(Default)]
+struct PlanMetrics {
+    fft: u64,
+    ifft: u64,
+    panner: u64,
+    convolution: u64,
+    samples: u64,
+}
+
+fn plan_metrics(plan: &BatchPlan) -> PlanMetrics {
+    let mut metrics = PlanMetrics::default();
+    for command in &plan.commands {
+        match command {
+            Command::Fft(job) => {
+                match job.direction {
+                    FftDirection::Forward => metrics.fft = metrics.fft.saturating_add(1),
+                    FftDirection::Inverse => metrics.ifft = metrics.ifft.saturating_add(1),
+                }
+                metrics.samples = metrics.samples.saturating_add(
+                    u64::try_from(job.size.saturating_mul(job.inputs.len())).unwrap_or(u64::MAX),
+                );
+            }
+            Command::Panner(job) => {
+                metrics.panner = metrics.panner.saturating_add(1);
+                metrics.samples = metrics.samples.saturating_add(
+                    u64::try_from(256_usize.saturating_mul(job.inputs.len())).unwrap_or(u64::MAX),
+                );
+            }
+            Command::Convolution(job) => {
+                metrics.convolution = metrics.convolution.saturating_add(1);
+                let samples = job.inputs.iter().fold(0_usize, |total, input| {
+                    total.saturating_add(input.block_size.saturating_mul(input.channels.len()))
+                });
+                metrics.samples = metrics
+                    .samples
+                    .saturating_add(u64::try_from(samples).unwrap_or(u64::MAX));
+            }
+            _ => {}
+        }
+    }
+    metrics
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+fn log_progress(event: &str, telemetry: AcmTelemetrySnapshot) {
+    let event_count = match event {
+        "submitted" => telemetry.submitted,
+        "retired" => telemetry.retired,
+        "failed" => telemetry.failed,
+        _ => return,
+    };
+    if event_count == 0 || !event_count.is_power_of_two() {
+        return;
+    }
+    let completed = telemetry.retired.saturating_add(telemetry.failed);
+    let average_queue_us = telemetry.queue_age_ns / completed.max(1) / 1_000;
+    let average_execution_us = telemetry.execution_ns / completed.max(1) / 1_000;
+    eprintln!(
+        "[REMu][ACM] event={event} submitted={} retired={} failed={} fft={} ifft={} panner={} convolution={} samples={} avg_queue_us={average_queue_us} avg_execution_us={average_execution_us}",
+        telemetry.submitted,
+        telemetry.retired,
+        telemetry.failed,
+        telemetry.fft,
+        telemetry.ifft,
+        telemetry.panner,
+        telemetry.convolution,
+        telemetry.samples,
+    );
 }
 
 fn worker_loop(core: Arc<EngineCore>) {
@@ -482,6 +587,7 @@ fn worker_loop(core: Arc<EngineCore>) {
     }
 }
 
+#[cfg(test)]
 fn execute_selected(core: &EngineCore, requested: Option<u32>) -> bool {
     let claim = {
         let mut state = core
@@ -511,7 +617,12 @@ fn claim_batch(state: &mut EngineState, requested: Option<u32>) -> Option<Execut
     state.contexts.get_mut(&context)?.active_batch = Some(batch);
     let batch_state = state.batches.get_mut(&batch)?;
     batch_state.status = BatchStatus::Running;
-    let plan = batch_state.plan.clone();
+    let queue_age = batch_state.submitted.elapsed();
+    let plan = batch_state
+        .plan
+        .take()
+        .expect("a pending ACM batch owns exactly one execution plan");
+    #[cfg(test)]
     let tag = plan.commands.iter().find_map(|command| match command {
         Command::Barrier { test_tag } => *test_tag,
         _ => None,
@@ -521,7 +632,9 @@ fn claim_batch(state: &mut EngineState, requested: Option<u32>) -> Option<Execut
         batch,
         generation: state.generation,
         plan,
+        #[cfg(test)]
         tag,
+        queue_age,
     })
 }
 
@@ -535,8 +648,16 @@ fn complete_claim(core: &EngineCore, claim: ExecutionClaim) {
         .copied()
         .collect::<Vec<_>>();
     let started = Instant::now();
-    let result = execute_plan_with_elapsed(&claim.plan, None, started, &history);
+    let mut failure_command = "batch";
+    let result = execute_plan_with_elapsed(
+        &claim.plan,
+        None,
+        started,
+        &history,
+        Some(&mut failure_command),
+    );
     let elapsed = started.elapsed();
+    let metrics = plan_metrics(&claim.plan);
     let mut state = core
         .state
         .lock()
@@ -551,6 +672,15 @@ fn complete_claim(core: &EngineCore, claim: ExecutionClaim) {
             context.active_batch = None;
         }
         if result.is_ok() {
+            state.telemetry.retired = state.telemetry.retired.saturating_add(1);
+            state.telemetry.fft = state.telemetry.fft.saturating_add(metrics.fft);
+            state.telemetry.ifft = state.telemetry.ifft.saturating_add(metrics.ifft);
+            state.telemetry.panner = state.telemetry.panner.saturating_add(metrics.panner);
+            state.telemetry.convolution = state
+                .telemetry
+                .convolution
+                .saturating_add(metrics.convolution);
+            state.telemetry.samples = state.telemetry.samples.saturating_add(metrics.samples);
             state.history.push_back(ExecutionSample {
                 ended: Instant::now(),
                 duration: elapsed,
@@ -558,11 +688,34 @@ fn complete_claim(core: &EngineCore, claim: ExecutionClaim) {
             while state.history.len() > 256 {
                 state.history.pop_front();
             }
+        } else if let Err(error) = result {
+            state.telemetry.failed = state.telemetry.failed.saturating_add(1);
+            let failure_count = state
+                .failure_counts
+                .entry((failure_command, error as u32))
+                .or_insert(0);
+            *failure_count = failure_count.saturating_add(1);
+            if failure_count.is_power_of_two() {
+                eprintln!(
+                    "[REMu][ACM] failure command={failure_command} error={:#010x} count={failure_count}",
+                    error as u32
+                );
+            }
         }
+        state.telemetry.queue_age_ns = state
+            .telemetry
+            .queue_age_ns
+            .saturating_add(duration_ns(claim.queue_age));
+        state.telemetry.execution_ns = state
+            .telemetry
+            .execution_ns
+            .saturating_add(duration_ns(elapsed));
+        let telemetry = state.telemetry;
         #[cfg(test)]
         if let Some(tag) = claim.tag {
             state.execution_tags.push(tag);
         }
+        log_progress(if result.is_ok() { "retired" } else { "failed" }, telemetry);
     }
     drop(state);
     core.changed.notify_all();
@@ -573,6 +726,7 @@ fn consume_terminal(state: &mut EngineState, batch: u32) -> Option<u64> {
     let result = match status {
         BatchStatus::Retired => 0,
         BatchStatus::Failed(error) => return_error(error),
+        #[cfg(any(test, target_arch = "x86_64"))]
         BatchStatus::Cancelled => return_error(AcmError::InvalidBatch),
         BatchStatus::Pending | BatchStatus::Running => return None,
     };
@@ -585,48 +739,26 @@ fn execute_plan_with_elapsed(
     elapsed_override: Option<Duration>,
     started: Instant,
     history: &[ExecutionSample],
+    mut failure_command: Option<&mut &'static str>,
 ) -> Result<(), AcmError> {
     let mut pending = Vec::<PendingWrite>::new();
     for command in &plan.commands {
-        match command {
-            Command::Activate
-            | Command::Barrier { .. }
-            | Command::Transfer(_)
-            | Command::Run
-            | Command::Inline { .. }
-            | Command::Queue
-            | Command::Delay => {}
-            Command::Statistics(statistics) => {
-                let mut value = read_pod::<AcmStatistics>(statistics.address)?;
-                let elapsed = elapsed_override.unwrap_or_else(|| started.elapsed());
-                value.usage_batch = scaled_seconds(elapsed);
-                for interval in &mut value.usage_intervals {
-                    if *interval == 0 || *interval == u32::MAX {
-                        *interval = if *interval == 0 {
-                            interval_usage(elapsed, *interval, history, started + elapsed)
-                        } else {
-                            u32::MAX
-                        };
-                    } else {
-                        *interval = interval_usage(elapsed, *interval, history, started + elapsed);
-                    }
-                }
-                pending.push(PendingWrite {
-                    address: statistics.address,
-                    bytes: statistics_bytes(value).to_vec(),
-                });
+        if let Err(error) =
+            execute_command(command, &mut pending, elapsed_override, started, history)
+        {
+            if let Some(destination) = failure_command.as_deref_mut() {
+                *destination = command_name(command);
             }
-            Command::Fft(job) => pending.extend(dsp::execute_fft(job)?),
-            Command::Panner(job) => pending.extend(dsp::execute_panner(job)?),
-            Command::Convolution(job) => pending.extend(dsp::execute_convolution(job)?),
-            #[cfg(test)]
-            Command::TestWrite(write) => pending.push(write.clone()),
-            #[cfg(test)]
-            Command::TestFault => return Err(AcmError::PageFault),
+            return Err(error);
         }
     }
 
-    validate_pending_writes(&pending)?;
+    if let Err(error) = validate_pending_writes(&pending) {
+        if let Some(destination) = failure_command {
+            *destination = "publication";
+        }
+        return Err(error);
+    }
     for write in &pending {
         write_guest_bytes(write.address, &write.bytes);
     }
@@ -637,6 +769,75 @@ fn execute_plan_with_elapsed(
         write_guest_bytes(notification.address, &[notification.value]);
     }
     Ok(())
+}
+
+fn execute_command(
+    command: &Command,
+    pending: &mut Vec<PendingWrite>,
+    elapsed_override: Option<Duration>,
+    started: Instant,
+    history: &[ExecutionSample],
+) -> Result<(), AcmError> {
+    match command {
+        Command::Activate
+        | Command::Barrier { .. }
+        | Command::Transfer(_)
+        | Command::Run
+        | Command::Inline { .. }
+        | Command::Queue
+        | Command::Delay => {}
+        Command::Statistics(statistics) => {
+            let mut value = read_pod::<AcmStatistics>(statistics.address)?;
+            let elapsed = elapsed_override.unwrap_or_else(|| started.elapsed());
+            value.usage_batch = scaled_seconds(elapsed);
+            for interval in &mut value.usage_intervals {
+                if *interval == 0 || *interval == u32::MAX {
+                    *interval = if *interval == 0 {
+                        interval_usage(elapsed, *interval, history, started + elapsed)
+                    } else {
+                        u32::MAX
+                    };
+                } else {
+                    *interval = interval_usage(elapsed, *interval, history, started + elapsed);
+                }
+            }
+            pending.push(PendingWrite {
+                address: statistics.address,
+                bytes: statistics_bytes(value).to_vec(),
+            });
+        }
+        Command::Fft(job) => pending.extend(dsp::execute_fft(job)?),
+        Command::Panner(job) => pending.extend(dsp::execute_panner(job)?),
+        Command::Convolution(job) => pending.extend(dsp::execute_convolution(job)?),
+        #[cfg(test)]
+        Command::TestWrite(write) => pending.push(write.clone()),
+        #[cfg(test)]
+        Command::TestFault => return Err(AcmError::PageFault),
+    }
+    Ok(())
+}
+
+fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Activate => "activate",
+        Command::Barrier { .. } => "barrier",
+        Command::Transfer(_) => "transfer",
+        Command::Run => "run",
+        Command::Statistics(_) => "statistics",
+        Command::Inline { .. } => "inline",
+        Command::Queue => "queue",
+        Command::Delay => "delay",
+        Command::Fft(job) => match job.direction {
+            FftDirection::Forward => "fft",
+            FftDirection::Inverse => "ifft",
+        },
+        Command::Panner(_) => "panner",
+        Command::Convolution(_) => "convolution",
+        #[cfg(test)]
+        Command::TestWrite(_) => "test-write",
+        #[cfg(test)]
+        Command::TestFault => "test-fault",
+    }
 }
 
 fn validate_pending_writes(writes: &[PendingWrite]) -> Result<(), AcmError> {
@@ -738,7 +939,7 @@ fn statistics_bytes(statistics: AcmStatistics) -> [u8; 24] {
 
 #[cfg(test)]
 fn execute_plan_with_elapsed_for_test(plan: &BatchPlan, elapsed: Duration) -> Result<(), AcmError> {
-    execute_plan_with_elapsed(plan, Some(elapsed), Instant::now(), &[])
+    execute_plan_with_elapsed(plan, Some(elapsed), Instant::now(), &[], None)
 }
 
 pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]) -> Option<u64> {

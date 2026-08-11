@@ -9237,12 +9237,12 @@ fn start_abi_gap_reporter() {
                 // runs, so the histogram must leave the process on this live path too. Reprint
                 // only when the header (shader/opcode counts) changes.
                 let opcode_lines = remu_shader::opcode_coverage_report();
-                if let Some(header) = opcode_lines.first() {
-                    if header != &previous_opcode_header {
-                        previous_opcode_header = header.clone();
-                        for line in &opcode_lines {
-                            eprintln!("[REMu][SHADER-OPCODES] {line}");
-                        }
+                if let Some(header) = opcode_lines.first()
+                    && header != &previous_opcode_header
+                {
+                    previous_opcode_header = header.clone();
+                    for line in &opcode_lines {
+                        eprintln!("[REMu][SHADER-OPCODES] {line}");
                     }
                 }
                 // Reprinting an unchanged summary would bury the run's other output, and the

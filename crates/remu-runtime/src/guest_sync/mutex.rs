@@ -57,7 +57,7 @@ fn trace_mutex_abi(op: &str, address: u64, result: u64) {
     }
     let slot = read_pthread_slot(address);
     let object = lookup_mutex_by_handle(address)
-        .or_else(|| slot.and_then(|value| lookup_mutex_by_handle(value)))
+        .or_else(|| slot.and_then(lookup_mutex_by_handle))
         .map(|entry| entry.guest_object)
         .unwrap_or(0);
     eprintln!(

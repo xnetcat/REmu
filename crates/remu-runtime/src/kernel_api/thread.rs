@@ -134,6 +134,11 @@ const _: () = assert!(crate::DEFAULT_THREAD_AFFINITY_MASK == 0x7f);
 /// only advances when a thread is placed for the first time or migrated after an affinity change.
 static NEXT_CORE_PLACEMENT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+#[cfg(test)]
+pub(super) fn reset_core_placement_for_test() {
+    NEXT_CORE_PLACEMENT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Reports which logical CPU the calling thread is running on.
 ///
 /// REmu runs guest threads on host threads and does not pin them to emulated cores, and macOS does

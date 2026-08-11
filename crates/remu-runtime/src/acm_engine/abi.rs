@@ -122,6 +122,7 @@ pub(crate) enum AcmFormat {
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum AcmError {
     Unknown = 0x8194_0001,
     InvalidContext = 0x8194_0002,

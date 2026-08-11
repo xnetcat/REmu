@@ -569,7 +569,7 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
     let label_address = (&raw mut label).addr() as u64;
     let commands = [
         agc_pm4(8, AGC_IT_NOP, crate::AGC_R_RELEASE_MEM),
-        0,
+        remu_gpu::GpuEndOfPipeCbDbAction::None as u32,
         2 << 16,
         low_u32(label_address),
         low_u32(label_address >> 32),
@@ -583,7 +583,7 @@ fn emits_ordered_gen5_release_and_wait_label_operations() {
         u32::MAX,
         0x89ab_cdef,
         0x0123_4567,
-        3,
+        3 | (1 << 8),
         0,
     ];
     let (sender, receiver) = remu_gpu::gpu_event_channel();
@@ -633,7 +633,7 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
     let label_address = (&raw mut label).addr() as u64;
     let indirect = [
         agc_pm4(8, AGC_IT_NOP, crate::AGC_R_RELEASE_MEM),
-        0,
+        remu_gpu::GpuEndOfPipeCbDbAction::None as u32,
         1 << 16,
         low_u32(label_address),
         low_u32(label_address >> 32),
@@ -652,7 +652,7 @@ fn executes_indirect_command_buffer_events_before_following_waits() {
         low_u32(label_address >> 32),
         u32::MAX,
         1,
-        0x13,
+        0x13 | (1 << 8),
         0,
     ];
     let (sender, receiver) = remu_gpu::gpu_event_channel();
