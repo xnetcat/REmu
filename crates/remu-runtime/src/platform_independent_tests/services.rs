@@ -773,15 +773,15 @@ fn offline_np_service_initializers_retain_context_and_property_ownership() {
     assert_eq!(crate::sysmodule_is_loaded(0xcc, &state), 0);
     assert_eq!(crate::game_update_initialize(&mut state), 0);
 
-    let entitlement_parameters = [0_u8; 0x20];
-    let mut entitlement_context = [0_u8; 0x20];
-    let entitlement_context_address = entitlement_context.as_mut_ptr().addr() as u64;
-    let entitlement_parameter_address = entitlement_parameters.as_ptr().addr() as u64;
+    let entitlement_init = [0_u8; 0x20];
+    let mut entitlement_boot = [0xa5_u8; 0x20];
+    let entitlement_init_address = entitlement_init.as_ptr().addr() as u64;
+    let entitlement_boot_address = entitlement_boot.as_mut_ptr().addr() as u64;
     assert_eq!(
         crate::np_entitlement_access_initialize(
             [
-                entitlement_context_address,
-                entitlement_parameter_address,
+                entitlement_init_address,
+                entitlement_boot_address,
                 0,
                 0,
                 0,
@@ -790,6 +790,19 @@ fn offline_np_service_initializers_retain_context_and_property_ownership() {
             &mut state,
         ),
         0
+    );
+    assert_eq!(entitlement_boot, [0; 0x20]);
+    let mut entitlement_hits = u32::MAX;
+    assert_eq!(
+        crate::np_entitlement_access_get_addcont_entitlement_info_list(
+            [0, 0, 0, (&raw mut entitlement_hits).addr() as u64, 0, 0,],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        entitlement_hits, 0,
+        "the local base-game image has no add-ons"
     );
     let signaling_parameters = [0x5a_u8; 0x28];
     assert_eq!(
@@ -826,6 +839,75 @@ fn offline_np_service_initializers_retain_context_and_property_ownership() {
     assert_eq!(
         crate::known_nid_name("s6W4Zl4Slgk"),
         Some("sceNpUniversalDataSystemCreateEventPropertyObject")
+    );
+}
+
+#[test]
+fn addcont_entitlement_count_query_is_empty_and_preserves_output_boundaries() {
+    const ERROR_NOT_INITIALIZED: u32 = 0x817d_0001;
+    const ERROR_PARAMETER: u32 = 0x817d_0002;
+    let mut state = ProbeDispatchState::default();
+    let mut hit_num = u32::MAX;
+    let hit_num_address = (&raw mut hit_num).addr() as u64;
+    assert_eq!(
+        crate::np_entitlement_access_get_addcont_entitlement_info_list(
+            [0, 0, 0, hit_num_address, 0, 0],
+            &mut state,
+        ),
+        crate::sce_kernel_error(ERROR_NOT_INITIALIZED)
+    );
+    assert_eq!(hit_num, u32::MAX);
+    assert_eq!(
+        crate::np_entitlement_access_initialize([0; 6], &mut state),
+        crate::sce_kernel_error(ERROR_PARAMETER)
+    );
+
+    let init = [0_u8; 0x20];
+    let mut guarded_boot = [0xa5_u8; 0x22];
+    assert_eq!(
+        crate::np_entitlement_access_initialize(
+            [
+                init.as_ptr().addr() as u64,
+                guarded_boot[1..].as_mut_ptr().addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(guarded_boot[0], 0xa5);
+    assert_eq!(&guarded_boot[1..0x21], &[0; 0x20]);
+    assert_eq!(guarded_boot[0x21], 0xa5);
+    assert_eq!(
+        crate::np_entitlement_access_get_addcont_entitlement_info_list(
+            [0, 0, 0, 0, 0, 0],
+            &mut state,
+        ),
+        crate::sce_kernel_error(ERROR_PARAMETER)
+    );
+    assert_eq!(
+        crate::np_entitlement_access_get_addcont_entitlement_info_list(
+            [0, 0, 1, hit_num_address, 0, 0],
+            &mut state,
+        ),
+        crate::sce_kernel_error(ERROR_PARAMETER)
+    );
+
+    let mut guarded_hits = [0xa5a5_a5a5_u32; 3];
+    assert_eq!(
+        crate::np_entitlement_access_get_addcont_entitlement_info_list(
+            [0, 0, 0, (&raw mut guarded_hits[1]).addr() as u64, 0, 0,],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(guarded_hits, [0xa5a5_a5a5, 0, 0xa5a5_a5a5]);
+    assert_eq!(
+        crate::known_nid_name("TFyU+KFBv54"),
+        Some("sceNpEntitlementAccessGetAddcontEntitlementInfoList")
     );
 }
 

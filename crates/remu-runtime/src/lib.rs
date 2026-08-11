@@ -5874,6 +5874,7 @@ fn dispatch_probe_import(
         "buYbeLOGWmA" => app_content_temporary_data_mount(arguments, state),
         "YJtKLttI9fM" => game_update_initialize(state),
         "jO8DM8oyego" => np_entitlement_access_initialize(arguments, state),
+        "TFyU+KFBv54" => np_entitlement_access_get_addcont_entitlement_info_list(arguments, state),
         "ysmw6J-P8Ak" => np_session_signaling_initialize(arguments, state),
         "sk54bi6FtYM" => np_web_api2_create_user_context(arguments, state),
         "WV1GwM32NgY" => np_web_api2_push_event_create_handle(arguments, state),
@@ -6849,11 +6850,37 @@ fn game_update_initialize(state: &mut ProbeDispatchState) -> u64 {
 }
 
 fn np_entitlement_access_initialize(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    remu_gpu::note_inert("jO8DM8oyego");
+    const ERROR_PARAMETER: u32 = 0x817d_0002;
     if arguments[0] == 0 || arguments[1] == 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+        return sce_kernel_error(ERROR_PARAMETER);
     }
+    guest_memset(arguments[1], 0, 0x20);
     state.services.np_entitlement_access = Some((arguments[0], arguments[1]));
+    0
+}
+
+/// `sceNpEntitlementAccessGetAddcontEntitlementInfoList(serviceLabel, list, listNum, hitNum)`.
+///
+/// REmu launches a local base-game image and has no account-backed add-on entitlements. The SDK
+/// exposes the destination count separately, and Demon’s Souls uses a zero-length list to ask only
+/// for the hit count. Returning a successful empty result is the observable local state, while
+/// initialization and pointer errors retain the library's own error family.
+fn np_entitlement_access_get_addcont_entitlement_info_list(
+    arguments: [u64; 6],
+    state: &mut ProbeDispatchState,
+) -> u64 {
+    const ERROR_NOT_INITIALIZED: u32 = 0x817d_0001;
+    const ERROR_PARAMETER: u32 = 0x817d_0002;
+    if state.services.np_entitlement_access.is_none() {
+        return sce_kernel_error(ERROR_NOT_INITIALIZED);
+    }
+    let list = arguments[1];
+    let list_num = low_u32(arguments[2]);
+    let hit_num = arguments[3];
+    if hit_num == 0 || (list_num != 0 && list == 0) {
+        return sce_kernel_error(ERROR_PARAMETER);
+    }
+    write_guest_u32(hit_num, 0);
     0
 }
 
