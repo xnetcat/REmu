@@ -189,6 +189,7 @@ fn the_priority_range_covers_every_policy_the_console_defines() {
 
 #[test]
 fn the_process_queries_report_stable_values_the_guest_can_compare() {
+    super::super::thread::reset_core_placement_for_test();
     let mut state = ProbeDispatchState::default();
 
     assert_eq!(

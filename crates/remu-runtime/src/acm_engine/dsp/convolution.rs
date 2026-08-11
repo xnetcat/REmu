@@ -119,22 +119,24 @@ pub(in crate::acm_engine) fn execute(job: &ConvolutionJob) -> Result<Vec<Pending
     let mut input_states = Vec::with_capacity(job.inputs.len());
     let mut input_null_counts = Vec::with_capacity(job.inputs.len());
     for input in &job.inputs {
+        let (history_position, history_count, history_null_count) =
+            current_input_state(input, job.version2)?;
         let all_live = input.pcm.iter().all(Option::is_some);
         let all_null = input.pcm.iter().all(Option::is_none);
         if !all_live && !all_null {
             return Err(AcmError::InvalidParameter);
         }
-        if (!job.version2 && all_null) || (input.history_null_count > 0 && all_live) {
+        if (!job.version2 && all_null) || (history_null_count > 0 && all_live) {
             return Err(AcmError::InvalidParameter);
         }
-        let position = if input.history_count == 0 {
+        let position = if history_count == 0 {
             0
         } else {
-            (input.history_position + 1) % input.block_count
+            (history_position + 1) % input.block_count
         };
-        let count = (input.history_count + 1).min(input.block_count);
+        let count = (history_count + 1).min(input.block_count);
         let null_count = if all_null {
-            input.history_null_count.saturating_add(1).min(count)
+            history_null_count.saturating_add(1).min(count)
         } else {
             0
         };
@@ -225,6 +227,15 @@ fn execute_tuple(
     version2: bool,
     pending: &mut Vec<PendingWrite>,
 ) -> Result<(), AcmError> {
+    let previous_gain = if version2 {
+        let value = read_pod::<ConvOutV2>(output.address)?;
+        if !value.previous_gain.is_finite() {
+            return Err(AcmError::InvalidParameter);
+        }
+        value.previous_gain
+    } else {
+        1.0
+    };
     let channel_count = output.pcm.len();
     for output_channel in 0..channel_count {
         let input_channel = if input.channels.len() == 1 {
@@ -282,8 +293,8 @@ fn execute_tuple(
         for sample in 0..input.block_size {
             let wet = time[sample] + previous_overlap[sample];
             let gain = if version2 {
-                output.previous_gain
-                    + (output.gain - output.previous_gain)
+                previous_gain
+                    + (output.gain - previous_gain)
                         * (sample as f32 / (input.block_size - 1) as f32)
             } else {
                 1.0
@@ -306,6 +317,27 @@ fn execute_tuple(
         });
     }
     Ok(())
+}
+
+fn current_input_state(
+    input: &ConvolutionInput,
+    version2: bool,
+) -> Result<(usize, usize, usize), AcmError> {
+    let (base, null_count) = if version2 {
+        let value = read_pod::<ConvInV2>(input.address)?;
+        (value.base, value.history_null_count as usize)
+    } else {
+        (read_pod::<ConvIn>(input.address)?, 0)
+    };
+    let position = base.history_position as usize;
+    let count = base.history_count as usize;
+    if count > input.block_count
+        || (count != 0 && position >= input.block_count)
+        || null_count > count
+    {
+        return Err(AcmError::InvalidParameter);
+    }
+    Ok((position, count, null_count))
 }
 
 fn snapshot_input(address: u64, version2: bool) -> Result<ConvolutionInput, AcmError> {

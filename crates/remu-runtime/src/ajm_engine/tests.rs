@@ -1316,10 +1316,17 @@ fn mp3_decodes_a_stream_and_matches_the_independent_ffmpeg_golden() {
         .chunks_exact(2)
         .map(|chunk| i16::from_le_bytes(chunk.try_into().unwrap()))
         .collect();
-    // Compare the overlapping prefix (encoder delay / padding may differ by a frame).
-    let n = decoded.len().min(reference.len()).saturating_sub(1152 * 2);
+    // minimp3 exposes raw MPEG frame output. This fixture starts with one 1152-sample Info
+    // frame and has 1105 samples of MP3 decoder priming; ffmpeg removes both when producing
+    // the independent golden. Compare after that known container/codec delay rather than
+    // comparing different points on the waveform.
+    const RAW_PRIMING_FRAMES: usize = 1152 + 1105;
+    let raw_priming_samples = RAW_PRIMING_FRAMES * 2;
+    assert!(decoded.len() > raw_priming_samples);
+    let aligned = &decoded[raw_priming_samples..];
+    let n = aligned.len().min(reference.len());
     assert!(n > 1000, "enough overlapping samples to compare");
-    let max_abs_diff = decoded[..n]
+    let max_abs_diff = aligned[..n]
         .iter()
         .zip(&reference[..n])
         .map(|(a, b)| (i32::from(*a) - i32::from(*b)).unsigned_abs())

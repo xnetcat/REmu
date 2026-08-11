@@ -327,7 +327,7 @@ fn history_wraparound_preserves_partition_order() {
         &second_spectrum,
     );
     let mut input_state = ConvIn::default();
-    let mut job = ConvolutionJob {
+    let job = ConvolutionJob {
         sharing: ConvolutionSharing::SharedInput,
         version2: false,
         inputs: vec![ConvolutionInput {
@@ -377,8 +377,6 @@ fn history_wraparound_preserves_partition_order() {
         for sample in output {
             assert!((sample - expected).abs() < 1.0e-3);
         }
-        job.inputs[0].history_position = input_state.history_position as usize;
-        job.inputs[0].history_count = input_state.history_count as usize;
         assert_eq!(input_state.history_position as usize, [0, 1, 0][call]);
     }
     assert_eq!(input_state.history_position, 0);
@@ -555,11 +553,7 @@ fn v2_tail_crossfade_and_initial_mix_follow_reference_state() {
     assert_eq!(input_state.history_null_count, 0);
     assert_eq!(output_state.previous_gain, 0.75);
 
-    job.inputs[0].history_position = input_state.base.history_position as usize;
-    job.inputs[0].history_count = input_state.base.history_count as usize;
-    job.inputs[0].history_null_count = input_state.history_null_count as usize;
     job.inputs[0].pcm[0] = None;
-    job.outputs[0].previous_gain = output_state.previous_gain;
     apply(&execute(&job).expect("null tail block"));
     let tail = read_f32_values(output_pcm.0.as_mut_ptr() as u64, BLOCK);
     assert!(tail.iter().any(|sample| (*sample - 0.5).abs() > 1.0e-4));
@@ -568,9 +562,6 @@ fn v2_tail_crossfade_and_initial_mix_follow_reference_state() {
     assert_eq!(input_state.base.history_count, 2);
     assert_eq!(input_state.history_null_count, 1);
 
-    job.inputs[0].history_position = input_state.base.history_position as usize;
-    job.inputs[0].history_count = input_state.base.history_count as usize;
-    job.inputs[0].history_null_count = input_state.history_null_count as usize;
     apply(&execute(&job).expect("fully null history block"));
     let exhausted_tail = read_f32_values(output_pcm.0.as_mut_ptr() as u64, BLOCK);
     assert!(
@@ -580,15 +571,9 @@ fn v2_tail_crossfade_and_initial_mix_follow_reference_state() {
     );
     assert_eq!(input_state.history_null_count, 2);
 
-    job.inputs[0].history_position = input_state.base.history_position as usize;
-    job.inputs[0].history_count = input_state.base.history_count as usize;
-    job.inputs[0].history_null_count = input_state.history_null_count as usize;
     apply(&execute(&job).expect("null history count saturates"));
     assert_eq!(input_state.history_null_count, 2);
 
-    job.inputs[0].history_position = input_state.base.history_position as usize;
-    job.inputs[0].history_count = input_state.base.history_count as usize;
-    job.inputs[0].history_null_count = input_state.history_null_count as usize;
     job.inputs[0].pcm[0] = Some(input_pcm.0.as_mut_ptr() as u64);
     assert_eq!(execute(&job), Err(AcmError::InvalidParameter));
 }

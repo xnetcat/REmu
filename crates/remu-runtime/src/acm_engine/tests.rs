@@ -5,9 +5,14 @@ use std::mem::size_of;
 use std::time::Duration;
 
 use super::AcmEngine;
-use super::abi::{AcmError, AcmFormat, SceAcmBatchCommand, SceAcmBatchInfo, return_error};
+use super::abi::{
+    AcmError, AcmFormat, ConvChannel, ConvIn, ConvIr, ConvOut, SceAcmBatchCommand, SceAcmBatchInfo,
+    return_error,
+};
 use super::batch::{AcmStatistics, BatchPlan, Command, Notification, PendingWrite, decode_buffers};
-use super::builders::{append_tagged_test_record, append_test_record, batch_job_notification};
+use super::builders::{
+    append_tagged_test_record, append_test_record, batch_job_notification, convolution, fft, panner,
+};
 
 const SUCCESS: u64 = 0;
 
@@ -27,6 +32,9 @@ fn address<T>(value: &T) -> u64 {
 
 #[repr(align(128))]
 struct AlignedBytes([u8; 256]);
+
+#[repr(align(128))]
+struct AlignedLarge([u8; 8192]);
 
 fn write_word(bytes: &mut [u8], index: usize, word: u64) {
     let start = index * 8;
@@ -549,4 +557,167 @@ fn execution_history_is_bounded_to_256_samples() {
         );
     }
     assert_eq!(engine.history_len_for_test(), 256);
+}
+
+fn write_f32_values(address: u64, values: &[f32]) {
+    crate::write_guest_bytes(
+        address,
+        &values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+}
+
+fn read_first_f32(address: u64) -> f32 {
+    let mut bytes = [0_u8; 4];
+    crate::read_guest_bytes(address, &mut bytes);
+    f32::from_le_bytes(bytes)
+}
+
+#[test]
+fn mixed_fft_panner_convolution_batch_retires_with_real_outputs() {
+    let mut arena = AlignedLarge([0; 8192]);
+    let mut info = SceAcmBatchInfo {
+        buffer: arena.0.as_mut_ptr() as u64,
+        offset: 0,
+        size: arena.0.len() as u64,
+    };
+
+    let mut fft_input = AlignedLarge([0; 8192]);
+    let mut fft_output = AlignedLarge([0; 8192]);
+    write_f32_values(fft_input.0.as_mut_ptr() as u64, &[1.0]);
+    let fft_inputs = [fft_input.0.as_mut_ptr() as u64];
+    let fft_outputs = [fft_output.0.as_mut_ptr() as u64];
+    assert_eq!(
+        fft(
+            [address_mut(&mut info), 512, 1, 0, address(&fft_inputs), 0,],
+            [address(&fft_outputs), 0, 0, 0, 0, 0],
+            false,
+        ),
+        SUCCESS
+    );
+
+    let mut panner_input = AlignedLarge([0; 8192]);
+    let mut panner_parameter = AlignedLarge([0; 8192]);
+    let mut panner_state = AlignedLarge([0; 8192]);
+    let mut panner_output = AlignedLarge([0; 8192]);
+    write_f32_values(panner_input.0.as_mut_ptr() as u64, &[1.0; 256]);
+    panner_parameter.0[4..8].copy_from_slice(&1.0_f32.to_le_bytes());
+    panner_state.0[..4].copy_from_slice(&1.0_f32.to_le_bytes());
+    let panner_inputs = [panner_input.0.as_mut_ptr() as u64];
+    let panner_parameters = [panner_parameter.0.as_mut_ptr() as u64];
+    let panner_states = [panner_state.0.as_mut_ptr() as u64];
+    let panner_initial = [0_u64];
+    let panner_outputs = [panner_output.0.as_mut_ptr() as u64];
+    assert_eq!(
+        panner(
+            [address_mut(&mut info), 1, address(&panner_inputs), 0, 0, 1,],
+            [
+                address(&panner_parameters),
+                address(&panner_states),
+                address(&panner_initial),
+                address(&panner_outputs),
+                0,
+                0,
+            ],
+        ),
+        SUCCESS
+    );
+
+    let mut convolution_history = AlignedLarge([0; 8192]);
+    let mut convolution_input_pcm = AlignedLarge([0; 8192]);
+    let mut convolution_ir_blocks = AlignedLarge([0; 8192]);
+    let mut convolution_temp = AlignedLarge([0; 8192]);
+    let mut convolution_output_pcm = AlignedLarge([0; 8192]);
+    write_f32_values(convolution_input_pcm.0.as_mut_ptr() as u64, &[1.0; 256]);
+    write_f32_values(convolution_ir_blocks.0.as_mut_ptr() as u64, &[1.0; 512]);
+    let input_channel = ConvChannel {
+        blocks: convolution_history.0.as_mut_ptr() as u64,
+        sizes: 0,
+    };
+    let input_channels = [address(&input_channel)];
+    let input_pcm = [convolution_input_pcm.0.as_mut_ptr() as u64];
+    let mut convolution_input = ConvIn {
+        block_size: 256,
+        block_count: 1,
+        channel_count: 1,
+        format: 0,
+        history_position: 0,
+        history_count: 0,
+        channels: address(&input_channels),
+        pcm: address(&input_pcm),
+    };
+    let ir_channel = ConvChannel {
+        blocks: convolution_ir_blocks.0.as_mut_ptr() as u64,
+        sizes: 0,
+    };
+    let ir_channels = [address(&ir_channel)];
+    let convolution_ir = ConvIr {
+        block_size: 256,
+        block_count: 1,
+        channel_count: 1,
+        format: 0,
+        block_gains: 0,
+        channels: address(&ir_channels),
+    };
+    let convolution_irs = [address(&convolution_ir)];
+    let convolution_temps = [convolution_temp.0.as_mut_ptr() as u64];
+    let convolution_outputs = [convolution_output_pcm.0.as_mut_ptr() as u64];
+    let convolution_output = ConvOut {
+        block_size: 256,
+        channel_count: 1,
+        temps: address(&convolution_temps),
+        pcm: address(&convolution_outputs),
+    };
+    let convolution_output_structs = [address(&convolution_output)];
+    assert_eq!(
+        convolution(
+            [
+                address_mut(&mut info),
+                1,
+                address_mut(&mut convolution_input),
+                1,
+                address(&convolution_irs),
+                0,
+            ],
+            [address(&convolution_output_structs), 0, 0, 0, 0, 0],
+            true,
+            false,
+        ),
+        SUCCESS
+    );
+
+    let engine = AcmEngine::new();
+    let context = create_context(&engine);
+    let info_pointers = [address(&info)];
+    let mut batch = 0_u32;
+    assert_eq!(
+        engine.batch_start_buffers(args(&[
+            u64::from(context),
+            1,
+            address(&info_pointers),
+            0,
+            address_mut(&mut batch),
+        ])),
+        SUCCESS
+    );
+    assert!(engine.execute_next_for_test());
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0])),
+        SUCCESS
+    );
+    assert!(read_first_f32(fft_output.0.as_mut_ptr() as u64).abs() > 1.0e-6);
+    assert!(read_first_f32(panner_output.0.as_mut_ptr() as u64).abs() > 1.0e-6);
+    assert!(read_first_f32(convolution_output_pcm.0.as_mut_ptr() as u64).abs() > 1.0e-6);
+    let telemetry = engine.telemetry_for_test();
+    assert_eq!(telemetry.submitted, 1);
+    assert_eq!(telemetry.retired, 1);
+    assert_eq!(telemetry.failed, 0);
+    assert_eq!(telemetry.fft, 1);
+    assert_eq!(telemetry.ifft, 0);
+    assert_eq!(telemetry.panner, 1);
+    assert_eq!(telemetry.convolution, 1);
+    assert_eq!(telemetry.samples, 1024);
+    assert!(telemetry.execution_ns > 0);
 }

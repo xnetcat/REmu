@@ -157,6 +157,8 @@ fn fresh_boot_does_not_skip_the_platform_notice_screen() {
 
 #[test]
 fn pad_get_handle_observes_the_primary_controller_lifecycle() {
+    crate::pad::reset_pad_runtime();
+    crate::hid::reset_hid_runtime();
     let mut state = ProbeDispatchState::default();
     let primary = [0x1000_0000, 0, 0, 0, 0, 0];
 
@@ -686,9 +688,21 @@ fn sdk10_acm_exports_are_owned_by_the_pre_lock_engine() {
         ("PVx9oQUaDdk", "sceAcm_ConvReverb_SharedIr_2"),
     ] {
         assert!(crate::acm_engine::owns_nid(nid), "missing ACM route {nid}");
+        let inert_before = remu_gpu::fabricated_success_counts()
+            .into_iter()
+            .find_map(|(key, count)| (key == nid).then_some(count))
+            .unwrap_or(0);
         assert!(
             crate::dispatch_stateless_import(nid, [0; 6], [0; 6]).is_some(),
             "ACM route {nid} must run before the process dispatch lock"
+        );
+        let inert_after = remu_gpu::fabricated_success_counts()
+            .into_iter()
+            .find_map(|(key, count)| (key == nid).then_some(count))
+            .unwrap_or(0);
+        assert_eq!(
+            inert_after, inert_before,
+            "ACM route {nid} must never report fabricated success"
         );
         assert_eq!(crate::known_nid_name(nid), Some(name));
     }

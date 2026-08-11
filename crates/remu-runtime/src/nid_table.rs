@@ -7,6 +7,7 @@ pub fn known_nid_name(nid: &str) -> Option<&'static str> {
     Some(match nid {
         "bzQExy189ZI" => "_init_env",
         "8G2LB+A3rzg" => "atexit",
+        "uMei1W9uyNo" => "exit",
         "tsvEmnenz48" => "__cxa_atexit",
         "H2e8t5ScQGc" => "__cxa_finalize",
         "rNhWz+lvOMU" => "_sceKernelSetThreadDtors",

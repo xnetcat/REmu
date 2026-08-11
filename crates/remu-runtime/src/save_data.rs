@@ -807,6 +807,7 @@ pub(crate) fn enumerate_save_data_entries(
         if name.to_ascii_lowercase().starts_with("sce_")
             || name.eq_ignore_ascii_case("temp0")
             || name.eq_ignore_ascii_case("download0")
+            || name.eq_ignore_ascii_case("devlog")
             || name.eq_ignore_ascii_case("savedata")
             || (!pattern.is_empty() && !save_data_pattern_matches(&name, pattern))
         {

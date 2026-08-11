@@ -458,7 +458,7 @@ pub(super) fn convolution(
     let config = u64::from(shared_input)
         | (u64::from(version2) << 1)
         | (u64::from(arguments[1] as u32) << 8)
-        | ((arguments[3] as u64) << 40);
+        | (arguments[3] << 40);
     let mut payload = vec![config, arguments[2], arguments[4], arguments[5], stack[0]];
     payload.resize(words - 1, 0);
     append_record(
