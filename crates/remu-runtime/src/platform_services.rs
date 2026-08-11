@@ -12,15 +12,27 @@
 
 use std::sync::Mutex;
 
-use crate::{SCE_KERNEL_ERROR_INVALID_ARGUMENT, low_i32, sce_kernel_error, write_guest_u32};
+use crate::{
+    SCE_KERNEL_ERROR_INVALID_ARGUMENT, low_i32, process_guest_range_is_readable, sce_kernel_error,
+    write_guest_bytes, write_guest_u32,
+};
 
 const SCE_USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
 const SCE_USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
 const SCE_VIDEO_OUT_ERROR_INVALID_VALUE: u32 = 0x8029_0001;
 const SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS: u32 = 0x8029_0002;
 const SCE_NET_CTL_ERROR_INVALID_ADDRESS: u32 = 0x8041_2101;
+const SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT: u32 = 0x8089_0001;
+const SCE_SYSTEM_GESTURE_ERROR_INVALID_HANDLE: u32 = 0x8089_0006;
 /// The guest's "no network connection" state value.
 const NET_CTL_STATE_DISCONNECTED: u32 = 0;
+
+const SYSTEM_GESTURE_HANDLE: i32 = 0;
+const SYSTEM_GESTURE_PRIMITIVE_PARAMETER_SIZE: usize = 64;
+const SYSTEM_GESTURE_RECOGNIZER_SIZE: usize = 361 * std::mem::size_of::<u64>();
+const SYSTEM_GESTURE_RECTANGLE_SIZE: usize = 24;
+const SYSTEM_GESTURE_PARAMETER_SIZE: usize = 64;
+const SYSTEM_GESTURE_TOUCH_PAD_DATA_SIZE: usize = 24;
 
 /// Base of the guest's partially-resident-texture address window.
 const PRT_AREA_START: u64 = 0x0000_0010_0000_0000;
@@ -121,18 +133,97 @@ fn net_ctl_get_state(output: u64) -> u64 {
     0
 }
 
+fn system_gesture_error(error: u32) -> u64 {
+    sce_kernel_error(error)
+}
+
+fn system_gesture_valid_handle(handle: u64) -> bool {
+    low_i32(handle) == SYSTEM_GESTURE_HANDLE
+}
+
+/// Initializes the primitive recognizer library. The parameter is an optional reserved record.
+fn system_gesture_initialize(parameter: u64) -> u64 {
+    if parameter != 0
+        && !process_guest_range_is_readable(parameter, SYSTEM_GESTURE_PRIMITIVE_PARAMETER_SIZE)
+    {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
+    }
+    0
+}
+
+/// Opens the one supported input source: the controller touchpad.
+fn system_gesture_open(arguments: [u64; 6]) -> u64 {
+    if low_i32(arguments[0]) != 0 || arguments[1] != 0 {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
+    }
+    SYSTEM_GESTURE_HANDLE as u64
+}
+
+/// Constructs a valid opaque SDK recognizer whose host input stream contains no touches.
+fn system_gesture_create_touch_recognizer(arguments: [u64; 6]) -> u64 {
+    if !system_gesture_valid_handle(arguments[0]) {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_HANDLE);
+    }
+    let recognizer = arguments[1];
+    let gesture_type = arguments[2] as u32;
+    let rectangle = arguments[3];
+    let parameter = arguments[4];
+    if recognizer == 0
+        || !process_guest_range_is_readable(recognizer, SYSTEM_GESTURE_RECOGNIZER_SIZE)
+        || !matches!(gesture_type, 1 | 2 | 4 | 8 | 16 | 32)
+        || (rectangle != 0
+            && !process_guest_range_is_readable(rectangle, SYSTEM_GESTURE_RECTANGLE_SIZE))
+        || (parameter != 0
+            && !process_guest_range_is_readable(parameter, SYSTEM_GESTURE_PARAMETER_SIZE))
+    {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
+    }
+    write_guest_bytes(recognizer, &[0; SYSTEM_GESTURE_RECOGNIZER_SIZE]);
+    0
+}
+
+fn system_gesture_update_primitive(arguments: [u64; 6]) -> u64 {
+    if !system_gesture_valid_handle(arguments[0]) {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_HANDLE);
+    }
+    if arguments[1] == 0
+        || !process_guest_range_is_readable(arguments[1], SYSTEM_GESTURE_TOUCH_PAD_DATA_SIZE)
+    {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
+    }
+    0
+}
+
+fn system_gesture_update_recognizer(arguments: [u64; 6]) -> u64 {
+    if !system_gesture_valid_handle(arguments[0]) {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_HANDLE);
+    }
+    if arguments[1] == 0
+        || !process_guest_range_is_readable(arguments[1], SYSTEM_GESTURE_RECOGNIZER_SIZE)
+    {
+        return system_gesture_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
+    }
+    0
+}
+
+fn system_gesture_touch_event_count(arguments: [u64; 6]) -> u64 {
+    let result = system_gesture_update_recognizer(arguments);
+    if result == 0 { 0 } else { result }
+}
+
 /// Routes the platform service entry points that need only integer arguments.
 pub(crate) fn dispatch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
         "BohYr-F7-is" => kernel_set_prt_aperture(arguments),
         "D-CzAxQL0XI" => user_service_platform_privacy_setting(arguments),
-        // This host models no touchpad. Opening a recognizer succeeds and no touch is ever
-        // reported, which is the same thing the guest observes from a pad nobody touches. The
-        // recognizers that would report gestures stay unserved rather than reporting none.
-        "qpo-mEOwje0" | "3pcAvmwKCvM" | "FWF8zkhr854" => {
-            remu_gpu::note_inert(nid);
-            0
-        }
+        // This host models the controller touchpad as present but untouched. SDK recognizer
+        // records are still fully initialized and every update/query observes an empty stream.
+        "3pcAvmwKCvM" => system_gesture_initialize(arguments[0]),
+        "qpo-mEOwje0" => system_gesture_open(arguments),
+        "FWF8zkhr854" => system_gesture_create_touch_recognizer(arguments),
+        "GgFMb22sbbI" => system_gesture_update_primitive(arguments),
+        "j4h82CQWENo" => system_gesture_update_recognizer(arguments),
+        "h8uongcBNVs" => system_gesture_touch_event_count(arguments),
         // Likewise no network interface: initialization succeeds and the state query reports
         // disconnected, which is what this host is. Nothing here fabricates a link.
         "gky0+oaNM4k" => {
@@ -254,7 +345,10 @@ mod tests {
         assert_eq!(dispatch("qpo-mEOwje0", [0; 6]), Some(0));
         assert_eq!(dispatch("3pcAvmwKCvM", [0; 6]), Some(0));
         assert_eq!(dispatch("gky0+oaNM4k", [0; 6]), Some(0));
-        assert_eq!(dispatch("FWF8zkhr854", [0; 6]), Some(0));
+        assert_eq!(
+            dispatch("FWF8zkhr854", [0; 6]),
+            Some(sce_kernel_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT))
+        );
         assert_eq!(dispatch("qQJfO8HAiaY", [0; 6]), Some(0));
         let mut state = 0xffff_ffff_u32;
         assert_eq!(net_ctl_get_state((&raw mut state).addr() as u64), 0);
@@ -271,6 +365,50 @@ mod tests {
         assert_eq!(
             crate::known_nid_name("D-CzAxQL0XI"),
             Some("sceUserServiceGetPlatformPrivacyWs1")
+        );
+    }
+
+    #[test]
+    fn a_no_touch_gesture_recognizer_has_initialized_state_and_zero_events() {
+        let mut recognizer = [0xff_u8; 361 * 8];
+        let input = [0_u8; 24];
+        let recognizer_address = recognizer.as_mut_ptr() as u64;
+        let input_address = input.as_ptr() as u64;
+
+        assert_eq!(dispatch("3pcAvmwKCvM", [0; 6]), Some(0));
+        assert_eq!(dispatch("qpo-mEOwje0", [0, 0, 0, 0, 0, 0]), Some(0));
+        assert_eq!(
+            dispatch("FWF8zkhr854", [0, recognizer_address, 0x20, 0, 0, 0]),
+            Some(0)
+        );
+        assert_eq!(
+            recognizer,
+            [0; 361 * 8],
+            "the SDK opaque recognizer must not retain caller garbage"
+        );
+        assert_eq!(
+            dispatch("GgFMb22sbbI", [0, input_address, 0, 0, 0, 0]),
+            Some(0)
+        );
+        assert_eq!(
+            dispatch("j4h82CQWENo", [0, recognizer_address, 0, 0, 0, 0]),
+            Some(0)
+        );
+        assert_eq!(
+            dispatch("h8uongcBNVs", [0, recognizer_address, 0, 0, 0, 0]),
+            Some(0),
+            "an untouched host touchpad has no gesture events"
+        );
+
+        let invalid_handle = sce_kernel_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_HANDLE);
+        assert_eq!(
+            dispatch("j4h82CQWENo", [1, recognizer_address, 0, 0, 0, 0]),
+            Some(invalid_handle)
+        );
+        let invalid_argument = sce_kernel_error(SCE_SYSTEM_GESTURE_ERROR_INVALID_ARGUMENT);
+        assert_eq!(
+            dispatch("FWF8zkhr854", [0, 0, 0x20, 0, 0, 0]),
+            Some(invalid_argument)
         );
     }
 }
