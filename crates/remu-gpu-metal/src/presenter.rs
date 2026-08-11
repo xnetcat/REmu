@@ -246,23 +246,25 @@ use self::texture::{
     write_watched_guest_texture_linear,
 };
 use self::tiling::{
-    ResourceSpan, copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z,
-    decode_mode27_mip_chain_from_raw, depth_sample_view_must_not_steal_depth_authority,
-    effective_linear_pitch, guest_physical_ranges_overlap, guest_ranges_overlap,
-    guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
+    ResourceSpan, copy_mode64k_2d_mip_level_to_linear, copy_tiled_to_linear_at_z,
+    depth_sample_view_must_not_steal_depth_authority, effective_linear_pitch,
+    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
+    guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    mode5_mip_chain_layout, mode27_mip_chain_layout, mode27_surface_z_xor,
+    mode5_mip_chain_layout, mode27_surface_z_xor, mode64k_2d_mip_chain_layout,
     render_resolve_candidate_matches, spans_overlap, tiled_block_bytes, tiled_block_dimensions,
 };
 #[cfg(test)]
 use self::tiling::{
-    copy_linear_to_tiled_at_z, decode_mode5_mip_chain_from_raw, encode_mode5_mip_chain_into_raw,
-    encode_mode27_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
-    mode5_within_block_byte_offset, mode9_within_block_byte_offset,
-    mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
+    copy_linear_to_mode64k_2d_mip_level, copy_linear_to_tiled_at_z,
+    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
+    encode_mode5_mip_chain_into_raw, encode_mode27_mip_chain_into_raw,
+    guest_texture_descriptors_share_component_reordered_storage, mode5_within_block_byte_offset,
+    mode9_within_block_byte_offset, mode24_within_block_byte_offset_for_format,
+    mode27_block_dimensions, mode27_mip_chain_layout, mode27_source_byte_offset,
     mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
 };
 
@@ -1304,10 +1306,9 @@ struct ResidentGuestTexture {
     write_watch: GuestTextureWriteWatch,
     /// The guest bytes this allocation declares, resolved once at creation.
     ///
-    /// `None` disables the range algebra for this resident and leaves it on the descriptor-overlap
-    /// behaviour. Note this is the resident's *whole* range — mip chain, array faces and all —
-    /// while the interval index keys residents by their level-0 span, so the index answers "which
-    /// residents might be involved" and `owned` answers "which bytes are actually theirs".
+    /// `None` disables the range algebra for this resident. This is the resident's *whole* range —
+    /// mip chain, array faces and all — and the interval index mirrors this same admission-time
+    /// span while `owned` answers which bytes inside it are currently authoritative.
     span: Option<ResourceSpan>,
     /// Guest bytes this allocation is the authority for.
     owned: RangeSet,

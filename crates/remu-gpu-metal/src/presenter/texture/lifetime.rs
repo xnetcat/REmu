@@ -1,9 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{
-    GuestTextureDescriptor, ResidentGuestTexture, ResidentTextureMap, ResourceSpan, SpanQueryOrder,
-};
+use super::{GuestTextureDescriptor, ResidentGuestTexture, ResidentTextureMap, SpanQueryOrder};
 use remu_memory::{CpuWriteWatchRetirement, guest_shared_backing_identity};
 use std::collections::HashSet;
 
@@ -103,7 +101,7 @@ pub(crate) fn resident_texture_eviction_plan(
             // The pairwise scan this replaces was quadratic in the resident count and took the
             // shared-mapping lock once per pair.
             !resident.gpu_written()
-                || !ResourceSpan::for_texture(resident.descriptor).is_some_and(|span| {
+                || !resident.span.is_some_and(|span| {
                     residents
                         .overlapping(&span, SpanQueryOrder::QueryFirst)
                         .into_iter()

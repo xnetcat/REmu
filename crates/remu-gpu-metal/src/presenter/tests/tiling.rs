@@ -4,14 +4,141 @@
 use metal::MTLPixelFormat;
 
 use super::{
-    GuestTextureDescriptor, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
-    encode_mode5_mip_chain_into_raw, encode_mode27_mip_chain_into_raw, guest_texture_byte_count,
-    mode5_mip_chain_layout, mode5_within_block_byte_offset, mode9_within_block_byte_offset,
+    GuestTextureDescriptor, copy_linear_to_mode64k_2d_mip_level,
+    copy_mode64k_2d_mip_level_to_linear, decode_mode5_mip_chain_from_raw,
+    decode_mode27_mip_chain_from_raw, encode_mode5_mip_chain_into_raw,
+    encode_mode27_mip_chain_into_raw, guest_texture_byte_count, mode5_mip_chain_layout,
+    mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_mip_chain_layout,
     mode27_source_byte_offset, mode27_within_block_byte_offset,
-    mode27_within_block_byte_offset_for_format, snapshot_guest_texture_linear,
-    tiled_block_dimensions, write_guest_texture_linear,
+    mode27_within_block_byte_offset_for_format, mode64k_2d_mip_chain_layout,
+    snapshot_guest_texture_linear, tiled_block_dimensions, write_guest_texture_linear,
 };
+
+#[test]
+fn sdk_tile9_2d_mips_share_64k_placement_with_tile27() {
+    let mode9 = GuestTextureDescriptor {
+        address: 0x70_6409_0000,
+        width: 512,
+        height: 256,
+        pitch: 512,
+        tile_mode: 9,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mode27 = GuestTextureDescriptor {
+        tile_mode: 27,
+        ..mode9
+    };
+
+    let mode9_layout = mode64k_2d_mip_chain_layout(mode9, 10).expect("SDK SW_64KB_S mip layout");
+    let mode27_layout =
+        mode64k_2d_mip_chain_layout(mode27, 10).expect("SDK SW_64KB_R_X mip layout");
+
+    assert_eq!(mode9_layout, mode27_layout);
+    assert_eq!(mode9_layout.block_width, 128);
+    assert_eq!(mode9_layout.block_height, 128);
+    assert_eq!(mode9_layout.byte_count, 786_432);
+    assert_eq!(
+        mode9_layout
+            .levels
+            .iter()
+            .map(|level| (
+                level.width,
+                level.height,
+                level.padded_width,
+                level.offset,
+                level.tail_x,
+                level.tail_y,
+                level.in_tail,
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (512, 256, 512, 262_144, 0, 0, false),
+            (256, 128, 256, 131_072, 0, 0, false),
+            (128, 64, 128, 65_536, 0, 0, false),
+            (64, 32, 128, 0, 64, 0, true),
+            (32, 16, 128, 0, 0, 64, true),
+            (16, 8, 128, 0, 32, 0, true),
+            (8, 4, 128, 0, 0, 32, true),
+            (4, 2, 128, 0, 16, 0, true),
+            (2, 1, 128, 0, 8, 16, true),
+            (1, 1, 128, 0, 0, 24, true),
+        ]
+    );
+}
+
+#[test]
+fn mode64k_mip_layout_refuses_an_unproven_explicit_pitch() {
+    for tile_mode in [9, 27] {
+        let descriptor = GuestTextureDescriptor {
+            address: 0x70_6409_0000,
+            width: 512,
+            height: 256,
+            pitch: 640,
+            tile_mode,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        assert!(
+            mode64k_2d_mip_chain_layout(descriptor, 5)
+                .expect_err("64K mip layout must not guess how explicit pitch changes placement")
+                .contains("pitch")
+        );
+    }
+}
+
+#[test]
+fn tile9_2d_mips_round_trip_with_the_standard_swizzle() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x70_6409_0000,
+        width: 512,
+        height: 256,
+        pitch: 512,
+        tile_mode: 9,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let layout = mode64k_2d_mip_chain_layout(descriptor, 10).expect("tile-9 mip layout");
+    let levels = layout
+        .levels
+        .iter()
+        .enumerate()
+        .map(|(level_index, level)| {
+            (0..level.width * level.height * layout.bytes_per_element)
+                .map(|byte| {
+                    u8::try_from((level_index * 47 + byte * 13 + byte / 241) & 0xff)
+                        .expect("masked byte fits")
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut raw = vec![0xa5; layout.byte_count];
+    for (level, linear) in layout.levels.iter().copied().zip(&levels) {
+        copy_linear_to_mode64k_2d_mip_level(descriptor.tile_mode, &layout, level, linear, &mut raw)
+            .expect("encode tile-9 mip");
+    }
+
+    // SDK generated_9: RGBA8 element (16,0) maps to byte 0x800 in SW_64KB_S.
+    let level0_texel = 16 * layout.bytes_per_element;
+    assert_eq!(
+        &raw[layout.levels[0].offset + 0x800..layout.levels[0].offset + 0x804],
+        &levels[0][level0_texel..level0_texel + 4]
+    );
+
+    for (level, expected) in layout.levels.iter().copied().zip(&levels) {
+        let mut decoded = vec![0; expected.len()];
+        copy_mode64k_2d_mip_level_to_linear(
+            descriptor.tile_mode,
+            &layout,
+            level,
+            &raw,
+            &mut decoded,
+        )
+        .expect("decode tile-9 mip");
+        assert_eq!(&decoded, expected);
+    }
+}
 
 #[test]
 fn sdk_npot_mip_rounding_uses_floor_for_visible_and_shift_ceil_for_padding() {

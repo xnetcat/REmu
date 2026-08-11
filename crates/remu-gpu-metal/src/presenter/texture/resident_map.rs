@@ -49,7 +49,7 @@ impl ResidentTextureMap {
         descriptor: GuestTextureDescriptor,
         resident: ResidentGuestTexture,
     ) -> Option<ResidentGuestTexture> {
-        self.index.insert(descriptor);
+        self.index.insert(descriptor, resident.span);
         self.textures.insert(descriptor, resident)
     }
 
@@ -125,11 +125,15 @@ impl ResidentSpanIndex {
         }
     }
 
-    pub(crate) fn insert(&mut self, descriptor: GuestTextureDescriptor) {
+    pub(crate) fn insert(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+        span: Option<ResourceSpan>,
+    ) {
         self.remove(&descriptor);
-        // A descriptor whose byte count overflows can never overlap anything, so it is left out
-        // of the index entirely rather than admitted with a degenerate span.
-        let Some(span) = ResourceSpan::for_texture(descriptor) else {
+        // A resident without a resolved declared span can never overlap anything, so it is left
+        // out of the index entirely rather than admitted with a guessed base-level span.
+        let Some(span) = span else {
             return;
         };
         self.virtual_intervals

@@ -4,7 +4,8 @@
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::completion::commit_and_settle;
 use super::super::tiler::{
-    encode_gpu_upload_from_guest, gpu_tiler_owns_descriptor, mode27_tiler_pipelines,
+    encode_gpu_upload_from_guest, gpu_tiler_owns_descriptor, mode9_tiler_pipelines,
+    mode27_tiler_pipelines,
 };
 use super::super::{
     FlushPolicy, GuestBatchFlushReason, SharedEventResidentTextureVersion, SharedEventWriteKind,
@@ -19,21 +20,20 @@ use super::{
     OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
     RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
-    SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
-    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
-    depth_sample_view_must_not_steal_depth_authority, guest_ranges_overlap,
-    guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
+    SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion,
+    decode_sampled_texture_linear_from_raw, depth_sample_view_must_not_steal_depth_authority,
+    ensure_mipmapped_resident_texture_in_map, guest_texture_byte_count,
+    guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
-    initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
-    promote_resident_mip_hierarchy, record_mode27_work_detail,
-    refresh_resident_texture_write_watch, resident_texture_eviction_plan,
-    resident_texture_for_sample, retire_overlapping_sampled_textures,
-    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
+    initial_depth_clear_for_target, mode64k_2d_mip_chain_layout, new_color_alias_texture_view,
+    promote_resident_mip_hierarchy, refresh_resident_texture_write_watch,
+    resident_texture_eviction_plan, resident_texture_for_sample,
+    retire_overlapping_sampled_textures, retire_sampled_textures_overlapping_writeback,
     snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout, tiled_block_bytes,
     tiled_block_dimensions, trace_residency_churn, trace_resident_texture_demotion,
-    trace_resident_texture_removal, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, written_byte_ranges,
+    trace_resident_texture_removal, watch_guest_texture, watch_sampled_texture,
+    written_byte_ranges,
 };
 use metal::{
     Buffer, ComputePipelineState, Device, MTLBlitOption, MTLLoadAction, MTLOrigin, MTLRegion,
@@ -47,7 +47,6 @@ use std::collections::HashSet;
 use std::ffi::c_void;
 use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 /// A/B lever for the range algebra: `REMU_RANGE_ALGEBRA=0` makes every write claim its writer's
 /// whole declared range, which supersedes exactly what the descriptor-overlap retirement did.
@@ -108,7 +107,7 @@ fn record_rematerialisation_failure(kind: RematerialisationFailureKind) {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Mode27RematerialisationSubresource {
+struct Mode64kRematerialisationSubresource {
     width: u64,
     height: u64,
     linear_offset: u64,
@@ -134,18 +133,18 @@ fn align_256(value: u64) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn mode27_rematerialisation_subresources(
+fn gpu_rematerialisation_subresources(
     resident: &ResidentGuestTexture,
-) -> Result<(Vec<Mode27RematerialisationSubresource>, u64), String> {
+) -> Result<(Vec<Mode64kRematerialisationSubresource>, u64), String> {
     let tile_mode = resident.descriptor.tile_mode;
     let valid_element_size = match tile_mode {
         24 => matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8),
-        27 => matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8 | 16),
+        9 | 27 => matches!(resident.descriptor.bytes_per_pixel, 1 | 2 | 4 | 8 | 16),
         _ => false,
     };
     if !valid_element_size || resident.layer_count == 0 || resident.mip_level_count == 0 {
         return Err(format!(
-            "GPU retile requires mode-24 1/2/4/8-byte or mode-27 1/2/4/8/16-byte storage, got mode={} bpe={} layers={} mips={}",
+            "GPU retile requires mode-24 1/2/4/8-byte or mode-9/27 1/2/4/8/16-byte storage, got mode={} bpe={} layers={} mips={}",
             tile_mode,
             resident.descriptor.bytes_per_pixel,
             resident.layer_count,
@@ -153,7 +152,7 @@ fn mode27_rematerialisation_subresources(
         ));
     }
     if resident.mip_level_count > 1
-        && (tile_mode != 27 || resident.texture_type != 9 || resident.layer_count != 1)
+        && (!matches!(tile_mode, 9 | 27) || resident.texture_type != 9 || resident.layer_count != 1)
     {
         return Err(format!(
             "GPU retile cannot represent mipmapped type={} layers={}",
@@ -209,7 +208,7 @@ fn mode27_rematerialisation_subresources(
         block_bytes,
         usize::try_from(bytes_per_element).map_err(|_| "element size does not fit usize")?,
     )
-    .ok_or("mode-27 block dimensions are unavailable")?;
+    .ok_or("GPU retile block dimensions are unavailable")?;
     let mut linear_offset = 0_u64;
     let mut result = Vec::new();
     let mut push = |width: u64,
@@ -242,7 +241,7 @@ fn mode27_rematerialisation_subresources(
         } else {
             0
         };
-        result.push(Mode27RematerialisationSubresource {
+        result.push(Mode64kRematerialisationSubresource {
             width,
             height,
             linear_offset,
@@ -255,10 +254,14 @@ fn mode27_rematerialisation_subresources(
             block_height,
             tail_x,
             tail_y,
-            surface_z_xor: u64::try_from(super::mode27_surface_z_xor(
-                usize::try_from(surface_z).expect("surface index fits usize"),
-            ))
-            .expect("surface xor fits u64"),
+            surface_z_xor: if tile_mode == 9 {
+                0
+            } else {
+                u64::try_from(super::mode27_surface_z_xor(
+                    usize::try_from(surface_z).expect("surface index fits usize"),
+                ))
+                .expect("surface xor fits u64")
+            },
             in_tail,
             metal_slice,
             metal_level,
@@ -271,7 +274,7 @@ fn mode27_rematerialisation_subresources(
         Ok(())
     };
     if resident.mip_level_count > 1 {
-        let layout = mode27_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
+        let layout = mode64k_2d_mip_chain_layout(resident.descriptor, resident.mip_level_count)?;
         for (level_index, level) in layout.levels.iter().enumerate() {
             push(
                 u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?,
@@ -313,21 +316,24 @@ fn mode27_rematerialisation_subresources(
     Ok((result, linear_offset))
 }
 
-struct Mode27RematerialisationInput {
+struct Mode64kRematerialisationInput {
     texture: Texture,
     span: ResourceSpan,
     debt: RangeSet,
-    subresources: Vec<Mode27RematerialisationSubresource>,
+    subresources: Vec<Mode64kRematerialisationSubresource>,
     linear_length: u64,
+    tile_mode: u32,
 }
 
-fn mode27_rematerialisation_parameters(
-    subresource: Mode27RematerialisationSubresource,
+fn gpu_rematerialisation_parameters(
+    subresource: Mode64kRematerialisationSubresource,
     resource_base: u64,
     target_span: ResourceSpan,
     run_count: usize,
-) -> Result<[u64; 18], String> {
-    Ok([
+) -> Result<Vec<u64>, String> {
+    let run_count =
+        u64::try_from(run_count).map_err(|_| "GPU retile run count does not fit u64")?;
+    let common = [
         subresource.width,
         subresource.height,
         subresource.linear_row_bytes,
@@ -341,12 +347,18 @@ fn mode27_rematerialisation_parameters(
         subresource.block_height,
         subresource.tail_x,
         subresource.tail_y,
-        subresource.surface_z_xor,
+    ];
+    let mut parameters = common.to_vec();
+    if subresource.tile_mode != 9 {
+        parameters.push(subresource.surface_z_xor);
+    }
+    parameters.extend_from_slice(&[
         u64::from(subresource.in_tail),
         target_span.len(),
-        u64::try_from(run_count).map_err(|_| "GPU retile run count does not fit u64")?,
+        run_count,
         subresource.tile_mode,
-    ])
+    ]);
+    Ok(parameters)
 }
 
 /// Returns `(retile/scatter, detile/gather)` pipelines from the S2 tiler module.
@@ -362,7 +374,7 @@ fn encode_texture_to_linear_buffer(
     blit: &metal::BlitCommandEncoderRef,
     texture: &Texture,
     linear: &Buffer,
-    subresources: &[Mode27RematerialisationSubresource],
+    subresources: &[Mode64kRematerialisationSubresource],
 ) {
     for subresource in subresources {
         blit.copy_from_texture_to_buffer(
@@ -388,7 +400,7 @@ fn encode_linear_buffer_to_texture(
     blit: &metal::BlitCommandEncoderRef,
     linear: &Buffer,
     texture: &Texture,
-    subresources: &[Mode27RematerialisationSubresource],
+    subresources: &[Mode64kRematerialisationSubresource],
 ) {
     for subresource in subresources {
         blit.copy_from_buffer_to_texture(
@@ -415,7 +427,7 @@ impl MetalPresenter {
     /// debt owner. All work stays in the open guest batch: the shared backing is read, never
     /// written, and no completion boundary is introduced.
     #[allow(clippy::too_many_lines)]
-    fn encode_mode27_stale_rematerialisation(
+    fn encode_mode64k_stale_rematerialisation(
         &mut self,
         target_descriptor: GuestTextureDescriptor,
         target_span: ResourceSpan,
@@ -426,23 +438,28 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        if self.mode27_rematerialisation_scatter_pipeline.is_none()
-            || self.mode27_rematerialisation_gather_pipeline.is_none()
-        {
-            let (scatter, gather) = compile_mode27_rematerialisation_pipelines(&device)?;
-            self.mode27_rematerialisation_scatter_pipeline = Some(scatter);
-            self.mode27_rematerialisation_gather_pipeline = Some(gather);
-        }
-        let scatter_pipeline = self
-            .mode27_rematerialisation_scatter_pipeline
-            .as_ref()
-            .expect("mode-27 scatter pipeline was initialized")
-            .clone();
-        let gather_pipeline = self
-            .mode27_rematerialisation_gather_pipeline
-            .as_ref()
-            .expect("mode-27 gather pipeline was initialized")
-            .clone();
+        let (scatter_pipeline, gather_pipeline) = if target_descriptor.tile_mode == 9 {
+            let (detile, retile) = mode9_tiler_pipelines(&device)?;
+            (retile, detile)
+        } else {
+            if self.mode27_rematerialisation_scatter_pipeline.is_none()
+                || self.mode27_rematerialisation_gather_pipeline.is_none()
+            {
+                let (scatter, gather) = compile_mode27_rematerialisation_pipelines(&device)?;
+                self.mode27_rematerialisation_scatter_pipeline = Some(scatter);
+                self.mode27_rematerialisation_gather_pipeline = Some(gather);
+            }
+            (
+                self.mode27_rematerialisation_scatter_pipeline
+                    .as_ref()
+                    .expect("mode-27 scatter pipeline was initialized")
+                    .clone(),
+                self.mode27_rematerialisation_gather_pipeline
+                    .as_ref()
+                    .expect("mode-27 gather pipeline was initialized")
+                    .clone(),
+            )
+        };
 
         let target = self
             .resident_guest_textures
@@ -450,7 +467,7 @@ impl MetalPresenter {
             .ok_or("stale rematerialisation target disappeared")?;
         let destination = target.texture.clone();
         let (target_subresources, target_linear_length) =
-            mode27_rematerialisation_subresources(target)?;
+            gpu_rematerialisation_subresources(target)?;
         let mut sources = Vec::with_capacity(source_descriptors.len());
         for descriptor in source_descriptors {
             let source = self
@@ -466,13 +483,14 @@ impl MetalPresenter {
             if debt.is_empty() {
                 continue;
             }
-            let (subresources, linear_length) = mode27_rematerialisation_subresources(source)?;
-            sources.push(Mode27RematerialisationInput {
+            let (subresources, linear_length) = gpu_rematerialisation_subresources(source)?;
+            sources.push(Mode64kRematerialisationInput {
                 texture: source.texture.clone(),
                 span,
                 debt,
                 subresources,
                 linear_length,
+                tile_mode: source.descriptor.tile_mode,
             });
         }
         if sources.is_empty() {
@@ -494,10 +512,10 @@ impl MetalPresenter {
         let guest = metal_buffer_with_guest_backing_range(&device, &backing_range)
             .ok_or("stale target guest backing cannot be exposed to Metal")?;
         let scratch = device.new_buffer(target_span.len(), MTLResourceOptions::StorageModePrivate);
-        scratch.set_label("REMu mode-27 rematerialisation tiled scratch");
+        scratch.set_label("REMu 64K rematerialisation tiled scratch");
         let target_linear =
             device.new_buffer(target_linear_length, MTLResourceOptions::StorageModePrivate);
-        target_linear.set_label("REMu mode-27 rematerialisation target linear");
+        target_linear.set_label("REMu 64K rematerialisation target linear");
 
         self.ensure_active_open_guest_batch()?;
         let command_buffer = {
@@ -520,9 +538,16 @@ impl MetalPresenter {
         initialize.end_encoding();
 
         for source in &sources {
+            let source_scatter_pipeline = if source.tile_mode == target_descriptor.tile_mode {
+                scatter_pipeline.clone()
+            } else if source.tile_mode == 9 {
+                mode9_tiler_pipelines(&device)?.1
+            } else {
+                compile_mode27_rematerialisation_pipelines(&device)?.0
+            };
             let linear =
                 device.new_buffer(source.linear_length, MTLResourceOptions::StorageModePrivate);
-            linear.set_label("REMu mode-27 rematerialisation source linear");
+            linear.set_label("REMu 64K rematerialisation source linear");
             let blit = command_buffer.new_blit_command_encoder();
             blit.set_label("REMu linearize current texture owner");
             encode_texture_to_linear_buffer(blit, &source.texture, &linear, &source.subresources);
@@ -541,15 +566,15 @@ impl MetalPresenter {
                 run_bytes,
                 MTLResourceOptions::StorageModeShared,
             );
-            runs.set_label("REMu mode-27 rematerialisation debt runs");
+            runs.set_label("REMu 64K rematerialisation debt runs");
             let compute = command_buffer.new_compute_command_encoder();
             compute.set_label("REMu retile current texture owner");
-            compute.set_compute_pipeline_state(&scatter_pipeline);
+            compute.set_compute_pipeline_state(&source_scatter_pipeline);
             compute.set_buffer(0, Some(&linear), 0);
             compute.set_buffer(1, Some(&scratch), 0);
             compute.set_buffer(2, Some(&runs), 0);
             for subresource in &source.subresources {
-                let parameters = mode27_rematerialisation_parameters(
+                let parameters = gpu_rematerialisation_parameters(
                     *subresource,
                     source.span.range_start(),
                     target_span,
@@ -557,7 +582,7 @@ impl MetalPresenter {
                 )?;
                 compute.set_bytes(
                     3,
-                    u64::try_from(std::mem::size_of_val(&parameters))
+                    u64::try_from(parameters.len() * std::mem::size_of::<u64>())
                         .expect("parameter byte count fits u64"),
                     parameters.as_ptr().cast::<c_void>(),
                 );
@@ -575,7 +600,7 @@ impl MetalPresenter {
         gather.set_buffer(0, Some(&scratch), 0);
         gather.set_buffer(1, Some(&target_linear), 0);
         for subresource in &target_subresources {
-            let parameters = mode27_rematerialisation_parameters(
+            let parameters = gpu_rematerialisation_parameters(
                 *subresource,
                 target_span.range_start(),
                 target_span,
@@ -583,7 +608,7 @@ impl MetalPresenter {
             )?;
             gather.set_bytes(
                 3,
-                u64::try_from(std::mem::size_of_val(&parameters))
+                u64::try_from(parameters.len() * std::mem::size_of::<u64>())
                     .expect("parameter byte count fits u64"),
                 parameters.as_ptr().cast::<c_void>(),
             );
@@ -1073,7 +1098,7 @@ impl MetalPresenter {
         let rematerialisation = if let Some(rematerialisation) = rematerialisation {
             rematerialisation
         } else {
-            let destination = match self.encode_mode27_stale_rematerialisation(
+            let destination = match self.encode_mode64k_stale_rematerialisation(
                 target_descriptor,
                 target_span,
                 &owners,
@@ -1191,6 +1216,64 @@ impl MetalPresenter {
         Ok(true)
     }
 
+    /// Returns a current GPU-only owner inside a mip hierarchy other than the hierarchy itself.
+    pub(crate) fn mip_hierarchy_gpu_alias_source(
+        &self,
+        descriptor: DecodedImageDescriptor,
+    ) -> Option<(GuestTextureDescriptor, u64)> {
+        let span = descriptor.span?;
+        let requested = RangeSet::for_span(&span);
+        self.resident_guest_textures
+            .overlapping(&span, SpanQueryOrder::ResidentFirst)
+            .into_iter()
+            .filter(|candidate| *candidate != descriptor.guest)
+            .filter_map(|candidate| {
+                let resident = self.resident_guest_textures.get(&candidate)?;
+                (resident.is_live()
+                    && resident.owned.intersects(&requested)
+                    && resident.gpu_authored.intersects(&requested))
+                .then_some((candidate, resident.content_version))
+            })
+            .max_by_key(|(_, version)| *version)
+    }
+
+    /// Reconstructs a newly created or cleanly promoted hierarchy before it can be read.
+    ///
+    /// Guest RAM supplies bytes with no GPU owner; current overlapping residents are overlaid on
+    /// the same ordered Metal command buffer. This is deliberately not a bookkeeping writeback:
+    /// the guest never requested publication and RAM remains stale for GPU-authored ranges.
+    fn rematerialise_gpu_aliases_into_mip_hierarchy(
+        &mut self,
+        descriptor: DecodedImageDescriptor,
+    ) -> Result<bool, String> {
+        let Some((source_descriptor, source_version)) =
+            self.mip_hierarchy_gpu_alias_source(descriptor)
+        else {
+            return Ok(false);
+        };
+        let target = self
+            .resident_guest_textures
+            .get_mut(&descriptor.guest)
+            .ok_or("mip hierarchy disappeared before alias reconciliation")?;
+        if target.gpu_written() {
+            return Err(format!(
+                "cannot reconcile mip hierarchy {:#x} with external GPU alias {:#x} after GPU-current promotion",
+                descriptor.guest.address, source_descriptor.address
+            ));
+        }
+        target.demote(StaleSource::Allocation {
+            descriptor: source_descriptor,
+            content_version: source_version,
+        });
+        if !self.rematerialise_stale_resident_for_read(descriptor.guest)? {
+            return Err(format!(
+                "GPU alias {:#x} did not rematerialise mip hierarchy {:#x}",
+                source_descriptor.address, descriptor.guest.address
+            ));
+        }
+        Ok(true)
+    }
+
     pub(crate) fn garbage_collect_resident_textures_to_budget(
         &mut self,
         byte_capacity: u64,
@@ -1301,7 +1384,14 @@ impl MetalPresenter {
                     && resident.layer_count == 1
                     && resident.mip_level_count < underlying_mip_count
             });
+        let needs_alias_reconciliation = self.mip_hierarchy_gpu_alias_source(descriptor).is_some();
         if needs_gpu_promotion {
+            if needs_alias_reconciliation {
+                return Err(format!(
+                    "cannot promote GPU-current mip hierarchy {:#x} while another GPU alias owns bytes in the grown allocation",
+                    descriptor.guest.address
+                ));
+            }
             self.ensure_active_open_guest_batch()?;
             let command_buffer = {
                 let batch = self
@@ -1358,7 +1448,7 @@ impl MetalPresenter {
                     && resident.layer_count == 1
                     && resident.mip_level_count < underlying_mip_count
             });
-        let promotion_command_buffer = if needs_clean_promotion {
+        let promotion_command_buffer = if needs_clean_promotion || needs_alias_reconciliation {
             self.ensure_active_open_guest_batch()?;
             let batch = self
                 .active_open_guest_batch_mut()
@@ -1370,7 +1460,7 @@ impl MetalPresenter {
             None
         };
         let queue = self.command_queue.as_ref();
-        let texture = super::ensure_mipmapped_resident_texture_in_map(
+        super::ensure_mipmapped_resident_texture_in_map(
             device,
             queue,
             promotion_command_buffer.as_deref(),
@@ -1378,6 +1468,9 @@ impl MetalPresenter {
             &mut self.resident_guest_textures,
             Mode27WorkOrigin::StorageCreate,
         )?;
+        if needs_alias_reconciliation {
+            self.rematerialise_gpu_aliases_into_mip_hierarchy(descriptor)?;
+        }
         if promotion_command_buffer.is_some() {
             self.active_open_guest_batch_mut()
                 .expect("mip-promotion batch remains open")
@@ -1387,7 +1480,13 @@ impl MetalPresenter {
                 );
             self.record_internal_resident_version(descriptor.guest);
         }
-        Ok(texture)
+        resident_texture_for_sample(
+            self.resident_guest_textures
+                .get_mut(&descriptor.guest)
+                .expect("ensured storage mip hierarchy exists"),
+            descriptor,
+        )
+        .ok_or_else(|| "ensured storage mip hierarchy cannot represent view".to_owned())
     }
 
     /// Ensures a resident for a descriptor no decoded structure carries a span for.
@@ -1658,7 +1757,7 @@ impl MetalPresenter {
             // Create-time upload uses a dedicated command buffer that settles before return so
             // a later CPU `replace_region` (tests) or GPU draw cannot race a deferred zero
             // upload still pending in the open guest batch. Steady-state publication stays on
-            // the open guest batch via `encode_gpu_publish_to_guest`.
+            // the open guest batch via `encode_gpu_publish_to_guest_view`.
             let queue = self
                 .command_queue
                 .as_ref()
@@ -1720,6 +1819,15 @@ impl MetalPresenter {
                 target.sample_count
             ));
         }
+        let descriptor = DecodedImageDescriptor {
+            guest: target.texture,
+            span: target.span,
+            destination_select: 0,
+            base_mip_level: 0,
+            mip_level_count: target.mip_level_count,
+            texture_type: target.texture_type,
+            layer_count: target.layer_count,
+        };
         if !discard_guest_contents && self.rematerialise_stale_resident_for_read(target.texture)? {
             return Ok(SelectedResidentTexture {
                 texture: self
@@ -1754,11 +1862,21 @@ impl MetalPresenter {
                 WriteWatchRefresh::Replaced => {}
             }
         }
+        // Discard applies only to the bound render-target mip. Other levels in the allocation
+        // remain readable, so GPU-only aliases anywhere in the full hierarchy must be preserved
+        // before that one mip is cleared.
+        let needs_alias_reconciliation = self.mip_hierarchy_gpu_alias_source(descriptor).is_some();
         if self
             .resident_guest_textures
             .get(&target.texture)
             .is_some_and(|resident| resident.gpu_written())
         {
+            if needs_alias_reconciliation {
+                return Err(format!(
+                    "cannot promote GPU-current mip target {:#x} while another GPU alias owns bytes in the grown allocation",
+                    target.texture.address
+                ));
+            }
             self.ensure_active_open_guest_batch()?;
             let command_buffer = {
                 let batch = self
@@ -1772,15 +1890,6 @@ impl MetalPresenter {
                 .resident_guest_textures
                 .remove(&target.texture)
                 .expect("selected GPU-written target exists");
-            let descriptor = DecodedImageDescriptor {
-                guest: target.texture,
-                span: target.span,
-                destination_select: 0,
-                base_mip_level: 0,
-                mip_level_count: target.mip_level_count,
-                texture_type: target.texture_type,
-                layer_count: target.layer_count,
-            };
             let promoted = promote_resident_mip_hierarchy(
                 device,
                 &command_buffer,
@@ -1803,63 +1912,58 @@ impl MetalPresenter {
                 descriptor: target.texture,
             });
         }
+        let needs_clean_promotion = self
+            .resident_guest_textures
+            .get(&target.texture)
+            .is_some_and(|resident| {
+                !resident.gpu_written()
+                    && resident.is_live()
+                    && resident.texture_type == 9
+                    && resident.layer_count == 1
+                    && resident.mip_level_count < target.mip_level_count
+            });
+        let promotion_command_buffer = if needs_clean_promotion || needs_alias_reconciliation {
+            self.ensure_active_open_guest_batch()?;
+            let batch = self
+                .active_open_guest_batch_mut()
+                .expect("guest batch was opened for mip target creation");
+            batch.end_compute_pass();
+            batch.close_active_pass_encoders();
+            Some(batch.command_buffer.clone())
+        } else {
+            None
+        };
         if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
             trace_resident_texture_removal("mipmapped-target-resident-replaced", &resident);
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
-        let started = Instant::now();
-        let layout = mode27_mip_chain_layout(target.texture, target.mip_level_count)?;
-        let write_watch = watch_resident_texture(
-            target.texture,
-            target.texture_type,
-            target.layer_count,
-            target.mip_level_count,
-        )?;
-        let raw =
-            snapshot_watched_guest_range(target.texture.address, layout.byte_count, &write_watch)?;
-        let (_, linear_levels) =
-            decode_mode27_mip_chain_from_raw(target.texture, target.mip_level_count, &raw)?;
-        let texture = create_mipmapped_guest_texture(
+        ensure_mipmapped_resident_texture_in_map(
             device,
-            target.texture,
-            target.mip_level_count,
-            &linear_levels,
-        )?;
-        record_mode27_work_detail(
+            self.command_queue.as_ref(),
+            promotion_command_buffer.as_deref(),
+            descriptor,
+            &mut self.resident_guest_textures,
             Mode27WorkOrigin::RenderTargetCreate,
-            target.texture,
-            target.mip_level_count,
-            layout.byte_count,
-            started.elapsed(),
-        );
-        texture.set_label(&format!(
-            "REMu {}-level guest image {:#x}",
-            target.mip_level_count, target.texture.address
-        ));
-        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
-        self.resident_guest_textures.insert(
-            target.texture,
-            ResidentGuestTexture {
-                texture: texture.clone(),
-                component_reorder_view: None,
-                descriptor: target.texture,
-                texture_type: target.texture_type,
-                layer_count: target.layer_count,
-                mip_level_count: target.mip_level_count,
-                write_watch,
-                span,
-                owned,
-                gpu_authored: RangeSet::default(),
-                state: ResidencyState::Live,
-                acquire_invalidated: false,
-                content_version: 0,
-                gpu_write_watch_generations: Vec::new(),
-                last_use: ResidentTextureActivityStamp::default(),
-                activity: super::super::ResidentTextureActivity::enabled(),
-            },
-        );
+        )?;
+        if needs_alias_reconciliation {
+            self.rematerialise_gpu_aliases_into_mip_hierarchy(descriptor)?;
+        }
+        if promotion_command_buffer.is_some() {
+            self.active_open_guest_batch_mut()
+                .expect("mip target creation batch remains open")
+                .record_resident_write_footprint(
+                    SharedEventWriteKind::InternalResidentDestination,
+                    target.span,
+                );
+            self.record_internal_resident_version(target.texture);
+        }
         Ok(SelectedResidentTexture {
-            texture,
+            texture: self
+                .resident_guest_textures
+                .get(&target.texture)
+                .expect("ensured mip target exists")
+                .texture
+                .clone(),
             descriptor: target.texture,
         })
     }
@@ -2613,24 +2717,18 @@ impl MetalPresenter {
                 OWNED_SUBTRACT_TENANTS_SURVIVED.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
-            // ResourceSpan::overlaps consults shared-backing identity and can report neighbours
-            // in the same heap that do not share virtual bytes (Silent Hill title intermediate
-            // @ 0x8044590000 vs RGBA16Float @ 0x8043490000). Never steal authority from a
-            // different-address resident unless the descriptors actually share storage or
-            // overlap in guest VA.
+            // Different virtual addresses can name the same physical guest bytes. Prefer the
+            // exact admission-time spans here; descriptor-only byte counts omit mip suffixes.
             if let Some(writer) = keep.filter(|writer| writer.address != candidate.address) {
                 let shares = guest_texture_descriptors_share_byte_storage(writer, candidate);
-                let overlaps_va = guest_texture_byte_count(writer).is_some_and(|left_bytes| {
-                    guest_texture_byte_count(candidate).is_some_and(|right_bytes| {
-                        guest_ranges_overlap(
-                            writer.address,
-                            left_bytes,
-                            candidate.address,
-                            right_bytes,
-                        )
-                    })
-                });
-                if !shares && !overlaps_va {
+                // `writer` can be a complete tile-9/27 mip hierarchy whose admitted span is
+                // larger than the base-level descriptor byte count. Use the exact spans already
+                // carried by the authority algebra, otherwise a tenant in that suffix survives
+                // after its bytes have moved into the rematerialised hierarchy.
+                let overlaps_declared_bytes = other
+                    .span
+                    .is_some_and(|other_span| other_span.overlaps(span));
+                if !shares && !overlaps_declared_bytes {
                     OWNED_SUBTRACT_TENANTS_SURVIVED.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }

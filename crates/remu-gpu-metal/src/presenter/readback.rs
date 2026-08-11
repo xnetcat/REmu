@@ -203,6 +203,11 @@ impl MetalPresenter {
         let authored: Vec<(u64, u64)> = resident.gpu_authored.runs().to_vec();
         let texture = resident.texture.clone();
         let guest_descriptor = resident.descriptor;
+        let publish_view = crate::presenter::tiler::GpuTilerView {
+            texture_type: resident.texture_type,
+            layer_count: resident.layer_count,
+            mip_level_count: resident.mip_level_count,
+        };
         // Lease lifetime: require the watch's mapping still covers the descriptor before encode.
         if resident.write_watch.retirement().is_some() {
             let resident = self
@@ -240,12 +245,13 @@ impl MetalPresenter {
             buffer
         };
         let standalone = self.active_open_guest_batch().is_none();
-        crate::presenter::tiler::encode_gpu_publish_to_guest(
+        crate::presenter::tiler::encode_gpu_publish_to_guest_view(
             &device,
             &command_buffer,
             guest_descriptor,
             &texture,
             &authored,
+            publish_view,
         )?;
         if standalone {
             command_buffer.commit();
@@ -1291,7 +1297,7 @@ fn trace_discarded_resident_writeback(
 
 // Phase 1G: CPU `write_resident_texture_contents_to_guest` (readback→CPU retile→guarded
 // publish) is deleted. Guest-observable publication goes through
-// `tiler::encode_gpu_publish_to_guest` on the GPU timeline.
+// `tiler::encode_gpu_publish_to_guest_view` on the GPU timeline.
 
 pub(super) fn read_texture_volume_linear(
     device: &Device,

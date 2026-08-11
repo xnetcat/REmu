@@ -21,7 +21,7 @@ mod equations;
 mod msl;
 
 pub(crate) use encode::{
-    GpuTilerView, encode_gpu_publish_to_guest, encode_gpu_upload_from_guest,
+    GpuTilerView, encode_gpu_publish_to_guest_view, encode_gpu_upload_from_guest,
     encode_gpu_upload_from_guest_view, gpu_tiler_owns_descriptor,
 };
 pub(crate) use end_state::{
@@ -33,4 +33,4 @@ pub(crate) use equations::{
     mode9_within_block_byte_offset_msl_oracle, mode27_within_block_byte_offset_msl_oracle,
     shift_ceil_u32, tiled_physical_byte_offset,
 };
-pub(crate) use msl::mode27_tiler_pipelines;
+pub(crate) use msl::{mode9_tiler_pipelines, mode27_tiler_pipelines};

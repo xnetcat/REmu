@@ -21,8 +21,8 @@ use super::{
     SampledTextureKey, ScanoutSnapshotTexture, StaleSource, TEXTURE_SNAPSHOT_BYTES,
     TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT,
     UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
-    compressed_texture_block_extent, copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z,
-    decode_image_descriptor, decode_mode27_mip_chain_from_raw,
+    compressed_texture_block_extent, copy_mode64k_2d_mip_level_to_linear,
+    copy_tiled_to_linear_at_z, decode_image_descriptor,
     depth_sample_view_must_not_steal_depth_authority, fallback_image_descriptor,
     guest_frame_fingerprint, guest_ranges_overlap, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
@@ -31,15 +31,18 @@ use super::{
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, initial_depth_clear_for_target, is_storage_image_opcode,
-    is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
-    mode27_surface_z_xor, record_mode27_work_detail, record_texture_dirty_work_detail,
+    is_writable_image_opcode, mode5_mip_chain_layout, mode27_surface_z_xor,
+    mode64k_2d_mip_chain_layout, record_mode27_work_detail, record_texture_dirty_work_detail,
     record_texture_snapshot_work_detail, record_texture_work, render_resolve_candidate_matches,
     sampled_alias_descriptor, sampler_uses_normalized_coordinates, spans_overlap,
     texture_element_layout, tiled_block_bytes, tiled_block_dimensions, trace_glyph_atlas,
     trace_image_descriptors, trace_target_sampling, trace_video_target_consumers,
 };
 #[cfg(test)]
-use super::{copy_linear_to_tiled_at_z, decode_mode5_mip_chain_from_raw};
+use super::{
+    copy_linear_to_tiled_at_z, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
+    mode27_mip_chain_layout,
+};
 #[cfg(test)]
 use remu_memory::{
     CpuWriteWatchRetirement, guest_shared_mapping_identity, read_guest_shared_backing,
@@ -72,8 +75,8 @@ pub(crate) use self::lifetime::{
 #[cfg(test)]
 pub(crate) use self::mips::create_exact_mode27_sampled_mip_view;
 pub(crate) use self::mips::{
-    create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
-    promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
+    ensure_mipmapped_resident_texture_in_map, promote_resident_mip_hierarchy,
+    storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::ranges::RangeSet;
 #[cfg(test)]
@@ -118,7 +121,7 @@ pub(crate) use self::watch::{
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
     refresh_sampled_texture_write_watch, resident_texture_raw_byte_count,
     sampled_texture_raw_range, sampled_texture_uses_exact_mode5_mips,
-    sampled_texture_uses_exact_mode27_mips, snapshot_guest_texture_raw,
+    sampled_texture_uses_exact_mode64k_2d_mips, snapshot_guest_texture_raw,
     snapshot_watched_guest_range, snapshot_watched_sampled_texture_raw, watch_guest_texture,
     watch_resident_texture, watch_sampled_texture,
 };

@@ -1343,25 +1343,42 @@ fn nonzero_raw_color_mask_with_zero_pixel_exports_has_no_color_attachments() {
 }
 
 #[test]
-fn silent_hill_render_target_accepts_absolute_max_mip_hierarchy() {
-    let address = 0x80b9_2700_00;
-    let mut registers = vec![GpuRegister {
-        offset: CB_TARGET_MASK,
-        value: 0xf,
-    }];
-    append_color_target_registers(&mut registers, 0, address, 32, 32, 5, 4, 27);
-    registers
-        .iter_mut()
-        .find(|register| register.offset == CB_COLOR0_ATTRIB2)
-        .expect("color attrib2 exists")
-        .value |= 5 << 28;
-    registers.sort_by_key(|register| register.offset);
-    let targets = decode_render_targets_from_registers(&registers, 0xf)
-        .expect("observed mip=0/max_mip=5 target is complete");
-    assert_eq!(targets.len(), 1);
-    assert_eq!(targets[0].mip_level, 0);
-    assert_eq!(targets[0].mip_level_count, 6);
-    assert_eq!(targets[0].texture.pixel_format, MTLPixelFormat::RG16Uint);
+fn mode9_and_mode27_render_targets_accept_absolute_max_mip_hierarchy() {
+    for tile_mode in [9, 27] {
+        let address = 0x80b9_2700_00;
+        let mut registers = vec![GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        }];
+        append_color_target_registers(&mut registers, 0, address, 512, 256, 5, 4, tile_mode);
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_ATTRIB2)
+            .expect("color attrib2 exists")
+            .value |= 9 << 28;
+        registers.sort_by_key(|register| register.offset);
+        let targets = decode_render_targets_from_registers(&registers, 0xf)
+            .expect("mip=0/max_mip=9 target is complete");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].mip_level, 0);
+        assert_eq!(targets[0].mip_level_count, 10);
+        assert_eq!(targets[0].texture.tile_mode, tile_mode);
+        assert_eq!(targets[0].texture.pixel_format, MTLPixelFormat::RG16Uint);
+        let target_span = targets[0].span.expect("mip target has a span");
+        assert_eq!(target_span.len(), 786_432);
+        assert!(target_span.overlaps(&super::ResourceSpan::new(address + 700_000, 4_096)));
+
+        registers
+            .iter_mut()
+            .find(|register| register.offset == CB_COLOR0_ATTRIB)
+            .expect("color attrib exists")
+            .value |= (1 << 12) | (1 << 15);
+        assert!(
+            decode_render_targets_from_registers(&registers, 0xf)
+                .expect_err("64K mip hierarchy must remain single-sample")
+                .contains("requires single-sample 64K 2D storage")
+        );
+    }
 }
 
 #[test]

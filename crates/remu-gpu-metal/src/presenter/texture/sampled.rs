@@ -6,19 +6,18 @@ use super::super::{
 };
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter, MetalTextureSwizzleChannels,
-    RESIDENT_DEPTH_SAMPLE_HITS, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
+    RESIDENT_DEPTH_SAMPLE_HITS, RangeSet, ResidentGuestTexture, ResidentTextureMap, ResourceSpan,
     SAMPLED_ALIAS_WRITEBACK_BYTES, SAMPLED_ALIAS_WRITEBACK_COUNT,
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SampledTextureKey, SpanQueryOrder, WriteWatchRefresh,
     comparison_depth32_upload, compressed_texture_block_extent,
     decode_guest_texture_linear_from_raw_at_z, guest_frame_fingerprint, guest_texture_byte_count,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, sampled_alias_descriptor, sampled_texture_uses_exact_mode5_mips,
-    sampled_texture_uses_exact_mode27_mips, texture_element_layout, trace_image_descriptors,
+    sampled_texture_uses_exact_mode64k_2d_mips, texture_element_layout, trace_image_descriptors,
     trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
 };
 use metal::foreign_types::ForeignType;
@@ -39,6 +38,93 @@ impl MetalPresenter {
         evaluations: &[&ShaderEvaluation],
         shared_event_texture_overrides: &[SharedEventDrawTextureOverride],
     ) -> Result<(), String> {
+        // Comparison sampling requires a native Metal depth texture. The generic 64K GPU
+        // rematerialiser produces the SRD's R16/R32 color format, which cannot be guessed into a
+        // depth view. Refuse before the ordinary bookkeeping pass can retain debt and let upload
+        // rebuild from stale RAM. A retained shared-event texture or an eligible native depth
+        // resident already supplies the required typed image and remains valid.
+        let mut comparison_mip_reads = evaluations
+            .iter()
+            .flat_map(|evaluation| evaluation.image_bindings.iter())
+            .filter(|binding| !is_storage_image_opcode(binding.opcode))
+            .filter(|binding| image_is_comparison(binding.opcode))
+            .filter_map(sampled_alias_descriptor)
+            .filter(|sampled| sampled_texture_uses_exact_mode64k_2d_mips(*sampled))
+            .filter(|sampled| {
+                !shared_event_texture_overrides
+                    .iter()
+                    .any(|retained| retained.matches(*sampled))
+            })
+            .collect::<Vec<_>>();
+        comparison_mip_reads.sort_unstable_by_key(|sampled| {
+            (
+                sampled.guest.address,
+                sampled.base_mip_level,
+                sampled.mip_level_count,
+            )
+        });
+        comparison_mip_reads.dedup();
+        for sampled in comparison_mip_reads {
+            if self
+                .resident_guest_textures
+                .values()
+                .any(|resident| resident_depth_sample_is_eligible(resident, sampled))
+            {
+                continue;
+            }
+            let Some(span) = sampled.span else {
+                continue;
+            };
+            let requested = RangeSet::for_span(&span);
+            let has_gpu_current_bytes = self
+                .resident_guest_textures
+                .overlapping(&span, SpanQueryOrder::ResidentFirst)
+                .into_iter()
+                .filter_map(|candidate| self.resident_guest_textures.get(&candidate))
+                .any(|resident| resident.is_live() && resident.gpu_authored.intersects(&requested));
+            if has_gpu_current_bytes {
+                return Err(format!(
+                    "comparison sample of exact tile-{} mip hierarchy {:#x} has GPU-current aliased bytes but no native depth resident or retained override",
+                    sampled.guest.tile_mode, sampled.guest.address
+                ));
+            }
+        }
+
+        // An exact 64K mip hierarchy may include GPU-only tenants beyond the descriptor's
+        // base-level byte count. Build one coherent resident on the GPU before the ordinary
+        // alias pass; bookkeeping writeback is intentionally forbidden for this internal read.
+        let mut mip_reads = evaluations
+            .iter()
+            .flat_map(|evaluation| evaluation.image_bindings.iter())
+            .filter(|binding| !is_storage_image_opcode(binding.opcode))
+            .filter(|binding| !image_is_comparison(binding.opcode))
+            .filter_map(sampled_alias_descriptor)
+            .filter(|sampled| sampled_texture_uses_exact_mode64k_2d_mips(*sampled))
+            .filter(|sampled| {
+                !shared_event_texture_overrides
+                    .iter()
+                    .any(|retained| retained.matches(*sampled))
+            })
+            .collect::<Vec<_>>();
+        mip_reads.sort_unstable_by_key(|sampled| {
+            (
+                sampled.guest.address,
+                sampled.base_mip_level,
+                sampled.mip_level_count,
+            )
+        });
+        mip_reads.dedup();
+        for sampled in mip_reads {
+            if self.mip_hierarchy_gpu_alias_source(sampled).is_some() {
+                let device = self
+                    .device
+                    .as_ref()
+                    .ok_or("Metal device is unavailable")?
+                    .clone();
+                self.ensure_mipmapped_storage_texture(&device, sampled)?;
+            }
+        }
+
         let mut aliases = Vec::new();
         for &evaluation in evaluations {
             for binding in evaluation
@@ -61,7 +147,7 @@ impl MetalPresenter {
                     continue;
                 }
                 let comparison = image_is_comparison(binding.opcode);
-                let sampled_bytes = guest_texture_byte_count(sampled.guest).ok_or_else(|| {
+                let sampled_span = sampled.span.ok_or_else(|| {
                     format!(
                         "image at PC {:#x} has an invalid guest byte extent",
                         binding.pc
@@ -86,16 +172,15 @@ impl MetalPresenter {
                         .filter(|resident| {
                             let overlaps_resident = resident
                                 .write_watch
-                                .overlaps_alias_range(sampled.guest.address, sampled_bytes);
+                                .overlaps_alias_range(sampled_span.address(), sampled_span.len());
                             // Write-watch ranges can over-report neighbours in a shared heap
                             // (Silent Hill: RGBA16Float @ 0x8043490000 vs BGRA8 @ 0x8044590000).
                             // Only residents that actually share the sampled bytes can need a
                             // SampledAlias publish; format views of the same allocation are
                             // served in Metal and must not enter this flush set.
-                            let shares_sampled_bytes = guest_texture_descriptors_share_byte_storage(
-                                resident.descriptor,
-                                sampled.guest,
-                            );
+                            let shares_sampled_bytes = resident
+                                .span
+                                .is_some_and(|resident_span| resident_span.overlaps(&sampled_span));
                             let aliases_sample = overlaps_resident
                                 && shares_sampled_bytes
                                 && resident.descriptor != sampled.guest
@@ -149,10 +234,7 @@ impl MetalPresenter {
                                         sampled.layer_count,
                                         sampled.destination_select,
                                         binding.pc,
-                                        guest_texture_descriptors_overlap(
-                                            resident.descriptor,
-                                            sampled.guest,
-                                        ),
+                                        shares_sampled_bytes,
                                     );
                                 }
                             }
@@ -177,7 +259,12 @@ impl MetalPresenter {
         }
         let alias_started = Instant::now();
         let alias_bytes = aliases.iter().fold(0_u64, |total, &descriptor| {
-            total.saturating_add(guest_texture_byte_count(descriptor).unwrap_or_default())
+            total.saturating_add(
+                self.resident_guest_textures
+                    .get(&descriptor)
+                    .and_then(|resident| resident.span)
+                    .map_or(0, |span| span.len()),
+            )
         });
         let alias_count = aliases.len();
         // End the open render pass and commit the current batch, but do not drain every in-flight
@@ -690,7 +777,7 @@ pub(crate) fn create_sampled_guest_texture_from_guest_gpu(
         .checked_add(descriptor.mip_level_count.max(1))
         .ok_or("sampled Metal mip range overflows")?;
     let exact_guest_mips = sampled_texture_uses_exact_mode5_mips(descriptor)
-        || sampled_texture_uses_exact_mode27_mips(descriptor);
+        || sampled_texture_uses_exact_mode64k_2d_mips(descriptor);
     let mip_level_count = if exact_guest_mips {
         underlying_mip_level_count
     } else if compressed_texture_block_extent(guest.pixel_format).is_some() {

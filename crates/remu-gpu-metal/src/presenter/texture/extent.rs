@@ -5,7 +5,7 @@ use super::{
     DecodedImageDescriptor, DecodedRenderTarget, GuestScissor, GuestTextureDescriptor,
     GuestTextureWriteWatch, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, RangeSet,
     ResourceSpan, compressed_texture_block_extent, guest_texture_byte_count,
-    mode5_mip_chain_layout, mode27_mip_chain_layout, texture_element_layout, tiled_block_bytes,
+    mode5_mip_chain_layout, mode64k_2d_mip_chain_layout, texture_element_layout, tiled_block_bytes,
     tiled_block_dimensions,
 };
 use metal::MTLScissorRect;
@@ -228,7 +228,13 @@ fn level_extents(
         }]);
     }
     let layout = match descriptor.tile_mode {
-        27 => mode27_mip_chain_layout(descriptor, mip_level_count).ok()?,
+        9 | 27
+            if compressed_texture_block_extent(descriptor.pixel_format).is_none()
+                && super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+                    == Some(descriptor.bytes_per_pixel) =>
+        {
+            mode64k_2d_mip_chain_layout(descriptor, mip_level_count).ok()?
+        }
         5 => mode5_mip_chain_layout(descriptor, mip_level_count).ok()?,
         _ => return None,
     };
@@ -349,7 +355,7 @@ mod tests {
     use super::super::copy_linear_to_tiled_at_z;
     use super::{
         GuestTextureDescriptor, OWNED_FALLBACK_FULL_RANGE, RangeSet, ResourceSpan, WrittenRegion,
-        guest_texture_byte_count, mode27_mip_chain_layout, written_byte_ranges,
+        guest_texture_byte_count, mode64k_2d_mip_chain_layout, written_byte_ranges,
     };
     use metal::{MTLPixelFormat, MTLScissorRect};
     use std::sync::atomic::Ordering;
@@ -494,45 +500,48 @@ mod tests {
 
     #[test]
     fn a_chain_level_lands_inside_its_own_level_and_a_tail_level_claims_the_tail_block() {
-        let descriptor = descriptor(1024, 1024, 1024, 27);
-        let levels = 11;
-        let layout = mode27_mip_chain_layout(descriptor, levels).expect("mode-27 chain layout");
-        let span = ResourceSpan::new(
-            descriptor.address,
-            u64::try_from(layout.byte_count).expect("chain byte count"),
-        );
-        for level in 0..levels {
-            let written = written_byte_ranges(
-                span,
-                descriptor,
-                9,
-                1,
-                levels,
-                WrittenRegion {
-                    first_level: level,
-                    level_count: 1,
-                    ..WrittenRegion::whole_resource()
-                },
+        for tile_mode in [27, 9] {
+            let descriptor = descriptor(1024, 1024, 1024, tile_mode);
+            let levels = 11;
+            let layout =
+                mode64k_2d_mip_chain_layout(descriptor, levels).expect("64 KiB 2D chain layout");
+            let span = ResourceSpan::new(
+                descriptor.address,
+                u64::try_from(layout.byte_count).expect("chain byte count"),
             );
-            let layer = layout.levels[usize::try_from(level).expect("level")];
-            let (start, end) = written.bounding_run().expect("a level claims bytes");
-            if layer.in_tail {
-                assert_eq!(
-                    (start - span.range_start(), end - span.range_start()),
-                    (0, 65_536),
-                    "a tail level claims the packed tail block"
+            for level in 0..levels {
+                let written = written_byte_ranges(
+                    span,
+                    descriptor,
+                    9,
+                    1,
+                    levels,
+                    WrittenRegion {
+                        first_level: level,
+                        level_count: 1,
+                        ..WrittenRegion::whole_resource()
+                    },
                 );
-                continue;
+                let layer = layout.levels[usize::try_from(level).expect("level")];
+                let (start, end) = written.bounding_run().expect("a level claims bytes");
+                if layer.in_tail {
+                    assert_eq!(
+                        (start - span.range_start(), end - span.range_start()),
+                        (0, 65_536),
+                        "a tail level claims the packed tail block"
+                    );
+                    continue;
+                }
+                let level_start = span.range_start() + u64::try_from(layer.offset).expect("offset");
+                assert!(
+                    start >= level_start && end <= span.range_end(),
+                    "tile {tile_mode} level {level} claimed {start:#x}..{end:#x} outside its own storage"
+                );
+                assert!(
+                    written.byte_count() < span.len() || level == 0,
+                    "only level 0 may be the bulk of the chain"
+                );
             }
-            let level_start = span.range_start() + u64::try_from(layer.offset).expect("offset");
-            assert!(
-                start >= level_start && end <= span.range_end(),
-                "level {level} claimed {start:#x}..{end:#x} outside its own storage"
-            );
-            assert!(
-                written.byte_count() < span.len() || level == 0,
-                "only level 0 may be the bulk of the chain"
-            );
         }
     }
 
@@ -541,7 +550,7 @@ mod tests {
         let span = span_of(descriptor(64, 64, 64, 27));
         let whole = [(span.range_start(), span.range_end())];
         // An unsupported tile mode has no chain layout at all.
-        let unsupported = descriptor(64, 64, 64, 9);
+        let unsupported = descriptor(64, 64, 64, 8);
         // A zero layer count, a level outside the resident, and a layered mip chain are all
         // shapes the layout arithmetic cannot answer for.
         let cases: [(GuestTextureDescriptor, u32, u32, WrittenRegion); 4] = [

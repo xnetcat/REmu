@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    GuestMipChainLayout, GuestMipLevelLayout, GuestTextureDescriptor, MODE27_DECODE_BYTES,
-    MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, record_texture_work, tiled_block_dimensions,
+    GuestMipChainLayout, GuestMipLevelLayout, GuestTextureDescriptor, tiled_block_byte_offsets,
+    tiled_block_dimensions,
+};
+#[cfg(test)]
+use super::{
+    MODE27_DECODE_BYTES, MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, record_texture_work,
 };
 use std::sync::OnceLock;
+#[cfg(test)]
 use std::time::Instant;
 
 pub(crate) const MODE27_MIP_TAIL_LOCATIONS: [[(usize, usize); 12]; 5] = [
@@ -86,14 +91,20 @@ pub(crate) fn shift_ceil(value: usize, shift: u32) -> Option<usize> {
     value.checked_add(divisor - 1).map(|value| value / divisor)
 }
 
-pub(crate) fn mode27_mip_chain_layout(
+pub(crate) fn mode64k_2d_mip_chain_layout(
     descriptor: GuestTextureDescriptor,
     mip_level_count: u32,
 ) -> Result<GuestMipChainLayout, String> {
-    if descriptor.tile_mode != 27 || mip_level_count == 0 || mip_level_count > 16 {
+    if !matches!(descriptor.tile_mode, 9 | 27) || mip_level_count == 0 || mip_level_count > 16 {
         return Err(format!(
-            "mode-27 mip layout requires 1..=16 levels, got tile={} levels={mip_level_count}",
+            "64 KiB 2D mip layout requires tile 9/27 and 1..=16 levels, got tile={} levels={mip_level_count}",
             descriptor.tile_mode
+        ));
+    }
+    if descriptor.pitch != descriptor.width {
+        return Err(format!(
+            "64 KiB 2D mip layout requires pitch==width, got pitch={} width={}",
+            descriptor.pitch, descriptor.width
         ));
     }
     let bytes_per_element = usize::try_from(descriptor.bytes_per_pixel)
@@ -102,12 +113,12 @@ pub(crate) fn mode27_mip_chain_layout(
         .map_err(|_| "mip element byte logarithm does not fit usize")?;
     if !bytes_per_element.is_power_of_two() || bytes_log2 >= MODE27_MIP_TAIL_LOCATIONS.len() {
         return Err(format!(
-            "mode-27 mip layout has unsupported {}-byte elements",
+            "64 KiB 2D mip layout has unsupported {}-byte elements",
             descriptor.bytes_per_pixel
         ));
     }
     let (block_width, block_height) = tiled_block_dimensions(65_536, bytes_per_element)
-        .ok_or("mode-27 mip layout requires a 1, 2, 4, 8, or 16-byte element format")?;
+        .ok_or("64 KiB 2D mip layout requires a 1, 2, 4, 8, or 16-byte element format")?;
     let width = usize::try_from(descriptor.width).map_err(|_| "mip width does not fit usize")?;
     let height = usize::try_from(descriptor.height).map_err(|_| "mip height does not fit usize")?;
     let level_count =
@@ -177,7 +188,7 @@ pub(crate) fn mode27_mip_chain_layout(
         let mip_height = (height >> shift).max(1);
         if tail_x + mip_width > block_width || tail_y + mip_height > block_height {
             return Err(format!(
-                "mode-27 mip {level} tail placement ({tail_x},{tail_y}) {mip_width}x{mip_height} exceeds {block_width}x{block_height}"
+                "64 KiB 2D mip {level} tail placement ({tail_x},{tail_y}) {mip_width}x{mip_height} exceeds {block_width}x{block_height}"
             ));
         }
         levels[level] = GuestMipLevelLayout {
@@ -199,12 +210,32 @@ pub(crate) fn mode27_mip_chain_layout(
     })
 }
 
-pub(crate) fn copy_mode27_mip_level_to_linear(
+#[cfg(test)]
+pub(crate) fn mode27_mip_chain_layout(
+    descriptor: GuestTextureDescriptor,
+    mip_level_count: u32,
+) -> Result<GuestMipChainLayout, String> {
+    if descriptor.tile_mode != 27 {
+        return Err(format!(
+            "mode-27 mip layout requires tile 27, got tile={}",
+            descriptor.tile_mode
+        ));
+    }
+    mode64k_2d_mip_chain_layout(descriptor, mip_level_count)
+}
+
+pub(crate) fn copy_mode64k_2d_mip_level_to_linear(
+    tile_mode: u32,
     layout: &GuestMipChainLayout,
     level: GuestMipLevelLayout,
     raw: &[u8],
     linear: &mut [u8],
 ) -> Result<(), String> {
+    if !matches!(tile_mode, 9 | 27) {
+        return Err(format!(
+            "64 KiB 2D mip copy requires tile 9/27, got tile={tile_mode}"
+        ));
+    }
     let expected = level
         .width
         .checked_mul(level.height)
@@ -212,18 +243,19 @@ pub(crate) fn copy_mode27_mip_level_to_linear(
         .ok_or("mip linear size overflows")?;
     if linear.len() != expected {
         return Err(format!(
-            "mode-27 mip destination has {} bytes, expected {expected}",
+            "64 KiB 2D mip destination has {} bytes, expected {expected}",
             linear.len()
         ));
     }
     if level.in_tail {
-        let offsets = mode27_block_byte_offsets(
+        let offsets = tiled_block_byte_offsets(
+            tile_mode,
             0,
             0,
             layout.bytes_per_element,
             layout.block_width,
             layout.block_height,
-        );
+        )?;
         for y in 0..level.height {
             let destination_row = y * level.width * layout.bytes_per_element;
             let offset_row = (level.tail_y + y) * layout.block_width + level.tail_x;
@@ -235,7 +267,7 @@ pub(crate) fn copy_mode27_mip_level_to_linear(
                 let destination = destination_row + x * layout.bytes_per_element;
                 linear[destination..destination + layout.bytes_per_element].copy_from_slice(
                     raw.get(source..source + layout.bytes_per_element)
-                        .ok_or("mode-27 mip-tail texel exceeds backing")?,
+                        .ok_or("64 KiB 2D mip-tail texel exceeds backing")?,
                 );
             }
         }
@@ -250,13 +282,14 @@ pub(crate) fn copy_mode27_mip_level_to_linear(
                     .checked_mul(65_536)
                     .and_then(|offset| level.offset.checked_add(offset))
                     .ok_or("mip block offset overflows")?;
-                let offsets = mode27_block_byte_offsets(
+                let offsets = tiled_block_byte_offsets(
+                    tile_mode,
                     block_x,
                     block_y,
                     layout.bytes_per_element,
                     layout.block_width,
                     layout.block_height,
-                );
+                )?;
                 for local_y in 0..rows {
                     let destination_row = ((block_y * layout.block_height + local_y) * level.width
                         + block_x * layout.block_width)
@@ -268,8 +301,103 @@ pub(crate) fn copy_mode27_mip_level_to_linear(
                         linear[destination..destination + layout.bytes_per_element]
                             .copy_from_slice(
                                 raw.get(source..source + layout.bytes_per_element)
-                                    .ok_or("mode-27 mip texel exceeds backing")?,
+                                    .ok_or("64 KiB 2D mip texel exceeds backing")?,
                             );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn copy_mode27_mip_level_to_linear(
+    layout: &GuestMipChainLayout,
+    level: GuestMipLevelLayout,
+    raw: &[u8],
+    linear: &mut [u8],
+) -> Result<(), String> {
+    copy_mode64k_2d_mip_level_to_linear(27, layout, level, raw, linear)
+}
+
+#[cfg(test)]
+pub(crate) fn copy_linear_to_mode64k_2d_mip_level(
+    tile_mode: u32,
+    layout: &GuestMipChainLayout,
+    level: GuestMipLevelLayout,
+    linear: &[u8],
+    raw: &mut [u8],
+) -> Result<(), String> {
+    if !matches!(tile_mode, 9 | 27) {
+        return Err(format!(
+            "64 KiB 2D mip copy requires tile 9/27, got tile={tile_mode}"
+        ));
+    }
+    let expected = level
+        .width
+        .checked_mul(level.height)
+        .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
+        .ok_or("mip linear size overflows")?;
+    if linear.len() != expected {
+        return Err(format!(
+            "64 KiB 2D mip source has {} bytes, expected {expected}",
+            linear.len()
+        ));
+    }
+    if level.in_tail {
+        let offsets = tiled_block_byte_offsets(
+            tile_mode,
+            0,
+            0,
+            layout.bytes_per_element,
+            layout.block_width,
+            layout.block_height,
+        )?;
+        for y in 0..level.height {
+            let source_row = y * level.width * layout.bytes_per_element;
+            let offset_row = (level.tail_y + y) * layout.block_width + level.tail_x;
+            for x in 0..level.width {
+                let source = source_row + x * layout.bytes_per_element;
+                let destination = level
+                    .offset
+                    .checked_add(usize::from(offsets[offset_row + x]))
+                    .ok_or("mip-tail destination offset overflows")?;
+                raw.get_mut(destination..destination + layout.bytes_per_element)
+                    .ok_or("64 KiB 2D mip-tail texel exceeds backing")?
+                    .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
+            }
+        }
+    } else {
+        let blocks_per_row = level.padded_width / layout.block_width;
+        let visible_blocks_per_row = level.width.div_ceil(layout.block_width);
+        for block_y in 0..level.height.div_ceil(layout.block_height) {
+            let rows = (level.height - block_y * layout.block_height).min(layout.block_height);
+            for block_x in 0..visible_blocks_per_row {
+                let columns = (level.width - block_x * layout.block_width).min(layout.block_width);
+                let block_base = (block_y * blocks_per_row + block_x)
+                    .checked_mul(65_536)
+                    .and_then(|offset| level.offset.checked_add(offset))
+                    .ok_or("mip block offset overflows")?;
+                let offsets = tiled_block_byte_offsets(
+                    tile_mode,
+                    block_x,
+                    block_y,
+                    layout.bytes_per_element,
+                    layout.block_width,
+                    layout.block_height,
+                )?;
+                for local_y in 0..rows {
+                    let source_row = ((block_y * layout.block_height + local_y) * level.width
+                        + block_x * layout.block_width)
+                        * layout.bytes_per_element;
+                    let offset_row = local_y * layout.block_width;
+                    for local_x in 0..columns {
+                        let source = source_row + local_x * layout.bytes_per_element;
+                        let destination = block_base + usize::from(offsets[offset_row + local_x]);
+                        raw.get_mut(destination..destination + layout.bytes_per_element)
+                            .ok_or("64 KiB 2D mip texel exceeds backing")?
+                            .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
                     }
                 }
             }
@@ -285,76 +413,10 @@ pub(crate) fn copy_linear_to_mode27_mip_level(
     linear: &[u8],
     raw: &mut [u8],
 ) -> Result<(), String> {
-    let expected = level
-        .width
-        .checked_mul(level.height)
-        .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
-        .ok_or("mip linear size overflows")?;
-    if linear.len() != expected {
-        return Err(format!(
-            "mode-27 mip source has {} bytes, expected {expected}",
-            linear.len()
-        ));
-    }
-    if level.in_tail {
-        let offsets = mode27_block_byte_offsets(
-            0,
-            0,
-            layout.bytes_per_element,
-            layout.block_width,
-            layout.block_height,
-        );
-        for y in 0..level.height {
-            let source_row = y * level.width * layout.bytes_per_element;
-            let offset_row = (level.tail_y + y) * layout.block_width + level.tail_x;
-            for x in 0..level.width {
-                let source = source_row + x * layout.bytes_per_element;
-                let destination = level
-                    .offset
-                    .checked_add(usize::from(offsets[offset_row + x]))
-                    .ok_or("mip-tail destination offset overflows")?;
-                raw.get_mut(destination..destination + layout.bytes_per_element)
-                    .ok_or("mode-27 mip-tail texel exceeds backing")?
-                    .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
-            }
-        }
-    } else {
-        let blocks_per_row = level.padded_width / layout.block_width;
-        let visible_blocks_per_row = level.width.div_ceil(layout.block_width);
-        for block_y in 0..level.height.div_ceil(layout.block_height) {
-            let rows = (level.height - block_y * layout.block_height).min(layout.block_height);
-            for block_x in 0..visible_blocks_per_row {
-                let columns = (level.width - block_x * layout.block_width).min(layout.block_width);
-                let block_base = (block_y * blocks_per_row + block_x)
-                    .checked_mul(65_536)
-                    .and_then(|offset| level.offset.checked_add(offset))
-                    .ok_or("mip block offset overflows")?;
-                let offsets = mode27_block_byte_offsets(
-                    block_x,
-                    block_y,
-                    layout.bytes_per_element,
-                    layout.block_width,
-                    layout.block_height,
-                );
-                for local_y in 0..rows {
-                    let source_row = ((block_y * layout.block_height + local_y) * level.width
-                        + block_x * layout.block_width)
-                        * layout.bytes_per_element;
-                    let offset_row = local_y * layout.block_width;
-                    for local_x in 0..columns {
-                        let source = source_row + local_x * layout.bytes_per_element;
-                        let destination = block_base + usize::from(offsets[offset_row + local_x]);
-                        raw.get_mut(destination..destination + layout.bytes_per_element)
-                            .ok_or("mode-27 mip texel exceeds backing")?
-                            .copy_from_slice(&linear[source..source + layout.bytes_per_element]);
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
+    copy_linear_to_mode64k_2d_mip_level(27, layout, level, linear, raw)
 }
 
+#[cfg(test)]
 pub(crate) fn decode_mode27_mip_chain_from_raw(
     descriptor: GuestTextureDescriptor,
     mip_level_count: u32,

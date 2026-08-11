@@ -8,7 +8,7 @@ use super::{
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
-    guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    guest_texture_byte_count, mode5_mip_chain_layout, mode64k_2d_mip_chain_layout,
     record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
     retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
     trace_resident_texture_removal,
@@ -727,7 +727,16 @@ pub(crate) fn resident_texture_raw_byte_count(
             return guest_texture_byte_count(descriptor)
                 .ok_or_else(|| "resident texture byte count overflows".to_owned());
         }
-        let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
+        if !matches!(descriptor.tile_mode, 9 | 27)
+            || super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+                != Some(descriptor.bytes_per_pixel)
+        {
+            return Err(format!(
+                "mipmapped resident byte count requires uncompressed tile 9/27, got tile={} format={:?} bpe={}",
+                descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
+            ));
+        }
+        let layout = mode64k_2d_mip_chain_layout(descriptor, mip_level_count)?;
         return u64::try_from(layout.byte_count)
             .map_err(|_| "mip chain byte count does not fit u64".to_owned());
     }
@@ -761,7 +770,13 @@ pub(crate) fn refresh_sampled_texture_write_watch(
             let was_dirty = cached.write_watch.is_dirty();
             let mut renewed = watch_sampled_texture(DecodedImageDescriptor {
                 guest: key.descriptor,
-                span: ResourceSpan::for_texture(key.descriptor),
+                span: ResourceSpan::for_image_view(
+                    key.descriptor,
+                    key.base_mip_level,
+                    key.mip_level_count,
+                    key.texture_type,
+                    key.layer_count,
+                )?,
                 // Component selection is lowered into each shader and does not change the host
                 // texture allocation or the guest bytes covered by its write watch.
                 destination_select: 0,
@@ -865,11 +880,16 @@ pub(crate) fn sampled_texture_raw_range(
     descriptor: DecodedImageDescriptor,
 ) -> Result<(usize, usize), String> {
     let exact_mode5_mip_chain = sampled_texture_uses_exact_mode5_mips(descriptor);
-    let exact_mode27_mip_chain = sampled_texture_uses_exact_mode27_mips(descriptor);
-    let byte_count = if exact_mode5_mip_chain || exact_mode27_mip_chain {
-        if exact_mode27_mip_chain && (descriptor.texture_type != 9 || descriptor.layer_count != 1) {
+    let exact_mode64k_mip_chain = sampled_texture_uses_exact_mode64k_2d_mips(descriptor);
+    let byte_count = if exact_mode5_mip_chain || exact_mode64k_mip_chain {
+        if exact_mode64k_mip_chain
+            && (descriptor.texture_type != 9
+                || descriptor.layer_count != 1
+                || super::super::metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
+                    != Some(descriptor.guest.bytes_per_pixel))
+        {
             return Err(format!(
-                "exact mode-27 sampled mip-chain upload requires a 2D single-layer resource, got type={} layers={} tile={} base={} count={}",
+                "exact tile-9/27 sampled mip-chain upload requires an uncompressed 2D single-layer resource, got type={} layers={} tile={} base={} count={}",
                 descriptor.texture_type,
                 descriptor.layer_count,
                 descriptor.guest.tile_mode,
@@ -900,7 +920,7 @@ pub(crate) fn sampled_texture_raw_range(
                 )
                 .ok_or("mode-5 sampled mip-chain byte count overflows")?
         } else {
-            mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count
+            mode64k_2d_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count
         };
         u64::try_from(byte_count).map_err(|_| "sampled mip-chain byte count does not fit u64")?
     } else {
@@ -927,8 +947,10 @@ pub(crate) fn sampled_texture_uses_exact_mode5_mips(descriptor: DecodedImageDesc
         && (descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1)
 }
 
-pub(crate) fn sampled_texture_uses_exact_mode27_mips(descriptor: DecodedImageDescriptor) -> bool {
-    descriptor.guest.tile_mode == 27
+pub(crate) fn sampled_texture_uses_exact_mode64k_2d_mips(
+    descriptor: DecodedImageDescriptor,
+) -> bool {
+    matches!(descriptor.guest.tile_mode, 9 | 27)
         && (descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1)
 }
 

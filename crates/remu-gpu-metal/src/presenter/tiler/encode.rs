@@ -9,8 +9,8 @@
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
 use super::super::tiling::{
-    guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
-    mode27_surface_z_xor, tiled_block_bytes, tiled_block_dimensions,
+    guest_texture_byte_count, mode5_mip_chain_layout, mode27_surface_z_xor,
+    mode64k_2d_mip_chain_layout, tiled_block_bytes, tiled_block_dimensions,
 };
 use super::super::{
     GuestTextureDescriptor, ResourceSpan, compressed_texture_block_extent,
@@ -209,8 +209,10 @@ fn plan_upload_subresources(
         );
     }
     if view.mip_level_count > 1
-        && matches!(descriptor.tile_mode, 5 | 24 | 27)
-        && !(matches!(descriptor.tile_mode, 27) && view.texture_type == 9 && view.layer_count == 1
+        && matches!(descriptor.tile_mode, 5 | 9 | 24 | 27)
+        && !(matches!(descriptor.tile_mode, 9 | 27)
+            && view.texture_type == 9
+            && view.layer_count == 1
             || matches!(descriptor.tile_mode, 5)
                 && matches!(view.texture_type, 9 | 11 | 13)
                 && view.layer_count >= 1)
@@ -236,8 +238,8 @@ fn plan_upload_subresources(
         ));
     }
     // Mode-5 already has AddrLib-backed mip-chain layout in element space (texels or BC
-    // blocks). Mode-1/9 stay single-level until their mip layouts are wired; mode-27 BC
-    // remains outside ownership entirely.
+    // blocks). Mode-1 stays single-level; compressed mode-9/27 mip chains remain outside
+    // ownership even though their uncompressed 64K mip layouts are exact.
     if compressed_block.is_some() && view.mip_level_count > 1 && descriptor.tile_mode != 5 {
         return Err(format!(
             "Phase 1G GPU tiler refuses compressed mip chains on tile={} (mode-5 element-grid mips only)",
@@ -312,8 +314,8 @@ fn plan_upload_subresources(
 
     let guest_bytes = if view.mip_level_count > 1 {
         match descriptor.tile_mode {
-            27 => {
-                let layout = mode27_mip_chain_layout(descriptor, view.mip_level_count)?;
+            9 | 27 => {
+                let layout = mode64k_2d_mip_chain_layout(descriptor, view.mip_level_count)?;
                 for (level_index, level) in layout.levels.iter().enumerate() {
                     let level_w =
                         u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?;
@@ -660,28 +662,10 @@ fn encode_detile_dispatch(
     compute.end_encoding();
 }
 
-/// Encodes `source` texture → guest tiled/linear bytes for `authored` absolute ranges.
+/// Encodes a layered / mipmapped `source` texture → guest bytes for `authored` absolute ranges.
 ///
 /// `authored` is an ephemeral run list for this encode only (not persistent debt tracking).
 /// An empty run list is a no-op success.
-pub(crate) fn encode_gpu_publish_to_guest(
-    device: &Device,
-    command_buffer: &CommandBufferRef,
-    descriptor: GuestTextureDescriptor,
-    source: &Texture,
-    authored: &[(u64, u64)],
-) -> Result<(), String> {
-    encode_gpu_publish_to_guest_view(
-        device,
-        command_buffer,
-        descriptor,
-        source,
-        authored,
-        GpuTilerView::SINGLE_LEVEL_2D,
-    )
-}
-
-/// Texture → guest publish for a layered / mipmapped view.
 pub(crate) fn encode_gpu_publish_to_guest_view(
     device: &Device,
     command_buffer: &CommandBufferRef,
@@ -1002,6 +986,72 @@ mod tests {
         assert!(
             err.contains("compressed mip chains on tile=9"),
             "unexpected refuse: {err}"
+        );
+    }
+
+    #[test]
+    fn refuses_tile9_layered_mip_chains_outside_the_exact_2d_shape() {
+        let err = match plan_upload_subresources(
+            descriptor(9),
+            GpuTilerView {
+                texture_type: 11,
+                layer_count: 2,
+                mip_level_count: 4,
+            },
+        ) {
+            Ok(_) => panic!("tile-9 array mips must stay loud"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("cannot represent mipmapped type=11 layers=2 tile=9"),
+            "unexpected refusal: {err}"
+        );
+    }
+
+    #[test]
+    fn plans_uncompressed_tile9_2d_mip_chain_without_relabelling_the_swizzle() {
+        let mut rgba8 = descriptor(9);
+        rgba8.width = 512;
+        rgba8.height = 256;
+        rgba8.pitch = 512;
+        let (subs, guest_bytes, linear_bytes) = plan_upload_subresources(
+            rgba8,
+            GpuTilerView {
+                texture_type: 9,
+                layer_count: 1,
+                mip_level_count: 10,
+            },
+        )
+        .expect("uncompressed tile-9 mip plan");
+
+        assert_eq!(guest_bytes, 786_432);
+        assert!(linear_bytes > 0);
+        assert_eq!(subs.len(), 10);
+        assert!(subs.iter().all(|sub| sub.tile_mode == 9));
+        assert_eq!(
+            subs.iter()
+                .map(|sub| (
+                    sub.width,
+                    sub.height,
+                    sub.level_offset,
+                    sub.pitch,
+                    sub.tail_x,
+                    sub.tail_y,
+                    sub.in_tail,
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (512, 256, 262_144, 512, 0, 0, 0),
+                (256, 128, 131_072, 256, 0, 0, 0),
+                (128, 64, 65_536, 128, 0, 0, 0),
+                (64, 32, 0, 128, 64, 0, 1),
+                (32, 16, 0, 128, 0, 64, 1),
+                (16, 8, 0, 128, 32, 0, 1),
+                (8, 4, 0, 128, 0, 32, 1),
+                (4, 2, 0, 128, 16, 0, 1),
+                (2, 1, 0, 128, 8, 16, 1),
+                (1, 1, 0, 128, 0, 24, 1),
+            ]
         );
     }
 

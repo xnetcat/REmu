@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::mode27::mode64k_2d_mip_chain_layout;
 use super::{GuestTextureDescriptor, guest_texture_byte_count};
 use metal::MTLPixelFormat;
 use remu_memory::{GuestSharedMappingIdentity, guest_shared_mapping_identity};
@@ -28,6 +29,40 @@ impl ResourceSpan {
             descriptor.address,
             guest_texture_byte_count(descriptor)?,
         ))
+    }
+
+    /// Resolves the complete allocation named by a 2D 64K mip hierarchy.
+    pub(crate) fn for_mode64k_2d_mip_chain(
+        descriptor: GuestTextureDescriptor,
+        mip_level_count: u32,
+    ) -> Result<Self, String> {
+        let layout = mode64k_2d_mip_chain_layout(descriptor, mip_level_count)?;
+        let byte_count = u64::try_from(layout.byte_count)
+            .map_err(|_| "64 KiB mip-chain span does not fit u64")?;
+        Ok(Self::new(descriptor.address, byte_count))
+    }
+
+    /// Resolves an image view's complete underlying allocation when its mip layout is exact.
+    pub(crate) fn for_image_view(
+        descriptor: GuestTextureDescriptor,
+        base_mip_level: u32,
+        mip_level_count: u32,
+        texture_type: u32,
+        layer_count: u32,
+    ) -> Result<Option<Self>, String> {
+        let underlying_mip_count = base_mip_level
+            .checked_add(mip_level_count)
+            .ok_or("image underlying mip count overflows")?;
+        if underlying_mip_count > 1
+            && matches!(descriptor.tile_mode, 9 | 27)
+            && texture_type == 9
+            && layer_count == 1
+            && super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+                == Some(descriptor.bytes_per_pixel)
+        {
+            return Self::for_mode64k_2d_mip_chain(descriptor, underlying_mip_count).map(Some);
+        }
+        Ok(Self::for_texture(descriptor))
     }
 
     pub(crate) fn new(address: u64, len: u64) -> Self {

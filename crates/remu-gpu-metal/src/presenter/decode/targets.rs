@@ -373,12 +373,12 @@ pub(crate) fn decode_render_target_state(
             "color target {guest_slot} has invalid mip view slices={slice_start}..={slice_max} mip={mip_level}/{max_mip} maximum={maximum_extent_mip} depth={mip0_depth}"
         ));
     }
-    if max_mip != 0 && (sample_count != 1 || tile_mode != 27) {
+    if max_mip != 0 && (sample_count != 1 || !matches!(tile_mode, 9 | 27)) {
         return Err(format!(
-            "color target {guest_slot} mip hierarchy requires single-sample mode-27 storage, got samples={sample_count} tile={tile_mode} mip={mip_level}/{max_mip}"
+            "color target {guest_slot} mip hierarchy requires single-sample 64K 2D storage, got samples={sample_count} tile={tile_mode} mip={mip_level}/{max_mip}"
         ));
     }
-    if !matches!(tile_mode, 0 | 27) {
+    if !matches!(tile_mode, 0 | 9 | 27) {
         return Err(format!(
             "color target {guest_slot} uses unsupported GFX10 swizzle mode {tile_mode}"
         ));
@@ -446,11 +446,20 @@ pub(crate) fn decode_render_target_state(
         pixel_format: format.pixel_format,
         bytes_per_pixel: format.bytes_per_pixel,
     };
+    let mip_level_count = max_mip + 1;
+    let span = if mip_level_count > 1 {
+        Some(ResourceSpan::for_mode64k_2d_mip_chain(
+            texture,
+            mip_level_count,
+        )?)
+    } else {
+        ResourceSpan::for_texture(texture)
+    };
     Ok(DecodedRenderTarget {
         guest_slot,
         texture,
         // The one place a colour target's physical span is resolved, mirroring the SRD path.
-        span: ResourceSpan::for_texture(texture),
+        span,
         output_kind: format.output_kind,
         write_mask,
         direct_scanout: false,
@@ -459,7 +468,7 @@ pub(crate) fn decode_render_target_state(
         layer_count,
         base_layer,
         mip_level,
-        mip_level_count: max_mip + 1,
+        mip_level_count,
         dcc_enabled: dcc_enable != 0,
         fast_clear_enabled: fast_clear != 0,
         blend_bypass,

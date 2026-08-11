@@ -143,14 +143,22 @@ fn decode_image_descriptor_impl(
         pixel_format,
         bytes_per_pixel: bytes_per_element,
     };
+    let mip_level_count = last_level - base_level + 1;
+    let span = ResourceSpan::for_image_view(
+        guest,
+        base_level,
+        mip_level_count,
+        texture_type,
+        layer_count,
+    )?;
     Ok(DecodedImageDescriptor {
         guest,
         // The one place a bound image's physical span is resolved. Every later overlap query
         // against this binding reuses it instead of re-entering the shared-mapping registry.
-        span: ResourceSpan::for_texture(guest),
+        span,
         destination_select,
         base_mip_level: base_level,
-        mip_level_count: last_level - base_level + 1,
+        mip_level_count,
         texture_type,
         layer_count,
     })

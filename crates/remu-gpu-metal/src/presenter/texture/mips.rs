@@ -1,19 +1,19 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::super::GuestMipChainLayout;
+use super::super::{GuestMipChainLayout, metal_uncompressed_bytes_per_pixel};
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState, ResidentGuestTexture,
-    ResidentTextureMap, WriteWatchRefresh, copy_mode27_mip_level_to_linear,
-    mode27_mip_chain_layout, record_mode27_work_detail, record_texture_work,
+    ResidentTextureMap, WriteWatchRefresh, copy_mode64k_2d_mip_level_to_linear,
+    mode64k_2d_mip_chain_layout, record_mode27_work_detail, record_texture_work,
     refresh_resident_texture_write_watch, resident_texture_for_sample,
     snapshot_watched_guest_range, trace_resident_texture_removal, watch_resident_texture,
 };
 #[cfg(test)]
 use super::{
     comparison_depth32_upload, compressed_texture_block_extent, decode_mode5_mip_chain_from_raw,
-    decode_mode27_mip_chain_from_raw, sampled_texture_usage,
+    decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout, sampled_texture_usage,
 };
 #[cfg(test)]
 use metal::NSRange;
@@ -35,11 +35,13 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
 ) -> Result<Texture, String> {
     if descriptor.texture_type != 9
         || descriptor.layer_count != 1
-        || descriptor.guest.tile_mode != 27
+        || !matches!(descriptor.guest.tile_mode, 9 | 27)
         || descriptor.mip_level_count == 0
+        || metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
+            != Some(descriptor.guest.bytes_per_pixel)
     {
         return Err(format!(
-            "mipmapped storage image requires a nonempty 2D single-layer mode-27 resource, got type={} layers={} tile={} base={} count={}",
+            "mipmapped storage image requires an uncompressed nonempty 2D single-layer tile-9/27 resource, got type={} layers={} tile={} base={} count={}",
             descriptor.texture_type,
             descriptor.layer_count,
             descriptor.guest.tile_mode,
@@ -115,7 +117,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         trace_resident_texture_removal("mip-hierarchy-replacement", &resident);
     }
     let started = Instant::now();
-    let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
+    let layout = mode64k_2d_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
     let write_watch = watch_resident_texture(
         descriptor.guest,
         descriptor.texture_type,
@@ -128,12 +130,6 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             descriptor.guest.tile_mode, descriptor.guest.pixel_format
         ));
     }
-    let queue = queue.ok_or_else(|| {
-        format!(
-            "Phase 1G: mipmapped storage at {:#x} needs a Metal queue for GPU upload",
-            descriptor.guest.address
-        )
-    })?;
     let usage = MTLTextureUsage::RenderTarget
         | MTLTextureUsage::ShaderRead
         | MTLTextureUsage::ShaderWrite
@@ -147,21 +143,38 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     metal_descriptor.set_storage_mode(MTLStorageMode::Shared);
     metal_descriptor.set_usage(usage);
     let texture = device.new_texture(&metal_descriptor);
-    let upload_buffer = queue.new_command_buffer().to_owned();
-    upload_buffer.set_label("REMu Phase 1G mipmapped storage GPU upload");
-    crate::presenter::tiler::encode_gpu_upload_from_guest_view(
-        device,
-        &upload_buffer,
-        descriptor.guest,
-        &texture,
-        crate::presenter::tiler::GpuTilerView {
-            texture_type: 9,
-            layer_count: 1,
-            mip_level_count: underlying_mip_count,
-        },
-    )?;
-    upload_buffer.commit();
-    upload_buffer.wait_until_completed();
+    let view = crate::presenter::tiler::GpuTilerView {
+        texture_type: 9,
+        layer_count: 1,
+        mip_level_count: underlying_mip_count,
+    };
+    if let Some(command_buffer) = promotion_command_buffer {
+        crate::presenter::tiler::encode_gpu_upload_from_guest_view(
+            device,
+            command_buffer,
+            descriptor.guest,
+            &texture,
+            view,
+        )?;
+    } else {
+        let queue = queue.ok_or_else(|| {
+            format!(
+                "Phase 1G: mipmapped storage at {:#x} needs a Metal queue for GPU upload",
+                descriptor.guest.address
+            )
+        })?;
+        let upload_buffer = queue.new_command_buffer().to_owned();
+        upload_buffer.set_label("REMu Phase 1G mipmapped storage GPU upload");
+        crate::presenter::tiler::encode_gpu_upload_from_guest_view(
+            device,
+            &upload_buffer,
+            descriptor.guest,
+            &texture,
+            view,
+        )?;
+        upload_buffer.commit();
+        upload_buffer.wait_until_completed();
+    }
     record_mode27_work_detail(
         origin,
         descriptor.guest,
@@ -204,26 +217,6 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     .ok_or_else(|| "created mip hierarchy cannot represent storage view".to_owned())
 }
 
-pub(crate) fn create_mipmapped_guest_texture(
-    device: &Device,
-    guest: GuestTextureDescriptor,
-    mip_level_count: u32,
-    linear_levels: &[Vec<u8>],
-) -> Result<Texture, String> {
-    let layout = mode27_mip_chain_layout(guest, mip_level_count)?;
-    create_mipmapped_guest_texture_from_layout(
-        device,
-        guest,
-        &layout,
-        0,
-        linear_levels,
-        MTLTextureUsage::RenderTarget
-            | MTLTextureUsage::ShaderRead
-            | MTLTextureUsage::ShaderWrite
-            | MTLTextureUsage::PixelFormatView,
-    )
-}
-
 pub(crate) fn promote_resident_mip_hierarchy(
     device: &Device,
     command_buffer: &CommandBufferRef,
@@ -237,13 +230,15 @@ pub(crate) fn promote_resident_mip_hierarchy(
         .ok_or("storage-image mip range overflows")?;
     if descriptor.texture_type != 9
         || descriptor.layer_count != 1
-        || descriptor.guest.tile_mode != 27
+        || !matches!(descriptor.guest.tile_mode, 9 | 27)
+        || metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
+            != Some(descriptor.guest.bytes_per_pixel)
         || underlying_mip_count <= resident.mip_level_count
         || resident.texture_type != 9
         || resident.layer_count != 1
     {
         return Err(format!(
-            "mip promotion requires a larger 2D mode-27 hierarchy, got old={}/{} new={underlying_mip_count} type={}/{} layers={}/{} tile={}",
+            "mip promotion requires a larger uncompressed 2D tile-9/27 hierarchy, got old={}/{} new={underlying_mip_count} type={}/{} layers={}/{} tile={}",
             resident.mip_level_count,
             resident.texture.mipmap_level_count(),
             resident.texture_type,
@@ -255,7 +250,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
     }
 
     let started = Instant::now();
-    let layout = mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
+    let layout = mode64k_2d_mip_chain_layout(descriptor.guest, underlying_mip_count)?;
     let write_watch = watch_resident_texture(
         descriptor.guest,
         descriptor.texture_type,
@@ -278,7 +273,13 @@ pub(crate) fn promote_resident_mip_hierarchy(
             .and_then(|elements| elements.checked_mul(layout.bytes_per_element))
             .ok_or("promoted mip linear size overflows")?;
         let mut linear = vec![0; byte_count];
-        copy_mode27_mip_level_to_linear(&layout, level, &raw, &mut linear)?;
+        copy_mode64k_2d_mip_level_to_linear(
+            descriptor.guest.tile_mode,
+            &layout,
+            level,
+            &raw,
+            &mut linear,
+        )?;
         linear_levels.push(linear);
     }
     let texture = create_mipmapped_guest_texture_from_layout(

@@ -18,8 +18,8 @@ use super::{
     DecodedImageDescriptor, DecodedRenderTarget, GuestTextureDescriptor, MetalPresenter, RangeSet,
     ResidentTextureActivity, ResidentTextureActivityStamp, ResourceSpan, WriteWatchRefresh,
     apply_image_destination_select, comparison_depth32_upload, copy_linear_to_tiled_at_z,
-    create_sampled_guest_texture, decode_guest_texture_linear_from_raw, decode_image_descriptor,
-    decode_mode27_mip_chain_from_raw, depth_array_face_descriptor,
+    copy_mode64k_2d_mip_level_to_linear, create_sampled_guest_texture,
+    decode_guest_texture_linear_from_raw, decode_image_descriptor, depth_array_face_descriptor,
     depth_array_face_set_is_complete, depth_sample_view_must_not_steal_depth_authority,
     fallback_image_descriptor, guest_shared_mapping_identity, guest_texture_byte_count,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
@@ -28,8 +28,8 @@ use super::{
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
-    new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
-    rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
+    mode64k_2d_mip_chain_layout, new_color_alias_texture_view, new_red_blue_swizzled_texture_view,
+    read_texture_linear, rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_same_image_sample_is_eligible,
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
@@ -2196,6 +2196,613 @@ fn accepts_a_nonzero_sampled_mip_view() {
 }
 
 #[test]
+fn tile9_sampled_mip_range_covers_the_complete_uncompressed_64k_chain() {
+    let guest = GuestTextureDescriptor {
+        address: 0x70_6409_0000,
+        width: 512,
+        height: 256,
+        pitch: 512,
+        tile_mode: 9,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let descriptor = DecodedImageDescriptor {
+        guest,
+        span: ResourceSpan::for_texture(guest),
+        destination_select: 0xfac,
+        base_mip_level: 0,
+        mip_level_count: 10,
+        texture_type: 9,
+        layer_count: 1,
+    };
+    assert_eq!(
+        super::sampled_texture_raw_range(descriptor)
+            .expect("tile-9 sampled hierarchy covers its complete packed chain")
+            .1,
+        mode64k_2d_mip_chain_layout(guest, 10)
+            .expect("tile-9 underlying mip layout")
+            .byte_count
+    );
+
+    let bc7 = DecodedImageDescriptor {
+        guest: GuestTextureDescriptor {
+            pixel_format: MTLPixelFormat::BC7_RGBAUnorm,
+            bytes_per_pixel: 16,
+            ..guest
+        },
+        ..descriptor
+    };
+    assert!(
+        super::sampled_texture_raw_range(bc7)
+            .expect_err("tile-9 BC mip chains stay unsupported")
+            .contains("uncompressed")
+    );
+}
+
+#[test]
+fn decoded_64k_mip_views_name_the_complete_underlying_allocation_span() {
+    let address = 0x70_6409_0000_u64;
+    let width = 512_u32;
+    let height = 256_u32;
+    let encoded_width = width - 1;
+
+    for tile_mode in [9, 27] {
+        for (base_level, last_level, underlying_mip_count) in [(0, 9, 10), (4, 4, 5)] {
+            let mut words = [0_u32; 8];
+            words[0] = u32::try_from(address >> 8).expect("low image address fits");
+            words[1] = u32::try_from(address >> 40).expect("high image address fits")
+                | (56 << 20)
+                | ((encoded_width & 0x3) << 30);
+            words[2] = (encoded_width >> 2) | ((height - 1) << 14);
+            words[3] =
+                0xfac | (base_level << 12) | (last_level << 16) | (tile_mode << 20) | (9 << 28);
+            words[4] = width - 1;
+
+            let descriptor = decode_image_descriptor(&words).expect("exact 64K mip view");
+            let expected = mode64k_2d_mip_chain_layout(descriptor.guest, underlying_mip_count)
+                .expect("complete underlying layout");
+            let span = descriptor.span.expect("decoded mip view has a span");
+            assert_eq!(span.len(), u64::try_from(expected.byte_count).unwrap());
+
+            let omitted_suffix = ResourceSpan::new(address + 700_000, 4_096);
+            assert!(
+                span.overlaps(&omitted_suffix),
+                "tile={tile_mode} base={base_level} view must overlap a tenant in the mip allocation suffix"
+            );
+            assert!(
+                !ResourceSpan::for_texture(descriptor.guest)
+                    .expect("base span")
+                    .overlaps(&omitted_suffix),
+                "the regression tenant must live beyond the legacy base-only span"
+            );
+        }
+    }
+
+    for tile_mode in [9, 27] {
+        let mut mismatched_pitch = [0_u32; 8];
+        mismatched_pitch[0] = u32::try_from(address >> 8).expect("low image address fits");
+        mismatched_pitch[1] = u32::try_from(address >> 40).expect("high image address fits")
+            | (56 << 20)
+            | ((encoded_width & 0x3) << 30);
+        mismatched_pitch[2] = (encoded_width >> 2) | ((height - 1) << 14);
+        mismatched_pitch[3] = 0xfac | (4 << 16) | (tile_mode << 20) | (9 << 28);
+        mismatched_pitch[4] = 640 - 1;
+        assert!(
+            decode_image_descriptor(&mismatched_pitch)
+                .expect_err("mipped SRD with unproven explicit pitch must be rejected")
+                .contains("pitch==width")
+        );
+    }
+}
+
+#[test]
+fn sampled_storage_and_target_mip_entrypoints_refuse_unproven_pitch() {
+    for tile_mode in [9, 27] {
+        let guest = GuestTextureDescriptor {
+            address: 0x70_6409_0000,
+            width: 512,
+            height: 256,
+            pitch: 640,
+            tile_mode,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let descriptor = DecodedImageDescriptor {
+            guest,
+            span: ResourceSpan::for_texture(guest),
+            destination_select: 0xfac,
+            base_mip_level: 0,
+            mip_level_count: 5,
+            texture_type: 9,
+            layer_count: 1,
+        };
+        assert!(
+            super::sampled_texture_raw_range(descriptor)
+                .expect_err("sampled mip range must refuse an unproven pitch")
+                .contains("pitch==width")
+        );
+
+        let device = Device::system_default().expect("Metal device");
+        let mut residents = ResidentTextureMap::new();
+        assert!(
+            super::ensure_mipmapped_resident_texture_in_map(
+                &device,
+                None,
+                None,
+                descriptor,
+                &mut residents,
+                super::Mode27WorkOrigin::StorageCreate,
+            )
+            .expect_err("storage mip hierarchy must refuse an unproven pitch")
+            .contains("pitch==width")
+        );
+
+        let target = DecodedRenderTarget {
+            guest_slot: 0,
+            texture: guest,
+            span: ResourceSpan::for_texture(guest),
+            output_kind: remu_shader::PixelOutputKind::Float,
+            write_mask: 0xf,
+            direct_scanout: false,
+            sample_count: 1,
+            texture_type: 9,
+            layer_count: 1,
+            base_layer: 0,
+            mip_level: 0,
+            mip_level_count: 5,
+            dcc_enabled: false,
+            fast_clear_enabled: false,
+            blend_bypass: false,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        assert!(
+            presenter
+                .ensure_mipmapped_render_target_texture(&device, target, false)
+                .expect_err("render-target mip hierarchy must refuse an unproven pitch")
+                .contains("pitch==width")
+        );
+    }
+}
+
+#[test]
+fn sampled_64k_mip_load_rematerialises_a_gpu_tenant_in_the_allocation_suffix() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection, read_guest_shared_backing,
+    };
+
+    for tile_mode in [9, 27] {
+        let allocation_size = 48 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(allocation_size * 2).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("mip backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("mip mapping")
+            .get();
+        let tenant = GuestTextureDescriptor {
+            address: address + 700_000,
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        presenter
+            .ensure_resident_texture(&device, tenant)
+            .expect("suffix tenant resident");
+        let authored = (0..32 * 32 * 4)
+            .map(|index| u8::try_from((index * 37 + tile_mode as usize) & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        presenter.resident_guest_textures[&tenant]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 32, 32),
+                0,
+                authored.as_ptr().cast::<std::ffi::c_void>(),
+                32 * 4,
+            );
+        presenter.mark_resident_texture_written(tenant);
+        assert!(presenter.resident_guest_textures[&tenant].gpu_written());
+
+        let width = 512_u32;
+        let height = 256_u32;
+        let encoded_width = width - 1;
+        let encoded_address = address >> 8;
+        let resource_descriptor = vec![
+            u32::try_from(encoded_address).expect("low address fits"),
+            (u32::try_from(encoded_address >> 32).expect("high address fits") & 0xff)
+                | (56 << 20)
+                | ((encoded_width & 0x3) << 30),
+            (encoded_width >> 2) | ((height - 1) << 14),
+            0xfac | (4 << 16) | (tile_mode << 20) | (9 << 28),
+            width - 1,
+            0,
+            0,
+            0,
+        ];
+        let sampled =
+            decode_image_descriptor(&resource_descriptor).expect("sampled mip descriptor decodes");
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![ImageBinding {
+                pc: 0x40,
+                opcode: Opcode::Known("ImageSample"),
+                control: ImageControl {
+                    dmask: 0xf,
+                    vector_address: 0,
+                    address_registers: vec![0, 1],
+                    vector_data: 4,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+                resource_descriptor: resource_descriptor.into(),
+                sampler_descriptor: vec![0; 4].into(),
+                mip_level: None,
+            }],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+        presenter
+            .synchronize_sampled_aliases(&[&evaluation], &[])
+            .expect("sampled suffix alias synchronization");
+        assert!(
+            !presenter.resident_guest_textures[&tenant].gpu_written(),
+            "sampled mip load must transfer suffix authority into the hierarchy"
+        );
+        assert!(!presenter.resident_guest_textures[&tenant].is_live());
+        assert!(presenter.resident_guest_textures[&sampled.guest].gpu_written());
+        let uploaded = upload_test_image_textures(&mut presenter, &evaluation);
+        assert_eq!(uploaded.len(), 1);
+        if let Some(batch) = presenter.open_guest_batch.take() {
+            batch.command_buffer.commit();
+            batch.command_buffer.wait_until_completed();
+        }
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal queue")
+            .clone();
+        let layout = mode64k_2d_mip_chain_layout(sampled.guest, 5).expect("sampled mip layout");
+        let mut raw = vec![0; layout.byte_count];
+        let tenant_byte_count =
+            usize::try_from(guest_texture_byte_count(tenant).expect("tenant byte count"))
+                .expect("tenant length fits usize");
+        let mut tenant_raw = vec![0; tenant_byte_count];
+        copy_linear_to_tiled_at_z(&authored, tenant, &mut tenant_raw, 0)
+            .expect("tenant retile oracle");
+        raw[700_000..700_000 + tenant_raw.len()].copy_from_slice(&tenant_raw);
+        let base = layout.levels[0];
+        let mut expected = vec![0; base.width * base.height * layout.bytes_per_element];
+        copy_mode64k_2d_mip_level_to_linear(tile_mode, &layout, base, &raw, &mut expected)
+            .expect("CPU detile oracle");
+        let actual = super::super::readback::read_texture_mip_linear(
+            &device,
+            &queue,
+            &uploaded[0],
+            sampled.guest,
+            0,
+        )
+        .expect("sampled mip readback");
+        assert_eq!(actual, expected, "tile={tile_mode} sampled suffix differs");
+        let mut unpublished = vec![0; tenant_raw.len()];
+        assert!(read_guest_shared_backing(tenant.address, &mut unpublished));
+        assert!(
+            unpublished.iter().all(|byte| *byte == 0),
+            "bookkeeping sample must not publish GPU-only bytes to guest RAM"
+        );
+    }
+}
+
+#[test]
+fn comparison_sampled_64k_mip_load_refuses_a_gpu_tenant_before_stale_upload() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    for tile_mode in [9, 27] {
+        let allocation_size = 48 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(allocation_size * 2).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("mip backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("mip mapping")
+            .get();
+        let tenant = GuestTextureDescriptor {
+            address: address + 700_000,
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode,
+            pixel_format: MTLPixelFormat::R32Float,
+            bytes_per_pixel: 4,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        presenter
+            .ensure_resident_texture(&device, tenant)
+            .expect("suffix tenant resident");
+        presenter.mark_resident_texture_written(tenant);
+
+        let width = 512_u32;
+        let height = 256_u32;
+        let encoded_width = width - 1;
+        let encoded_address = address >> 8;
+        let resource_descriptor = vec![
+            u32::try_from(encoded_address).expect("low address fits"),
+            (u32::try_from(encoded_address >> 32).expect("high address fits") & 0xff)
+                | (22 << 20)
+                | ((encoded_width & 0x3) << 30),
+            (encoded_width >> 2) | ((height - 1) << 14),
+            0x204 | (4 << 16) | (tile_mode << 20) | (9 << 28),
+            width - 1,
+            0,
+            0,
+            0,
+        ];
+        let comparison = ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![ImageBinding {
+                pc: 0x44,
+                opcode: Opcode::Known("ImageSampleCLz"),
+                control: ImageControl {
+                    dmask: 1,
+                    vector_address: 0,
+                    address_registers: vec![0, 1, 2],
+                    vector_data: 4,
+                    scalar_resource: 0,
+                    scalar_sampler: 8,
+                    dimension: 1,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+                resource_descriptor: resource_descriptor.into(),
+                sampler_descriptor: vec![0; 4].into(),
+                mip_level: None,
+            }],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+        let error = presenter
+            .synchronize_sampled_aliases(&[&comparison], &[])
+            .expect_err("comparison mip read must not fall through to stale RAM");
+        assert!(error.contains("comparison"), "unexpected refusal: {error}");
+        assert!(
+            presenter.resident_guest_textures[&tenant].gpu_written(),
+            "refusal must retain the unpublished GPU debt"
+        );
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn mip_hierarchy_load_preserves_a_gpu_tenant_in_the_allocation_suffix() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    for tile_mode in [9, 27] {
+        for clean_promotion in [false, true] {
+            for render_target in [false, true] {
+                for discard_target_contents in [false, true] {
+                    if discard_target_contents && !render_target {
+                        continue;
+                    }
+                    let allocation_size = 48 * GUEST_PAGE_SIZE;
+                    let mut memory =
+                        GuestAddressSpace::new(allocation_size * 2).expect("guest address space");
+                    let backing = GuestPhysicalBacking::new(allocation_size).expect("mip backing");
+                    let address = memory
+                        .map_shared(
+                            GuestMapPlacement::Anywhere,
+                            allocation_size,
+                            GUEST_PAGE_SIZE,
+                            GuestProtection::READ_WRITE,
+                            &backing,
+                            0,
+                        )
+                        .expect("mip mapping")
+                        .get();
+                    let guest = GuestTextureDescriptor {
+                        address,
+                        width: 512,
+                        height: 256,
+                        pitch: 512,
+                        tile_mode,
+                        pixel_format: MTLPixelFormat::RGBA8Unorm,
+                        bytes_per_pixel: 4,
+                    };
+                    let layout =
+                        mode64k_2d_mip_chain_layout(guest, 5).expect("five-level mip layout");
+                    let descriptor = DecodedImageDescriptor {
+                        guest,
+                        span: Some(ResourceSpan::new(
+                            address,
+                            u64::try_from(layout.byte_count).expect("layout length fits u64"),
+                        )),
+                        destination_select: 0xfac,
+                        base_mip_level: 0,
+                        mip_level_count: 5,
+                        texture_type: 9,
+                        layer_count: 1,
+                    };
+                    let (_sender, receiver) = std::sync::mpsc::channel();
+                    let mut presenter =
+                        MetalPresenter::new(receiver).expect("Metal presenter state");
+                    presenter.per_queue_guest_batches = false;
+                    let device = presenter.device.as_ref().expect("Metal device").clone();
+                    let queue = presenter
+                        .command_queue
+                        .as_ref()
+                        .expect("Metal queue")
+                        .clone();
+                    if clean_promotion {
+                        presenter
+                            .ensure_resident_texture(&device, guest)
+                            .expect("clean base resident");
+                    }
+
+                    let tenant = GuestTextureDescriptor {
+                        address: address + 700_000,
+                        width: 32,
+                        height: 32,
+                        pitch: 32,
+                        tile_mode,
+                        pixel_format: MTLPixelFormat::RGBA8Unorm,
+                        bytes_per_pixel: 4,
+                    };
+                    presenter
+                        .ensure_resident_texture(&device, tenant)
+                        .expect("suffix tenant resident");
+                    let authored = (0..32 * 32 * 4)
+                        .map(|index| {
+                            u8::try_from((index * 37 + tile_mode as usize) & 0xff).unwrap()
+                        })
+                        .collect::<Vec<_>>();
+                    presenter.resident_guest_textures[&tenant]
+                        .texture
+                        .replace_region(
+                            MTLRegion::new_2d(0, 0, 32, 32),
+                            0,
+                            authored.as_ptr().cast::<std::ffi::c_void>(),
+                            32 * 4,
+                        );
+                    presenter.mark_resident_texture_written(tenant);
+
+                    let texture = if render_target {
+                        presenter
+                            .ensure_mipmapped_render_target_texture(
+                                &device,
+                                DecodedRenderTarget {
+                                    guest_slot: 0,
+                                    texture: guest,
+                                    span: descriptor.span,
+                                    output_kind: remu_shader::PixelOutputKind::Float,
+                                    write_mask: 0xf,
+                                    direct_scanout: false,
+                                    sample_count: 1,
+                                    texture_type: 9,
+                                    layer_count: 1,
+                                    base_layer: 0,
+                                    mip_level: if discard_target_contents { 4 } else { 0 },
+                                    mip_level_count: 5,
+                                    dcc_enabled: false,
+                                    fast_clear_enabled: false,
+                                    blend_bypass: false,
+                                },
+                                discard_target_contents,
+                            )
+                            .expect("mipmapped render target")
+                            .texture
+                    } else {
+                        presenter
+                            .ensure_mipmapped_storage_texture(&device, descriptor)
+                            .expect("mipmapped storage texture")
+                    };
+                    assert!(
+                        !presenter.resident_guest_textures[&tenant].is_live(),
+                        "tile={tile_mode} promotion={clean_promotion} target={render_target} must transfer suffix ownership before bind"
+                    );
+                    assert!(presenter.resident_guest_textures[&guest].gpu_written());
+                    if discard_target_contents {
+                        let pass = RenderPassDescriptor::new();
+                        let attachment = pass
+                            .color_attachments()
+                            .object_at(0)
+                            .expect("color attachment zero");
+                        attachment.set_texture(Some(&texture));
+                        attachment.set_level(4);
+                        attachment.set_load_action(MTLLoadAction::Clear);
+                        attachment.set_store_action(MTLStoreAction::Store);
+                        attachment.set_clear_color(MTLClearColor::new(1.0, 0.0, 0.0, 1.0));
+                        let command_buffer = presenter
+                            .open_guest_batch
+                            .as_ref()
+                            .expect("discard reconciliation stays in the guest batch")
+                            .command_buffer
+                            .clone();
+                        let encoder = command_buffer.new_render_command_encoder(pass);
+                        encoder.end_encoding();
+                    }
+                    if let Some(batch) = presenter.open_guest_batch.take() {
+                        batch.command_buffer.commit();
+                        batch.command_buffer.wait_until_completed();
+                    }
+
+                    let mut raw = vec![0; layout.byte_count];
+                    let tenant_byte_count = usize::try_from(
+                        guest_texture_byte_count(tenant).expect("tenant byte count"),
+                    )
+                    .expect("tenant length fits usize");
+                    let mut tenant_raw = vec![0; tenant_byte_count];
+                    copy_linear_to_tiled_at_z(&authored, tenant, &mut tenant_raw, 0)
+                        .expect("tenant retile oracle");
+                    raw[700_000..700_000 + tenant_raw.len()].copy_from_slice(&tenant_raw);
+                    let base = layout.levels[0];
+                    let mut expected = vec![0; base.width * base.height * layout.bytes_per_element];
+                    copy_mode64k_2d_mip_level_to_linear(
+                        tile_mode,
+                        &layout,
+                        base,
+                        &raw,
+                        &mut expected,
+                    )
+                    .expect("CPU detile oracle");
+                    let actual = super::super::readback::read_texture_mip_linear(
+                        &device, &queue, &texture, guest, 0,
+                    )
+                    .expect("mip-zero readback");
+                    assert_eq!(
+                        actual, expected,
+                        "tile={tile_mode} promotion={clean_promotion} target={render_target} discard={discard_target_contents} overwrote unbound suffix GPU authority from stale RAM"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn mode5_sampled_mip_range_covers_the_packed_prefix_and_deferred_base_image() {
     const MODE5_HIERARCHY: GuestTextureDescriptor = GuestTextureDescriptor {
         address: 0x70_2754_1000,
@@ -2975,7 +3582,313 @@ fn bookkeeping_trigger_refuses_publish_and_keeps_debt() {
 }
 
 #[test]
-fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
+fn clean_64k_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    for tile_mode in [27, 9] {
+        let allocation_size = 4 * GUEST_PAGE_SIZE;
+        let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("guest mip mapping");
+        let guest = GuestTextureDescriptor {
+            address: address.get(),
+            width: 32,
+            height: 32,
+            pitch: 32,
+            tile_mode,
+            pixel_format: MTLPixelFormat::RG16Uint,
+            bytes_per_pixel: 4,
+        };
+        let descriptor = DecodedImageDescriptor {
+            guest,
+            span: ResourceSpan::for_texture(guest),
+            destination_select: 0x22c,
+            base_mip_level: 2,
+            mip_level_count: 1,
+            texture_type: 9,
+            layer_count: 1,
+        };
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal command queue")
+            .clone();
+        presenter
+            .ensure_resident_texture(&device, guest)
+            .expect("single-level resident");
+
+        let error = super::ensure_mipmapped_resident_texture_in_map(
+            &device,
+            Some(&queue),
+            None,
+            descriptor,
+            &mut presenter.resident_guest_textures,
+            super::Mode27WorkOrigin::StorageCreate,
+        )
+        .expect_err("promotion without an ordered command buffer must be rejected");
+        assert!(error.contains("ordered guest command buffer"));
+        assert!(
+            presenter.resident_guest_textures.contains_key(&guest),
+            "a rejected promotion must retain the original resident"
+        );
+
+        let command_buffer = queue.new_command_buffer().to_owned();
+        let view = super::ensure_mipmapped_resident_texture_in_map(
+            &device,
+            Some(&queue),
+            Some(&command_buffer),
+            descriptor,
+            &mut presenter.resident_guest_textures,
+            super::Mode27WorkOrigin::StorageCreate,
+        )
+        .expect("ordered clean mip promotion");
+        assert_eq!(
+            command_buffer.status(),
+            MTLCommandBufferStatus::NotEnqueued,
+            "promotion must not synchronously commit or wait"
+        );
+        assert_eq!(view.width(), 8);
+        assert_eq!(view.height(), 8);
+        let resident = presenter
+            .resident_guest_textures
+            .get(&guest)
+            .expect("promoted resident");
+        assert_eq!(resident.mip_level_count, 3);
+        assert!(
+            !resident.gpu_written(),
+            "copying clean guest-derived levels must not invent GPU ownership"
+        );
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+
+        let rendered_mip = (0..8 * 8 * 4)
+            .map(|byte| u8::try_from((byte * 29 + tile_mode as usize) & 0xff).expect("byte"))
+            .collect::<Vec<_>>();
+        presenter.resident_guest_textures[&guest]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 8, 8),
+                2,
+                rendered_mip.as_ptr().cast::<std::ffi::c_void>(),
+                8 * 4,
+            );
+        let resident_span = presenter.resident_guest_textures[&guest].span;
+        presenter.mark_resident_texture_written_at(
+            guest,
+            resident_span,
+            None,
+            WrittenRegion {
+                first_level: 2,
+                level_count: 1,
+                ..WrittenRegion::whole_resource()
+            },
+            ResidentTextureActivityStamp { work: 1, flip: 1 },
+        );
+        assert!(
+            presenter
+                .settle_resident_texture_writeback(guest, WritebackTrigger::FlipTarget)
+                .expect("publish promoted mip hierarchy")
+        );
+        if let Some(batch) = presenter.open_guest_batch.take() {
+            batch.command_buffer.commit();
+            batch.command_buffer.wait_until_completed();
+        }
+        let layout = mode64k_2d_mip_chain_layout(guest, 3).expect("published mip layout");
+        let raw = snapshot_guest_texture_raw(guest).expect("published tiled bytes");
+        let mut decoded_mip = vec![0; rendered_mip.len()];
+        copy_mode64k_2d_mip_level_to_linear(
+            tile_mode,
+            &layout,
+            layout.levels[2],
+            &raw,
+            &mut decoded_mip,
+        )
+        .expect("detile published mip");
+        assert_eq!(decoded_mip, rendered_mip, "tile {tile_mode} mip publish");
+    }
+}
+
+#[test]
+fn demon_souls_sized_64k_promotion_and_writeback_cover_nontail_and_nonzero_base_views() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection, read_guest_shared_backing,
+    };
+
+    for tile_mode in [9, 27] {
+        for base_mip_level in [1, 4] {
+            let underlying_mip_count = base_mip_level + 1;
+            let template = GuestTextureDescriptor {
+                address: 0,
+                width: 512,
+                height: 256,
+                pitch: 512,
+                tile_mode,
+                pixel_format: MTLPixelFormat::RGBA8Unorm,
+                bytes_per_pixel: 4,
+            };
+            let template_layout = mode64k_2d_mip_chain_layout(template, underlying_mip_count)
+                .expect("Demon-like 64K layout");
+            let allocation_size = u64::try_from(template_layout.byte_count)
+                .expect("layout byte count fits u64")
+                .div_ceil(GUEST_PAGE_SIZE)
+                * GUEST_PAGE_SIZE;
+            let mut memory = GuestAddressSpace::new(allocation_size * 2)
+                .expect("guest address space for complete mip allocation");
+            let backing = GuestPhysicalBacking::new(allocation_size).expect("complete mip backing");
+            let address = memory
+                .map_shared(
+                    GuestMapPlacement::Anywhere,
+                    allocation_size,
+                    GUEST_PAGE_SIZE,
+                    GuestProtection::READ_WRITE,
+                    &backing,
+                    0,
+                )
+                .expect("complete mip mapping")
+                .get();
+            let guest = GuestTextureDescriptor {
+                address,
+                ..template
+            };
+            let layout = mode64k_2d_mip_chain_layout(guest, underlying_mip_count)
+                .expect("mapped Demon-like 64K layout");
+            let descriptor = DecodedImageDescriptor {
+                guest,
+                span: Some(
+                    ResourceSpan::for_mode64k_2d_mip_chain(guest, underlying_mip_count)
+                        .expect("decoded complete mip span"),
+                ),
+                destination_select: 0xfac,
+                base_mip_level,
+                mip_level_count: 1,
+                texture_type: 9,
+                layer_count: 1,
+            };
+
+            let (_sender, receiver) = std::sync::mpsc::channel();
+            let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+            let device = presenter.device.as_ref().expect("Metal device").clone();
+            let queue = presenter
+                .command_queue
+                .as_ref()
+                .expect("Metal command queue")
+                .clone();
+            presenter
+                .ensure_resident_texture(&device, guest)
+                .expect("single-level base resident");
+            assert_eq!(
+                presenter.resident_guest_textures[&guest].mip_level_count, 1,
+                "promotion precondition is an old one-level resident"
+            );
+
+            let promotion = queue.new_command_buffer().to_owned();
+            let view = super::ensure_mipmapped_resident_texture_in_map(
+                &device,
+                Some(&queue),
+                Some(&promotion),
+                descriptor,
+                &mut presenter.resident_guest_textures,
+                super::Mode27WorkOrigin::StorageCreate,
+            )
+            .expect("ordered Demon-like mip promotion");
+            assert_eq!(promotion.status(), MTLCommandBufferStatus::NotEnqueued);
+            assert_eq!(view.width(), u64::from(guest.width >> base_mip_level));
+            assert_eq!(view.height(), u64::from(guest.height >> base_mip_level));
+            assert_eq!(
+                presenter.resident_guest_textures[&guest]
+                    .span
+                    .expect("promoted resident span")
+                    .len(),
+                u64::try_from(layout.byte_count).unwrap()
+            );
+            promotion.commit();
+            promotion.wait_until_completed();
+            assert_eq!(promotion.status(), MTLCommandBufferStatus::Completed);
+
+            let level = layout.levels[usize::try_from(base_mip_level).unwrap()];
+            let rendered = (0..level.width * level.height * layout.bytes_per_element)
+                .map(|byte| {
+                    u8::try_from(
+                        (byte * 31
+                            + usize::try_from(tile_mode).unwrap()
+                            + usize::try_from(base_mip_level).unwrap())
+                            & 0xff,
+                    )
+                    .expect("rendered byte")
+                })
+                .collect::<Vec<_>>();
+            presenter.resident_guest_textures[&guest]
+                .texture
+                .replace_region(
+                    MTLRegion::new_2d(
+                        0,
+                        0,
+                        u64::try_from(level.width).unwrap(),
+                        u64::try_from(level.height).unwrap(),
+                    ),
+                    u64::from(base_mip_level),
+                    rendered.as_ptr().cast::<std::ffi::c_void>(),
+                    u64::try_from(level.width * layout.bytes_per_element).unwrap(),
+                );
+            let resident_span = presenter.resident_guest_textures[&guest].span;
+            presenter.mark_resident_texture_written_at(
+                guest,
+                resident_span,
+                None,
+                WrittenRegion {
+                    first_level: base_mip_level,
+                    level_count: 1,
+                    ..WrittenRegion::whole_resource()
+                },
+                ResidentTextureActivityStamp { work: 1, flip: 1 },
+            );
+            assert!(
+                presenter
+                    .settle_resident_texture_writeback(guest, WritebackTrigger::FlipTarget)
+                    .expect("publish Demon-like mip hierarchy")
+            );
+            if let Some(batch) = presenter.open_guest_batch.take() {
+                batch.command_buffer.commit();
+                batch.command_buffer.wait_until_completed();
+                assert_eq!(
+                    batch.command_buffer.status(),
+                    MTLCommandBufferStatus::Completed
+                );
+            }
+
+            let mut raw = vec![0; layout.byte_count];
+            assert!(read_guest_shared_backing(guest.address, &mut raw));
+            let mut decoded = vec![0; rendered.len()];
+            copy_mode64k_2d_mip_level_to_linear(tile_mode, &layout, level, &raw, &mut decoded)
+                .expect("detile published Demon-like mip");
+            assert_eq!(
+                decoded, rendered,
+                "tile={tile_mode} base={base_mip_level} writeback"
+            );
+        }
+    }
+}
+
+#[test]
+fn creates_an_uncompressed_tile9_mipmapped_render_target() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -2993,82 +3906,43 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
             &backing,
             0,
         )
-        .expect("guest mip mapping");
+        .expect("guest mip mapping")
+        .get();
     let guest = GuestTextureDescriptor {
-        address: address.get(),
+        address,
         width: 32,
         height: 32,
         pitch: 32,
-        tile_mode: 27,
+        tile_mode: 9,
         pixel_format: MTLPixelFormat::RG16Uint,
         bytes_per_pixel: 4,
     };
-    let descriptor = DecodedImageDescriptor {
-        guest,
+    let target = DecodedRenderTarget {
+        guest_slot: 0,
+        texture: guest,
         span: ResourceSpan::for_texture(guest),
-        destination_select: 0x22c,
-        base_mip_level: 2,
-        mip_level_count: 1,
+        output_kind: remu_shader::PixelOutputKind::Uint,
+        write_mask: 0xf,
+        direct_scanout: false,
+        sample_count: 1,
         texture_type: 9,
         layer_count: 1,
+        base_layer: 0,
+        mip_level: 0,
+        mip_level_count: 3,
+        dcc_enabled: false,
+        fast_clear_enabled: false,
+        blend_bypass: false,
     };
 
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
     let device = presenter.device.as_ref().expect("Metal device").clone();
-    let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal command queue")
-        .clone();
-    presenter
-        .ensure_resident_texture(&device, guest)
-        .expect("single-level resident");
-
-    let error = super::ensure_mipmapped_resident_texture_in_map(
-        &device,
-        Some(&queue),
-        None,
-        descriptor,
-        &mut presenter.resident_guest_textures,
-        super::Mode27WorkOrigin::StorageCreate,
-    )
-    .expect_err("promotion without an ordered command buffer must be rejected");
-    assert!(error.contains("ordered guest command buffer"));
-    assert!(
-        presenter.resident_guest_textures.contains_key(&guest),
-        "a rejected promotion must retain the original resident"
-    );
-
-    let command_buffer = queue.new_command_buffer().to_owned();
-    let view = super::ensure_mipmapped_resident_texture_in_map(
-        &device,
-        Some(&queue),
-        Some(&command_buffer),
-        descriptor,
-        &mut presenter.resident_guest_textures,
-        super::Mode27WorkOrigin::StorageCreate,
-    )
-    .expect("ordered clean mip promotion");
-    assert_eq!(
-        command_buffer.status(),
-        MTLCommandBufferStatus::NotEnqueued,
-        "promotion must not synchronously commit or wait"
-    );
-    assert_eq!(view.width(), 8);
-    assert_eq!(view.height(), 8);
-    let resident = presenter
-        .resident_guest_textures
-        .get(&guest)
-        .expect("promoted resident");
-    assert_eq!(resident.mip_level_count, 3);
-    assert!(
-        !resident.gpu_written(),
-        "copying clean guest-derived levels must not invent GPU ownership"
-    );
-    command_buffer.commit();
-    command_buffer.wait_until_completed();
-    assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
+    let selected = presenter
+        .ensure_mipmapped_render_target_texture(&device, target, false)
+        .expect("tile-9 mipmapped render target");
+    assert_eq!(selected.texture.mipmap_level_count(), 3);
+    assert_eq!(presenter.resident_guest_textures[&guest].mip_level_count, 3);
 }
 
 #[test]
@@ -4146,126 +5020,142 @@ fn mode27_gpu_detile_reconstructs_every_volume_slice_with_surface_xor() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn mode27_gpu_detile_reconstructs_nontail_and_mip_tail_levels() {
+fn gpu_detile_reconstructs_tile9_and_tile27_nontail_and_mip_tail_levels() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
     };
 
-    const SOURCE_BYTES: u64 = 4 * 65_536;
-    let mut memory = GuestAddressSpace::new(4 * SOURCE_BYTES).expect("guest address space");
-    let backing = GuestPhysicalBacking::new(SOURCE_BYTES).expect("guest backing");
-    let address = memory
-        .map_shared(
-            GuestMapPlacement::Anywhere,
-            SOURCE_BYTES,
-            GUEST_PAGE_SIZE,
-            GuestProtection::READ_WRITE,
-            &backing,
-            0,
-        )
-        .expect("pooled mapping")
-        .get();
-    let source = GuestTextureDescriptor {
-        address,
-        width: 256,
-        height: 256,
-        pitch: 256,
-        tile_mode: 27,
-        pixel_format: MTLPixelFormat::RGBA8Unorm,
-        bytes_per_pixel: 4,
-    };
-    let mipped = GuestTextureDescriptor {
-        address,
-        width: 256,
-        height: 128,
-        pitch: 256,
-        tile_mode: 27,
-        pixel_format: MTLPixelFormat::R16Uint,
-        bytes_per_pixel: 2,
-    };
-    let mipped_image = DecodedImageDescriptor {
-        guest: mipped,
-        span: ResourceSpan::for_texture(mipped),
-        destination_select: 0,
-        base_mip_level: 0,
-        mip_level_count: 6,
-        texture_type: 9,
-        layer_count: 1,
-    };
-    let mip_layout = mode27_mip_chain_layout(mipped, 6).expect("target mip layout");
-    assert!(mip_layout.levels.iter().any(|level| level.in_tail));
-    assert!(mip_layout.levels.iter().any(|level| !level.in_tail));
+    for tile_mode in [27, 9] {
+        const SOURCE_BYTES: u64 = 4 * 65_536;
+        let mut memory = GuestAddressSpace::new(4 * SOURCE_BYTES).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(SOURCE_BYTES).expect("guest backing");
+        let address = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                SOURCE_BYTES,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("pooled mapping")
+            .get();
+        let source = GuestTextureDescriptor {
+            address,
+            width: 256,
+            height: 256,
+            pitch: 256,
+            tile_mode,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let mipped = GuestTextureDescriptor {
+            address,
+            width: 256,
+            height: 128,
+            pitch: 256,
+            tile_mode,
+            pixel_format: MTLPixelFormat::R16Uint,
+            bytes_per_pixel: 2,
+        };
+        let mipped_image = DecodedImageDescriptor {
+            guest: mipped,
+            span: ResourceSpan::for_texture(mipped),
+            destination_select: 0,
+            base_mip_level: 0,
+            mip_level_count: 6,
+            texture_type: 9,
+            layer_count: 1,
+        };
+        let mip_layout = mode64k_2d_mip_chain_layout(mipped, 6).expect("target mip layout");
+        assert!(mip_layout.levels.iter().any(|level| level.in_tail));
+        assert!(mip_layout.levels.iter().any(|level| !level.in_tail));
 
-    let (_sender, receiver) = std::sync::mpsc::channel();
-    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
-    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
-    presenter.per_queue_guest_batches = false;
-    let device = presenter.device.as_ref().expect("Metal device").clone();
-    let queue = presenter
-        .command_queue
-        .as_ref()
-        .expect("Metal command queue")
-        .clone();
-    presenter
-        .ensure_resident_texture(&device, source)
-        .expect("source resident");
-    presenter
-        .ensure_mipmapped_storage_texture(&device, mipped_image)
-        .expect("mip-chain resident");
-    if let Some(batch) = presenter.open_guest_batch.take() {
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+        // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal command queue")
+            .clone();
+        presenter
+            .ensure_resident_texture(&device, source)
+            .expect("source resident");
+        presenter
+            .ensure_mipmapped_storage_texture(&device, mipped_image)
+            .expect("mip-chain resident");
+        if let Some(batch) = presenter.open_guest_batch.take() {
+            batch.command_buffer.commit();
+            batch.command_buffer.wait_until_completed();
+        }
+
+        let mut source_linear = vec![0_u8; 256 * 256 * 4];
+        for (index, byte) in source_linear.iter_mut().enumerate() {
+            *byte = u8::try_from((index * 47 + index / 181) & 0xff).expect("byte pattern");
+        }
+        presenter.resident_guest_textures[&source]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 256, 256),
+                0,
+                source_linear.as_ptr().cast::<std::ffi::c_void>(),
+                256 * 4,
+            );
+        presenter.mark_resident_texture_written(source);
+        assert!(matches!(
+            presenter.resident_guest_textures[&mipped].state,
+            ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+        ));
+
+        let rematerialised = presenter
+            .ensure_mipmapped_storage_texture(&device, mipped_image)
+            .expect("mip chain rematerialises");
+        let batch = presenter
+            .open_guest_batch
+            .take()
+            .expect("mip detile remains in the open batch");
+        assert_eq!(
+            batch.command_buffer.status(),
+            MTLCommandBufferStatus::NotEnqueued
+        );
         batch.command_buffer.commit();
         batch.command_buffer.wait_until_completed();
-    }
 
-    let mut source_linear = vec![0_u8; 256 * 256 * 4];
-    for (index, byte) in source_linear.iter_mut().enumerate() {
-        *byte = u8::try_from((index * 47 + index / 181) & 0xff).expect("byte pattern");
-    }
-    presenter.resident_guest_textures[&source]
-        .texture
-        .replace_region(
-            MTLRegion::new_2d(0, 0, 256, 256),
-            0,
-            source_linear.as_ptr().cast::<std::ffi::c_void>(),
-            256 * 4,
-        );
-    presenter.mark_resident_texture_written(source);
-    assert!(matches!(
-        presenter.resident_guest_textures[&mipped].state,
-        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
-    ));
-
-    let rematerialised = presenter
-        .ensure_mipmapped_storage_texture(&device, mipped_image)
-        .expect("mip chain rematerialises");
-    let batch = presenter
-        .open_guest_batch
-        .take()
-        .expect("mip detile remains in the open batch");
-    assert_eq!(
-        batch.command_buffer.status(),
-        MTLCommandBufferStatus::NotEnqueued
-    );
-    batch.command_buffer.commit();
-    batch.command_buffer.wait_until_completed();
-
-    let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
-    copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
-        .expect("CPU source retile oracle");
-    let (_, expected_levels) =
-        decode_mode27_mip_chain_from_raw(mipped, 6, &source_raw[..mip_layout.byte_count])
-            .expect("CPU mip detile oracle");
-    for (level, expected) in expected_levels.iter().enumerate() {
-        let actual = super::super::readback::read_texture_mip_linear(
-            &device,
-            &queue,
-            &rematerialised,
-            mipped,
-            u32::try_from(level).expect("mip index"),
-        )
-        .expect("mip readback");
-        assert_eq!(&actual, expected, "mip {level} differs from CPU oracle");
+        let mut source_raw = vec![0_u8; usize::try_from(SOURCE_BYTES).unwrap()];
+        copy_linear_to_tiled_at_z(&source_linear, source, &mut source_raw, 0)
+            .expect("CPU source retile oracle");
+        let expected_levels = mip_layout
+            .levels
+            .iter()
+            .copied()
+            .map(|level| {
+                let mut linear = vec![0; level.width * level.height * mip_layout.bytes_per_element];
+                copy_mode64k_2d_mip_level_to_linear(
+                    tile_mode,
+                    &mip_layout,
+                    level,
+                    &source_raw[..mip_layout.byte_count],
+                    &mut linear,
+                )
+                .expect("CPU mip detile oracle");
+                linear
+            })
+            .collect::<Vec<_>>();
+        for (level, expected) in expected_levels.iter().enumerate() {
+            let actual = super::super::readback::read_texture_mip_linear(
+                &device,
+                &queue,
+                &rematerialised,
+                mipped,
+                u32::try_from(level).expect("mip index"),
+            )
+            .expect("mip readback");
+            assert_eq!(&actual, expected, "mip {level} differs from CPU oracle");
+        }
     }
 }
 
@@ -5905,7 +6795,7 @@ fn resident_span_index_answers_exactly_what_the_linear_overlap_scan_does() {
             continue;
         }
         residents.push(descriptor);
-        index.insert(descriptor);
+        index.insert(descriptor, ResourceSpan::for_texture(descriptor));
     }
     assert_eq!(index.len(), residents.len());
 
@@ -5942,6 +6832,34 @@ fn resident_span_index_answers_exactly_what_the_linear_overlap_scan_does() {
 }
 
 #[test]
+fn resident_span_index_keeps_a_mip_allocation_suffix_visible() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x70_6409_0000,
+        width: 512,
+        height: 256,
+        pitch: 512,
+        tile_mode: 9,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let full_span =
+        ResourceSpan::for_mode64k_2d_mip_chain(descriptor, 5).expect("complete resident mip span");
+    let suffix = ResourceSpan::new(descriptor.address + 700_000, 4_096);
+    assert!(
+        !ResourceSpan::for_texture(descriptor)
+            .unwrap()
+            .overlaps(&suffix)
+    );
+
+    let mut index = ResidentSpanIndex::new();
+    index.insert(descriptor, Some(full_span));
+    assert_eq!(
+        index.overlapping(&suffix, SpanQueryOrder::ResidentFirst),
+        vec![descriptor]
+    );
+}
+
+#[test]
 fn resident_span_index_matches_the_linear_scan_after_random_inserts_and_removes() {
     let (_memory, bases, mapping_bytes) = index_test_mappings();
     let mut random = IndexTestRandom::new(0x5eed_0002);
@@ -5958,7 +6876,7 @@ fn resident_span_index_matches_the_linear_scan_after_random_inserts_and_removes(
             index.remove(&candidate);
         } else if !live.contains(&candidate) {
             live.push(candidate);
-            index.insert(candidate);
+            index.insert(candidate, ResourceSpan::for_texture(candidate));
         }
         assert_eq!(
             index.len(),
