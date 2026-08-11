@@ -8,10 +8,11 @@ use super::{
     ProbeDispatchState, PthreadAttrState, SCE_KERNEL_ERROR_NOT_IMPLEMENTED,
     allocate_pthread_thread_object, capture_guest_exception, clone_guest_tls, create_pthread_attr,
     destroy_pthread_attr, dispatch_probe_import, guest_free, pthread_attr_get_affinity,
-    pthread_attr_get_stack, pthread_attr_set_affinity, pthread_attr_set_detach_state,
-    pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u32, read_guest_u64,
-    sce_kernel_error, set_current_guest_thread_pointer, take_exit_callbacks, tls_dtv_entry_offset,
-    write_guest_u32, write_guest_u64, write_import_stub,
+    pthread_attr_get_stack, pthread_attr_get_stack_address, pthread_attr_get_stack_size,
+    pthread_attr_set_affinity, pthread_attr_set_detach_state, pthread_attr_set_schedule_param,
+    pthread_attr_set_stack_size, read_guest_u32, read_guest_u64, sce_kernel_error,
+    set_current_guest_thread_pointer, take_exit_callbacks, tls_dtv_entry_offset, write_guest_u32,
+    write_guest_u64, write_import_stub,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -420,6 +421,38 @@ fn pthread_attributes_preserve_observable_thread_creation_values() {
     assert_eq!(attributes.schedule_priority, priority);
     assert_eq!(stack_address, 0);
     assert_eq!(stack_size, 0x20_0000);
+    stack_address = u64::MAX;
+    stack_size = u64::MAX;
+    assert_eq!(
+        pthread_attr_get_stack_address(
+            [
+                attribute_address,
+                (&raw mut stack_address).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &state,
+        ),
+        0
+    );
+    assert_eq!(stack_address, 0);
+    assert_eq!(
+        pthread_attr_get_stack_size(
+            [
+                attribute_address,
+                (&raw mut stack_size).addr() as u64,
+                0,
+                0,
+                0,
+                0,
+            ],
+            &state,
+        ),
+        0
+    );
+    assert_eq!(stack_size, 0x20_0000);
     assert_eq!(
         pthread_attr_get_affinity(
             [
@@ -432,7 +465,7 @@ fn pthread_attributes_preserve_observable_thread_creation_values() {
             ],
             &state,
         ),
-        0x7f
+        0
     );
     assert_eq!(affinity_mask, 0x7f);
     assert_eq!(destroy_pthread_attr(attribute_address, &mut state), 0);
