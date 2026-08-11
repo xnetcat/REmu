@@ -88,6 +88,43 @@ fn distinguishes_absent_disabled_programmed_and_malformed_color_target_state() {
 }
 
 #[test]
+fn invalid_format_tail_slots_do_not_discard_a_programmed_color_target_prefix() {
+    let address = 0x0070_1234_5600_u64;
+    let mut registers = BTreeMap::from([
+        (crate::AGC_CB_TARGET_MASK, u32::MAX),
+        (crate::AGC_CB_COLOR0_BASE, low_u32(address >> 8)),
+        (crate::AGC_CB_COLOR0_BASE_EXT, low_u32(address >> 40)),
+        (crate::AGC_CB_COLOR0_VIEW, 0),
+        (crate::AGC_CB_COLOR0_INFO, 10 << 2),
+        (crate::AGC_CB_COLOR0_ATTRIB, 0),
+        (
+            crate::AGC_CB_COLOR0_ATTRIB2,
+            ((1_280 - 1) << 14) | (720 - 1),
+        ),
+        (crate::AGC_CB_COLOR0_ATTRIB3, (27 << 14) | (1 << 24)),
+    ]);
+    for slot in 1..crate::AGC_COLOR_TARGET_COUNT {
+        registers.insert(
+            crate::AGC_CB_COLOR0_INFO + slot * crate::AGC_CB_COLOR_REGISTER_STRIDE,
+            0,
+        );
+    }
+
+    let AgcColorTargetState::Programmed(targets) = agc_color_target_state(&registers) else {
+        panic!("invalid-format default slots must not discard the valid MRT prefix");
+    };
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].slot, 0);
+
+    registers.insert(crate::AGC_CB_COLOR0_INFO, 10 << 2);
+    registers.insert(crate::AGC_CB_COLOR0_BASE, 0);
+    assert!(matches!(
+        agc_color_target_state(&registers),
+        AgcColorTargetState::Malformed { slot: 0 }
+    ));
+}
+
+#[test]
 fn explicit_zero_target_mask_does_not_enable_targetless_scanout_fallback() {
     let target = crate::AgcVideoOutTarget {
         address: 0x0070_1234_5600,
