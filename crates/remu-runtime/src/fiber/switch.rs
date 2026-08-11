@@ -119,18 +119,24 @@ pub(super) unsafe extern "C" fn fiber_switch_entry(
         "fldcw [r11 + 0x2c]",
         "2:",
         "mov r10, [r11 + 0x20]",
+        "mov r9, [r11 + 0x30]",
         "mov rdi, [r11 + 0x08]",
         "mov rsi, [r11 + 0x10]",
         "mov rax, [r11 + 0x18]",
         "mov r11, [r11 + 0x00]",
         // Only after the complete handoff record is resident in registers can the old stack be
-        // released. No instruction below this point reads FiberData.
+        // released. No instruction below this point reads FiberData. Guest state is mirrored
+        // first; host IDLE is the authoritative last release that permits registry reclamation.
         "mov rsp, rax",
         "xor ebp, ebp",
         "test r10, r10",
         "jz 3f",
         "mov dword ptr [r10], 2",
         "3:",
+        "test r9, r9",
+        "jz 4f",
+        "mov dword ptr [r9], 1",
+        "4:",
         // A fresh fiber must not observe register contents from whatever ran before it.
         "xor eax, eax",
         "xor ebx, ebx",

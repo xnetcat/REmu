@@ -9,8 +9,9 @@
 //! calls further imports as soon as it starts. They are therefore dispatched on the stateless path.
 //!
 //! The fiber object itself is guest storage: the guest allocates it and passes its address, so its
-//! fields are read and written through the guest accessors rather than held host-side. The only
-//! host-side state is the per-thread record of which fiber is currently running.
+//! ABI fields are read and written through the guest accessors. Resumable host register records
+//! are different: a title may place an SceFiber object inside another fiber's reusable stack, so
+//! they live in a host registry for the complete initialize/finalize generation.
 //!
 //! A fiber does *not* stay on one thread. An observed job system parks a fiber on one worker and
 //! lets whichever worker picks the job up next resume it, so a suspended frame routinely continues
@@ -20,8 +21,10 @@
 
 mod switch;
 
-use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::cell::{Cell, UnsafeCell};
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+use std::sync::{atomic::AtomicBool, atomic::AtomicU32, atomic::AtomicU64, atomic::Ordering};
 
 use crate::{
     current_guest_thread_name, guest_memset, read_guest_cstring, read_guest_u32, read_guest_u64,
@@ -109,16 +112,15 @@ mod offset {
     pub(super) const CONTEXT: u64 = 0x48;
     pub(super) const FLAGS: u64 = 0x50;
     pub(super) const MAGIC_END: u64 = 0x68;
-    /// Host-owned resumable register storage inside the SDK's opaque 256-byte object.
+    /// Non-authoritative guest mirror of the host-owned resumable register storage.
     pub(super) const SAVED_CONTEXT: u64 = 0x70;
 }
 
 /// The register state required to resume a suspended SysV call.
 ///
 /// Only callee-saved registers belong here. Caller-saved registers are allowed to change across
-/// the `fiber_set_jmp` call, and keeping the record compact lets every suspended fiber own stable
-/// storage inside its opaque 256-byte SDK object instead of leaving the record on a stack that a
-/// migrating job system can reuse on another worker.
+/// the `fiber_set_jmp` call. The record lives in the host fiber registry rather than the guest
+/// object or a stack that a migrating job system can reuse on another worker.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct FiberJumpContext {
@@ -145,6 +147,10 @@ pub(crate) struct FiberContext {
     argument_on_run_to: u64,
     argument_on_return: u64,
     entry_returned: u64,
+    /// Stable host-generation pointer for `current_fiber`, carried with the migrating run chain.
+    current_host_fiber: u64,
+    /// Host lifecycle word released with `previous_fiber` after a direct handoff.
+    previous_host_state: u64,
 }
 
 /// The handoff record [`switch::fiber_switch_entry`] consumes when starting a fiber.
@@ -159,6 +165,7 @@ pub(crate) struct FiberData {
     mxcsr: u32,
     floating_point_control: u16,
     _padding: u16,
+    previous_host_state: u64,
 }
 
 const _: () = {
@@ -166,47 +173,269 @@ const _: () = {
     assert!(std::mem::offset_of!(FiberJumpContext, floating_point_control) == 0x44);
     assert!(std::mem::size_of::<FiberJumpContext>() == 0x48);
     assert!(std::mem::offset_of!(FiberContext, current_fiber) == 0x48);
-    assert!(std::mem::size_of::<FiberContext>() == 0x70);
+    assert!(std::mem::size_of::<FiberContext>() == 0x80);
     assert!(offset::SAVED_CONTEXT as usize + std::mem::size_of::<FiberJumpContext>() <= 256);
     assert!(std::mem::offset_of!(FiberData, stack_address) == 0x18);
     assert!(std::mem::offset_of!(FiberData, previous_state) == 0x20);
     assert!(std::mem::offset_of!(FiberData, mxcsr) == 0x28);
     assert!(std::mem::offset_of!(FiberData, floating_point_control) == 0x2c);
+    assert!(std::mem::offset_of!(FiberData, previous_host_state) == 0x30);
+    assert!(std::mem::size_of::<FiberData>() == 0x38);
 };
 
-/// Returns the stable register record owned by `fiber`'s opaque SDK object.
-fn saved_context(fiber: u64) -> *mut FiberJumpContext {
-    (fiber + offset::SAVED_CONTEXT) as *mut FiberJumpContext
+const HOST_FIBER_IDLE: u32 = 1;
+const HOST_FIBER_RUN: u32 = 2;
+const HOST_FIBER_RETIRED: u32 = 3;
+
+/// One stable initialize/finalize generation of a guest fiber.
+///
+/// The registry owns this allocation while the fiber is initialized. A successful claim changes
+/// its host lifecycle to RUN under the registry read lock before exposing its raw pointer, which
+/// excludes initialize/finalize writers until the last pointer use is complete. Guest state is an
+/// ABI mirror and is never trusted to bound this allocation's lifetime.
+struct HostFiberState {
+    generation: u64,
+    entry: u64,
+    argument_on_initialize: u64,
+    stack_start: u64,
+    stack_size: u64,
+    debug_options: u32,
+    lifecycle: AtomicU32,
+    published: AtomicBool,
+    argument_on_run: AtomicU64,
+    jump: UnsafeCell<FiberJumpContext>,
 }
 
-/// The guest-visible publication word for a suspended fiber's host-owned register record.
-fn saved_context_publication(fiber: u64) -> &'static AtomicU64 {
-    // SAFETY: every validated fiber is eight-byte aligned, and CONTEXT is an aligned u64 field in
-    // its live 256-byte object. The object outlives every access while its state is not terminated.
-    unsafe { AtomicU64::from_ptr((fiber + offset::CONTEXT) as *mut u64) }
+impl HostFiberState {
+    fn new(
+        generation: u64,
+        entry: u64,
+        argument_on_initialize: u64,
+        stack_start: u64,
+        stack_size: u64,
+        debug_options: u32,
+    ) -> Self {
+        #[cfg(test)]
+        LIVE_HOST_FIBER_STATES.fetch_add(1, Ordering::Relaxed);
+        Self {
+            generation,
+            entry,
+            argument_on_initialize,
+            stack_start,
+            stack_size,
+            debug_options,
+            lifecycle: AtomicU32::new(HOST_FIBER_IDLE),
+            published: AtomicBool::new(false),
+            argument_on_run: AtomicU64::new(0),
+            jump: UnsafeCell::new(FiberJumpContext::default()),
+        }
+    }
+
+    fn jump(&self) -> *mut FiberJumpContext {
+        self.jump.get()
+    }
+}
+
+#[cfg(test)]
+impl Drop for HostFiberState {
+    fn drop(&mut self) {
+        LIVE_HOST_FIBER_STATES.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: the jump record has one writer while host lifecycle is RUN. Release publication and the
+// next successful host claim transfer it to the sole successful Acquire taker before any read.
+unsafe impl Send for HostFiberState {}
+// SAFETY: the protocol above prevents concurrent jump-record reads/writes; all other fields are
+// immutable or atomic, and registry lifecycle serialization bounds the allocation lifetime.
+unsafe impl Sync for HostFiberState {}
+
+#[derive(Clone, Copy)]
+struct ActiveHostFiber {
+    identity: u64,
+    generation: u64,
+    state: *const HostFiberState,
+}
+
+impl ActiveHostFiber {
+    fn state(&self) -> &HostFiberState {
+        // SAFETY: an ActiveHostFiber exists only after host IDLE -> RUN while holding the registry
+        // read lock. Initialize/finalize require its write lock and cannot remove this allocation
+        // until host lifecycle returns to IDLE, after the last use of this handle.
+        unsafe { &*self.state }
+    }
+
+    fn jump(self) -> *mut FiberJumpContext {
+        self.state().jump()
+    }
+
+    fn stack_bounds(self) -> (u64, u64) {
+        (self.state().stack_start, self.state().stack_size)
+    }
+}
+
+#[derive(Default)]
+struct HostFiberRegistry {
+    next_generation: u64,
+    active: HashMap<u64, Box<HostFiberState>>,
+}
+
+fn host_fiber_registry() -> &'static RwLock<HostFiberRegistry> {
+    static REGISTRY: OnceLock<RwLock<HostFiberRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HostFiberRegistry::default()))
+}
+
+#[cfg(test)]
+static LIVE_HOST_FIBER_STATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+static INITIALIZE_LIFECYCLE_PAUSE: std::sync::Mutex<Option<std::sync::Arc<std::sync::Barrier>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static RUN_AFTER_CLAIM_PAUSE: std::sync::Mutex<Option<(u64, std::sync::Arc<std::sync::Barrier>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn pause_initialize_lifecycle_for_test() {
+    let barrier = INITIALIZE_LIFECYCLE_PAUSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+#[cfg(test)]
+fn pause_run_after_claim_for_test(fiber: u64) {
+    let barrier = RUN_AFTER_CLAIM_PAUSE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(target, _)| *target == fiber)
+        .map(|(_, barrier)| std::sync::Arc::clone(barrier));
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
+
+fn register_host_fiber(
+    registry: &mut HostFiberRegistry,
+    fiber: u64,
+    entry: u64,
+    argument_on_initialize: u64,
+    stack_start: u64,
+    stack_size: u64,
+    debug_options: u32,
+) {
+    if let Some(previous) = registry.active.remove(&fiber) {
+        assert_eq!(previous.lifecycle.load(Ordering::Acquire), HOST_FIBER_IDLE);
+        previous
+            .lifecycle
+            .store(HOST_FIBER_RETIRED, Ordering::Release);
+    }
+    registry.next_generation = registry
+        .next_generation
+        .checked_add(1)
+        .expect("fiber generation counter exhausted");
+    let generation = registry.next_generation;
+    let state = Box::new(HostFiberState::new(
+        generation,
+        entry,
+        argument_on_initialize,
+        stack_start,
+        stack_size,
+        debug_options,
+    ));
+    registry.active.insert(fiber, state);
+}
+
+fn retire_host_fiber(registry: &mut HostFiberRegistry, fiber: u64) {
+    if let Some(handle) = registry.active.remove(&fiber) {
+        assert_eq!(handle.lifecycle.load(Ordering::Acquire), HOST_FIBER_IDLE);
+        handle
+            .lifecycle
+            .store(HOST_FIBER_RETIRED, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+fn active_host_fiber(fiber: u64) -> Option<ActiveHostFiber> {
+    let registry = host_fiber_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = registry.active.get(&fiber)?;
+    if state.lifecycle.load(Ordering::Acquire) == HOST_FIBER_RETIRED {
+        return None;
+    }
+    Some(ActiveHostFiber {
+        identity: fiber,
+        generation: state.generation,
+        state: std::ptr::from_ref(state.as_ref()),
+    })
+}
+
+#[cfg(test)]
+fn saved_context(fiber: u64) -> *mut FiberJumpContext {
+    active_host_fiber(fiber)
+        .expect("a live fiber must have a host generation")
+        .jump()
+}
+
+/// Publishes a completed host record and mirrors it into the opaque guest ABI fields.
+fn publish_saved_context(fiber: ActiveHostFiber, saved: *mut FiberJumpContext) {
+    assert_eq!(
+        fiber.state().lifecycle.load(Ordering::Acquire),
+        HOST_FIBER_RUN
+    );
+    assert_eq!(fiber.state().generation, fiber.generation);
+    assert_eq!(fiber.jump(), saved);
+    // SAFETY: the fiber is RUN, so it exclusively owns both its host record and opaque guest ABI
+    // mirror. The latter is diagnostic compatibility only and is never used as a jump source.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            saved,
+            (fiber.identity + offset::SAVED_CONTEXT) as *mut FiberJumpContext,
+            1,
+        );
+    }
+    write_guest_u64(
+        fiber.identity + offset::CONTEXT,
+        fiber.identity + offset::SAVED_CONTEXT,
+    );
+    fiber.state().published.store(true, Ordering::Release);
 }
 
 /// Validates and atomically takes the opaque resume record before handing it to naked assembly.
 ///
-/// A copied or overwritten fiber object must fail as an SDK error, not turn an arbitrary guest
-/// pointer into the host stack pointer. The saved call frame itself must remain inside the fiber's
-/// declared context allocation. Taking the publication here also closes the validation/use gap:
-/// the transfer must jump through this exact validated pointer, never a second guest-memory read.
+/// Guest object storage is never consulted for the resume pointer or saved registers. Taking the
+/// host publication closes the validation/use gap: the transfer jumps through the exact stable
+/// generation record this function checked, even if the guest identity is later reinitialized.
+#[cfg(test)]
 fn take_saved_context(fiber: u64) -> Result<Option<*mut FiberJumpContext>, u64> {
-    let publication = saved_context_publication(fiber);
-    let published = publication.load(Ordering::Acquire);
-    if published == 0 {
+    let fiber = active_host_fiber(fiber).ok_or_else(|| fiber_error(SCE_FIBER_ERROR_INVALID))?;
+    take_saved_context_from(fiber)
+}
+
+fn take_saved_context_from(fiber: ActiveHostFiber) -> Result<Option<*mut FiberJumpContext>, u64> {
+    if fiber
+        .state()
+        .published
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
         return Ok(None);
     }
-    let expected = saved_context(fiber);
-    if published != expected as u64 {
-        return Err(fiber_error(SCE_FIBER_ERROR_INVALID));
-    }
-    // SAFETY: `expected` lies within the validated, live 256-byte fiber object.
+    let expected = fiber.jump();
+    // SAFETY: successful publication transfers the fully written record to this sole taker.
     let (rsp, return_address) = unsafe { ((*expected).rsp, (*expected).return_address) };
-    let stack_start = read_guest_u64(fiber + offset::ADDR_CONTEXT);
-    let stack_size = read_guest_u64(fiber + offset::SIZE_CONTEXT);
+    let (stack_start, stack_size) = fiber.stack_bounds();
     let Some(stack_end) = stack_start.checked_add(stack_size) else {
+        fiber.state().published.store(true, Ordering::Release);
         return Err(fiber_error(SCE_FIBER_ERROR_INVALID));
     };
     if return_address == 0
@@ -214,12 +443,11 @@ fn take_saved_context(fiber: u64) -> Result<Option<*mut FiberJumpContext>, u64> 
         || rsp < stack_start
         || rsp.checked_add(8).is_none_or(|end| end > stack_end)
     {
+        fiber.state().published.store(true, Ordering::Release);
         return Err(fiber_error(SCE_FIBER_ERROR_INVALID));
     }
-    publication
-        .compare_exchange(published, 0, Ordering::AcqRel, Ordering::Acquire)
-        .map(|_| Some(expected))
-        .map_err(|_| fiber_error(SCE_FIBER_ERROR_STATE))
+    write_guest_u64(fiber.identity + offset::CONTEXT, 0);
+    Ok(Some(expected))
 }
 
 thread_local! {
@@ -256,6 +484,37 @@ fn current_fiber_identity() -> u64 {
     }
 }
 
+/// Returns the stable generation carried by the live run chain without another registry lookup.
+///
+/// # Safety
+///
+/// `context` must be the non-null live context for the currently running fiber.
+unsafe fn running_host_fiber(context: *mut FiberContext) -> ActiveHostFiber {
+    // SAFETY: guaranteed by the caller; its current fiber remains RUN for every pointer use here.
+    let (identity, state) = unsafe {
+        (
+            (*context).current_fiber,
+            (*context).current_host_fiber as *const HostFiberState,
+        )
+    };
+    assert_ne!(
+        identity, 0,
+        "a running chain must identify its current fiber"
+    );
+    assert!(
+        !state.is_null(),
+        "a running chain must carry its host generation"
+    );
+    // SAFETY: the current fiber is RUN, excluding the registry writers that can remove it.
+    let state = unsafe { &*state };
+    assert_eq!(state.lifecycle.load(Ordering::Acquire), HOST_FIBER_RUN);
+    ActiveHostFiber {
+        identity,
+        generation: state.generation,
+        state: std::ptr::from_ref(state),
+    }
+}
+
 /// Publishes this thread's current fiber context. Never inlined, for the reason above.
 #[inline(never)]
 fn set_fiber_context(context: *mut FiberContext) {
@@ -289,40 +548,130 @@ fn validate_fiber(fiber: u64) -> Result<(), u64> {
     Ok(())
 }
 
-/// Claims a fiber for execution, which only an idle fiber permits.
-fn claim_idle(fiber: u64) -> Result<(), u64> {
-    fiber_state(fiber)
+fn validate_fiber_lifecycle(fiber: u64) -> Result<(), u64> {
+    let _registry = host_fiber_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    validate_fiber(fiber)
+}
+
+/// Resolves one stable host generation and claims its guest fiber for execution.
+///
+/// The registry lookup is intentionally paid once per target transition. All subsequent saved
+/// record, stack-bound, and publication operations use this handle without taking the global map.
+fn claim_idle(fiber: u64) -> Result<ActiveHostFiber, u64> {
+    let registry = host_fiber_registry()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    validate_fiber(fiber)?;
+    if fiber_state(fiber).load(Ordering::Acquire) != FIBER_STATE_IDLE {
+        return Err(fiber_error(SCE_FIBER_ERROR_STATE));
+    }
+    let state = registry
+        .active
+        .get(&fiber)
+        .ok_or_else(|| fiber_error(SCE_FIBER_ERROR_INVALID))?;
+    if state.lifecycle.load(Ordering::Acquire) != HOST_FIBER_IDLE {
+        return Err(fiber_error(SCE_FIBER_ERROR_STATE));
+    }
+    // Holding the read lock through the state claim prevents initialize/finalize from replacing
+    // or removing the allocation before RUN makes it ineligible for either operation.
+    let host = ActiveHostFiber {
+        identity: fiber,
+        generation: state.generation,
+        state: std::ptr::from_ref(state.as_ref()),
+    };
+    if host.state().stack_start == 0 {
+        return Err(fiber_error(SCE_FIBER_ERROR_INVALID));
+    }
+    state
+        .lifecycle
+        .compare_exchange(
+            HOST_FIBER_IDLE,
+            HOST_FIBER_RUN,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .map_err(|_| fiber_error(SCE_FIBER_ERROR_STATE))?;
+    if fiber_state(fiber)
         .compare_exchange(
             FIBER_STATE_IDLE,
             FIBER_STATE_RUN,
             Ordering::AcqRel,
             Ordering::Acquire,
         )
-        .map(|_| ())
-        .map_err(|_| fiber_error(SCE_FIBER_ERROR_STATE))
+        .is_err()
+    {
+        state.lifecycle.store(HOST_FIBER_IDLE, Ordering::Release);
+        return Err(fiber_error(SCE_FIBER_ERROR_STATE));
+    }
+    Ok(host)
+}
+
+/// Releases one claimed generation after its final pointer use.
+fn release_claimed_fiber(fiber: ActiveHostFiber) {
+    fiber_state(fiber.identity).store(FIBER_STATE_IDLE, Ordering::Release);
+    fiber
+        .state()
+        .lifecycle
+        .compare_exchange(
+            HOST_FIBER_RUN,
+            HOST_FIBER_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("a released fiber must own the host RUN generation");
+}
+
+fn host_lifecycle_address(fiber: ActiveHostFiber) -> u64 {
+    std::ptr::from_ref(&fiber.state().lifecycle).addr() as u64
+}
+
+/// Releases a host lifecycle pointer captured while its generation was RUN.
+///
+/// # Safety
+///
+/// `lifecycle` must name the live lifecycle word of the RUN generation being handed off. No code
+/// may access its HostFiberState after this call because a registry writer may immediately drop it.
+unsafe fn release_host_lifecycle(lifecycle: u64) {
+    assert_ne!(lifecycle, 0);
+    // SAFETY: guaranteed by the caller; AtomicU32 has natural four-byte alignment.
+    let lifecycle = unsafe { AtomicU32::from_ptr(lifecycle as *mut u32) };
+    lifecycle
+        .compare_exchange(
+            HOST_FIBER_RUN,
+            HOST_FIBER_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .expect("a handed-off fiber must own the host RUN generation");
 }
 
 /// Reports whether a running fiber has written past the low end of its stack.
-fn stack_intact(fiber: u64) -> bool {
-    if read_guest_u32(fiber + offset::FLAGS) & SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE
-        == 0
-    {
+fn host_stack_intact(fiber: ActiveHostFiber) -> bool {
+    if fiber.state().debug_options & SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE == 0 {
         return true;
     }
-    let address = read_guest_u64(fiber + offset::ADDR_CONTEXT);
+    let (address, _) = fiber.stack_bounds();
     address == 0 || read_guest_u64(address) == FIBER_STACK_GUARD
+}
+
+#[cfg(test)]
+fn stack_intact(fiber: u64) -> bool {
+    active_host_fiber(fiber).is_some_and(host_stack_intact)
 }
 
 /// Builds the handoff record that starts `fiber` on `stack_top`.
 fn entry_data(
-    fiber: u64,
+    fiber: ActiveHostFiber,
     argument_on_run_to: u64,
     stack_top: u64,
     previous_state: u64,
+    previous_host_state: u64,
 ) -> FiberData {
     FiberData {
-        entry: read_guest_u64(fiber + offset::ENTRY),
-        argument_on_initialize: read_guest_u64(fiber + offset::ARG_ON_INITIALIZE),
+        entry: fiber.state().entry,
+        argument_on_initialize: fiber.state().argument_on_initialize,
         argument_on_run_to,
         stack_address: stack_top,
         previous_state,
@@ -331,6 +680,7 @@ fn entry_data(
         mxcsr: 0x9fc0,
         floating_point_control: 0x037f,
         _padding: 0,
+        previous_host_state,
     }
 }
 
@@ -340,28 +690,27 @@ fn entry_data(
 ///
 /// `context` must be the live thread context, and `fiber` a validated fiber claimed for running.
 unsafe fn switch_to_fiber(
-    fiber: u64,
+    fiber: ActiveHostFiber,
     argument_on_run_to: u64,
     context: *mut FiberContext,
     saved: Option<*mut FiberJumpContext>,
 ) -> ! {
+    let (stack_start, stack_size) = fiber.stack_bounds();
     if trace_fiber() {
-        let jump = saved_context(fiber);
-        let (saved_rsp, saved_return) = if saved.is_none() {
-            (0, 0)
-        } else {
+        let (saved_rsp, saved_return) = saved.map_or((0, 0), |jump| {
             // SAFETY: validation and the state claim precede every call to this function.
             unsafe { ((*jump).rsp, (*jump).return_address) }
-        };
+        });
         // SAFETY: the caller supplies the live thread context for the complete transfer.
         let previous = unsafe { (*context).previous_fiber };
         eprintln!(
-            "[REMu][FIBER] transfer from={previous:#x} to={fiber:#x} mode={} entry={:#x} arg_init={:#x} arg_run={argument_on_run_to:#x} stack={:#x} size={:#x} saved_context={:#x} saved_rsp={saved_rsp:#x} saved_return={saved_return:#x} host={:?} thread={:?}",
+            "[REMu][FIBER] transfer from={previous:#x} to={:#x} mode={} entry={:#x} arg_init={:#x} arg_run={argument_on_run_to:#x} stack={:#x} size={:#x} saved_context={:#x} saved_rsp={saved_rsp:#x} saved_return={saved_return:#x} host={:?} thread={:?}",
+            fiber.identity,
             if saved.is_none() { "fresh" } else { "resume" },
-            read_guest_u64(fiber + offset::ENTRY),
-            read_guest_u64(fiber + offset::ARG_ON_INITIALIZE),
-            read_guest_u64(fiber + offset::ADDR_CONTEXT),
-            read_guest_u64(fiber + offset::SIZE_CONTEXT),
+            fiber.state().entry,
+            fiber.state().argument_on_initialize,
+            stack_start,
+            stack_size,
             saved.map_or(0, |saved| saved as u64),
             host_thread_id(),
             current_guest_thread_name(),
@@ -375,18 +724,29 @@ unsafe fn switch_to_fiber(
         }
     }
     // SAFETY: `context` is live for the duration of the switch.
-    let previous_state = unsafe {
+    let (previous_state, previous_host_state) = unsafe {
         let previous = (*context).previous_fiber;
+        let previous_host_state = (*context).previous_host_state;
         (*context).previous_fiber = 0;
+        (*context).previous_host_state = 0;
         if previous == 0 {
-            0
+            assert_eq!(previous_host_state, 0);
+            (0, 0)
         } else {
-            previous + offset::STATE
+            assert_ne!(previous_host_state, 0);
+            (previous + offset::STATE, previous_host_state)
         }
     };
-    let stack_top = read_guest_u64(fiber + offset::ADDR_CONTEXT)
-        .wrapping_add(read_guest_u64(fiber + offset::SIZE_CONTEXT));
-    let data = entry_data(fiber, argument_on_run_to, stack_top, previous_state);
+    let stack_top = stack_start
+        .checked_add(stack_size)
+        .expect("fiber stack bounds were validated at initialization");
+    let data = entry_data(
+        fiber,
+        argument_on_run_to,
+        stack_top,
+        previous_state,
+        previous_host_state,
+    );
     // SAFETY: the stack top is sixteen-byte aligned by the size and address checks applied when
     // the context was attached, and the entry never returns.
     unsafe { switch::fiber_switch_entry(&raw const data, 1) }
@@ -449,6 +809,9 @@ fn initialize(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
     if size & 15 != 0 || (address == 0) != (size == 0) {
         return fiber_error(SCE_FIBER_ERROR_INVALID);
     }
+    if address.checked_add(size).is_none() {
+        return fiber_error(SCE_FIBER_ERROR_INVALID);
+    }
     if opt_param != 0 && read_guest_u32(opt_param) != FIBER_OPT_PARAM_MAGIC {
         return fiber_error(SCE_FIBER_ERROR_INVALID);
     }
@@ -461,6 +824,16 @@ fn initialize(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
         return fiber_error(SCE_FIBER_ERROR_INVALID);
     }
 
+    let mut registry = host_fiber_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(active) = registry.active.get(&fiber)
+        && active.lifecycle.load(Ordering::Acquire) != HOST_FIBER_IDLE
+    {
+        return fiber_error(SCE_FIBER_ERROR_STATE);
+    }
+    #[cfg(test)]
+    pause_initialize_lifecycle_for_test();
     write_guest_u64(fiber + offset::ENTRY, entry);
     write_guest_u64(fiber + offset::ARG_ON_INITIALIZE, argument_on_initialize);
     write_guest_u64(fiber + offset::ADDR_CONTEXT, address);
@@ -478,6 +851,15 @@ fn initialize(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
     }
     write_guest_u32(fiber + offset::MAGIC_START, FIBER_MAGIC_START);
     write_guest_u32(fiber + offset::MAGIC_END, FIBER_MAGIC_END);
+    register_host_fiber(
+        &mut registry,
+        fiber,
+        entry,
+        argument_on_initialize,
+        address,
+        size,
+        debug_options,
+    );
     // The state guard is published last so a fiber is never claimable before it is fully described.
     fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
     0
@@ -496,6 +878,16 @@ fn write_fiber_name(fiber: u64, name: u64) {
 
 /// `sceFiberFinalize(fiber)`.
 fn finalize(fiber: u64) -> u64 {
+    let mut registry = host_fiber_registry()
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if registry
+        .active
+        .get(&fiber)
+        .is_some_and(|active| active.lifecycle.load(Ordering::Acquire) != HOST_FIBER_IDLE)
+    {
+        return fiber_error(SCE_FIBER_ERROR_STATE);
+    }
     if let Err(error) = validate_fiber(fiber) {
         return error;
     }
@@ -505,7 +897,11 @@ fn finalize(fiber: u64) -> u64 {
         Ordering::AcqRel,
         Ordering::Acquire,
     ) {
-        Ok(_) => 0,
+        Ok(_) => {
+            retire_host_fiber(&mut registry, fiber);
+            write_guest_u64(fiber + offset::CONTEXT, 0);
+            0
+        }
         Err(_) => fiber_error(SCE_FIBER_ERROR_STATE),
     }
 }
@@ -517,24 +913,24 @@ fn run(arguments: [u64; 6]) -> u64 {
     let fiber = arguments[0];
     let argument_on_run_to = arguments[1];
     let argument_on_return = arguments[2];
-    if let Err(error) = validate_fiber(fiber) {
-        return error;
-    }
     // A thread already inside a fiber must use `sceFiberSwitch`; nesting `run` would strand the
     // outer frame with no way back.
     if !fiber_context().is_null() {
+        if let Err(error) = validate_fiber_lifecycle(fiber) {
+            return error;
+        }
         return fiber_error(SCE_FIBER_ERROR_PERMISSION);
     }
-    if read_guest_u64(fiber + offset::ADDR_CONTEXT) == 0 {
-        return fiber_error(SCE_FIBER_ERROR_INVALID);
-    }
-    if let Err(error) = claim_idle(fiber) {
-        return error;
-    }
-    let saved = match take_saved_context(fiber) {
+    let fiber_host = match claim_idle(fiber) {
+        Ok(host) => host,
+        Err(error) => return error,
+    };
+    #[cfg(test)]
+    pause_run_after_claim_for_test(fiber);
+    let saved = match take_saved_context_from(fiber_host) {
         Ok(saved) => saved,
         Err(error) => {
-            fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
+            release_claimed_fiber(fiber_host);
             return error;
         }
     };
@@ -546,6 +942,7 @@ fn run(arguments: [u64; 6]) -> u64 {
     // of every guest/native stack it may traverse.
     let context = Box::into_raw(Box::new(FiberContext {
         current_fiber: fiber,
+        current_host_fiber: fiber_host.state.addr() as u64,
         ..FiberContext::default()
     }));
     set_fiber_context(context);
@@ -554,7 +951,7 @@ fn run(arguments: [u64; 6]) -> u64 {
     let resumed = unsafe { switch::fiber_set_jmp(&raw mut (*context).jump) };
     if resumed == 0 {
         // SAFETY: the fiber is claimed and its context validated above.
-        unsafe { switch_to_fiber(fiber, argument_on_run_to, context, saved) }
+        unsafe { switch_to_fiber(fiber_host, argument_on_run_to, context, saved) }
     }
 
     // SAFETY: reached only by a long jump back into this frame.
@@ -563,17 +960,30 @@ fn run(arguments: [u64; 6]) -> u64 {
         !context.is_null(),
         "a resumed fiber run chain must retain its stable thread context"
     );
-    let (current, returned, argument) = unsafe {
+    let (current, current_host_fiber, returned, argument) = unsafe {
         let current = (*context).current_fiber;
+        let current_host_fiber = (*context).current_host_fiber;
         (*context).current_fiber = 0;
+        (*context).current_host_fiber = 0;
         (
             current,
+            current_host_fiber,
             (*context).entry_returned,
             (*context).argument_on_return,
         )
     };
     if current != 0 {
+        assert_ne!(current_host_fiber, 0);
+        // SAFETY: the current generation remains host-RUN until this final release.
+        let lifecycle = unsafe {
+            std::ptr::from_ref(&(*(current_host_fiber as *const HostFiberState)).lifecycle).addr()
+                as u64
+        };
         fiber_state(current).store(FIBER_STATE_IDLE, Ordering::Release);
+        // SAFETY: no HostFiberState access occurs after releasing its last ownership word.
+        unsafe { release_host_lifecycle(lifecycle) };
+    } else {
+        assert_eq!(current_host_fiber, 0);
     }
     set_fiber_context(std::ptr::null_mut());
     // SAFETY: this run invocation created the allocation and has cleared the only published TLS
@@ -594,46 +1004,58 @@ fn switch_fiber(arguments: [u64; 6]) -> u64 {
     let fiber = arguments[0];
     let argument_on_run_to = arguments[1];
     let argument_on_run = arguments[2];
-    if let Err(error) = validate_fiber(fiber) {
-        return error;
-    }
     let thread_context = fiber_context();
     if thread_context.is_null() {
+        if let Err(error) = validate_fiber_lifecycle(fiber) {
+            return error;
+        }
         return fiber_error(SCE_FIBER_ERROR_PERMISSION);
     }
-    if read_guest_u64(fiber + offset::ADDR_CONTEXT) == 0 {
-        return fiber_error(SCE_FIBER_ERROR_INVALID);
-    }
-    if let Err(error) = claim_idle(fiber) {
-        return error;
-    }
-    let saved_target = match take_saved_context(fiber) {
+    let target_host = match claim_idle(fiber) {
+        Ok(host) => host,
+        Err(error) => return error,
+    };
+    let saved_target = match take_saved_context_from(target_host) {
         Ok(saved) => saved,
         Err(error) => {
-            fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
+            release_claimed_fiber(target_host);
             return error;
         }
     };
 
     // SAFETY: the thread context frame is suspended below this one.
     let current = unsafe { (*thread_context).current_fiber };
-    let saved = saved_context(current);
-    // SAFETY: the opaque fiber object stays live while suspended and owns this register record.
+    // SAFETY: `thread_context` is the non-null live run chain and identifies `current`.
+    let current_host = unsafe { running_host_fiber(thread_context) };
+    assert_eq!(current_host.identity, current);
+    let saved = current_host.jump();
+    current_host
+        .state()
+        .argument_on_run
+        .store(argument_on_run, Ordering::Release);
+    // SAFETY: this fiber generation owns the stable host record while its guest state is RUN.
     let resumed = unsafe { switch::fiber_set_jmp(saved) };
     if resumed == 0 {
         assert!(
-            stack_intact(current),
+            host_stack_intact(current_host),
             "a fiber overflowed its context before switching away"
         );
-        saved_context_publication(current).store(saved as u64, Ordering::Release);
+        publish_saved_context(current_host, saved);
         // SAFETY: both fibers are validated and the target is claimed.
         unsafe {
             (*thread_context).previous_fiber = current;
+            (*thread_context).previous_host_state = host_lifecycle_address(current_host);
             (*thread_context).current_fiber = fiber;
-            switch_to_fiber(fiber, argument_on_run_to, thread_context, saved_target)
+            (*thread_context).current_host_fiber = target_host.state.addr() as u64;
+            switch_to_fiber(
+                target_host,
+                argument_on_run_to,
+                thread_context,
+                saved_target,
+            )
         }
     }
-    resume_here(argument_on_run)
+    resume_here()
 }
 
 /// `sceFiberReturnToThread(argOnReturn, argOnRun)`.
@@ -646,15 +1068,22 @@ fn return_to_thread(arguments: [u64; 6]) -> u64 {
     }
     // SAFETY: the thread context frame is suspended below this one.
     let current = unsafe { (*thread_context).current_fiber };
-    let saved = saved_context(current);
-    // SAFETY: the opaque fiber object stays live while suspended and owns this register record.
+    // SAFETY: `thread_context` is the non-null live run chain and identifies `current`.
+    let current_host = unsafe { running_host_fiber(thread_context) };
+    assert_eq!(current_host.identity, current);
+    let saved = current_host.jump();
+    current_host
+        .state()
+        .argument_on_run
+        .store(argument_on_run, Ordering::Release);
+    // SAFETY: this fiber generation owns the stable host record while its guest state is RUN.
     let resumed = unsafe { switch::fiber_set_jmp(saved) };
     if resumed == 0 {
         assert!(
-            stack_intact(current),
+            host_stack_intact(current_host),
             "a fiber overflowed its context before returning to its thread"
         );
-        saved_context_publication(current).store(saved as u64, Ordering::Release);
+        publish_saved_context(current_host, saved);
         // SAFETY: the thread context frame is live and suspended.
         unsafe {
             (*thread_context).argument_on_return = argument_on_return;
@@ -664,7 +1093,7 @@ fn return_to_thread(arguments: [u64; 6]) -> u64 {
             )
         }
     }
-    resume_here(argument_on_run)
+    resume_here()
 }
 
 /// Shared tail for the two entry points a fiber can be resumed through.
@@ -673,7 +1102,7 @@ fn return_to_thread(arguments: [u64; 6]) -> u64 {
 /// suspended the frame, so the thread context has to be resolved fresh rather than reusing
 /// anything the suspending frame had already computed.
 #[inline(never)]
-fn resume_here(argument_on_run: u64) -> u64 {
+fn resume_here() -> u64 {
     // The thread context is re-read rather than reused: this arrival came through a long jump, and
     // the running fiber may have moved on since the value was last loaded.
     let thread_context = fiber_context();
@@ -681,13 +1110,32 @@ fn resume_here(argument_on_run: u64) -> u64 {
         return fiber_error(SCE_FIBER_ERROR_PERMISSION);
     }
     // SAFETY: the thread context frame is suspended below this one.
-    let (previous, argument) = unsafe {
+    let (previous, previous_host_state, argument) = unsafe {
         let previous = (*thread_context).previous_fiber;
+        let previous_host_state = (*thread_context).previous_host_state;
         (*thread_context).previous_fiber = 0;
-        (previous, (*thread_context).argument_on_run_to)
+        (*thread_context).previous_host_state = 0;
+        (
+            previous,
+            previous_host_state,
+            (*thread_context).argument_on_run_to,
+        )
     };
+    // A Rust local is not safe across the returns-twice assembly boundary: the optimizer may keep
+    // it in a caller-saved register. Resolve the per-fiber output pointer from stable host state.
+    // SAFETY: `thread_context` identifies the RUN fiber that has just resumed.
+    let argument_on_run = unsafe { running_host_fiber(thread_context) }
+        .state()
+        .argument_on_run
+        .load(Ordering::Acquire);
     if previous != 0 {
+        assert_ne!(previous_host_state, 0);
         fiber_state(previous).store(FIBER_STATE_IDLE, Ordering::Release);
+        // SAFETY: the long jump has installed the target stack, and this is the final access to
+        // the outgoing generation whose lifecycle pointer the switch captured.
+        unsafe { release_host_lifecycle(previous_host_state) };
+    } else {
+        assert_eq!(previous_host_state, 0);
     }
     if argument_on_run != 0 {
         write_guest_u64(argument_on_run, argument);
