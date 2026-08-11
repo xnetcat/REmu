@@ -1923,6 +1923,34 @@ fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
         &binding.resource_descriptor
     ));
     assert!(!image_resource_descriptor_is_null(&[]));
+
+    // Prospero image SRDs are null when their 40-bit base address is zero. Default/optional
+    // bindings may retain dimension/type metadata, so requiring all eight words to be zero sends
+    // a null FORMAT_INVALID descriptor into strict Metal format decoding instead of the safe
+    // dimension-compatible fallback.
+    let null_with_metadata = [
+        0x0000_0000,
+        0x1234_5600,
+        0x021b_c3bf,
+        0x91b0_03ac,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+    ];
+    assert!(image_resource_descriptor_is_null(&null_with_metadata));
+
+    let nonnull_format_invalid = [
+        0x804b_9100,
+        0x1234_5600,
+        0x021b_c3bf,
+        0x01b0_03ac,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+        0x0000_0000,
+    ];
+    assert!(!image_resource_descriptor_is_null(&nonnull_format_invalid));
     assert!(decode_image_descriptor(&binding.resource_descriptor).is_err());
     let fallback = fallback_image_descriptor(&binding).expect("fallback descriptor");
     assert_eq!(fallback.guest.address, 0);

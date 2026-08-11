@@ -9,7 +9,7 @@ use crate::{
     BufferMemoryControl, GlobalMemoryBinding, GlobalMemoryControl, GuestMemoryReader, ImageBinding,
     ImageControl, Instruction, InstructionControl, Opcode, Operand, OperandKind,
     ScalarMemoryControl, ShaderState, VertexInputBinding, decode_inline_constant,
-    decode_unified_format,
+    decode_unified_format, image_resource_descriptor_is_null,
 };
 
 use super::scalar_alu::{copy_registers, evaluate_operand, read_scalar_pair};
@@ -813,8 +813,8 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             .position(|existing| existing.pc == instruction.pc)
         {
             let existing = &self.image_bindings[index];
-            let existing_null = existing.resource_descriptor.iter().all(|word| *word == 0);
-            let candidate_null = binding.resource_descriptor.iter().all(|word| *word == 0);
+            let existing_null = image_resource_descriptor_is_null(&existing.resource_descriptor);
+            let candidate_null = image_resource_descriptor_is_null(&binding.resource_descriptor);
             if existing_null && !candidate_null {
                 self.image_bindings[index] = binding;
             } else if !candidate_null

@@ -145,7 +145,7 @@ pub(crate) fn is_storage_image_opcode(opcode: remu_shader::Opcode) -> bool {
 }
 
 pub(crate) fn image_resource_descriptor_is_null(words: &[u32]) -> bool {
-    !words.is_empty() && words.iter().all(|word| *word == 0)
+    remu_shader::image_resource_descriptor_is_null(words)
 }
 
 pub(crate) fn validate_compute_launch_for_metal(
