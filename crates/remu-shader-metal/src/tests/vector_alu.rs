@@ -405,6 +405,12 @@ fn lowers_observed_rdna2_half_float_arithmetic() {
             MetalShaderStage::Pixel,
         );
         assert!(shader.source.contains(conversion));
+        assert!(
+            shader
+                .source
+                .contains("inline uint remu_f16_to_f32_bits(uint half_bits)"),
+            "ordinary {name} must include the FP16 helper prelude its generated body calls"
+        );
     }
 }
 
