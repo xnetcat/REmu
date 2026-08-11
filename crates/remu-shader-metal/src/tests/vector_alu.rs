@@ -157,11 +157,7 @@ fn lowers_vector_bitfield_mask_from_width_and_offset() {
             encoding: ShaderEncoding::Vop3,
             opcode: Opcode::Known("VBfmB32"),
             words: vec![0, 0],
-            sources: vec![
-                Operand::vector(5),
-                Operand::vector(6),
-                Operand::vector(7),
-            ],
+            sources: vec![Operand::vector(5), Operand::vector(6), Operand::vector(7)],
             destinations: vec![Operand::vector(8)],
             control: None,
         },
