@@ -669,6 +669,33 @@ fn ajm_lifecycle_registers_codec_and_instances() {
 }
 
 #[test]
+fn sdk10_acm_exports_are_owned_by_the_pre_lock_engine() {
+    for (nid, name) in [
+        ("ZIXln2K3XMk", "sceAcmContextCreate"),
+        ("jBgBjAj02R8", "sceAcmContextDestroy"),
+        ("tW9W+CAG4FE", "sceAcmBatchStartBuffer"),
+        ("8fe55ktlNVo", "sceAcmBatchStartBuffers"),
+        ("RLN3gRlXJLE", "sceAcmBatchWait"),
+        ("r7z5YQFZo+U", "sceAcmBatchJobNotification"),
+        ("KovqaFbmtsM", "sceAcm_FFT"),
+        ("DR-ZCmvVR9Q", "sceAcm_IFFT"),
+        ("LA4RCNKnFjg", "sceAcm_Panner"),
+        ("u70oWo92SYQ", "sceAcm_ConvReverb_SharedInput"),
+        ("9nLbWmRDpa8", "sceAcm_ConvReverb_SharedIr"),
+        ("wM41Cc+ieog", "sceAcm_ConvReverb_SharedInput_2"),
+        ("PVx9oQUaDdk", "sceAcm_ConvReverb_SharedIr_2"),
+    ] {
+        assert!(crate::acm_engine::owns_nid(nid), "missing ACM route {nid}");
+        assert!(
+            crate::dispatch_stateless_import(nid, [0; 6], [0; 6]).is_some(),
+            "ACM route {nid} must run before the process dispatch lock"
+        );
+        assert_eq!(crate::known_nid_name(nid), Some(name));
+    }
+    assert!(!crate::acm_engine::owns_nid("not-an-acm-nid"));
+}
+
+#[test]
 fn json_initializer_tracks_allocator_and_file_buffer_configuration() {
     let mut state = ProbeDispatchState::default();
     let mut initializer = [0_u8; 8];
@@ -794,30 +821,36 @@ fn offline_np_service_initializers_retain_context_and_property_ownership() {
 #[cfg(target_os = "macos")]
 #[test]
 fn acm_contexts_are_distinct_handles_with_checked_lifetimes() {
-    let mut state = ProbeDispatchState::default();
+    crate::acm_engine::reset_for_new_process();
+    let call = |nid, arguments| {
+        crate::acm_engine::dispatch(nid, arguments, [0; 6]).expect("the ACM engine owns this NID")
+    };
     let mut first = 0_u32;
     let mut second = 0_u32;
     assert_eq!(
-        crate::acm_context_create([(&raw mut first).addr() as u64, 0, 0, 0, 0, 0], &mut state),
+        call(
+            "ZIXln2K3XMk",
+            [(&raw mut first).addr() as u64, 0, 0, 0, 0, 0]
+        ),
         0
     );
     assert_eq!(
-        crate::acm_context_create([(&raw mut second).addr() as u64, 0, 0, 0, 0, 0], &mut state),
+        call(
+            "ZIXln2K3XMk",
+            [(&raw mut second).addr() as u64, 0, 0, 0, 0, 0]
+        ),
         0
     );
     assert_ne!(first, 0);
     assert_ne!(first, second, "each context must be its own handle");
     assert_eq!(
-        crate::acm_context_create([0, 0, 0, 0, 0, 0], &mut state),
-        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT)
+        call("ZIXln2K3XMk", [0, 0, 0, 0, 0, 0]),
+        sce_kernel_error(0x8194_0006)
     );
+    assert_eq!(call("jBgBjAj02R8", [u64::from(first), 0, 0, 0, 0, 0]), 0);
     assert_eq!(
-        crate::acm_context_destroy([u64::from(first), 0, 0, 0, 0, 0], &mut state),
-        0
-    );
-    assert_eq!(
-        crate::acm_context_destroy([u64::from(first), 0, 0, 0, 0, 0], &mut state),
-        sce_kernel_error(crate::SCE_KERNEL_ERROR_INVALID_ARGUMENT),
+        call("jBgBjAj02R8", [u64::from(first), 0, 0, 0, 0, 0]),
+        sce_kernel_error(0x8194_0002),
         "destroying a released context must not report success"
     );
     assert_eq!(
