@@ -152,6 +152,9 @@ fn links_relative_and_import_relocations_into_fixed_memory() {
     write_relocation(&mut bytes[0x210..], 0, 0x4180, 8, 0x1234);
     write_relocation(&mut bytes[0x210..], 1, 0x4188, (1_u64 << 32) | 7, 0);
     bytes[0x240..0x249].copy_from_slice(&[0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0]);
+    // Keep the second live FS site on an authenticated control-flow edge. The bytes between the
+    // two fixtures are padding rather than instructions and must not be relied on as boundaries.
+    bytes[0x249..0x24b].copy_from_slice(&[0xeb, 0x05]);
     bytes[0x250..0x25c]
         .copy_from_slice(&[0x64, 0xc7, 0x04, 0x25, 0x28, 0, 0, 0, 0x0b, 0, 0x02, 0xa0]);
     bytes[0x25c] = 0xc3;
@@ -252,7 +255,11 @@ fn write_elf_header(bytes: &mut [u8]) {
     bytes[4] = 2;
     bytes[5] = 1;
     bytes[0x12..0x14].copy_from_slice(&62_u16.to_le_bytes());
-    bytes[0x18..0x20].copy_from_slice(&0x4000_u64.to_le_bytes());
+    // Seed the synthetic function that owns the live FS load/store sequence. The linker uses
+    // authenticated entry/FDE/relocation targets rather than scanning executable data for byte
+    // patterns; leaving this at the PT_LOAD base would intentionally classify both sites as
+    // unreachable alongside the embedded lookalike at 0x4190.
+    bytes[0x18..0x20].copy_from_slice(&0x4140_u64.to_le_bytes());
     bytes[0x20..0x28].copy_from_slice(&64_u64.to_le_bytes());
     bytes[0x34..0x36].copy_from_slice(&64_u16.to_le_bytes());
     bytes[0x36..0x38].copy_from_slice(&56_u16.to_le_bytes());
