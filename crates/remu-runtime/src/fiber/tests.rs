@@ -136,6 +136,14 @@ fn a_returning_entry_is_caught_by_the_fiber_boundary_instead_of_jumping_to_zero(
         FIBER_STATE_IDLE,
         "the force-quit boundary must release a returning fiber"
     );
+    assert_eq!(
+        active_host_fiber(fiber.address())
+            .expect("returning fiber must retain its quiescent generation")
+            .state()
+            .lifecycle
+            .load(Ordering::Acquire),
+        HOST_FIBER_IDLE
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -169,7 +177,6 @@ fn a_fiber_runs_on_its_own_stack_and_yields_back_with_both_arguments() {
         fiber_state(fiber.address()).load(Ordering::Acquire),
         FIBER_STATE_IDLE
     );
-
     let mut returned = 0_u64;
     assert_eq!(
         run([
@@ -188,12 +195,20 @@ fn a_fiber_runs_on_its_own_stack_and_yields_back_with_both_arguments() {
     assert_eq!(
         read_guest_u64(fiber.address() + offset::CONTEXT),
         fiber.address() + offset::SAVED_CONTEXT,
-        "a suspended register record must live in the opaque fiber object, not on its stack"
+        "the guest ABI mirror must retain its opaque in-object context address"
     );
     // A yielded fiber is idle again and the thread is no longer inside a fiber.
     assert_eq!(
         fiber_state(fiber.address()).load(Ordering::Acquire),
         FIBER_STATE_IDLE
+    );
+    assert_eq!(
+        active_host_fiber(fiber.address())
+            .expect("yielded fiber must retain its host generation")
+            .state()
+            .lifecycle
+            .load(Ordering::Acquire),
+        HOST_FIBER_IDLE
     );
     assert!(fiber_context().is_null());
 
@@ -214,7 +229,7 @@ fn a_fiber_runs_on_its_own_stack_and_yields_back_with_both_arguments() {
 }
 
 #[test]
-fn a_corrupt_resume_pointer_is_rejected_before_restoring_the_host_stack() {
+fn a_corrupt_guest_resume_mirror_cannot_redirect_the_host_context() {
     OBSERVED.lock().unwrap().clear();
     let fiber = FiberObject::default();
     let stack = FiberStack::new();
@@ -225,15 +240,13 @@ fn a_corrupt_resume_pointer_is_rejected_before_restoring_the_host_stack() {
         fiber.address() + offset::SAVED_CONTEXT + 8,
     );
 
-    assert_eq!(
-        run([fiber.address(), 0, 0, 0, 0, 0]),
-        fiber_error(SCE_FIBER_ERROR_INVALID)
-    );
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
     assert_eq!(
         fiber_state(fiber.address()).load(Ordering::Acquire),
         FIBER_STATE_IDLE,
-        "a refused resume must not claim the fiber"
+        "the non-authoritative guest mirror must not redirect the resume"
     );
+    assert_eq!(OBSERVED.lock().unwrap().len(), 1, "entry must not re-run");
 }
 
 #[test]
@@ -247,12 +260,398 @@ fn a_validated_resume_pointer_is_consumed_exactly_once() {
     assert_eq!(
         take_saved_context(fiber.address()).unwrap(),
         Some(saved_context(fiber.address())),
-        "validation must return the exact object-owned context it checked"
+        "validation must return the exact host-generation context it checked"
     );
     assert_eq!(
         take_saved_context(fiber.address()).unwrap(),
         None,
-        "the guest publication cannot be re-read as a second jump target"
+        "the host publication cannot be taken as a second jump target"
+    );
+}
+
+#[test]
+fn a_stack_nested_fiber_uses_a_resume_record_outside_guest_stack_memory() {
+    OBSERVED.lock().unwrap().clear();
+    let containing_stack = SmallFiberStack::new();
+    let fiber = containing_stack.address() + 0x1000;
+    let context_stack = FiberStack::new();
+    let name = c"stack-nested-fiber";
+    assert_eq!(
+        initialize(
+            [
+                fiber,
+                name.as_ptr().addr() as u64,
+                yields_once as *const () as usize as u64,
+                0,
+                context_stack.address(),
+                FiberStack::size(),
+            ],
+            [0; 6],
+        ),
+        0
+    );
+    assert_eq!(run([fiber, 0, 0, 0, 0, 0]), 0);
+
+    let saved = take_saved_context(fiber)
+        .unwrap()
+        .expect("the yielded fiber must publish a resume record")
+        .addr() as u64;
+    let containing_end = containing_stack.address() + SmallFiberStack::size();
+    assert!(
+        !(containing_stack.address()..containing_end).contains(&saved),
+        "a guest stack can be recycled while the nested fiber remains suspended"
+    );
+    assert!(
+        !(fiber..fiber + 256).contains(&saved),
+        "the opaque guest object is not stable host resume storage"
+    );
+}
+
+#[test]
+fn a_taken_resume_record_survives_clearing_the_guest_object_storage() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+
+    let saved = take_saved_context(fiber.address())
+        .unwrap()
+        .expect("the yielded fiber must publish a resume record");
+    guest_memset(
+        fiber.address() + offset::SAVED_CONTEXT,
+        0,
+        std::mem::size_of::<FiberJumpContext>() as u64,
+    );
+    // SAFETY: a taken record must stay owned by the host until the non-returning jump consumes it.
+    let (rsp, return_address) = unsafe { ((*saved).rsp, (*saved).return_address) };
+    assert_ne!(
+        rsp, 0,
+        "guest object reuse must not clear the saved stack pointer"
+    );
+    assert_ne!(
+        return_address, 0,
+        "guest object reuse must not clear the saved return target"
+    );
+}
+
+#[test]
+fn concurrent_resume_takes_have_exactly_one_winner() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let fiber = fiber.address();
+        workers.push(std::thread::spawn(move || {
+            barrier.wait();
+            take_saved_context(fiber)
+                .unwrap()
+                .map_or(0, |saved| saved.addr() as u64)
+        }));
+    }
+    barrier.wait();
+    let mut results = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("resume taker must not panic"))
+        .collect::<Vec<_>>();
+    results.sort_unstable();
+    assert_eq!(results[0], 0, "one racing take must observe consumed state");
+    assert_ne!(results[1], 0, "one racing take must own the resume record");
+}
+
+#[test]
+fn an_invalid_host_resume_record_remains_published_for_diagnosis() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+
+    let saved = saved_context(fiber.address());
+    // SAFETY: the fiber is suspended and this test exclusively owns the fixture.
+    let valid_return = unsafe { std::mem::replace(&mut (*saved).return_address, 0) };
+    assert_eq!(
+        take_saved_context(fiber.address()),
+        Err(fiber_error(SCE_FIBER_ERROR_INVALID))
+    );
+    assert_eq!(
+        take_saved_context(fiber.address()),
+        Err(fiber_error(SCE_FIBER_ERROR_INVALID)),
+        "failed validation must not silently turn a suspended fiber into a fresh entry"
+    );
+    // SAFETY: the invalid record stayed suspended and exclusively owned by this fixture.
+    unsafe { (*saved).return_address = valid_return };
+    assert_eq!(take_saved_context(fiber.address()).unwrap(), Some(saved));
+}
+
+#[test]
+fn reinitializing_one_guest_address_does_not_reuse_a_retired_resume_generation() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let first_stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &first_stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+    let retired = active_host_fiber(fiber.address())
+        .expect("the first generation must stay registered while suspended")
+        .generation;
+    assert_eq!(finalize(fiber.address()), 0);
+
+    let second_stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &second_stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+    let replacement = active_host_fiber(fiber.address())
+        .expect("the replacement generation must stay registered while suspended")
+        .generation;
+    assert_ne!(
+        replacement, retired,
+        "a stale raw pointer must never name a replacement fiber generation"
+    );
+}
+
+#[test]
+fn initialize_serializes_guest_publication_against_a_claim() {
+    let fiber = FiberObject::default();
+    let first_stack = FiberStack::new();
+    let second_stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &first_stack, yields_once, 0), 0);
+
+    let initialize_pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+    *INITIALIZE_LIFECYCLE_PAUSE.lock().unwrap() = Some(std::sync::Arc::clone(&initialize_pause));
+    let fiber_address = fiber.address();
+    let second_stack_address = second_stack.address();
+    let initializer = std::thread::spawn(move || {
+        let name = c"claim-race";
+        initialize(
+            [
+                fiber_address,
+                name.as_ptr().addr() as u64,
+                yields_once as *const () as usize as u64,
+                0,
+                second_stack_address,
+                FiberStack::size(),
+            ],
+            [0; 6],
+        )
+    });
+    initialize_pause.wait();
+
+    let claim_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
+    let worker_started = std::sync::Arc::clone(&claim_started);
+    let claimant = std::thread::spawn(move || {
+        worker_started.wait();
+        claimed_tx
+            .send(claim_idle(fiber_address).map(|host| host.generation))
+            .unwrap();
+    });
+    claim_started.wait();
+    let early_claim = claimed_rx.recv_timeout(std::time::Duration::from_millis(200));
+
+    initialize_pause.wait();
+    *INITIALIZE_LIFECYCLE_PAUSE.lock().unwrap() = None;
+    let initialize_result = initializer.join().expect("initializer must not panic");
+    let claim_completed_while_initialize_was_paused = early_claim.is_ok();
+    let claimed_generation = match early_claim {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => claimed_rx.recv().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("claimant disconnected")
+        }
+    }
+    .expect("the published generation must be claimable");
+    claimant.join().expect("claimant must not panic");
+    let active_generation = active_host_fiber(fiber.address())
+        .expect("a successful initialize must retain an active generation")
+        .generation;
+    let state_after_race = fiber_state(fiber.address()).load(Ordering::Acquire);
+    if state_after_race == FIBER_STATE_RUN {
+        release_claimed_fiber(
+            active_host_fiber(fiber.address())
+                .expect("the claimed generation must remain registered"),
+        );
+    }
+    assert_eq!(finalize(fiber.address()), 0);
+
+    assert_eq!(initialize_result, 0);
+    assert!(
+        !claim_completed_while_initialize_was_paused,
+        "claim must not observe guest fields before their host generation is published"
+    );
+    assert_eq!(claimed_generation, active_generation);
+    assert_eq!(state_after_race, FIBER_STATE_RUN);
+}
+
+#[test]
+fn initialize_serializes_guest_publication_against_finalize() {
+    let fiber = FiberObject::default();
+    let first_stack = FiberStack::new();
+    let second_stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &first_stack, yields_once, 0), 0);
+
+    let initialize_pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+    *INITIALIZE_LIFECYCLE_PAUSE.lock().unwrap() = Some(std::sync::Arc::clone(&initialize_pause));
+    let fiber_address = fiber.address();
+    let second_stack_address = second_stack.address();
+    let initializer = std::thread::spawn(move || {
+        let name = c"finalize-race";
+        initialize(
+            [
+                fiber_address,
+                name.as_ptr().addr() as u64,
+                yields_once as *const () as usize as u64,
+                0,
+                second_stack_address,
+                FiberStack::size(),
+            ],
+            [0; 6],
+        )
+    });
+    initialize_pause.wait();
+
+    let finalize_started = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let (finalized_tx, finalized_rx) = std::sync::mpsc::channel();
+    let worker_started = std::sync::Arc::clone(&finalize_started);
+    let finalizer = std::thread::spawn(move || {
+        worker_started.wait();
+        finalized_tx.send(finalize(fiber_address)).unwrap();
+    });
+    finalize_started.wait();
+    let early_finalize = finalized_rx.recv_timeout(std::time::Duration::from_millis(200));
+
+    initialize_pause.wait();
+    *INITIALIZE_LIFECYCLE_PAUSE.lock().unwrap() = None;
+    let initialize_result = initializer.join().expect("initializer must not panic");
+    let finalize_completed_while_initialize_was_paused = early_finalize.is_ok();
+    let finalize_result = match early_finalize {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => finalized_rx.recv().unwrap(),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("finalizer disconnected")
+        }
+    };
+    finalizer.join().expect("finalizer must not panic");
+    let state_after_race = fiber_state(fiber.address()).load(Ordering::Acquire);
+    let has_active_generation = active_host_fiber(fiber.address()).is_some();
+    if state_after_race == FIBER_STATE_IDLE {
+        assert_eq!(finalize(fiber.address()), 0);
+    }
+
+    assert_eq!(initialize_result, 0);
+    assert_eq!(finalize_result, 0);
+    assert!(
+        !finalize_completed_while_initialize_was_paused,
+        "finalize must not retire a different generation than the guest state it terminates"
+    );
+    assert_eq!(state_after_race, FIBER_STATE_TERMINATED);
+    assert!(!has_active_generation);
+}
+
+#[test]
+fn guest_object_corruption_cannot_retire_a_claimed_host_generation() {
+    let fiber = FiberObject::default();
+    let first_stack = FiberStack::new();
+    let second_stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &first_stack, yields_once, 0), 0);
+    let claimed = claim_idle(fiber.address()).expect("idle fiber must be claimable");
+
+    guest_memset(fiber.address(), 0, 256);
+    let name = c"replacement";
+    let replacement_arguments = [
+        fiber.address(),
+        name.as_ptr().addr() as u64,
+        yields_once as *const () as usize as u64,
+        0,
+        second_stack.address(),
+        FiberStack::size(),
+    ];
+    let replacement_while_claimed = initialize(replacement_arguments, [0; 6]);
+
+    let (preserved_generation, replacement_after_release) =
+        if replacement_while_claimed == fiber_error(SCE_FIBER_ERROR_STATE) {
+            let preserved = active_host_fiber(fiber.address())
+                .is_some_and(|active| active.generation == claimed.generation);
+            release_claimed_fiber(claimed);
+            (preserved, Some(initialize(replacement_arguments, [0; 6])))
+        } else {
+            (false, None)
+        };
+    if fiber_state(fiber.address()).load(Ordering::Acquire) == FIBER_STATE_IDLE {
+        assert_eq!(finalize(fiber.address()), 0);
+    }
+
+    assert_eq!(
+        replacement_while_claimed,
+        fiber_error(SCE_FIBER_ERROR_STATE),
+        "host RUN ownership must survive cleared guest lifecycle bytes"
+    );
+    assert!(preserved_generation);
+    assert_eq!(replacement_after_release, Some(0));
+}
+
+#[test]
+fn a_fresh_claim_uses_its_host_snapshot_after_guest_object_recycling() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0x1357), 0);
+
+    let pause = std::sync::Arc::new(std::sync::Barrier::new(2));
+    *RUN_AFTER_CLAIM_PAUSE.lock().unwrap() = Some((fiber.address(), std::sync::Arc::clone(&pause)));
+    let fiber_address = fiber.address();
+    let runner = std::thread::spawn(move || run([fiber_address, 0x2468, 0, 0, 0, 0]));
+    pause.wait();
+    guest_memset(fiber.address(), 0, 256);
+    pause.wait();
+    *RUN_AFTER_CLAIM_PAUSE.lock().unwrap() = None;
+    let result = runner.join().expect("fresh fiber runner must not panic");
+
+    assert_eq!(result, 0);
+    assert_eq!(OBSERVED.lock().unwrap().as_slice(), &[(0x1357, 0x2468)]);
+    assert_eq!(
+        active_host_fiber(fiber.address())
+            .expect("recycled guest bytes must not retire the host generation")
+            .state()
+            .lifecycle
+            .load(Ordering::Acquire),
+        HOST_FIBER_IDLE
+    );
+    // Restore the guest ABI object before finalizing the fixture. The quiescent old generation
+    // may be replaced because no raw host pointer survives the run.
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(finalize(fiber.address()), 0);
+}
+
+#[test]
+fn repeated_initialize_finalize_keeps_host_generation_storage_bounded() {
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    // Normalize any stale registry entry left by a fixture whose heap address was recycled before
+    // taking the baseline for this exact identity.
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(finalize(fiber.address()), 0);
+    let baseline = LIVE_HOST_FIBER_STATES.load(Ordering::Relaxed);
+    let mut previous_generation = 0;
+
+    for _ in 0..128 {
+        assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+        let generation = active_host_fiber(fiber.address())
+            .expect("initialized fiber must have a host generation")
+            .generation;
+        assert!(generation > previous_generation);
+        previous_generation = generation;
+        assert_eq!(finalize(fiber.address()), 0);
+    }
+
+    assert_eq!(
+        LIVE_HOST_FIBER_STATES.load(Ordering::Relaxed),
+        baseline,
+        "quiescent finalized generations must release their host record"
     );
 }
 
@@ -346,6 +745,16 @@ fn one_fiber_switches_directly_to_another_and_back() {
         fiber_state(second.address()).load(Ordering::Acquire),
         FIBER_STATE_IDLE
     );
+    for fiber in [first.address(), second.address()] {
+        assert_eq!(
+            active_host_fiber(fiber)
+                .expect("handed-off fiber must retain its quiescent generation")
+                .state()
+                .lifecycle
+                .load(Ordering::Acquire),
+            HOST_FIBER_IDLE
+        );
+    }
 }
 
 unsafe extern "C" fn reports_self(_argument_on_initialize: u64, _argument_on_run_to: u64) {
