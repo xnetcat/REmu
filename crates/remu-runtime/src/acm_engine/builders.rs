@@ -39,6 +39,14 @@ impl RecordPayload {
             words: (1..words).map(|word| word as u64).collect(),
         }
     }
+
+    #[cfg(test)]
+    fn tagged_test(tag: u64) -> Self {
+        Self {
+            kind: RecordKind::Test,
+            words: vec![tag],
+        }
+    }
 }
 
 fn record_header(kind: RecordKind, words: u16) -> u64 {
@@ -101,4 +109,9 @@ pub(super) fn append_record(
 #[cfg(test)]
 pub(super) fn append_test_record(info_address: u64, words: usize) -> Result<(), AcmError> {
     append_record(info_address, words, RecordPayload::test(words))
+}
+
+#[cfg(test)]
+pub(super) fn append_tagged_test_record(info_address: u64, tag: u64) -> Result<(), AcmError> {
+    append_record(info_address, 2, RecordPayload::tagged_test(tag))
 }

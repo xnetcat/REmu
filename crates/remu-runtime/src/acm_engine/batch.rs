@@ -20,7 +20,7 @@ pub(super) struct BatchPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Command {
     /// Test-only private no-op record. It follows the same framing rules as DSP records.
-    Barrier,
+    Barrier(u64),
     Statistics(Statistics),
 }
 
@@ -64,7 +64,10 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                     .filter(|end| *end <= words.len())
                     .ok_or(AcmError::MalformedBatch)?;
                 match kind {
-                    RecordKind::Test => plan.commands.push(Command::Barrier),
+                    RecordKind::Test => {
+                        let tag = words.get(cursor + 1).copied().unwrap_or_default();
+                        plan.commands.push(Command::Barrier(tag));
+                    }
                 }
                 cursor = end;
                 continue;
