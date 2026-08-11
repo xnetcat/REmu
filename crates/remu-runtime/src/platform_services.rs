@@ -18,7 +18,8 @@ use crate::{
 };
 
 const SCE_USER_SERVICE_ERROR_INVALID_ARGUMENT: u32 = 0x8096_0005;
-const SCE_USER_SERVICE_ERROR_INVALID_PARAMETER: u32 = 0x8096_0009;
+const SCE_USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED: u32 = 0x8096_0006;
+const SCE_USER_SERVICE_ERROR_NOT_LOGGED_IN: u32 = 0x8096_0009;
 const SCE_VIDEO_OUT_ERROR_INVALID_VALUE: u32 = 0x8029_0001;
 const SCE_VIDEO_OUT_ERROR_INVALID_ADDRESS: u32 = 0x8029_0002;
 const SCE_NET_CTL_ERROR_INVALID_ADDRESS: u32 = 0x8041_2101;
@@ -49,8 +50,8 @@ const PRT_APERTURE_COUNT: usize = 3;
 static PRT_APERTURES: Mutex<[(u64, u64); PRT_APERTURE_COUNT]> =
     Mutex::new([(0, 0); PRT_APERTURE_COUNT]);
 
-/// The only privacy parameter a title may query, and the one this host answers.
-const USER_SERVICE_PRIVACY_PARAMETER: i32 = 1000;
+/// The only local user published by the user-service implementation.
+const USER_SERVICE_INITIAL_USER: i32 = 0x1000_0000;
 
 /// `sceKernelSetPrtAperture(id, base, size)`.
 ///
@@ -87,21 +88,23 @@ pub(crate) fn prt_aperture(aperture: usize) -> Option<(u64, u64)> {
         .copied()
 }
 
-/// `sceUserServiceGetPlatformPrivacySetting(parameter, valueOut)`.
+/// `sceUserServiceGetPlatformPrivacyWs1(userId, valueOut)`.
 ///
-/// One parameter is defined. The reported value is the unrestricted setting, which is what a
-/// single-user host without parental controls or an account service actually is.
-fn user_service_platform_privacy_setting(arguments: [u64; 6]) -> u64 {
-    let parameter = low_i32(arguments[0]);
+/// This private export is not the public `sceUserServiceGetPlatformPrivacySetting`; the two names
+/// hash to different NIDs. The title passes its user ID and reads a four-byte result only after a
+/// successful return. The SDK confirms that shape for adjacent PS5 user getters, but does not
+/// define what Ws1's output values mean, so the host must not enable or disable a guest subsystem
+/// by inventing one.
+fn user_service_platform_privacy_ws1(arguments: [u64; 6]) -> u64 {
+    let user_id = low_i32(arguments[0]);
     let output = arguments[1];
-    if parameter != USER_SERVICE_PRIVACY_PARAMETER {
-        return sce_kernel_error(SCE_USER_SERVICE_ERROR_INVALID_PARAMETER);
+    if user_id != USER_SERVICE_INITIAL_USER {
+        return sce_kernel_error(SCE_USER_SERVICE_ERROR_NOT_LOGGED_IN);
     }
     if output == 0 {
         return sce_kernel_error(SCE_USER_SERVICE_ERROR_INVALID_ARGUMENT);
     }
-    write_guest_u32(output, 0);
-    0
+    sce_kernel_error(SCE_USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED)
 }
 
 /// `sceVideoOutColorSettingsSetGamma(settings, gamma)`.
@@ -215,7 +218,7 @@ fn system_gesture_touch_event_count(arguments: [u64; 6]) -> u64 {
 pub(crate) fn dispatch(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
         "BohYr-F7-is" => kernel_set_prt_aperture(arguments),
-        "D-CzAxQL0XI" => user_service_platform_privacy_setting(arguments),
+        "D-CzAxQL0XI" => user_service_platform_privacy_ws1(arguments),
         // This host models the controller touchpad as present but untouched. SDK recognizer
         // records are still fully initialized and every update/query observes an empty stream.
         "3pcAvmwKCvM" => system_gesture_initialize(arguments[0]),
@@ -300,21 +303,25 @@ mod tests {
     }
 
     #[test]
-    fn platform_privacy_reports_the_unrestricted_setting_for_its_one_parameter() {
+    fn platform_privacy_ws1_uses_a_user_id_and_does_not_guess_the_private_setting() {
         let mut value = 0xffff_ffff_u32;
         let address = (&raw mut value).addr() as u64;
         assert_eq!(
-            user_service_platform_privacy_setting([1000, address, 0, 0, 0, 0]),
-            0
-        );
-        assert_eq!(value, 0);
-        assert_eq!(
-            user_service_platform_privacy_setting([1001, address, 0, 0, 0, 0]),
-            sce_kernel_error(SCE_USER_SERVICE_ERROR_INVALID_PARAMETER),
-            "only the defined parameter is answerable"
+            user_service_platform_privacy_ws1([0x1000_0000, address, 0, 0, 0, 0]),
+            sce_kernel_error(SCE_USER_SERVICE_ERROR_OPERATION_NOT_SUPPORTED),
+            "the private Ws1 output semantics are not documented"
         );
         assert_eq!(
-            user_service_platform_privacy_setting([1000, 0, 0, 0, 0, 0]),
+            value, 0xffff_ffff,
+            "a failed query must not publish a value"
+        );
+        assert_eq!(
+            user_service_platform_privacy_ws1([0x1000_0001, address, 0, 0, 0, 0]),
+            sce_kernel_error(SCE_USER_SERVICE_ERROR_NOT_LOGGED_IN),
+            "an unknown user must not be mistaken for a setting selector"
+        );
+        assert_eq!(
+            user_service_platform_privacy_ws1([0x1000_0000, 0, 0, 0, 0, 0]),
             sce_kernel_error(SCE_USER_SERVICE_ERROR_INVALID_ARGUMENT)
         );
     }
