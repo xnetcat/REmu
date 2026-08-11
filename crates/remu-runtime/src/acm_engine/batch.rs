@@ -3,7 +3,7 @@
 
 //! Immutable ACM batch plans decoded from guest-owned command arenas.
 
-use super::abi::{AcmError, SceAcmBatchInfo, checked_span, read_array};
+use super::abi::{AcmError, GuestPod, SceAcmBatchInfo, checked_span, read_array};
 use super::builders::{RECORD_MAGIC, RECORD_VERSION, RecordKind};
 
 const COMMAND_STATISTICS: u8 = 11;
@@ -20,13 +20,58 @@ pub(super) struct BatchPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Command {
     /// Test-only private no-op record. It follows the same framing rules as DSP records.
-    Barrier(u64),
+    Activate,
+    Barrier {
+        test_tag: Option<u64>,
+    },
+    Transfer(TransferKind),
+    Run,
     Statistics(Statistics),
+    Inline {
+        chained: bool,
+        constant: bool,
+    },
+    Queue,
+    Delay,
+    #[cfg(test)]
+    TestWrite(PendingWrite),
+    #[cfg(test)]
+    TestFault,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TransferKind {
+    ChainInput,
+    ChainInputSplit,
+    ChainOutput,
+    ChainOutputSplit,
+    Input,
+    InputSplit,
+    Output,
+    OutputSplit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Statistics {
     pub(super) address: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct AcmStatistics {
+    pub(super) flags: u32,
+    pub(super) usage_batch: u32,
+    pub(super) usage_intervals: [u32; 3],
+    pub(super) pad: u32,
+}
+
+// SAFETY: the SDK layout is six consecutive `u32` values with no padding.
+unsafe impl GuestPod for AcmStatistics {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PendingWrite {
+    pub(super) address: u64,
+    pub(super) bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +90,7 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
         notification: None,
     };
     let mut saw_statistics = false;
+    let mut chain_active = false;
 
     for (buffer_index, info) in infos.iter().enumerate() {
         let words = read_buffer_words(info)?;
@@ -66,7 +112,9 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                 match kind {
                     RecordKind::Test => {
                         let tag = words.get(cursor + 1).copied().unwrap_or_default();
-                        plan.commands.push(Command::Barrier(tag));
+                        plan.commands.push(Command::Barrier {
+                            test_tag: Some(tag),
+                        });
                     }
                 }
                 cursor = end;
@@ -75,6 +123,41 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
 
             let command = word as u8;
             match command {
+                0 => {
+                    require_empty_fields(word)?;
+                    plan.commands.push(Command::Activate);
+                    chain_active = true;
+                    cursor += 1;
+                }
+                1 => {
+                    require_empty_fields(word)?;
+                    plan.commands.push(Command::Barrier { test_tag: None });
+                    cursor += 1;
+                }
+                2..=9 => {
+                    require_empty_fields(word)?;
+                    if command <= 5 && !chain_active {
+                        return Err(AcmError::MalformedBatch);
+                    }
+                    let kind = match command {
+                        2 => TransferKind::ChainInput,
+                        3 => TransferKind::ChainInputSplit,
+                        4 => TransferKind::ChainOutput,
+                        5 => TransferKind::ChainOutputSplit,
+                        6 => TransferKind::Input,
+                        7 => TransferKind::InputSplit,
+                        8 => TransferKind::Output,
+                        9 => TransferKind::OutputSplit,
+                        _ => unreachable!(),
+                    };
+                    plan.commands.push(Command::Transfer(kind));
+                    cursor += 1;
+                }
+                10 => {
+                    require_empty_fields(word)?;
+                    plan.commands.push(Command::Run);
+                    cursor += 1;
+                }
                 COMMAND_STATISTICS => {
                     if word != u64::from(COMMAND_STATISTICS) || saw_statistics {
                         return Err(AcmError::MalformedBatch);
@@ -85,6 +168,18 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                         .push(Command::Statistics(Statistics { address }));
                     saw_statistics = true;
                     cursor += 2;
+                }
+                12 | 13 | 15 => {
+                    require_empty_fields(word)?;
+                    let chained = command != 13;
+                    if chained && !chain_active {
+                        return Err(AcmError::MalformedBatch);
+                    }
+                    plan.commands.push(Command::Inline {
+                        chained,
+                        constant: command == 15,
+                    });
+                    cursor += 1;
                 }
                 COMMAND_NOTIFICATION => {
                     if word & !0xffff != 0 {
@@ -108,12 +203,29 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                     plan.notification = Some(Notification { value, address });
                     cursor += 2;
                 }
+                16 => {
+                    require_empty_fields(word)?;
+                    plan.commands.push(Command::Queue);
+                    cursor += 1;
+                }
+                17 => {
+                    require_empty_fields(word)?;
+                    plan.commands.push(Command::Delay);
+                    cursor += 1;
+                }
                 _ => return Err(AcmError::MalformedBatch),
             }
         }
     }
 
     Ok(plan)
+}
+
+fn require_empty_fields(word: u64) -> Result<(), AcmError> {
+    if word >> 8 != 0 {
+        return Err(AcmError::MalformedBatch);
+    }
+    Ok(())
 }
 
 fn read_buffer_words(info: &SceAcmBatchInfo) -> Result<Vec<u64>, AcmError> {

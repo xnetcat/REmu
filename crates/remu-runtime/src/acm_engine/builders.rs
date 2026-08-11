@@ -5,7 +5,7 @@
 
 use crate::write_guest_bytes;
 
-use super::abi::{AcmError, SceAcmBatchInfo, read_pod, write_pod};
+use super::abi::{AcmError, SceAcmBatchInfo, checked_span, read_pod, return_error, write_pod};
 
 pub(super) const RECORD_MAGIC: u32 = 0x524d_4143;
 pub(super) const RECORD_VERSION: u8 = 1;
@@ -65,12 +65,29 @@ pub(super) fn append_record(
         return Err(AcmError::InvalidParameter);
     }
 
+    let mut encoded = vec![0_u64; words];
+    encoded[0] = record_header(
+        payload.kind,
+        u16::try_from(words).expect("validated record word count"),
+    );
+    encoded[1..1 + payload.words.len()].copy_from_slice(&payload.words);
+    append_words(info_address, &encoded)
+}
+
+fn append_words(info_address: u64, words: &[u64]) -> Result<(), AcmError> {
+    if words.is_empty() {
+        return Err(AcmError::InvalidParameter);
+    }
+
     let info = read_pod::<SceAcmBatchInfo>(info_address).map_err(|_| AcmError::InvalidParameter)?;
     if info.buffer == 0 || !info.offset.is_multiple_of(8) || info.offset > info.size {
         return Err(AcmError::InvalidParameter);
     }
 
-    let byte_count = words.checked_mul(8).ok_or(AcmError::InvalidParameter)?;
+    let byte_count = words
+        .len()
+        .checked_mul(8)
+        .ok_or(AcmError::InvalidParameter)?;
     let byte_count_u64 = u64::try_from(byte_count).map_err(|_| AcmError::InvalidParameter)?;
     let new_offset = info
         .offset
@@ -86,15 +103,8 @@ pub(super) fn append_record(
     super::abi::checked_span(destination, byte_count, 8).map_err(|_| AcmError::InvalidParameter)?;
 
     let mut encoded = vec![0_u8; byte_count];
-    encoded[..8].copy_from_slice(
-        &record_header(
-            payload.kind,
-            u16::try_from(words).expect("validated record word count"),
-        )
-        .to_le_bytes(),
-    );
-    for (index, word) in payload.words.iter().enumerate() {
-        let start = (index + 1) * 8;
+    for (index, word) in words.iter().enumerate() {
+        let start = index * 8;
         encoded[start..start + 8].copy_from_slice(&word.to_le_bytes());
     }
 
@@ -104,6 +114,27 @@ pub(super) fn append_record(
         ..info
     };
     write_pod(info_address, &committed).map_err(|_| AcmError::InvalidParameter)
+}
+
+pub(super) fn batch_job_notification(arguments: [u64; 6]) -> u64 {
+    let info = arguments[0];
+    let value = arguments[1] as u8;
+    let notification = arguments[2];
+    if info == 0 || value == 0 || notification == 0 {
+        return return_error(AcmError::InvalidParameter);
+    }
+    if !notification.is_multiple_of(128) {
+        return return_error(AcmError::Alignment);
+    }
+    if checked_span(notification, 128, 128).is_err() {
+        return return_error(AcmError::InvalidParameter);
+    }
+    let header = u64::from(14_u8) | (u64::from(value) << 8);
+    if let Err(error) = append_words(info, &[header, notification]) {
+        return return_error(error);
+    }
+    write_guest_bytes(notification, &[0; 128]);
+    0
 }
 
 #[cfg(test)]

@@ -4,14 +4,15 @@
 //! PlayStation 5 Audio Compute Manager service.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::atomic::{Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::{guest_output_pointer, low_u32, write_guest_u32};
+use crate::{guest_output_pointer, low_u32, write_guest_bytes, write_guest_u32};
 
-use self::abi::{AcmError, SceAcmBatchInfo, read_array, read_pod, return_error};
-use self::batch::{BatchPlan, Command, decode_buffers};
+use self::abi::{AcmError, SceAcmBatchInfo, checked_span, read_array, read_pod, return_error};
+use self::batch::{AcmStatistics, BatchPlan, Command, PendingWrite, decode_buffers};
 
 mod abi;
 mod batch;
@@ -60,6 +61,12 @@ struct BatchState {
     waiter_active: bool,
 }
 
+#[derive(Clone, Copy)]
+struct ExecutionSample {
+    ended: Instant,
+    duration: Duration,
+}
+
 #[derive(Default)]
 struct EngineState {
     next_context: u32,
@@ -68,6 +75,7 @@ struct EngineState {
     stopping: bool,
     contexts: BTreeMap<u32, ContextState>,
     batches: BTreeMap<u32, BatchState>,
+    history: VecDeque<ExecutionSample>,
     #[cfg(test)]
     execution_tags: Vec<u64>,
 }
@@ -382,6 +390,11 @@ impl AcmEngine {
             .is_some_and(|batch| batch.waiter_active)
     }
 
+    #[cfg(test)]
+    fn history_len_for_test(&self) -> usize {
+        self.lock().history.len()
+    }
+
     fn start_workers(&self) {
         let mut workers = self
             .workers
@@ -499,8 +512,8 @@ fn claim_batch(state: &mut EngineState, requested: Option<u32>) -> Option<Execut
     batch_state.status = BatchStatus::Running;
     let plan = batch_state.plan.clone();
     let tag = plan.commands.iter().find_map(|command| match command {
-        Command::Barrier(tag) => Some(*tag),
-        Command::Statistics(_) => None,
+        Command::Barrier { test_tag } => *test_tag,
+        _ => None,
     });
     Some(ExecutionClaim {
         context,
@@ -512,7 +525,17 @@ fn claim_batch(state: &mut EngineState, requested: Option<u32>) -> Option<Execut
 }
 
 fn complete_claim(core: &EngineCore, claim: ExecutionClaim) {
-    let result = execute_plan(&claim.plan);
+    let history = core
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .history
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let result = execute_plan_with_elapsed(&claim.plan, None, started, &history);
+    let elapsed = started.elapsed();
     let mut state = core
         .state
         .lock()
@@ -525,6 +548,15 @@ fn complete_claim(core: &EngineCore, claim: ExecutionClaim) {
             && context.active_batch == Some(claim.batch)
         {
             context.active_batch = None;
+        }
+        if result.is_ok() {
+            state.history.push_back(ExecutionSample {
+                ended: Instant::now(),
+                duration: elapsed,
+            });
+            while state.history.len() > 256 {
+                state.history.pop_front();
+            }
         }
         #[cfg(test)]
         if let Some(tag) = claim.tag {
@@ -547,16 +579,162 @@ fn consume_terminal(state: &mut EngineState, batch: u32) -> Option<u64> {
     Some(result)
 }
 
-fn execute_plan(plan: &BatchPlan) -> Result<(), AcmError> {
+fn execute_plan_with_elapsed(
+    plan: &BatchPlan,
+    elapsed_override: Option<Duration>,
+    started: Instant,
+    history: &[ExecutionSample],
+) -> Result<(), AcmError> {
+    let mut pending = Vec::<PendingWrite>::new();
     for command in &plan.commands {
         match command {
-            Command::Barrier(_) => {}
+            Command::Activate
+            | Command::Barrier { .. }
+            | Command::Transfer(_)
+            | Command::Run
+            | Command::Inline { .. }
+            | Command::Queue
+            | Command::Delay => {}
             Command::Statistics(statistics) => {
-                let _ = statistics.address;
+                let mut value = read_pod::<AcmStatistics>(statistics.address)?;
+                let elapsed = elapsed_override.unwrap_or_else(|| started.elapsed());
+                value.usage_batch = scaled_seconds(elapsed);
+                for interval in &mut value.usage_intervals {
+                    if *interval == 0 || *interval == u32::MAX {
+                        *interval = if *interval == 0 {
+                            interval_usage(elapsed, *interval, history, started + elapsed)
+                        } else {
+                            u32::MAX
+                        };
+                    } else {
+                        *interval = interval_usage(elapsed, *interval, history, started + elapsed);
+                    }
+                }
+                pending.push(PendingWrite {
+                    address: statistics.address,
+                    bytes: statistics_bytes(value).to_vec(),
+                });
+            }
+            #[cfg(test)]
+            Command::TestWrite(write) => pending.push(write.clone()),
+            #[cfg(test)]
+            Command::TestFault => return Err(AcmError::PageFault),
+        }
+    }
+
+    validate_pending_writes(&pending)?;
+    for write in &pending {
+        write_guest_bytes(write.address, &write.bytes);
+    }
+    fence(Ordering::Release);
+    if let Some(notification) = plan.notification
+        && remu_memory::guest_shared_mapping_identity(notification.address, 128).is_some()
+    {
+        write_guest_bytes(notification.address, &[notification.value]);
+    }
+    Ok(())
+}
+
+fn validate_pending_writes(writes: &[PendingWrite]) -> Result<(), AcmError> {
+    for (index, write) in writes.iter().enumerate() {
+        checked_span(write.address, write.bytes.len(), 1)?;
+        let end = write
+            .address
+            .checked_add(write.bytes.len() as u64)
+            .ok_or(AcmError::InvalidParameter)?;
+        for previous in &writes[..index] {
+            let previous_end = previous
+                .address
+                .checked_add(previous.bytes.len() as u64)
+                .ok_or(AcmError::InvalidParameter)?;
+            let overlaps = write.address < previous_end && previous.address < end;
+            if overlaps
+                && (write.address != previous.address
+                    || write.bytes.len() != previous.bytes.len()
+                    || write.bytes != previous.bytes)
+            {
+                return Err(AcmError::InvalidParameter);
             }
         }
     }
     Ok(())
+}
+
+fn scaled_seconds(duration: Duration) -> u32 {
+    const SCALE: u128 = 1_u128 << 31;
+    let scaled = duration.as_nanos().saturating_mul(SCALE) / 1_000_000_000;
+    u32::try_from(scaled.max(u128::from(!duration.is_zero()))).unwrap_or(u32::MAX)
+}
+
+fn interval_usage(
+    current: Duration,
+    interval: u32,
+    history: &[ExecutionSample],
+    ended: Instant,
+) -> u32 {
+    const SCALE: u128 = 1_u128 << 31;
+    if interval == 0 {
+        let Some(first) = history.first() else {
+            return u32::MAX;
+        };
+        let start = first
+            .ended
+            .checked_sub(first.duration)
+            .unwrap_or(first.ended);
+        let window = ended.saturating_duration_since(start);
+        return scaled_usage(current, history, start, ended, window);
+    }
+    let window_nanos = u128::from(interval).saturating_mul(1_000_000_000) / SCALE;
+    let window = Duration::from_nanos(u64::try_from(window_nanos.max(1)).unwrap_or(u64::MAX));
+    let start = ended.checked_sub(window).unwrap_or(ended);
+    scaled_usage(current, history, start, ended, window)
+}
+
+fn scaled_usage(
+    current: Duration,
+    history: &[ExecutionSample],
+    start: Instant,
+    ended: Instant,
+    window: Duration,
+) -> u32 {
+    const SCALE: u128 = 1_u128 << 31;
+    let mut used = current.min(window).as_nanos();
+    for sample in history {
+        let sample_start = sample
+            .ended
+            .checked_sub(sample.duration)
+            .unwrap_or(sample.ended);
+        let overlap_start = sample_start.max(start);
+        let overlap_end = sample.ended.min(ended);
+        if overlap_end > overlap_start {
+            used = used.saturating_add(overlap_end.duration_since(overlap_start).as_nanos());
+        }
+    }
+    let usage = used.saturating_mul(SCALE) / window.as_nanos().max(1);
+    u32::try_from(usage.min(SCALE)).unwrap_or(u32::MAX)
+}
+
+fn statistics_bytes(statistics: AcmStatistics) -> [u8; 24] {
+    let mut bytes = [0_u8; 24];
+    for (index, value) in [
+        statistics.flags,
+        statistics.usage_batch,
+        statistics.usage_intervals[0],
+        statistics.usage_intervals[1],
+        statistics.usage_intervals[2],
+        statistics.pad,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+#[cfg(test)]
+fn execute_plan_with_elapsed_for_test(plan: &BatchPlan, elapsed: Duration) -> Result<(), AcmError> {
+    execute_plan_with_elapsed(plan, Some(elapsed), Instant::now(), &[])
 }
 
 pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], _stack_arguments: [u64; 6]) -> Option<u64> {
@@ -566,8 +744,9 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], _stack_arguments: [u64; 6
         "tW9W+CAG4FE" => AcmEngine::global().batch_start_buffer(arguments),
         "8fe55ktlNVo" => AcmEngine::global().batch_start_buffers(arguments),
         "RLN3gRlXJLE" => AcmEngine::global().batch_wait(arguments),
-        "r7z5YQFZo+U" | "KovqaFbmtsM" | "DR-ZCmvVR9Q" | "LA4RCNKnFjg" | "u70oWo92SYQ"
-        | "9nLbWmRDpa8" | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
+        "r7z5YQFZo+U" => builders::batch_job_notification(arguments),
+        "KovqaFbmtsM" | "DR-ZCmvVR9Q" | "LA4RCNKnFjg" | "u70oWo92SYQ" | "9nLbWmRDpa8"
+        | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
             return Some(return_error(AcmError::InvalidParameter));
         }
         _ => return None,
