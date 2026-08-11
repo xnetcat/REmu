@@ -1,5 +1,11 @@
 # Complete ACM Engine Design
 
+**Outcome (2026-08-11): implemented.** The engine landed through commits `dacdcd5e`, `79e68531`,
+`1dcb828d`, `9e2b49bd`, `b57d3d51`, `edcb3ec3`, `7445ea96`, `b20c762a`, and `5acfa6d6`.
+The measured bounded run submitted 2,050 batches, retired 2,048, failed none, and progressed into
+AGC work. Current compatibility evidence lives in `docs/status.md`; the evidence below is the
+pre-implementation problem statement, not the current title state.
+
 ## Goal
 
 Implement the PlayStation 5 Audio Compute Manager public contract completely enough that titles
@@ -11,7 +17,7 @@ This is the first subproject in the broader “get the game working” program. 
 graphics-correctness, and performance blockers get separate evidence, specifications, and plans
 after ACM is complete.
 
-## Evidence
+## Pre-implementation evidence
 
 - The 2026-08-11 bounded Demon’s Souls run reached no VideoOut, AGC, draw, flip, or present work.
   It repeatedly failed `sceAcmBatchStartBuffers` and `sceAcm_ConvReverb_SharedInput` while its audio

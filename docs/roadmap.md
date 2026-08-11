@@ -14,6 +14,8 @@ Status: complete.
 
 ## M1: read-only executable model
 
+Status: implemented; maintained as compatibility grows.
+
 - Parse ELF program headers, dynamic entries, symbols, relocations, and PS5-specific metadata.
 - Parse executable-container metadata without copying protected payloads into the repository.
 - Produce deterministic inspection output and precise validation errors.
@@ -23,12 +25,16 @@ This milestone does not map or execute guest code.
 
 ## M2: guest virtual memory and dynamic linker
 
+Status: implemented and under active correctness hardening.
+
 - Reserve and manage a guest address space with explicit page permissions.
 - Map loadable segments and zero-fill memory without writable/executable overlap.
 - Resolve supported relocations, module dependencies, TLS, and import trampolines.
 - Add crash-safe diagnostics for address, module, thread, and guest register state.
 
 ## M3: native x86-64 execution and minimum HLE
+
+Status: implemented through the Rosetta backend; HLE coverage remains incremental.
 
 - Enter guest code only in the Rosetta x86-64 build.
 - Implement process/thread startup, synchronization, timing, filesystem, and libc calls demanded by
@@ -37,6 +43,8 @@ This milestone does not map or execute guest code.
 - Keep every HLE function attributable to public documentation or recorded black-box behavior.
 
 ## M4: graphics-to-Metal vertical slice
+
+Status: implemented; shader, resource, and synchronization coverage remains active work.
 
 - Define AGC command, resource, format, synchronization, and shader-domain types in backend-neutral
   crates.
@@ -47,11 +55,15 @@ This milestone does not map or execute guest code.
 
 ## M5: first game loop
 
+Status: initial vertical slice achieved; UI, 3D correctness, and title compatibility are incomplete.
+
 - Bring the first small test title through module initialization, frame submission, input, and audio.
 - Add deterministic boot checkpoints and opt-in local smoke-test configuration.
 - Fix correctness blockers by subsystem instead of adding title-specific binary patches.
 
 ## M6: compatibility growth
+
+Status: active.
 
 - Use progressively larger titles as broader regression targets.
 - Add codecs, savedata, richer audio, controller behavior, and synchronization as demanded.
@@ -59,11 +71,15 @@ This milestone does not map or execute guest code.
 
 ## M7: other host backends
 
+Status: planned.
+
 - Add D3D12 plus HLSL/DXIL on Windows.
 - Add Vulkan plus SPIR-V on Linux.
 - Share guest decoding and shader IR, not host-API abstractions that erase important semantics.
 
 ## M8: native Apple Silicon CPU backend
+
+Status: planned.
 
 - Add an x86-64 decoder, typed CPU IR, code cache, dispatcher, and AArch64 emitter.
 - Validate it against the native/Rosetta behavior oracle using synthetic instruction and ABI tests.
