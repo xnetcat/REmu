@@ -92,7 +92,7 @@ coalesced ranges. Release builds use one codegen unit with ThinLTO. Focused unit
 contract; this is not yet an FPS claim because the requested no-game constraint prevents a clean
 before/after title benchmark.
 
-## Demon's Souls bring-up (updated 2026-08-11) — one Metal draw and real flip queued, no present/frame
+## Demon's Souls bring-up (updated 2026-08-11) — latest run still PC-zero/zero-frame; furthest checkpoint one draw and queued flip
 
 The complete CPU ACM engine is no longer the title's first blocker. Its context, batch, command,
 buffer, execution, wait, statistics, and teardown paths are implemented with SDK-shaped errors and
@@ -141,7 +141,7 @@ without an API error. This is one clean observation, not proof that a timing-sen
 closed: `REMU_TRACE_FIBER=1` emitted 47,891 synchronized log records and the guest-write journal was
 also enabled, so the run is intentionally not a performance benchmark.
 
-**Latest clean run (`b79aac96`, 2026-08-11):** artifact
+**Prior clean run (`b79aac96`, 2026-08-11):** artifact
 `/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T191410Z-PPSA01342-app0`.
 It crashed after 39 seconds at host PC zero before reproducing the preceding artifact's Metal draw
 or queued-flip progress; it produced no present, captured frame, or FPS sample. Offline
@@ -153,6 +153,14 @@ concurrent clearing, but it does not uniquely identify whether the consumed reco
 run-chain context or the object-resident resume path. Because this run ended before comparable GPU
 progress, it does not supersede the `a8f2b713` renderer checkpoint and does not show that the title
 renders.
+
+**Latest clean pre-fix run (`d0dcdc7d`, 2026-08-11):** artifact
+`/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T202343Z-PPSA01342-app0`.
+It ended after 22 seconds with exit status 139 and another null-address SIGSEGV at host PC zero.
+All three telemetry windows reported `fps=0.000`, and the artifact contains zero captured frames.
+This run predates both `8392fd99` and `a9fba6e9`; it is therefore the current live result, not
+validation of either fix. No post-fix game run exists, and there is still no evidence of rendered
+UI, 3D, a completed present/frame, or usable FPS.
 
 The run exposed three renderer gaps that are now fixed offline but not yet game-validated.
 Ordinary VOP1/VOP2 FP16 lowering called `remu_f16_to_f32_bits` without emitting its definition;
@@ -189,6 +197,16 @@ and the full serial Metal suite 541 passed, 0 failed, with 5 intentionally ignor
 format, and diff checks also pass. These are offline implementation checks; no post-commit game run
 exists, so they are not evidence that Demon's Souls UI, 3D, presentation, or performance is fixed.
 
+`8392fd99` fixes the concrete hierarchy-growth case left by that first implementation: a same-key,
+GPU-current, uncompressed mode-27 type-13 array with two slices can now grow from a one-level
+physical hierarchy to the requested two logical mip levels without replacing the GPU-authored
+base level from stale guest RAM. Promotion preserves the old GPU level, sources the clean suffix
+from guest authority, transfers ownership away from an overlapping clean suffix tenant, and keeps
+later suffix rematerialization exact rather than leaving a second live owner. The full serial Metal
+suite at that commit passed 544 tests, failed none, and intentionally ignored 5; strict clippy,
+format, and diff checks passed. This is narrowly scoped offline evidence, and the latest game run
+above predates it.
+
 The same acceptance run also demonstrated that sparse work could disappear from structured
 telemetry: the one real Metal draw landed between the 500-millisecond live-title reset and the
 five-second JSON publication. `d8ba87c2` now accumulates draw, compute, flip, presentation, batch,
@@ -204,7 +222,7 @@ Two evidence-backed blockers from that run are now fixed in code but have not be
   resource discovery, so a skipped block's own `S_LOAD_DWORDX8` supplies the real T# rather than
   the evaluator copying the initial pointer into an eight-dword descriptor. Nonzero-address
   FORMAT/TYPE 0 remains an error; it was not reinterpreted as a typeless image.
-- **Migrating fiber resume (`dc57398f`, hardened by `d6160073`):** the first crash restored `rsp=0`
+- **Migrating fiber resume (`dc57398f`, hardened by `d6160073` and `a9fba6e9`):** the first crash restored `rsp=0`
   from a saved context located on a fiber stack that another worker was actively using. Suspended
   callee-saved state therefore moved into the opaque 256-byte `SceFiber`, with canonical-pointer,
   return-frame, and declared-stack validation. The later `b79aac96` crash proved that a long-jump
@@ -214,9 +232,18 @@ Two evidence-backed blockers from that run are now fixed in code but have not be
   consumes the exact published pointer once instead of validating and then rereading guest memory.
   Long jumps retain source tags in RSI for fiber resume, entry return, and return-to-thread, so a
   future crash can identify which ownership path supplied the record without hot-path logging.
-  These changes and their focused regressions narrow the observed race; there is no post-fix game
-  run, and they do not prove that an abandoned caller frame cannot be cleared or that the PC-zero
-  failure is closed.
+  The clean `d0dcdc7d` artifact then source-tagged another PC-zero failure as a fiber resume and
+  localized the consumed record to guest `SceFiber + 0x70`; that fiber object itself was nested in
+  another small recyclable fiber stack. This is the concrete crash class `a9fba6e9` addresses:
+  jump records and fresh-entry metadata now live in a host-owned per-generation registry rather
+  than guest object/stack storage; host `IDLE/RUN/RETIRED` state is authoritative; outgoing guest
+  and host releases occur only after the target RSP is installed; and quiescent generations are
+  reclaimed instead of leaked. Entry, initialization argument, stack bounds, and debug flags are
+  immutable host snapshots, while guest context fields remain non-authoritative ABI mirrors.
+  Deterministic regressions cover object clearing after claim, consumed-once/concurrent takes,
+  lifecycle races, generation reuse, bounded storage, direct handoff, and cross-thread migration.
+  There is no post-`a9fba6e9` game run, so this closes the demonstrated storage design defect in
+  code but does not establish that Demon's Souls no longer crashes or renders a frame.
 
 The remaining pre-crash import failures were audited separately. Cold AMPR reset `EPERM`, unknown
 PlayGo chunk probes, User Service `NO_EVENT`, and optional file misses are expected and leave guest
@@ -239,13 +266,16 @@ resume transfer identity. Tests cover a returning entry, repeated cross-thread m
 nested return frame, and migration through a real generated import stub/trampoline; all pass, so
 there is not yet evidence for another speculative fiber behavior change.
 
-Focused verification is green: `remu-shader` 178/178 tests, optimized x86 fiber tests 17/17, and
-`remu-memory` 99/99 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
-suite is 762/762. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
-dynamic data rather than its live FS function; `36593f56` gives the seeded decoder authenticated
-control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
-sparse, untraced run that drains the already-observed real flip through presenter acceptance and
-completes a present/frame; until then Demon's Souls is not considered rendering.
+Focused verification is green: `remu-shader` 178/178 tests, optimized x86 fiber tests 29/29, and
+`remu-memory` 99/99 tests, plus strict `-D warnings` lint, format, and diff checks. The full debug
+x86 runtime suite passes 774/774. The full optimized suite passes 772/774; its two failures are
+known unrelated release-only test-design defects: a `debug_assertions` expected-panic test cannot
+panic in release, and the AGC boolean-predication fixture derives a release-sensitive masked stack
+address. Its former debug failure was a stale synthetic ELF fixture whose entry pointed at dynamic
+data rather than its live FS function; `36593f56` gives the seeded decoder authenticated control
+flow while preserving the deliberately embedded lookalike. The next acceptance point is a sparse,
+untraced run that drains the already-observed real flip through presenter acceptance and completes
+a present/frame; until then Demon's Souls is not considered rendering.
 
 **2026-08-11 Metal release cleanup (offline; no game run):** the optimized Metal package now builds
 without the previous 41 unused/dead-code warnings. An obsolete captured global byte-cache shell,
