@@ -24,8 +24,8 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{
-    current_guest_thread_name, read_guest_cstring, read_guest_u32, read_guest_u64, trace_fiber,
-    write_guest_u32, write_guest_u64,
+    current_guest_thread_name, guest_memset, read_guest_cstring, read_guest_u32, read_guest_u64,
+    trace_fiber, write_guest_u32, write_guest_u64,
 };
 
 /// Logs one fiber transition when `REMU_TRACE_FIBER=1`.
@@ -80,6 +80,8 @@ const SCE_FIBER_ERROR_STATE: u32 = 0x8059_0006;
 const FIBER_MAGIC_START: u32 = 0xdef1_649c;
 const FIBER_MAGIC_END: u32 = 0xb375_92a0;
 const FIBER_OPT_PARAM_MAGIC: u32 = 0xbb40_e64d;
+const SCE_FIBER_OPT_PARAM_SIZE: usize = 128;
+const SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE: u32 = 1;
 /// Written to the lowest word of a fiber's stack so an overflow that walks past the limit is
 /// detectable at the next switch instead of silently corrupting neighbouring guest storage.
 const FIBER_STACK_GUARD: u64 = 0x7149_f2ca_7149_f2ca;
@@ -217,6 +219,11 @@ fn claim_idle(fiber: u64) -> Result<(), u64> {
 
 /// Reports whether a running fiber has written past the low end of its stack.
 fn stack_intact(fiber: u64) -> bool {
+    if read_guest_u32(fiber + offset::FLAGS) & SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE
+        == 0
+    {
+        return true;
+    }
     let address = read_guest_u64(fiber + offset::ADDR_CONTEXT);
     address == 0 || read_guest_u64(address) == FIBER_STACK_GUARD
 }
@@ -301,6 +308,7 @@ fn opt_param_initialize(opt_param: u64) -> u64 {
     if opt_param & 7 != 0 {
         return fiber_error(SCE_FIBER_ERROR_ALIGNMENT);
     }
+    guest_memset(opt_param, 0, SCE_FIBER_OPT_PARAM_SIZE as u64);
     write_guest_u32(opt_param, FIBER_OPT_PARAM_MAGIC);
     0
 }
@@ -334,15 +342,23 @@ fn initialize(arguments: [u64; 6], stack_arguments: [u64; 6]) -> u64 {
     if opt_param != 0 && read_guest_u32(opt_param) != FIBER_OPT_PARAM_MAGIC {
         return fiber_error(SCE_FIBER_ERROR_INVALID);
     }
+    let debug_options = if opt_param == 0 {
+        0
+    } else {
+        read_guest_u32(opt_param + 4)
+    };
+    if debug_options & !SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE != 0 {
+        return fiber_error(SCE_FIBER_ERROR_INVALID);
+    }
 
     write_guest_u64(fiber + offset::ENTRY, entry);
     write_guest_u64(fiber + offset::ARG_ON_INITIALIZE, argument_on_initialize);
     write_guest_u64(fiber + offset::ADDR_CONTEXT, address);
     write_guest_u64(fiber + offset::SIZE_CONTEXT, size);
     write_guest_u64(fiber + offset::CONTEXT, 0);
-    write_guest_u32(fiber + offset::FLAGS, 0);
+    write_guest_u32(fiber + offset::FLAGS, debug_options);
     write_fiber_name(fiber, name);
-    if address != 0 {
+    if address != 0 && debug_options & SCE_FIBER_OPT_PARAM_DEBUG_OPTION_CHECK_CONTEXT_SIZE != 0 {
         write_guest_u64(address, FIBER_STACK_GUARD);
     }
     write_guest_u32(fiber + offset::MAGIC_START, FIBER_MAGIC_START);
