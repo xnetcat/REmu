@@ -6,6 +6,7 @@
 use crate::write_guest_bytes;
 
 use super::abi::{AcmError, SceAcmBatchInfo, checked_span, read_pod, return_error, write_pod};
+use super::batch::FftDirection;
 
 pub(super) const RECORD_MAGIC: u32 = 0x524d_4143;
 pub(super) const RECORD_VERSION: u8 = 1;
@@ -14,12 +15,16 @@ pub(super) const RECORD_VERSION: u8 = 1;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum RecordKind {
     Test = 1,
+    Fft = 2,
+    Ifft = 3,
 }
 
 impl RecordKind {
     pub(super) fn from_byte(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Test),
+            2 => Some(Self::Fft),
+            3 => Some(Self::Ifft),
             _ => None,
         }
     }
@@ -135,6 +140,136 @@ pub(super) fn batch_job_notification(arguments: [u64; 6]) -> u64 {
     }
     write_guest_bytes(notification, &[0; 128]);
     0
+}
+
+pub(super) fn fft(arguments: [u64; 6], stack: [u64; 6], inverse: bool) -> u64 {
+    let info = arguments[0];
+    let size = arguments[1] as usize;
+    let count = arguments[2] as usize;
+    let input_format = arguments[3] as u32;
+    let input_array = arguments[4];
+    let output_format = arguments[5] as u32;
+    let output_array = stack[0];
+    let flags = stack[1] as u32;
+    if info == 0
+        || !matches!(size, 512 | 1024 | 2048)
+        || count == 0
+        || count > usize::from(u16::MAX)
+        || input_format > 1
+        || output_format > 1
+        || flags & !7 != 0
+    {
+        return return_error(AcmError::InvalidParameter);
+    }
+    let Some(input_count) = count.checked_mul(1 + usize::from(flags & 2 != 0)) else {
+        return return_error(AcmError::InvalidParameter);
+    };
+    let Some(output_count) = count.checked_mul(1 + usize::from(flags & 4 != 0)) else {
+        return return_error(AcmError::InvalidParameter);
+    };
+    let inputs = match super::abi::read_array::<u64>(input_array, input_count) {
+        Ok(pointers) => pointers,
+        Err(_) => return return_error(AcmError::InvalidParameter),
+    };
+    let outputs = match super::abi::read_array::<u64>(output_array, output_count) {
+        Ok(pointers) => pointers,
+        Err(_) => return return_error(AcmError::InvalidParameter),
+    };
+    let direction = if inverse {
+        FftDirection::Inverse
+    } else {
+        FftDirection::Forward
+    };
+    let (input_bytes, output_bytes) =
+        fft_pointer_bytes(direction, size, input_format, output_format, flags);
+    for pointer in &inputs {
+        if let Err(error) = validate_audio_pointer(*pointer, input_bytes) {
+            return return_error(error);
+        }
+    }
+    for pointer in &outputs {
+        if let Err(error) = validate_audio_pointer(*pointer, output_bytes) {
+            return return_error(error);
+        }
+    }
+
+    let output_extra = flags & 4 != 0 || (inverse && flags & 1 != 0);
+    let words_per_job = 7 + usize::from(flags & 2 != 0) + usize::from(output_extra);
+    let Some(total_words) = count
+        .checked_mul(words_per_job)
+        .and_then(|words| words.checked_add(2))
+    else {
+        return return_error(AcmError::InvalidParameter);
+    };
+    let config = size as u64
+        | ((count as u64) << 16)
+        | (u64::from(input_format) << 32)
+        | (u64::from(output_format) << 40)
+        | (u64::from(flags) << 48);
+    let mut payload = Vec::with_capacity(total_words - 1);
+    payload.push(config);
+    let input_stride = 1 + usize::from(flags & 2 != 0);
+    let output_stride = 1 + usize::from(flags & 4 != 0);
+    for index in 0..count {
+        payload.extend_from_slice(&[
+            inputs[index * input_stride],
+            outputs[index * output_stride],
+            input_bytes as u64,
+            output_bytes as u64,
+            index as u64,
+            0,
+            0,
+        ]);
+        if input_stride == 2 {
+            payload.push(inputs[index * input_stride + 1]);
+        }
+        if output_stride == 2 {
+            payload.push(outputs[index * output_stride + 1]);
+        } else if inverse && flags & 1 != 0 {
+            payload.push(0);
+        }
+    }
+    let payload = RecordPayload {
+        kind: if inverse {
+            RecordKind::Ifft
+        } else {
+            RecordKind::Fft
+        },
+        words: payload,
+    };
+    append_record(info, total_words, payload).map_or_else(return_error, |()| 0)
+}
+
+fn fft_pointer_bytes(
+    direction: FftDirection,
+    size: usize,
+    input_format: u32,
+    output_format: u32,
+    flags: u32,
+) -> (usize, usize) {
+    let input_values = match direction {
+        FftDirection::Forward if flags & 1 != 0 => size / 2,
+        _ => size,
+    };
+    let output_values = match direction {
+        FftDirection::Inverse if flags & 1 != 0 => size / 2,
+        _ => size,
+    };
+    let input_parts = 1 + usize::from(flags & 2 != 0);
+    let output_parts = 1 + usize::from(flags & 4 != 0);
+    (
+        input_values * if input_format == 0 { 4 } else { 2 } / input_parts,
+        output_values * if output_format == 0 { 4 } else { 2 } / output_parts,
+    )
+}
+
+fn validate_audio_pointer(address: u64, bytes: usize) -> Result<(), AcmError> {
+    if !address.is_multiple_of(128) {
+        return Err(AcmError::Alignment);
+    }
+    checked_span(address, bytes, 128)
+        .map(|_| ())
+        .map_err(|_| AcmError::InvalidParameter)
 }
 
 #[cfg(test)]
