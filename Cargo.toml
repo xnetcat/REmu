@@ -26,12 +26,14 @@ clap = { version = "4.5", features = ["derive"] }
 core-graphics-types = "0.2"
 cpal = "0.18"
 iced-x86 = "1.21"
+half = "2.7"
 libc = "0.2"
 metal = { version = "0.33", features = ["private"] }
 objc = "0.2"
 png = "0.17.16"
 sha1 = "0.10"
 smallvec = "1.15"
+rustfft = "6.4"
 symphonia = { version = "0.5.4", default-features = false, features = ["aac"] }
 thiserror = "2.0"
 winit = "0.30"

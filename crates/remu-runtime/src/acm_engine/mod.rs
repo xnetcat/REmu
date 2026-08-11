@@ -17,6 +17,7 @@ use self::batch::{AcmStatistics, BatchPlan, Command, PendingWrite, decode_buffer
 mod abi;
 mod batch;
 mod builders;
+mod dsp;
 
 pub(crate) const SDK10_ACM_NIDS: [&str; 13] = [
     "ZIXln2K3XMk",
@@ -615,6 +616,7 @@ fn execute_plan_with_elapsed(
                     bytes: statistics_bytes(value).to_vec(),
                 });
             }
+            Command::Fft(job) => pending.extend(dsp::execute(job)?),
             #[cfg(test)]
             Command::TestWrite(write) => pending.push(write.clone()),
             #[cfg(test)]
@@ -737,7 +739,7 @@ fn execute_plan_with_elapsed_for_test(plan: &BatchPlan, elapsed: Duration) -> Re
     execute_plan_with_elapsed(plan, Some(elapsed), Instant::now(), &[])
 }
 
-pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], _stack_arguments: [u64; 6]) -> Option<u64> {
+pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
         "ZIXln2K3XMk" => AcmEngine::global().context_create(arguments),
         "jBgBjAj02R8" => AcmEngine::global().context_destroy(arguments),
@@ -745,8 +747,9 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], _stack_arguments: [u64; 6
         "8fe55ktlNVo" => AcmEngine::global().batch_start_buffers(arguments),
         "RLN3gRlXJLE" => AcmEngine::global().batch_wait(arguments),
         "r7z5YQFZo+U" => builders::batch_job_notification(arguments),
-        "KovqaFbmtsM" | "DR-ZCmvVR9Q" | "LA4RCNKnFjg" | "u70oWo92SYQ" | "9nLbWmRDpa8"
-        | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
+        "KovqaFbmtsM" => builders::fft(arguments, stack_arguments, false),
+        "DR-ZCmvVR9Q" => builders::fft(arguments, stack_arguments, true),
+        "LA4RCNKnFjg" | "u70oWo92SYQ" | "9nLbWmRDpa8" | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
             return Some(return_error(AcmError::InvalidParameter));
         }
         _ => return None,

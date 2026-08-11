@@ -3,7 +3,7 @@
 
 //! Immutable ACM batch plans decoded from guest-owned command arenas.
 
-use super::abi::{AcmError, GuestPod, SceAcmBatchInfo, checked_span, read_array};
+use super::abi::{AcmError, AcmFormat, GuestPod, SceAcmBatchInfo, checked_span, read_array};
 use super::builders::{RECORD_MAGIC, RECORD_VERSION, RecordKind};
 
 const COMMAND_STATISTICS: u8 = 11;
@@ -33,10 +33,34 @@ pub(super) enum Command {
     },
     Queue,
     Delay,
+    Fft(FftJob),
     #[cfg(test)]
     TestWrite(PendingWrite),
     #[cfg(test)]
     TestFault,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FftDirection {
+    Forward,
+    Inverse,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct FftBuffer {
+    pub(super) first: u64,
+    pub(super) second: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct FftJob {
+    pub(super) direction: FftDirection,
+    pub(super) size: usize,
+    pub(super) input_format: AcmFormat,
+    pub(super) output_format: AcmFormat,
+    pub(super) inputs: Vec<FftBuffer>,
+    pub(super) outputs: Vec<FftBuffer>,
+    pub(super) flags: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -115,6 +139,13 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                         plan.commands.push(Command::Barrier {
                             test_tag: Some(tag),
                         });
+                    }
+                    RecordKind::Fft | RecordKind::Ifft => {
+                        plan.commands.push(Command::Fft(decode_fft_record(
+                            kind,
+                            &words[cursor + 1..end],
+                            record_words,
+                        )?));
                     }
                 }
                 cursor = end;
@@ -219,6 +250,146 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
     }
 
     Ok(plan)
+}
+
+fn decode_fft_record(
+    kind: RecordKind,
+    payload: &[u64],
+    record_words: usize,
+) -> Result<FftJob, AcmError> {
+    let config = *payload.first().ok_or(AcmError::MalformedBatch)?;
+    if config >> 56 != 0 {
+        return Err(AcmError::MalformedBatch);
+    }
+    let size = usize::from(config as u16);
+    let count = usize::from((config >> 16) as u16);
+    let input_format = decode_format((config >> 32) as u8)?;
+    let output_format = decode_format((config >> 40) as u8)?;
+    let flags = u32::from((config >> 48) as u8);
+    if !matches!(size, 512 | 1024 | 2048) || count == 0 || flags & !7 != 0 {
+        return Err(AcmError::MalformedBatch);
+    }
+    let direction = match kind {
+        RecordKind::Fft => FftDirection::Forward,
+        RecordKind::Ifft => FftDirection::Inverse,
+        RecordKind::Test => return Err(AcmError::MalformedBatch),
+    };
+    let split_input = flags & 2 != 0;
+    let split_output = flags & 4 != 0;
+    let output_extra = split_output || (direction == FftDirection::Inverse && flags & 1 != 0);
+    let words_per_job = 7 + usize::from(split_input) + usize::from(output_extra);
+    if record_words != 2 + count * words_per_job || payload.len() != 1 + count * words_per_job {
+        return Err(AcmError::MalformedBatch);
+    }
+
+    let (input_bytes, output_bytes) =
+        fft_buffer_bytes(direction, size, input_format, output_format, flags)?;
+    let mut inputs = Vec::with_capacity(count);
+    let mut outputs = Vec::with_capacity(count);
+    let mut cursor = 1;
+    for index in 0..count {
+        let fixed = payload
+            .get(cursor..cursor + 7)
+            .ok_or(AcmError::MalformedBatch)?;
+        if fixed[2] != input_bytes as u64
+            || fixed[3] != output_bytes as u64
+            || fixed[4] != index as u64
+            || fixed[5] != 0
+            || fixed[6] != 0
+        {
+            return Err(AcmError::MalformedBatch);
+        }
+        cursor += 7;
+        let input_second = split_input.then(|| {
+            let pointer = payload[cursor];
+            cursor += 1;
+            pointer
+        });
+        let output_second = if split_output {
+            let pointer = payload[cursor];
+            cursor += 1;
+            Some(pointer)
+        } else {
+            None
+        };
+        if direction == FftDirection::Inverse && flags & 1 != 0 && !split_output {
+            if payload[cursor] != 0 {
+                return Err(AcmError::MalformedBatch);
+            }
+            cursor += 1;
+        }
+        validate_audio_buffer(fixed[0], input_bytes)?;
+        validate_audio_buffer(fixed[1], output_bytes)?;
+        if let Some(pointer) = input_second {
+            validate_audio_buffer(pointer, input_bytes)?;
+        }
+        if let Some(pointer) = output_second {
+            validate_audio_buffer(pointer, output_bytes)?;
+        }
+        inputs.push(FftBuffer {
+            first: fixed[0],
+            second: input_second,
+        });
+        outputs.push(FftBuffer {
+            first: fixed[1],
+            second: output_second,
+        });
+    }
+    Ok(FftJob {
+        direction,
+        size,
+        input_format,
+        output_format,
+        inputs,
+        outputs,
+        flags,
+    })
+}
+
+fn decode_format(value: u8) -> Result<AcmFormat, AcmError> {
+    match value {
+        0 => Ok(AcmFormat::Fp32),
+        1 => Ok(AcmFormat::Fp16),
+        _ => Err(AcmError::MalformedBatch),
+    }
+}
+
+fn fft_buffer_bytes(
+    direction: FftDirection,
+    size: usize,
+    input_format: AcmFormat,
+    output_format: AcmFormat,
+    flags: u32,
+) -> Result<(usize, usize), AcmError> {
+    let input_parts = 1 + usize::from(flags & 2 != 0);
+    let output_parts = 1 + usize::from(flags & 4 != 0);
+    let (input_values, output_values) = match direction {
+        FftDirection::Forward => (if flags & 1 != 0 { size / 2 } else { size }, size),
+        FftDirection::Inverse => (size, if flags & 1 != 0 { size / 2 } else { size }),
+    };
+    let input_bytes = input_values
+        .checked_mul(format_bytes(input_format))
+        .and_then(|bytes| bytes.checked_div(input_parts))
+        .ok_or(AcmError::MalformedBatch)?;
+    let output_bytes = output_values
+        .checked_mul(format_bytes(output_format))
+        .and_then(|bytes| bytes.checked_div(output_parts))
+        .ok_or(AcmError::MalformedBatch)?;
+    Ok((input_bytes, output_bytes))
+}
+
+fn format_bytes(format: AcmFormat) -> usize {
+    match format {
+        AcmFormat::Fp32 => 4,
+        AcmFormat::Fp16 => 2,
+    }
+}
+
+fn validate_audio_buffer(address: u64, bytes: usize) -> Result<(), AcmError> {
+    if !address.is_multiple_of(128) {
+        return Err(AcmError::Alignment);
+    }
+    checked_span(address, bytes, 128).map(|_| ())
 }
 
 fn require_empty_fields(word: u64) -> Result<(), AcmError> {

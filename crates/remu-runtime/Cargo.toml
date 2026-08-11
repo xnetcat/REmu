@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+half.workspace = true
 iced-x86.workspace = true
 libc.workspace = true
 remu-core = { path = "../remu-core" }
@@ -15,6 +16,7 @@ remu-memory = { path = "../remu-memory" }
 remu-shader = { path = "../remu-shader" }
 remu-shader-metal = { path = "../remu-shader-metal" }
 png.workspace = true
+rustfft.workspace = true
 sha1.workspace = true
 symphonia.workspace = true
 thiserror.workspace = true
