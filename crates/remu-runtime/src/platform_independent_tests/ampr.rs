@@ -12,6 +12,102 @@ use super::{
     write_guest_u32,
 };
 
+#[test]
+fn ampr_command_buffer_lifecycle_matches_the_public_sdk_layout() {
+    // SDK 10.00 `SceAmprCommandBuffer` is exactly:
+    //   i32 type; u32 offset; i32 num; u32 bufsize; void *buffer;
+    // `AprCommandBuffer` then appends two eight-byte reserved states. Keep canaries around the
+    // complete 0x28-byte C++ object so constructor and lifecycle writes cannot silently spill.
+    let mut storage = [0xa5_u8; 0x38];
+    let object = storage[8..].as_mut_ptr().addr() as u64;
+    let mut command_records = [0_u8; 0x100];
+    let records = command_records.as_mut_ptr().addr() as u64;
+    let mut state = ProbeDispatchState::default();
+
+    assert_eq!(
+        crate::ampr_command_buffer_constructor(
+            [object, 0x1111_2222_3333_4444, u64::MAX, 0, 0, 0],
+            &mut state,
+        ),
+        object
+    );
+    assert_eq!(
+        crate::ampr_apr_command_buffer_constructor(
+            [object, object + 0x18, object + 0x20, u64::MAX, 0, 0],
+            &mut state,
+        ),
+        object
+    );
+    assert_eq!(&storage[..8], &[0xa5; 8]);
+    assert_eq!(&storage[8..0x30], &[0; 0x28]);
+    assert_eq!(&storage[0x30..], &[0xa5; 8]);
+
+    assert_eq!(
+        crate::ampr_command_buffer_set_buffer(
+            [object, records, command_records.len() as u64, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(u32::from_le_bytes(storage[12..16].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(storage[16..20].try_into().unwrap()), 0);
+    assert_eq!(
+        u32::from_le_bytes(storage[20..24].try_into().unwrap()),
+        command_records.len() as u32
+    );
+    assert_eq!(
+        u64::from_le_bytes(storage[24..32].try_into().unwrap()),
+        records
+    );
+    assert_eq!(
+        crate::ampr_command_buffer_set_buffer([object, records, 4, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_BUSY),
+        "setBuffer must reject replacing an attached buffer"
+    );
+
+    let mut completion = 0_u64;
+    assert_eq!(
+        ampr_command_buffer_write_address_on_completion(
+            [object, (&raw mut completion).addr() as u64, 1, 0, 0, 0],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(
+        u32::from_le_bytes(storage[12..16].try_into().unwrap()),
+        crate::AMPR_COMMAND_RECORD_SIZE as u32
+    );
+    assert_eq!(u32::from_le_bytes(storage[16..20].try_into().unwrap()), 1);
+
+    assert_eq!(
+        crate::ampr_command_buffer_reset([object, 0, 0, 0, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(u32::from_le_bytes(storage[12..16].try_into().unwrap()), 0);
+    assert_eq!(u32::from_le_bytes(storage[16..20].try_into().unwrap()), 0);
+    assert_eq!(
+        u32::from_le_bytes(storage[20..24].try_into().unwrap()),
+        command_records.len() as u32
+    );
+    assert_eq!(
+        u64::from_le_bytes(storage[24..32].try_into().unwrap()),
+        records
+    );
+
+    assert_eq!(
+        crate::ampr_command_buffer_clear_buffer([object, 0, 0, 0, 0, 0], &mut state),
+        records
+    );
+    assert_eq!(&storage[12..32], &[0; 0x14]);
+    assert_eq!(&storage[..8], &[0xa5; 8]);
+    assert_eq!(&storage[0x30..], &[0xa5; 8]);
+    assert_eq!(
+        crate::ampr_command_buffer_reset([object, 0, 0, 0, 0, 0], &mut state),
+        sce_kernel_error(crate::SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED),
+        "reset requires an attached buffer"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn apr_resolver_imports_report_posix_failures_to_the_sdk_wrappers() {

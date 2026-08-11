@@ -17,13 +17,19 @@ use crate::{
     kernel_stat_payload_from_metadata, lock_probe_dispatch_for_write, low_u32,
     notify_kernel_equeue_waiters, process_guest_range_has_read_access, queue_kernel_event,
     read_guest_u64, resolve_probe_guest_path_with_presence, sce_kernel_error, trace_ampr_reads,
-    try_read_process_guest_u64, write_guest_u32, write_guest_u64,
+    try_read_process_guest_u32, try_read_process_guest_u64, write_guest_u32, write_guest_u64,
 };
 
 const AMPR_ORDER_LOCK_COUNT: usize = 64;
 const AMPR_STAGING_POOL_LIMIT: usize = 4;
 const AMPR_MAX_RETAINED_STAGING_BYTES: usize = 8 * 1024 * 1024;
 const AMPR_MAX_PATH_BYTES: usize = 1024;
+const AMPR_COMMAND_BUFFER_HEADER_SIZE: usize = 0x18;
+const AMPR_COMMAND_BUFFER_OFFSET_OFFSET: u64 = 0x04;
+const AMPR_COMMAND_BUFFER_COUNT_OFFSET: u64 = 0x08;
+const AMPR_COMMAND_BUFFER_SIZE_OFFSET: u64 = 0x0c;
+const AMPR_COMMAND_BUFFER_ADDRESS_OFFSET: u64 = 0x10;
+const AMPR_COMMAND_BUFFER_SIZE_MAX: u64 = 64 * 1024 * 1024;
 /// Published to a recorded completion word when the submission's transfers did not all run.
 ///
 /// Zero is the word's pre-submission state, so a failure cannot be reported by leaving it or by
@@ -117,18 +123,14 @@ pub(crate) fn ampr_command_buffer_constructor(
     if command_buffer == 0 {
         return 0;
     }
-    guest_memset(command_buffer, 0, 0x28);
-    write_guest_u64(command_buffer, command_buffer);
-    write_guest_u64(command_buffer + 8, arguments[1]);
-    write_guest_u64(command_buffer + 0x10, arguments[2]);
-    state.ampr_command_buffers.insert(
-        command_buffer,
-        AmprCommandBufferState {
-            buffer: arguments[1],
-            size: arguments[2],
-            ..AmprCommandBufferState::default()
-        },
-    );
+    // `CommandBuffer()` receives only `this`. The other captured registers are caller residue,
+    // not constructor arguments. SDK 10.00 exposes the exact 0x18-byte base-object layout as
+    // `SceAmprCommandBuffer`; writing those residues into it made its size and backing pointer
+    // arbitrary and let inline guest code consume a structurally corrupt object.
+    guest_memset(command_buffer, 0, AMPR_COMMAND_BUFFER_HEADER_SIZE as u64);
+    state
+        .ampr_command_buffers
+        .insert(command_buffer, AmprCommandBufferState::default());
     command_buffer
 }
 
@@ -140,19 +142,17 @@ pub(crate) fn ampr_apr_command_buffer_constructor(
     if command_buffer == 0 {
         return 0;
     }
-    let buffer = read_guest_u64(command_buffer + 8);
-    let size = read_guest_u64(command_buffer + 0x10);
-    write_guest_u64(command_buffer, command_buffer);
-    write_guest_u64(command_buffer + 0x18, arguments[1]);
-    write_guest_u64(command_buffer + 0x20, arguments[2]);
-    state.ampr_command_buffers.insert(
-        command_buffer,
-        AmprCommandBufferState {
-            buffer,
-            size,
-            ..AmprCommandBufferState::default()
-        },
-    );
+    // The C++ wrapper passes pointers to its two trailing reserved states as arguments one and
+    // two. They are storage to initialize, not values to retain in that storage.
+    for reserved in [arguments[1], arguments[2]] {
+        if reserved != 0 && process_guest_range_has_read_access(reserved, 8) {
+            write_guest_u64(reserved, 0);
+        }
+    }
+    state
+        .ampr_command_buffers
+        .entry(command_buffer)
+        .or_default();
     command_buffer
 }
 
@@ -161,17 +161,36 @@ pub(crate) fn ampr_command_buffer_set_buffer(
     state: &mut ProbeDispatchState,
 ) -> u64 {
     let command_buffer = arguments[0];
-    if command_buffer == 0 {
+    let buffer = arguments[1];
+    let size = arguments[2];
+    if command_buffer == 0
+        || buffer == 0
+        || buffer & 3 != 0
+        || size == 0
+        || size > AMPR_COMMAND_BUFFER_SIZE_MAX
+        || size & 3 != 0
+    {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    write_guest_u64(command_buffer, command_buffer);
-    write_guest_u64(command_buffer + 8, arguments[1]);
-    write_guest_u64(command_buffer + 0x10, arguments[2]);
+    if state
+        .ampr_command_buffers
+        .get(&command_buffer)
+        .is_some_and(|entry| entry.buffer != 0 || entry.size != 0)
+    {
+        return sce_kernel_error(crate::SCE_KERNEL_ERROR_BUSY);
+    }
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_OFFSET_OFFSET, 0);
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_COUNT_OFFSET, 0);
+    write_guest_u32(
+        command_buffer + AMPR_COMMAND_BUFFER_SIZE_OFFSET,
+        u32::try_from(size).expect("validated AMPR command-buffer size fits u32"),
+    );
+    write_guest_u64(command_buffer + AMPR_COMMAND_BUFFER_ADDRESS_OFFSET, buffer);
     state.ampr_command_buffers.insert(
         command_buffer,
         AmprCommandBufferState {
-            buffer: arguments[1],
-            size: arguments[2],
+            buffer,
+            size,
             ..AmprCommandBufferState::default()
         },
     );
@@ -194,10 +213,15 @@ pub(crate) fn ampr_command_buffer_get_size(arguments: [u64; 6], state: &ProbeDis
     if command_buffer == 0 {
         return 0;
     }
-    state
-        .ampr_command_buffers
-        .get(&command_buffer)
-        .map_or_else(|| read_guest_u64(command_buffer + 0x10), |entry| entry.size)
+    state.ampr_command_buffers.get(&command_buffer).map_or_else(
+        || {
+            u64::from(
+                try_read_process_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_SIZE_OFFSET)
+                    .unwrap_or(0),
+            )
+        },
+        |entry| entry.size,
+    )
 }
 
 /// Reports how many bytes of the attached memory already hold recorded commands.
@@ -209,10 +233,29 @@ pub(crate) fn ampr_command_buffer_get_current_offset(
     if command_buffer == 0 {
         return 0;
     }
-    state
-        .ampr_command_buffers
-        .get(&command_buffer)
-        .map_or(0, |entry| entry.write_offset)
+    state.ampr_command_buffers.get(&command_buffer).map_or_else(
+        || {
+            u64::from(
+                try_read_process_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_OFFSET_OFFSET)
+                    .unwrap_or(0),
+            )
+        },
+        |entry| entry.write_offset,
+    )
+}
+
+fn sync_ampr_command_buffer_progress(command_buffer: u64, offset: u64, count: u64) {
+    if !process_guest_range_has_read_access(command_buffer, AMPR_COMMAND_BUFFER_HEADER_SIZE) {
+        return;
+    }
+    let Ok(offset) = u32::try_from(offset) else {
+        return;
+    };
+    let Ok(count) = u32::try_from(count) else {
+        return;
+    };
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_OFFSET_OFFSET, offset);
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_COUNT_OFFSET, count);
 }
 
 /// Reports the bytes one command occupies, so the guest can size its buffer before recording.
@@ -251,6 +294,7 @@ pub(crate) fn ampr_command_buffer_write_kernel_event_queue(
     write_guest_u64(record + 0x18, user_data);
     command.write_offset += AMPR_COMMAND_RECORD_SIZE;
     command.command_count += 1;
+    sync_ampr_command_buffer_progress(command_buffer, command.write_offset, command.command_count);
     // The completion belongs to the submission, not to recording it. Retain it so submitting the
     // buffer announces it in the order the guest recorded.
     command.pending_completions.push(AmprCompletion {
@@ -297,6 +341,7 @@ pub(crate) fn ampr_command_buffer_write_address_on_completion(
     write_guest_u64(record + 0x10, value);
     command.write_offset += AMPR_COMMAND_RECORD_SIZE;
     command.command_count += 1;
+    sync_ampr_command_buffer_progress(command_buffer, command.write_offset, command.command_count);
     command
         .pending_address_writes
         .push(AmprAddressWrite { address, value });
@@ -334,20 +379,29 @@ pub(crate) fn ampr_command_buffer_clear_buffer(
     if command_buffer == 0 {
         return 0;
     }
-    let buffer = state
-        .ampr_command_buffers
-        .get(&command_buffer)
-        .map_or_else(|| read_guest_u64(command_buffer + 8), |entry| entry.buffer);
-    let size = state
-        .ampr_command_buffers
-        .get(&command_buffer)
-        .map_or_else(|| read_guest_u64(command_buffer + 0x10), |entry| entry.size);
+    let buffer = state.ampr_command_buffers.get(&command_buffer).map_or_else(
+        || read_guest_u64(command_buffer + AMPR_COMMAND_BUFFER_ADDRESS_OFFSET),
+        |entry| entry.buffer,
+    );
+    let size = state.ampr_command_buffers.get(&command_buffer).map_or_else(
+        || {
+            u64::from(
+                try_read_process_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_SIZE_OFFSET)
+                    .unwrap_or(0),
+            )
+        },
+        |entry| entry.size,
+    );
     if buffer == 0 || size == 0 {
         return 0;
     }
-    write_guest_u64(command_buffer + 8, 0);
-    write_guest_u64(command_buffer + 0x10, 0);
-    state.ampr_command_buffers.remove(&command_buffer);
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_OFFSET_OFFSET, 0);
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_COUNT_OFFSET, 0);
+    write_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_SIZE_OFFSET, 0);
+    write_guest_u64(command_buffer + AMPR_COMMAND_BUFFER_ADDRESS_OFFSET, 0);
+    state
+        .ampr_command_buffers
+        .insert(command_buffer, AmprCommandBufferState::default());
     buffer
 }
 
@@ -363,15 +417,22 @@ pub(crate) fn ampr_command_buffer_reset(
         .ampr_command_buffers
         .entry(command_buffer)
         .or_insert_with(|| AmprCommandBufferState {
-            buffer: read_guest_u64(command_buffer + 8),
-            size: read_guest_u64(command_buffer + 0x10),
+            buffer: read_guest_u64(command_buffer + AMPR_COMMAND_BUFFER_ADDRESS_OFFSET),
+            size: u64::from(
+                try_read_process_guest_u32(command_buffer + AMPR_COMMAND_BUFFER_SIZE_OFFSET)
+                    .unwrap_or(0),
+            ),
             ..AmprCommandBufferState::default()
         });
+    if entry.buffer == 0 || entry.size == 0 {
+        return sce_kernel_error(crate::SCE_KERNEL_ERROR_OPERATION_NOT_PERMITTED);
+    }
     entry.write_offset = 0;
     entry.command_count = 0;
     entry.pending_reads.clear();
     entry.pending_completions.clear();
     entry.pending_address_writes.clear();
+    sync_ampr_command_buffer_progress(command_buffer, 0, 0);
     0
 }
 
@@ -845,6 +906,7 @@ pub(crate) fn ampr_command_buffer_record_read(
     });
     command.write_offset += AMPR_COMMAND_RECORD_SIZE;
     command.command_count += 1;
+    sync_ampr_command_buffer_progress(command_buffer, command.write_offset, command.command_count);
     if trace_ampr_reads() {
         eprintln!(
             "[REMu][AMPR] record read id={file_id:#x} offset={file_offset:#x} requested={size:#x} destination={destination:#x} thread={:?}",
