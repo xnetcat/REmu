@@ -10,7 +10,7 @@ use crate::{
     AGC_SPI_SHADER_PGM_LO_PS, AGC_VGT_PRIMITIVE_TYPE, AgcColorTargetState, AgcComputeDispatchError,
     AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory,
     ShaderEvaluationWorkers, VideoOutState, agc_color_target_state, agc_has_active_depth_state,
-    agc_program_address, agc_register_snapshot, agc_shader_prefix_snapshot, agc_shader_snapshot,
+    agc_program_address, agc_shader_prefix_snapshot, agc_shader_snapshot,
     agc_video_out_target_for_address, draw_required_vertex_record_count, dump_draw_shader_ir,
     emit_agc_gpu_event, evaluate_draw_shader_requests_parallel,
     evaluate_shader_register_snapshot_cached, export_user_data_register, read_guest_u32,
@@ -91,7 +91,7 @@ pub(crate) fn agc_decode_compute_dispatch(
     shaders: &mut AgcShaderRegistry,
 ) -> Result<remu_gpu::ComputeDispatch, AgcComputeDispatchError> {
     let packet = agc_packet_words(packet_address, length);
-    let shader_registers = agc_register_snapshot(&graphics.shader_registers);
+    let shader_registers = graphics.shader_register_snapshot();
     let (source, launch) = if opcode == AGC_IT_DISPATCH_DIRECT {
         (
             remu_gpu::ComputeDispatchSource::Direct,
@@ -624,9 +624,9 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         pixel_shader_evaluation: None,
         color_target_address,
         scanout_target: None,
-        context_registers: agc_register_snapshot(&graphics.context_registers),
-        shader_registers: agc_register_snapshot(&graphics.shader_registers),
-        user_config_registers: agc_register_snapshot(&graphics.user_config_registers),
+        context_registers: graphics.context_register_snapshot(),
+        shader_registers: graphics.shader_register_snapshot(),
+        user_config_registers: graphics.user_config_register_snapshot(),
     };
     if indirect_arguments_address.is_none() {
         draw.index_snapshot = snapshot_draw_indices(&draw);

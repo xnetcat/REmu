@@ -1262,14 +1262,14 @@ struct OrderedGpuEventReceiver {
     event_queue_timing: bool,
     last_event_ingested_at: Option<Instant>,
     last_event_queue_wait: Duration,
-    /// Count of queued small producer writes per 8-byte label cell (`address >> 3`).
+    /// Count of queued small producer writes per queue and 4-byte label cell.
     ///
     /// The dependency-ingress predicate must know whether an ingested queue can still satisfy
     /// a blocked memory wait. Scanning every queued event per check made the ingest control
     /// path O(queue²); this index answers it in O(1). Producers wider than the small-label
     /// cap are deliberately not counted: an undercount only widens ingress, which is the safe
     /// direction, while an overcount could starve a waiting queue of its producer.
-    producer_labels: HashMap<u64, u32>,
+    producer_labels: HashMap<(u64, u64), u32>,
 }
 
 #[derive(Debug)]

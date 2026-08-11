@@ -1999,7 +1999,7 @@ fn same_queue_compute_snapshots_unsnapshotted_physical_global_after_the_gpu_wait
             metadata: None,
         }),
         shader_evaluation: Some(Arc::new(evaluation)),
-        shader_registers: Vec::new(),
+        shader_registers: std::sync::Arc::from([]),
     };
     let plan = presenter
         .prepare_shared_event_direct_compute_plan(7, &[fence], &dispatch)
@@ -3672,7 +3672,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
         shader_prefix: [0; 4],
         shader: None,
         shader_evaluation: None,
-        shader_registers: Vec::new(),
+        shader_registers: std::sync::Arc::from([]),
     };
     let program = Arc::new(Program::new(dispatch.shader_address, Vec::new()));
     let key = ComputePipelineKey {
@@ -3781,7 +3781,7 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
         shader_prefix: [0; 4],
         shader: None,
         shader_evaluation: None,
-        shader_registers: Vec::new(),
+        shader_registers: std::sync::Arc::from([]),
     };
     sender
         .send(GpuEvent::QueueSubmission {
@@ -3990,6 +3990,20 @@ fn blocked_wait_dependencies_are_ingested_before_periodic_retry_clears_block_sta
         "dependency ingress must discover the independent producer"
     );
 
+    let producer_source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event:
+                GpuEvent::MemoryRelease(GpuMemoryRelease {
+                    address: 0x4a00,
+                    value: GpuMemoryReleaseValue::Immediate32(1),
+                    ..
+                }),
+        } => source,
+        other => panic!("expected ingested producer before periodic wait retry, got {other:?}"),
+    };
+    ordered.finish_event(producer_source);
+
     let source = match ordered.try_recv(|_| true) {
         OrderedEventPoll::Event {
             source,
@@ -4005,17 +4019,6 @@ fn blocked_wait_dependencies_are_ingested_before_periodic_retry_clears_block_sta
         GpuEvent::MemoryWait(wait),
         QueueBlockReason::GuestMemoryWait(wait),
     );
-    assert!(matches!(
-        ordered.try_recv(|_| true),
-        OrderedEventPoll::Event {
-            source: OrderedEventSource::GuestQueue(33),
-            event: GpuEvent::MemoryRelease(GpuMemoryRelease {
-                address: 0x4a00,
-                value: GpuMemoryReleaseValue::Immediate32(1),
-                ..
-            }),
-        }
-    ));
 }
 
 #[test]
@@ -4589,6 +4592,18 @@ fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
         })
         .expect("queue satisfying compute submission");
 
+    let producer_source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryRelease(release),
+        } => {
+            assert_eq!(release.address, wait.address);
+            source
+        }
+        other => panic!("expected producer-first compute release, got {other:?}"),
+    };
+    ordered.finish_event(producer_source);
+
     let source = match ordered.try_recv(|_| true) {
         OrderedEventPoll::Event {
             source,
@@ -4597,7 +4612,7 @@ fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
             assert_eq!(actual, wait);
             source
         }
-        other => panic!("expected graphics wait, got {other:?}"),
+        other => panic!("expected graphics wait after its producer, got {other:?}"),
     };
     ordered.block_event(
         source,
@@ -4608,24 +4623,12 @@ fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
     let source = match ordered.try_recv(|_| true) {
         OrderedEventPoll::Event {
             source,
-            event: GpuEvent::MemoryRelease(release),
-        } => {
-            assert_eq!(release.address, wait.address);
-            source
-        }
-        other => panic!("expected compute release, got {other:?}"),
-    };
-    ordered.finish_event(source);
-    ordered.retry_guest_memory_waits();
-
-    let source = match ordered.try_recv(|_| true) {
-        OrderedEventPoll::Event {
-            source,
             event: GpuEvent::SubmissionBoundary(2),
         } => source,
         other => panic!("expected compute boundary, got {other:?}"),
     };
     ordered.finish_event(source);
+    ordered.retry_guest_memory_waits();
     let source = match ordered.try_recv(|_| true) {
         OrderedEventPoll::Event {
             source,
@@ -4647,6 +4650,79 @@ fn suspended_memory_wait_keeps_same_queue_tail_behind_it() {
             }),
             ..
         }
+    ));
+}
+
+#[test]
+fn queued_cross_queue_producer_runs_before_an_unpolled_front_wait() {
+    let (sender, receiver) = gpu_event_channel();
+    let wait = GpuMemoryWait::memory(0x5200, 1, u64::from(u32::MAX), 3, false);
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue consumer wait");
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                wait.address,
+                GpuMemoryReleaseValue::Immediate32(1),
+            ))],
+        })
+        .expect("queue matching producer");
+
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    let source = match ordered.try_recv(|_| true) {
+        OrderedEventPoll::Event {
+            source,
+            event: GpuEvent::MemoryRelease(release),
+        } => {
+            assert_eq!(release.address, wait.address);
+            source
+        }
+        other => panic!("matching producer should run before polling the wait, got {other:?}"),
+    };
+    assert_eq!(source, OrderedEventSource::GuestQueue(33));
+    ordered.finish_event(source);
+
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Event {
+            source: OrderedEventSource::GuestQueue(0),
+            event: GpuEvent::MemoryWait(actual),
+        } if actual == wait
+    ));
+}
+
+#[test]
+fn producer_index_does_not_alias_disjoint_32_bit_labels() {
+    let (sender, receiver) = gpu_event_channel();
+    let wait = GpuMemoryWait::memory(0x5304, 1, u64::from(u32::MAX), 3, false);
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![GpuEvent::MemoryWait(wait)],
+        })
+        .expect("queue consumer wait");
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: vec![GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                0x5300,
+                GpuMemoryReleaseValue::Immediate32(1),
+            ))],
+        })
+        .expect("queue disjoint producer");
+
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+    assert!(matches!(
+        ordered.try_recv(|_| true),
+        OrderedEventPoll::Event {
+            source: OrderedEventSource::GuestQueue(0),
+            event: GpuEvent::MemoryWait(actual),
+        } if actual == wait
     ));
 }
 
@@ -5342,7 +5418,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             metadata: None,
         }),
         shader_evaluation: Some(Arc::new(evaluation)),
-        shader_registers: Vec::new(),
+        shader_registers: std::sync::Arc::from([]),
     };
     assert!(
         presenter
@@ -5540,7 +5616,7 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
             metadata: None,
         }),
         shader_evaluation: Some(Arc::new(evaluation)),
-        shader_registers: Vec::new(),
+        shader_registers: std::sync::Arc::from([]),
     };
     let plan = presenter
         .prepare_shared_event_direct_compute_plan(7, &[fence], &dispatch)
@@ -7339,8 +7415,8 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
         presenter
             .statistics
             .shared_event_fallbacks_no_exact_producer,
-        1,
-        "one exact ticket missed on its first execution; retries are not new generations"
+        0,
+        "producer-first scheduling should bind the exact ticket before the consumer is polled"
     );
     assert!(matches!(
         presenter.receiver.blocked_queues.get(&0),

@@ -23,20 +23,20 @@ fn dependency_ingress_budget() -> usize {
     }
 }
 
-/// Largest producer write, in bytes, indexed per 8-byte cell in `producer_labels`.
+/// Largest producer write, in bytes, indexed per 4-byte cell in `producer_labels`.
 ///
 /// Fence labels and release/write payloads are a few dwords; indexing a multi-megabyte DMA or
 /// storage binding per cell would be as expensive as the scan this index replaces. Skipping
 /// wide producers undercounts, which only widens dependency ingress — the safe direction.
 const PRODUCER_LABEL_MAX_BYTES: u64 = 512;
 
-/// Visits the 8-byte label cells of one producer write, or nothing if it is too wide.
+/// Visits the 4-byte label cells of one producer write, or nothing if it is too wide.
 fn for_each_producer_label_cell(address: u64, byte_count: u64, mut visit: impl FnMut(u64)) {
     if byte_count == 0 || byte_count > PRODUCER_LABEL_MAX_BYTES {
         return;
     }
-    let first = address >> 3;
-    let last = address.saturating_add(byte_count - 1) >> 3;
+    let first = address >> 2;
+    let last = address.saturating_add(byte_count - 1) >> 2;
     for cell in first..=last {
         visit(cell);
     }
@@ -128,18 +128,19 @@ impl OrderedGpuEventReceiver {
         self.last_event_queue_wait
     }
 
-    fn index_queued_event_producers(&mut self, event: &GpuEvent) {
+    fn index_queued_event_producers(&mut self, queue_id: u64, event: &GpuEvent) {
         for_each_event_producer_cell(event, |cell| {
-            *self.producer_labels.entry(cell).or_insert(0) += 1;
+            *self.producer_labels.entry((cell, queue_id)).or_insert(0) += 1;
         });
     }
 
-    fn unindex_queued_event_producers(&mut self, event: &GpuEvent) {
+    fn unindex_queued_event_producers(&mut self, queue_id: u64, event: &GpuEvent) {
         for_each_event_producer_cell(event, |cell| {
-            if let Some(count) = self.producer_labels.get_mut(&cell) {
+            let key = (cell, queue_id);
+            if let Some(count) = self.producer_labels.get_mut(&key) {
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    self.producer_labels.remove(&cell);
+                    self.producer_labels.remove(&key);
                 }
             }
         });
@@ -199,7 +200,7 @@ impl OrderedGpuEventReceiver {
                         self.queue_order.push(queue_id);
                     }
                     for event in &events {
-                        self.index_queued_event_producers(event);
+                        self.index_queued_event_producers(queue_id, event);
                     }
                     self.submissions.entry(queue_id).or_default().push_back(
                         ScheduledGpuSubmission {
@@ -252,11 +253,17 @@ impl OrderedGpuEventReceiver {
 
     fn blocked_memory_wait_missing_ingested_producer(&self) -> bool {
         self.blocked_queues
-            .values()
-            .chain(self.host_block.iter())
-            .any(|reason| match reason {
+            .iter()
+            .any(|(queue_id, reason)| match reason {
                 QueueBlockReason::GuestMemoryWait(wait) => {
-                    !self.queued_wait_has_indexed_producer(*wait)
+                    !self.queued_wait_has_indexed_producer(*wait, Some(*queue_id))
+                }
+                QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
+                _ => false,
+            })
+            || self.host_block.as_ref().is_some_and(|reason| match reason {
+                QueueBlockReason::GuestMemoryWait(wait) => {
+                    !self.queued_wait_has_indexed_producer(*wait, None)
                 }
                 QueueBlockReason::GuestMemoryWaitPendingTerminal(_) => false,
                 _ => false,
@@ -267,14 +274,64 @@ impl OrderedGpuEventReceiver {
     ///
     /// Wide producers are not indexed, so a miss can be an undercount — that only elevates
     /// dependency ingress, the direction the elevated path exists to guarantee. A hit can be
-    /// aliased at cell granularity (a disjoint write in the same 8-byte cell), which merely
-    /// keeps the ordinary ingress cap; the exact scan had the same self-queue blindness. The
-    /// exact scan survives as `describe_queued_wait_producers` for the rate-limited log line.
-    fn queued_wait_has_indexed_producer(&self, wait: GpuMemoryWait) -> bool {
+    /// indexed at the guest's minimum 32-bit label granularity. Per-queue keys also keep a
+    /// producer behind its own queue's wait from masquerading as runnable cross-queue work.
+    fn queued_wait_has_indexed_producer(
+        &self,
+        wait: GpuMemoryWait,
+        excluded_queue: Option<u64>,
+    ) -> bool {
         let wait_bytes = if wait.is_64_bit { 8 } else { 4 };
-        let first = wait.address >> 3;
-        let last = wait.address.saturating_add(wait_bytes - 1) >> 3;
-        (first..=last).any(|cell| self.producer_labels.contains_key(&cell))
+        let first = wait.address >> 2;
+        let last = wait.address.saturating_add(wait_bytes - 1) >> 2;
+        self.queue_order.iter().any(|queue_id| {
+            Some(*queue_id) != excluded_queue
+                && (first..=last).any(|cell| self.producer_labels.contains_key(&(cell, *queue_id)))
+        })
+    }
+
+    fn queue_front_event(&self, queue_id: u64) -> Option<&GpuEvent> {
+        self.submissions
+            .get(&queue_id)?
+            .iter()
+            .find_map(|submission| submission.events.front())
+    }
+
+    fn queue_front_memory_wait(&self, queue_id: u64) -> Option<GpuMemoryWait> {
+        match self.queue_front_event(queue_id)? {
+            GpuEvent::MemoryWait(wait) | GpuEvent::RegisteredMemoryWait { wait, .. } => Some(*wait),
+            _ => None,
+        }
+    }
+
+    /// Chooses a runnable queue which already contains a write overlapping another queue's
+    /// front wait. Executing that queue first avoids an unnecessary CPU poll, batch flush, and
+    /// block/retry cycle while preserving FIFO order inside both guest queues.
+    fn queued_producer_before_front_wait(&self) -> Option<(u64, u64)> {
+        for consumer_queue in self.queue_order.iter().copied() {
+            if self.blocked_queues.contains_key(&consumer_queue) {
+                continue;
+            }
+            let Some(wait) = self.queue_front_memory_wait(consumer_queue) else {
+                continue;
+            };
+            let wait_bytes = if wait.is_64_bit { 8 } else { 4 };
+            let first = wait.address >> 2;
+            let last = wait.address.saturating_add(wait_bytes - 1) >> 2;
+            let producer_queue = self.queue_order.iter().copied().find(|queue_id| {
+                *queue_id != consumer_queue
+                    && !self.blocked_queues.contains_key(queue_id)
+                    && self
+                        .queue_front_event(*queue_id)
+                        .is_some_and(|event| !event_is_memory_wait(event))
+                    && (first..=last)
+                        .any(|cell| self.producer_labels.contains_key(&(cell, *queue_id)))
+            });
+            if let Some(producer_queue) = producer_queue {
+                return Some((consumer_queue, producer_queue));
+            }
+        }
+        None
     }
 
     /// Returns whether one current queue front can execute without first polling a memory wait.
@@ -390,6 +447,16 @@ impl OrderedGpuEventReceiver {
             };
         }
 
+        if let Some((consumer_queue, producer_queue)) = self.queued_producer_before_front_wait()
+            && let Some(event) = self.pop_queue_event(producer_queue)
+        {
+            self.active_queue = Some(consumer_queue);
+            return OrderedEventPoll::Event {
+                source: OrderedEventSource::GuestQueue(producer_queue),
+                event,
+            };
+        }
+
         if let Some(queue_id) = self.active_queue {
             if !self.blocked_queues.contains_key(&queue_id)
                 && let Some(event) = self.pop_queue_event(queue_id)
@@ -456,7 +523,7 @@ impl OrderedGpuEventReceiver {
         self.last_event_queue_wait = ingested_at.map_or(Duration::ZERO, |at| {
             Instant::now().saturating_duration_since(at)
         });
-        self.unindex_queued_event_producers(&event);
+        self.unindex_queued_event_producers(queue_id, &event);
         Some(event)
     }
 
@@ -499,7 +566,7 @@ impl OrderedGpuEventReceiver {
                 self.host_block = Some(reason);
             }
             OrderedEventSource::GuestQueue(queue_id) => {
-                self.index_queued_event_producers(&event);
+                self.index_queued_event_producers(queue_id, &event);
                 self.submissions
                     .get_mut(&queue_id)
                     .and_then(|queue| queue.front_mut())

@@ -894,44 +894,67 @@ mod tests {
     }
 
     fn append_color_target(
-        registers: &mut Vec<GpuRegister>,
+        registers: &mut Arc<[GpuRegister]>,
         slot: u32,
         address: u64,
         width: u32,
         height: u32,
     ) {
         let primary = slot * super::super::super::CB_COLOR_REGISTER_STRIDE;
-        registers.extend([
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_BASE + primary,
-                value: u32::try_from(address >> 8)
-                    .expect("test color-target address low bits fit u32"),
-            },
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_VIEW + primary,
-                value: 0,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_INFO + primary,
-                value: 10 << 2,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_ATTRIB + primary,
-                value: 0,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_BASE_EXT + slot,
-                value: ((address >> 40) & 0xff) as u32,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_ATTRIB2 + slot,
-                value: ((width - 1) << 14) | (height - 1),
-            },
-            GpuRegister {
-                offset: super::super::super::decode::CB_COLOR0_ATTRIB3 + slot,
-                value: u32::from(height > 1) << 24,
-            },
-        ]);
+        extend_registers(
+            registers,
+            [
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_BASE + primary,
+                    value: u32::try_from(address >> 8)
+                        .expect("test color-target address low bits fit u32"),
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_VIEW + primary,
+                    value: 0,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_INFO + primary,
+                    value: 10 << 2,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_ATTRIB + primary,
+                    value: 0,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_BASE_EXT + slot,
+                    value: ((address >> 40) & 0xff) as u32,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_ATTRIB2 + slot,
+                    value: ((width - 1) << 14) | (height - 1),
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::CB_COLOR0_ATTRIB3 + slot,
+                    value: u32::from(height > 1) << 24,
+                },
+            ],
+        );
+    }
+
+    fn mutate_registers(
+        registers: &mut Arc<[GpuRegister]>,
+        mutate: impl FnOnce(&mut Vec<GpuRegister>),
+    ) {
+        let mut owned = registers.to_vec();
+        mutate(&mut owned);
+        *registers = owned.into();
+    }
+
+    fn push_register(registers: &mut Arc<[GpuRegister]>, register: GpuRegister) {
+        mutate_registers(registers, |owned| owned.push(register));
+    }
+
+    fn extend_registers<const N: usize>(
+        registers: &mut Arc<[GpuRegister]>,
+        extension: [GpuRegister; N],
+    ) {
+        mutate_registers(registers, |owned| owned.extend(extension));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -961,9 +984,9 @@ mod tests {
             pixel_shader_evaluation: None,
             color_target_address: base,
             scanout_target: None,
-            context_registers: Vec::new(),
-            shader_registers: Vec::new(),
-            user_config_registers: Vec::new(),
+            context_registers: Arc::from([]),
+            shader_registers: Arc::from([]),
+            user_config_registers: Arc::from([]),
         };
         append_color_target(&mut draw.context_registers, 0, base, 64, 64);
         append_color_target(
@@ -973,47 +996,52 @@ mod tests {
             64,
             64,
         );
-        draw.context_registers.push(GpuRegister {
-            offset: super::super::super::CB_TARGET_MASK,
-            value: 0xff,
-        });
+        push_register(
+            &mut draw.context_registers,
+            GpuRegister {
+                offset: super::super::super::CB_TARGET_MASK,
+                value: 0xff,
+            },
+        );
 
         let depth = base + 2 * GUEST_PAGE_SIZE;
         let depth_base =
             u32::try_from(depth >> 8).expect("test depth-target address low bits fit u32");
         let depth_base_hi = ((depth >> 40) & 0xff) as u32;
-        draw.context_registers.extend([
-            GpuRegister {
-                offset: super::super::super::DB_DEPTH_SIZE_XY,
-                value: 63 | (63 << 16),
-            },
-            GpuRegister {
-                offset: super::super::super::DB_Z_INFO,
-                value: 3,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::DB_Z_READ_BASE,
-                value: depth_base,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::DB_Z_WRITE_BASE,
-                value: depth_base,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::DB_Z_READ_BASE_HI,
-                value: depth_base_hi,
-            },
-            GpuRegister {
-                offset: super::super::super::decode::DB_Z_WRITE_BASE_HI,
-                value: depth_base_hi,
-            },
-            GpuRegister {
-                offset: super::super::super::DB_DEPTH_CONTROL,
-                value: 0x66,
-            },
-        ]);
-        draw.context_registers
-            .sort_unstable_by_key(|register| register.offset);
+        extend_registers(
+            &mut draw.context_registers,
+            [
+                GpuRegister {
+                    offset: super::super::super::DB_DEPTH_SIZE_XY,
+                    value: 63 | (63 << 16),
+                },
+                GpuRegister {
+                    offset: super::super::super::DB_Z_INFO,
+                    value: 3,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::DB_Z_READ_BASE,
+                    value: depth_base,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::DB_Z_WRITE_BASE,
+                    value: depth_base,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::DB_Z_READ_BASE_HI,
+                    value: depth_base_hi,
+                },
+                GpuRegister {
+                    offset: super::super::super::decode::DB_Z_WRITE_BASE_HI,
+                    value: depth_base_hi,
+                },
+                GpuRegister {
+                    offset: super::super::super::DB_DEPTH_CONTROL,
+                    value: 0x66,
+                },
+            ],
+        );
+        Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
         let global = base + 3 * GUEST_PAGE_SIZE;
         let writable_global = base + 4 * GUEST_PAGE_SIZE;
@@ -1223,19 +1251,21 @@ mod tests {
     fn fragmentless_depth_only_draw_is_structurally_complete() {
         let (_space, base) = mapped_space(16);
         let mut draw = complete_draw(base);
-        draw.context_registers.retain(|register| {
-            !matches!(
-                register.offset,
-                super::super::super::CB_TARGET_MASK
-                    | super::super::super::decode::CB_COLOR0_BASE
-                    | super::super::super::decode::CB_COLOR0_VIEW
-                    | super::super::super::decode::CB_COLOR0_INFO
-                    | super::super::super::decode::CB_COLOR0_ATTRIB
-                    | super::super::super::decode::CB_COLOR0_ATTRIB2
-                    | super::super::super::decode::CB_COLOR0_ATTRIB3
-            ) && register.offset
-                < super::super::super::decode::CB_COLOR0_BASE
-                    + super::super::super::CB_COLOR_REGISTER_STRIDE
+        mutate_registers(&mut draw.context_registers, |registers| {
+            registers.retain(|register| {
+                !matches!(
+                    register.offset,
+                    super::super::super::CB_TARGET_MASK
+                        | super::super::super::decode::CB_COLOR0_BASE
+                        | super::super::super::decode::CB_COLOR0_VIEW
+                        | super::super::super::decode::CB_COLOR0_INFO
+                        | super::super::super::decode::CB_COLOR0_ATTRIB
+                        | super::super::super::decode::CB_COLOR0_ATTRIB2
+                        | super::super::super::decode::CB_COLOR0_ATTRIB3
+                ) && register.offset
+                    < super::super::super::decode::CB_COLOR0_BASE
+                        + super::super::super::CB_COLOR_REGISTER_STRIDE
+            })
         });
         draw.pixel_shader = None;
         draw.pixel_shader_evaluation = None;
@@ -1292,12 +1322,14 @@ mod tests {
 
         for operation in [2, 3, 5] {
             let mut special = draw.clone();
-            special.context_registers.push(GpuRegister {
-                offset: super::super::super::CB_COLOR_CONTROL,
-                value: operation << 4,
-            });
-            special
-                .context_registers
+            push_register(
+                &mut special.context_registers,
+                GpuRegister {
+                    offset: super::super::super::CB_COLOR_CONTROL,
+                    value: operation << 4,
+                },
+            );
+            Arc::make_mut(&mut special.context_registers)
                 .sort_unstable_by_key(|register| register.offset);
             cases.push((special, SharedEventDrawReject::SpecialOperation));
         }

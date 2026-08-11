@@ -32,11 +32,11 @@
 - Produces: completion helpers accepting an explicit `sequence: u64`.
 - Consumes: existing AGC-state and EventState locks.
 
-- [ ] Add a failing route/ordering test proving all six submission NIDs use the unlocked handler and an unrelated NID does not.
-- [ ] Run the focused runtime test and confirm it fails because the unlocked route is absent.
-- [ ] Add a submission-serialization mutex, cloneable VideoOut snapshot, short dispatch-lock snapshot/update sections, and explicit-sequence publication helpers.
-- [ ] Route the unlocked handler before the process-wide write lock in the live import path.
-- [ ] Run the focused tests and the existing AGC submission tests.
+- [x] Add a failing route/ordering test proving all six submission NIDs use the unlocked handler and an unrelated NID does not.
+- [x] Run the focused runtime test and confirm it fails because the unlocked route is absent.
+- [x] Add a submission-serialization mutex, cloneable VideoOut snapshot, short dispatch-lock snapshot/update sections, and explicit-sequence publication helpers.
+- [x] Route the unlocked handler before the process-wide write lock in the live import path.
+- [x] Run the focused tests and the existing AGC submission tests.
 
 ### Task 2: Schedule an ingested cross-queue producer before a front wait
 
@@ -48,12 +48,12 @@
 - Produces: exact `(four_byte_cell, queue_id)` producer counts.
 - Produces: a receiver decision returning one runnable producer queue for a front wait.
 
-- [ ] Add a failing receiver test with a consumer wait queued before a producer release; require the release to be returned first without blocking the consumer.
-- [ ] Add a failing test proving a write to the other half of the old eight-byte cell is not a producer.
-- [ ] Run both focused tests and confirm the old consumer-first/cell-alias behavior.
-- [ ] Replace the count-only eight-byte index with exact four-byte, per-queue counts.
-- [ ] Select one different runnable producer queue before popping a front wait, preserving both queue FIFOs and the existing fallback.
-- [ ] Run the focused and full gpu-metal submission tests.
+- [x] Add a failing receiver test with a consumer wait queued before a producer release; require the release to be returned first without blocking the consumer.
+- [x] Add a failing test proving a write to the other half of the old eight-byte cell is not a producer.
+- [x] Run both focused tests and confirm the old consumer-first/cell-alias behavior.
+- [x] Replace the count-only eight-byte index with exact four-byte, per-queue counts.
+- [x] Select one different runnable producer queue before popping a front wait, preserving both queue FIFOs and the existing fallback.
+- [x] Run the focused and full gpu-metal submission tests.
 
 ### Task 3: Share and cache immutable register snapshots
 
@@ -71,12 +71,12 @@
 - Produces: draw/compute fields of type `Arc<[GpuRegister]>`.
 - Produces: generation-keyed `AgcGraphicsState` snapshot methods.
 
-- [ ] Add failing tests asserting two snapshots without a register mutation are `Arc::ptr_eq` and a real mutation creates a new snapshot.
-- [ ] Add a failing sorted-lookup test that distinguishes present and absent offsets.
-- [ ] Convert event payloads and fixtures from `Vec<GpuRegister>` to `Arc<[GpuRegister]>`.
-- [ ] Add per-register-file generations and cached snapshots; invalidate only when a value really changes.
-- [ ] Use binary search for runtime lookup over sorted snapshots.
-- [ ] Run `remu-gpu`, focused runtime, and gpu-metal compile/tests.
+- [x] Add failing tests asserting two snapshots without a register mutation are `Arc::ptr_eq` and a real mutation creates a new snapshot.
+- [x] Add a failing sorted-lookup test that distinguishes present and absent offsets.
+- [x] Convert event payloads and fixtures from `Vec<GpuRegister>` to `Arc<[GpuRegister]>`.
+- [x] Add per-register-file generations and cached snapshots; invalidate only when a value really changes.
+- [x] Use binary search for runtime lookup over sorted snapshots.
+- [x] Run `remu-gpu`, focused runtime, and gpu-metal compile/tests.
 
 ### Task 4: Compact shader-evaluation cache admission
 
@@ -88,10 +88,10 @@
 - Produces: `ShaderEvaluationAdmissionFilter::observe(fingerprint) -> bool`.
 - Produces: one precomputed fingerprint per full evaluation key.
 
-- [ ] Add failing tests for first-observation rejection, second-observation admission, and bounded oldest-fingerprint retirement.
-- [ ] Extract the admission filter using only `u64` fingerprints and admission ids.
-- [ ] Precompute the full key fingerprint once and make the admitted map hash only that fingerprint while retaining full key equality.
-- [ ] Run focused cache tests and the deterministic runtime library suite.
+- [x] Add failing tests for first-observation rejection, second-observation admission, and bounded oldest-fingerprint retirement.
+- [x] Extract the admission filter using only `u64` fingerprints and admission ids.
+- [x] Precompute the full key fingerprint once and make the admitted map hash only that fingerprint while retaining full key equality.
+- [x] Run focused cache tests and the deterministic runtime library suite.
 
 ### Task 5: Batch chronic write-watch demotion
 
@@ -104,10 +104,10 @@
 - Produces: test-only protection-call counter.
 - Consumes: existing `restore_unowned_pages` coalescing.
 
-- [ ] Add a failing multi-page demotion test that asserts bounded protection calls and preserves an overlapping armed owner.
-- [ ] Count protection calls under `cfg(test)` without changing release behavior.
-- [ ] Disarm the whole demoted range and restore it once through `restore_unowned_pages`.
-- [ ] Run the focused and full remu-memory tests single-threaded.
+- [x] Add a failing multi-page demotion test that asserts bounded protection calls and preserves an overlapping armed owner.
+- [x] Count protection calls under `cfg(test)` without changing release behavior.
+- [x] Disarm the whole demoted range and restore it once through `restore_unowned_pages`.
+- [x] Run the focused and full remu-memory tests single-threaded.
 
 ### Task 6: Release build and documentation verification
 
@@ -118,8 +118,7 @@
 **Interfaces:**
 - Produces: one release codegen unit with ThinLTO.
 
-- [ ] Set release `codegen-units = 1` so the Rosetta-hosted hot path is optimized as one unit.
-- [ ] Update status documentation with implemented fast paths and the no-live-benchmark limitation.
-- [ ] Run formatting, focused suites, workspace check, and clippy where the existing dirty tree permits.
-- [ ] Inspect the final diff for unrelated edits and report any pre-existing failures separately.
-
+- [x] Set release `codegen-units = 1` so the Rosetta-hosted hot path is optimized as one unit.
+- [x] Update status documentation with implemented fast paths and the no-live-benchmark limitation.
+- [x] Run formatting, focused suites, workspace check, and clippy where the existing dirty tree permits.
+- [x] Inspect the final diff for unrelated edits and report any pre-existing failures separately.

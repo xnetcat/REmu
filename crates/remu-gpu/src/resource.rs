@@ -136,9 +136,9 @@ pub struct IndexedDraw {
     pub pixel_shader_evaluation: Option<Arc<ShaderEvaluation>>,
     pub color_target_address: u64,
     pub scanout_target: Option<GpuScanoutTarget>,
-    pub context_registers: Vec<GpuRegister>,
-    pub shader_registers: Vec<GpuRegister>,
-    pub user_config_registers: Vec<GpuRegister>,
+    pub context_registers: Arc<[GpuRegister]>,
+    pub shader_registers: Arc<[GpuRegister]>,
+    pub user_config_registers: Arc<[GpuRegister]>,
 }
 
 #[derive(Debug, Error)]

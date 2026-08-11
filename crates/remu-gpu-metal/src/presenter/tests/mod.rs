@@ -100,7 +100,7 @@ mod tiling;
 
 #[allow(clippy::too_many_arguments)]
 fn append_color_target_registers(
-    registers: &mut Vec<GpuRegister>,
+    registers: &mut impl TestGpuRegisterCollection,
     slot: u32,
     address: u64,
     width: u32,
@@ -110,41 +110,80 @@ fn append_color_target_registers(
     tile_mode: u32,
 ) {
     let primary = slot * CB_COLOR_REGISTER_STRIDE;
-    registers.extend([
-        GpuRegister {
-            offset: CB_COLOR0_BASE + primary,
-            value: u32::try_from((address >> 8) & 0xffff_ffff).expect("base fits u32"),
-        },
-        GpuRegister {
-            offset: CB_COLOR0_VIEW + primary,
-            value: 0,
-        },
-        GpuRegister {
-            offset: CB_COLOR0_INFO + primary,
-            value: (data_format << 2) | (number_type << 8),
-        },
-        GpuRegister {
-            offset: CB_COLOR0_ATTRIB + primary,
-            value: 0,
-        },
-        GpuRegister {
-            offset: CB_COLOR0_CMASK + primary,
-            value: u32::try_from(((address + 0x1000_0000) >> 8) & 0xffff_ffff)
-                .expect("CMASK base fits u32"),
-        },
-        GpuRegister {
-            offset: CB_COLOR0_BASE_EXT + slot,
-            value: u32::try_from((address >> 40) & 0xff).expect("base extension fits u32"),
-        },
-        GpuRegister {
-            offset: CB_COLOR0_ATTRIB2 + slot,
-            value: ((width - 1) << 14) | (height - 1),
-        },
-        GpuRegister {
-            offset: CB_COLOR0_ATTRIB3 + slot,
-            value: (tile_mode << 14) | (u32::from(height > 1) << 24),
-        },
-    ]);
+    extend_gpu_registers(
+        registers,
+        [
+            GpuRegister {
+                offset: CB_COLOR0_BASE + primary,
+                value: u32::try_from((address >> 8) & 0xffff_ffff).expect("base fits u32"),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_VIEW + primary,
+                value: 0,
+            },
+            GpuRegister {
+                offset: CB_COLOR0_INFO + primary,
+                value: (data_format << 2) | (number_type << 8),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_ATTRIB + primary,
+                value: 0,
+            },
+            GpuRegister {
+                offset: CB_COLOR0_CMASK + primary,
+                value: u32::try_from(((address + 0x1000_0000) >> 8) & 0xffff_ffff)
+                    .expect("CMASK base fits u32"),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_BASE_EXT + slot,
+                value: u32::try_from((address >> 40) & 0xff).expect("base extension fits u32"),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_ATTRIB2 + slot,
+                value: ((width - 1) << 14) | (height - 1),
+            },
+            GpuRegister {
+                offset: CB_COLOR0_ATTRIB3 + slot,
+                value: (tile_mode << 14) | (u32::from(height > 1) << 24),
+            },
+        ],
+    );
+}
+
+fn mutate_gpu_registers(
+    registers: &mut std::sync::Arc<[GpuRegister]>,
+    mutate: impl FnOnce(&mut Vec<GpuRegister>),
+) {
+    let mut owned = registers.to_vec();
+    mutate(&mut owned);
+    *registers = owned.into();
+}
+
+trait TestGpuRegisterCollection {
+    fn extend_registers<const N: usize>(&mut self, extension: [GpuRegister; N]);
+}
+
+impl TestGpuRegisterCollection for Vec<GpuRegister> {
+    fn extend_registers<const N: usize>(&mut self, extension: [GpuRegister; N]) {
+        self.extend(extension);
+    }
+}
+
+impl TestGpuRegisterCollection for std::sync::Arc<[GpuRegister]> {
+    fn extend_registers<const N: usize>(&mut self, extension: [GpuRegister; N]) {
+        mutate_gpu_registers(self, |owned| owned.extend(extension));
+    }
+}
+
+fn push_gpu_register(registers: &mut std::sync::Arc<[GpuRegister]>, register: GpuRegister) {
+    mutate_gpu_registers(registers, |owned| owned.push(register));
+}
+
+fn extend_gpu_registers<const N: usize>(
+    registers: &mut impl TestGpuRegisterCollection,
+    extension: [GpuRegister; N],
+) {
+    registers.extend_registers(extension);
 }
 
 /// A minimal graphics pipeline key, used where only its identity as a block reason matters.
@@ -220,9 +259,9 @@ fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw 
         pixel_shader_evaluation: None,
         color_target_address: 0,
         scanout_target: None,
-        context_registers: Vec::new(),
-        shader_registers: Vec::new(),
-        user_config_registers: Vec::new(),
+        context_registers: std::sync::Arc::from([]),
+        shader_registers: std::sync::Arc::from([]),
+        user_config_registers: std::sync::Arc::from([]),
     }
 }
 
@@ -236,37 +275,40 @@ fn append_depth_target_registers(
 ) {
     let base = u32::try_from((address >> 8) & 0xffff_ffff).expect("depth base fits u32");
     let base_hi = u32::try_from((address >> 40) & 0xff).expect("depth base high fits u32");
-    draw.context_registers.extend([
-        GpuRegister {
-            offset: DB_DEPTH_SIZE_XY,
-            value: (width - 1) | ((height - 1) << 16),
-        },
-        GpuRegister {
-            offset: DB_Z_INFO,
-            value: z_info,
-        },
-        GpuRegister {
-            offset: DB_Z_READ_BASE,
-            value: base,
-        },
-        GpuRegister {
-            offset: DB_Z_WRITE_BASE,
-            value: base,
-        },
-        GpuRegister {
-            offset: DB_Z_READ_BASE_HI,
-            value: base_hi,
-        },
-        GpuRegister {
-            offset: DB_Z_WRITE_BASE_HI,
-            value: base_hi,
-        },
-        GpuRegister {
-            offset: DB_DEPTH_CONTROL,
-            value: depth_control,
-        },
-    ]);
-    draw.context_registers
+    extend_gpu_registers(
+        &mut draw.context_registers,
+        [
+            GpuRegister {
+                offset: DB_DEPTH_SIZE_XY,
+                value: (width - 1) | ((height - 1) << 16),
+            },
+            GpuRegister {
+                offset: DB_Z_INFO,
+                value: z_info,
+            },
+            GpuRegister {
+                offset: DB_Z_READ_BASE,
+                value: base,
+            },
+            GpuRegister {
+                offset: DB_Z_WRITE_BASE,
+                value: base,
+            },
+            GpuRegister {
+                offset: DB_Z_READ_BASE_HI,
+                value: base_hi,
+            },
+            GpuRegister {
+                offset: DB_Z_WRITE_BASE_HI,
+                value: base_hi,
+            },
+            GpuRegister {
+                offset: DB_DEPTH_CONTROL,
+                value: depth_control,
+            },
+        ],
+    );
+    std::sync::Arc::make_mut(&mut draw.context_registers)
         .sort_unstable_by_key(|register| register.offset);
 }
 

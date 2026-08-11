@@ -28,7 +28,7 @@ use super::{
     decode_graphics_wave_state, decode_metal_blend_attachment, decode_ngg_registers_from_state,
     decode_ngg_subgroup_limits, decode_ngg_subgroup_limits_with_uc, decode_raster_state,
     decode_render_target_format, decode_render_targets_from_registers, decode_scissor,
-    decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch,
+    decode_viewport, disabled_metal_blend_attachment, effective_linear_pitch, extend_gpu_registers,
     fragmentless_pixel_program, graphics_pipeline_key, guest_texture_byte_count,
     guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
@@ -36,9 +36,9 @@ use super::{
     metal_primitive_topology_class, metal_primitive_type, ngg_mesh_base_vertex,
     ngg_mesh_dispatch_required, noop_placeholder_cover_draw, pixel_input_controls,
     prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
-    prepare_nonindexed_ngg_indices, read_draw_indices, read_texture_array_linear,
-    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
-    render_target_cmask_address, render_target_fast_clear_color,
+    prepare_nonindexed_ngg_indices, push_gpu_register, read_draw_indices,
+    read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
+    rearm_depth_metadata_clear, render_target_cmask_address, render_target_fast_clear_color,
 };
 
 fn empty_shader_evaluation() -> Arc<ShaderEvaluation> {
@@ -102,7 +102,8 @@ fn clamps_signed_screen_scissor_coordinates_instead_of_dropping_bit_15() {
             offset: 0x00d,
             value: (70 << 16) | 80,
         },
-    ];
+    ]
+    .into();
 
     let scissor = decode_scissor(&draw, 100, 100).expect("signed screen scissor decodes");
     let GuestScissor::Rect(rect) = scissor else {
@@ -136,9 +137,9 @@ fn applies_window_offset_disable_independently_for_each_scissor() {
             offset: 0x091,
             value: (100 << 16) | 100,
         },
-    ];
-    draw.context_registers
-        .sort_by_key(|register| register.offset);
+    ]
+    .into();
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
     let scissor = decode_scissor(&draw, 200, 200).expect("independent scissor flags decode");
     let GuestScissor::Rect(rect) = scissor else {
@@ -195,10 +196,13 @@ fn carries_pa_cl_vte_cntl_into_pipeline_key() {
     });
     draw.export_shader_evaluation = Some(empty_shader_evaluation());
     append_depth_target_registers(&mut draw, 0x0080_10b5_0000, 256, 256, 0xa000_0003, 0x66);
-    draw.context_registers.push(GpuRegister {
-        offset: 0x206,
-        value: 0x43f,
-    });
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: 0x206,
+            value: 0x43f,
+        },
+    );
 
     let key = graphics_pipeline_key(&draw).expect("depth-only draw has a Metal pipeline");
     assert_eq!(
@@ -258,12 +262,14 @@ fn rejects_fragmentless_pipeline_with_color_writes() {
         metadata: None,
     });
     draw.export_shader_evaluation = Some(empty_shader_evaluation());
-    draw.context_registers.push(GpuRegister {
-        offset: CB_TARGET_MASK,
-        value: 0xf,
-    });
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let error = graphics_pipeline_key(&draw).expect_err("color writes require a pixel shader");
     assert!(error.contains("requests color output"), "{error}");
@@ -335,17 +341,19 @@ fn color_resolve_decodes_mrt1_without_a_target_mask_or_shader_export() {
         7,
         27,
     );
-    draw.context_registers.push(GpuRegister {
-        offset: CB_TARGET_MASK,
-        value: 0xf,
-    });
-    draw.context_registers
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == CB_COLOR0_ATTRIB)
         .expect("MRT0 attributes")
         .value = (1 << 12) | (1 << 15);
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let (source, destination) =
         decode_color_resolve_targets(&draw).expect("valid MRT0-to-MRT1 resolve");
@@ -371,13 +379,12 @@ fn fast_clear_elimination_decodes_mrt0_without_a_target_mask_or_shader_export() 
         7,
         27,
     );
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == CB_COLOR0_INFO)
         .expect("MRT0 info")
         .value |= 1 << 13;
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let target = decode_color_eliminate_fast_clear_target(&draw)
         .expect("valid fast-clear state")
@@ -386,7 +393,7 @@ fn fast_clear_elimination_decodes_mrt0_without_a_target_mask_or_shader_export() 
     assert_eq!(target.texture.address, address);
     assert!(target.fast_clear_enabled);
 
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == CB_COLOR0_INFO)
         .expect("MRT0 info")
@@ -441,19 +448,21 @@ fn decodes_observed_depth16_greater_equal_read_only_target() {
 fn decodes_htile_address_only_when_tile_surface_is_enabled() {
     let mut draw = indexed_draw(0, 0, 0);
     append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0x66);
-    draw.context_registers.push(GpuRegister {
-        offset: DB_HTILE_DATA_BASE,
-        value: 0x0012_3456,
-    });
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: DB_HTILE_DATA_BASE,
+            value: 0x0012_3456,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let depth = decode_depth_target(&draw)
         .expect("valid HTILE depth target")
         .expect("enabled depth target");
     assert_eq!(depth.htile_address, Some(0x1234_5600));
 
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == DB_Z_INFO)
         .expect("depth info")
@@ -513,7 +522,7 @@ fn depth_target_uses_fixed_mode24_layout_and_rejects_nonzero_tile_index() {
         Some(3_840 * 2_176 * 4)
     );
 
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == DB_Z_INFO)
         .expect("depth info")
@@ -527,12 +536,14 @@ fn depth_target_view_selects_the_backing_array_slice() {
     let address = 0x0070_69b9_0000;
     let mut draw = indexed_draw(0, 0, 0);
     append_depth_target_registers(&mut draw, address, 1_024, 1_024, 0xa000_0001, 0x66);
-    draw.context_registers.push(GpuRegister {
-        offset: DB_DEPTH_VIEW,
-        value: 3 | (3 << 13),
-    });
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: DB_DEPTH_VIEW,
+            value: 3 | (3 << 13),
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let depth = decode_depth_target(&draw)
         .expect("single depth slice is supported")
@@ -542,7 +553,7 @@ fn depth_target_view_selects_the_backing_array_slice() {
     assert_eq!(depth.layer_count, 1);
     assert_eq!(guest_texture_byte_count(depth.texture), Some(slice_bytes));
 
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == DB_DEPTH_VIEW)
         .expect("depth view")
@@ -615,7 +626,7 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
         "an implicit first-use clear must not consume stale DB_DEPTH_CLEAR state"
     );
 
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == DB_DEPTH_CONTROL)
         .expect("depth control")
@@ -632,12 +643,12 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
             .contains("stencil is enabled without an active depth/stencil surface")
     );
 
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == DB_DEPTH_CONTROL)
         .expect("depth control")
         .value = 0x66;
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == DB_Z_INFO)
         .expect("depth info")
@@ -652,12 +663,14 @@ fn decodes_depth32_write_target_and_ignores_stencil_only_state() {
 fn ignores_stale_stencil_operations_when_stencil_testing_is_disabled() {
     let mut draw = indexed_draw(0, 0, 0);
     append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0x76);
-    draw.context_registers.push(GpuRegister {
-        offset: DB_STENCIL_CONTROL,
-        value: 0x00aa_aaaa,
-    });
-    draw.context_registers
-        .sort_by_key(|register| register.offset);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: DB_STENCIL_CONTROL,
+            value: 0x00aa_aaaa,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
     let depth = decode_depth_target(&draw)
         .expect("disabled stencil ignores stale unrepresentable ops")
@@ -677,20 +690,22 @@ fn refuses_distinct_stencil_replace_operation_value_instead_of_using_test_value(
         0xa000_0003,
         0x777,
     );
-    draw.context_registers.extend([
-        GpuRegister {
-            offset: DB_STENCIL_CONTROL,
-            // Front-face depth-pass operation is AMD REPLACE_OP.
-            value: 4 << 4,
-        },
-        GpuRegister {
-            offset: DB_STENCILREFMASK,
-            // STENCILOPVAL=0xaa, STENCILTESTVAL=0x55.
-            value: 0xaa_ff_ff55,
-        },
-    ]);
-    draw.context_registers
-        .sort_by_key(|register| register.offset);
+    extend_gpu_registers(
+        &mut draw.context_registers,
+        [
+            GpuRegister {
+                offset: DB_STENCIL_CONTROL,
+                // Front-face depth-pass operation is AMD REPLACE_OP.
+                value: 4 << 4,
+            },
+            GpuRegister {
+                offset: DB_STENCILREFMASK,
+                // STENCILOPVAL=0xaa, STENCILTESTVAL=0x55.
+                value: 0xaa_ff_ff55,
+            },
+        ],
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
     let error =
         decode_depth_target(&draw).expect_err("independent replace value is not Metal-exact");
@@ -701,18 +716,20 @@ fn refuses_distinct_stencil_replace_operation_value_instead_of_using_test_value(
 fn decodes_explicit_guest_depth_clear_without_depth_test() {
     let mut draw = indexed_draw(0, 0, 0);
     append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0);
-    draw.context_registers.extend([
-        GpuRegister {
-            offset: DB_RENDER_CONTROL,
-            value: 1,
-        },
-        GpuRegister {
-            offset: DB_DEPTH_CLEAR,
-            value: 0.25_f32.to_bits(),
-        },
-    ]);
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    extend_gpu_registers(
+        &mut draw.context_registers,
+        [
+            GpuRegister {
+                offset: DB_RENDER_CONTROL,
+                value: 1,
+            },
+            GpuRegister {
+                offset: DB_DEPTH_CLEAR,
+                value: 0.25_f32.to_bits(),
+            },
+        ],
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let depth = decode_depth_target(&draw)
         .expect("valid explicit clear state")
@@ -728,12 +745,14 @@ fn decodes_explicit_guest_depth_clear_without_depth_test() {
 fn rejects_non_finite_guest_depth_clear_value() {
     let mut draw = indexed_draw(0, 0, 0);
     append_depth_target_registers(&mut draw, 0x0070_1412_0000, 1_920, 1_080, 0xa000_0003, 0x2);
-    draw.context_registers.push(GpuRegister {
-        offset: DB_DEPTH_CLEAR,
-        value: f32::NAN.to_bits(),
-    });
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: DB_DEPTH_CLEAR,
+            value: f32::NAN.to_bits(),
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
     let depth = decode_depth_target(&draw)
         .expect("invalid clear register falls back safely")
@@ -784,22 +803,24 @@ fn absent_viewport_registers_use_agc_unit_scale_and_zero_depth_range() {
 #[test]
 fn decodes_polygon_offset_depth_bias_in_sdk_sixteenth_units() {
     let mut draw = indexed_draw(0, 0, 0);
-    draw.context_registers.extend([
-        GpuRegister {
-            offset: 0x2e0,
-            value: f32::to_bits(16.0),
-        },
-        GpuRegister {
-            offset: 0x2e1,
-            value: f32::to_bits(2.0),
-        },
-        GpuRegister {
-            offset: 0x2df,
-            value: f32::to_bits(0.25),
-        },
-    ]);
-    draw.context_registers
-        .sort_unstable_by_key(|register| register.offset);
+    extend_gpu_registers(
+        &mut draw.context_registers,
+        [
+            GpuRegister {
+                offset: 0x2e0,
+                value: f32::to_bits(16.0),
+            },
+            GpuRegister {
+                offset: 0x2e1,
+                value: f32::to_bits(2.0),
+            },
+            GpuRegister {
+                offset: 0x2df,
+                value: f32::to_bits(0.25),
+            },
+        ],
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
     let raster = decode_raster_state(&draw).expect("polygon offset raster state");
     assert_eq!(raster.depth_bias.slope_scale, 1.0);
     assert_eq!(raster.depth_bias.constant, 2.0);
@@ -948,10 +969,13 @@ fn decodes_graphics_scratch_ring_and_export_wave_width_from_agc_registers() {
 #[test]
 fn decodes_observed_clockwise_back_face_culling() {
     let mut draw = indexed_draw(0, 0, 0);
-    draw.context_registers.push(GpuRegister {
-        offset: PA_SU_SC_MODE_CNTL,
-        value: 0x246,
-    });
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: PA_SU_SC_MODE_CNTL,
+            value: 0x246,
+        },
+    );
 
     assert_eq!(
         decode_raster_state(&draw).expect("observed raster state"),
@@ -967,30 +991,32 @@ fn decodes_observed_clockwise_back_face_culling() {
 #[test]
 fn negative_height_viewport_keeps_sdk_front_face_for_metal() {
     let mut draw = indexed_draw(0, 0, 0);
-    draw.context_registers.extend([
-        GpuRegister {
-            offset: PA_SU_SC_MODE_CNTL,
-            value: 0x246,
-        },
-        GpuRegister {
-            offset: 0x10f,
-            value: 960.0_f32.to_bits(),
-        },
-        GpuRegister {
-            offset: 0x110,
-            value: 960.0_f32.to_bits(),
-        },
-        GpuRegister {
-            offset: 0x111,
-            value: (-540.0_f32).to_bits(),
-        },
-        GpuRegister {
-            offset: 0x112,
-            value: 540.0_f32.to_bits(),
-        },
-    ]);
-    draw.context_registers
-        .sort_by_key(|register| register.offset);
+    extend_gpu_registers(
+        &mut draw.context_registers,
+        [
+            GpuRegister {
+                offset: PA_SU_SC_MODE_CNTL,
+                value: 0x246,
+            },
+            GpuRegister {
+                offset: 0x10f,
+                value: 960.0_f32.to_bits(),
+            },
+            GpuRegister {
+                offset: 0x110,
+                value: 960.0_f32.to_bits(),
+            },
+            GpuRegister {
+                offset: 0x111,
+                value: (-540.0_f32).to_bits(),
+            },
+            GpuRegister {
+                offset: 0x112,
+                value: 540.0_f32.to_bits(),
+            },
+        ],
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
     assert_eq!(
         decode_raster_state(&draw).expect("negative-height viewport raster state"),
@@ -1017,10 +1043,13 @@ fn negative_height_viewport_keeps_sdk_front_face_for_metal() {
 #[test]
 fn decodes_dual_polygon_line_mode_and_rejects_unrepresentable_states() {
     let mut draw = indexed_draw(0, 0, 0);
-    draw.context_registers.push(GpuRegister {
-        offset: PA_SU_SC_MODE_CNTL,
-        value: (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8),
-    });
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: PA_SU_SC_MODE_CNTL,
+            value: (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8),
+        },
+    );
     assert_eq!(
         decode_raster_state(&draw)
             .expect("matching front/back line mode")
@@ -1028,7 +1057,7 @@ fn decodes_dual_polygon_line_mode_and_rejects_unrepresentable_states() {
         MTLTriangleFillMode::Lines
     );
 
-    draw.context_registers[0].value |= 1 | 2;
+    Arc::make_mut(&mut draw.context_registers)[0].value |= 1 | 2;
     assert!(
         decode_raster_state(&draw)
             .expect_err("Metal cannot cull both orientations")
@@ -2493,7 +2522,8 @@ fn removes_triangle_list_primitive_restart_indices() {
             offset: 0x2a5,
             value: 1,
         },
-    ];
+    ]
+    .into();
     let (indices, primitive) =
         prepare_indexed_primitive(&draw, [0, 1, 2, u32::from(u16::MAX), 3, 4, 5].into())
             .expect("triangle-list primitive restart");
@@ -2514,7 +2544,8 @@ fn expands_restarted_triangle_strips_to_triangle_lists() {
             offset: 0x2a5,
             value: 1,
         },
-    ];
+    ]
+    .into();
     let (indices, primitive) =
         prepare_indexed_primitive(&draw, [0, 1, 2, 3, u32::from(u16::MAX), 4, 5, 6].into())
             .expect("triangle-strip primitive restart");
@@ -2558,9 +2589,9 @@ fn decodes_programmed_negative_height_viewport_and_intersected_scissors() {
             offset: 0x112,
             value: 1_080.0_f32.to_bits(),
         },
-    ];
-    draw.context_registers
-        .sort_by_key(|register| register.offset);
+    ]
+    .into();
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
     let scissor = decode_scissor(&draw, 3_840, 2_160).expect("valid guest scissors");
     let super::GuestScissor::Rect(scissor_rect) = scissor else {

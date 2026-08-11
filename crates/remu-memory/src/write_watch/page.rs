@@ -9,6 +9,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) static HOST_PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+static PROTECT_RANGE_CALLS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+pub(super) fn reset_protect_range_call_count() {
+    PROTECT_RANGE_CALLS.store(0, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(super) fn protect_range_call_count() -> u64 {
+    PROTECT_RANGE_CALLS.load(Ordering::SeqCst)
+}
+
 pub(super) fn protect_page(page_address: u64, read_only: bool) -> io::Result<()> {
     protect_range(page_address, host_page_size_infallible(), read_only)
 }
@@ -27,6 +40,8 @@ pub(super) fn protect_range_no_access(address: u64, byte_count: u64) -> io::Resu
 }
 
 fn protect_range_with(address: u64, byte_count: u64, protection: i32) -> io::Result<()> {
+    #[cfg(test)]
+    PROTECT_RANGE_CALLS.fetch_add(1, Ordering::SeqCst);
     let address = usize::try_from(address)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "page address does not fit"))?
         as *mut c_void;

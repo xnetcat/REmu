@@ -59,7 +59,9 @@ assertions_on_constants = "allow" # Static ABI size checks
 
 [profile.release]
 # Module boundaries must not cost performance. Without this, rustc partitions the crate
-# into 16 codegen units along module lines and will not inline across them, so splitting
-# a large file into topic modules can silently pessimise hot paths such as import
-# dispatch. ThinLTO restores cross-module inlining at a modest build-time cost.
+# into independent codegen units along module lines and will not inline across them, so splitting
+# a large file into topic modules can silently pessimise hot paths such as import dispatch.
+# ThinLTO plus one release unit gives rustc a complete optimization view of the CPU/GPU front end;
+# release builds take longer, but emulator runtime throughput is the priority.
 lto = "thin"
+codegen-units = 1

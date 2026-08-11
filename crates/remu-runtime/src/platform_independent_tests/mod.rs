@@ -295,9 +295,10 @@ fn targetless_scanout_test_draw() -> remu_gpu::IndexedDraw {
         context_registers: vec![remu_gpu::GpuRegister {
             offset: super::AGC_CB_SHADER_MASK,
             value: 0xf,
-        }],
-        shader_registers: Vec::new(),
-        user_config_registers: Vec::new(),
+        }]
+        .into(),
+        shader_registers: Arc::from([]),
+        user_config_registers: Arc::from([]),
     }
 }
 

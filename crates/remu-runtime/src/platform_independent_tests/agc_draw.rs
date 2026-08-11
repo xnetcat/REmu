@@ -47,7 +47,8 @@ fn primitive_restart_does_not_expand_the_required_vertex_resource_range() {
             offset: 0x2a5,
             value: 1,
         },
-    ];
+    ]
+    .into();
     assert_eq!(draw_required_vertex_record_count(&draw), Some(8));
 }
 
@@ -555,7 +556,7 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
         pixel.program.address,
         instructions,
     ));
-    draw.context_registers
+    Arc::make_mut(&mut draw.context_registers)
         .iter_mut()
         .find(|register| register.offset == crate::AGC_CB_SHADER_MASK)
         .expect("test shader mask")

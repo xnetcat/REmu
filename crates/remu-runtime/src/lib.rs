@@ -137,8 +137,8 @@ pub(crate) use agc_flip::{
     queue_video_out_flip_for_video_out, refresh_completed_video_out_flips,
     request_agc_compute_submission_completion,
     request_agc_compute_submission_completion_for_sequence, request_agc_submission_completion,
-    request_agc_submission_completion_for_sequence,
-    video_out_add_flip_event, video_out_add_vblank_event, video_out_register_buffers2,
+    request_agc_submission_completion_for_sequence, video_out_add_flip_event,
+    video_out_add_vblank_event, video_out_register_buffers2,
 };
 pub(crate) use agc_registers::{
     AgcColorTargetState, AgcComputeDispatchError, AgcSubmissionError,
@@ -1138,6 +1138,12 @@ pub(crate) struct AgcGraphicsState {
     context_registers: BTreeMap<u32, u32>,
     shader_registers: BTreeMap<u32, u32>,
     user_config_registers: BTreeMap<u32, u32>,
+    context_register_generation: u64,
+    shader_register_generation: u64,
+    user_config_register_generation: u64,
+    context_register_snapshot_cache: Option<(u64, Arc<[remu_gpu::GpuRegister]>)>,
+    shader_register_snapshot_cache: Option<(u64, Arc<[remu_gpu::GpuRegister]>)>,
+    user_config_register_snapshot_cache: Option<(u64, Arc<[remu_gpu::GpuRegister]>)>,
     /// Last accepted command-processor write for each `CB_BLENDn_CONTROL` context register.
     ///
     /// This is diagnostic provenance only; draw semantics continue to come from
@@ -1187,6 +1193,12 @@ impl Default for AgcGraphicsState {
             user_config_registers: agc_register_defaults::seed_register_defaults(
                 agc_register_defaults::RegisterFile::UserConfig,
             ),
+            context_register_generation: 0,
+            shader_register_generation: 0,
+            user_config_register_generation: 0,
+            context_register_snapshot_cache: None,
+            shader_register_snapshot_cache: None,
+            user_config_register_snapshot_cache: None,
             blend_register_provenance: [None; 8],
             register_write_sequence: 0,
             predicate_skip: false,
@@ -1256,6 +1268,82 @@ pub(crate) mod agc_reset_queue_op {
 }
 
 impl AgcGraphicsState {
+    fn cached_register_snapshot(
+        registers: &BTreeMap<u32, u32>,
+        generation: u64,
+        cache: &mut Option<(u64, Arc<[remu_gpu::GpuRegister]>)>,
+    ) -> Arc<[remu_gpu::GpuRegister]> {
+        if cache
+            .as_ref()
+            .is_none_or(|(cached_generation, _)| *cached_generation != generation)
+        {
+            *cache = Some((generation, agc_register_snapshot(registers)));
+        }
+        Arc::clone(
+            &cache
+                .as_ref()
+                .expect("register snapshot cache is populated")
+                .1,
+        )
+    }
+
+    pub(crate) fn context_register_snapshot(&mut self) -> Arc<[remu_gpu::GpuRegister]> {
+        Self::cached_register_snapshot(
+            &self.context_registers,
+            self.context_register_generation,
+            &mut self.context_register_snapshot_cache,
+        )
+    }
+
+    pub(crate) fn shader_register_snapshot(&mut self) -> Arc<[remu_gpu::GpuRegister]> {
+        Self::cached_register_snapshot(
+            &self.shader_registers,
+            self.shader_register_generation,
+            &mut self.shader_register_snapshot_cache,
+        )
+    }
+
+    pub(crate) fn user_config_register_snapshot(&mut self) -> Arc<[remu_gpu::GpuRegister]> {
+        Self::cached_register_snapshot(
+            &self.user_config_registers,
+            self.user_config_register_generation,
+            &mut self.user_config_register_snapshot_cache,
+        )
+    }
+
+    pub(crate) fn set_context_register(&mut self, offset: u32, value: u32) -> Option<u32> {
+        let previous = self.context_registers.insert(offset, value);
+        if previous != Some(value) {
+            self.context_register_generation = self.context_register_generation.wrapping_add(1);
+        }
+        previous
+    }
+
+    pub(crate) fn set_shader_register(&mut self, offset: u32, value: u32) -> Option<u32> {
+        let previous = self.shader_registers.insert(offset, value);
+        if previous != Some(value) {
+            self.shader_register_generation = self.shader_register_generation.wrapping_add(1);
+        }
+        previous
+    }
+
+    pub(crate) fn remove_shader_register(&mut self, offset: u32) -> Option<u32> {
+        let previous = self.shader_registers.remove(&offset);
+        if previous.is_some() {
+            self.shader_register_generation = self.shader_register_generation.wrapping_add(1);
+        }
+        previous
+    }
+
+    pub(crate) fn set_user_config_register(&mut self, offset: u32, value: u32) -> Option<u32> {
+        let previous = self.user_config_registers.insert(offset, value);
+        if previous != Some(value) {
+            self.user_config_register_generation =
+                self.user_config_register_generation.wrapping_add(1);
+        }
+        previous
+    }
+
     /// Apply a selective `ResetQueueOp` mask. Register files reseed from
     /// `agc_register_defaults`; they are never left empty.
     pub(crate) fn apply_reset_queue_op(&mut self, ops: u32) {
@@ -1263,21 +1351,25 @@ impl AgcGraphicsState {
             self.context_registers = agc_register_defaults::seed_register_defaults(
                 agc_register_defaults::RegisterFile::Context,
             );
+            self.context_register_generation = self.context_register_generation.wrapping_add(1);
             self.blend_register_provenance = [None; 8];
         }
         if ops & agc_reset_queue_op::SH_STATE != 0 {
             self.shader_registers = agc_register_defaults::seed_register_defaults(
                 agc_register_defaults::RegisterFile::Shader,
             );
+            self.shader_register_generation = self.shader_register_generation.wrapping_add(1);
         }
         if ops & agc_reset_queue_op::UC_STATE != 0 {
             self.user_config_registers = agc_register_defaults::seed_register_defaults(
                 agc_register_defaults::RegisterFile::UserConfig,
             );
+            self.user_config_register_generation =
+                self.user_config_register_generation.wrapping_add(1);
         } else if ops & agc_reset_queue_op::MEMORY_MAPPING_MASK != 0 {
             // SDK: kMemoryMappingMask resets only UcMemoryMappingMask (0x35..0x3c).
             for offset in 0x35..=0x3c {
-                self.user_config_registers.insert(offset, 0);
+                self.set_user_config_register(offset, 0);
             }
         }
         if ops & agc_reset_queue_op::INSTANCE_COUNT != 0 {

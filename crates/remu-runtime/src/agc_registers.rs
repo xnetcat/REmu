@@ -80,11 +80,9 @@ fn agc_apply_register_value(
     value: u32,
 ) {
     let previous = match destination {
-        AgcRegisterFile::Context => graphics.context_registers.insert(normalized_offset, value),
-        AgcRegisterFile::Shader => graphics.shader_registers.insert(normalized_offset, value),
-        AgcRegisterFile::UserConfig => graphics
-            .user_config_registers
-            .insert(normalized_offset, value),
+        AgcRegisterFile::Context => graphics.set_context_register(normalized_offset, value),
+        AgcRegisterFile::Shader => graphics.set_shader_register(normalized_offset, value),
+        AgcRegisterFile::UserConfig => graphics.set_user_config_register(normalized_offset, value),
     };
     let blend_slot = normalized_offset
         .checked_sub(AGC_CB_BLEND0_CONTROL)
@@ -584,11 +582,14 @@ pub(crate) fn agc_has_active_depth_state(registers: &BTreeMap<u32, u32>) -> bool
     read_address != 0 || write_address != 0
 }
 
-pub(crate) fn agc_register_snapshot(registers: &BTreeMap<u32, u32>) -> Vec<remu_gpu::GpuRegister> {
+pub(crate) fn agc_register_snapshot(
+    registers: &BTreeMap<u32, u32>,
+) -> Arc<[remu_gpu::GpuRegister]> {
     registers
         .iter()
         .map(|(&offset, &value)| remu_gpu::GpuRegister { offset, value })
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
 }
 
 pub(crate) fn agc_shader_prefix_snapshot(address: u64) -> [u32; 4] {

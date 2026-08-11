@@ -121,22 +121,31 @@ mod tests {
     #[test]
     fn event_state_lock_is_usable_without_probe_dispatch() {
         reset_event_state_for_tests();
-        let (_h, mut state) = lock_event_state_for_write();
-        state.next_equeue = 7;
+        {
+            let (_h, mut state) = lock_event_state_for_write();
+            state.next_equeue = 7;
+        }
         crate::event_state::with_event_state_mut(|e| {
             e.kernel_equeues.insert(7);
         });
-        assert!(state.kernel_equeues.contains(&7));
+        assert!(crate::event_state::with_event_state(|state| state
+            .kernel_equeues
+            .contains(&7)));
     }
 
     #[test]
     fn event_state_may_nest_under_probe_dispatch() {
         reset_event_state_for_tests();
         let _dispatch = LockHierarchyGuard::enter(LockLevel::ProbeDispatch);
-        let (_h, state) = lock_event_state_for_write();
+        {
+            let (_h, mut state) = lock_event_state_for_write();
+            state.next_equeue = 3;
+        }
         crate::event_state::with_event_state_mut(|e| {
             e.kernel_equeues.insert(3);
         });
-        assert!(state.kernel_equeues.contains(&3));
+        assert!(crate::event_state::with_event_state(|state| state
+            .kernel_equeues
+            .contains(&3)));
     }
 }

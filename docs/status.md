@@ -78,6 +78,17 @@ wave64 execution, GS instancing, array base layers, layered target views, and wr
 authority. No clean live validation exists and no game/address-specific workaround is justified.
 See `docs/notes/gpu-3d-architecture-audit-20260810.md` and the compositor handoff.
 
+**2026-08-10 CPU/GPU front-end performance rewrite (offline; no game run):** all six live AGC
+submission imports now translate outside the process-wide service lock under a dedicated ordered
+submission lock. The Metal receiver schedules an already-ingested cross-queue label producer
+before polling its consumer wait, with exact per-queue 32-bit label indexing. Draw/compute register
+files use generation-cached shared snapshots and sorted binary lookup. Shader evaluation's two-hit
+ghost filter stores compact fingerprints rather than duplicate 64-word keys, while admitted cache
+entries retain full-key equality. Chronic multi-page write-watch demotion restores permissions in
+coalesced ranges. Release builds use one codegen unit with ThinLTO. Focused unit tests cover each
+contract; this is not yet an FPS claim because the requested no-game constraint prevents a clean
+before/after title benchmark.
+
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
 Guest exception delivery with Orbis `ucontext_t` (mcontext at `+0x40`); interruptive

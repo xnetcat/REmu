@@ -219,10 +219,13 @@ pub(super) fn arm_range(range: &WatchedRange, state: &WatchState) -> io::Result<
     if range.demoted.load(Ordering::Acquire) {
         for page in &range.pages {
             page.dirty.store(true, Ordering::Release);
-            if page.armed.swap(false, Ordering::AcqRel) {
-                restore_page_if_unowned(page.address, state);
-            }
+            page.armed.store(false, Ordering::Release);
         }
+        // Restore the now-unowned pages with the same ownership bitmap and contiguous-run
+        // coalescing used by teardown. Calling restore_page_if_unowned once per armed tail page
+        // made the one-time demotion of a large texture O(pages * all watched pages) plus one
+        // mprotect syscall per page.
+        restore_unowned_pages(range, state);
         range.dirty.store(true, Ordering::Release);
         return Ok(());
     }

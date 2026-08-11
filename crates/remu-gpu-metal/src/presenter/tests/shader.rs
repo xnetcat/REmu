@@ -64,7 +64,7 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
             metadata: None,
         }),
         shader_evaluation: Some(evaluation),
-        shader_registers: Vec::new(),
+        shader_registers: std::sync::Arc::from([]),
     };
     let key = ComputePipelineKey {
         program_identity: ProgramIdentity(program),

@@ -470,8 +470,9 @@ fn build_shader_register_state(
         compute_system_registers,
         |offset| {
             shader_registers
-                .iter()
-                .find(|register| register.offset == offset)
+                .binary_search_by_key(&offset, |register| register.offset)
+                .ok()
+                .map(|index| &shader_registers[index])
                 .map(|register| register.value)
         },
     )

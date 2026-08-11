@@ -195,12 +195,7 @@ pub(crate) fn queue_video_out_flip(
     buffer_index: u32,
     flip_argument: u64,
 ) {
-    queue_video_out_flip_for_video_out(
-        &state.video_out,
-        handle,
-        buffer_index,
-        flip_argument,
-    );
+    queue_video_out_flip_for_video_out(&state.video_out, handle, buffer_index, flip_argument);
 }
 
 pub(crate) fn queue_video_out_flip_for_video_out(
@@ -357,11 +352,7 @@ pub(crate) fn request_agc_submission_completion(
     queue_id: u64,
     events: Vec<remu_gpu::GpuEvent>,
 ) -> bool {
-    request_agc_submission_completion_for_sequence(
-        state.agc_submission_count,
-        queue_id,
-        events,
-    )
+    request_agc_submission_completion_for_sequence(state.agc_submission_count, queue_id, events)
 }
 
 pub(crate) fn request_agc_submission_completion_for_sequence(

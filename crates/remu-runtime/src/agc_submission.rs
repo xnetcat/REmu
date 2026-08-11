@@ -171,16 +171,15 @@ fn agc_emit_indirect_draw(
                 .iter()
                 .any(|&(saved, _)| saved == register)
         {
-            neutralized_registers.push((register, graphics.shader_registers.insert(register, 0)));
+            neutralized_registers.push((register, graphics.set_shader_register(register, 0)));
         }
     }
 
     let previous_instance_count =
         std::mem::replace(&mut graphics.instance_count, arguments.instance_count);
     // Indirect `startVertexLocation` programs UcIndexOffset for the duration of the draw.
-    let previous_index_offset = graphics
-        .user_config_registers
-        .insert(0x24a, arguments.base_vertex as u32);
+    let previous_index_offset =
+        graphics.set_user_config_register(0x24a, arguments.base_vertex as u32);
     agc_emit_draw_with_indirect_arguments(
         packet_address,
         graphics,
@@ -194,14 +193,12 @@ fn agc_emit_indirect_draw(
         Some(arguments_address),
     );
     graphics.instance_count = previous_instance_count;
-    graphics
-        .user_config_registers
-        .insert(0x24a, previous_index_offset.unwrap_or(0));
+    graphics.set_user_config_register(0x24a, previous_index_offset.unwrap_or(0));
     for (register, value) in neutralized_registers {
         if let Some(value) = value {
-            graphics.shader_registers.insert(register, value);
+            graphics.set_shader_register(register, value);
         } else {
-            graphics.shader_registers.remove(&register);
+            graphics.remove_shader_register(register);
         }
     }
 }

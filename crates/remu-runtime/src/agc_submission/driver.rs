@@ -3,29 +3,25 @@
 
 use crate::{
     AgcSubmissionError, GuestImportTracePhase, GuestImportTracePhaseGuard, ProbeDispatchState,
-    agc_command_abi, capture_agc_gpu_events, low_u32, queue_agc_event_write, queue_video_out_flip,
-    queue_agc_event_write_unlocked, queue_video_out_flip_for_video_out, read_guest_u32,
-    read_guest_u64, request_agc_compute_submission_completion,
+    agc_command_abi, capture_agc_gpu_events, low_u32, queue_agc_event_write,
+    queue_agc_event_write_unlocked, queue_video_out_flip, queue_video_out_flip_for_video_out,
+    read_guest_u32, read_guest_u64, request_agc_compute_submission_completion,
     request_agc_compute_submission_completion_for_sequence, request_agc_submission_completion,
-    request_agc_submission_completion_for_sequence, trace_agc_programs,
-    trace_logarithmic_sequence,
+    request_agc_submission_completion_for_sequence, trace_agc_programs, trace_logarithmic_sequence,
 };
 
 use super::{AgcSubmissionContext, agc_parse_graphics_submission, agc_parse_submission};
 
 fn unlocked_submission_snapshot() -> (crate::VideoOutState, u64) {
-    let dispatch = crate::PROBE_DISPATCH
-        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let dispatch =
+        crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
     let state = crate::lock_probe_dispatch_for_write(dispatch);
-    (
-        state.video_out.clone(),
-        state.agc_submission_count,
-    )
+    (state.video_out.clone(), state.agc_submission_count)
 }
 
 fn publish_unlocked_submission_count(sequence: u64) {
-    let dispatch = crate::PROBE_DISPATCH
-        .get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
+    let dispatch =
+        crate::PROBE_DISPATCH.get_or_init(|| std::sync::RwLock::new(ProbeDispatchState::default()));
     let mut state = crate::lock_probe_dispatch_for_write(dispatch);
     state.agc_submission_count = state.agc_submission_count.max(sequence);
 }
@@ -70,12 +66,7 @@ pub(crate) fn submit_graphics_unlocked(
         return Err("presenter is unavailable".to_owned());
     }
     for (handle, buffer_index, flip_argument) in flips {
-        queue_video_out_flip_for_video_out(
-            &video_out,
-            handle,
-            buffer_index,
-            flip_argument,
-        );
+        queue_video_out_flip_for_video_out(&video_out, handle, buffer_index, flip_argument);
     }
     for event_type in event_writes {
         queue_agc_event_write_unlocked(event_type);
@@ -129,12 +120,7 @@ pub(crate) fn submit_compute_unlocked(
         return Err("presenter is unavailable".to_owned());
     }
     for (handle, buffer_index, flip_argument) in flips {
-        queue_video_out_flip_for_video_out(
-            &video_out,
-            handle,
-            buffer_index,
-            flip_argument,
-        );
+        queue_video_out_flip_for_video_out(&video_out, handle, buffer_index, flip_argument);
     }
     for event_type in event_writes {
         queue_agc_event_write_unlocked(event_type);
@@ -142,10 +128,7 @@ pub(crate) fn submit_compute_unlocked(
     Ok(())
 }
 
-pub(crate) fn dispatch_unlocked_submission(
-    nid: &str,
-    arguments: [u64; 6],
-) -> Option<u64> {
+pub(crate) fn dispatch_unlocked_submission(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
         "UglJIZjGssM" => agc_driver_submit_dcb_unlocked(arguments),
         "6UzEidRZwkg" => agc_driver_submit_multi_dcbs_unlocked(arguments),

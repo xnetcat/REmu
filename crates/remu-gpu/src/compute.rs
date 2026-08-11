@@ -110,7 +110,7 @@ pub struct ComputeDispatch {
     pub shader_prefix: [u32; 4],
     pub shader: Option<ShaderSnapshot>,
     pub shader_evaluation: Option<Arc<ShaderEvaluation>>,
-    pub shader_registers: Vec<GpuRegister>,
+    pub shader_registers: Arc<[GpuRegister]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]

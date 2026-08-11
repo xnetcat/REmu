@@ -23,13 +23,13 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+use crate::agc_submission::submit_graphics_unlocked;
 use crate::{
     AgcSubmissionContext, KERNEL_EVENT_FILTER_GRAPHICS, ProbeDispatchState,
     SCE_KERNEL_ERROR_NOT_FOUND, agc_command_abi, agc_parse_graphics_submission,
     capture_agc_gpu_events, process_guest_range_is_readable, queue_agc_event_write,
     queue_video_out_flip, request_agc_submission_completion, sce_kernel_error,
 };
-use crate::agc_submission::submit_graphics_unlocked;
 
 const AGC_ERROR_ALIGNMENT: u64 = 0x8a6c_0002;
 const AGC_ERROR_INVALID_SUBMIT_QUEUE: u64 = 0x8a6c_0009;
@@ -118,10 +118,7 @@ fn dispatch_submission(
     })
 }
 
-pub(crate) fn dispatch_unlocked_submission(
-    nid: &str,
-    arguments: [u64; 6],
-) -> Option<u64> {
+pub(crate) fn dispatch_unlocked_submission(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
         "AhGvpITrf4M" => agr_submit_dcb_unlocked(arguments),
         "+T8Xo6LtFJI" => agr_submit_multi_dcbs_unlocked(arguments),
@@ -182,12 +179,9 @@ fn agr_submit_multi_dcbs_unlocked(arguments: [u64; 6]) -> u64 {
         if dword_count == 0 {
             continue;
         }
-        if let Err(error) =
-            submit_graphics_unlocked(u64::from(queue), command_address, dword_count)
+        if let Err(error) = submit_graphics_unlocked(u64::from(queue), command_address, dword_count)
         {
-            eprintln!(
-                "[REMu][AGC] rejected graphics submission {index} of {count}: {error}"
-            );
+            eprintln!("[REMu][AGC] rejected graphics submission {index} of {count}: {error}");
             return AGC_ERROR_UNEXPECTED_PARAMETER;
         }
     }
@@ -820,6 +814,7 @@ mod tests {
 
     #[test]
     fn a_graphics_submission_parses_its_stream_and_requests_a_completion_event() {
+        crate::event_state::reset_event_state_for_tests();
         let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_thread_local_event_sink(sender);
         let stream = command_stream();
@@ -895,6 +890,7 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_every_listed_command_buffer() {
+        crate::event_state::reset_event_state_for_tests();
         let (sender, receiver) = remu_gpu::gpu_event_channel();
         remu_gpu::install_thread_local_event_sink(sender);
         let stream = command_stream();
@@ -938,6 +934,7 @@ mod tests {
 
     #[test]
     fn a_multi_buffer_submission_runs_nothing_when_one_entry_is_invalid() {
+        crate::event_state::reset_event_state_for_tests();
         let stream = command_stream();
         let address = stream.as_ptr().addr() as u64;
         let addresses = [address, 0];

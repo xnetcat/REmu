@@ -12,6 +12,40 @@ use super::{
 };
 
 #[test]
+fn register_snapshots_are_shared_until_the_register_file_changes() {
+    let mut graphics = crate::AgcGraphicsState::default();
+    let initial = graphics.shader_register_snapshot();
+    let reused = graphics.shader_register_snapshot();
+    assert!(std::sync::Arc::ptr_eq(&initial, &reused));
+
+    graphics.set_shader_register(0x777, 0x1234_5678);
+    let changed = graphics.shader_register_snapshot();
+    assert!(!std::sync::Arc::ptr_eq(&initial, &changed));
+
+    graphics.set_shader_register(0x777, 0x1234_5678);
+    let no_op = graphics.shader_register_snapshot();
+    assert!(std::sync::Arc::ptr_eq(&changed, &no_op));
+}
+
+#[test]
+fn shader_evaluation_admission_filter_is_two_hit_and_bounded() {
+    let mut filter = crate::shader_cache::ShaderEvaluationAdmissionFilter::new(2);
+    assert!(!filter.observe(0x10));
+    assert_eq!(filter.len(), 1);
+    assert!(filter.observe(0x10));
+    assert_eq!(filter.len(), 0);
+
+    assert!(!filter.observe(0x20));
+    assert!(!filter.observe(0x30));
+    assert!(!filter.observe(0x40));
+    assert_eq!(filter.len(), 2);
+    assert!(
+        !filter.observe(0x20),
+        "the oldest one-hit fingerprint must be evicted at capacity"
+    );
+}
+
+#[test]
 fn live_agc_submissions_are_classified_for_pre_dispatch_translation() {
     for nid in [
         "UglJIZjGssM",
@@ -26,7 +60,9 @@ fn live_agc_submissions_are_classified_for_pre_dispatch_translation() {
             "submission import {nid} must not hold the process-wide dispatch lock while parsing"
         );
     }
-    assert!(!crate::is_unlocked_agc_submission_import("not-an-agc-submit"));
+    assert!(!crate::is_unlocked_agc_submission_import(
+        "not-an-agc-submit"
+    ));
 }
 
 #[test]

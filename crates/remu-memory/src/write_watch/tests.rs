@@ -237,6 +237,46 @@ fn a_chronically_dirty_watch_demotes_to_acquire_time_revalidation() {
 }
 
 #[test]
+fn demoting_a_large_dirty_watch_restores_permissions_in_one_batch() {
+    let mapping = TestMapping::new(8);
+    // SAFETY: all eight pages remain mapped until the watch is dropped.
+    let watch = unsafe { CpuWriteWatch::new(mapping.address(), (page_size() * 8) as u64).unwrap() };
+    // SAFETY: the final page remains live and deliberately overlaps the large watch. Keeping the
+    // overlap at the end also leaves the seven unowned pages as one contiguous restore run.
+    let survivor = unsafe {
+        CpuWriteWatch::new(
+            mapping.address() + (page_size() * 7) as u64,
+            page_size() as u64,
+        )
+        .unwrap()
+    };
+
+    for value in 0..(super::DEMOTION_THRESHOLD - 1) {
+        // SAFETY: the watched mapping is live and the handler restores this page's write access.
+        unsafe { mapping.write(0, value as u8) };
+        let _ = watch.consume_dirty();
+        watch.rearm().unwrap();
+    }
+    // The final dirty cycle demotes while the untouched tail pages are still armed.
+    unsafe { mapping.write(0, 0xff) };
+    let _ = watch.consume_dirty();
+    super::page::reset_protect_range_call_count();
+    watch.rearm().unwrap();
+
+    assert!(watch.is_demoted());
+    assert!(
+        super::page::protect_range_call_count() <= 1,
+        "demotion should restore one contiguous range instead of one syscall per armed page"
+    );
+    // SAFETY: the overlapping watch must keep the last page protected after the large watch
+    // demotes; this write faults through that survivor and marks it dirty.
+    unsafe { mapping.write(page_size() * 7, 0x5a) };
+    assert!(survivor.is_dirty());
+    drop(survivor);
+    drop(watch);
+}
+
+#[test]
 fn an_occasionally_dirty_watch_never_demotes() {
     let mapping = TestMapping::new(1);
     // SAFETY: the mapping remains live and writable until watch is dropped.

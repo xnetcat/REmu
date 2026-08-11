@@ -39,6 +39,24 @@ fn shader_evaluation_cache_buckets_vertex_record_extents_safely() {
 }
 
 #[test]
+fn shader_evaluation_admission_filter_is_two_hit_and_bounded() {
+    let mut filter = super::shader_cache::ShaderEvaluationAdmissionFilter::new(2);
+    assert!(!filter.observe(0x10));
+    assert_eq!(filter.len(), 1);
+    assert!(filter.observe(0x10));
+    assert_eq!(filter.len(), 0);
+
+    assert!(!filter.observe(0x20));
+    assert!(!filter.observe(0x30));
+    assert!(!filter.observe(0x40));
+    assert_eq!(filter.len(), 2);
+    assert!(
+        !filter.observe(0x20),
+        "the oldest one-hit fingerprint must be evicted at capacity"
+    );
+}
+
+#[test]
 fn shader_evaluation_cache_key_ignores_unreferenced_user_data() {
     let state = remu_shader::ShaderState {
         program: Arc::new(remu_shader::Program::new(0x1000, Vec::new())),

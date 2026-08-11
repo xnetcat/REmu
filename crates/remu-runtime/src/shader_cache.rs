@@ -20,13 +20,47 @@ pub(crate) const SHADER_EVALUATION_CACHE_CAPACITY: usize = 16 * 1024;
 
 pub(crate) const SHADER_EVALUATION_PENDING_CAPACITY: usize = SHADER_EVALUATION_CACHE_CAPACITY * 4;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ShaderEvaluationCacheKey {
     pub(crate) program_address: u64,
     pub(crate) user_data: ShaderEvaluationUserDataKey,
     pub(crate) compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
     pub(crate) user_data_scalar_register_base: u32,
     pub(crate) options: remu_shader::EvaluationOptions,
+    fingerprint: u64,
+}
+
+impl Hash for ShaderEvaluationCacheKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // Equality still compares every semantic field. The fingerprint only prevents each of
+        // the cache's hash tables from re-reading as many as 64 user-data words per lookup.
+        state.write_u64(self.fingerprint);
+    }
+}
+
+impl ShaderEvaluationCacheKey {
+    fn new(
+        program_address: u64,
+        user_data: ShaderEvaluationUserDataKey,
+        compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
+        user_data_scalar_register_base: u32,
+        options: remu_shader::EvaluationOptions,
+    ) -> Self {
+        let mut hasher = ShaderEvaluationCacheHasher::default();
+        program_address.hash(&mut hasher);
+        user_data.hash(&mut hasher);
+        compute_system_registers.hash(&mut hasher);
+        user_data_scalar_register_base.hash(&mut hasher);
+        options.hash(&mut hasher);
+        Self {
+            program_address,
+            user_data,
+            compute_system_registers,
+            user_data_scalar_register_base,
+            options,
+            fingerprint: hasher.finish(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -148,14 +182,69 @@ pub(crate) struct ShaderEvaluationCacheEntry {
 pub(crate) type ShaderEvaluationCacheEntries =
     HashMap<ShaderEvaluationCacheKey, ShaderEvaluationCacheEntry, ShaderEvaluationCacheBuildHasher>;
 
-pub(crate) type ShaderEvaluationPendingEntries =
-    HashMap<ShaderEvaluationCacheKey, u64, ShaderEvaluationCacheBuildHasher>;
+/// Bounded two-hit admission metadata for one-shot shader resource states.
+///
+/// Fingerprint collisions can admit an extra evaluation, but the main cache still checks the
+/// complete key before reuse, so collision handling cannot return a wrong shader state.
+#[derive(Debug)]
+pub(crate) struct ShaderEvaluationAdmissionFilter {
+    capacity: usize,
+    seen_once: HashMap<u64, u64, ShaderEvaluationCacheBuildHasher>,
+    order: VecDeque<(u64, u64)>,
+    next_id: u64,
+}
+
+impl ShaderEvaluationAdmissionFilter {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            seen_once: HashMap::default(),
+            order: VecDeque::new(),
+            next_id: 0,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, fingerprint: u64) -> bool {
+        if self.seen_once.remove(&fingerprint).is_some() {
+            return true;
+        }
+        if self.capacity == 0 {
+            return false;
+        }
+        while self.order.len() >= self.capacity {
+            let Some((old_fingerprint, old_id)) = self.order.pop_front() else {
+                break;
+            };
+            if self
+                .seen_once
+                .get(&old_fingerprint)
+                .is_some_and(|current_id| *current_id == old_id)
+            {
+                self.seen_once.remove(&old_fingerprint);
+            }
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.seen_once.insert(fingerprint, id);
+        self.order.push_back((fingerprint, id));
+        false
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.seen_once.len()
+    }
+}
+
+impl Default for ShaderEvaluationAdmissionFilter {
+    fn default() -> Self {
+        Self::new(SHADER_EVALUATION_PENDING_CAPACITY)
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct ShaderEvaluationCache {
     pub(crate) entries: ShaderEvaluationCacheEntries,
-    pub(crate) seen_once: ShaderEvaluationPendingEntries,
-    pub(crate) pending_admission_order: VecDeque<(ShaderEvaluationCacheKey, u64)>,
+    pub(crate) admission_filter: ShaderEvaluationAdmissionFilter,
     pub(crate) admission_order: VecDeque<(ShaderEvaluationCacheKey, u64)>,
     pub(crate) next_admission_id: u64,
     pub(crate) hits: u64,
@@ -180,7 +269,7 @@ impl ShaderEvaluationCache {
     pub(crate) fn stats(&self) -> ShaderEvaluationCacheStats {
         ShaderEvaluationCacheStats {
             entries: self.entries.len(),
-            pending_admissions: self.seen_once.len(),
+            pending_admissions: self.admission_filter.len(),
             hits: self.hits,
             misses: self.misses,
             failures: self.failures,
@@ -348,17 +437,17 @@ impl ShaderEvaluationCache {
                     format!("evaluation-error({error})")
                 });
         }
-        let key = ShaderEvaluationCacheKey {
-            program_address: state.program.address,
+        let key = ShaderEvaluationCacheKey::new(
+            state.program.address,
             // Only scalar inputs actually referenced by the decoded program can affect control
             // flow, resource discovery, or the generated Metal shader. Unity updates unused
             // hardware user-data slots extremely often, so including them here caused false
             // misses and expensive whole-generation cache destruction.
-            user_data: shader_evaluation_user_data_key(state),
-            compute_system_registers: state.compute_system_registers,
-            user_data_scalar_register_base: state.user_data_scalar_register_base,
+            shader_evaluation_user_data_key(state),
+            state.compute_system_registers,
+            state.user_data_scalar_register_base,
             options,
-        };
+        );
         if let Some(cached) = self.entries.get(&key).map(|entry| entry.value.clone()) {
             if cached
                 .as_ref()
@@ -391,34 +480,11 @@ impl ShaderEvaluationCache {
         // populating a command buffer. Never make such a failure persistent for the same pointer
         // state; only successful evaluations participate in the two-hit admission filter.
         let admit = if evaluated.is_ok() {
-            if self.seen_once.remove(&key).is_some() {
-                true
-            } else {
-                while self.pending_admission_order.len() >= SHADER_EVALUATION_PENDING_CAPACITY {
-                    let Some((old_key, admission_id)) = self.pending_admission_order.pop_front()
-                    else {
-                        break;
-                    };
-                    let is_current = self
-                        .seen_once
-                        .get(&old_key)
-                        .is_some_and(|current| *current == admission_id);
-                    if is_current {
-                        self.seen_once.remove(&old_key);
-                    }
-                }
-                let admission_id = self.next_admission_id;
-                self.next_admission_id = self.next_admission_id.wrapping_add(1);
-                self.seen_once.insert(key.clone(), admission_id);
-                self.pending_admission_order
-                    .push_back((key.clone(), admission_id));
-                false
-            }
+            self.admission_filter.observe(key.fingerprint)
         } else {
             false
         };
         if admit {
-            self.seen_once.remove(&key);
             while self.entries.len() >= SHADER_EVALUATION_CACHE_CAPACITY {
                 let Some((old_key, admission_id)) = self.admission_order.pop_front() else {
                     break;
