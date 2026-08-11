@@ -269,6 +269,52 @@ fn rdna2_floor_and_packed_unorm_conversions_preserve_exact_integer_semantics() {
 }
 
 #[test]
+fn lowers_rdna_integer_round_positive_and_u8_insert_conversions() {
+    let round_positive = compile_vector_instruction(
+        Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VCvtRpiI32F32"),
+            words: vec![0],
+            sources: vec![Operand::vector(1)],
+            destinations: vec![Operand::vector(8)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+    assert!(
+        round_positive
+            .source
+            .contains("floor(as_type<float>(remu_v_1) + 0.5f)")
+    );
+    assert!(round_positive.source.contains("+ 0.5f"));
+    assert!(round_positive.source.contains("<= -2147483648.0f ? 0x80000000u"));
+    assert!(round_positive.source.contains(">= 2147483648.0f ? 0x7FFFFFFFu"));
+
+    let insert_byte = compile_vector_instruction(
+        Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VCvtPkU8F32"),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(1),
+                Operand::vector(2),
+                Operand::vector(3),
+            ],
+            destinations: vec![Operand::vector(8)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+    assert!(insert_byte.source.contains("remu_v_2 & 3u"));
+    assert!(insert_byte.source.contains("0xFFu <<"));
+    assert!(insert_byte.source.contains("remu_v_3 & ~"));
+    assert!(insert_byte.source.contains(">= 255.0f ? 0xFFu"));
+    assert!(insert_byte.source.contains("(uint)trunc("));
+}
+
+#[test]
 fn lowers_silent_hill_half_to_u16_and_signed_bitfield_extract() {
     let conversion = compile_vector_instruction(
         Instruction {

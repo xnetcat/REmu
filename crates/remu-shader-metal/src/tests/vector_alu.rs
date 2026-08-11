@@ -150,6 +150,30 @@ fn lowers_unsigned_vector_bitfield_extract_without_overrunning_the_word() {
 }
 
 #[test]
+fn lowers_vector_bitfield_mask_from_width_and_offset() {
+    let shader = compile_vector_instruction(
+        Instruction {
+            pc: 0x250,
+            encoding: ShaderEncoding::Vop3,
+            opcode: Opcode::Known("VBfmB32"),
+            words: vec![0, 0],
+            sources: vec![
+                Operand::vector(5),
+                Operand::vector(6),
+                Operand::vector(7),
+            ],
+            destinations: vec![Operand::vector(8)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+
+    assert!(shader.source.contains("(1u << (remu_v_5 & 31u)) - 1u"));
+    assert!(shader.source.contains("<< (remu_v_6 & 31u)"));
+    assert!(!shader.source.contains("remu_v_7"));
+}
+
+#[test]
 fn lowers_each_unsigned_byte_to_f32_conversion_from_the_selected_source_bits() {
     for (name, shift) in [
         ("VCvtF32Ubyte0", 0),
