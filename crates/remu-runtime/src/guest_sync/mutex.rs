@@ -18,16 +18,39 @@ use super::identity::{
     classify_mutex_slot_value, read_pthread_slot,
 };
 use super::state::{
-    GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE, guest_mutex_shard,
-    guest_mutex_shards, guest_sync,
+    GUEST_MUTEX_SHARD_COUNT, GuestMutexEntry, GuestMutexState, MUTEX_CONTENTION_SEQUENCE,
+    guest_mutex_shard, guest_mutex_shards, guest_sync,
 };
 
 const GUEST_MUTEX_ENTRY_CACHE_SIZE: usize = 16;
+const GUEST_MUTEX_SLOT_CACHE_SIZE: usize = 16;
 const GUEST_MUTEX_TYPE_OFFSET: u64 = 0x20;
 const GUEST_MUTEX_PROTOCOL_OFFSET: u64 = 0x3c;
 
+static GUEST_MUTEX_REGISTRY_EPOCHS: [AtomicU64; GUEST_MUTEX_SHARD_COUNT] =
+    [const { AtomicU64::new(1) }; GUEST_MUTEX_SHARD_COUNT];
+
 #[cfg(test)]
 pub(crate) static GUEST_MUTEX_WAKE_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static GUEST_MUTEX_REGISTRY_LOOKUP_COUNT: std::cell::Cell<u64> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn guest_mutex_registry_lookup_count() -> u64 {
+    GUEST_MUTEX_REGISTRY_LOOKUP_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn reset_guest_mutex_lookup_observability() {
+    GUEST_MUTEX_REGISTRY_LOOKUP_COUNT.set(0);
+    GUEST_MUTEX_ENTRY_CACHE.with_borrow_mut(|cache| cache.fill(None));
+    GUEST_MUTEX_SLOT_CACHE.with_borrow_mut(|cache| cache.fill(None));
+}
 
 /// First-N mutex ABI trace when `REMU_TRACE_MUTEX_ABI=1` (Demon's Souls / Scream bring-up).
 static MUTEX_ABI_TRACE_REMAINING: AtomicU64 = AtomicU64::new(0);
@@ -70,10 +93,30 @@ thread_local! {
     static GUEST_MUTEX_ENTRY_CACHE: RefCell<
         [Option<(u64, Arc<GuestMutexEntry>)>; GUEST_MUTEX_ENTRY_CACHE_SIZE]
     > = const { RefCell::new([const { None }; GUEST_MUTEX_ENTRY_CACHE_SIZE]) };
+
+    /// Validated aliases from an SDK `ScePthreadMutex *` slot to its published control block.
+    /// The bare-handle shard epoch, guest-visible handle, and entry liveness are rechecked on every
+    /// hit, so stack-slot recycling, address reuse, and destroy/reinit cannot resurrect an older
+    /// generation or override bare-handle precedence.
+    static GUEST_MUTEX_SLOT_CACHE: RefCell<
+        [Option<(u64, u64, u64, Arc<GuestMutexEntry>)>; GUEST_MUTEX_SLOT_CACHE_SIZE]
+    > = const { RefCell::new([const { None }; GUEST_MUTEX_SLOT_CACHE_SIZE]) };
 }
 
 fn guest_mutex_cache_index(handle: u64) -> usize {
     usize::try_from(handle >> 4).unwrap_or_default() & (GUEST_MUTEX_ENTRY_CACHE_SIZE - 1)
+}
+
+fn guest_mutex_slot_cache_index(address: u64) -> usize {
+    usize::try_from(address >> 3).unwrap_or_default() & (GUEST_MUTEX_SLOT_CACHE_SIZE - 1)
+}
+
+fn guest_mutex_registry_epoch(handle: u64) -> &'static AtomicU64 {
+    &GUEST_MUTEX_REGISTRY_EPOCHS[guest_mutex_shard(handle)]
+}
+
+fn bump_guest_mutex_registry_epoch(handle: u64) {
+    guest_mutex_registry_epoch(handle).fetch_add(1, Ordering::Release);
 }
 
 fn cached_guest_mutex_entry(handle: u64) -> Option<Arc<GuestMutexEntry>> {
@@ -91,8 +134,9 @@ fn cache_guest_mutex_entry(handle: u64, entry: &Arc<GuestMutexEntry>) {
     static LOGGED: Once = Once::new();
     LOGGED.call_once(|| {
         eprintln!(
-            "[REMu][PTHREAD] mutex lookup cache enabled slots={GUEST_MUTEX_ENTRY_CACHE_SIZE} \
-             identity=control-block-handle uncontended-wake-elision=true"
+            "[REMu][PTHREAD] mutex lookup cache enabled handles={GUEST_MUTEX_ENTRY_CACHE_SIZE} \
+             aliases={GUEST_MUTEX_SLOT_CACHE_SIZE} identity=control-block-handle \
+             uncontended-wake-elision=true"
         );
     });
     GUEST_MUTEX_ENTRY_CACHE.with_borrow_mut(|cache| {
@@ -100,19 +144,72 @@ fn cache_guest_mutex_entry(handle: u64, entry: &Arc<GuestMutexEntry>) {
     });
 }
 
-fn lookup_mutex_by_handle(handle: u64) -> Option<Arc<GuestMutexEntry>> {
-    if handle == 0 || handle == PTHREAD_ADAPTIVE_MUTEX_INITIALIZER {
-        return None;
-    }
-    if let Some(entry) = cached_guest_mutex_entry(handle) {
+fn cached_guest_mutex_slot(address: u64) -> Option<Arc<GuestMutexEntry>> {
+    let cached = GUEST_MUTEX_SLOT_CACHE.with_borrow(|cache| {
+        cache[guest_mutex_slot_cache_index(address)]
+            .as_ref()
+            .filter(|(cached_address, _, _, entry)| {
+                *cached_address == address && entry.active.load(Ordering::Acquire)
+            })
+            .map(|(_, handle, epoch, entry)| (*handle, *epoch, entry.clone()))
+    });
+    let (handle, epoch, entry) = cached?;
+    let registry_epoch = guest_mutex_registry_epoch(address);
+    if registry_epoch.load(Ordering::Acquire) == epoch
+        && read_pthread_slot(address) == Some(handle)
+        && registry_epoch.load(Ordering::Acquire) == epoch
+        && entry.active.load(Ordering::Acquire)
+    {
         return Some(entry);
     }
+    GUEST_MUTEX_SLOT_CACHE.with_borrow_mut(|cache| {
+        let slot = &mut cache[guest_mutex_slot_cache_index(address)];
+        if slot
+            .as_ref()
+            .is_some_and(|(cached_address, _, _, _)| *cached_address == address)
+        {
+            *slot = None;
+        }
+    });
+    None
+}
+
+fn cache_guest_mutex_slot(
+    address: u64,
+    handle: u64,
+    registry_epoch: u64,
+    entry: &Arc<GuestMutexEntry>,
+) {
+    GUEST_MUTEX_SLOT_CACHE.with_borrow_mut(|cache| {
+        cache[guest_mutex_slot_cache_index(address)] =
+            Some((address, handle, registry_epoch, entry.clone()));
+    });
+}
+
+fn lookup_mutex_by_handle(handle: u64) -> Option<Arc<GuestMutexEntry>> {
+    lookup_mutex_by_handle_with_epoch(handle).0
+}
+
+fn lookup_mutex_by_handle_with_epoch(handle: u64) -> (Option<Arc<GuestMutexEntry>>, u64) {
+    let registry_epoch = guest_mutex_registry_epoch(handle);
+    if handle == 0 || handle == PTHREAD_ADAPTIVE_MUTEX_INITIALIZER {
+        return (None, registry_epoch.load(Ordering::Acquire));
+    }
+    if let Some(entry) = cached_guest_mutex_entry(handle) {
+        return (Some(entry), registry_epoch.load(Ordering::Acquire));
+    }
+    #[cfg(test)]
+    GUEST_MUTEX_REGISTRY_LOOKUP_COUNT
+        .set(GUEST_MUTEX_REGISTRY_LOOKUP_COUNT.get().saturating_add(1));
     let shard = guest_mutex_shards()[guest_mutex_shard(handle)]
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let entry = shard.get(&handle)?.clone();
-    cache_guest_mutex_entry(handle, &entry);
-    Some(entry)
+    let entry = shard.get(&handle).cloned();
+    let epoch = registry_epoch.load(Ordering::Acquire);
+    if let Some(entry) = entry.as_ref() {
+        cache_guest_mutex_entry(handle, entry);
+    }
+    (entry, epoch)
 }
 
 /// Resolve a `ScePthreadMutex *` argument to its host entry via the SDK pointer-typedef ABI.
@@ -127,26 +224,41 @@ pub(crate) fn guest_mutex_entry(
     address: u64,
     allow_static_init: bool,
 ) -> Option<Arc<GuestMutexEntry>> {
-    if address == 0 {
-        return None;
-    }
-    if let Some(entry) = lookup_mutex_by_handle(address) {
-        return Some(entry);
-    }
-    let slot_value = read_pthread_slot(address)?;
-    match classify_mutex_slot_value(slot_value) {
-        PthreadSlotValue::ControlBlock(handle) => lookup_mutex_by_handle(handle),
-        PthreadSlotValue::StaticDefault if allow_static_init => {
-            materialize_static_mutex(address, PthreadMutexAttrState::default())
+    loop {
+        if address == 0 {
+            return None;
         }
-        PthreadSlotValue::StaticAdaptiveMutex if allow_static_init => materialize_static_mutex(
-            address,
-            PthreadMutexAttrState {
-                mutex_type: 4,
-                ..PthreadMutexAttrState::default()
-            },
-        ),
-        PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => None,
+        if let Some(entry) = cached_guest_mutex_slot(address) {
+            return Some(entry);
+        }
+        let (bare_entry, bare_epoch) = lookup_mutex_by_handle_with_epoch(address);
+        if bare_entry.is_some() {
+            return bare_entry;
+        }
+        let slot_value = read_pthread_slot(address)?;
+        match classify_mutex_slot_value(slot_value) {
+            PthreadSlotValue::ControlBlock(handle) => {
+                let entry = lookup_mutex_by_handle(handle)?;
+                if guest_mutex_registry_epoch(address).load(Ordering::Acquire) != bare_epoch {
+                    continue;
+                }
+                cache_guest_mutex_slot(address, handle, bare_epoch, &entry);
+                return Some(entry);
+            }
+            PthreadSlotValue::StaticDefault if allow_static_init => {
+                return materialize_static_mutex(address, PthreadMutexAttrState::default());
+            }
+            PthreadSlotValue::StaticAdaptiveMutex if allow_static_init => {
+                return materialize_static_mutex(
+                    address,
+                    PthreadMutexAttrState {
+                        mutex_type: 4,
+                        ..PthreadMutexAttrState::default()
+                    },
+                );
+            }
+            PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => return None,
+        }
     }
 }
 
@@ -167,7 +279,10 @@ fn materialize_static_mutex(
     }
     let slot_value = read_pthread_slot(slot)?;
     match classify_mutex_slot_value(slot_value) {
-        PthreadSlotValue::ControlBlock(handle) => lookup_mutex_by_handle(handle),
+        PthreadSlotValue::ControlBlock(handle) => {
+            let entry = lookup_mutex_by_handle(handle)?;
+            Some(entry)
+        }
         PthreadSlotValue::StaticDefault | PthreadSlotValue::StaticAdaptiveMutex => {
             let guest_object = allocate_guest_mutex_object(attributes).ok()?;
             let entry = insert_mutex_entry(slot, guest_object, attributes);
@@ -196,8 +311,25 @@ fn insert_mutex_entry(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     shard.insert(guest_object, entry.clone());
+    bump_guest_mutex_registry_epoch(guest_object);
     cache_guest_mutex_entry(guest_object, &entry);
     entry
+}
+
+#[cfg(test)]
+pub(crate) fn install_test_mutex_entry_at_handle(handle: u64) -> Arc<GuestMutexEntry> {
+    insert_mutex_entry(0, handle, PthreadMutexAttrState::default())
+}
+
+#[cfg(test)]
+pub(crate) fn remove_test_mutex_entry_at_handle(handle: u64) {
+    let mut shard = guest_mutex_shards()[guest_mutex_shard(handle)]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = shard.remove(&handle) {
+        entry.active.store(false, Ordering::Release);
+        bump_guest_mutex_registry_epoch(handle);
+    }
 }
 
 pub(crate) fn guest_pthread_once(control: u64, routine: u64) -> u64 {
@@ -342,6 +474,7 @@ fn destroy_resolved_mutex(entry: Arc<GuestMutexEntry>, passed_arg: u64) -> u64 {
     let entry = shard
         .remove(&guest_object)
         .expect("the mutex entry checked above remains in its shard");
+    bump_guest_mutex_registry_epoch(guest_object);
     drop(shard);
     // Only clear publishing storage when it still holds this object's handle. Stack-init
     // then return-by-value leaves `storage_address` pointing at a recycled frame; blanking
