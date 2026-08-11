@@ -138,10 +138,13 @@ for this title's cold inline command buffers: the SDK documents that result when
 attached, and the title immediately clears and attaches one. Returning fabricated success there
 would hide a valid lifecycle transition and would not remove the calls.
 
-**Last clean bounded run (`72175efc`, 2026-08-11):** the title reached its main loop, submitted
-eight AGC command buffers, compiled eight compute pipelines, and reached one draw. It produced no
-VideoOut flip and no captured frame before a host fiber-resume SIGSEGV. This is progress beyond the
-old "ACM-blocked / no AGC" checkpoint, not a UI, 3D, FPS, or playability claim.
+**Last clean bounded run (`72175efc`, 2026-08-11):** artifact
+`/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T141911Z-PPSA01342-app0`.
+The title submitted 2,050 ACM batches, retired 2,048, failed none, and completed 681 convolution
+jobs covering 697,344 samples. It then reached its main loop, submitted eight AGC command buffers,
+compiled eight compute pipelines, and reached one draw. It produced no real VideoOut flip and no
+captured frame before a host fiber-resume SIGSEGV. This is progress beyond the old
+"ACM-blocked / no AGC" checkpoint, not a UI, 3D, FPS, or playability claim.
 
 Two evidence-backed blockers from that run are now fixed in code but have not been game-validated:
 
@@ -177,6 +180,11 @@ dynamic data rather than its live FS function; `36593f56` gives the seeded decod
 control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
 sparse clean run that passes both prior failures and reaches a real VideoOut flip/frame; until then
 Demon’s Souls is not considered rendering.
+
+## Historical phase snapshots
+
+The Phase 0/1 acceptance notes below preserve what was known at each dated revision. Present-tense
+blocker language inside them is historical and is superseded by the current title sections above.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 
@@ -299,7 +307,12 @@ full diagnostic timeout. On revision `663bc58` (2026-08-05) it SIGSEGV'd at ~1s 
 sustained-run claims for that title as stale until re-proven at one revision with n≥1 clean evidence
 run (crash claims still need n≥5 before calling a crash "stable").
 
-Current overall state: the first small test title boots through resource loading, submits AGC
+### Historical July 2026 overall-state snapshot (superseded)
+
+This snapshot predates the live refutation immediately above and the August title sections at the
+top of this document. It is retained only as a record of the implementation state at that time.
+
+The first small test title boots through resource loading, submits AGC
 draw streams, compiles observed RDNA2 shaders to Metal, and flips its display buffers. Early
 splash frames render correctly; full scene rendering and playability are still open. A second,
 Unity/IL2CPP title (which commits nearly all of its memory by reserving virtual ranges and
@@ -336,7 +349,9 @@ first recovering names. `scripts/generate-nid-names.py` hashes every symbol expo
 directory of PS5 modules and keeps the matches; `scripts/audit-import-coverage.py` then reports,
 per title, how each imported NID is served.
 
-For the larger of the two test titles, of 2028 callable imports: 1140 resolve inside modules the
+**Historical July 2026 larger-title snapshot:** the exact title and source revision were not
+recorded with these counts, so they must not be treated as current compatibility measurements.
+Of 2028 callable imports, 1140 resolve inside modules the
 game itself ships, 436 are implemented here, and 443 remain unserved. All but 12 have a recovered
 name, which is what makes the remaining gap a work list rather than a list of hashes. The unserved
 majority is concentrated in the graphics and asynchronous-file command-buffer builders.
@@ -725,20 +740,13 @@ phase blocks on a cold pipeline compile (`active=3` for two windows) and resolve
 permanent-looking "wedge" recorded at `Q W683` was this phase with the guest dying of the
 corruption above before escaping it.
 
-### The runtime test suite is order-dependent
+### Runtime event-sink test interference — CLOSED
 
-`cargo test -p remu-runtime --lib` fails intermittently, at roughly a one-in-three rate, in
-`agc_driver::tests::a_graphics_submission_parses_its_stream_and_requests_a_completion_event`. It
-passes reliably with `--test-threads=1`.
-
-`remu_gpu::install_event_sink` writes a process-global sink. Tests that assert on emitted GPU
-events take `GPU_EVENT_SINK_TEST` to serialize, but 121 tests reach the import dispatcher without
-holding it, so an event emitted by one test can be delivered to another test's receiver.
-
-Until this is fixed, verification runs must pass `--test-threads=1`, which makes the suite
-deterministic. The fix is either to make every test that can emit take the guard, or to add a
-thread-local event sink to `remu-gpu` and route test events through it. `remu-gpu` has no
-thread-local capture today, so the second option is new code, not a rewiring of what exists.
+The former intermittent AGC driver failure came from tests replacing a process-global GPU event
+sink. Tests now install thread-local sinks, so parallel import-dispatch activity cannot deliver an
+event to another test's receiver. The full x86 runtime library suite passes 756/756. Metal tests
+remain serialized for a separate reason: memory-watch fixtures share process signal handlers and
+mapping registries.
 
 ## Subsystem table
 
@@ -751,7 +759,7 @@ thread-local capture today, so the second option is new code, not a rewiring of 
 | Render state / pipelines | GFX10 render-target decoding, MRT attachment layout, write masks, viewport/scissor, formats, depth-target validity requirements, `CB_COLOR_CONTROL` resolve/eliminate-fast-clear/FMASK-decompression command handling, seeded AGC register defaults (Phase 1D), stencil/depth-bias/`CB_COLOR_INFO` blend-bypass/`UcGeCntl` NGG decode, and translated shader pipelines with cached construction. | Combined depth/stencil surface formats; remaining multisampling behavior; full structural pipeline-cache identity. |
 | Shader translation | Typed backend-neutral Gen5 IR, direct single-path MSL lowering, scalar/vector state, exports, sampled/storage images, buffers, zero-copy global bindings, wave64 ballot handling on SIMD32, and observed compute geometry, with offline Metal compilation tests. | Complete the remaining RDNA2 instruction/resource/control-flow surface and eliminate residual per-draw Metal buffer churn without weakening guest-memory visibility. |
 | Presentation / frame capture | Guest display size independent of host drawable size; opt-in headless Metal; interactive runs as a regular app bundle; direct scanout without routine GPU-to-CPU round trips; asynchronous shader compilation with strict event ordering; on-disk Metal library and pipeline caches; live title-bar performance statistics. | Resolve early post-boot output into the first real scene and use completed-presentation and guest-flip rates to measure pacing. |
-| Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes/condvars/rwlocks/semaphores keyed by SDK control-block handles (Phase 1A closed — Scream mutex path passes); guest `fs:` TLS via seeded decode + helpers + SIGSEGV backstop (Phase 1B closed); ordered guest label/HLE word publication with release stores + payload→label fence (Phase 1C closed); video-out attributes; save-data basics; NP service objects. | Implement `sceAcmBatchStartBuffers` / ACM DSP for Demon's Souls; cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
+| Runtime / ABI | Whole-process import auditing across HLE, guest-libc, and host routes; FIFO-ticket condition variables with exact signal/broadcast cardinality; guest mutexes/condvars/rwlocks/semaphores keyed by SDK control-block handles (Phase 1A closed — Scream mutex path passes); guest `fs:` TLS via seeded decode + helpers + SIGSEGV backstop (Phase 1B closed); ordered guest label/HLE word publication with release stores + payload→label fence (Phase 1C closed); complete 13-NID asynchronous CPU ACM engine with checked contexts, batches, waits, statistics, FFT/IFFT, panning, and convolution; video-out attributes; save-data basics; NP service objects. | Reach and validate the first real Demon’s Souls VideoOut/AGC flip after the current offline fixes; cancellation, clock attributes, and absolute timed waits; continue source-backed AGC event queues, save dialogs, and remaining researched NIDs. |
 | Audio | Host output, guest port/config validation, bounded queues, resampling, stereo downmixing, and the complete defined AudioOut2 format lattice (float/i16 × mono/stereo/7.1 × standard order), which is what FMOD titles open. Twelve-channel layouts stay explicitly rejected until the mixer models them. | Crackling from 15–17% audio underruns under heavy import-thread contention on command-heavy titles; audit timing, backpressure, device change, pause, teardown, and A/V synchronization with deterministic offline mixer evidence. |
 | Video / Bink | Initial AvPlayer MP4/H.264 and audio decode through ffmpeg pipes, stream enumeration, play/pause/resume/seek/loop/trick-speed state, media-clock frame gating, NV12 buffers, and deferred event callbacks, covered by generated fixtures. | Present the Unity title's intro frames and resolve its preparation/pause transition; Bink has no compatibility claim yet. |
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |

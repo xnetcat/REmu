@@ -1,5 +1,10 @@
 # Complete ACM Engine Implementation Plan
 
+**Status: completed on 2026-08-11.** Tasks 1–9 landed through commits `dacdcd5e`, `79e68531`,
+`1dcb828d`, `9e2b49bd`, `b57d3d51`, `edcb3ec3`, `7445ea96`, `b20c762a`, and `5acfa6d6`.
+The bounded gate submitted 2,050 ACM batches, retired 2,048, failed none, and reached AGC work;
+it did not produce a real flip or captured frame. See `docs/status.md` for the current blocker.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement all 13 SDK 10 `libSceAcm` exports as a real asynchronous CPU audio-DSP engine so Demon’s Souls can leave its current pre-VideoOut ACM stall without fabricated success.
@@ -41,7 +46,7 @@
 - Produces: `abi::{SceAcmBatchInfo, SceAcmBatchCommand, AcmFormat, AcmError, return_error, read_pod, write_pod, read_array, checked_span}`.
 - Consumes: `crate::{process_guest_range_has_read_access, read_guest_bytes, write_guest_bytes, write_guest_u32, sce_kernel_error}`.
 
-- [ ] **Step 1: Write ABI and export-inventory tests before creating the module**
+- [x] **Step 1: Write ABI and export-inventory tests before creating the module**
 
 ```rust
 #[test]
@@ -67,13 +72,13 @@ fn dispatch_claims_exactly_the_thirteen_sdk10_exports() {
 }
 ```
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+- [x] **Step 2: Run the focused tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::sdk10_abi_sizes_and_error_words_are_exact acm_engine::tests::dispatch_claims_exactly_the_thirteen_sdk10_exports -- --test-threads=1`
 
 Expected: compilation fails because `acm_engine`, its ABI types, and `owns_nid` do not exist.
 
-- [ ] **Step 3: Add exact ABI types, errors, and the NID ownership table**
+- [x] **Step 3: Add exact ABI types, errors, and the NID ownership table**
 
 ```rust
 #[repr(C)]
@@ -122,7 +127,7 @@ pub(crate) fn owns_nid(nid: &str) -> bool {
 }
 ```
 
-- [ ] **Step 4: Write failing context validation, destruction, and reset tests**
+- [x] **Step 4: Write failing context validation, destruction, and reset tests**
 
 ```rust
 #[test]
@@ -141,23 +146,23 @@ fn context_ids_are_checked_and_reset_is_process_local() {
 }
 ```
 
-- [ ] **Step 5: Run the context test and verify RED**
+- [x] **Step 5: Run the context test and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::context_ids_are_checked_and_reset_is_process_local -- --test-threads=1`
 
 Expected: compilation fails because `AcmEngine` and its lifecycle methods are absent.
 
-- [ ] **Step 6: Implement the minimal checked context engine and pre-lock route**
+- [x] **Step 6: Implement the minimal checked context engine and pre-lock route**
 
 Use `Mutex<EngineState>` with `next_context: u32` and `BTreeMap<u32, ContextState>`. Move context create/destroy out of `ProbeDispatchState`, call `acm_engine::dispatch` immediately after `ajm_engine::dispatch`, call `acm_engine::reset_for_new_process()` from `configure_probe_dispatch`, remove `next_acm_context` and `acm_contexts`, and delete the locked ACM match arms.
 
-- [ ] **Step 7: Add all 13 names to the hand NID table and verify GREEN**
+- [x] **Step 7: Add all 13 names to the hand NID table and verify GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine:: platform_independent_tests::services:: -- --test-threads=1`
 
 Expected: all ACM ABI, lifecycle, route, and name tests pass.
 
-- [ ] **Step 8: Commit only Task 1 files**
+- [x] **Step 8: Commit only Task 1 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/mod.rs crates/remu-runtime/src/acm_engine/abi.rs crates/remu-runtime/src/acm_engine/tests.rs crates/remu-runtime/src/lib.rs crates/remu-runtime/src/nid_table.rs crates/remu-runtime/src/platform_independent_tests/services.rs
@@ -182,7 +187,7 @@ git commit -m "feat: add checked ACM context engine"
 - Produces: `Command::{Fft, Ifft, Panner, Convolution, Statistics, Transfer, Barrier, Queue, Delay}`.
 - Consumes: `abi::SceAcmBatchInfo` and SDK command word size of 8 bytes.
 
-- [ ] **Step 1: Write failing atomic cursor/capacity tests**
+- [x] **Step 1: Write failing atomic cursor/capacity tests**
 
 ```rust
 #[repr(align(128))]
@@ -206,17 +211,17 @@ fn builder_reserves_exact_words_and_does_not_mutate_on_full_or_overflow() {
 }
 ```
 
-- [ ] **Step 2: Run the builder test and verify RED**
+- [x] **Step 2: Run the builder test and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::builder_reserves_exact_words_and_does_not_mutate_on_full_or_overflow -- --test-threads=1`
 
 Expected: compilation fails because the builder and aligned test arena do not exist.
 
-- [ ] **Step 3: Implement an atomic record reservation helper**
+- [x] **Step 3: Implement an atomic record reservation helper**
 
 Use a 64-bit record prefix containing magic `0x524d_4143` (`RMAC`), record kind, version, and total word count. Validate the entire old `SceAcmBatchInfo`, checked `offset + words * 8`, and the complete destination span before writing; write payload and zero padding first, then update `info.offset` last. The arena encoding is private, while its occupied word count exactly matches each public `*_SIZE` macro.
 
-- [ ] **Step 4: Write failing copied-arena and malformed-record parser tests**
+- [x] **Step 4: Write failing copied-arena and malformed-record parser tests**
 
 ```rust
 #[test]
@@ -233,23 +238,23 @@ fn decoded_plan_survives_arena_copy_and_unknown_records_fail_loudly() {
 }
 ```
 
-- [ ] **Step 5: Run the parser test and verify RED**
+- [x] **Step 5: Run the parser test and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::decoded_plan_survives_arena_copy_and_unknown_records_fail_loudly -- --test-threads=1`
 
 Expected: compilation fails because `BatchPlan`, `Command`, and `decode_buffers` are absent.
 
-- [ ] **Step 6: Implement immutable decoding for private records and inline SDK records**
+- [x] **Step 6: Implement immutable decoding for private records and inline SDK records**
 
 Decode private records by value with no host pointer side table. Decode SDK command 11 as a two-word statistics request and command 14 as a two-word completion notification. Enforce that statistics has no following statistics job and notification is the final command of the final buffer. Reject nonzero reserved bits, truncated records, zero-length records, and an inline command whose required continuation word crosses a buffer boundary.
 
-- [ ] **Step 7: Run Task 2 tests and verify GREEN**
+- [x] **Step 7: Run Task 2 tests and verify GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::builder_ acm_engine::tests::decoded_plan_ -- --test-threads=1`
 
 Expected: exact cursor, copy, statistics, notification, and malformed-stream tests pass.
 
-- [ ] **Step 8: Commit only Task 2 files**
+- [x] **Step 8: Commit only Task 2 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/mod.rs crates/remu-runtime/src/acm_engine/abi.rs crates/remu-runtime/src/acm_engine/builders.rs crates/remu-runtime/src/acm_engine/batch.rs crates/remu-runtime/src/acm_engine/tests.rs
@@ -271,7 +276,7 @@ git commit -m "feat: add ACM batch record parser"
 - Produces: a bounded two-thread worker pool in `AcmEngine::global()`.
 - Consumes: immutable `BatchPlan` from Task 2.
 
-- [ ] **Step 1: Write failing start/wait/error-lifetime tests**
+- [x] **Step 1: Write failing start/wait/error-lifetime tests**
 
 ```rust
 #[test]
@@ -303,17 +308,17 @@ fn finite_and_infinite_waits_share_one_waiter_slot() {
 }
 ```
 
-- [ ] **Step 2: Run the lifecycle test and verify RED**
+- [x] **Step 2: Run the lifecycle test and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::batch_start_is_async_wait_consumes_retirement_and_poll_reports_busy acm_engine::tests::finite_and_infinite_waits_share_one_waiter_slot -- --test-threads=1`
 
 Expected: compilation fails because batch lifecycle methods and statuses are absent.
 
-- [ ] **Step 3: Implement checked starts and terminal waits**
+- [x] **Step 3: Implement checked starts and terminal waits**
 
 For `sceAcmBatchStartBuffers`, interpret count zero as one indirect `SceAcmBatchInfo*`; otherwise read `count` pointers. For `sceAcmBatchStartBuffer`, wrap the raw command address/byte length as one `SceAcmBatchInfo`. Validate and decode before allocating a nonzero batch ID. Implement timeout zero, finite milliseconds using one absolute `Instant`, and `u32::MAX` infinite wait. A timeout or second waiter returns `Busy`; a successful or failed terminal wait removes the batch.
 
-- [ ] **Step 4: Write failing FIFO, cross-context concurrency, destroy, and reset tests**
+- [x] **Step 4: Write failing FIFO, cross-context concurrency, destroy, and reset tests**
 
 ```rust
 #[test]
@@ -332,23 +337,23 @@ fn each_context_is_fifo_while_distinct_contexts_can_run_independently() {
 }
 ```
 
-- [ ] **Step 5: Run concurrency tests and verify RED**
+- [x] **Step 5: Run concurrency tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::each_context_is_fifo_while_distinct_contexts_can_run_independently acm_engine::tests::destroy_drains_and_reset_cancels -- --test-threads=1`
 
 Expected: assertions fail because queue selection and drain/cancel behavior are not implemented.
 
-- [ ] **Step 6: Add per-context runnable scheduling and process reset cancellation**
+- [x] **Step 6: Add per-context runnable scheduling and process reset cancellation**
 
 Keep one `VecDeque<u32>` per context and an `active_batch: Option<u32>`. Workers claim only a context with no active batch, execute the plan outside the lifecycle mutex, then reacquire it to publish status and expose that context’s next batch. Context destroy waits on the engine condition variable until its queue and active slot are empty. Process reset marks the pool stopping, removes queued work, marks retained batches cancelled, wakes workers and waiters, takes and joins both worker handles outside the state mutex, clears state and identifiers, then starts a fresh two-worker pool. A generation token prevents a worker that was already publishing when reset began from writing into the next process.
 
-- [ ] **Step 7: Verify Task 3 GREEN and the pre-lock wait invariant**
+- [x] **Step 7: Verify Task 3 GREEN and the pre-lock wait invariant**
 
 Run: `cargo test -p remu-runtime acm_engine::tests:: platform_independent_tests::synchronization:: -- --test-threads=1`
 
 Expected: all lifecycle and synchronization tests pass without dispatch-lock wait assertions.
 
-- [ ] **Step 8: Commit only Task 3 files**
+- [x] **Step 8: Commit only Task 3 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/mod.rs crates/remu-runtime/src/acm_engine/batch.rs crates/remu-runtime/src/acm_engine/tests.rs
@@ -372,7 +377,7 @@ git commit -m "feat: execute asynchronous ACM batches"
 - Produces: `ExecutionMemory` for owned input snapshots and `PendingWrite { address: u64, bytes: Vec<u8> }` for atomic output publication.
 - Consumes: task generation, guest output publication, and batch timing from Task 3.
 
-- [ ] **Step 1: Write one failing table test covering all 18 public command IDs**
+- [x] **Step 1: Write one failing table test covering all 18 public command IDs**
 
 ```rust
 #[test]
@@ -388,17 +393,17 @@ fn every_public_command_id_has_a_typed_decoder_and_reserved_bits_are_rejected() 
 }
 ```
 
-- [ ] **Step 2: Run the decoder table test and verify RED**
+- [x] **Step 2: Run the decoder table test and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::every_public_command_id_has_a_typed_decoder_and_reserved_bits_are_rejected -- --test-threads=1`
 
 Expected: command IDs other than statistics and notification are rejected.
 
-- [ ] **Step 3: Decode every command into explicit execution semantics**
+- [x] **Step 3: Decode every command into explicit execution semantics**
 
 Map activate/barrier/queue/delay to ordering nodes; input/output/split/inline/constant records to checked byte transfers; run to the selected DSP operation; statistics to a terminal statistics node; notification to a final release-published byte. Validate chain activation before chain commands, buffer indices, function/group matches, `iCount` continuation lengths, `iSize1` byte spans, and queue/delay bounds. If an SDK field lacks a public semantic for the requested function/group combination, return `MalformedBatch` rather than treating it as a no-op. For notification memory, accept a valid aligned CPU range but publish the byte only when `remu_memory::guest_shared_mapping_identity(address, 128)` proves GPU-visible backing, matching the SDK’s success-without-notification rule for non-GPU-mapped storage.
 
-- [ ] **Step 4: Write failing output-atomicity, notification-order, and statistics tests**
+- [x] **Step 4: Write failing output-atomicity, notification-order, and statistics tests**
 
 ```rust
 #[test]
@@ -420,23 +425,23 @@ fn statistics_scale_real_elapsed_time_and_mark_unavailable_history() {
 }
 ```
 
-- [ ] **Step 5: Run publication tests and verify RED**
+- [x] **Step 5: Run publication tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::notification_is_written_last_and_failed_batches_publish_no_partial_output acm_engine::tests::statistics_scale_real_elapsed_time_and_mark_unavailable_history -- --test-threads=1`
 
 Expected: output or notification changes before the planned error, and statistics fields remain unset.
 
-- [ ] **Step 6: Execute into host staging buffers and publish atomically**
+- [x] **Step 6: Execute into host staging buffers and publish atomically**
 
 Snapshot all inputs before the first command executes. Accumulate output writes as `(guest_address, Vec<u8>)`, reject overlapping writes with incompatible sizes, validate every final destination again, then publish output/state/statistics through `write_guest_bytes`. Issue `std::sync::atomic::fence(Ordering::Release)` before writing the optional one-byte notification. Retain a bounded 256-entry execution history for interval statistics.
 
-- [ ] **Step 7: Verify Task 4 GREEN**
+- [x] **Step 7: Verify Task 4 GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine::tests:: -- --test-threads=1`
 
 Expected: all command, atomicity, notification, and statistics tests pass.
 
-- [ ] **Step 8: Commit only Task 4 files**
+- [x] **Step 8: Commit only Task 4 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/batch.rs crates/remu-runtime/src/acm_engine/builders.rs crates/remu-runtime/src/acm_engine/mod.rs crates/remu-runtime/src/acm_engine/tests.rs
@@ -464,7 +469,7 @@ git commit -m "feat: execute ACM control commands"
 - Produces: packed real-spectrum helpers with DC in element 0 real and Nyquist in element 0 imaginary.
 - Consumes: `rustfft::{FftPlanner, num_complex::Complex32}` and `half::f16`.
 
-- [ ] **Step 1: Add dependencies and write independent DFT fixture tests**
+- [x] **Step 1: Add dependencies and write independent DFT fixture tests**
 
 ```rust
 #[test]
@@ -481,17 +486,17 @@ fn fft_impulse_dc_nyquist_and_round_trip_match_scalar_reference() {
 }
 ```
 
-- [ ] **Step 2: Run FFT fixtures and verify RED**
+- [x] **Step 2: Run FFT fixtures and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::fft_tests::fft_impulse_dc_nyquist_and_round_trip_match_scalar_reference -- --test-threads=1`
 
 Expected: compilation fails because the DSP FFT module and execution helpers are absent.
 
-- [ ] **Step 3: Implement cached transforms and Sony real-spectrum packing**
+- [x] **Step 3: Implement cached transforms and Sony real-spectrum packing**
 
 Use one mutex-protected `FftPlanner<f32>` only to construct plans and store plans as `Arc<dyn Fft<f32>>` keyed by `(size, direction)`. Reconstruct the conjugate half before inverse transforms, apply RustFFT’s required `1 / size` normalization on IFFT, and convert fp16 only at guest-memory boundaries.
 
-- [ ] **Step 4: Write failing builder-size, split-buffer, and flag validation tests**
+- [x] **Step 4: Write failing builder-size, split-buffer, and flag validation tests**
 
 ```rust
 #[test]
@@ -505,23 +510,23 @@ fn fft_builders_use_sdk_word_counts_and_honor_all_split_flags() {
 }
 ```
 
-- [ ] **Step 5: Run builder/flag tests and verify RED**
+- [x] **Step 5: Run builder/flag tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::fft_tests::fft_builders_use_sdk_word_counts_and_honor_all_split_flags acm_engine::dsp::fft_tests::fp16_and_half_frame_flags_match_reference -- --test-threads=1`
 
 Expected: builder dispatch is missing or uses an incorrect word count/flag layout.
 
-- [ ] **Step 6: Implement both imported builders and all documented formats/flags**
+- [x] **Step 6: Implement both imported builders and all documented formats/flags**
 
 Handle sizes 512/1024/2048, positive count, formats fp32/fp16, split input/output, FFT zero-second-half, and IFFT drop-first-half. Validate every pointer-array span and each 128-byte audio pointer before mutating the batch cursor. Serialize all addresses and formats into the private record and execute them from the decoded copy.
 
-- [ ] **Step 7: Verify Task 5 GREEN**
+- [x] **Step 7: Verify Task 5 GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::fft_tests:: -- --test-threads=1`
 
 Expected: scalar references, fp16 tolerances, all flags, alignment failures, and exact builder sizes pass.
 
-- [ ] **Step 8: Commit only Task 5 files**
+- [x] **Step 8: Commit only Task 5 files**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/remu-runtime/Cargo.toml crates/remu-runtime/src/acm_engine/dsp/mod.rs crates/remu-runtime/src/acm_engine/dsp/fft.rs crates/remu-runtime/src/acm_engine/dsp/fft_tests.rs crates/remu-runtime/src/acm_engine/builders.rs crates/remu-runtime/src/acm_engine/batch.rs crates/remu-runtime/src/acm_engine/mod.rs
@@ -545,7 +550,7 @@ git commit -m "feat: execute ACM FFT jobs"
 - Produces: `panner::execute(job: &PannerJob, memory: &ExecutionMemory) -> Result<Vec<PendingWrite>, AcmError>`.
 - Consumes: fixed ACM Panner frame size of 256 fp32 samples per voice and key-on flag bit 0.
 
-- [ ] **Step 1: Write failing identity, ramp, and initial-mix tests**
+- [x] **Step 1: Write failing identity, ramp, and initial-mix tests**
 
 ```rust
 #[test]
@@ -563,17 +568,17 @@ fn panner_applies_per_sample_gain_ramp_and_optional_initial_output() {
 }
 ```
 
-- [ ] **Step 2: Run Panner output tests and verify RED**
+- [x] **Step 2: Run Panner output tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::panner_tests::panner_applies_per_sample_gain_ramp_and_optional_initial_output -- --test-threads=1`
 
 Expected: compilation fails because Panner DSP and fixtures do not exist.
 
-- [ ] **Step 3: Implement deterministic gain interpolation and accumulation**
+- [x] **Step 3: Implement deterministic gain interpolation and accumulation**
 
 For sample `n` in 0..256 use `previous + (target - previous) * (n / 255.0)`. Filter each mono voice before distributing it to outputs, sum every voice contribution, optionally begin from `pOutInit[channel]`, and write the target gains back to each voice state only after the complete job succeeds.
 
-- [ ] **Step 4: Write failing biquad/key-on/persistent-state tests**
+- [x] **Step 4: Write failing biquad/key-on/persistent-state tests**
 
 ```rust
 #[test]
@@ -589,23 +594,23 @@ fn panner_biquads_update_at_half_frames_and_key_on_resets_state() {
 }
 ```
 
-- [ ] **Step 5: Run state tests and verify RED**
+- [x] **Step 5: Run state tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::panner_tests::panner_biquads_update_at_half_frames_and_key_on_resets_state acm_engine::dsp::panner_tests::panner_rejects_invalid_shapes_without_mutation -- --test-threads=1`
 
 Expected: state is ignored, updated at the wrong boundary, or mutated on failure.
 
-- [ ] **Step 6: Implement variable parameter/state layouts and the 20-word builder**
+- [x] **Step 6: Implement variable parameter/state layouts and the 20-word builder**
 
 Validate input count, biquad count 0..=2, update log2 0..=1, output count 1..=36, all pointer arrays, 128-byte voice/parameter/state/output buffers, parameter bytes `4 + biquads * (1 << updates) * 20 + outputs * 4`, and state bytes `biquads * 8 + outputs * 4` rounded to 128. Apply Direct Form II transposed `(b0,b1,b2,a1,a2)` cascades, switching coefficient sets at sample 128 when update log2 is 1. Serialize exactly 20 command words.
 
-- [ ] **Step 7: Verify Task 6 GREEN**
+- [x] **Step 7: Verify Task 6 GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::panner_tests:: -- --test-threads=1`
 
 Expected: mapping, ramps, two-biquad cascades, coefficient updates, key-on, persistence, initial mixing, builder size, and invalid-shape tests pass.
 
-- [ ] **Step 8: Commit only Task 6 files**
+- [x] **Step 8: Commit only Task 6 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/dsp/mod.rs crates/remu-runtime/src/acm_engine/dsp/panner.rs crates/remu-runtime/src/acm_engine/dsp/panner_tests.rs crates/remu-runtime/src/acm_engine/builders.rs crates/remu-runtime/src/acm_engine/batch.rs crates/remu-runtime/src/acm_engine/mod.rs
@@ -631,7 +636,7 @@ git commit -m "feat: execute ACM Panner jobs"
 - Produces: imported builders for SharedInput/SharedIr v1/v2.
 - Consumes: FFT packing and transform plans from Task 5.
 
-- [ ] **Step 1: Write failing ABI layout and graph-validation tests**
+- [x] **Step 1: Write failing ABI layout and graph-validation tests**
 
 ```rust
 #[test]
@@ -654,17 +659,17 @@ fn convolution_accepts_only_1_to_n_n_to_1_or_n_to_n_channel_graphs() {
 }
 ```
 
-- [ ] **Step 2: Run layout/graph tests and verify RED**
+- [x] **Step 2: Run layout/graph tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::convolution_tests::convolution_struct_layouts_match_sdk10_lp64 acm_engine::dsp::convolution_tests::convolution_accepts_only_1_to_n_n_to_1_or_n_to_n_channel_graphs -- --test-threads=1`
 
 Expected: compilation fails because convolution ABI types and validation are absent.
 
-- [ ] **Step 3: Implement recursive pointer-graph validation without mutation**
+- [x] **Step 3: Implement recursive pointer-graph validation without mutation**
 
 Validate block count argument equals 1; block sizes are 256/512/1024 and compatible across each tuple; formats are fp16/fp32; input history capacity/count/position are bounded; channel counts are nonzero; `pSizes` is null for input channels; IR runtime byte size never exceeds memory byte size and respects format alignment; every pointer array and pointed buffer is mapped; all audio/history/temp/PCM blocks are 128-byte aligned. Snapshot the complete graph into owned descriptors before reserving batch words.
 
-- [ ] **Step 4: Write failing exact-size and v2-tail-builder tests**
+- [x] **Step 4: Write failing exact-size and v2-tail-builder tests**
 
 ```rust
 #[test]
@@ -681,23 +686,23 @@ fn convolution_builders_reserve_the_public_macro_size_and_preserve_v2_fields() {
 }
 ```
 
-- [ ] **Step 5: Run builder tests and verify RED**
+- [x] **Step 5: Run builder tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::convolution_tests::convolution_builders_reserve_the_public_macro_size_and_preserve_v2_fields -- --test-threads=1`
 
 Expected: imported builders are absent or do not use the SDK macro’s dynamic word count.
 
-- [ ] **Step 6: Implement all four imported builders**
+- [x] **Step 6: Implement all four imported builders**
 
 Decode SysV stack arguments exactly: v1 output pointer array from `stack_arguments[0]`; v2 output pointer array from `stack_arguments[0]` and reserved value from `stack_arguments[1]`. SharedInput snapshots one input plus `count` IR/output tuples; SharedIr snapshots one IR plus `count` input/output tuples. Reject nonzero v2 reserved values. Store the entire owned graph in the private record and zero-fill the remaining ABI-sized command words.
 
-- [ ] **Step 7: Verify Task 7 GREEN**
+- [x] **Step 7: Verify Task 7 GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::convolution_tests::convolution_struct_ acm_engine::dsp::convolution_tests::convolution_accepts_ acm_engine::dsp::convolution_tests::convolution_builders_ -- --test-threads=1`
 
 Expected: ABI, shape, pointer, alignment, exact-size, SharedInput/SharedIr, and v2 builder tests pass.
 
-- [ ] **Step 8: Commit only Task 7 files**
+- [x] **Step 8: Commit only Task 7 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/dsp/mod.rs crates/remu-runtime/src/acm_engine/dsp/convolution.rs crates/remu-runtime/src/acm_engine/dsp/convolution_tests.rs crates/remu-runtime/src/acm_engine/abi.rs crates/remu-runtime/src/acm_engine/builders.rs crates/remu-runtime/src/acm_engine/batch.rs crates/remu-runtime/src/acm_engine/mod.rs
@@ -718,7 +723,7 @@ git commit -m "feat: build ACM convolution jobs"
 - Produces: history-position/count/null-count and previous-gain state updates as staged writes.
 - Consumes: packed frequency-domain input/IR blocks and inverse transforms from Task 5.
 
-- [ ] **Step 1: Write failing direct-reference convolution tests**
+- [x] **Step 1: Write failing direct-reference convolution tests**
 
 ```rust
 #[test]
@@ -733,17 +738,17 @@ fn partitioned_convolution_matches_direct_time_domain_reference() {
 }
 ```
 
-- [ ] **Step 2: Run numerical convolution tests and verify RED**
+- [x] **Step 2: Run numerical convolution tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::convolution_tests::partitioned_convolution_matches_direct_time_domain_reference -- --test-threads=1`
 
 Expected: execution is absent and produces no output.
 
-- [ ] **Step 3: Implement frequency-domain history and overlap-add**
+- [x] **Step 3: Implement frequency-domain history and overlap-add**
 
 FFT each new zero-extended PCM block, write its packed spectrum into the next input-history slot, multiply every available history partition by the matching IR partition and optional block/tuple gain, sum in `Complex32`, inverse transform, add the saved temp half, publish the first block, and save the second block as the next temp. Respect per-IR `iSize` by zeroing compressed high-frequency bins beyond the runtime byte count. Advance history position modulo capacity and saturate history count at capacity only after all outputs succeed.
 
-- [ ] **Step 4: Write failing mapping, fp16, wraparound, and v2 tail tests**
+- [x] **Step 4: Write failing mapping, fp16, wraparound, and v2 tail tests**
 
 ```rust
 #[test]
@@ -761,23 +766,23 @@ fn v2_tail_crossfade_and_initial_mix_follow_reference_state() {
 }
 ```
 
-- [ ] **Step 5: Run state/mapping tests and verify RED**
+- [x] **Step 5: Run state/mapping tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::convolution_tests::v2_tail_crossfade_and_initial_mix_follow_reference_state acm_engine::dsp::convolution_tests::channel_mappings_and_fp16_ir_match_reference acm_engine::dsp::convolution_tests::history_wraparound_preserves_partition_order -- --test-threads=1`
 
 Expected: tail counters, gains, mapping, fp16 conversion, or history order differ from the independent reference.
 
-- [ ] **Step 6: Complete SharedInput/SharedIr mappings and v2 state rules**
+- [x] **Step 6: Complete SharedInput/SharedIr mappings and v2 state rules**
 
 Map one input across N IR channels, N input channels across one IR, or equal N:N channels. SharedInput applies each tuple gain to its IR result; SharedIr applies it to its input result. Version 2 counts consecutive null PCM blocks, forbids a non-null PCM after null-tail mode begins, linearly ramps `fGainPrev` to `fGain` across the output block, optionally adds `pPcmInit`, and stages `fGainPrev = fGain` for the next call.
 
-- [ ] **Step 7: Verify Task 8 GREEN**
+- [x] **Step 7: Verify Task 8 GREEN**
 
 Run: `cargo test -p remu-runtime acm_engine::dsp::convolution_tests:: -- --test-threads=1`
 
 Expected: direct numerical references, three block sizes, fp16/fp32 IRs, all mappings, gains, compression sizes, overlap, history wrapping, null tails, crossfades, and initial mixing pass.
 
-- [ ] **Step 8: Commit only Task 8 files**
+- [x] **Step 8: Commit only Task 8 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/dsp/convolution.rs crates/remu-runtime/src/acm_engine/dsp/convolution_tests.rs crates/remu-runtime/src/acm_engine/batch.rs
@@ -799,7 +804,7 @@ git commit -m "feat: execute ACM convolution reverb"
 - Produces: documented next blocker from one bounded title run.
 - Consumes: all prior task interfaces.
 
-- [ ] **Step 1: Write the final failing export and end-to-end batch tests**
+- [x] **Step 1: Write the final failing export and end-to-end batch tests**
 
 ```rust
 #[test]
@@ -827,17 +832,17 @@ fn mixed_fft_panner_convolution_batch_retires_with_real_outputs() {
 }
 ```
 
-- [ ] **Step 2: Run the final focused tests and verify RED**
+- [x] **Step 2: Run the final focused tests and verify RED**
 
 Run: `cargo test -p remu-runtime acm_engine::tests::every_sdk10_export_executes_a_real_checked_path acm_engine::tests::mixed_fft_panner_convolution_batch_retires_with_real_outputs -- --test-threads=1`
 
 Expected: any missing route, inert telemetry, or mixed-job integration gap fails explicitly.
 
-- [ ] **Step 3: Close integration gaps and add rate-limited telemetry**
+- [x] **Step 3: Close integration gaps and add rate-limited telemetry**
 
 Increment counters only on accepted work and completed DSP. Log the first validation/execution failure per `(command, error)` and power-of-two repeats. Ensure none of the 13 ACM NIDs reaches `note_inert`, the unimplemented import fallback, or the locked dispatcher.
 
-- [ ] **Step 4: Run formatting and complete offline verification**
+- [x] **Step 4: Run formatting and complete offline verification**
 
 Run: `cargo fmt --all -- --check`
 
@@ -851,7 +856,7 @@ Run: `cargo clippy -p remu-runtime --all-targets -- -D warnings`
 
 Expected: every command exits 0. If an unrelated dirty-tree failure remains, record its exact test and stack without weakening ACM assertions.
 
-- [ ] **Step 5: Build release and run one bounded 90-second title gate**
+- [x] **Step 5: Build release and run one bounded 90-second title gate**
 
 ```bash
 cargo build --release --target x86_64-apple-darwin
@@ -860,17 +865,17 @@ REMU_SKIP_BUILD=1 REMU_AUTO_CROSS=8 REMU_AUTO_CROSS_REPEAT_MS=3000 REMU_AUTO_CRO
 
 Expected: the run summary contains zero unimplemented ACM imports and nonzero retired ACM batches. Record whether VideoOut/AGC activity begins; if not, name the next first failing import or guest assertion without launching again.
 
-- [ ] **Step 6: Update status documentation with measured evidence**
+- [x] **Step 6: Update status documentation with measured evidence**
 
 Document the exact commit, artifact path, ACM call/retirement/failure counts, VideoOut/AGC boundary reached, and any next blocker. Do not claim playability or FPS from a pre-render run.
 
-- [ ] **Step 7: Re-run the offline ACM suite after documentation-adjacent cleanup**
+- [x] **Step 7: Re-run the offline ACM suite after documentation-adjacent cleanup**
 
 Run: `cargo test -p remu-runtime acm_engine:: -- --test-threads=1`
 
 Expected: all ACM tests pass with zero failures.
 
-- [ ] **Step 8: Commit only Task 9 files**
+- [x] **Step 8: Commit only Task 9 files**
 
 ```bash
 git add crates/remu-runtime/src/acm_engine/mod.rs crates/remu-runtime/src/acm_engine/tests.rs crates/remu-runtime/src/platform_independent_tests/services.rs docs/status.md
