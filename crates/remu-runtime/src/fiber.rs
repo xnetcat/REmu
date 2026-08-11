@@ -35,7 +35,8 @@ use crate::{
 fn trace(call: &str, fiber: u64, result: u64) {
     if trace_fiber() {
         eprintln!(
-            "[REMu][FIBER] {call} fiber={fiber:#x} result={result:#x} context={:?} slot={:?} host={:?} thread={:?}",
+            "[REMu][FIBER] {call} fiber={fiber:#x} result={result:#x} current={:#x} context={:?} slot={:?} host={:?} thread={:?}",
+            current_fiber_identity(),
             fiber_context(),
             THREAD_FIBER_CONTEXT.with(std::ptr::from_ref),
             host_thread_id(),
@@ -232,6 +233,17 @@ fn fiber_context() -> *mut FiberContext {
     THREAD_FIBER_CONTEXT.with(Cell::get)
 }
 
+/// Returns the running SceFiber object for diagnostics, or zero outside a fiber chain.
+fn current_fiber_identity() -> u64 {
+    let context = fiber_context();
+    if context.is_null() {
+        0
+    } else {
+        // SAFETY: a non-null TLS context belongs to the live run frame on this host thread.
+        unsafe { (*context).current_fiber }
+    }
+}
+
 /// Publishes this thread's current fiber context. Never inlined, for the reason above.
 #[inline(never)]
 fn set_fiber_context(context: *mut FiberContext) {
@@ -317,6 +329,27 @@ fn entry_data(
 /// `context` must be the live thread context, and `fiber` a validated fiber claimed for running.
 unsafe fn switch_to_fiber(fiber: u64, argument_on_run_to: u64, context: *mut FiberContext) -> ! {
     let saved = read_guest_u64(fiber + offset::CONTEXT);
+    if trace_fiber() {
+        let jump = saved_context(fiber);
+        let (saved_rsp, saved_return) = if saved == 0 {
+            (0, 0)
+        } else {
+            // SAFETY: validation and the state claim precede every call to this function.
+            unsafe { ((*jump).rsp, (*jump).return_address) }
+        };
+        // SAFETY: the caller supplies the live thread context for the complete transfer.
+        let previous = unsafe { (*context).previous_fiber };
+        eprintln!(
+            "[REMu][FIBER] transfer from={previous:#x} to={fiber:#x} mode={} entry={:#x} arg_init={:#x} arg_run={argument_on_run_to:#x} stack={:#x} size={:#x} saved_context={saved:#x} saved_rsp={saved_rsp:#x} saved_return={saved_return:#x} host={:?} thread={:?}",
+            if saved == 0 { "fresh" } else { "resume" },
+            read_guest_u64(fiber + offset::ENTRY),
+            read_guest_u64(fiber + offset::ARG_ON_INITIALIZE),
+            read_guest_u64(fiber + offset::ADDR_CONTEXT),
+            read_guest_u64(fiber + offset::SIZE_CONTEXT),
+            host_thread_id(),
+            current_guest_thread_name(),
+        );
+    }
     if saved != 0 {
         // SAFETY: the pointer was stored by this module from a frame that is still suspended.
         unsafe {
@@ -691,8 +724,9 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]
         )
     {
         eprintln!(
-            "[REMu][FIBER] enter nid={nid} arg0={:#x} context={:?} slot={:?} host={:?} thread={:?}",
+            "[REMu][FIBER] enter nid={nid} arg0={:#x} current={:#x} context={:?} slot={:?} host={:?} thread={:?}",
             arguments[0],
+            current_fiber_identity(),
             fiber_context(),
             THREAD_FIBER_CONTEXT.with(std::ptr::from_ref),
             host_thread_id(),

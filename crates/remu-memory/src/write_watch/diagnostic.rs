@@ -173,6 +173,31 @@ pub(super) fn format_fault_stack_words(
     buffer.push_bytes(b"\n");
 }
 
+/// Renders words immediately below the interrupted stack pointer.
+///
+/// On x86 a fault caused by `ret` is reported after the instruction has consumed its target and
+/// advanced RSP. Keeping the starting address explicit makes the popped word at `rsp - 8`
+/// recoverable instead of silently omitting the most important part of the broken frame.
+pub(super) fn format_fault_stack_preceding_words(
+    stack_pointer: u64,
+    start: u64,
+    words: &[u64],
+    buffer: &mut DiagnosticBuffer,
+) {
+    buffer.push_bytes(b"[REMu][WATCH] fault stack before-rsp=");
+    buffer.push_hexadecimal(stack_pointer);
+    buffer.push_bytes(b" start=");
+    buffer.push_hexadecimal(start);
+    buffer.push_bytes(b" words=");
+    for (index, word) in words.iter().enumerate() {
+        if index != 0 {
+            buffer.push_bytes(b",");
+        }
+        buffer.push_hexadecimal(*word);
+    }
+    buffer.push_bytes(b"\n");
+}
+
 fn signal_name(signal: i32) -> &'static [u8] {
     if signal == libc::SIGBUS {
         b"SIGBUS"
@@ -216,7 +241,8 @@ fn signal_code_name(signal: i32, code: i32) -> &'static [u8] {
 mod tests {
     use super::{
         BUS_OBJERR, DiagnosticBuffer, FaultReason, FaultRegister, FaultReport, FaultSpace,
-        SEGV_ACCERR, format_fault_registers, format_fault_report, format_fault_stack_words,
+        SEGV_ACCERR, format_fault_registers, format_fault_report,
+        format_fault_stack_preceding_words, format_fault_stack_words,
     };
 
     fn rendered(report: FaultReport, reason: FaultReason) -> String {
@@ -317,6 +343,22 @@ mod tests {
             String::from_utf8(buffer.as_slice().to_vec()).expect("stack lines are ASCII"),
             "[REMu][WATCH] fault stack rsp=0x30a82f2b0 \
              words=0x1002bd1a0,0x7ff911070960,0x0\n"
+        );
+    }
+
+    #[test]
+    fn reports_words_immediately_before_rsp_to_recover_a_popped_return_address() {
+        let mut buffer = DiagnosticBuffer::new();
+        format_fault_stack_preceding_words(
+            0x7108_803f00,
+            0x7108_803ef0,
+            &[0x8008_74a11, 0],
+            &mut buffer,
+        );
+        assert_eq!(
+            String::from_utf8(buffer.as_slice().to_vec()).expect("stack lines are ASCII"),
+            "[REMu][WATCH] fault stack before-rsp=0x7108803f00 start=0x7108803ef0 \
+             words=0x800874a11,0x0\n"
         );
     }
 }

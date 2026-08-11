@@ -129,7 +129,7 @@ coalesced ranges. Release builds use one codegen unit with ThinLTO. Focused unit
 contract; this is not yet an FPS claim because the requested no-game constraint prevents a clean
 before/after title benchmark.
 
-## Demon's Souls bring-up (updated 2026-08-11) — first draw, no flip/frame yet
+## Demon's Souls bring-up (updated 2026-08-11) — first draw in a prior run, no flip/frame yet
 
 The complete CPU ACM engine is no longer the title's first blocker. Its context, batch, command,
 buffer, execution, wait, statistics, and teardown paths are implemented with SDK-shaped errors and
@@ -145,6 +145,20 @@ jobs covering 697,344 samples. It then reached its main loop, submitted eight AG
 compiled eight compute pipelines, and reached one draw. It produced no real VideoOut flip and no
 captured frame before a host fiber-resume SIGSEGV. This is progress beyond the old
 "ACM-blocked / no AGC" checkpoint, not a UI, 3D, FPS, or playability claim.
+
+**Latest sparse performance/acceptance run (`7b2deea3`, 2026-08-11):** artifact
+`/var/folders/hq/mpk08tmn5r1_3dqbd58mff380000gn/T/remu-runs/20260811T160445Z-PPSA01342-app0`.
+The title reached its main loop in 18.613 seconds instead of 51.888 seconds in the prior artifact,
+and reached its first AGC submission in 22.374 seconds instead of 55.456 seconds. It completed
+three submissions and was parsing the fourth, but produced no draw, real VideoOut flip, captured
+frame, or FPS sample. Its crash report records `rip=0` and `rsp=0x7108803f00`; the saved register
+fingerprint matches guest tagged-arena vtable slot 32 at `0x80082f710`, whose routine ends in
+`ret`. All statically resolved callers enter that routine with ordinary `call` instructions and
+nonzero continuations. A missing or overwritten call return at `rsp-8` is therefore the leading
+hypothesis, not a captured fact: the old diagnostic dumped only at and above RSP. The new
+below-RSP dump and fiber identity trace are required to distinguish that from another zero-target
+control transfer. The signature is different from the earlier native `remu_fiber_long_jmp`
+failure.
 
 Two evidence-backed blockers from that run are now fixed in code but have not been game-validated:
 
@@ -171,17 +185,25 @@ as the cause of the prior graphics failure.
 
 If corruption persists, `d0650358` makes the next sparse run more diagnostic: register-anchored
 write matching includes publications on the following page, and the crash journal inventories the
-fill byte inferred from poison-shaped addresses such as the observed `0x03` pattern.
+fill byte inferred from poison-shaped addresses such as the observed `0x03` pattern. The current
+diagnostic hardening also best-effort dumps up to 0x200 bytes in the same page below a faulting
+stack pointer, so the consumed return slot and nearby abandoned import frame can survive offline
+analysis. Host page
+geometry is published before the signal handlers become visible, and unaligned corrupted stack
+pointers are read without aligned-access assumptions. Sparse fiber tracing now records fresh and
+resume transfer identity. Tests cover a returning entry, repeated cross-thread migration with a
+nested return frame, and migration through a real generated import stub/trampoline; all pass, so
+there is not yet evidence for another speculative fiber behavior change.
 
-Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 14/14, and
-`remu-memory` 94/94 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
-suite is 759/759. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
+Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 17/17, and
+`remu-memory` 99/99 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
+suite is 762/762. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
 dynamic data rather than its live FS function; `36593f56` gives the seeded decoder authenticated
 control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
 sparse clean run that passes both prior failures and reaches a real VideoOut flip/frame; until then
 Demon’s Souls is not considered rendering.
 
-**2026-08-11 pre-render CPU profile and mutex fast path (offline; no new game run):** the saved
+**2026-08-11 pre-render CPU profile, mutex fast path, and sparse correlation:** the earlier saved
 artifact above does not contain an FPS sample: all ten telemetry windows ended before the first AGC
 submission, and the title never produced a real flip. It does show 423,863 process-wide dispatch
 lock acquisitions in 50.119 seconds, with 166.16 aggregate seconds waiting and 34.08 seconds
@@ -194,6 +216,14 @@ that repeated warm lock/unlock avoids further shard lookups while slot recycling
 bare handles, stack copies, static initializers, recursive mutexes, and contention retain their
 existing semantics. This removes a source-identified registry-shard lookup from a measured
 high-frequency pre-render path; its CPU and FPS impact remains unmeasured.
+
+The later `7b2deea3` run is materially faster at the title milestones and is consistent with this
+cache helping, but it is not an isolated cache benchmark. Relative to the full earlier artifact,
+mean process-wide dispatch wait fell from 392.0 to 146.6 microseconds and mean hold from 80.4 to
+38.8 microseconds; active-audio underruns fell from a duration-weighted 76.598% to 0% during the
+shorter run. Host load, phase mix, run duration, and several correctness commits also differ, and
+direct mutex imports bypass the measured process-wide dispatch lock. Treat these as strong
+run-level correlation, not an attributable CPU or FPS result.
 
 ## Historical phase snapshots
 
@@ -758,7 +788,7 @@ corruption above before escaping it.
 
 The former intermittent AGC driver failure came from tests replacing a process-global GPU event
 sink. Tests now install thread-local sinks, so parallel import-dispatch activity cannot deliver an
-event to another test's receiver. The full x86 runtime library suite passes 759/759. Metal tests
+event to another test's receiver. The full x86 runtime library suite passes 762/762. Metal tests
 remain serialized for a separate reason: memory-watch fixtures share process signal handlers and
 mapping registries.
 

@@ -3421,6 +3421,10 @@ unsafe extern "C" fn import_dispatch_trampoline() {
 #[cfg(all(test, target_arch = "x86_64"))]
 const TEST_CAPTURE_DISPATCH_INDEX: u64 = i32::MAX as u64;
 
+/// Test-only generated-stub route for a real non-local fiber return/resume cycle.
+#[cfg(all(test, target_arch = "x86_64"))]
+const TEST_FIBER_RETURN_DISPATCH_INDEX: u64 = (i32::MAX - 1) as u64;
+
 #[cfg(all(test, target_arch = "x86_64"))]
 static TEST_CAPTURED_IMPORT_FRAME: Mutex<Option<ImportCallFrame>> = Mutex::new(None);
 
@@ -3725,6 +3729,19 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         return ProbeImportReturn {
             integer: frame.rax,
             float: low_xmm_f64(frame.xmm_arguments[7]),
+        };
+    }
+    #[cfg(all(test, target_arch = "x86_64"))]
+    if frame.dispatch_index == TEST_FIBER_RETURN_DISPATCH_INDEX {
+        let result = fiber::dispatch(
+            "B0ZX2hx9DMw",
+            frame.integer_arguments,
+            read_import_stack_arguments(frame),
+        )
+        .expect("the test route must resolve sceFiberReturnToThread");
+        return ProbeImportReturn {
+            integer: result,
+            float: 0.0,
         };
     }
     deliver_pending_guest_exception_at_import(frame);

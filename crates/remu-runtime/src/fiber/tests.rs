@@ -23,6 +23,26 @@ impl FiberStack {
     }
 }
 
+/// The 16 KiB context size used by the repeated migration regression. Keeping the stack small
+/// makes a bad saved RSP or gradually drifting call frame fail quickly instead of hiding inside
+/// the roomier default fixture.
+#[repr(C, align(16))]
+struct SmallFiberStack([u8; 0x4000]);
+
+impl SmallFiberStack {
+    fn new() -> Box<Self> {
+        Box::new(Self([0; 0x4000]))
+    }
+
+    fn address(&self) -> u64 {
+        std::ptr::from_ref(self).addr() as u64
+    }
+
+    fn size() -> u64 {
+        0x4000
+    }
+}
+
 /// An eight-byte-aligned fiber object, as the guest would allocate.
 #[repr(C, align(16))]
 struct FiberObject([u8; 256]);
@@ -73,6 +93,24 @@ unsafe extern "C" fn yields_once(argument_on_initialize: u64, argument_on_run_to
     // second round trip through the same saved context.
     return_to_thread([0xdead_beef, 0, 0, 0, 0, 0]);
     unreachable!("the test never resumes this fiber a third time");
+}
+
+unsafe extern "C" fn returns_immediately(_argument_on_initialize: u64, _argument_on_run_to: u64) {}
+
+#[test]
+fn a_returning_entry_is_caught_by_the_fiber_boundary_instead_of_jumping_to_zero() {
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, returns_immediately, 0), 0);
+    assert_eq!(
+        run([fiber.address(), 0, 0, 0, 0, 0]),
+        fiber_error(SCE_FIBER_ERROR_STATE)
+    );
+    assert_eq!(
+        fiber_state(fiber.address()).load(Ordering::Acquire),
+        FIBER_STATE_IDLE,
+        "the force-quit boundary must release a returning fiber"
+    );
 }
 
 #[test]
@@ -671,4 +709,220 @@ fn a_suspended_fiber_resumes_on_a_different_thread() {
         &[(0, 0x99)],
         "the resume must deliver the argument the second thread passed"
     );
+}
+
+const REPEATED_MIGRATIONS: u64 = 64;
+const REPEATED_MIGRATION_DONE: u64 = 0xd00d_f1be;
+static REPEATED_MIGRATION_ERROR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Keeps a real nested return address and local payload live across each thread migration.
+#[inline(never)]
+fn yield_from_nested_migration_frame(step: u64, argument_on_run: &mut u64) -> u64 {
+    let marker = step ^ 0xa5a5_5a5a_1234_5678;
+    let payload = [marker; 32];
+    let status = return_to_thread([
+        marker,
+        (argument_on_run as *mut u64).addr() as u64,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    if payload.iter().any(|word| *word != marker) {
+        REPEATED_MIGRATION_ERROR.store(step + 1, Ordering::Release);
+    }
+    std::hint::black_box(&payload);
+    status
+}
+
+unsafe extern "C" fn repeatedly_yields_across_threads(
+    _argument_on_initialize: u64,
+    argument_on_run_to: u64,
+) {
+    let mut received = argument_on_run_to;
+    for step in 0..REPEATED_MIGRATIONS {
+        if received != 0x1000 + step {
+            REPEATED_MIGRATION_ERROR.store(0x1000 + step, Ordering::Release);
+        }
+        let mut next = 0;
+        let status = yield_from_nested_migration_frame(step, &mut next);
+        if status != 0 {
+            REPEATED_MIGRATION_ERROR.store(0x2000 + step, Ordering::Release);
+        }
+        received = next;
+    }
+    return_to_thread([REPEATED_MIGRATION_DONE, 0, 0, 0, 0, 0]);
+    unreachable!("the migration stress fiber is not resumed after its final yield");
+}
+
+#[test]
+fn a_small_fiber_preserves_nested_return_frames_across_repeated_thread_migration() {
+    REPEATED_MIGRATION_ERROR.store(0, Ordering::Release);
+    let fiber = FiberObject::default();
+    let stack = SmallFiberStack::new();
+    let name = c"migrating-fiber";
+    assert_eq!(
+        initialize(
+            [
+                fiber.address(),
+                name.as_ptr().addr() as u64,
+                repeatedly_yields_across_threads as *const () as usize as u64,
+                0,
+                stack.address(),
+                SmallFiberStack::size(),
+            ],
+            [0; 6],
+        ),
+        0
+    );
+
+    let mut returned = 0_u64;
+    assert_eq!(
+        run([
+            fiber.address(),
+            0x1000,
+            (&raw mut returned).addr() as u64,
+            0,
+            0,
+            0,
+        ]),
+        0
+    );
+    assert_eq!(returned, 0xa5a5_5a5a_1234_5678);
+
+    for step in 1..=REPEATED_MIGRATIONS {
+        let fiber_address = fiber.address();
+        let (status, yielded) = std::thread::spawn(move || {
+            let mut yielded = 0;
+            let status = run([
+                fiber_address,
+                0x1000 + step,
+                (&raw mut yielded).addr() as u64,
+                0,
+                0,
+                0,
+            ]);
+            (status, yielded)
+        })
+        .join()
+        .expect("every migration worker must return normally");
+        assert_eq!(status, 0, "migration {step} must resume normally");
+        let expected = if step == REPEATED_MIGRATIONS {
+            REPEATED_MIGRATION_DONE
+        } else {
+            step ^ 0xa5a5_5a5a_1234_5678
+        };
+        assert_eq!(yielded, expected, "migration {step} yielded wrong marker");
+    }
+    assert_eq!(
+        REPEATED_MIGRATION_ERROR.load(Ordering::Acquire),
+        0,
+        "no resumed nested frame may lose its arguments, return address, or local payload"
+    );
+}
+
+#[cfg(all(unix, target_arch = "x86_64"))]
+unsafe extern "C" fn yields_through_generated_import_stub(
+    stub_address: u64,
+    _argument_on_run_to: u64,
+) {
+    // SAFETY: the test maps a complete executable import stub with this two-argument SysV shape.
+    let stub = unsafe {
+        std::mem::transmute::<usize, unsafe extern "C" fn(u64, u64) -> u64>(stub_address as usize)
+    };
+    let mut argument_on_run = 0_u64;
+    // This call does not return until another host thread resumes the suspended import frame.
+    let result = unsafe { stub(0x1111, (&raw mut argument_on_run).addr() as u64) };
+    OBSERVED.lock().unwrap().push((result, argument_on_run));
+    // Yield once more so the resuming thread can return normally without letting the entry end.
+    let _ = unsafe { stub(0x2222, 0) };
+    OBSERVED.lock().unwrap().push((UNEXPECTED, 0));
+    return_to_thread([0, 0, 0, 0, 0, 0]);
+}
+
+#[cfg(all(unix, target_arch = "x86_64"))]
+#[test]
+fn a_generated_import_stub_preserves_its_return_frame_across_fiber_migration() {
+    const PAGE_SIZE: usize = 0x4000;
+    OBSERVED.lock().unwrap().clear();
+    let mut slot = [0_u8; crate::IMPORT_STUB_SIZE_USIZE];
+    crate::write_import_stub(
+        &mut slot,
+        usize::try_from(crate::TEST_FIBER_RETURN_DISPATCH_INDEX).unwrap(),
+        crate::import_dispatch_trampoline as *const () as usize as u64,
+    )
+    .unwrap();
+    // SAFETY: the test owns this anonymous page until both fiber legs complete.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            PAGE_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    // SAFETY: the mapping is writable and the fixed stub fits at its start.
+    unsafe { std::ptr::copy_nonoverlapping(slot.as_ptr(), mapping.cast::<u8>(), slot.len()) };
+    // SAFETY: mapping and size are the exact values returned by mmap above.
+    assert_eq!(
+        unsafe { libc::mprotect(mapping, PAGE_SIZE, libc::PROT_READ | libc::PROT_EXEC) },
+        0
+    );
+
+    let fiber = FiberObject::default();
+    let stack = SmallFiberStack::new();
+    let name = c"stub-migration";
+    assert_eq!(
+        initialize(
+            [
+                fiber.address(),
+                name.as_ptr().addr() as u64,
+                yields_through_generated_import_stub as *const () as usize as u64,
+                mapping.addr() as u64,
+                stack.address(),
+                SmallFiberStack::size(),
+            ],
+            [0; 6],
+        ),
+        0
+    );
+    let mut returned = 0_u64;
+    assert_eq!(
+        run([
+            fiber.address(),
+            0,
+            (&raw mut returned).addr() as u64,
+            0,
+            0,
+            0,
+        ]),
+        0
+    );
+    assert_eq!(returned, 0x1111);
+
+    let fiber_address = fiber.address();
+    let (status, returned) = std::thread::spawn(move || {
+        let mut returned = 0_u64;
+        let status = run([
+            fiber_address,
+            0x9999,
+            (&raw mut returned).addr() as u64,
+            0,
+            0,
+            0,
+        ]);
+        (status, returned)
+    })
+    .join()
+    .expect("the import-frame resume must not fault");
+    assert_eq!(status, 0);
+    assert_eq!(returned, 0x2222);
+    assert_eq!(OBSERVED.lock().unwrap().as_slice(), &[(0, 0x9999)]);
+
+    // SAFETY: no fiber can execute the stub after the second yield has returned to its thread.
+    assert_eq!(unsafe { libc::munmap(mapping, PAGE_SIZE) }, 0);
 }
