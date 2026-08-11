@@ -25,8 +25,9 @@ const PLAYGO_INSTALL_SPEED_FULL: u32 = 2;
 ///
 /// Retail systems obtain this list from package metadata. REmu's extracted app directories do not
 /// consistently retain the binary package table, but development and preservation dumps commonly
-/// include `playgo-chunkdefs.xml`. Only enabled `<chunk>` elements are package chunks; `<chunkset>`
-/// elements and disabled placeholders must not be exposed through the ABI.
+/// include `playgo-chunkdefs.xml`. Every declared `<chunk>` is an ABI-visible identifier, including
+/// empty placeholders marked `enabled="false"`; `<chunkset>` elements are grouping metadata rather
+/// than chunks.
 fn discover_play_go_chunk_ids(state: &ProbeDispatchState) -> Vec<u16> {
     let Ok(xml) = std::fs::read_to_string(state.game_root.join("playgo-chunkdefs.xml")) else {
         return Vec::new();
@@ -47,8 +48,7 @@ fn discover_play_go_chunk_ids(state: &ProbeDispatchState) -> Vec<u16> {
         let tag = &cursor[..end];
         cursor = &cursor[end + 1..];
         let id = xml_attribute(tag, "id").and_then(|value| value.parse::<u16>().ok());
-        let enabled = xml_attribute(tag, "enabled").is_none_or(|value| value != "false");
-        if let Some(id) = id.filter(|_| enabled) {
+        if let Some(id) = id {
             ids.push(id);
         }
     }
