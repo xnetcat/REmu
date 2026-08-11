@@ -68,6 +68,250 @@ fn capture_submission_events(
     events
 }
 
+fn context_state_op(operation: u32) -> [u32; 3] {
+    [0xc001_1068, 0x4358_4f50, operation]
+}
+
+fn parse_context_commands(
+    commands: &[u32],
+    graphics: &mut AgcGraphicsState,
+) -> Result<(), crate::AgcSubmissionError> {
+    let mut submission_count = 0;
+    crate::agc_parse_submission(
+        commands.as_ptr().addr() as u64,
+        u32::try_from(commands.len()).expect("command dword count"),
+        &mut crate::AgcSubmissionContext {
+            graphics,
+            shaders: &mut AgcShaderRegistry::default(),
+            video_out: &VideoOutState::default(),
+            submission_count: &mut submission_count,
+            flips: &mut Vec::new(),
+            event_writes: &mut Vec::new(),
+        },
+    )
+}
+
+#[test]
+fn context_state_clear_reseeds_cx_in_submission_order() {
+    let mut commands = vec![agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0), 0x205, 0x246];
+    commands.extend(context_state_op(0));
+    commands.extend([
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x318,
+        0x1234_5600,
+    ]);
+    let mut graphics = AgcGraphicsState::default();
+    graphics.shader_registers.insert(0x20c, 0x99);
+    graphics.user_config_registers.insert(0x24a, 7);
+
+    let events =
+        capture_submission_events(&commands, &mut graphics, &mut AgcShaderRegistry::default());
+
+    assert!(events.is_empty());
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x240));
+    assert_eq!(graphics.context_registers.get(&0x318), Some(&0x1234_5600));
+    assert_eq!(graphics.shader_registers.get(&0x20c), Some(&0x99));
+    assert_eq!(graphics.user_config_registers.get(&0x24a), Some(&7));
+}
+
+#[test]
+fn context_state_push_and_pop_restore_cx_and_blend_provenance() {
+    let mut commands = vec![
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x1e0,
+        0x2001_0001,
+    ];
+    commands.extend(context_state_op(1));
+    commands.extend([
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x1e0,
+        0x6501_0501,
+    ]);
+    commands.extend(context_state_op(2));
+    let mut graphics = AgcGraphicsState::default();
+
+    let events =
+        capture_submission_events(&commands, &mut graphics, &mut AgcShaderRegistry::default());
+
+    assert!(events.is_empty());
+    assert_eq!(graphics.context_registers.get(&0x1e0), Some(&0x2001_0001));
+    assert_eq!(
+        graphics.blend_register_provenance[0]
+            .as_ref()
+            .map(|provenance| provenance.value),
+        Some(0x2001_0001)
+    );
+}
+
+#[test]
+fn context_state_push_clear_restores_outer_cx_across_submissions() {
+    let mut push_clear = vec![agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0), 0x205, 0x246];
+    push_clear.extend(context_state_op(3));
+    push_clear.extend([
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x318,
+        0x1234_5600,
+    ]);
+    let mut graphics = AgcGraphicsState::default();
+    let mut shaders = AgcShaderRegistry::default();
+
+    assert!(capture_submission_events(&push_clear, &mut graphics, &mut shaders).is_empty());
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x240));
+    assert_eq!(graphics.context_registers.get(&0x318), Some(&0x1234_5600));
+
+    assert!(
+        capture_submission_events(&context_state_op(2), &mut graphics, &mut shaders).is_empty()
+    );
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x246));
+    assert_eq!(graphics.context_registers.get(&0x318), Some(&0));
+}
+
+#[test]
+fn context_state_pop_invalidates_a_cached_inner_cx_snapshot() {
+    let mut commands = vec![agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0), 0x205, 0x246];
+    commands.extend(context_state_op(1));
+    commands.extend([agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0), 0x205, 0x247]);
+    let mut graphics = AgcGraphicsState::default();
+
+    parse_context_commands(&commands, &mut graphics).expect("push with inner Cx state");
+    let inner = graphics.context_register_snapshot();
+    assert_eq!(
+        inner
+            .iter()
+            .find(|register| register.offset == 0x205)
+            .map(|register| register.value),
+        Some(0x247)
+    );
+
+    parse_context_commands(&context_state_op(2), &mut graphics).expect("pop outer Cx state");
+    let outer = graphics.context_register_snapshot();
+    assert_eq!(
+        outer
+            .iter()
+            .find(|register| register.offset == 0x205)
+            .map(|register| register.value),
+        Some(0x246)
+    );
+}
+
+#[test]
+fn context_state_rejects_a_second_push() {
+    let mut commands = Vec::new();
+    commands.extend(context_state_op(1));
+    commands.extend(context_state_op(3));
+
+    assert!(matches!(
+        parse_context_commands(&commands, &mut AgcGraphicsState::default()),
+        Err(crate::AgcSubmissionError::ContextStateAlreadyPushed { operation: 3 })
+    ));
+}
+
+#[test]
+fn context_state_rejects_pop_without_a_push() {
+    assert!(matches!(
+        parse_context_commands(&context_state_op(2), &mut AgcGraphicsState::default()),
+        Err(crate::AgcSubmissionError::ContextStatePopWithoutPush)
+    ));
+}
+
+#[test]
+fn context_state_rejects_unknown_stream_operation() {
+    assert!(matches!(
+        parse_context_commands(&context_state_op(4), &mut AgcGraphicsState::default()),
+        Err(crate::AgcSubmissionError::UnsupportedContextStateOperation(
+            4
+        ))
+    ));
+}
+
+#[test]
+fn context_state_rejects_a_malformed_private_marker() {
+    let wrong_length = [agc_pm4(2, AGC_IT_NOP, 0x1a), 0x4358_4f50];
+    let wrong_magic = [agc_pm4(3, AGC_IT_NOP, 0x1a), 0xfeed_face, 0];
+
+    assert!(matches!(
+        parse_context_commands(&wrong_length, &mut AgcGraphicsState::default()),
+        Err(crate::AgcSubmissionError::ContextStatePacketLength { actual: 2 })
+    ));
+    assert!(matches!(
+        parse_context_commands(&wrong_magic, &mut AgcGraphicsState::default()),
+        Err(crate::AgcSubmissionError::ContextStatePacketMagic(
+            0xfeed_face
+        ))
+    ));
+}
+
+#[test]
+fn reset_queue_context_push_bit_restores_a_pushed_state() {
+    let mut commands = vec![agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0), 0x205, 0x246];
+    commands.extend(context_state_op(1));
+    commands.extend([
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x205,
+        0x247,
+        agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0),
+        crate::agc_reset_queue_op::CONTEXT_OP_PUSH,
+    ]);
+    let mut graphics = AgcGraphicsState::default();
+
+    parse_context_commands(&commands, &mut graphics).expect("reset pops an occupied Cx stack");
+
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x246));
+}
+
+#[test]
+fn reset_queue_context_push_then_cx_clear_finishes_at_defaults() {
+    let mut commands = vec![agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0), 0x205, 0x246];
+    commands.extend(context_state_op(1));
+    commands.extend([
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x205,
+        0x247,
+        agc_pm4(2, crate::AGC_IT_CLEAR_STATE, 0),
+        crate::agc_reset_queue_op::CONTEXT_OP_PUSH | crate::agc_reset_queue_op::CX_STATE,
+    ]);
+    let mut graphics = AgcGraphicsState::default();
+
+    parse_context_commands(&commands, &mut graphics)
+        .expect("reset pops the occupied stack before clearing Cx");
+
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x240));
+    assert!(matches!(
+        parse_context_commands(&context_state_op(2), &mut graphics),
+        Err(crate::AgcSubmissionError::ContextStatePopWithoutPush)
+    ));
+}
+
+#[test]
+fn ordinary_type_two_packet_remains_inert() {
+    let mut graphics = AgcGraphicsState::default();
+    graphics.context_registers.insert(0x205, 0x246);
+
+    parse_context_commands(&[0x8000_0000], &mut graphics).expect("ordinary type-2 NOP");
+
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x246));
+}
+
+#[test]
+fn context_state_operation_executes_inside_an_indirect_buffer() {
+    let indirect = context_state_op(0);
+    let indirect_address = indirect.as_ptr().addr() as u64;
+    let commands = [
+        agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+        0x205,
+        0x246,
+        agc_pm4(4, crate::AGC_IT_INDIRECT_BUFFER, 0),
+        low_u32(indirect_address),
+        low_u32(indirect_address >> 32),
+        3,
+    ];
+    let mut graphics = AgcGraphicsState::default();
+
+    parse_context_commands(&commands, &mut graphics).expect("nested context clear");
+
+    assert_eq!(graphics.context_registers.get(&0x205), Some(&0x240));
+}
+
 #[test]
 fn submission_parser_skips_the_one_dword_uncounted_nop() {
     let events = capture_submission_events(

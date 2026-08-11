@@ -1118,6 +1118,16 @@ pub(crate) enum AgcSubmissionError {
     ClearStatePacketLength { actual: u32 },
     #[error("CLEAR_STATE control has unsupported bits 0x{0:08X}")]
     UnsupportedClearStateControl(u32),
+    #[error("context state operation {operation} attempted a second push")]
+    ContextStateAlreadyPushed { operation: u32 },
+    #[error("context state pop has no matching push")]
+    ContextStatePopWithoutPush,
+    #[error("context state operation {0} is not implemented")]
+    UnsupportedContextStateOperation(u32),
+    #[error("context state marker has {actual} dwords, expected 3")]
+    ContextStatePacketLength { actual: u32 },
+    #[error("context state marker has invalid magic 0x{0:08X}")]
+    ContextStatePacketMagic(u32),
     #[error("PFP_SYNC_ME packet has {actual} dwords, expected 2")]
     PfpSyncMePacketLength { actual: u32 },
     #[error("WAIT_FLIP_DONE packet has {actual} dwords, expected 7")]

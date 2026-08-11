@@ -570,16 +570,47 @@ fn builds_native_register_and_draw_packets() {
 }
 
 #[test]
-fn builds_native_type_two_packet() {
+fn builds_context_state_operation_packets() {
     let mut fixture = CommandFixture::new(0);
     let buffer = fixture.address();
 
+    for operation in 0_u32..=3 {
+        let expected_address = fixture.start() + u64::from(operation) * 12;
+        assert_eq!(
+            call("qj7QZpgr9Uw", args(&[buffer, u64::from(operation)]), [0; 6],),
+            expected_address
+        );
+        let word = usize::try_from(operation * 3).expect("context operation word index");
+        assert_eq!(
+            &fixture.words[word..word + 3],
+            &[0xc001_1068, 0x4358_4f50, operation]
+        );
+    }
+    assert_eq!(fixture.cursor(), fixture.start() + 48);
+}
+
+#[test]
+fn returns_context_state_operation_packet_size() {
+    for operation in 0_u32..=3 {
+        assert_eq!(
+            dispatch_agc_command_abi("H6vHS5cidSA", args(&[u64::from(operation)]), [0; 6]),
+            Some(12)
+        );
+    }
+}
+
+#[test]
+fn rejects_invalid_context_state_operation() {
+    let mut fixture = CommandFixture::new(0);
+    let buffer = fixture.address();
+
+    assert_eq!(call("qj7QZpgr9Uw", args(&[buffer, 4]), [0; 6]), 0);
+    assert_eq!(fixture.cursor(), fixture.start());
+    assert_eq!(fixture.words[0], 0);
     assert_eq!(
-        call("qj7QZpgr9Uw", args(&[buffer]), [0; 6]),
-        fixture.start()
+        dispatch_agc_command_abi("H6vHS5cidSA", args(&[4]), [0; 6]),
+        Some(0)
     );
-    assert_eq!(fixture.words[0], 0x8000_0000);
-    assert_eq!(fixture.cursor(), fixture.start() + 4);
 }
 
 #[test]
