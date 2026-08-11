@@ -362,9 +362,6 @@ const ANCHOR_FLOOR: u64 = 0x10000;
 ///
 /// Signal-safe: it allocates nothing, takes no lock, and renders through a fixed buffer.
 pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
-    if ENABLED.load(Ordering::Relaxed) != ENABLED_YES {
-        return;
-    }
     // A fault raised by the dump's own probing must not recurse into a second dump.
     static DUMPING: AtomicU8 = AtomicU8::new(0);
     if DUMPING.swap(1, Ordering::AcqRel) != 0 {
@@ -373,7 +370,17 @@ pub fn dump_guest_write_journal(fault_address: u64, anchors: &[u64]) {
         write_diagnostic(&buffer);
         return;
     }
-    dump_guest_write_journal_locked(fault_address, anchors);
+    if ENABLED.load(Ordering::Relaxed) == ENABLED_YES {
+        dump_guest_write_journal_locked(fault_address, anchors);
+    } else {
+        // The journal is deliberately expensive and normally disabled, but the bounded memory
+        // neighbourhood dump is cheap, allocation-free and often the only way to recover the
+        // corrupted object or vtable after Rosetta forwards the fatal signal. Keep that last-
+        // chance evidence available on every unhandled fault instead of coupling it to the
+        // 200 MiB publication history.
+        let mut buffer = DiagnosticBuffer::new();
+        dump_anchor_neighbourhoods(fault_address, anchors, &mut buffer);
+    }
     DUMPING.store(0, Ordering::Release);
 }
 
