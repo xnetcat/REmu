@@ -6457,7 +6457,7 @@ fn array_image_base_slice_selects_exact_span_and_cache_identity() {
 }
 
 #[test]
-fn mode27_array_mips_are_rejected_before_span_admission() {
+fn mode27_array_mips_select_slice_major_full_chain_spans() {
     let address = 0x0070_1a40_0000_u64;
     let width = 128_u32;
     let height = 128_u32;
@@ -6468,15 +6468,55 @@ fn mode27_array_mips_are_rejected_before_span_admission() {
         | (130 << 20)
         | ((encoded_width & 0x3) << 30);
     words[2] = (encoded_width >> 2) | ((height - 1) << 14);
-    // LAST_LEVEL=1 requests two levels on a type-13 mode-27 array. No layered 64K mip
-    // allocation equation is implemented, so decode must not publish a one-face fallback span.
+    // LAST_LEVEL=1 requests two levels on a type-13 mode-27 array. The SDK addresses each
+    // absolute slice at block-slice-size * slice, where block-slice-size is the full mip chain.
     words[3] = 0xfac | (1 << 16) | (27 << 20) | (13 << 28);
     words[4] = (3 << 16) | 4;
 
-    let error = decode_image_descriptor(&words).expect_err("layered mode-27 mips stay loud");
+    let decoded = decode_image_descriptor(&words).expect("exact layered mode-27 mip span");
+    const CHAIN_BYTES: u64 = 131_072;
+    let span = decoded.span.expect("selected layered mip span");
+    assert_eq!(span.address(), address + 3 * CHAIN_BYTES);
+    assert_eq!(span.len(), 2 * CHAIN_BYTES);
+
+    let suffix_neighbour = ResourceSpan::new(address + 4 * CHAIN_BYTES + 96 * 1024, 4096);
     assert!(
-        error.contains("does not support layered or 3D mip views"),
-        "unexpected decode error: {error}"
+        span.overlaps(&suffix_neighbour),
+        "the selected span must include the second slice's mip tail"
+    );
+
+    let mode9 = GuestTextureDescriptor {
+        tile_mode: 9,
+        ..decoded.guest
+    };
+    assert!(
+        ResourceSpan::for_image_view(mode9, 0, 2, 13, 3, 2)
+            .expect_err("mode-9 layered mips stay unsupported")
+            .contains("does not support layered")
+    );
+    let compressed = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::BC7_RGBAUnorm,
+        bytes_per_pixel: 16,
+        ..decoded.guest
+    };
+    assert!(
+        ResourceSpan::for_image_view(compressed, 0, 2, 13, 3, 2)
+            .expect_err("mode-27 BC layered mips stay unsupported")
+            .contains("uncompressed")
+    );
+    assert!(
+        ResourceSpan::for_image_view(decoded.guest, 0, 2, 10, 0, 2)
+            .expect_err("mode-27 3D mips stay unsupported")
+            .contains("does not support layered")
+    );
+    let mismatched_pitch = GuestTextureDescriptor {
+        pitch: decoded.guest.width + 64,
+        ..decoded.guest
+    };
+    assert!(
+        ResourceSpan::for_image_view(mismatched_pitch, 0, 2, 13, 3, 2)
+            .expect_err("mode-27 layered mips require the SDK width-derived pitch")
+            .contains("pitch==width")
     );
 }
 

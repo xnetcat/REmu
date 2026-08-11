@@ -79,10 +79,12 @@ pub(crate) use self::mips::{
     storage_image_requires_mip_hierarchy,
 };
 pub(crate) use self::ranges::RangeSet;
-#[cfg(test)]
-pub(crate) use self::residency::rematerialisation_blit_source_origin_y;
 pub(crate) use self::residency::{
     ensure_resident_texture_in_map, resident_texture_ownership_stats,
+};
+#[cfg(test)]
+pub(crate) use self::residency::{
+    rematerialisation_blit_source_origin_y, rematerialisation_subresource_summary,
 };
 #[cfg(test)]
 pub(crate) use self::resident_map::ResidentSpanIndex;
@@ -107,7 +109,9 @@ pub(crate) use self::sampled::{
     resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
     sampled_texture_supports_access, sampled_texture_view_for_binding,
 };
-pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
+pub(crate) use self::upload::{
+    comparison_depth32_upload, exact_mode27_array_storage_supported, upload_image_textures,
+};
 #[cfg(test)]
 pub(crate) use self::upload::{
     sampled_texture_cache_accepts, sampled_texture_cache_requires_eviction,

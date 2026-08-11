@@ -730,6 +730,20 @@ pub(crate) fn resident_texture_raw_byte_count(
     layer_count: u32,
     mip_level_count: u32,
 ) -> Result<u64, String> {
+    if descriptor.tile_mode == 27
+        && texture_type == 13
+        && layer_count > 0
+        && mip_level_count > 1
+        && super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+            == Some(descriptor.bytes_per_pixel)
+    {
+        let face_bytes =
+            u64::try_from(mode64k_2d_mip_chain_layout(descriptor, mip_level_count)?.byte_count)
+                .map_err(|_| "mode-27 array mip-chain byte count does not fit u64")?;
+        return face_bytes
+            .checked_mul(u64::from(layer_count))
+            .ok_or_else(|| "mode-27 array mip-chain byte count overflows".to_owned());
+    }
     if texture_type == 9 && layer_count == 1 {
         if mip_level_count == 1 {
             return guest_texture_byte_count(descriptor)
@@ -1272,4 +1286,27 @@ pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(
             (start < end).then(|| (start as u64, &raw[start..end]))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod layered_mode27_mip_tests {
+    use super::{GuestTextureDescriptor, resident_texture_raw_byte_count};
+    use metal::MTLPixelFormat;
+
+    #[test]
+    fn resident_byte_count_uses_full_chain_stride_for_each_mode27_array_slice() {
+        let descriptor = GuestTextureDescriptor {
+            address: 0x70_2700_0000,
+            width: 128,
+            height: 128,
+            pitch: 128,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        assert_eq!(
+            resident_texture_raw_byte_count(descriptor, 13, 2, 2),
+            Ok(262_144)
+        );
+    }
 }

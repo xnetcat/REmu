@@ -221,13 +221,14 @@ use self::submission::{
 use self::texture::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
     SpanQueryOrder, WrittenRegion, decode_guest_texture_linear_from_raw,
-    refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
-    resident_declared_span, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible, resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
-    resident_texture_raw_byte_count, retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
-    sampled_texture_raw_range, snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy,
+    exact_mode27_array_storage_supported, refresh_resident_texture_write_watch,
+    resident_color_view_sample_is_eligible, resident_declared_span,
+    resident_depth_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
+    resident_texture_ownership_stats, resident_texture_raw_byte_count,
+    retire_multisample_textures_overlapping_writeback, retire_sampled_textures_matching,
+    retire_sampled_textures_overlapping_writeback, sampled_texture_raw_range,
+    snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy,
     trace_resident_texture_removal, upload_image_textures,
 };
 #[cfg(test)]

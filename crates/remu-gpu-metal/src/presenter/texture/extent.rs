@@ -162,17 +162,35 @@ fn resource_relative_runs(
     mip_level_count: u32,
     region: WrittenRegion,
 ) -> Option<RangeSet> {
-    // A mip chain only exists for a plain 2D single-layer surface, which is the same shape
-    // `watch_resident_texture` restricts chains to; nothing else has a layout to answer from.
+    let exact_layered_mode27_mips =
+        descriptor.tile_mode == 27 && texture_type == 13 && layer_count > 0;
     if layer_count == 0
         || mip_level_count == 0
-        || (mip_level_count > 1 && (texture_type != 9 || layer_count != 1))
+        || (mip_level_count > 1
+            && !((texture_type == 9 && layer_count == 1) || exact_layered_mode27_mips))
     {
         return None;
     }
     let (_, _, _, bytes_per_element) = texture_element_layout(descriptor).ok()?;
-    let face_bytes = guest_texture_byte_count(descriptor)?;
     let levels = level_extents(descriptor, mip_level_count)?;
+    let face_bytes = if mip_level_count > 1 {
+        let byte_count = match descriptor.tile_mode {
+            5 => {
+                mode5_mip_chain_layout(descriptor, mip_level_count)
+                    .ok()?
+                    .byte_count
+            }
+            9 | 27 => {
+                mode64k_2d_mip_chain_layout(descriptor, mip_level_count)
+                    .ok()?
+                    .byte_count
+            }
+            _ => return None,
+        };
+        u64::try_from(byte_count).ok()?
+    } else {
+        guest_texture_byte_count(descriptor)?
+    };
     let first_level = region.first_level;
     let level_end = first_level
         .saturating_add(region.level_count)
@@ -185,7 +203,7 @@ fn resource_relative_runs(
         return None;
     }
     // Mode-27 slices are both strided and XOR-permuted inside the block, so a rect cannot be
-    // refined across them. The whole written face is claimed instead.
+    // refined across them. Coarsen only the selected mip extent in each written slice.
     let volume_faces = descriptor.tile_mode == 27 && layer_count > 1;
     if volume_faces && region.rect.is_some() {
         OWNED_RANGE_SET_COARSENED.fetch_add(1, Ordering::Relaxed);
@@ -193,15 +211,11 @@ fn resource_relative_runs(
     let mut runs = RangeSet::default();
     for layer in first_layer..layer_end {
         let layer_offset = face_bytes.checked_mul(u64::from(layer))?;
-        if volume_faces {
-            runs.insert_run(layer_offset, layer_offset.checked_add(face_bytes)?);
-            continue;
-        }
         for level in first_level..level_end {
             let extent = levels.get(usize::try_from(level).ok()?)?;
             extend_level_runs(
                 *extent,
-                region.rect,
+                if volume_faces { None } else { region.rect },
                 descriptor,
                 bytes_per_element,
                 layer_offset,
@@ -543,6 +557,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mode27_array_storage_write_claims_only_the_bound_mip_in_each_local_slice() {
+        let descriptor = descriptor(128, 128, 128, 27);
+        let mip_level_count = 2;
+        let layout = mode64k_2d_mip_chain_layout(descriptor, mip_level_count)
+            .expect("mode-27 per-slice mip layout");
+        assert_eq!(layout.byte_count, 131_072);
+        let span = ResourceSpan::new(
+            descriptor.address + 3 * u64::try_from(layout.byte_count).unwrap(),
+            2 * u64::try_from(layout.byte_count).unwrap(),
+        );
+        let written = written_byte_ranges(
+            span,
+            descriptor,
+            13,
+            2,
+            mip_level_count,
+            WrittenRegion {
+                first_level: 1,
+                level_count: 1,
+                first_layer: 0,
+                layer_count: 2,
+                rect: None,
+            },
+        );
+        let base = span.range_start();
+        assert_eq!(
+            written.runs(),
+            &[(base, base + 65_536), (base + 131_072, base + 196_608),],
+            "ImageStore debt must use local Metal slices but full-chain guest strides"
+        );
+
+        let rect_written = written_byte_ranges(
+            span,
+            descriptor,
+            13,
+            2,
+            mip_level_count,
+            WrittenRegion {
+                first_level: 1,
+                level_count: 1,
+                first_layer: 0,
+                layer_count: 2,
+                rect: Some(MTLScissorRect {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                }),
+            },
+        );
+        assert_eq!(
+            rect_written.runs(),
+            written.runs(),
+            "a rect on an array mip may coarsen that mip, never the whole slice chain"
+        );
+        assert!(!rect_written.contains_run(base + 65_536, base + 65_537));
     }
 
     #[test]

@@ -525,10 +525,25 @@ pub(crate) fn resident_texture_for_sample(
         && resident.texture_type == sampled.texture_type
         && resident.base_array_slice == sampled.base_array_slice
         && resident.layer_count == sampled.layer_count
-        && sampled.base_mip_level == 0
-        && sampled.mip_level_count.max(1) == resident.mip_level_count
+        && resident.mip_level_count == underlying_mip_count
+        && resident.span == sampled.span
     {
-        return Some(resident.texture.clone());
+        if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
+        {
+            return Some(resident.texture.clone());
+        }
+        return Some(resident.texture.new_texture_view_from_slice(
+            resident.texture.pixel_format(),
+            MTLTextureType::D2Array,
+            NSRange::new(
+                u64::from(sampled.base_mip_level),
+                u64::from(sampled.mip_level_count.max(1)),
+            ),
+            NSRange::new(0, u64::from(resident.layer_count)),
+        ));
+    }
+    if matches!(sampled.texture_type, 11 | 13) {
+        return None;
     }
     if guest_texture_descriptors_share_depth_sample_storage(
         resident.descriptor,

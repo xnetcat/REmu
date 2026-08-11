@@ -68,7 +68,10 @@ impl ResourceSpan {
             u64::try_from(mode5_mip_chain_layout(descriptor, underlying_mip_count)?.byte_count)
                 .map_err(|_| "mode-5 image face byte count does not fit u64")?
         } else if underlying_mip_count > 1 && matches!(descriptor.tile_mode, 9 | 27) {
-            if texture_type != 9 || layer_count != 1 {
+            let exact_2d = texture_type == 9 && layer_count == 1;
+            let exact_mode27_array =
+                descriptor.tile_mode == 27 && texture_type == 13 && layer_count > 0;
+            if !exact_2d && !exact_mode27_array {
                 return Err(format!(
                     "mode-{} exact mip layout does not support layered or 3D mip views (type={texture_type} layers={layer_count})",
                     descriptor.tile_mode,

@@ -296,12 +296,18 @@ fn settle_gpu_sampled_upload(
     Ok(texture)
 }
 
-fn exact_mode27_array_storage_supported(descriptor: super::DecodedImageDescriptor) -> bool {
+pub(crate) fn exact_mode27_array_storage_supported(
+    descriptor: super::DecodedImageDescriptor,
+) -> bool {
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count);
     descriptor.texture_type == 13
         && descriptor.guest.tile_mode == 27
-        && descriptor.base_mip_level == 0
-        && descriptor.mip_level_count == 1
+        && descriptor.mip_level_count > 0
+        && underlying_mip_count.is_some()
         && descriptor.layer_count > 0
+        && (underlying_mip_count == Some(1) || descriptor.guest.pitch == descriptor.guest.width)
         && super::super::metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
             == Some(descriptor.guest.bytes_per_pixel)
 }
@@ -317,11 +323,13 @@ fn refuse_gpu_authored_array_aliases(
     for alias in aliases {
         let exact_same_view = alias == descriptor.guest
             && residents.get(&alias).is_some_and(|resident| {
+                let underlying_mip_count = descriptor
+                    .base_mip_level
+                    .checked_add(descriptor.mip_level_count);
                 resident.texture_type == descriptor.texture_type
                     && resident.base_array_slice == descriptor.base_array_slice
                     && resident.layer_count == descriptor.layer_count
-                    && descriptor.base_mip_level == 0
-                    && resident.mip_level_count == descriptor.mip_level_count
+                    && underlying_mip_count == Some(resident.mip_level_count)
                     && resident.span == Some(selected_span)
             });
         if allow_exact_same_view && exact_same_view {
@@ -359,7 +367,7 @@ fn ensure_exact_mode27_array_storage_resident(
 ) -> Result<Texture, String> {
     if !exact_mode27_array_storage_supported(descriptor) {
         return Err(format!(
-            "writable array residency requires an uncompressed single-level mode-27 type-13 view, got type={} tile={} base_mip={} mips={} layers={} format={:?} bpe={}",
+            "writable array residency requires an exact uncompressed mode-27 type-13 view, got type={} tile={} base_mip={} mips={} layers={} format={:?} bpe={}",
             descriptor.texture_type,
             descriptor.guest.tile_mode,
             descriptor.base_mip_level,
@@ -372,12 +380,16 @@ fn ensure_exact_mode27_array_storage_resident(
     let selected_span = descriptor
         .span
         .ok_or("writable array selected span overflows")?;
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count)
+        .ok_or("writable array underlying mip count overflows")?;
     refuse_gpu_authored_array_aliases(descriptor, residents, true)?;
     let exact_existing = residents.get(&descriptor.guest).is_some_and(|resident| {
         resident.texture_type == descriptor.texture_type
             && resident.base_array_slice == descriptor.base_array_slice
             && resident.layer_count == descriptor.layer_count
-            && resident.mip_level_count == descriptor.mip_level_count
+            && resident.mip_level_count == underlying_mip_count
             && resident.span == descriptor.span
             && resident.owned.covers(&selected_span)
     });
@@ -401,11 +413,15 @@ fn ensure_exact_mode27_array_storage_resident(
             (refresh, cpu_changed, resident.gpu_written())
         };
         if refresh != WriteWatchRefresh::Replaced && !cpu_changed {
-            return Ok(residents
-                .get(&descriptor.guest)
-                .expect("exact array resident still exists")
-                .texture
-                .clone());
+            return resident_texture_for_sample(
+                residents
+                    .get_mut(&descriptor.guest)
+                    .expect("exact array resident still exists"),
+                descriptor,
+            )
+            .ok_or_else(|| {
+                "exact array resident cannot represent the requested mip view".to_owned()
+            });
         }
         if cpu_changed && gpu_written {
             return Err(format!(
@@ -432,7 +448,12 @@ fn ensure_exact_mode27_array_storage_resident(
         trace_resident_texture_removal("array-storage-view-replaced", &retired);
     }
     let write_watch = watch_sampled_texture(descriptor)?;
-    let texture = settle_gpu_sampled_upload(device, queue, descriptor, false, true)?;
+    let full_descriptor = super::DecodedImageDescriptor {
+        base_mip_level: 0,
+        mip_level_count: underlying_mip_count,
+        ..descriptor
+    };
+    let texture = settle_gpu_sampled_upload(device, queue, full_descriptor, false, true)?;
     let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
     if span != Some(selected_span) {
         return Err("array storage resident watch does not match decoded selected span".to_owned());
@@ -446,7 +467,7 @@ fn ensure_exact_mode27_array_storage_resident(
             texture_type: descriptor.texture_type,
             base_array_slice: descriptor.base_array_slice,
             layer_count: descriptor.layer_count,
-            mip_level_count: descriptor.mip_level_count,
+            mip_level_count: underlying_mip_count,
             write_watch,
             span,
             owned,
@@ -459,7 +480,13 @@ fn ensure_exact_mode27_array_storage_resident(
             activity: super::super::ResidentTextureActivity::enabled(),
         },
     );
-    Ok(texture)
+    resident_texture_for_sample(
+        residents
+            .get_mut(&descriptor.guest)
+            .expect("new exact array resident exists"),
+        descriptor,
+    )
+    .ok_or_else(|| "new exact array resident cannot represent the requested mip view".to_owned())
 }
 
 pub(crate) fn upload_image_textures(
@@ -711,7 +738,12 @@ pub(crate) fn upload_image_textures(
                         resident.texture_type == descriptor.texture_type
                             && resident.base_array_slice == descriptor.base_array_slice
                             && resident.layer_count == descriptor.layer_count
-                            && resident.mip_level_count >= underlying_mip_count
+                            && if descriptor.texture_type == 13 {
+                                resident.mip_level_count == underlying_mip_count
+                                    && resident.span == descriptor.span
+                            } else {
+                                resident.mip_level_count >= underlying_mip_count
+                            }
                     });
                 let mut remove_resident = false;
                 if matching_resident {
@@ -815,7 +847,12 @@ pub(crate) fn upload_image_textures(
                                         && resident.base_array_slice
                                             == descriptor.base_array_slice
                                         && resident.layer_count == descriptor.layer_count
-                                        && resident.mip_level_count >= underlying_mip_count
+                                        && if descriptor.texture_type == 13 {
+                                            resident.mip_level_count == underlying_mip_count
+                                                && resident.span == descriptor.span
+                                        } else {
+                                            resident.mip_level_count >= underlying_mip_count
+                                        }
                                 })
                                 .map(|resident| {
                                     (resident.descriptor, resident.gpu_written(), resident.content_version)
@@ -1343,4 +1380,983 @@ pub(crate) fn upload_image_textures(
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod exact_mode27_array_mip_tests {
+    use super::{
+        ensure_exact_mode27_array_storage_resident, exact_mode27_array_storage_supported,
+        resident_texture_for_sample, settle_gpu_sampled_upload,
+    };
+    use crate::presenter::texture::rematerialisation_subresource_summary;
+    use crate::presenter::{
+        DecodedImageDescriptor, GuestTextureDescriptor, MetalPresenter,
+        ResidentTextureActivityStamp, ResourceSpan, WritebackTrigger, WrittenRegion,
+        copy_linear_to_mode64k_2d_mip_level, copy_linear_to_tiled_at_z,
+        copy_mode64k_2d_mip_level_to_linear, decode_image_descriptor, mode27_surface_z_xor,
+        mode64k_2d_mip_chain_layout,
+    };
+    use metal::foreign_types::ForeignType;
+    use metal::{MTLPixelFormat, MTLRegion, MTLTextureType};
+    use remu_shader::{ImageBinding, ImageControl, Opcode, ShaderEvaluation};
+
+    #[test]
+    fn writable_mode27_arrays_accept_full_and_nonzero_mip_views() {
+        let guest = GuestTextureDescriptor {
+            address: 0x70_2713_0000,
+            width: 512,
+            height: 256,
+            pitch: 512,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        for (base_mip_level, mip_level_count) in [(0, 5), (4, 1)] {
+            let descriptor = DecodedImageDescriptor {
+                guest,
+                span: ResourceSpan::for_image_view(
+                    guest,
+                    base_mip_level,
+                    mip_level_count,
+                    13,
+                    3,
+                    2,
+                )
+                .expect("exact array mip span"),
+                destination_select: 0xfac,
+                base_mip_level,
+                mip_level_count,
+                texture_type: 13,
+                base_array_slice: 3,
+                layer_count: 2,
+            };
+            assert!(exact_mode27_array_storage_supported(descriptor));
+        }
+    }
+
+    #[test]
+    fn nonzero_base_array_mip_storage_uploads_and_publishes_bound_levels() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection, read_guest_shared_backing,
+        };
+
+        let template = GuestTextureDescriptor {
+            address: 0,
+            width: 128,
+            height: 128,
+            pitch: 128,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let layout = mode64k_2d_mip_chain_layout(template, 2).expect("array chain layout");
+        assert_eq!(layout.byte_count, 131_072);
+        let allocation_size = u64::try_from(layout.byte_count * 5).expect("allocation size");
+        let mut memory = GuestAddressSpace::new(allocation_size * 2).expect("address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("array backing");
+        let mapping = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping");
+        let guest = GuestTextureDescriptor {
+            address: mapping.get(),
+            ..template
+        };
+        let descriptor = DecodedImageDescriptor {
+            guest,
+            span: ResourceSpan::for_image_view(guest, 1, 1, 13, 3, 2).expect("selected span"),
+            destination_select: 0xfac,
+            base_mip_level: 1,
+            mip_level_count: 1,
+            texture_type: 13,
+            base_array_slice: 3,
+            layer_count: 2,
+        };
+
+        let mut guest_raw = vec![0_u8; usize::try_from(allocation_size).unwrap()];
+        let mut expected = Vec::new();
+        for absolute_slice in 3_usize..5 {
+            let mut ordinary = vec![0_u8; layout.byte_count];
+            let mut slice_levels = Vec::new();
+            for (level_index, level) in layout.levels.iter().copied().enumerate() {
+                let linear = (0..level.width * level.height * layout.bytes_per_element)
+                    .map(|index| {
+                        u8::try_from(
+                            (absolute_slice * 41 + level_index * 17 + index * 13 + index / 97)
+                                & 0xff,
+                        )
+                        .expect("pattern byte")
+                    })
+                    .collect::<Vec<_>>();
+                copy_linear_to_mode64k_2d_mip_level(27, &layout, level, &linear, &mut ordinary)
+                    .expect("retile ordinary mip chain");
+                slice_levels.push(linear);
+            }
+            let xor = mode27_surface_z_xor(absolute_slice);
+            let mut swizzled = vec![0_u8; layout.byte_count];
+            for block_base in (0..layout.byte_count).step_by(65_536) {
+                for byte in 0..65_536 {
+                    swizzled[block_base + (byte ^ xor)] = ordinary[block_base + byte];
+                }
+            }
+            let slice_base = absolute_slice * layout.byte_count;
+            guest_raw[slice_base..slice_base + layout.byte_count].copy_from_slice(&swizzled);
+            expected.push(slice_levels);
+        }
+        memory
+            .write(mapping, &guest_raw)
+            .expect("seed array mip chains");
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("presenter");
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal queue")
+            .clone();
+        let sampled = settle_gpu_sampled_upload(&device, &queue, descriptor, false, false)
+            .expect("nonzero-base sampled mip upload");
+        assert_eq!(sampled.texture_type(), MTLTextureType::D2Array);
+        assert_eq!(sampled.array_length(), 2);
+        assert_eq!(sampled.mipmap_level_count(), 1);
+        for (local_slice, levels) in expected.iter().enumerate() {
+            let expected_level = &levels[1];
+            let mut actual = vec![0_u8; expected_level.len()];
+            sampled.get_bytes_in_slice(
+                actual.as_mut_ptr().cast(),
+                64 * 4,
+                u64::try_from(actual.len()).unwrap(),
+                MTLRegion::new_2d(0, 0, 64, 64),
+                0,
+                u64::try_from(local_slice).unwrap(),
+            );
+            assert_eq!(&actual, expected_level, "sampled local slice {local_slice}");
+        }
+        let selected = ensure_exact_mode27_array_storage_resident(
+            &device,
+            &queue,
+            descriptor,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("nonzero-base storage mip upload");
+        assert_eq!(selected.texture_type(), MTLTextureType::D2Array);
+        assert_eq!(selected.array_length(), 2);
+        assert_eq!(selected.mipmap_level_count(), 1);
+        assert_eq!((selected.width(), selected.height()), (64, 64));
+        let compatible_full_hierarchy = DecodedImageDescriptor {
+            base_mip_level: 0,
+            mip_level_count: 2,
+            ..descriptor
+        };
+        assert_eq!(descriptor.span, compatible_full_hierarchy.span);
+        assert!(
+            resident_texture_for_sample(
+                presenter
+                    .resident_guest_textures
+                    .get_mut(&guest)
+                    .expect("array mip resident"),
+                compatible_full_hierarchy,
+            )
+            .is_some(),
+            "views with the same underlying mip count and selected span may reuse storage"
+        );
+        let incompatible_single_level = DecodedImageDescriptor {
+            span: ResourceSpan::for_image_view(guest, 0, 1, 13, 3, 2)
+                .expect("single-level selected span"),
+            base_mip_level: 0,
+            mip_level_count: 1,
+            ..descriptor
+        };
+        assert_ne!(descriptor.span, incompatible_single_level.span);
+        assert!(
+            resident_texture_for_sample(
+                presenter
+                    .resident_guest_textures
+                    .get_mut(&guest)
+                    .expect("array mip resident"),
+                incompatible_single_level,
+            )
+            .is_none(),
+            "a same-key view with a different full-chain stride must not reuse Metal storage"
+        );
+        let resident = &presenter.resident_guest_textures[&guest];
+        assert_eq!(resident.mip_level_count, 2);
+        assert_eq!(resident.base_array_slice, 3);
+        assert_eq!(
+            rematerialisation_subresource_summary(resident).expect("array remat plan"),
+            vec![
+                (0, 0, 65_536, 0xc00),
+                (0, 1, 0, 0xc00),
+                (1, 0, 196_608, 0x200),
+                (1, 1, 131_072, 0x200),
+            ]
+        );
+
+        for (local_slice, levels) in expected.iter().enumerate() {
+            for (level_index, expected_level) in levels.iter().enumerate() {
+                let level = layout.levels[level_index];
+                let mut actual = vec![0_u8; expected_level.len()];
+                let row_bytes = u64::try_from(level.width * layout.bytes_per_element).unwrap();
+                resident.texture.get_bytes_in_slice(
+                    actual.as_mut_ptr().cast(),
+                    row_bytes,
+                    u64::try_from(actual.len()).unwrap(),
+                    MTLRegion::new_2d(
+                        0,
+                        0,
+                        u64::try_from(level.width).unwrap(),
+                        u64::try_from(level.height).unwrap(),
+                    ),
+                    u64::try_from(level_index).unwrap(),
+                    u64::try_from(local_slice).unwrap(),
+                );
+                assert_eq!(
+                    &actual, expected_level,
+                    "slice {local_slice} level {level_index}"
+                );
+            }
+        }
+
+        let mut rendered = Vec::new();
+        let bound = layout.levels[1];
+        for local_slice in 0_usize..2 {
+            let linear = (0..bound.width * bound.height * layout.bytes_per_element)
+                .map(|index| u8::try_from((0xb7 + local_slice * 23 + index * 29) & 0xff).unwrap())
+                .collect::<Vec<_>>();
+            selected.replace_region_in_slice(
+                MTLRegion::new_2d(
+                    0,
+                    0,
+                    u64::try_from(bound.width).unwrap(),
+                    u64::try_from(bound.height).unwrap(),
+                ),
+                0,
+                u64::try_from(local_slice).unwrap(),
+                linear.as_ptr().cast(),
+                u64::try_from(bound.width * layout.bytes_per_element).unwrap(),
+                u64::try_from(linear.len()).unwrap(),
+            );
+            rendered.push(linear);
+        }
+        presenter.mark_resident_texture_written_at(
+            guest,
+            descriptor.span,
+            Some(guest),
+            WrittenRegion::storage_image(descriptor),
+            ResidentTextureActivityStamp { work: 7, flip: 2 },
+        );
+        assert!(
+            presenter
+                .settle_resident_texture_writeback(guest, WritebackTrigger::FlipTarget)
+                .expect("publish bound array mip")
+        );
+        if let Some(batch) = presenter.open_guest_batch.take() {
+            batch.command_buffer.commit();
+            batch.command_buffer.wait_until_completed();
+        }
+
+        let mut published = vec![0_u8; usize::try_from(allocation_size).unwrap()];
+        assert!(read_guest_shared_backing(guest.address, &mut published));
+        let selected_base = 3 * layout.byte_count;
+        assert_eq!(
+            &published[..selected_base],
+            &guest_raw[..selected_base],
+            "publishing selected BASE_ARRAY slices must not touch allocation neighbours"
+        );
+        for (local_slice, expected_level) in rendered.iter().enumerate() {
+            let absolute_slice = 3 + local_slice;
+            let xor = mode27_surface_z_xor(absolute_slice);
+            let slice_base = absolute_slice * layout.byte_count;
+            let actual_chain = &published[slice_base..slice_base + layout.byte_count];
+            let mut ordinary = vec![0_u8; layout.byte_count];
+            for block_base in (0..layout.byte_count).step_by(65_536) {
+                for byte in 0..65_536 {
+                    ordinary[block_base + byte] = actual_chain[block_base + (byte ^ xor)];
+                }
+            }
+            let mut preserved_base = vec![0_u8; expected[local_slice][0].len()];
+            copy_mode64k_2d_mip_level_to_linear(
+                27,
+                &layout,
+                layout.levels[0],
+                &ordinary,
+                &mut preserved_base,
+            )
+            .expect("detile preserved base mip");
+            assert_eq!(
+                preserved_base, expected[local_slice][0],
+                "publishing mip1 must preserve slice {local_slice} mip0"
+            );
+            let mut decoded = vec![0_u8; expected_level.len()];
+            copy_mode64k_2d_mip_level_to_linear(27, &layout, bound, &ordinary, &mut decoded)
+                .expect("detile published array mip");
+            assert_eq!(
+                &decoded, expected_level,
+                "published local slice {local_slice}"
+            );
+        }
+
+        let guest_before_rematerialisation = published;
+        let selected_address = descriptor.span.expect("selected array span").address();
+        let tenant = GuestTextureDescriptor {
+            address: selected_address,
+            width: 256,
+            height: 256,
+            pitch: 256,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        presenter
+            .ensure_resident_texture(&device, tenant)
+            .expect("full selected-span tenant resident");
+        let tenant_linear = (0..256 * 256 * 4)
+            .map(|index| u8::try_from((index * 43 + index / 31 + 0x5d) & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        presenter.resident_guest_textures[&tenant]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 256, 256),
+                0,
+                tenant_linear.as_ptr().cast(),
+                256 * 4,
+            );
+        presenter.mark_resident_texture_written(tenant);
+        assert!(
+            presenter
+                .rematerialise_stale_resident_for_read(guest)
+                .expect("array hierarchy rematerialisation")
+        );
+        let remat_batch = presenter
+            .open_guest_batch
+            .take()
+            .expect("array rematerialisation stays ordered in the guest batch");
+        remat_batch.command_buffer.commit();
+        remat_batch.command_buffer.wait_until_completed();
+        let target = &presenter.resident_guest_textures[&guest];
+        assert!(target.gpu_written());
+        let mut actual_rematerialised = vec![0_u8; 64 * 64 * 4];
+        target.texture.get_bytes_in_slice(
+            actual_rematerialised.as_mut_ptr().cast(),
+            64 * 4,
+            u64::try_from(actual_rematerialised.len()).unwrap(),
+            MTLRegion::new_2d(0, 0, 64, 64),
+            1,
+            0,
+        );
+        let mut tenant_raw = vec![0_u8; 4 * 65_536];
+        copy_linear_to_tiled_at_z(&tenant_linear, tenant, &mut tenant_raw, 0)
+            .expect("retile tenant oracle");
+        let xor = mode27_surface_z_xor(3);
+        let mut target_ordinary = vec![0_u8; layout.byte_count];
+        for byte in 0..65_536 {
+            target_ordinary[byte] = tenant_raw[byte ^ xor];
+        }
+        let mut expected_rematerialised = vec![0_u8; 64 * 64 * 4];
+        copy_mode64k_2d_mip_level_to_linear(
+            27,
+            &layout,
+            layout.levels[1],
+            &target_ordinary,
+            &mut expected_rematerialised,
+        )
+        .expect("detile absolute-slice rematerialisation oracle");
+        assert_eq!(actual_rematerialised, expected_rematerialised);
+        let mut guest_after_rematerialisation =
+            vec![0_u8; usize::try_from(allocation_size).unwrap()];
+        assert!(read_guest_shared_backing(
+            guest.address,
+            &mut guest_after_rematerialisation
+        ));
+        assert_eq!(
+            guest_after_rematerialisation, guest_before_rematerialisation,
+            "GPU rematerialisation must not publish the tenant into guest RAM"
+        );
+    }
+
+    fn exact_array_gpu_tenant_production_route(opcode: &'static str) {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection, read_guest_shared_backing,
+        };
+
+        let template = GuestTextureDescriptor {
+            address: 0,
+            width: 128,
+            height: 128,
+            pitch: 128,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let layout = mode64k_2d_mip_chain_layout(template, 2).expect("two-level SDK layout");
+        assert_eq!(layout.byte_count, 131_072);
+        let allocation_size = u64::try_from(5 * layout.byte_count).unwrap();
+        let mut memory = GuestAddressSpace::new(allocation_size * 2).expect("address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("array backing");
+        let mapping = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping");
+        let address = mapping.get();
+        let guest_raw = (0..usize::try_from(allocation_size).unwrap())
+            .map(|index| u8::try_from((index * 7 + index / 29 + 0x31) & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        memory.write(mapping, &guest_raw).expect("seed guest array");
+
+        let encoded_width = template.width - 1;
+        let mut words = vec![0_u32; 8];
+        words[0] = u32::try_from(address >> 8).expect("low image address fits");
+        words[1] = u32::try_from(address >> 40).expect("high image address fits")
+            | (130 << 20)
+            | ((encoded_width & 0x3) << 30);
+        words[2] = (encoded_width >> 2) | ((template.height - 1) << 14);
+        words[3] = 0xfac | (1 << 16) | (27 << 20) | (13 << 28);
+        words[4] = (3 << 16) | 4;
+        let descriptor = decode_image_descriptor(&words).expect("exact array mip descriptor");
+        let evaluation = ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![ImageBinding {
+                pc: 0x40,
+                opcode: Opcode::Known(opcode),
+                control: ImageControl {
+                    dmask: 0xf,
+                    vector_address: 0,
+                    address_registers: vec![0, 1, 2],
+                    vector_data: 4,
+                    scalar_resource: 0,
+                    scalar_sampler: 0,
+                    dimension: 5,
+                    is_array: true,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+                resource_descriptor: words.into(),
+                sampler_descriptor: if opcode == "ImageSample" {
+                    vec![0_u32; 4].into()
+                } else {
+                    Vec::new().into()
+                },
+                mip_level: None,
+            }],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        };
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("presenter");
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal queue")
+            .clone();
+        if opcode == "ImageStore" {
+            let short_descriptor = DecodedImageDescriptor {
+                span: ResourceSpan::for_image_view(
+                    descriptor.guest,
+                    0,
+                    1,
+                    13,
+                    descriptor.base_array_slice,
+                    descriptor.layer_count,
+                )
+                .expect("short array hierarchy span"),
+                mip_level_count: 1,
+                ..descriptor
+            };
+            ensure_exact_mode27_array_storage_resident(
+                &device,
+                &queue,
+                short_descriptor,
+                &mut presenter.resident_guest_textures,
+            )
+            .expect("clean short hierarchy");
+            assert_eq!(
+                presenter.resident_guest_textures[&descriptor.guest].mip_level_count,
+                1
+            );
+        }
+        let tenant = GuestTextureDescriptor {
+            address: descriptor.span.expect("selected span").address(),
+            width: 256,
+            height: 256,
+            pitch: 256,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        presenter
+            .ensure_resident_texture(&device, tenant)
+            .expect("selected-span tenant resident");
+        let tenant_linear = (0..256 * 256 * 4)
+            .map(|index| u8::try_from((index * 43 + index / 31 + 0x5d) & 0xff).unwrap())
+            .collect::<Vec<_>>();
+        presenter.resident_guest_textures[&tenant]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 256, 256),
+                0,
+                tenant_linear.as_ptr().cast(),
+                256 * 4,
+            );
+        presenter.mark_resident_texture_written(tenant);
+
+        if opcode == "ImageStore" {
+            presenter
+                .ensure_mipmapped_storage_texture(&device, descriptor)
+                .expect("production storage pre-acquire rematerialises the array hierarchy");
+        } else {
+            presenter
+                .synchronize_sampled_aliases(&[&evaluation], &[])
+                .expect("production sampled pre-sync rematerialises the array hierarchy");
+        }
+        let uploaded = super::upload_image_textures(
+            "test",
+            &device,
+            &queue,
+            &evaluation,
+            &mut presenter.resident_guest_textures,
+            &presenter.depth_array_textures,
+            &presenter.multisample_textures,
+            &mut presenter.sampled_texture_cache,
+            &mut presenter.sampled_texture_write_watches,
+            &mut presenter.fallback_texture_cache,
+            &mut presenter.next_sampled_texture_use,
+            ResidentTextureActivityStamp::default(),
+            &[],
+        )
+        .expect("production image upload binds the rematerialised hierarchy");
+        assert_eq!(uploaded.len(), 1);
+        assert_eq!(uploaded[0].texture.texture_type(), MTLTextureType::D2Array);
+        assert_eq!(uploaded[0].texture.array_length(), 2);
+        assert_eq!(uploaded[0].texture.mipmap_level_count(), 2);
+        assert_eq!(uploaded[0].selected_resident, Some(descriptor.guest));
+        assert_eq!(uploaded[0].writable, opcode == "ImageStore");
+
+        let batch = presenter
+            .open_guest_batch
+            .take()
+            .expect("rematerialisation remains in the ordered guest batch");
+        batch.command_buffer.commit();
+        batch.command_buffer.wait_until_completed();
+        let target = &presenter.resident_guest_textures[&descriptor.guest];
+        assert_eq!(target.mip_level_count, 2);
+        assert!(target.gpu_written());
+        assert!(
+            target
+                .owned
+                .covers(&descriptor.span.expect("selected span"))
+        );
+        assert!(!presenter.resident_guest_textures[&tenant].is_live());
+
+        let mut actual = vec![0_u8; 64 * 64 * 4];
+        target.texture.get_bytes_in_slice(
+            actual.as_mut_ptr().cast(),
+            64 * 4,
+            u64::try_from(actual.len()).unwrap(),
+            MTLRegion::new_2d(0, 0, 64, 64),
+            1,
+            0,
+        );
+        let mut tenant_raw = vec![0_u8; 4 * 65_536];
+        copy_linear_to_tiled_at_z(&tenant_linear, tenant, &mut tenant_raw, 0)
+            .expect("retile tenant oracle");
+        let mut target_ordinary = vec![0_u8; layout.byte_count];
+        let xor = mode27_surface_z_xor(3);
+        for byte in 0..65_536 {
+            target_ordinary[byte] = tenant_raw[byte ^ xor];
+        }
+        let mut expected = vec![0_u8; actual.len()];
+        copy_mode64k_2d_mip_level_to_linear(
+            27,
+            &layout,
+            layout.levels[1],
+            &target_ordinary,
+            &mut expected,
+        )
+        .expect("detile rematerialisation oracle");
+        assert_eq!(actual, expected);
+
+        let mut guest_after = vec![0_u8; guest_raw.len()];
+        assert!(read_guest_shared_backing(address, &mut guest_after));
+        assert_eq!(
+            guest_after, guest_raw,
+            "GPU reconstruction must not publish RAM"
+        );
+    }
+
+    #[test]
+    fn sampled_array_mip_first_create_rematerialises_external_gpu_tenant() {
+        exact_array_gpu_tenant_production_route("ImageSample");
+    }
+
+    #[test]
+    fn storage_array_mip_first_create_rematerialises_external_gpu_tenant() {
+        exact_array_gpu_tenant_production_route("ImageStore");
+    }
+
+    fn exact_array_presenter_refreshes_current_guest(remap: bool) {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let allocation_size = 2 * 131_072_u64;
+        let mut memory = GuestAddressSpace::new(4 * allocation_size).expect("address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("array backing");
+        let mapping = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping");
+        memory
+            .write(
+                mapping,
+                &vec![0x11; usize::try_from(allocation_size).unwrap()],
+            )
+            .expect("seed original array");
+        let guest = GuestTextureDescriptor {
+            address: mapping.get(),
+            width: 128,
+            height: 128,
+            pitch: 128,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let descriptor = DecodedImageDescriptor {
+            guest,
+            span: ResourceSpan::for_image_view(guest, 0, 2, 13, 0, 2).expect("exact array span"),
+            destination_select: 0xfac,
+            base_mip_level: 0,
+            mip_level_count: 2,
+            texture_type: 13,
+            base_array_slice: 0,
+            layer_count: 2,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("presenter");
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        presenter
+            .ensure_mipmapped_storage_texture(&device, descriptor)
+            .expect("initial ordered array hierarchy");
+        let batch = presenter
+            .open_guest_batch
+            .take()
+            .expect("initial upload batch");
+        batch.command_buffer.commit();
+        batch.command_buffer.wait_until_completed();
+        let original = presenter.resident_guest_textures[&guest].texture.clone();
+
+        let expected_byte = if remap { 0x6c } else { 0xa5 };
+        let current_descriptor = if remap {
+            presenter
+                .resident_guest_textures
+                .get_mut(&guest)
+                .expect("original array resident")
+                .note_gpu_authored_whole_span();
+            memory
+                .unmap(mapping, allocation_size)
+                .expect("replace array mapping");
+            let replacement = GuestPhysicalBacking::new(allocation_size).expect("replacement");
+            memory
+                .map_shared(
+                    GuestMapPlacement::Fixed(mapping),
+                    allocation_size,
+                    GUEST_PAGE_SIZE,
+                    GuestProtection::READ_WRITE,
+                    &replacement,
+                    0,
+                )
+                .expect("replacement mapping");
+            memory
+                .write(
+                    mapping,
+                    &vec![expected_byte; usize::try_from(allocation_size).unwrap()],
+                )
+                .expect("seed replacement array");
+            DecodedImageDescriptor {
+                span: ResourceSpan::for_image_view(guest, 0, 2, 13, 0, 2)
+                    .expect("replacement array span"),
+                ..descriptor
+            }
+        } else {
+            memory
+                .write(
+                    mapping,
+                    &vec![expected_byte; usize::try_from(allocation_size).unwrap()],
+                )
+                .expect("dirty current array");
+            descriptor
+        };
+        let selected = presenter
+            .ensure_mipmapped_storage_texture(&device, current_descriptor)
+            .expect("ordered array refresh uses current guest mapping");
+        let batch = presenter
+            .open_guest_batch
+            .take()
+            .expect("refresh upload batch");
+        batch.command_buffer.commit();
+        batch.command_buffer.wait_until_completed();
+        assert_ne!(selected.as_ptr(), original.as_ptr());
+        let mut pixel = [0_u8; 4];
+        selected.get_bytes_in_slice(
+            pixel.as_mut_ptr().cast(),
+            4,
+            4,
+            MTLRegion::new_2d(0, 0, 1, 1),
+            0,
+            0,
+        );
+        assert_eq!(pixel, [expected_byte; 4]);
+        assert!(!presenter.resident_guest_textures[&guest].gpu_written());
+    }
+
+    #[test]
+    fn ordered_array_mip_refreshes_cpu_dirty_clean_resident() {
+        exact_array_presenter_refreshes_current_guest(false);
+    }
+
+    #[test]
+    fn ordered_array_mip_retires_gpu_debt_from_replaced_mapping() {
+        exact_array_presenter_refreshes_current_guest(true);
+    }
+
+    fn ordered_array_mip_refuses_cpu_dirty_gpu_tenant(existing_target: bool) {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let allocation_size = 2 * 131_072_u64;
+        let mut memory = GuestAddressSpace::new(4 * allocation_size).expect("address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("array backing");
+        let mapping = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping");
+        let guest = GuestTextureDescriptor {
+            address: mapping.get(),
+            width: 128,
+            height: 128,
+            pitch: 128,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let descriptor = DecodedImageDescriptor {
+            guest,
+            span: ResourceSpan::for_image_view(guest, 0, 2, 13, 0, 2).expect("exact array span"),
+            destination_select: 0xfac,
+            base_mip_level: 0,
+            mip_level_count: 2,
+            texture_type: 13,
+            base_array_slice: 0,
+            layer_count: 2,
+        };
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("presenter");
+        presenter.per_queue_guest_batches = false;
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        if existing_target {
+            presenter
+                .ensure_mipmapped_storage_texture(&device, descriptor)
+                .expect("initial exact array target");
+            let batch = presenter
+                .open_guest_batch
+                .take()
+                .expect("initial target batch");
+            batch.command_buffer.commit();
+            batch.command_buffer.wait_until_completed();
+        }
+        let tenant = GuestTextureDescriptor {
+            address: guest.address,
+            width: 256,
+            height: 256,
+            pitch: 256,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        presenter
+            .ensure_resident_texture(&device, tenant)
+            .expect("full-span tenant");
+        presenter.resident_guest_textures[&tenant]
+            .texture
+            .replace_region(
+                MTLRegion::new_2d(0, 0, 256, 256),
+                0,
+                vec![0x3c_u8; 256 * 256 * 4].as_ptr().cast(),
+                256 * 4,
+            );
+        presenter.mark_resident_texture_written(tenant);
+        memory
+            .write(
+                mapping,
+                &vec![0xa5; usize::try_from(allocation_size).unwrap()],
+            )
+            .expect("CPU supersedes tenant bytes");
+
+        let error = presenter
+            .ensure_mipmapped_storage_texture(&device, descriptor)
+            .expect_err("CPU-dirty GPU tenant must never overwrite newer guest RAM");
+        assert!(
+            error.contains("CPU-modified") && error.contains("GPU-current"),
+            "unexpected dirty-tenant refusal: {error}"
+        );
+        assert!(presenter.open_guest_batch.is_none());
+    }
+
+    #[test]
+    fn ordered_array_mip_first_create_refuses_cpu_dirty_gpu_tenant() {
+        ordered_array_mip_refuses_cpu_dirty_gpu_tenant(false);
+    }
+
+    #[test]
+    fn ordered_array_mip_partial_existing_refuses_cpu_dirty_gpu_tenant() {
+        ordered_array_mip_refuses_cpu_dirty_gpu_tenant(true);
+    }
+
+    #[test]
+    fn array_resident_identity_requires_the_exact_underlying_mip_hierarchy() {
+        use remu_memory::{
+            GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+            GuestProtection,
+        };
+
+        let template = GuestTextureDescriptor {
+            address: 0,
+            width: 512,
+            height: 256,
+            pitch: 512,
+            tile_mode: 27,
+            pixel_format: MTLPixelFormat::RGBA8Unorm,
+            bytes_per_pixel: 4,
+        };
+        let full_stride = mode64k_2d_mip_chain_layout(template, 5)
+            .expect("five-level SDK layout")
+            .byte_count;
+        assert_eq!(full_stride, 786_432);
+        let allocation_size = u64::try_from(full_stride * 2).expect("array allocation size");
+        let mut memory = GuestAddressSpace::new(allocation_size * 2).expect("address space");
+        let backing = GuestPhysicalBacking::new(allocation_size).expect("array backing");
+        let mapping = memory
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                allocation_size,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping");
+        let guest = GuestTextureDescriptor {
+            address: mapping.get(),
+            ..template
+        };
+        let image = |base_mip_level, mip_level_count| DecodedImageDescriptor {
+            guest,
+            span: ResourceSpan::for_image_view(guest, base_mip_level, mip_level_count, 13, 0, 2)
+                .expect("selected hierarchy span"),
+            destination_select: 0xfac,
+            base_mip_level,
+            mip_level_count,
+            texture_type: 13,
+            base_array_slice: 0,
+            layer_count: 2,
+        };
+
+        let (_sender, receiver) = std::sync::mpsc::channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("presenter");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let queue = presenter
+            .command_queue
+            .as_ref()
+            .expect("Metal queue")
+            .clone();
+
+        let full = image(0, 5);
+        ensure_exact_mode27_array_storage_resident(
+            &device,
+            &queue,
+            full,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("five-level array resident");
+        let retained_full = presenter.resident_guest_textures[&guest].texture.clone();
+        assert_eq!(presenter.resident_guest_textures[&guest].mip_level_count, 5);
+
+        let short = image(0, 2);
+        assert_ne!(full.span, short.span);
+        ensure_exact_mode27_array_storage_resident(
+            &device,
+            &queue,
+            short,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("two-level hierarchy rebuild");
+        let short_resident = &presenter.resident_guest_textures[&guest];
+        assert_eq!(short_resident.mip_level_count, 2);
+        assert_ne!(short_resident.texture.as_ptr(), retained_full.as_ptr());
+
+        let tail_view = image(4, 1);
+        assert_eq!(full.span, tail_view.span);
+        let selected = ensure_exact_mode27_array_storage_resident(
+            &device,
+            &queue,
+            tail_view,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("base-four view rebuilds its complete five-level hierarchy");
+        assert_eq!(presenter.resident_guest_textures[&guest].mip_level_count, 5);
+        assert_eq!(selected.mipmap_level_count(), 1);
+        assert_eq!((selected.width(), selected.height()), (32, 16));
+        let full_pointer = presenter.resident_guest_textures[&guest].texture.as_ptr();
+        ensure_exact_mode27_array_storage_resident(
+            &device,
+            &queue,
+            full,
+            &mut presenter.resident_guest_textures,
+        )
+        .expect("same-underlying full view reuse");
+        assert_eq!(
+            presenter.resident_guest_textures[&guest].texture.as_ptr(),
+            full_pointer
+        );
+    }
 }

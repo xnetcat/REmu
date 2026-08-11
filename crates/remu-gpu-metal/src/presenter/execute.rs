@@ -49,14 +49,14 @@ use super::{
     diagnostic_uploaded_global_binding_head, diagnostic_use_draw_merged_wave_counts,
     diagnostic_video_chain_selected_draw, dump_msl_compute_filter_matches, dump_shader_pair_msl,
     evaluation_samples_glyph_atlas, evaluation_samples_large_linear_video,
-    evaluation_samples_layered_comparison, fragmentless_pixel_evaluation, guest_frame_fingerprint,
-    guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
-    image_resource_descriptor_is_null, initial_depth_clear_for_target,
-    initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
-    metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
-    prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
-    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    evaluation_samples_layered_comparison, exact_mode27_array_storage_supported,
+    fragmentless_pixel_evaluation, guest_frame_fingerprint, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_storage, half_float_to_f32, image_resource_descriptor_is_null,
+    initial_depth_clear_for_target, initial_render_target_clear_color, is_storage_image_opcode,
+    is_writable_image_opcode, metal_nonindexed_vertex_count, metal_primitive_type,
+    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra, ngg_mesh_base_vertex,
+    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_nonindexed_ngg_indices,
+    read_draw_indices, read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
@@ -739,6 +739,8 @@ impl MetalPresenter {
                             true,
                         )?;
                     }
+                } else if exact_mode27_array_storage_supported(descriptor) {
+                    self.ensure_mipmapped_storage_texture(&device, descriptor)?;
                 }
             }
         }

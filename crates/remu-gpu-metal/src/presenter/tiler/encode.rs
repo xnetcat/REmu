@@ -221,6 +221,7 @@ fn plan_upload_subresources(
         && !(matches!(descriptor.tile_mode, 9 | 27)
             && view.texture_type == 9
             && view.layer_count == 1
+            || descriptor.tile_mode == 27 && view.texture_type == 13 && view.layer_count >= 1
             || matches!(descriptor.tile_mode, 5)
                 && matches!(view.texture_type, 9 | 11 | 13)
                 && view.layer_count >= 1)
@@ -329,31 +330,48 @@ fn plan_upload_subresources(
         match descriptor.tile_mode {
             9 | 27 => {
                 let layout = mode64k_2d_mip_chain_layout(descriptor, view.mip_level_count)?;
-                for (level_index, level) in layout.levels.iter().enumerate() {
-                    let level_w =
-                        u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?;
-                    let level_h =
-                        u64::try_from(level.height).map_err(|_| "mip height does not fit u64")?;
-                    push(
-                        level_w,
-                        level_h,
-                        level_w,
-                        level_h,
-                        u64::try_from(level.offset).map_err(|_| "mip offset does not fit u64")?,
-                        u64::try_from(level.padded_width)
-                            .map_err(|_| "mip pitch does not fit u64")?,
-                        u64::try_from(layout.block_width)
-                            .map_err(|_| "mip block width does not fit u64")?,
-                        u64::try_from(layout.block_height)
-                            .map_err(|_| "mip block height does not fit u64")?,
-                        u64::try_from(level.tail_x).map_err(|_| "mip tail X does not fit u64")?,
-                        u64::try_from(level.tail_y).map_err(|_| "mip tail Y does not fit u64")?,
-                        level.in_tail,
-                        0,
-                        u64::try_from(level_index).map_err(|_| "mip index does not fit u64")?,
-                    )?;
+                let face_bytes = u64::try_from(layout.byte_count)
+                    .map_err(|_| "mip chain bytes do not fit u64")?;
+                for surface_z in 0..view.layer_count {
+                    let layer_base = face_bytes
+                        .checked_mul(u64::from(surface_z))
+                        .ok_or("64 KiB layered mip base overflows")?;
+                    for (level_index, level) in layout.levels.iter().enumerate() {
+                        let level_w =
+                            u64::try_from(level.width).map_err(|_| "mip width does not fit u64")?;
+                        let level_h = u64::try_from(level.height)
+                            .map_err(|_| "mip height does not fit u64")?;
+                        let level_offset = layer_base
+                            .checked_add(
+                                u64::try_from(level.offset)
+                                    .map_err(|_| "mip offset does not fit u64")?,
+                            )
+                            .ok_or("64 KiB layered mip offset overflows")?;
+                        push(
+                            level_w,
+                            level_h,
+                            level_w,
+                            level_h,
+                            level_offset,
+                            u64::try_from(level.padded_width)
+                                .map_err(|_| "mip pitch does not fit u64")?,
+                            u64::try_from(layout.block_width)
+                                .map_err(|_| "mip block width does not fit u64")?,
+                            u64::try_from(layout.block_height)
+                                .map_err(|_| "mip block height does not fit u64")?,
+                            u64::try_from(level.tail_x)
+                                .map_err(|_| "mip tail X does not fit u64")?,
+                            u64::try_from(level.tail_y)
+                                .map_err(|_| "mip tail Y does not fit u64")?,
+                            level.in_tail,
+                            surface_z,
+                            u64::try_from(level_index).map_err(|_| "mip index does not fit u64")?,
+                        )?;
+                    }
                 }
-                u64::try_from(layout.byte_count).map_err(|_| "mip chain bytes do not fit u64")?
+                face_bytes
+                    .checked_mul(u64::from(view.layer_count))
+                    .ok_or("64 KiB layered mip chain overflows")?
             }
             5 => {
                 let layout = mode5_mip_chain_layout(descriptor, view.mip_level_count)?;
@@ -1028,6 +1046,22 @@ mod tests {
             err.contains("cannot represent mipmapped type=11 layers=2 tile=9"),
             "unexpected refusal: {err}"
         );
+        let err = match plan_upload_subresources(
+            descriptor(9),
+            GpuTilerView {
+                texture_type: 13,
+                base_array_slice: 3,
+                layer_count: 2,
+                mip_level_count: 4,
+            },
+        ) {
+            Ok(_) => panic!("tile-9 type-13 mip arrays must stay loud"),
+            Err(error) => error,
+        };
+        assert!(
+            err.contains("cannot represent mipmapped type=13 layers=2 tile=9"),
+            "unexpected refusal: {err}"
+        );
     }
 
     #[test]
@@ -1160,5 +1194,41 @@ mod tests {
         assert_eq!(subs[1].level_offset, face_bytes);
         assert_eq!(subs[0].surface_z_xor, 0xc00);
         assert_eq!(subs[1].surface_z_xor, 0x200);
+    }
+
+    #[test]
+    fn plans_mode27_array_mip_chains_slice_major_with_absolute_xor() {
+        let mut rgba8 = descriptor(27);
+        rgba8.width = 512;
+        rgba8.height = 256;
+        rgba8.pitch = 512;
+        let (subs, guest_bytes, _) = plan_upload_subresources(
+            rgba8,
+            GpuTilerView {
+                texture_type: 13,
+                base_array_slice: 3,
+                layer_count: 2,
+                mip_level_count: 10,
+            },
+        )
+        .expect("mode-27 layered mip plan");
+
+        const CHAIN_BYTES: u64 = 786_432;
+        assert_eq!(guest_bytes, 2 * CHAIN_BYTES);
+        assert_eq!(subs.len(), 20);
+        for (index, sub) in subs.iter().enumerate() {
+            let local_slice = index / 10;
+            let level = index % 10;
+            assert_eq!(sub.metal_slice, u64::try_from(local_slice).unwrap());
+            assert_eq!(sub.metal_level, u64::try_from(level).unwrap());
+            assert_eq!(
+                sub.level_offset,
+                u64::try_from(local_slice).unwrap() * CHAIN_BYTES + subs[level].level_offset
+            );
+            assert_eq!(
+                sub.surface_z_xor,
+                if local_slice == 0 { 0xc00 } else { 0x200 }
+            );
+        }
     }
 }

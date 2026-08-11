@@ -14,9 +14,10 @@ use super::{
     diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_overlapping_texture_writers,
     diagnostic_target_after_mrt_ready, diagnostic_texture_numeric_range, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
-    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    metal_uncompressed_bytes_per_pixel, read_texture_linear, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
+    exact_mode27_array_storage_supported, image_resource_descriptor_is_null,
+    is_storage_image_opcode, is_writable_image_opcode, metal_uncompressed_bytes_per_pixel,
+    read_texture_linear, rearm_color_metadata_clear, rearm_depth_metadata_clear,
+    record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, shader_scalar_metadata_for_registers,
     storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
@@ -301,6 +302,8 @@ impl MetalPresenter {
                         true,
                     )?;
                 }
+            } else if exact_mode27_array_storage_supported(descriptor) {
+                self.ensure_mipmapped_storage_texture(&device, descriptor)?;
             }
         }
         self.synchronize_sampled_aliases(&[evaluation], &[])?;
