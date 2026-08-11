@@ -36,7 +36,7 @@ pub use ir::{
     ProgramLinkError, RawOpcodeFamily, ResourceKind, ResourceMapping, ScalarMemoryControl,
     SdwaControl, ShaderEncoding, ShaderEvaluation, ShaderMetadata, ShaderState,
     TextureDescriptorType, VertexInputBinding, Vop3Control, Vop3pControl, image_is_comparison,
-    image_sample_modifiers, link_program_continuation,
+    image_resource_descriptor_is_null, image_sample_modifiers, link_program_continuation,
 };
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};
 pub use state::{ShaderStateError, build_shader_state};

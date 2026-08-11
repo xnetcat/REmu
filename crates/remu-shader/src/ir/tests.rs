@@ -667,6 +667,21 @@ fn parses_the_descriptor_texture_type_from_dword3() {
     let mut null_binding = image_binding(1, false, "ImageSample", 13 << 28);
     null_binding.resource_descriptor = smallvec::SmallVec::from_slice(&[0_u32; 8]);
     assert_eq!(null_binding.descriptor_type(), None);
+
+    // A null image is identified by its zero 40-bit base, even when optional/default descriptor
+    // state retains a valid TYPE and other metadata.
+    null_binding.resource_descriptor[1] = 0x1234_5600;
+    null_binding.resource_descriptor[2] = 0x021b_c3bf;
+    null_binding.resource_descriptor[3] = 0xd1b0_03ac;
+    assert!(null_binding.resource_descriptor_is_null());
+    assert_eq!(null_binding.descriptor_type(), None);
+
+    null_binding.resource_descriptor[1] |= 1;
+    assert!(!null_binding.resource_descriptor_is_null());
+    assert_eq!(
+        null_binding.descriptor_type(),
+        Some(TextureDescriptorType::TwoDArray)
+    );
 }
 
 #[test]

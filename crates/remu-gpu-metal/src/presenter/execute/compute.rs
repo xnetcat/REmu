@@ -210,8 +210,25 @@ impl MetalPresenter {
             .filter(|binding| is_storage_image_opcode(binding.opcode))
             .filter(|binding| !image_resource_descriptor_is_null(&binding.resource_descriptor))
         {
-            let descriptor = decode_image_descriptor(&binding.resource_descriptor)
-                .map_err(|error| format!("image at PC {:#x}: {error}", binding.pc))?;
+            let descriptor = decode_image_descriptor(&binding.resource_descriptor).map_err(|error| {
+                let words = &binding.resource_descriptor;
+                let address = words
+                    .get(0..2)
+                    .map(|pair| {
+                        ((u64::from(pair[1] & 0xff) << 32) | u64::from(pair[0])) << 8
+                    })
+                    .unwrap_or_default();
+                let unified_format = words.get(1).map_or(0, |word| (word >> 20) & 0x1ff);
+                let texture_type = words.get(3).map_or(0, |word| (word >> 28) & 0xf);
+                format!(
+                    "image at PC {:#x}: {error}; opcode={} srsrc=s[{}:{}] dim={} address={address:#x} type={texture_type} unified_format={unified_format} words={words:08x?}",
+                    binding.pc,
+                    binding.opcode,
+                    binding.control.scalar_resource,
+                    binding.control.scalar_resource.saturating_add(7),
+                    binding.control.dimension,
+                )
+            })?;
             // ImageLoad is read-only and Metal can read a GPU-current RGBA/BGRA resident through
             // a component-swizzled view or a native depth surface through its R32/R16 Z view.
             // Forcing an exact descriptor here would first write that resident back to guest

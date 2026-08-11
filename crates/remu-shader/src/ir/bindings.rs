@@ -17,6 +17,15 @@ pub struct ImageBinding {
     pub mip_level: Option<u32>,
 }
 
+/// Returns whether a GFX10 image SRD names no resource.
+///
+/// The image base is a 40-bit field split across DWORD0 and DWORD1[7:0]. Descriptor builders may
+/// leave format, dimension, and destination-select metadata populated when that base is zero.
+#[must_use]
+pub fn image_resource_descriptor_is_null(words: &[u32]) -> bool {
+    words.len() >= 2 && words[0] == 0 && (words[1] & 0xff) == 0
+}
+
 /// Native texture type carried in descriptor DWORD3 bits 31:28.
 ///
 /// The field and values are the SDK's `Agc::Core::Texture`: `Type m_type : 4` closes DWORD3
@@ -68,11 +77,17 @@ pub enum ImageViewReinterpretation {
 }
 
 impl ImageBinding {
+    /// Returns whether this binding's image SRD names no resource.
+    #[must_use]
+    pub fn resource_descriptor_is_null(&self) -> bool {
+        image_resource_descriptor_is_null(&self.resource_descriptor)
+    }
+
     /// The descriptor's native texture type, when a live descriptor with a valid TYPE nibble is
     /// bound (DWORD3 bits 31:28, agc/core/texture.h:249; values texture.h:54-63).
     #[must_use]
     pub fn descriptor_type(&self) -> Option<TextureDescriptorType> {
-        if self.resource_descriptor.iter().all(|word| *word == 0) {
+        if self.resource_descriptor_is_null() {
             return None;
         }
         match self.resource_descriptor.get(3)? >> 28 {
