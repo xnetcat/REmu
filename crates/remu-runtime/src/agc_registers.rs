@@ -489,6 +489,13 @@ pub(crate) fn agc_color_target_state(registers: &BTreeMap<u32, u32>) -> AgcColor
             continue;
         }
         let primary = slot * AGC_CB_COLOR_REGISTER_STRIDE;
+        let info = registers.get(&(AGC_CB_COLOR0_INFO + primary)).copied();
+        // The SDK clears an MRT slot by programming its descriptor with Format::kInvalid while
+        // leaving CB_TARGET_MASK independently configured. Such a slot is absent, not malformed,
+        // and must not discard a valid dense prefix of render targets.
+        if info.is_some_and(|info| info & 0x7c == 0) {
+            continue;
+        }
         let base = registers.get(&(AGC_CB_COLOR0_BASE + primary)).copied();
         let base_ext = registers.get(&(AGC_CB_COLOR0_BASE_EXT + slot)).copied();
         let address = base
@@ -505,7 +512,7 @@ pub(crate) fn agc_color_target_state(registers: &BTreeMap<u32, u32>) -> AgcColor
         let Some(view) = registers.get(&(AGC_CB_COLOR0_VIEW + primary)).copied() else {
             return AgcColorTargetState::Malformed { slot };
         };
-        let Some(info) = registers.get(&(AGC_CB_COLOR0_INFO + primary)).copied() else {
+        let Some(info) = info else {
             return AgcColorTargetState::Malformed { slot };
         };
         let Some(attrib) = registers.get(&(AGC_CB_COLOR0_ATTRIB + primary)).copied() else {
