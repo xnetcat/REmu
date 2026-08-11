@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CB_BLEND0_CONTROL, CB_TARGET_MASK, CX_GRAPHICS_SCRATCH_RING_SIZE, CX_VGT_SHADER_STAGES_EN,
+    CB_BLEND0_CONTROL, CX_GRAPHICS_SCRATCH_RING_SIZE, CX_VGT_SHADER_STAGES_EN,
     CX_VGT_SHADER_STAGES_EN_GS_WAVE32, DB_DEPTH_CONTROL, DB_SHADER_CONTROL,
     DEFAULT_CB_BLEND_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState,
     DecodedRenderTarget, DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
@@ -80,15 +80,12 @@ pub(crate) fn ngg_fullscreen_cover_draw(
 
 /// Returns whether a draw is a UE/Octopath memoryless cover placeholder with no attachments.
 ///
-/// Boot and frame-boundary fences occasionally emit ps=0 draws whose `CB_TARGET_MASK` is zero and
-/// whose depth block is inactive. They carry no renderable state and exist only to preserve queue
-/// ordering until the next real pass.
+/// Boot and frame-boundary fences occasionally emit ps=0 draws whose depth block is inactive.
+/// They carry no renderable state and exist only to preserve queue ordering until the next real
+/// pass. `CB_TARGET_MASK` is deliberately ignored: without a pixel stage there are no exports, so
+/// persistent raw mask bits cannot make this placeholder observable.
 pub(crate) fn noop_placeholder_cover_draw(draw: &IndexedDraw) -> bool {
     if draw.pixel_shader_address != 0 {
-        return false;
-    }
-    let target_mask = register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
-    if target_mask != 0 {
         return false;
     }
     if decode_depth_target(draw).ok().flatten().is_some() {

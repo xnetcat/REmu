@@ -162,8 +162,17 @@ fn accepts_fragmentless_depth_only_pipeline() {
     });
     draw.export_shader_evaluation = Some(empty_shader_evaluation());
     append_depth_target_registers(&mut draw, 0x0080_10b5_0000, 256, 256, 0xa000_0003, 0x66);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: u32::MAX,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
-    let key = graphics_pipeline_key(&draw).expect("depth-only draw has a Metal pipeline");
+    let key = graphics_pipeline_key(&draw)
+        .expect("fragmentless depth-only draw ignores stale raw color-mask bits");
     assert!(key.targets.is_empty());
     assert!(key.depth.is_some());
     assert_eq!(key.pixel_shader_address, 0);
@@ -243,6 +252,14 @@ fn recognizes_noop_placeholder_cover_without_attachments() {
         metadata: None,
     });
     draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: u32::MAX,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
     assert!(noop_placeholder_cover_draw(&draw));
     assert!(
         graphics_pipeline_key(&draw)
@@ -252,7 +269,7 @@ fn recognizes_noop_placeholder_cover_without_attachments() {
 }
 
 #[test]
-fn rejects_fragmentless_pipeline_with_color_writes() {
+fn fragmentless_pipeline_does_not_treat_raw_color_mask_as_an_attachment() {
     let mut draw = indexed_draw(0, 0, 3);
     draw.export_shader_address = 0x0080_07a8_0000;
     draw.export_shader = Some(ShaderSnapshot {
@@ -271,8 +288,11 @@ fn rejects_fragmentless_pipeline_with_color_writes() {
     );
     Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
-    let error = graphics_pipeline_key(&draw).expect_err("color writes require a pixel shader");
-    assert!(error.contains("requests color output"), "{error}");
+    let error = graphics_pipeline_key(&draw).expect_err("attachment-free work remains a no-op");
+    assert!(
+        error.contains("neither an enabled color target nor an active depth target"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1307,6 +1327,18 @@ fn zero_color_target_mask_is_a_valid_depth_only_attachment_set() {
 
     let targets = decode_render_targets_from_registers(&registers, 0xf)
         .expect("depth-only draws have no color attachments");
+    assert!(targets.is_empty());
+}
+
+#[test]
+fn nonzero_raw_color_mask_with_zero_pixel_exports_has_no_color_attachments() {
+    let registers = [GpuRegister {
+        offset: CB_TARGET_MASK,
+        value: u32::MAX,
+    }];
+
+    let targets = decode_render_targets_from_registers(&registers, 0)
+        .expect("zero pixel exports make the effective color-write mask empty");
     assert!(targets.is_empty());
 }
 
