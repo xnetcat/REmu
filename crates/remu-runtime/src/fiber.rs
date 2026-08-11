@@ -21,7 +21,7 @@
 mod switch;
 
 use std::cell::Cell;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::{
     current_guest_thread_name, guest_memset, read_guest_cstring, read_guest_u32, read_guest_u64,
@@ -179,15 +179,24 @@ fn saved_context(fiber: u64) -> *mut FiberJumpContext {
     (fiber + offset::SAVED_CONTEXT) as *mut FiberJumpContext
 }
 
-/// Validates the opaque resume record before handing it to naked assembly.
+/// The guest-visible publication word for a suspended fiber's host-owned register record.
+fn saved_context_publication(fiber: u64) -> &'static AtomicU64 {
+    // SAFETY: every validated fiber is eight-byte aligned, and CONTEXT is an aligned u64 field in
+    // its live 256-byte object. The object outlives every access while its state is not terminated.
+    unsafe { AtomicU64::from_ptr((fiber + offset::CONTEXT) as *mut u64) }
+}
+
+/// Validates and atomically takes the opaque resume record before handing it to naked assembly.
 ///
 /// A copied or overwritten fiber object must fail as an SDK error, not turn an arbitrary guest
 /// pointer into the host stack pointer. The saved call frame itself must remain inside the fiber's
-/// declared context allocation.
-fn validate_saved_context(fiber: u64) -> Result<(), u64> {
-    let published = read_guest_u64(fiber + offset::CONTEXT);
+/// declared context allocation. Taking the publication here also closes the validation/use gap:
+/// the transfer must jump through this exact validated pointer, never a second guest-memory read.
+fn take_saved_context(fiber: u64) -> Result<Option<*mut FiberJumpContext>, u64> {
+    let publication = saved_context_publication(fiber);
+    let published = publication.load(Ordering::Acquire);
     if published == 0 {
-        return Ok(());
+        return Ok(None);
     }
     let expected = saved_context(fiber);
     if published != expected as u64 {
@@ -207,7 +216,10 @@ fn validate_saved_context(fiber: u64) -> Result<(), u64> {
     {
         return Err(fiber_error(SCE_FIBER_ERROR_INVALID));
     }
-    Ok(())
+    publication
+        .compare_exchange(published, 0, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| Some(expected))
+        .map_err(|_| fiber_error(SCE_FIBER_ERROR_STATE))
 }
 
 thread_local! {
@@ -327,11 +339,15 @@ fn entry_data(
 /// # Safety
 ///
 /// `context` must be the live thread context, and `fiber` a validated fiber claimed for running.
-unsafe fn switch_to_fiber(fiber: u64, argument_on_run_to: u64, context: *mut FiberContext) -> ! {
-    let saved = read_guest_u64(fiber + offset::CONTEXT);
+unsafe fn switch_to_fiber(
+    fiber: u64,
+    argument_on_run_to: u64,
+    context: *mut FiberContext,
+    saved: Option<*mut FiberJumpContext>,
+) -> ! {
     if trace_fiber() {
         let jump = saved_context(fiber);
-        let (saved_rsp, saved_return) = if saved == 0 {
+        let (saved_rsp, saved_return) = if saved.is_none() {
             (0, 0)
         } else {
             // SAFETY: validation and the state claim precede every call to this function.
@@ -340,22 +356,22 @@ unsafe fn switch_to_fiber(fiber: u64, argument_on_run_to: u64, context: *mut Fib
         // SAFETY: the caller supplies the live thread context for the complete transfer.
         let previous = unsafe { (*context).previous_fiber };
         eprintln!(
-            "[REMu][FIBER] transfer from={previous:#x} to={fiber:#x} mode={} entry={:#x} arg_init={:#x} arg_run={argument_on_run_to:#x} stack={:#x} size={:#x} saved_context={saved:#x} saved_rsp={saved_rsp:#x} saved_return={saved_return:#x} host={:?} thread={:?}",
-            if saved == 0 { "fresh" } else { "resume" },
+            "[REMu][FIBER] transfer from={previous:#x} to={fiber:#x} mode={} entry={:#x} arg_init={:#x} arg_run={argument_on_run_to:#x} stack={:#x} size={:#x} saved_context={:#x} saved_rsp={saved_rsp:#x} saved_return={saved_return:#x} host={:?} thread={:?}",
+            if saved.is_none() { "fresh" } else { "resume" },
             read_guest_u64(fiber + offset::ENTRY),
             read_guest_u64(fiber + offset::ARG_ON_INITIALIZE),
             read_guest_u64(fiber + offset::ADDR_CONTEXT),
             read_guest_u64(fiber + offset::SIZE_CONTEXT),
+            saved.map_or(0, |saved| saved as u64),
             host_thread_id(),
             current_guest_thread_name(),
         );
     }
-    if saved != 0 {
+    if let Some(saved) = saved {
         // SAFETY: the pointer was stored by this module from a frame that is still suspended.
         unsafe {
             (*context).argument_on_run_to = argument_on_run_to;
-            write_guest_u64(fiber + offset::CONTEXT, 0);
-            switch::fiber_long_jmp(saved as *mut FiberJumpContext)
+            switch::fiber_long_jmp(saved, switch::JUMP_SOURCE_FIBER_RESUME)
         }
     }
     // SAFETY: `context` is live for the duration of the switch.
@@ -390,7 +406,7 @@ pub(crate) unsafe extern "C" fn fiber_force_quit(value: u64) -> ! {
     // SAFETY: the thread context frame is suspended, not returned.
     unsafe {
         (*context).entry_returned = value;
-        switch::fiber_long_jmp(&raw mut (*context).jump)
+        switch::fiber_long_jmp(&raw mut (*context).jump, switch::JUMP_SOURCE_ENTRY_RETURN)
     }
 }
 
@@ -515,26 +531,38 @@ fn run(arguments: [u64; 6]) -> u64 {
     if let Err(error) = claim_idle(fiber) {
         return error;
     }
-    if let Err(error) = validate_saved_context(fiber) {
-        fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
-        return error;
-    }
+    let saved = match take_saved_context(fiber) {
+        Ok(saved) => saved,
+        Err(error) => {
+            fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
+            return error;
+        }
+    };
 
-    let mut context = FiberContext {
+    // A run chain can migrate through a fiber whose context allocation is also reused as a
+    // worker stack. Keeping this long-lived return record in the caller's stack lets another
+    // worker zero that stack while `fiber_long_jmp` is restoring it, producing a torn context
+    // (a valid RSP followed by a zero return target). Give the chain stable storage independent
+    // of every guest/native stack it may traverse.
+    let context = Box::into_raw(Box::new(FiberContext {
         current_fiber: fiber,
         ..FiberContext::default()
-    };
-    let context = &raw mut context;
+    }));
     set_fiber_context(context);
 
     // SAFETY: `context` lives in this frame, which stays suspended until the fiber returns here.
     let resumed = unsafe { switch::fiber_set_jmp(&raw mut (*context).jump) };
     if resumed == 0 {
         // SAFETY: the fiber is claimed and its context validated above.
-        unsafe { switch_to_fiber(fiber, argument_on_run_to, context) }
+        unsafe { switch_to_fiber(fiber, argument_on_run_to, context, saved) }
     }
 
     // SAFETY: reached only by a long jump back into this frame.
+    let context = fiber_context();
+    assert!(
+        !context.is_null(),
+        "a resumed fiber run chain must retain its stable thread context"
+    );
     let (current, returned, argument) = unsafe {
         let current = (*context).current_fiber;
         (*context).current_fiber = 0;
@@ -548,6 +576,9 @@ fn run(arguments: [u64; 6]) -> u64 {
         fiber_state(current).store(FIBER_STATE_IDLE, Ordering::Release);
     }
     set_fiber_context(std::ptr::null_mut());
+    // SAFETY: this run invocation created the allocation and has cleared the only published TLS
+    // pointer after the chain returned. No fiber can retain the thread context past this point.
+    drop(unsafe { Box::from_raw(context) });
     if returned != 0 {
         // The entry ran off its own end. Report it rather than pretending the fiber yielded.
         return fiber_error(SCE_FIBER_ERROR_STATE);
@@ -576,10 +607,13 @@ fn switch_fiber(arguments: [u64; 6]) -> u64 {
     if let Err(error) = claim_idle(fiber) {
         return error;
     }
-    if let Err(error) = validate_saved_context(fiber) {
-        fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
-        return error;
-    }
+    let saved_target = match take_saved_context(fiber) {
+        Ok(saved) => saved,
+        Err(error) => {
+            fiber_state(fiber).store(FIBER_STATE_IDLE, Ordering::Release);
+            return error;
+        }
+    };
 
     // SAFETY: the thread context frame is suspended below this one.
     let current = unsafe { (*thread_context).current_fiber };
@@ -591,12 +625,12 @@ fn switch_fiber(arguments: [u64; 6]) -> u64 {
             stack_intact(current),
             "a fiber overflowed its context before switching away"
         );
-        write_guest_u64(current + offset::CONTEXT, saved as u64);
+        saved_context_publication(current).store(saved as u64, Ordering::Release);
         // SAFETY: both fibers are validated and the target is claimed.
         unsafe {
             (*thread_context).previous_fiber = current;
             (*thread_context).current_fiber = fiber;
-            switch_to_fiber(fiber, argument_on_run_to, thread_context)
+            switch_to_fiber(fiber, argument_on_run_to, thread_context, saved_target)
         }
     }
     resume_here(argument_on_run)
@@ -620,11 +654,14 @@ fn return_to_thread(arguments: [u64; 6]) -> u64 {
             stack_intact(current),
             "a fiber overflowed its context before returning to its thread"
         );
-        write_guest_u64(current + offset::CONTEXT, saved as u64);
+        saved_context_publication(current).store(saved as u64, Ordering::Release);
         // SAFETY: the thread context frame is live and suspended.
         unsafe {
             (*thread_context).argument_on_return = argument_on_return;
-            switch::fiber_long_jmp(&raw mut (*thread_context).jump)
+            switch::fiber_long_jmp(
+                &raw mut (*thread_context).jump,
+                switch::JUMP_SOURCE_RETURN_TO_THREAD,
+            )
         }
     }
     resume_here(argument_on_run)

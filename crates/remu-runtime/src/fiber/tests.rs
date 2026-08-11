@@ -97,6 +97,31 @@ unsafe extern "C" fn yields_once(argument_on_initialize: u64, argument_on_run_to
 
 unsafe extern "C" fn returns_immediately(_argument_on_initialize: u64, _argument_on_run_to: u64) {}
 
+#[cfg(target_os = "macos")]
+static THREAD_CONTEXT_WAS_ON_NATIVE_STACK: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn records_thread_context_storage(
+    _argument_on_initialize: u64,
+    _argument_on_run_to: u64,
+) {
+    let context = fiber_context().addr();
+    // SAFETY: these Darwin queries only inspect the current live pthread's immutable stack range.
+    let thread = unsafe { libc::pthread_self() };
+    // SAFETY: `thread` is the current live pthread.
+    let top = unsafe { libc::pthread_get_stackaddr_np(thread) }.addr();
+    // SAFETY: `thread` is the current live pthread.
+    let size = unsafe { libc::pthread_get_stacksize_np(thread) };
+    let base = top
+        .checked_sub(size)
+        .expect("a native stack range cannot underflow");
+    THREAD_CONTEXT_WAS_ON_NATIVE_STACK.store(
+        (base..top).contains(&context),
+        std::sync::atomic::Ordering::Release,
+    );
+}
+
 #[test]
 fn a_returning_entry_is_caught_by_the_fiber_boundary_instead_of_jumping_to_zero() {
     let fiber = FiberObject::default();
@@ -110,6 +135,26 @@ fn a_returning_entry_is_caught_by_the_fiber_boundary_instead_of_jumping_to_zero(
         fiber_state(fiber.address()).load(Ordering::Acquire),
         FIBER_STATE_IDLE,
         "the force-quit boundary must release a returning fiber"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_migrating_thread_context_is_not_owned_by_a_reusable_native_stack() {
+    THREAD_CONTEXT_WAS_ON_NATIVE_STACK.store(false, Ordering::Release);
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(
+        initialize_fiber(&fiber, &stack, records_thread_context_storage, 0),
+        0
+    );
+    assert_eq!(
+        run([fiber.address(), 0, 0, 0, 0, 0]),
+        fiber_error(SCE_FIBER_ERROR_STATE)
+    );
+    assert!(
+        !THREAD_CONTEXT_WAS_ON_NATIVE_STACK.load(Ordering::Acquire),
+        "the run-chain context outlives stack migration and must use stable storage"
     );
 }
 
@@ -188,6 +233,26 @@ fn a_corrupt_resume_pointer_is_rejected_before_restoring_the_host_stack() {
         fiber_state(fiber.address()).load(Ordering::Acquire),
         FIBER_STATE_IDLE,
         "a refused resume must not claim the fiber"
+    );
+}
+
+#[test]
+fn a_validated_resume_pointer_is_consumed_exactly_once() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+
+    assert_eq!(
+        take_saved_context(fiber.address()).unwrap(),
+        Some(saved_context(fiber.address())),
+        "validation must return the exact object-owned context it checked"
+    );
+    assert_eq!(
+        take_saved_context(fiber.address()).unwrap(),
+        None,
+        "the guest publication cannot be re-read as a second jump target"
     );
 }
 
