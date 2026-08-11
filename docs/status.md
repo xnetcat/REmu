@@ -135,7 +135,7 @@ fill byte inferred from poison-shaped addresses such as the observed `0x03` patt
 
 Focused verification is green: `remu-shader` 159/159 tests, optimized x86 fiber tests 14/14, and
 `remu-memory` 94/94 tests, plus `-D warnings` lint for the changed packages. The full x86 runtime
-suite is 756/756. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
+suite is 759/759. Its former lone failure was a stale synthetic ELF fixture whose entry pointed at
 dynamic data rather than its live FS function; `36593f56` gives the seeded decoder authenticated
 control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
 sparse clean run that passes both prior failures and reaches a real VideoOut flip/frame; until then
@@ -152,6 +152,20 @@ accepts any number of cold-pipeline retries while requiring every retry to prese
 disjoint admission. The suite still runs serially because memory-watch tests share process signal
 and registry state. This reduces release surface and maintenance cost; it is not an FPS claim and
 does not replace the required sparse title validation.
+
+**2026-08-11 pre-render CPU profile and mutex fast path (offline; no new game run):** the saved
+artifact above does not contain an FPS sample: all ten telemetry windows ended before the first AGC
+submission, and the title never produced a real flip. It does show 423,863 process-wide dispatch
+lock acquisitions in 50.119 seconds, with 166.16 aggregate seconds waiting and 34.08 seconds
+holding the lock. The strongest source-backed hot path was 1,458,683 guest mutex lock/unlock calls.
+Normal slot-pointer calls redundantly missed a 64-way handle-registry shard before reading the
+published handle. A thread-local validated slot alias now caches `(slot address, observed handle,
+bare-handle shard epoch, live entry)` and rechecks the registry epoch, guest value, and entry
+liveness on every hit. Focused tests prove
+that repeated warm lock/unlock avoids further shard lookups while slot recycling, destroy/reinit,
+bare handles, stack copies, static initializers, recursive mutexes, and contention retain their
+existing semantics. This removes a source-identified registry-shard lookup from a measured
+high-frequency pre-render path; its CPU and FPS impact remains unmeasured.
 
 ## Historical phase snapshots
 
@@ -716,7 +730,7 @@ corruption above before escaping it.
 
 The former intermittent AGC driver failure came from tests replacing a process-global GPU event
 sink. Tests now install thread-local sinks, so parallel import-dispatch activity cannot deliver an
-event to another test's receiver. The full x86 runtime library suite passes 756/756. Metal tests
+event to another test's receiver. The full x86 runtime library suite passes 759/759. Metal tests
 remain serialized for a separate reason: memory-watch fixtures share process signal handlers and
 mapping registries.
 

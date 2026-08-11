@@ -29,7 +29,10 @@ pub(crate) use self::event_flag::EVENT_FLAG_WAIT_OR;
 pub(crate) use self::event_flag::guest_event_flag_entry;
 pub(crate) use self::event_flag::guest_event_flag_wait;
 #[cfg(test)]
-pub(crate) use self::mutex::GUEST_MUTEX_WAKE_COUNT;
+pub(crate) use self::mutex::{
+    GUEST_MUTEX_WAKE_COUNT, guest_mutex_registry_lookup_count, install_test_mutex_entry_at_handle,
+    remove_test_mutex_entry_at_handle, reset_guest_mutex_lookup_observability,
+};
 pub(crate) use self::mutex::{
     guest_mutex_destroy, guest_mutex_entry, guest_mutex_init, guest_mutex_lock, guest_mutex_unlock,
     guest_pthread_once,

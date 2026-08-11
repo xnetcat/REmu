@@ -652,6 +652,93 @@ fn mutex_lookup_cache_does_not_resurrect_a_destroyed_generation() {
 }
 
 #[test]
+fn mutex_slot_lookup_cache_skips_registry_after_warmup() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (address, _slot) = pthread_slot();
+    assert_eq!(
+        crate::guest_mutex_init(address, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    crate::guest_sync::reset_guest_mutex_lookup_observability();
+
+    assert_eq!(crate::guest_mutex_lock(address, false), 0);
+    assert_eq!(crate::guest_mutex_unlock(address), 0);
+    let warm_lookups = crate::guest_sync::guest_mutex_registry_lookup_count();
+    assert_eq!(
+        warm_lookups, 2,
+        "cold resolution checks the argument as a handle, then resolves the published handle"
+    );
+
+    for _ in 0..32 {
+        assert_eq!(crate::guest_mutex_lock(address, false), 0);
+        assert_eq!(crate::guest_mutex_unlock(address), 0);
+    }
+    assert_eq!(
+        crate::guest_sync::guest_mutex_registry_lookup_count(),
+        warm_lookups,
+        "a validated slot alias must avoid repeated failed address lookups"
+    );
+    assert_eq!(crate::guest_mutex_destroy(address), 0);
+}
+
+#[test]
+fn mutex_slot_lookup_cache_rejects_a_recycled_slot_value() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (first_slot, mut first_storage) = pthread_slot();
+    let (second_slot, second_storage) = pthread_slot();
+    assert_eq!(
+        crate::guest_mutex_init(first_slot, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    assert_eq!(
+        crate::guest_mutex_init(second_slot, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    let first_entry = crate::guest_mutex_entry(first_slot, false).expect("first mutex entry");
+    let second_entry = crate::guest_mutex_entry(second_slot, false).expect("second mutex entry");
+
+    *first_storage = *second_storage;
+    let recycled = crate::guest_mutex_entry(first_slot, false).expect("recycled slot entry");
+    assert!(std::sync::Arc::ptr_eq(&recycled, &second_entry));
+    assert!(!std::sync::Arc::ptr_eq(&recycled, &first_entry));
+
+    assert_eq!(crate::guest_mutex_destroy(first_slot), 0);
+    assert_eq!(crate::guest_mutex_destroy(first_entry.guest_object), 0);
+}
+
+#[test]
+fn mutex_slot_lookup_cache_yields_to_a_reused_bare_handle() {
+    let _guard = GUEST_CONDITION_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (slot, storage) = pthread_slot();
+    assert_eq!(
+        crate::guest_mutex_init(slot, crate::PthreadMutexAttrState::default()),
+        0
+    );
+    let aliased = crate::guest_mutex_entry(slot, false).expect("slot alias entry");
+    assert_eq!(*storage, aliased.guest_object);
+
+    // Model the publishing storage being recycled as a new control-block allocation while the
+    // original mutex remains live through a copied handle. Opaque control blocks are guest/libc
+    // writable, so the new object's first qword can still equal the old alias handle.
+    let reused = crate::guest_sync::install_test_mutex_entry_at_handle(slot);
+    let resolved = crate::guest_mutex_entry(slot, false).expect("reused bare-handle entry");
+    assert!(
+        std::sync::Arc::ptr_eq(&resolved, &reused),
+        "a newly registered bare handle must take precedence over the older slot alias"
+    );
+    assert!(!std::sync::Arc::ptr_eq(&resolved, &aliased));
+
+    crate::guest_sync::remove_test_mutex_entry_at_handle(slot);
+    assert_eq!(crate::guest_mutex_destroy(aliased.guest_object), 0);
+}
+
+#[test]
 fn mutex_unlock_notifies_only_when_a_contender_is_waiting() {
     let _guard = GUEST_CONDITION_TEST
         .lock()
