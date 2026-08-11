@@ -28,7 +28,7 @@ use metal::{
 };
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
-use remu_shader::{ShaderEvaluation, image_is_comparison};
+use remu_shader::{ImageBinding, ImageViewReinterpretation, ShaderEvaluation, image_is_comparison};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -302,6 +302,47 @@ pub(crate) fn sampled_texture_supports_access(texture: &Texture, writable: bool)
         MTLTextureUsage::ShaderRead
     };
     texture.usage().contains(required)
+}
+
+pub(crate) fn sampled_texture_view_for_binding(
+    texture: &Texture,
+    binding: &ImageBinding,
+) -> Result<Texture, String> {
+    if binding.control.dimension != 5 {
+        return Ok(texture.clone());
+    }
+    match binding.view_reinterpretation() {
+        ImageViewReinterpretation::Direct | ImageViewReinterpretation::CubeFacesAsArray => {
+            if texture.texture_type() != MTLTextureType::D2Array {
+                return Err(format!(
+                    "DIM=2D_ARRAY {:?} binding produced non-array Metal texture {:?}",
+                    binding.view_reinterpretation(),
+                    texture.texture_type()
+                ));
+            }
+            Ok(texture.clone())
+        }
+        ImageViewReinterpretation::SingleLayerAsArray => {
+            if texture.texture_type() == MTLTextureType::D2Array {
+                return Ok(texture.clone());
+            }
+            if texture.texture_type() != MTLTextureType::D2 {
+                return Err(format!(
+                    "DIM=2D_ARRAY single-layer view requires a 2D Metal texture, got {:?}",
+                    texture.texture_type()
+                ));
+            }
+            Ok(texture.new_texture_view_from_slice(
+                texture.pixel_format(),
+                MTLTextureType::D2Array,
+                NSRange::new(0, texture.mipmap_level_count()),
+                NSRange::new(0, 1),
+            ))
+        }
+        reinterpretation => Err(format!(
+            "DIM=2D_ARRAY cannot use descriptor view {reinterpretation:?}"
+        )),
+    }
 }
 
 #[cfg(test)]

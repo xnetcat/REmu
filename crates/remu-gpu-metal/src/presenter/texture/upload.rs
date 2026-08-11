@@ -23,10 +23,10 @@ use super::{
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, resident_sample_authority_ok,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
-    sampled_texture_key, sampled_texture_supports_access, sampler_uses_normalized_coordinates,
-    storage_image_requires_mip_hierarchy, texture_element_layout,
-    trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
-    trace_target_sampling,
+    sampled_texture_key, sampled_texture_supports_access, sampled_texture_view_for_binding,
+    sampler_uses_normalized_coordinates, storage_image_requires_mip_hierarchy,
+    texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
+    trace_resident_texture_removal, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -479,8 +479,9 @@ pub(crate) fn upload_image_textures(
                 .iter()
                 .find(|retained| retained.matches(descriptor))
             {
+                let texture = sampled_texture_view_for_binding(&retained.texture, binding)?;
                 return Ok(UploadedImageTexture {
-                    texture: retained.texture.clone(),
+                    texture,
                     descriptor,
                     writable: false,
                     selected_resident: None,
@@ -1155,6 +1156,7 @@ pub(crate) fn upload_image_textures(
                     texture
                 }
             };
+            let texture = sampled_texture_view_for_binding(&texture, binding)?;
             Ok(UploadedImageTexture {
                 texture,
                 descriptor,

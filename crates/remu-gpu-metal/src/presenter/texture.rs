@@ -99,7 +99,7 @@ pub(crate) use self::sampled::{
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, resident_sample_authority_ok,
     resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
-    sampled_texture_supports_access, sampled_texture_usage,
+    sampled_texture_supports_access, sampled_texture_usage, sampled_texture_view_for_binding,
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 #[cfg(test)]

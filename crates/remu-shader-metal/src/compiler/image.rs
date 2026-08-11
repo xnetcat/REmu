@@ -4,8 +4,8 @@
 //! MIMG lowering: image loads, stores and sample operations.
 
 use remu_shader::{
-    ImageBinding, ImageControl, Instruction, InstructionControl, Opcode, decode_unified_format,
-    image_sample_modifiers,
+    ImageBinding, ImageControl, ImageViewReinterpretation, Instruction, InstructionControl, Opcode,
+    decode_unified_format, image_sample_modifiers,
 };
 
 use crate::Compiler;
@@ -18,6 +18,7 @@ pub(crate) struct ImageKind {
     pub(crate) comparison: bool,
     pub(crate) dimension: u32,
     pub(crate) texture_type: u32,
+    pub(crate) view_reinterpretation: ImageViewReinterpretation,
 }
 
 /// Metal texture dimensionality after Kyty-style SRD rematerialization.
@@ -27,6 +28,16 @@ pub(crate) struct ImageKind {
 /// against TYPE=2D descriptors; binding those as `texture3d` yields solid tofu glyphs. Prefer
 /// the live descriptor type when it is a known Prospero 2D/3D/array encoding.
 pub(crate) fn metal_image_dimension(kind: ImageKind) -> u32 {
+    if kind.dimension == 5
+        && matches!(
+            kind.view_reinterpretation,
+            ImageViewReinterpretation::Direct
+                | ImageViewReinterpretation::CubeFacesAsArray
+                | ImageViewReinterpretation::SingleLayerAsArray
+        )
+    {
+        return 3;
+    }
     // Prospero SQ_IMG TYPE (dwords[3]>>28), matching Kyty DescriptorDimension:
     // 1D/2D/2D_MSAA → Dim2D; 3D → Dim3D; cube/arrays → Dim2DArray.
     match kind.texture_type {
@@ -110,11 +121,17 @@ impl Compiler<'_> {
         if kind.storage {
             return Err("sample operation resolved to a storage image".to_owned());
         }
-        let native_2d_array = image.dimension == 5 && kind.texture_type == 13;
-        if !native_2d_array && (image.is_array || !matches!(image.dimension, 0..=3)) {
+        let compatible_2d_array = image.dimension == 5
+            && matches!(
+                kind.view_reinterpretation,
+                ImageViewReinterpretation::Direct
+                    | ImageViewReinterpretation::CubeFacesAsArray
+                    | ImageViewReinterpretation::SingleLayerAsArray
+            );
+        if !compatible_2d_array && (image.is_array || !matches!(image.dimension, 0..=3)) {
             return Err(format!(
-                "sampled image dimension {} array={} requires its matching Metal texture type",
-                image.dimension, image.is_array
+                "sampled image dimension {} array={} is incompatible with descriptor TYPE={} ({:?})",
+                image.dimension, image.is_array, kind.texture_type, kind.view_reinterpretation,
             ));
         }
         let sampler_slot = self.image_slots.sampler_slots[evaluation_index]

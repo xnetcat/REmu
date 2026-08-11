@@ -422,6 +422,31 @@ fn native_2d_array_gather_offsets_use_array_texture_overloads() {
 }
 
 #[test]
+fn dim2d_array_reconciles_native_array_cube_faces_and_single_layer_views() {
+    for texture_type in [9, 11, 13] {
+        let gradient = compile_offset_sample("ImageSampleD", 5, texture_type);
+        assert!(
+            gradient.source.contains("texture2d_array<float> tex0"),
+            "TYPE={texture_type} must expose DIM=2D_ARRAY through an array view:\n{}",
+            gradient.source
+        );
+        assert!(gradient.source.contains("gradient2d("));
+        assert!(gradient.source.contains("tex0.get_array_size() - 1u"));
+
+        let comparison = compile_offset_sample("ImageSampleCLz", 5, texture_type);
+        assert!(comparison.source.contains("depth2d_array<float> tex0"));
+        assert!(comparison.source.contains("sample_compare("));
+        assert!(comparison.source.contains("level(0.0f)"));
+    }
+
+    let error = try_compile_sample("ImageSampleD", 5, 10)
+        .expect_err("a 3D descriptor cannot satisfy a 2D-array signature");
+    let message = error.to_string();
+    assert!(message.contains("dimension 5"));
+    assert!(message.contains("TYPE=10"));
+}
+
+#[test]
 fn true_3d_offsets_keep_the_three_axis_coordinate_lowering() {
     let shader = compile_offset_sample("ImageSampleLzO", 2, 10);
 
@@ -510,6 +535,14 @@ fn generated_offset_image_msl_compiles_with_apple_metal() {
         (
             "gather-compare-2d-array",
             compile_offset_sample("ImageGather4CLzO", 5, 13),
+        ),
+        (
+            "sample-gradient-single-layer-as-array",
+            compile_offset_sample("ImageSampleD", 5, 9),
+        ),
+        (
+            "sample-compare-cube-faces-as-array",
+            compile_offset_sample("ImageSampleCLz", 5, 11),
         ),
         // The minimum-LOD clamp overloads, which accept a bias or gradient beside them and sit
         // between the LOD option and the texel offset.

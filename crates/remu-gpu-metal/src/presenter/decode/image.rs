@@ -197,6 +197,7 @@ pub(crate) fn fallback_image_descriptor(
         match binding.control.dimension {
             2 => 10,
             3 => 11,
+            5 => 13,
             _ => 9,
         }
     };

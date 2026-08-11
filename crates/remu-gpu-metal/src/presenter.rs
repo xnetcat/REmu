@@ -243,8 +243,8 @@ use self::texture::{
     prepare_sampled_texture_upload, rematerialisation_blit_source_origin_y,
     resident_texture_eviction_plan, sampled_texture_cache_accepts,
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
-    sampled_texture_key, snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
-    watch_guest_texture, write_guest_texture_linear,
+    sampled_texture_key, sampled_texture_view_for_binding, snapshot_guest_texture_linear,
+    snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
 };
 use self::tiling::{
     ResourceSpan, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,

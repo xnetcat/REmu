@@ -248,6 +248,7 @@ impl<'a> Compiler<'a> {
                         .resource_descriptor
                         .get(3)
                         .map_or(0, |word| (word >> 28) & 0xf),
+                    view_reinterpretation: binding.view_reinterpretation(),
                 });
             } else if texture_slot > image_kinds.len() {
                 return Err(MetalCompileError::InvalidInterface(

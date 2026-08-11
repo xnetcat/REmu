@@ -34,11 +34,12 @@ use super::{
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
-    sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
-    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
-    upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
+    sampled_texture_cache_requires_eviction, sampled_texture_view_for_binding,
+    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
+    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
+    write_watched_guest_texture_linear,
 };
-use metal::foreign_types::ForeignType;
+use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
@@ -1929,6 +1930,14 @@ fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
     assert_eq!(fallback.texture_type, 9);
     assert_eq!(fallback.layer_count, 1);
 
+    let mut array_binding = binding.clone();
+    array_binding.control.dimension = 5;
+    array_binding.control.is_array = true;
+    array_binding.control.address_registers = vec![0, 1, 2];
+    let fallback = fallback_image_descriptor(&array_binding).expect("2D-array fallback descriptor");
+    assert_eq!(fallback.texture_type, 13);
+    assert_eq!(fallback.layer_count, 1);
+
     let mut buffer_descriptor = binding.clone();
     buffer_descriptor.pc = 0xc4;
     buffer_descriptor.resource_descriptor =
@@ -1953,6 +1962,66 @@ fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
     buffer_descriptor.resource_descriptor =
         vec![0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x91b0_03ac].into();
     assert!(sampled_alias_descriptor(&buffer_descriptor).is_some());
+}
+
+#[test]
+fn dim2d_array_over_a_single_layer_descriptor_binds_a_real_array_view() {
+    let device = Device::system_default().expect("Metal device");
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+    descriptor.set_width(4);
+    descriptor.set_height(4);
+    descriptor.set_mipmap_level_count(2);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&descriptor);
+    let binding = ImageBinding {
+        pc: 0x58,
+        opcode: Opcode::Known("ImageSampleD"),
+        control: ImageControl {
+            dmask: 1,
+            vector_address: 0,
+            address_registers: (0..7).collect(),
+            vector_data: 8,
+            scalar_resource: 12,
+            scalar_sampler: 20,
+            dimension: 5,
+            is_array: true,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+            unorm: false,
+        },
+        resource_descriptor: vec![1, 0, 0, 9 << 28, 0, 0, 0, 0].into(),
+        sampler_descriptor: vec![0; 4].into(),
+        mip_level: None,
+    };
+
+    let view = sampled_texture_view_for_binding(&texture, &binding)
+        .expect("single-layer 2D descriptor should expose an array view");
+    assert_eq!(view.texture_type(), MTLTextureType::D2Array);
+    assert_eq!(view.array_length(), 1);
+    assert_eq!(view.mipmap_level_count(), 2);
+    assert_eq!(
+        view.parent_texture().expect("array view parent").as_ptr(),
+        texture.as_ptr()
+    );
+
+    let depth_descriptor = TextureDescriptor::new();
+    depth_descriptor.set_texture_type(MTLTextureType::D2);
+    depth_descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
+    depth_descriptor.set_width(4);
+    depth_descriptor.set_height(4);
+    depth_descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let depth = device.new_texture(&depth_descriptor);
+    let mut comparison_binding = binding;
+    comparison_binding.opcode = Opcode::Known("ImageSampleCLz");
+    let depth_view = sampled_texture_view_for_binding(&depth, &comparison_binding)
+        .expect("single-layer depth descriptor should expose an array view");
+    assert_eq!(depth_view.texture_type(), MTLTextureType::D2Array);
+    assert_eq!(depth_view.pixel_format(), MTLPixelFormat::Depth32Float);
+    assert_eq!(depth_view.array_length(), 1);
 }
 
 #[test]
