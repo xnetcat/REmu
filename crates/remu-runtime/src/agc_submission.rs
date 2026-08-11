@@ -317,6 +317,17 @@ pub(crate) fn agc_handle_submission_packet(
         register,
         predicated: _,
     } = packet;
+    if opcode == AGC_IT_NOP && register == crate::agc_command_abi::R_CONTEXT_STATE_OP {
+        if length != 3 {
+            return Err(AgcSubmissionError::ContextStatePacketLength { actual: length });
+        }
+        let magic = read_guest_u32(packet_address + 4);
+        if magic != crate::agc_command_abi::CONTEXT_STATE_OP_MAGIC {
+            return Err(AgcSubmissionError::ContextStatePacketMagic(magic));
+        }
+        graphics.apply_context_state_op(read_guest_u32(packet_address + 8))?;
+        return Ok(());
+    }
     if opcode == AGC_IT_CLEAR_STATE {
         agc_apply_clear_state(packet_address, length, graphics)?;
     }

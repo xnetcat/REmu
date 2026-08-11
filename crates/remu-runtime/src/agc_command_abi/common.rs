@@ -2,18 +2,33 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    IT_DISPATCH_DIRECT, IT_INDIRECT_BUFFER, IT_NOP, IT_SET_SH_REG, MAX_PACKET_DWORDS,
-    R_RELEASE_MEM, R_ZERO, allocate_dwords, low_u8, low_u16, low_u32,
-    mark_graphics_release_for_command_buffer, pm4, read_u32, register_graphics_continuation,
-    write_u32, write_words,
+    CONTEXT_STATE_OP_MAGIC, IT_DISPATCH_DIRECT, IT_INDIRECT_BUFFER, IT_NOP, IT_SET_SH_REG,
+    MAX_PACKET_DWORDS, R_CONTEXT_STATE_OP, R_RELEASE_MEM, R_ZERO, allocate_dwords, low_u8, low_u16,
+    low_u32, mark_graphics_release_for_command_buffer, pm4, read_u32,
+    register_graphics_continuation, write_u32, write_words,
 };
 
-pub(super) fn type_two_packet(arguments: [u64; 6]) -> u64 {
-    let Some(command) = allocate_dwords(arguments[0], 1) else {
+pub(super) fn context_state_op(arguments: [u64; 6]) -> u64 {
+    let operation = low_u32(arguments[1]);
+    if operation > 3 {
+        return 0;
+    }
+    let Some(command) = allocate_dwords(arguments[0], 3) else {
         return 0;
     };
-    write_u32(command, 0x8000_0000);
+    write_words(
+        command,
+        &[
+            pm4(3, IT_NOP, R_CONTEXT_STATE_OP),
+            CONTEXT_STATE_OP_MAGIC,
+            operation,
+        ],
+    );
     command
+}
+
+pub(super) fn context_state_op_size(arguments: [u64; 6]) -> u64 {
+    if low_u32(arguments[0]) <= 3 { 12 } else { 0 }
 }
 
 pub(super) fn cb_nop(arguments: [u64; 6]) -> u64 {

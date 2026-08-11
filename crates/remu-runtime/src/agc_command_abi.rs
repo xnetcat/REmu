@@ -32,7 +32,7 @@ pub(crate) use self::buffer::{
 pub(crate) use self::buffer::{graphics_tracking_test_guard, track_graphics_allocation};
 use self::common::{
     cb_branch, cb_dispatch, cb_nop, cb_release_mem, cb_set_register_range, cb_set_sh_registers,
-    type_two_packet,
+    context_state_op, context_state_op_size,
 };
 use self::draw::{
     dcb_dispatch_indirect, dcb_reset_queue, dcb_wait_until_safe, draw_index, draw_index_auto,
@@ -106,6 +106,8 @@ const R_ACQUIRE_MEM: u32 = 0x14;
 const R_WAIT_MEM_64: u32 = 0x16;
 const R_FLIP: u32 = 0x17;
 const R_RELEASE_MEM: u32 = 0x18;
+pub(crate) const R_CONTEXT_STATE_OP: u32 = 0x1a;
+pub(crate) const CONTEXT_STATE_OP_MAGIC: u32 = 0x4358_4f50;
 
 const VGT_INDEX_TYPE: u32 = 0x243;
 const MAX_PACKET_DWORDS: u32 = 0x4001;
@@ -229,7 +231,8 @@ fn dispatch_common_command(
     stack_arguments: [u64; 6],
 ) -> Option<u64> {
     Some(match nid {
-        "qj7QZpgr9Uw" => type_two_packet(arguments),
+        "qj7QZpgr9Uw" => context_state_op(arguments),
+        "H6vHS5cidSA" => context_state_op_size(arguments),
         "LtTouSCZjHM" => cb_nop(arguments),
         "t7PlZ9nt5Lc" => low_u32(arguments[0]).wrapping_mul(4).into(),
         "k3GhuSNmBLU" => cb_dispatch(arguments),

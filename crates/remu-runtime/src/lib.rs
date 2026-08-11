@@ -1138,6 +1138,12 @@ pub(crate) struct PendingVideoOutFlip {
 // many as three cache tables. This small Fx-style mixer retains full equality checks in HashMap
 // while making those repeated fixed-width writes substantially cheaper.
 #[derive(Debug)]
+struct AgcContextStateSnapshot {
+    context_registers: BTreeMap<u32, u32>,
+    blend_register_provenance: [Option<AgcBlendRegisterProvenance>; 8],
+}
+
+#[derive(Debug)]
 pub(crate) struct AgcGraphicsState {
     context_registers: BTreeMap<u32, u32>,
     shader_registers: BTreeMap<u32, u32>,
@@ -1155,6 +1161,7 @@ pub(crate) struct AgcGraphicsState {
     /// accepted-path trace distinguish a guest-authored disabled value from a later routing or
     /// reset loss.
     blend_register_provenance: [Option<AgcBlendRegisterProvenance>; 8],
+    context_state_stack: Option<AgcContextStateSnapshot>,
     register_write_sequence: u64,
     predicate_skip: bool,
     index_buffer_address: u64,
@@ -1204,6 +1211,7 @@ impl Default for AgcGraphicsState {
             shader_register_snapshot_cache: None,
             user_config_register_snapshot_cache: None,
             blend_register_provenance: [None; 8],
+            context_state_stack: None,
             register_write_sequence: 0,
             predicate_skip: false,
             index_buffer_address: 0,
@@ -1272,6 +1280,62 @@ pub(crate) mod agc_reset_queue_op {
 }
 
 impl AgcGraphicsState {
+    fn clear_context_state(&mut self) {
+        self.context_registers = agc_register_defaults::seed_register_defaults(
+            agc_register_defaults::RegisterFile::Context,
+        );
+        self.context_register_generation = self.context_register_generation.wrapping_add(1);
+        self.blend_register_provenance = [None; 8];
+    }
+
+    fn context_state_snapshot(&self) -> AgcContextStateSnapshot {
+        AgcContextStateSnapshot {
+            context_registers: self.context_registers.clone(),
+            blend_register_provenance: self.blend_register_provenance,
+        }
+    }
+
+    fn restore_context_state(&mut self, snapshot: AgcContextStateSnapshot) {
+        self.context_registers = snapshot.context_registers;
+        self.blend_register_provenance = snapshot.blend_register_provenance;
+        self.context_register_generation = self.context_register_generation.wrapping_add(1);
+    }
+
+    pub(crate) fn apply_context_state_op(
+        &mut self,
+        operation: u32,
+    ) -> Result<(), AgcSubmissionError> {
+        match operation {
+            0 => self.clear_context_state(),
+            1 => {
+                if self.context_state_stack.is_some() {
+                    return Err(AgcSubmissionError::ContextStateAlreadyPushed { operation });
+                }
+                self.context_state_stack = Some(self.context_state_snapshot());
+            }
+            2 => {
+                let snapshot = self
+                    .context_state_stack
+                    .take()
+                    .ok_or(AgcSubmissionError::ContextStatePopWithoutPush)?;
+                self.restore_context_state(snapshot);
+            }
+            3 => {
+                if self.context_state_stack.is_some() {
+                    return Err(AgcSubmissionError::ContextStateAlreadyPushed { operation });
+                }
+                self.context_state_stack = Some(self.context_state_snapshot());
+                self.clear_context_state();
+            }
+            _ => {
+                return Err(AgcSubmissionError::UnsupportedContextStateOperation(
+                    operation,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn cached_register_snapshot(
         registers: &BTreeMap<u32, u32>,
         generation: u64,
@@ -1351,12 +1415,13 @@ impl AgcGraphicsState {
     /// Apply a selective `ResetQueueOp` mask. Register files reseed from
     /// `agc_register_defaults`; they are never left empty.
     pub(crate) fn apply_reset_queue_op(&mut self, ops: u32) {
+        if ops & agc_reset_queue_op::CONTEXT_OP_PUSH != 0
+            && let Some(snapshot) = self.context_state_stack.take()
+        {
+            self.restore_context_state(snapshot);
+        }
         if ops & agc_reset_queue_op::CX_STATE != 0 {
-            self.context_registers = agc_register_defaults::seed_register_defaults(
-                agc_register_defaults::RegisterFile::Context,
-            );
-            self.context_register_generation = self.context_register_generation.wrapping_add(1);
-            self.blend_register_provenance = [None; 8];
+            self.clear_context_state();
         }
         if ops & agc_reset_queue_op::SH_STATE != 0 {
             self.shader_registers = agc_register_defaults::seed_register_defaults(
@@ -1389,16 +1454,13 @@ impl AgcGraphicsState {
         if ops & agc_reset_queue_op::BASE_INDIRECT_POINTERS != 0 {
             self.indirect_args_address = 0;
         }
-        // Flush/drain/occlusion/context-op-push are GPU timeline effects. Flush and drain are
-        // host no-ops here (completion already serializes submissions). Context-op push/pop is
-        // tracked only when the guest emits those packets; a reset that asks to pop while we
-        // have no push stack is intentionally ignored.
+        // Flush/drain/occlusion are GPU timeline effects and are host no-ops here because
+        // completion already serializes submissions.
         let _ = (
             ops & agc_reset_queue_op::FLUSH_CACHES,
             ops & agc_reset_queue_op::DRAIN_COMPUTE,
             ops & agc_reset_queue_op::DRAIN_GRAPHICS,
             ops & agc_reset_queue_op::OCCLUSION_QUERY,
-            ops & agc_reset_queue_op::CONTEXT_OP_PUSH,
         );
         self.predicate_skip = false;
     }
