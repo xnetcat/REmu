@@ -13,7 +13,7 @@
 //! control words sit at naturally aligned offsets rather than at the packed offsets the console
 //! library happens to use.
 
-use super::{FiberContext, FiberData};
+use super::{FiberData, FiberJumpContext};
 
 /// Saves the caller's resumable state into `context`.
 ///
@@ -22,7 +22,7 @@ use super::{FiberContext, FiberData};
 ///
 /// # Safety
 ///
-/// `context` must point to a live, writable [`FiberContext`] that outlives every resume through
+/// `context` must point to a live, writable [`FiberJumpContext`] that outlives every resume through
 /// it. Resuming a context whose stack frame has returned jumps into freed stack.
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
@@ -30,27 +30,21 @@ use super::{FiberContext, FiberData};
 // unit than its callers, which intermittently left the mangled symbol undefined at link time as
 // unrelated code in this crate shifted partitioning.
 #[unsafe(export_name = "remu_fiber_set_jmp")]
-pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberContext) -> u32 {
+pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberJumpContext) -> u32 {
     core::arch::naked_asm!(
-        "mov [rdi + 0x00], rax",
+        "mov [rdi + 0x00], rbx",
+        "mov [rdi + 0x08], rsp",
+        "mov [rdi + 0x10], rbp",
+        "mov [rdi + 0x18], r12",
+        "mov [rdi + 0x20], r13",
+        "mov [rdi + 0x28], r14",
+        "mov [rdi + 0x30], r15",
         // The return address is the resume point: a later long jump puts it back on the restored
         // stack and returns to it.
         "mov rdx, [rsp]",
-        "mov [rdi + 0x10], rdx",
-        "mov [rdi + 0x08], rcx",
-        "mov [rdi + 0x18], rbx",
-        "mov [rdi + 0x20], rsp",
-        "mov [rdi + 0x28], rbp",
-        "mov [rdi + 0x30], r8",
-        "mov [rdi + 0x38], r9",
-        "mov [rdi + 0x40], r10",
-        "mov [rdi + 0x48], r11",
-        "mov [rdi + 0x50], r12",
-        "mov [rdi + 0x58], r13",
-        "mov [rdi + 0x60], r14",
-        "mov [rdi + 0x68], r15",
-        "stmxcsr [rdi + 0x70]",
-        "fnstcw [rdi + 0x74]",
+        "mov [rdi + 0x38], rdx",
+        "stmxcsr [rdi + 0x40]",
+        "fnstcw [rdi + 0x44]",
         "xor eax, eax",
         "ret",
     );
@@ -64,33 +58,27 @@ pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberContext) -> u3
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(export_name = "remu_fiber_long_jmp")]
-pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberContext) -> ! {
+pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberJumpContext) -> ! {
     core::arch::naked_asm!(
         // Restore the saved rounding and masking bits while keeping the live exception flags,
         // which are sticky status the resumed code may still be reading.
         "stmxcsr [rsp - 8]",
-        "mov eax, [rdi + 0x70]",
+        "mov eax, [rdi + 0x40]",
         "and eax, 0xffffffc0",
         "mov ecx, [rsp - 8]",
         "and ecx, 0x3f",
         "xor ecx, eax",
         "mov [rsp - 8], ecx",
         "ldmxcsr [rsp - 8]",
-        "mov rax, [rdi + 0x00]",
-        "mov rcx, [rdi + 0x08]",
-        "mov rdx, [rdi + 0x10]",
-        "mov rbx, [rdi + 0x18]",
-        "mov rsp, [rdi + 0x20]",
-        "mov rbp, [rdi + 0x28]",
-        "mov r8,  [rdi + 0x30]",
-        "mov r9,  [rdi + 0x38]",
-        "mov r10, [rdi + 0x40]",
-        "mov r11, [rdi + 0x48]",
-        "mov r12, [rdi + 0x50]",
-        "mov r13, [rdi + 0x58]",
-        "mov r14, [rdi + 0x60]",
-        "mov r15, [rdi + 0x68]",
-        "fldcw [rdi + 0x74]",
+        "mov rbx, [rdi + 0x00]",
+        "mov rsp, [rdi + 0x08]",
+        "mov rbp, [rdi + 0x10]",
+        "mov r12, [rdi + 0x18]",
+        "mov r13, [rdi + 0x20]",
+        "mov r14, [rdi + 0x28]",
+        "mov r15, [rdi + 0x30]",
+        "mov rdx, [rdi + 0x38]",
+        "fldcw [rdi + 0x44]",
         // Put the saved resume address back where `ret` expects it, then report the second arrival.
         "mov [rsp], rdx",
         "mov eax, 1",
@@ -116,24 +104,27 @@ pub(super) unsafe extern "C" fn fiber_switch_entry(
 ) -> ! {
     core::arch::naked_asm!(
         "mov r11, rdi",
-        // Move onto the fiber's own stack before touching anything else.
-        "mov rsp, [r11 + 0x18]",
-        "xor ebp, ebp",
-        // The fiber this one displaced becomes idle only once its registers can no longer be
-        // reached, which is here: its stack is no longer current.
-        "mov r10, [r11 + 0x20]",
-        "test r10, r10",
-        "jz 2f",
-        "mov dword ptr [r10], 2",
-        "2:",
+        // FiberData is a local on the outgoing fiber's stack. Consume every field before making
+        // that fiber claimable: another worker may resume it as soon as state becomes IDLE and is
+        // then allowed to overwrite the old stack.
         "test esi, esi",
-        "jz 3f",
+        "jz 2f",
         "ldmxcsr [r11 + 0x28]",
         "fldcw [r11 + 0x2c]",
-        "3:",
+        "2:",
+        "mov r10, [r11 + 0x20]",
         "mov rdi, [r11 + 0x08]",
         "mov rsi, [r11 + 0x10]",
+        "mov rax, [r11 + 0x18]",
         "mov r11, [r11 + 0x00]",
+        // Only after the complete handoff record is resident in registers can the old stack be
+        // released. No instruction below this point reads FiberData.
+        "mov rsp, rax",
+        "xor ebp, ebp",
+        "test r10, r10",
+        "jz 3f",
+        "mov dword ptr [r10], 2",
+        "3:",
         // A fresh fiber must not observe register contents from whatever ran before it.
         "xor eax, eax",
         "xor ebx, ebx",
