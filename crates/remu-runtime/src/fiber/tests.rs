@@ -102,6 +102,11 @@ fn a_fiber_runs_on_its_own_stack_and_yields_back_with_both_arguments() {
     // The entry saw the value bound at initialize and the value passed at run.
     assert_eq!(OBSERVED.lock().unwrap().as_slice(), &[(0x1111, 0x2222)]);
     assert_eq!(returned, 0xfeed_face);
+    assert_eq!(
+        read_guest_u64(fiber.address() + offset::CONTEXT),
+        fiber.address() + offset::SAVED_CONTEXT,
+        "a suspended register record must live in the opaque fiber object, not on its stack"
+    );
     // A yielded fiber is idle again and the thread is no longer inside a fiber.
     assert_eq!(
         fiber_state(fiber.address()).load(Ordering::Acquire),
@@ -123,6 +128,29 @@ fn a_fiber_runs_on_its_own_stack_and_yields_back_with_both_arguments() {
     );
     assert_eq!(OBSERVED.lock().unwrap().len(), 1, "entry must not re-run");
     assert_eq!(returned, 0xdead_beef);
+}
+
+#[test]
+fn a_corrupt_resume_pointer_is_rejected_before_restoring_the_host_stack() {
+    OBSERVED.lock().unwrap().clear();
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(initialize_fiber(&fiber, &stack, yields_once, 0), 0);
+    assert_eq!(run([fiber.address(), 0, 0, 0, 0, 0]), 0);
+    write_guest_u64(
+        fiber.address() + offset::CONTEXT,
+        fiber.address() + offset::SAVED_CONTEXT + 8,
+    );
+
+    assert_eq!(
+        run([fiber.address(), 0, 0, 0, 0, 0]),
+        fiber_error(SCE_FIBER_ERROR_INVALID)
+    );
+    assert_eq!(
+        fiber_state(fiber.address()).load(Ordering::Acquire),
+        FIBER_STATE_IDLE,
+        "a refused resume must not claim the fiber"
+    );
 }
 
 /// The two peers of the switch test, published before either fiber starts. A fiber entry is
@@ -517,6 +545,50 @@ unsafe extern "C" fn attempts_nested_run(_initialize: u64, _run_to: u64) {
     OBSERVED.lock().unwrap().push((result, 0));
     return_to_thread([0, 0, 0, 0, 0, 0]);
     unreachable!("the test never resumes this fiber");
+}
+
+static CONCURRENT_FIBER_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static RELEASE_CONCURRENT_FIBER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "C" fn waits_while_another_thread_attempts_run(_initialize: u64, _run_to: u64) {
+    CONCURRENT_FIBER_ACTIVE.store(true, Ordering::Release);
+    while !RELEASE_CONCURRENT_FIBER.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
+    return_to_thread([0, 0, 0, 0, 0, 0]);
+    unreachable!("the test never resumes this fiber");
+}
+
+#[test]
+fn a_fiber_cannot_be_claimed_by_two_threads_at_once() {
+    CONCURRENT_FIBER_ACTIVE.store(false, Ordering::Release);
+    RELEASE_CONCURRENT_FIBER.store(false, Ordering::Release);
+    let fiber = FiberObject::default();
+    let stack = FiberStack::new();
+    assert_eq!(
+        initialize_fiber(&fiber, &stack, waits_while_another_thread_attempts_run, 0),
+        0
+    );
+    let fiber_address = fiber.address();
+    let running = std::thread::spawn(move || run([fiber_address, 0, 0, 0, 0, 0]));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !CONCURRENT_FIBER_ACTIVE.load(Ordering::Acquire) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first worker did not enter the fiber"
+        );
+        std::thread::yield_now();
+    }
+
+    assert_eq!(
+        run([fiber.address(), 0, 0, 0, 0, 0]),
+        fiber_error(SCE_FIBER_ERROR_STATE),
+        "the state claim must exclude a second worker while the fiber stack is active"
+    );
+    RELEASE_CONCURRENT_FIBER.store(true, Ordering::Release);
+    assert_eq!(running.join().expect("the first worker must return"), 0);
 }
 
 /// The fiber a second thread will resume, and the value it reports on that resume.
