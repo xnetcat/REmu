@@ -6,7 +6,7 @@ use std::mem::size_of;
 use super::AcmEngine;
 use super::abi::{AcmError, AcmFormat, SceAcmBatchCommand, SceAcmBatchInfo, return_error};
 use super::batch::{Command, decode_buffers};
-use super::builders::append_test_record;
+use super::builders::{append_tagged_test_record, append_test_record};
 
 const SUCCESS: u64 = 0;
 
@@ -20,12 +20,86 @@ fn address_mut<T>(value: &mut T) -> u64 {
     std::ptr::from_mut(value) as u64
 }
 
+fn address<T>(value: &T) -> u64 {
+    std::ptr::from_ref(value) as u64
+}
+
 #[repr(align(128))]
 struct AlignedBytes([u8; 256]);
 
 fn write_word(bytes: &mut [u8], index: usize, word: u64) {
     let start = index * 8;
     bytes[start..start + 8].copy_from_slice(&word.to_le_bytes());
+}
+
+fn create_context(engine: &AcmEngine) -> u32 {
+    let mut context = 0_u32;
+    assert_eq!(
+        engine.context_create(args(&[address_mut(&mut context)])),
+        SUCCESS
+    );
+    context
+}
+
+fn start_empty_batch(engine: &AcmEngine, context: u32, batch_error: u64) -> Result<u32, AcmError> {
+    let mut arena = AlignedBytes([0; 256]);
+    let info = SceAcmBatchInfo {
+        buffer: arena.0.as_mut_ptr() as u64,
+        offset: 0,
+        size: arena.0.len() as u64,
+    };
+    let info_pointers = [address(&info)];
+    let mut batch = 0_u32;
+    let result = engine.batch_start_buffers(args(&[
+        u64::from(context),
+        1,
+        address(&info_pointers),
+        batch_error,
+        address_mut(&mut batch),
+    ]));
+    if result == SUCCESS {
+        Ok(batch)
+    } else {
+        Err([
+            AcmError::Unknown,
+            AcmError::InvalidContext,
+            AcmError::InvalidBatch,
+            AcmError::OutOfMemory,
+            AcmError::OutOfResources,
+            AcmError::InvalidParameter,
+            AcmError::MalformedBatch,
+            AcmError::Busy,
+            AcmError::BatchBufferFull,
+            AcmError::Alignment,
+            AcmError::PageFault,
+        ]
+        .into_iter()
+        .find(|error| return_error(*error) == result)
+        .expect("known ACM error"))
+    }
+}
+
+fn start_tagged(engine: &AcmEngine, context: u32, tag: u64) -> u32 {
+    let mut arena = AlignedBytes([0; 256]);
+    let mut info = SceAcmBatchInfo {
+        buffer: arena.0.as_mut_ptr() as u64,
+        offset: 0,
+        size: arena.0.len() as u64,
+    };
+    append_tagged_test_record(address_mut(&mut info), tag).unwrap();
+    let info_pointers = [address(&info)];
+    let mut batch = 0_u32;
+    assert_eq!(
+        engine.batch_start_buffers(args(&[
+            u64::from(context),
+            1,
+            address(&info_pointers),
+            0,
+            address_mut(&mut batch),
+        ])),
+        SUCCESS
+    );
+    batch
 }
 
 #[test]
@@ -199,4 +273,116 @@ fn decoded_plan_survives_arena_copy_and_unknown_records_fail_loudly() {
         Err(AcmError::MalformedBatch),
         "an inline continuation cannot cross a buffer boundary"
     );
+}
+
+#[test]
+fn batch_start_is_async_wait_consumes_retirement_and_poll_reports_busy() {
+    let engine = AcmEngine::new();
+    let context = create_context(&engine);
+    let batch = start_empty_batch(&engine, context, 0).expect("valid batch starts");
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0])),
+        return_error(AcmError::Busy)
+    );
+    assert!(engine.execute_next_for_test());
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0])),
+        SUCCESS
+    );
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0])),
+        return_error(AcmError::InvalidBatch)
+    );
+    assert_eq!(
+        start_empty_batch(&engine, context, 8),
+        Err(AcmError::InvalidParameter),
+        "SDK 10 only supports a null SceAcmBatchError pointer"
+    );
+}
+
+#[test]
+fn finite_and_infinite_waits_share_one_waiter_slot() {
+    let engine = AcmEngine::new();
+    let context = create_context(&engine);
+    let batch = start_empty_batch(&engine, context, 0).unwrap();
+    assert_eq!(
+        engine.batch_wait(args(&[u64::from(context), u64::from(batch), 1])),
+        return_error(AcmError::Busy)
+    );
+    engine.set_waiter_active_for_test(batch, true);
+    assert_eq!(
+        engine.batch_wait(args(&[
+            u64::from(context),
+            u64::from(batch),
+            u64::from(u32::MAX),
+        ])),
+        return_error(AcmError::Busy)
+    );
+    engine.set_waiter_active_for_test(batch, false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| assert!(engine.execute_next_for_test()));
+        assert_eq!(
+            engine.batch_wait(args(&[
+                u64::from(context),
+                u64::from(batch),
+                u64::from(u32::MAX),
+            ])),
+            SUCCESS
+        );
+    });
+}
+
+#[test]
+fn each_context_is_fifo_while_distinct_contexts_can_run_independently() {
+    let engine = AcmEngine::new();
+    let a = create_context(&engine);
+    let b = create_context(&engine);
+    let a1 = start_tagged(&engine, a, 11);
+    let a2 = start_tagged(&engine, a, 12);
+    let b1 = start_tagged(&engine, b, 21);
+
+    assert_eq!(engine.runnable_for_test(), vec![a1, b1]);
+    assert!(engine.execute_batch_for_test(b1));
+    assert!(engine.execute_batch_for_test(a1));
+    assert_eq!(engine.runnable_for_test(), vec![a2]);
+    assert_eq!(engine.execution_tags_for_test(), vec![21, 11]);
+}
+
+#[test]
+fn destroy_drains_and_reset_cancels() {
+    let engine = AcmEngine::new();
+    let context = create_context(&engine);
+    let batch = start_tagged(&engine, context, 31);
+
+    std::thread::scope(|scope| {
+        let destroy = scope.spawn(|| engine.context_destroy(args(&[u64::from(context)])));
+        while !engine.context_is_destroying_for_test(context) {
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            start_empty_batch(&engine, context, 0),
+            Err(AcmError::InvalidContext),
+            "destroy must close the context to new submissions before draining"
+        );
+        assert!(engine.execute_batch_for_test(batch));
+        assert_eq!(destroy.join().unwrap(), SUCCESS);
+    });
+
+    let context = create_context(&engine);
+    let batch = start_tagged(&engine, context, 41);
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| {
+            engine.batch_wait(args(&[
+                u64::from(context),
+                u64::from(batch),
+                u64::from(u32::MAX),
+            ]))
+        });
+        while !engine.waiter_active_for_test(batch) {
+            std::thread::yield_now();
+        }
+        engine.reset();
+        assert_eq!(waiter.join().unwrap(), return_error(AcmError::InvalidBatch));
+    });
+    assert_eq!(create_context(&engine), 1);
 }
