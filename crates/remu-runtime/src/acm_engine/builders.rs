@@ -17,6 +17,7 @@ pub(super) enum RecordKind {
     Test = 1,
     Fft = 2,
     Ifft = 3,
+    Panner = 4,
 }
 
 impl RecordKind {
@@ -25,6 +26,7 @@ impl RecordKind {
             1 => Some(Self::Test),
             2 => Some(Self::Fft),
             3 => Some(Self::Ifft),
+            4 => Some(Self::Panner),
             _ => None,
         }
     }
@@ -270,6 +272,151 @@ fn validate_audio_pointer(address: u64, bytes: usize) -> Result<(), AcmError> {
     checked_span(address, bytes, 128)
         .map(|_| ())
         .map_err(|_| AcmError::InvalidParameter)
+}
+
+pub(super) fn panner(arguments: [u64; 6], stack: [u64; 6]) -> u64 {
+    let info = arguments[0];
+    let input_count = arguments[1] as usize;
+    let biquad_count = arguments[3] as usize;
+    let update_log2 = arguments[4] as usize;
+    let output_count = arguments[5] as usize;
+    if info == 0
+        || input_count == 0
+        || input_count > usize::from(u16::MAX)
+        || biquad_count > 2
+        || update_log2 > 1
+        || !(1..=36).contains(&output_count)
+    {
+        return return_error(AcmError::InvalidParameter);
+    }
+    let arrays = match panner_arrays(
+        input_count,
+        output_count,
+        arguments[2],
+        stack[0],
+        stack[1],
+        stack[2],
+        stack[3],
+    ) {
+        Ok(arrays) => arrays,
+        Err(error) => return return_error(error),
+    };
+    let parameter_bytes = match panner_parameter_bytes(biquad_count, update_log2, output_count) {
+        Some(bytes) => bytes,
+        None => return return_error(AcmError::InvalidParameter),
+    };
+    let state_bytes = match panner_state_bytes(biquad_count, output_count) {
+        Some(bytes) => bytes,
+        None => return return_error(AcmError::InvalidParameter),
+    };
+    for pointer in &arrays.inputs {
+        if let Err(error) = validate_audio_pointer(*pointer, 256 * 4) {
+            return return_error(error);
+        }
+    }
+    for pointer in &arrays.parameters {
+        if let Err(error) = validate_audio_pointer(*pointer, parameter_bytes) {
+            return return_error(error);
+        }
+    }
+    for pointer in &arrays.states {
+        if let Err(error) = validate_audio_pointer(*pointer, state_bytes) {
+            return return_error(error);
+        }
+    }
+    for pointer in arrays.initial_outputs.iter().flatten() {
+        if let Err(error) = validate_audio_pointer(*pointer, 256 * 4) {
+            return return_error(error);
+        }
+    }
+    for pointer in &arrays.outputs {
+        if let Err(error) = validate_audio_pointer(*pointer, 256 * 4) {
+            return return_error(error);
+        }
+    }
+
+    let config = input_count as u64
+        | ((biquad_count as u64) << 16)
+        | ((update_log2 as u64) << 24)
+        | ((output_count as u64) << 32);
+    let mut words = vec![config, arguments[2], stack[0], stack[1], stack[2], stack[3]];
+    words.resize(19, 0);
+    append_record(
+        info,
+        20,
+        RecordPayload {
+            kind: RecordKind::Panner,
+            words,
+        },
+    )
+    .map_or_else(return_error, |()| 0)
+}
+
+pub(super) struct PannerArrays {
+    pub(super) inputs: Vec<u64>,
+    pub(super) parameters: Vec<u64>,
+    pub(super) states: Vec<u64>,
+    pub(super) initial_outputs: Vec<Option<u64>>,
+    pub(super) outputs: Vec<u64>,
+}
+
+pub(super) fn panner_arrays(
+    input_count: usize,
+    output_count: usize,
+    inputs: u64,
+    parameters: u64,
+    states: u64,
+    initial_outputs: u64,
+    outputs: u64,
+) -> Result<PannerArrays, AcmError> {
+    let inputs =
+        super::abi::read_array(inputs, input_count).map_err(|_| AcmError::InvalidParameter)?;
+    let parameters =
+        super::abi::read_array(parameters, input_count).map_err(|_| AcmError::InvalidParameter)?;
+    let states =
+        super::abi::read_array(states, input_count).map_err(|_| AcmError::InvalidParameter)?;
+    let initial_outputs = if initial_outputs == 0 {
+        vec![None; output_count]
+    } else {
+        super::abi::read_array::<u64>(initial_outputs, output_count)
+            .map_err(|_| AcmError::InvalidParameter)?
+            .into_iter()
+            .map(|pointer| (pointer != 0).then_some(pointer))
+            .collect()
+    };
+    let outputs =
+        super::abi::read_array(outputs, output_count).map_err(|_| AcmError::InvalidParameter)?;
+    Ok(PannerArrays {
+        inputs,
+        parameters,
+        states,
+        initial_outputs,
+        outputs,
+    })
+}
+
+pub(super) fn panner_parameter_bytes(
+    biquad_count: usize,
+    update_log2: usize,
+    output_count: usize,
+) -> Option<usize> {
+    4_usize
+        .checked_add(
+            biquad_count
+                .checked_mul(1 << update_log2)?
+                .checked_mul(20)?,
+        )?
+        .checked_add(output_count.checked_mul(4)?)?
+        .checked_add(127)
+        .map(|bytes| bytes & !127)
+}
+
+pub(super) fn panner_state_bytes(biquad_count: usize, output_count: usize) -> Option<usize> {
+    biquad_count
+        .checked_mul(8)?
+        .checked_add(output_count.checked_mul(4)?)?
+        .checked_add(127)
+        .map(|bytes| bytes & !127)
 }
 
 #[cfg(test)]

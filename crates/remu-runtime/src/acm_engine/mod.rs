@@ -616,7 +616,8 @@ fn execute_plan_with_elapsed(
                     bytes: statistics_bytes(value).to_vec(),
                 });
             }
-            Command::Fft(job) => pending.extend(dsp::execute(job)?),
+            Command::Fft(job) => pending.extend(dsp::execute_fft(job)?),
+            Command::Panner(job) => pending.extend(dsp::execute_panner(job)?),
             #[cfg(test)]
             Command::TestWrite(write) => pending.push(write.clone()),
             #[cfg(test)]
@@ -749,7 +750,8 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]
         "r7z5YQFZo+U" => builders::batch_job_notification(arguments),
         "KovqaFbmtsM" => builders::fft(arguments, stack_arguments, false),
         "DR-ZCmvVR9Q" => builders::fft(arguments, stack_arguments, true),
-        "LA4RCNKnFjg" | "u70oWo92SYQ" | "9nLbWmRDpa8" | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
+        "LA4RCNKnFjg" => builders::panner(arguments, stack_arguments),
+        "u70oWo92SYQ" | "9nLbWmRDpa8" | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
             return Some(return_error(AcmError::InvalidParameter));
         }
         _ => return None,

@@ -4,7 +4,10 @@
 //! Immutable ACM batch plans decoded from guest-owned command arenas.
 
 use super::abi::{AcmError, AcmFormat, GuestPod, SceAcmBatchInfo, checked_span, read_array};
-use super::builders::{RECORD_MAGIC, RECORD_VERSION, RecordKind};
+use super::builders::{
+    RECORD_MAGIC, RECORD_VERSION, RecordKind, panner_arrays, panner_parameter_bytes,
+    panner_state_bytes,
+};
 
 const COMMAND_STATISTICS: u8 = 11;
 const COMMAND_NOTIFICATION: u8 = 14;
@@ -34,6 +37,7 @@ pub(super) enum Command {
     Queue,
     Delay,
     Fft(FftJob),
+    Panner(PannerJob),
     #[cfg(test)]
     TestWrite(PendingWrite),
     #[cfg(test)]
@@ -61,6 +65,18 @@ pub(super) struct FftJob {
     pub(super) inputs: Vec<FftBuffer>,
     pub(super) outputs: Vec<FftBuffer>,
     pub(super) flags: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct PannerJob {
+    pub(super) biquad_count: usize,
+    pub(super) update_log2: usize,
+    pub(super) output_count: usize,
+    pub(super) inputs: Vec<u64>,
+    pub(super) parameters: Vec<u64>,
+    pub(super) states: Vec<u64>,
+    pub(super) initial_outputs: Vec<Option<u64>>,
+    pub(super) outputs: Vec<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -147,6 +163,9 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                             record_words,
                         )?));
                     }
+                    RecordKind::Panner => plan.commands.push(Command::Panner(
+                        decode_panner_record(&words[cursor + 1..end], record_words)?,
+                    )),
                 }
                 cursor = end;
                 continue;
@@ -272,7 +291,7 @@ fn decode_fft_record(
     let direction = match kind {
         RecordKind::Fft => FftDirection::Forward,
         RecordKind::Ifft => FftDirection::Inverse,
-        RecordKind::Test => return Err(AcmError::MalformedBatch),
+        RecordKind::Test | RecordKind::Panner => return Err(AcmError::MalformedBatch),
     };
     let split_input = flags & 2 != 0;
     let split_output = flags & 4 != 0;
@@ -343,6 +362,62 @@ fn decode_fft_record(
         inputs,
         outputs,
         flags,
+    })
+}
+
+fn decode_panner_record(payload: &[u64], record_words: usize) -> Result<PannerJob, AcmError> {
+    if record_words != 20 || payload.len() != 19 || payload[6..].iter().any(|word| *word != 0) {
+        return Err(AcmError::MalformedBatch);
+    }
+    let config = payload[0];
+    if config >> 40 != 0 {
+        return Err(AcmError::MalformedBatch);
+    }
+    let input_count = usize::from(config as u16);
+    let biquad_count = usize::from((config >> 16) as u8);
+    let update_log2 = usize::from((config >> 24) as u8);
+    let output_count = usize::from((config >> 32) as u8);
+    if input_count == 0 || biquad_count > 2 || update_log2 > 1 || !(1..=36).contains(&output_count)
+    {
+        return Err(AcmError::MalformedBatch);
+    }
+    let arrays = panner_arrays(
+        input_count,
+        output_count,
+        payload[1],
+        payload[2],
+        payload[3],
+        payload[4],
+        payload[5],
+    )?;
+    let parameter_bytes = panner_parameter_bytes(biquad_count, update_log2, output_count)
+        .ok_or(AcmError::MalformedBatch)?;
+    let state_bytes =
+        panner_state_bytes(biquad_count, output_count).ok_or(AcmError::MalformedBatch)?;
+    for pointer in &arrays.inputs {
+        validate_audio_buffer(*pointer, 256 * 4)?;
+    }
+    for pointer in &arrays.parameters {
+        validate_audio_buffer(*pointer, parameter_bytes)?;
+    }
+    for pointer in &arrays.states {
+        validate_audio_buffer(*pointer, state_bytes)?;
+    }
+    for pointer in arrays.initial_outputs.iter().flatten() {
+        validate_audio_buffer(*pointer, 256 * 4)?;
+    }
+    for pointer in &arrays.outputs {
+        validate_audio_buffer(*pointer, 256 * 4)?;
+    }
+    Ok(PannerJob {
+        biquad_count,
+        update_log2,
+        output_count,
+        inputs: arrays.inputs,
+        parameters: arrays.parameters,
+        states: arrays.states,
+        initial_outputs: arrays.initial_outputs,
+        outputs: arrays.outputs,
     })
 }
 
