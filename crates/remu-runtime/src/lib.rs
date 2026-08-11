@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+mod acm_engine;
 mod agc_acb;
 mod agc_api;
 mod agc_command_abi;
@@ -491,8 +492,6 @@ struct ProbeDispatchState {
     bundled_modules: Vec<LinkedGuestModule>,
     unwind_modules: Vec<GuestUnwindModule>,
     installed_exception_handlers: BTreeMap<i32, u64>,
-    next_acm_context: u32,
-    acm_contexts: BTreeSet<u32>,
     heap_trace_storage: Vec<u64>,
     guest_mspaces: BTreeMap<u64, GuestMspace>,
     json_runtime: JsonRuntimeState,
@@ -2511,8 +2510,7 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.installed_exception_handlers.clear();
     clear_installed_guest_handlers();
     ajm_engine::reset_for_new_process();
-    state.next_acm_context = 1;
-    state.acm_contexts.clear();
+    acm_engine::reset_for_new_process();
     *guest_exception_delivery()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -5047,35 +5045,6 @@ fn guest_zeroed_constructor(address: u64, size: u64) -> u64 {
     address
 }
 
-/// `sceAcmContextCreate(contextOut)`.
-///
-/// An ACM context is an opaque identifier: the guest passes it back to the batch entry points and
-/// never inspects it, so handing out a distinct live id is the whole contract of this call. The
-/// signal-processing batch entry points it is used with stay unimplemented, and deliberately so —
-/// this makes the audio engine keep its context instead of tearing its whole stack down at
-/// creation, and moves the loud gap to the calls that would actually have to do the work.
-fn acm_context_create(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    remu_gpu::note_inert("ZIXln2K3XMk");
-    let output = arguments[0];
-    if output == 0 {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
-    let context = state.next_acm_context.max(1);
-    state.next_acm_context = context.saturating_add(1);
-    state.acm_contexts.insert(context);
-    write_guest_u32(output, context);
-    0
-}
-
-/// `sceAcmContextDestroy(context)`.
-fn acm_context_destroy(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    let context = low_u32(arguments[0]);
-    if !state.acm_contexts.remove(&context) {
-        return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
-    }
-    0
-}
-
 fn np_web_api2_initialize(arguments: [u64; 6]) -> u64 {
     const SCE_NP_WEB_API2_ERROR_LIB_CONTEXT_MAX: u32 = 0x8055_3418;
     const MAXIMUM_LIBRARY_CONTEXTS: usize = 0x7fff;
@@ -5123,6 +5092,11 @@ fn dispatch_stateless_import(
     // blocking `sceAjmBatchWait` parks on the engine's own condition variable rather than
     // holding the process-wide dispatch lock against the workers retiring its batch.
     if let Some(result) = ajm_engine::dispatch(nid, arguments, stack_arguments) {
+        return Some(result);
+    }
+    // ACM owns its own lifecycle synchronization and workers. Serve it before PROBE_DISPATCH so
+    // finite and infinite batch waits cannot hold the process-wide import lock.
+    if let Some(result) = acm_engine::dispatch(nid, arguments, stack_arguments) {
         return Some(result);
     }
     Some(match nid {
@@ -5389,9 +5363,6 @@ fn dispatch_probe_import(
             state.application_heap_api_address = arguments[0];
             0
         }
-        // ACM context handles. The batch/DSP entry points stay unserved.
-        "ZIXln2K3XMk" => acm_context_create(arguments, state),
-        "jBgBjAj02R8" => acm_context_destroy(arguments, state),
         // Bundled PRXs are mapped, relocated, and initialized before the main executable. Runtime
         // module loads must still resolve those objects to their stable process-local handles;
         // Unity treats a negative return here as a plug-in load failure and skips assembly setup.
