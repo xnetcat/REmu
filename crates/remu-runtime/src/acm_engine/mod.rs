@@ -618,6 +618,7 @@ fn execute_plan_with_elapsed(
             }
             Command::Fft(job) => pending.extend(dsp::execute_fft(job)?),
             Command::Panner(job) => pending.extend(dsp::execute_panner(job)?),
+            Command::Convolution(_) => {}
             #[cfg(test)]
             Command::TestWrite(write) => pending.push(write.clone()),
             #[cfg(test)]
@@ -751,9 +752,10 @@ pub(crate) fn dispatch(nid: &str, arguments: [u64; 6], stack_arguments: [u64; 6]
         "KovqaFbmtsM" => builders::fft(arguments, stack_arguments, false),
         "DR-ZCmvVR9Q" => builders::fft(arguments, stack_arguments, true),
         "LA4RCNKnFjg" => builders::panner(arguments, stack_arguments),
-        "u70oWo92SYQ" | "9nLbWmRDpa8" | "wM41Cc+ieog" | "PVx9oQUaDdk" => {
-            return Some(return_error(AcmError::InvalidParameter));
-        }
+        "u70oWo92SYQ" => builders::convolution(arguments, stack_arguments, true, false),
+        "9nLbWmRDpa8" => builders::convolution(arguments, stack_arguments, false, false),
+        "wM41Cc+ieog" => builders::convolution(arguments, stack_arguments, true, true),
+        "PVx9oQUaDdk" => builders::convolution(arguments, stack_arguments, false, true),
         _ => return None,
     })
 }

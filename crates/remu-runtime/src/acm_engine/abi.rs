@@ -19,6 +19,72 @@ pub(crate) struct SceAcmBatchInfo {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct SceAcmBatchCommand(pub(crate) u64);
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConvBlockSize {
+    pub(crate) size_memory: u16,
+    pub(crate) size: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConvChannel {
+    pub(crate) blocks: u64,
+    pub(crate) sizes: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConvIn {
+    pub(crate) block_size: u32,
+    pub(crate) block_count: u32,
+    pub(crate) channel_count: u32,
+    pub(crate) format: u32,
+    pub(crate) history_position: u32,
+    pub(crate) history_count: u32,
+    pub(crate) channels: u64,
+    pub(crate) pcm: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConvInV2 {
+    pub(crate) base: ConvIn,
+    pub(crate) history_null_count: u32,
+    pub(crate) reserved: [u32; 6],
+    pub(crate) tail_padding: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConvIr {
+    pub(crate) block_size: u32,
+    pub(crate) block_count: u32,
+    pub(crate) channel_count: u32,
+    pub(crate) format: u32,
+    pub(crate) block_gains: u64,
+    pub(crate) channels: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ConvOut {
+    pub(crate) block_size: u32,
+    pub(crate) channel_count: u32,
+    pub(crate) temps: u64,
+    pub(crate) pcm: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ConvOutV2 {
+    pub(crate) base: ConvOut,
+    pub(crate) gain: f32,
+    pub(crate) previous_gain: f32,
+    pub(crate) pcm_init: u64,
+    pub(crate) reserved: [u32; 4],
+}
+
 /// Marker for ABI records whose complete bit pattern can be copied to and from guest memory.
 ///
 /// # Safety
@@ -32,6 +98,20 @@ unsafe impl GuestPod for SceAcmBatchInfo {}
 unsafe impl GuestPod for SceAcmBatchCommand {}
 // SAFETY: fixed-width unsigned integers accept every bit pattern.
 unsafe impl GuestPod for u64 {}
+// SAFETY: these SDK records contain only fixed-width integers/pointers with initialized padding.
+unsafe impl GuestPod for ConvBlockSize {}
+// SAFETY: two `u64` fields have no padding and accept every bit pattern.
+unsafe impl GuestPod for ConvChannel {}
+// SAFETY: the LP64 record contains only integer fields and has no padding.
+unsafe impl GuestPod for ConvIn {}
+// SAFETY: the v2 tail and alignment padding are explicit initialized integer fields.
+unsafe impl GuestPod for ConvInV2 {}
+// SAFETY: the LP64 record contains only integer fields and has no padding.
+unsafe impl GuestPod for ConvIr {}
+// SAFETY: the LP64 record contains only integer fields and has no padding.
+unsafe impl GuestPod for ConvOut {}
+// SAFETY: every field accepts arbitrary bits; the explicit tail fills the LP64 layout.
+unsafe impl GuestPod for ConvOutV2 {}
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,4 +198,11 @@ const _: () = {
     assert!(std::mem::offset_of!(SceAcmBatchInfo, offset) == 8);
     assert!(std::mem::offset_of!(SceAcmBatchInfo, size) == 16);
     assert!(std::mem::size_of::<SceAcmBatchCommand>() == 8);
+    assert!(std::mem::size_of::<ConvChannel>() == 16);
+    assert!(std::mem::size_of::<ConvBlockSize>() == 4);
+    assert!(std::mem::size_of::<ConvIn>() == 40);
+    assert!(std::mem::size_of::<ConvInV2>() == 72);
+    assert!(std::mem::size_of::<ConvIr>() == 32);
+    assert!(std::mem::size_of::<ConvOut>() == 24);
+    assert!(std::mem::size_of::<ConvOutV2>() == 56);
 };

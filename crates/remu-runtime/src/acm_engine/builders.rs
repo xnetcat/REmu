@@ -18,6 +18,7 @@ pub(super) enum RecordKind {
     Fft = 2,
     Ifft = 3,
     Panner = 4,
+    Convolution = 5,
 }
 
 impl RecordKind {
@@ -27,6 +28,7 @@ impl RecordKind {
             2 => Some(Self::Fft),
             3 => Some(Self::Ifft),
             4 => Some(Self::Panner),
+            5 => Some(Self::Convolution),
             _ => None,
         }
     }
@@ -417,6 +419,57 @@ pub(super) fn panner_state_bytes(biquad_count: usize, output_count: usize) -> Op
         .checked_add(output_count.checked_mul(4)?)?
         .checked_add(127)
         .map(|bytes| bytes & !127)
+}
+
+pub(super) fn convolution(
+    arguments: [u64; 6],
+    stack: [u64; 6],
+    shared_input: bool,
+    version2: bool,
+) -> u64 {
+    if version2 && stack[1] != 0 {
+        return return_error(AcmError::InvalidParameter);
+    }
+    let sharing = if shared_input {
+        super::batch::ConvolutionSharing::SharedInput
+    } else {
+        super::batch::ConvolutionSharing::SharedIr
+    };
+    let job = match super::dsp::snapshot_convolution(
+        sharing,
+        version2,
+        arguments[1] as u32,
+        arguments[2],
+        arguments[3] as usize,
+        arguments[4],
+        arguments[5],
+        stack[0],
+    ) {
+        Ok(job) => job,
+        Err(error) => return return_error(error),
+    };
+    let words = match super::dsp::convolution_record_words(&job) {
+        Ok(words) => words,
+        Err(error) => return return_error(error),
+    };
+    if words > usize::from(u16::MAX) {
+        return return_error(AcmError::OutOfResources);
+    }
+    let config = u64::from(shared_input)
+        | (u64::from(version2) << 1)
+        | (u64::from(arguments[1] as u32) << 8)
+        | ((arguments[3] as u64) << 40);
+    let mut payload = vec![config, arguments[2], arguments[4], arguments[5], stack[0]];
+    payload.resize(words - 1, 0);
+    append_record(
+        arguments[0],
+        words,
+        RecordPayload {
+            kind: RecordKind::Convolution,
+            words: payload,
+        },
+    )
+    .map_or_else(return_error, |()| 0)
 }
 
 #[cfg(test)]

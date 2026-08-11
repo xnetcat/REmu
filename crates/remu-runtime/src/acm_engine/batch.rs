@@ -14,13 +14,13 @@ const COMMAND_NOTIFICATION: u8 = 14;
 const STATISTICS_BYTES: usize = 24;
 const NOTIFICATION_BYTES: usize = 128;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct BatchPlan {
     pub(super) commands: Vec<Command>,
     pub(super) notification: Option<Notification>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) enum Command {
     /// Test-only private no-op record. It follows the same framing rules as DSP records.
     Activate,
@@ -38,6 +38,7 @@ pub(super) enum Command {
     Delay,
     Fft(FftJob),
     Panner(PannerJob),
+    Convolution(ConvolutionJob),
     #[cfg(test)]
     TestWrite(PendingWrite),
     #[cfg(test)]
@@ -77,6 +78,56 @@ pub(super) struct PannerJob {
     pub(super) states: Vec<u64>,
     pub(super) initial_outputs: Vec<Option<u64>>,
     pub(super) outputs: Vec<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConvolutionSharing {
+    SharedInput,
+    SharedIr,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ConvolutionInput {
+    pub(super) address: u64,
+    pub(super) block_size: usize,
+    pub(super) block_count: usize,
+    pub(super) format: AcmFormat,
+    pub(super) history_position: usize,
+    pub(super) history_count: usize,
+    pub(super) history_null_count: usize,
+    pub(super) channels: Vec<super::abi::ConvChannel>,
+    pub(super) pcm: Vec<Option<u64>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ConvolutionIr {
+    pub(super) block_size: usize,
+    pub(super) block_count: usize,
+    pub(super) format: AcmFormat,
+    pub(super) channels: Vec<super::abi::ConvChannel>,
+    pub(super) sizes: Vec<Option<Vec<super::abi::ConvBlockSize>>>,
+    pub(super) block_gains: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ConvolutionOutput {
+    pub(super) address: u64,
+    pub(super) block_size: usize,
+    pub(super) temps: Vec<u64>,
+    pub(super) pcm: Vec<u64>,
+    pub(super) initial_pcm: Vec<Option<u64>>,
+    pub(super) previous_gain: f32,
+    pub(super) gain: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ConvolutionJob {
+    pub(super) sharing: ConvolutionSharing,
+    pub(super) version2: bool,
+    pub(super) inputs: Vec<ConvolutionInput>,
+    pub(super) irs: Vec<ConvolutionIr>,
+    pub(super) gains: Vec<f32>,
+    pub(super) outputs: Vec<ConvolutionOutput>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -166,6 +217,13 @@ pub(super) fn decode_buffers(infos: &[SceAcmBatchInfo]) -> Result<BatchPlan, Acm
                     RecordKind::Panner => plan.commands.push(Command::Panner(
                         decode_panner_record(&words[cursor + 1..end], record_words)?,
                     )),
+                    RecordKind::Convolution => {
+                        plan.commands
+                            .push(Command::Convolution(decode_convolution_record(
+                                &words[cursor + 1..end],
+                                record_words,
+                            )?))
+                    }
                 }
                 cursor = end;
                 continue;
@@ -291,7 +349,9 @@ fn decode_fft_record(
     let direction = match kind {
         RecordKind::Fft => FftDirection::Forward,
         RecordKind::Ifft => FftDirection::Inverse,
-        RecordKind::Test | RecordKind::Panner => return Err(AcmError::MalformedBatch),
+        RecordKind::Test | RecordKind::Panner | RecordKind::Convolution => {
+            return Err(AcmError::MalformedBatch);
+        }
     };
     let split_input = flags & 2 != 0;
     let split_output = flags & 4 != 0;
@@ -363,6 +423,44 @@ fn decode_fft_record(
         outputs,
         flags,
     })
+}
+
+fn decode_convolution_record(
+    payload: &[u64],
+    record_words: usize,
+) -> Result<ConvolutionJob, AcmError> {
+    if payload.len() + 1 != record_words
+        || payload.len() < 5
+        || payload[5..].iter().any(|word| *word != 0)
+    {
+        return Err(AcmError::MalformedBatch);
+    }
+    let config = payload[0];
+    let sharing = if config & 1 != 0 {
+        ConvolutionSharing::SharedInput
+    } else {
+        ConvolutionSharing::SharedIr
+    };
+    let version2 = config & 2 != 0;
+    if config & 0xfc != 0 || config >> 56 != 0 {
+        return Err(AcmError::MalformedBatch);
+    }
+    let block_count = (config >> 8) as u32;
+    let count = usize::from((config >> 40) as u16);
+    let job = super::dsp::snapshot_convolution(
+        sharing,
+        version2,
+        block_count,
+        payload[1],
+        count,
+        payload[2],
+        payload[3],
+        payload[4],
+    )?;
+    if super::dsp::convolution_record_words(&job)? != record_words {
+        return Err(AcmError::MalformedBatch);
+    }
+    Ok(job)
 }
 
 fn decode_panner_record(payload: &[u64], record_words: usize) -> Result<PannerJob, AcmError> {

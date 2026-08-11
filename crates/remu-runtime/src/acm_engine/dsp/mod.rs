@@ -3,9 +3,13 @@
 
 //! CPU implementations of ACM DSP functions.
 
+mod convolution;
 mod fft;
 mod panner;
 
+pub(super) use convolution::{
+    record_words as convolution_record_words, snapshot_job as snapshot_convolution,
+};
 pub(super) use fft::execute as execute_fft;
 pub(super) use panner::execute as execute_panner;
 
@@ -14,3 +18,6 @@ mod fft_tests;
 
 #[cfg(test)]
 mod panner_tests;
+
+#[cfg(test)]
+mod convolution_tests;
