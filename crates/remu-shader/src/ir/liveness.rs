@@ -3,7 +3,7 @@
 
 //! Scalar liveness analysis used to size the evaluation slice of a decoded program.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use super::{Instruction, InstructionControl, Opcode, OperandKind, ShaderEncoding};
 
@@ -48,10 +48,41 @@ fn scalar_operand_width(instruction: &Instruction) -> u32 {
     }
 }
 
+/// Width of one scalar source operand. A `B64` result does not imply that every input is 64-bit:
+/// shifts, bit-field extracts and bit tests take a 32-bit control operand.
+fn scalar_source_width(instruction: &Instruction, source_index: usize) -> u32 {
+    if source_index > 0
+        && matches!(
+            instruction.opcode.known_name(),
+            Some(
+                "SLshlB64"
+                    | "SLshrB64"
+                    | "SAshrI64"
+                    | "SBfeU64"
+                    | "SBfeI64"
+                    | "SBitcmp0B64"
+                    | "SBitcmp1B64"
+            )
+        )
+    {
+        return 1;
+    }
+    if matches!(
+        instruction.opcode.known_name(),
+        Some("SBfmB64" | "SBitset0B64" | "SBitset1B64")
+    ) {
+        return 1;
+    }
+    scalar_operand_width(instruction)
+}
+
 /// Width of the scalar destination write, which differs from the source width for the 64-bit
 /// scans and counts: they read a register pair but write one 32-bit result. Killing the pair
 /// would under-approximate liveness for the neighboring register.
 fn scalar_destination_width(instruction: &Instruction) -> u32 {
+    if instruction.opcode.is("SBitreplicateB64B32") {
+        return 2;
+    }
     if matches!(
         instruction.opcode.known_name(),
         Some(
@@ -197,6 +228,293 @@ fn scalar_destination_is_also_source(instruction: &Instruction) -> bool {
                 | "SCmovB64"
         )
     )
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct ScalarMaskTaint {
+    registers: ScalarLiveSet,
+    scalar_condition: bool,
+}
+
+fn scalar_range_is_mask_tainted(taint: &ScalarMaskTaint, first: u32, count: u32) -> bool {
+    (first..first.saturating_add(count).min(256))
+        .any(|register| scalar_live_contains(&taint.registers, register))
+}
+
+fn set_scalar_taint_range(taint: &mut ScalarMaskTaint, first: u32, count: u32, value: bool) {
+    scalar_live_remove_range(&mut taint.registers, first, count);
+    if value {
+        scalar_live_insert_range(&mut taint.registers, first, count);
+    }
+}
+
+fn scalar_sources_are_mask_tainted(instruction: &Instruction, taint: &ScalarMaskTaint) -> bool {
+    let explicit_source_tainted = instruction
+        .sources
+        .iter()
+        .enumerate()
+        .any(|(index, source)| match source.kind {
+            OperandKind::ScalarRegister => scalar_range_is_mask_tainted(
+                taint,
+                source.value,
+                scalar_source_width(instruction, index),
+            ),
+            OperandKind::EncodedConstant => match source.value {
+                251 => scalar_range_is_mask_tainted(taint, 106, 2),
+                252 => scalar_range_is_mask_tainted(taint, 126, 2),
+                253 => taint.scalar_condition,
+                _ => false,
+            },
+            OperandKind::VectorRegister => true,
+            OperandKind::LiteralConstant => false,
+        });
+    let destination_source_tainted = (instruction.encoding == ShaderEncoding::Sopk
+        && instruction.opcode.starts_with("SCmpk")
+        || scalar_destination_is_also_source(instruction))
+        && instruction.destinations.iter().any(|destination| {
+            destination.kind == OperandKind::ScalarRegister
+                && scalar_range_is_mask_tainted(
+                    taint,
+                    destination.value,
+                    scalar_destination_width(instruction),
+                )
+        });
+
+    explicit_source_tainted
+        || destination_source_tainted
+        || (scalar_instruction_reads_condition(instruction) && taint.scalar_condition)
+}
+
+fn scalar_memory_address_is_mask_tainted(
+    instruction: &Instruction,
+    taint: &ScalarMaskTaint,
+) -> bool {
+    instruction
+        .sources
+        .iter()
+        .enumerate()
+        .any(|(index, source)| match source.kind {
+            OperandKind::ScalarRegister => {
+                let width = if index == 0 {
+                    if instruction.opcode.starts_with("SBufferLoad") {
+                        4
+                    } else {
+                        2
+                    }
+                } else {
+                    1
+                };
+                scalar_range_is_mask_tainted(taint, source.value, width)
+            }
+            OperandKind::EncodedConstant => match source.value {
+                251 => scalar_range_is_mask_tainted(taint, 106, 2),
+                252 => scalar_range_is_mask_tainted(taint, 126, 2),
+                253 => taint.scalar_condition,
+                _ => false,
+            },
+            OperandKind::VectorRegister => true,
+            OperandKind::LiteralConstant => false,
+        })
+}
+
+fn apply_scalar_mask_taint(
+    instruction: &Instruction,
+    mut taint: ScalarMaskTaint,
+) -> ScalarMaskTaint {
+    let scalar_encoding = matches!(
+        instruction.encoding,
+        ShaderEncoding::Sop1 | ShaderEncoding::Sop2 | ShaderEncoding::Sopc | ShaderEncoding::Sopk
+    );
+    if scalar_encoding {
+        let saveexec = instruction.opcode.contains("Saveexec");
+        let saveexec_width = if saveexec
+            && instruction
+                .opcode
+                .known_name()
+                .is_some_and(|name| name.ends_with("SaveexecB32"))
+        {
+            1
+        } else {
+            2
+        };
+        let old_exec_tainted = scalar_range_is_mask_tainted(&taint, 126, saveexec_width);
+        let source_tainted = scalar_sources_are_mask_tainted(instruction, &taint);
+        let result_tainted = source_tainted || (saveexec && old_exec_tainted);
+        let compare_k =
+            instruction.encoding == ShaderEncoding::Sopk && instruction.opcode.starts_with("SCmpk");
+        if !compare_k {
+            for destination in &instruction.destinations {
+                if destination.kind == OperandKind::ScalarRegister {
+                    set_scalar_taint_range(
+                        &mut taint,
+                        destination.value,
+                        scalar_destination_width(instruction),
+                        if saveexec {
+                            old_exec_tainted
+                        } else {
+                            result_tainted
+                        },
+                    );
+                }
+            }
+        }
+        if scalar_instruction_defines_condition(instruction) {
+            taint.scalar_condition = result_tainted;
+        }
+        if saveexec {
+            set_scalar_taint_range(&mut taint, 126, saveexec_width, result_tainted);
+            if saveexec_width == 1 {
+                set_scalar_taint_range(&mut taint, 127, 1, false);
+            }
+        }
+        return taint;
+    }
+
+    if matches!(
+        instruction.encoding,
+        ShaderEncoding::Smem | ShaderEncoding::Smrd
+    ) {
+        let result_tainted = scalar_memory_address_is_mask_tainted(instruction, &taint);
+        for destination in &instruction.destinations {
+            if destination.kind == OperandKind::ScalarRegister {
+                set_scalar_taint_range(&mut taint, destination.value, 1, result_tainted);
+            }
+        }
+        return taint;
+    }
+
+    let vector_compare = instruction.opcode.starts_with("VCmp");
+    let vector_compare_updates_exec = instruction.opcode.starts_with("VCmpx");
+    let control_destination = match instruction.control {
+        Some(InstructionControl::Vop3(control)) => control.scalar_destination,
+        Some(InstructionControl::Sdwa(control)) => control.scalar_destination,
+        _ => None,
+    };
+    // VCMPX updates only EXEC. Ordinary compares update their explicit SDWA destination or the
+    // default VCC pair, including VOP3/e64 instructions whose control has no scalar destination.
+    // Handle this before generic vector scalar outputs because decoded VCMPX SDWA fields are not
+    // architectural destinations.
+    if vector_compare_updates_exec {
+        set_scalar_taint_range(&mut taint, 126, 2, true);
+        return taint;
+    }
+    if vector_compare {
+        set_scalar_taint_range(&mut taint, control_destination.unwrap_or(106), 2, true);
+        return taint;
+    }
+
+    // Vector lane results written to SGPRs are mask-derived even when VOP3B/SDWA encodes the
+    // scalar destination in control metadata rather than `Instruction::destinations`.
+    let explicit_destination_width = if instruction.encoding == ShaderEncoding::Vopc {
+        2
+    } else {
+        scalar_destination_width(instruction)
+    };
+    for destination in &instruction.destinations {
+        if destination.kind == OperandKind::ScalarRegister {
+            set_scalar_taint_range(
+                &mut taint,
+                destination.value,
+                explicit_destination_width,
+                true,
+            );
+        }
+    }
+    if let Some(destination) = control_destination {
+        set_scalar_taint_range(&mut taint, destination, 2, true);
+    }
+    taint
+}
+
+fn merge_scalar_mask_taint(target: &mut ScalarMaskTaint, source: ScalarMaskTaint) -> bool {
+    let previous = *target;
+    for word in 0..SCALAR_LIVE_WORDS {
+        target.registers[word] |= source.registers[word];
+    }
+    target.scalar_condition |= source.scalar_condition;
+    *target != previous
+}
+
+fn scalar_mask_taint_successors(instructions: &[Instruction], index: usize) -> Vec<usize> {
+    let instruction = &instructions[index];
+    if instruction.opcode == Opcode::END_PROGRAM {
+        return Vec::new();
+    }
+    let name = instruction.opcode.known_name();
+    let is_branch = matches!(
+        name,
+        Some(
+            "SBranch"
+                | "SCbranchScc0"
+                | "SCbranchScc1"
+                | "SCbranchVccz"
+                | "SCbranchVccnz"
+                | "SCbranchExecz"
+                | "SCbranchExecnz"
+        )
+    );
+    let mut successors = Vec::with_capacity(2);
+    if is_branch
+        && let Some(target) = evaluation_branch_target(instruction)
+        && let Ok(target_index) =
+            instructions.binary_search_by_key(&target, |candidate| candidate.pc)
+    {
+        successors.push(target_index);
+    }
+    if !matches!(name, Some("SBranch")) && index + 1 < instructions.len() {
+        successors.push(index + 1);
+    }
+    successors
+}
+
+/// Returns whether SCC at `condition_index` can depend on EXEC/VCC along a reachable path in this
+/// natural loop. A forward may-taint fixed point follows branch targets and joins, so unreachable
+/// definitions cannot replace or contaminate the definition that reaches the SCC exit.
+pub(crate) fn scalar_condition_depends_on_vector_mask(
+    instructions: &[Instruction],
+    condition_index: usize,
+) -> bool {
+    if condition_index >= instructions.len() || instructions.is_empty() {
+        return false;
+    }
+    // Dynamic SGPR addressing and indirect/subroutine transfers need alias or interprocedural
+    // state that this local natural-loop analysis does not have. Decline classification rather
+    // than attributing a mask definition to the wrong reaching value.
+    if instructions.iter().any(|instruction| {
+        scalar_instruction_touches_dynamic_register(instruction)
+            || matches!(
+                instruction.opcode.known_name(),
+                Some("SCallB64" | "SSetpcB64" | "SSwappcB64")
+            )
+    }) {
+        return false;
+    }
+
+    let mut entry_taint = vec![None; instructions.len()];
+    let mut initial_taint = ScalarMaskTaint::default();
+    scalar_live_insert_range(&mut initial_taint.registers, 106, 2);
+    scalar_live_insert_range(&mut initial_taint.registers, 126, 2);
+    entry_taint[0] = Some(initial_taint);
+    let mut pending = VecDeque::from([0]);
+    while let Some(index) = pending.pop_front() {
+        let Some(input) = entry_taint[index] else {
+            continue;
+        };
+        let output = apply_scalar_mask_taint(&instructions[index], input);
+        for successor in scalar_mask_taint_successors(instructions, index) {
+            let changed = if let Some(current) = &mut entry_taint[successor] {
+                merge_scalar_mask_taint(current, output)
+            } else {
+                entry_taint[successor] = Some(output);
+                true
+            };
+            if changed {
+                pending.push_back(successor);
+            }
+        }
+    }
+
+    entry_taint[condition_index].is_some_and(|taint| taint.scalar_condition)
 }
 
 #[allow(clippy::too_many_lines)]

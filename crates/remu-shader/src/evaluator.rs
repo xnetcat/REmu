@@ -392,9 +392,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
     /// Returns whether an unconditional latch closes a loop whose exit depends on lane state.
     ///
     /// LLVM represents many divergent loops as a forward EXEC/VCC exit followed by an
-    /// unconditional backward latch. The latch itself carries no condition, so classifying every
-    /// backward `S_BRANCH` as vector-controlled also misclassifies ordinary scalar counted loops.
-    /// An EXEC/VCC edge that leaves the latch's natural-loop interval is the distinguishing fact.
+    /// unconditional backward latch. Mesa also lowers mask-derived exits through SCC, for example
+    /// `s_andn2 ..., exec; s_cbranch_scc0`. The latch itself carries no condition, so classify an
+    /// SCC exit as vector-controlled only when its reaching SCC definition depends on EXEC/VCC;
+    /// ordinary scalar counted loops remain exact.
     fn unconditional_latch_is_vector_controlled(
         &self,
         header_index: usize,
@@ -402,16 +403,31 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
     ) -> Result<bool, EvaluationError> {
         let header_pc = self.state.program.instructions[header_index].pc;
         let latch_pc = self.state.program.instructions[latch_index].pc;
-        for instruction in &self.state.program.instructions[header_index..latch_index] {
-            if instruction.encoding != ShaderEncoding::Sopp
-                || !is_scalar_branch(instruction.opcode)
-                || !branch_condition_depends_on_vector_state(instruction.opcode)
+        for (relative_index, instruction) in self.state.program.instructions
+            [header_index..latch_index]
+            .iter()
+            .enumerate()
+        {
+            if instruction.encoding != ShaderEncoding::Sopp || !is_scalar_branch(instruction.opcode)
             {
                 continue;
             }
             let target_pc = branch_target(instruction)?;
-            if target_pc < header_pc || target_pc > latch_pc {
+            if target_pc >= header_pc && target_pc <= latch_pc {
+                continue;
+            }
+            if branch_condition_depends_on_vector_state(instruction.opcode) {
                 return Ok(true);
+            }
+            if instruction.opcode.is("SCbranchScc0") || instruction.opcode.is("SCbranchScc1") {
+                let instruction_index = header_index + relative_index;
+                if self
+                    .state
+                    .program
+                    .scalar_condition_depends_on_vector_mask(latch_index, instruction_index)
+                {
+                    return Ok(true);
+                }
             }
         }
         Ok(false)
