@@ -985,6 +985,11 @@ struct RuntimeServiceState {
     message_dialog_button: u32,
     play_go_initialized: bool,
     play_go_open: bool,
+    /// Package chunk identifiers discovered from the unpacked title metadata.
+    ///
+    /// Empty means the metadata was unavailable; PlayGo then exposes the mandatory launch chunk
+    /// (zero) instead of claiming that every possible 16-bit identifier belongs to the package.
+    play_go_chunk_ids: Vec<u16>,
     save_data_dialog_status: i32,
     save_data_dialog_sequence: u64,
     save_data_dialog_mode: u32,

@@ -46,7 +46,8 @@ use super::{
     guest_toupper_table, guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove,
     join_guest_path, kernel_add_ampr_event, kernel_batch_map, kernel_release_direct_memory,
     kernel_stat_payload, kernel_virtual_query, low_f32, low_u32, pace_video_out_flip,
-    process_clock_nanos, process_time_since_nanos, pthread_attr_get_affinity,
+    play_go_get_chunk_id, play_go_get_install_speed, play_go_get_locus, play_go_initialize,
+    play_go_open, process_clock_nanos, process_time_since_nanos, pthread_attr_get_affinity,
     pthread_attr_get_stack, pthread_attr_set_affinity, pthread_attr_set_detach_state,
     pthread_attr_set_schedule_param, pthread_attr_set_stack_size, read_guest_u16, read_guest_u32,
     read_guest_u64, resolve_guest_path, resolve_probe_guest_path, rtc_get_current_clock_local_time,
@@ -69,6 +70,7 @@ mod filesystem;
 mod guest_libc;
 mod imports;
 mod memory;
+mod playgo;
 mod services;
 mod shader;
 mod synchronization;
