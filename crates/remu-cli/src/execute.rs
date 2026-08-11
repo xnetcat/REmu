@@ -53,6 +53,12 @@ pub(crate) fn link(path: &Path) -> ExitCode {
     println!("image_base={}", linked.memory.image_base());
     println!("entry={}", linked.memory.entry_address());
     println!("import_stubs={}", linked.import_stubs.len());
+    for (dispatch_index, stub) in linked.import_stubs.iter().enumerate() {
+        println!(
+            "import_stub[{dispatch_index}]=address:{} nid:{}",
+            stub.address, stub.nid
+        );
+    }
     let import_resolutions = linked.import_resolution_stats();
     println!("imports.bundled_guest={}", import_resolutions.bundled_guest);
     println!("imports.host_direct={}", import_resolutions.host_direct);
