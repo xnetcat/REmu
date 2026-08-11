@@ -6,34 +6,30 @@ use super::{
     GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
     RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RangeSet, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
-    StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
-    TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
     guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
     record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
     retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
-    trace_resident_texture_demotion, trace_resident_texture_removal,
+    trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
-    CpuWriteWatch, CpuWriteWatchRetirement, GuestRangeLease, GuestWriteSite, LeasePublishOutcome,
-    guest_shared_backing_alias_segments, guest_shared_backing_identity, guest_shared_mapping_epoch,
-    guest_shared_mapping_identity, read_guest_shared_backing,
+    CpuWriteWatch, CpuWriteWatchRetirement, guest_shared_backing_alias_segments,
+    guest_shared_mapping_epoch, guest_shared_mapping_identity, read_guest_shared_backing,
+};
+#[cfg(test)]
+use remu_memory::{
+    GuestRangeLease, GuestWriteSite, LeasePublishOutcome, guest_shared_backing_identity,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-/// Validation granularity for page-dirty guest image contents.
-///
-/// This is deliberately smaller than the 16 KiB guest page and independent of the host page
-/// size. A false-positive protection fault therefore hashes only the touched neighborhood rather
-/// than copying and decoding a complete multi-megabyte image.
-
 /// Outcome of a leased texture publication into guest memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum TextureWritebackOutcome {
     /// At least one authored run landed (live VA or producer identity).
     Applied,
@@ -74,10 +70,6 @@ impl AcquireNoOpWatchToken {
             && !self.dirty
             && self.dirty_page_ranges.is_empty()
             && !self.content_validation_pending
-    }
-
-    pub(crate) fn generations(&self) -> &[u64] {
-        &self.generations
     }
 }
 
@@ -517,6 +509,7 @@ impl GuestTextureWriteWatch {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn with_live_backing<T>(&self, operation: impl FnOnce() -> T) -> Result<T, String> {
         if let Some(retirement) = self.retirement() {
             return Err(format!(
@@ -565,71 +558,8 @@ impl GuestTextureWriteWatch {
         })
     }
 
-    fn alias_address_for_canonical_range(&self, address: u64, byte_count: u64) -> Option<u64> {
-        self.ranges.iter().find_map(|range| {
-            let offset = address.checked_sub(range.canonical_address)?;
-            let (alias_address, alias_byte_count) = range.watch.range();
-            (offset.checked_add(byte_count)? <= alias_byte_count)
-                .then(|| alias_address.checked_add(offset))
-                .flatten()
-        })
-    }
-
-    /// Copies a canonical physical range through whichever live CPU aliases cover it.
-    ///
-    /// # Safety
-    ///
-    /// The caller must hold [`Self::with_live_backing`] for the duration of this operation.
-    unsafe fn copy_from_live_aliases(
-        &self,
-        address: u64,
-        destination: &mut [u8],
-    ) -> Result<(), String> {
-        let byte_count = u64::try_from(destination.len())
-            .map_err(|_| "canonical texture copy length does not fit u64")?;
-        let end = address
-            .checked_add(byte_count)
-            .ok_or("canonical texture copy range overflows")?;
-        let mut cursor = address;
-        while cursor < end {
-            let (range, canonical_end) = self
-                .ranges
-                .iter()
-                .filter_map(|range| {
-                    let (_, alias_byte_count) = range.watch.range();
-                    let range_end = range.canonical_address.checked_add(alias_byte_count)?;
-                    (range.canonical_address <= cursor && cursor < range_end)
-                        .then_some((range, range_end))
-                })
-                .max_by_key(|(_, range_end)| *range_end)
-                .ok_or_else(|| {
-                    format!("canonical texture range {cursor:#x}..{end:#x} has no live CPU alias")
-                })?;
-            let copy_end = canonical_end.min(end);
-            let copy_bytes = usize::try_from(copy_end - cursor)
-                .map_err(|_| "canonical texture copy segment is too large")?;
-            let destination_offset = usize::try_from(cursor - address)
-                .map_err(|_| "canonical texture copy offset is too large")?;
-            let (alias_address, _) = range.watch.range();
-            let source_address = alias_address
-                .checked_add(cursor - range.canonical_address)
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or("canonical texture alias address does not fit usize")?;
-            // SAFETY: the caller pins every write-watch mapping against replacement, and the
-            // selected alias range covers this exact source segment.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    source_address as *const u8,
-                    destination.as_mut_ptr().add(destination_offset),
-                    copy_bytes,
-                );
-            }
-            cursor = copy_end;
-        }
-        Ok(())
-    }
-
     /// The CPU watches backing this texture watch, for self-exclusion in write notifications.
+    #[cfg(test)]
     pub(crate) fn cpu_watches(&self) -> Vec<&remu_memory::CpuWriteWatch> {
         self.ranges.iter().map(|range| &range.watch).collect()
     }
@@ -707,6 +637,7 @@ impl GuestTextureWriteWatch {
     }
 
     /// Phase 1G: no content fingerprint baseline — coarse dirty invalidation only.
+    #[cfg(test)]
     pub(crate) fn record_live_content_baseline(&self) -> Result<(), String> {
         self.content_state
             .lock()
@@ -1110,6 +1041,7 @@ pub(crate) fn snapshot_watched_guest_range(
 }
 
 #[track_caller]
+#[cfg(test)]
 pub(crate) fn snapshot_watched_guest_texture_raw(
     descriptor: GuestTextureDescriptor,
     write_watch: &GuestTextureWriteWatch,
@@ -1130,6 +1062,7 @@ pub(crate) fn snapshot_watched_guest_texture_raw(
 /// callers pass it so [`GuestRangeLease::publish_run_if_baseline`] can refuse a run the guest has
 /// since written (MASTER-PLAN D3). When absent, each run's baseline is read live immediately
 /// before publish (linear row path).
+#[cfg(test)]
 pub(crate) fn write_watched_guest_range(
     address: u64,
     raw: &[u8],
@@ -1191,6 +1124,7 @@ pub(crate) fn write_watched_guest_range(
 }
 
 /// How a leased texture publish obtains the capture-time baseline for each run.
+#[cfg(test)]
 enum BaselineSource<'a> {
     /// Read the current guest bytes immediately before each publish (linear row path).
     LiveGuest,
@@ -1202,6 +1136,7 @@ enum BaselineSource<'a> {
 ///
 /// A revoked lease becomes [`TextureWritebackOutcome::DiscardedStale`] (D4-texture): the caller
 /// demotes the resident to `Stale` rather than silently rebuilding or publishing by a dead identity.
+#[cfg(test)]
 fn publish_segments_leased(
     address: u64,
     byte_count: u64,
@@ -1313,6 +1248,7 @@ fn publish_segments_leased(
     Ok(TextureWritebackOutcome::Applied)
 }
 
+#[cfg(test)]
 fn trace_discarded_stale_texture_writeback(
     address: u64,
     byte_count: usize,
@@ -1330,6 +1266,7 @@ fn trace_discarded_stale_texture_writeback(
 }
 
 /// Clamps `runs` to `raw` and slices it, dropping anything that names no byte of the image.
+#[cfg(test)]
 pub(crate) fn authored_segments<'a>(raw: &'a [u8], runs: &[(u64, u64)]) -> Vec<(u64, &'a [u8])> {
     runs.iter()
         .filter_map(|&(start, end)| {

@@ -12,9 +12,11 @@ use super::{
 };
 use metal::MTLPixelFormat;
 use remu_gpu::{ComputeDispatch, GpuMemoryCopy, GpuRegister, IndexedDraw, ShaderSnapshot};
+#[cfg(test)]
+use remu_memory::guest_write_journal_enabled;
 use remu_memory::{
     GuestWriteSite, guest_shared_backing_identity, guest_shared_backing_ranges_overlap,
-    guest_write_journal_enabled, record_guest_write,
+    record_guest_write,
 };
 use remu_shader::{
     GlobalMemoryBinding, ImageBinding, Program, ShaderEvaluation, ShaderMetadata,
@@ -1783,6 +1785,7 @@ pub(super) fn journal_guest_write(
 }
 
 /// Records a scattered publication, one entry per contiguous run it actually wrote.
+#[cfg(test)]
 pub(super) fn journal_guest_write_segments(
     site: GuestWriteSite,
     address: u64,

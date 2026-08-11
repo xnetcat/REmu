@@ -20,9 +20,9 @@ use super::{
     RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
     SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw, depth_sample_view_must_not_steal_depth_authority,
-    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
+    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
+    depth_sample_view_must_not_steal_depth_authority, guest_ranges_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
@@ -30,10 +30,10 @@ use super::{
     refresh_resident_texture_write_watch, resident_texture_eviction_plan,
     resident_texture_for_sample, retire_overlapping_sampled_textures,
     retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
-    snapshot_watched_guest_texture_raw, snapshot_watched_sampled_texture_raw, spans_overlap,
-    texture_element_layout, tiled_block_bytes, tiled_block_dimensions, trace_residency_churn,
-    trace_resident_texture_demotion, trace_resident_texture_removal, watch_guest_texture,
-    watch_resident_texture, watch_sampled_texture, written_byte_ranges,
+    snapshot_watched_sampled_texture_raw, spans_overlap, texture_element_layout, tiled_block_bytes,
+    tiled_block_dimensions, trace_residency_churn, trace_resident_texture_demotion,
+    trace_resident_texture_removal, watch_guest_texture, watch_resident_texture,
+    watch_sampled_texture, written_byte_ranges,
 };
 use metal::{
     Buffer, ComputePipelineState, Device, MTLBlitOption, MTLLoadAction, MTLOrigin, MTLRegion,
@@ -2782,40 +2782,6 @@ pub(crate) fn ensure_resident_texture_in_map(
             last_use: ResidentTextureActivityStamp::default(),
             activity: super::super::ResidentTextureActivity::enabled(),
         },
-    );
-    Ok(texture)
-}
-
-pub(crate) fn create_guest_texture(
-    device: &Device,
-    guest: GuestTextureDescriptor,
-    usage: MTLTextureUsage,
-    linear: &[u8],
-) -> Result<Texture, String> {
-    let (elements_wide, elements_high, _, bytes_per_element) = texture_element_layout(guest)?;
-    let required = u64::try_from(elements_wide)
-        .ok()
-        .and_then(|width| width.checked_mul(u64::try_from(elements_high).ok()?))
-        .and_then(|elements| elements.checked_mul(u64::try_from(bytes_per_element).ok()?))
-        .and_then(|bytes| usize::try_from(bytes).ok())
-        .ok_or("Metal texture dimensions overflow")?;
-    if guest.width == 0 || guest.height == 0 || linear.len() != required {
-        return Err(format!(
-            "invalid guest texture upload {}x{} format {:?} with {} bytes (expected {required})",
-            guest.width,
-            guest.height,
-            guest.pixel_format,
-            linear.len()
-        ));
-    }
-    let texture = create_uninitialized_guest_texture(device, guest, usage)?;
-    texture.replace_region(
-        MTLRegion::new_2d(0, 0, u64::from(guest.width), u64::from(guest.height)),
-        0,
-        linear.as_ptr().cast::<c_void>(),
-        u64::try_from(elements_wide).expect("validated texture element width fits u64")
-            * u64::try_from(bytes_per_element)
-                .expect("validated texture element byte count fits u64"),
     );
     Ok(texture)
 }

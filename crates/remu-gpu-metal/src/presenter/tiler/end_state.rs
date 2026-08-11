@@ -10,6 +10,7 @@
 //! Full zero-copy execution-time landing waits on B2 tiler + shared-backing proof (PROT_READ
 //! watch precondition) — until then reconciliation stays LOUD when the lease is missing.
 
+#[cfg(test)]
 use remu_memory::GuestRangeLease;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,6 +40,7 @@ pub(crate) fn classify_end_state_write(
 
 /// True when a lease proves the range is still the guest's and shared backing is the
 /// execution-time destination — the B5 end-state publish path.
+#[cfg(test)]
 pub(crate) fn lease_validated_reconciliation_ready(lease: Option<&GuestRangeLease>) -> bool {
     // `live_va_matches` re-proves coverage under the registry; a missing lease is never ready.
     lease.is_some_and(GuestRangeLease::live_va_matches)

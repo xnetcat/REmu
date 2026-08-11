@@ -27,17 +27,17 @@ pub(crate) use self::descriptors::{
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     render_resolve_candidate_matches, spans_overlap,
 };
+pub(crate) use self::mode5::mode5_mip_chain_layout;
 #[cfg(test)]
-pub(crate) use self::mode5::encode_mode5_mip_chain_into_raw;
-pub(crate) use self::mode5::{decode_mode5_mip_chain_from_raw, mode5_mip_chain_layout};
+pub(crate) use self::mode5::{decode_mode5_mip_chain_from_raw, encode_mode5_mip_chain_into_raw};
 pub(crate) use self::mode27::{
-    copy_mode27_mip_level_to_linear, decode_mode27_mip_chain_from_raw,
-    encode_mode27_mip_chain_into_raw, mode27_block_byte_offsets, mode27_mip_chain_layout,
-    mode27_surface_z_xor, mode27_within_block_byte_offset_for_format,
+    copy_mode27_mip_level_to_linear, decode_mode27_mip_chain_from_raw, mode27_block_byte_offsets,
+    mode27_mip_chain_layout, mode27_surface_z_xor, mode27_within_block_byte_offset_for_format,
 };
 #[cfg(test)]
 pub(crate) use self::mode27::{
-    mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
+    encode_mode27_mip_chain_into_raw, mode27_block_dimensions, mode27_source_byte_offset,
+    mode27_within_block_byte_offset,
 };
 
 pub(super) fn copy_tiled_to_linear_at_z(
@@ -106,6 +106,7 @@ pub(super) fn copy_tiled_to_linear_at_z(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn copy_linear_to_tiled_at_z(
     source: &[u8],
     descriptor: GuestTextureDescriptor,

@@ -985,8 +985,8 @@ impl MetalPresenter {
             }
             eprintln!(
                 "[REMu][PERF-GLOBAL-CACHE] captured={}/{:.1}MiB identity={}/{:.1}MiB",
-                self.global_buffer_cache.len(),
-                self.global_buffer_cache_bytes as f64 / (1024.0 * 1024.0),
+                0,
+                0.0,
                 self.guest_global_buffer_cache.len(),
                 self.guest_global_buffer_cache_bytes as f64 / (1024.0 * 1024.0),
             );
@@ -1365,10 +1365,8 @@ impl MetalPresenter {
                         metal_tgt_overlap_residents,
                         metal_tgt_overlap_resident_mib,
                         metal_tgt_idle,
-                        global_cache_captured_count: u64::try_from(self.global_buffer_cache.len())
-                            .unwrap_or(0),
-                        global_cache_captured_mib: self.global_buffer_cache_bytes as f64
-                            / (1024.0 * 1024.0),
+                        global_cache_captured_count: 0,
+                        global_cache_captured_mib: 0.0,
                         global_cache_identity_count: u64::try_from(
                             self.guest_global_buffer_cache.len(),
                         )

@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
-    GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
-    NggSubgroupLimits, PendingGlobalWriteback, PhysicalFootprintRange,
-    SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, SharedEventComputeGlobalBindingPlan,
-    SharedEventDirectComputePlan, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
-    UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
-    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
+    CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget, GlobalBufferOriginalVersion,
+    GuestCommandBatch, MetalPresenter, NggSubgroupLimits, PendingGlobalWriteback,
+    PhysicalFootprintRange, SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey,
+    SharedEventComputeGlobalBindingPlan, SharedEventDirectComputePlan,
+    SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint, UploadedGlobalBuffer,
+    canonical_sampler_bindings, create_sampler_argument_buffer, describe_guest_batch,
+    effective_global_memory_binding, guest_batch_writes_overlap, guest_physical_ranges_overlap,
+    metal_buffer_with_bytes, prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -1873,10 +1873,6 @@ fn trace_global_coherence(binding: &GlobalMemoryBinding, source: &str) {
         binding.base_address, binding.byte_count
     );
 }
-pub(super) const GLOBAL_BUFFER_CACHE_CAPACITY: usize = 4_096;
-
-pub(super) const GLOBAL_BUFFER_CACHE_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
-
 pub(super) const GLOBAL_UPLOAD_CHUNK_BYTE_COUNT: usize = 2 * 1024 * 1024;
 
 pub(super) const GLOBAL_UPLOAD_ALIGNMENT: usize = 256;

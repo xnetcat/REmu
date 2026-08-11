@@ -1,6 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#[cfg(test)]
 use super::blocks::mode5_block_byte_offsets;
 use super::{
     GuestMipChainLayout, GuestMipLevelLayout, GuestTextureDescriptor, texture_element_layout,
@@ -157,6 +158,7 @@ pub(crate) fn mode5_mip_chain_layout(
     })
 }
 
+#[cfg(test)]
 fn copy_mode5_mip_level_to_linear(
     layout: &GuestMipChainLayout,
     level: GuestMipLevelLayout,
@@ -305,6 +307,7 @@ fn copy_linear_to_mode5_mip_level(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn decode_mode5_mip_chain_from_raw(
     descriptor: GuestTextureDescriptor,
     mip_level_count: u32,

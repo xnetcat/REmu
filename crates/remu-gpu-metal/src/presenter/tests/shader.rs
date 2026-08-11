@@ -400,10 +400,7 @@ fn reconciles_param_less_exports_to_sdk_use_default_without_lds() {
     assert!(lds_missing.is_empty());
     assert_eq!(reconciled[0], unmatched_param_default_control(0));
     assert_eq!(reconciled[1], unmatched_param_default_control(1));
-    assert_eq!(
-        remu_shader_metal::PixelInputControl::from_register(reconciled[0]).uses_default(),
-        true
-    );
+    assert!(remu_shader_metal::PixelInputControl::from_register(reconciled[0]).uses_default());
     assert_eq!(
         missing_vertex_parameter_exports(0, 0b11, &reconciled),
         Vec::new(),

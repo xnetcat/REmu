@@ -32,10 +32,9 @@ use super::super::submission::{
     shared_event_host_effect_is_resolved,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
-    PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SameQueueDmaFillReject, SharedEventDrawReject, SharedEventFence,
-    SharedEventGlobalBufferVersion, SharedEventHostEffectLatencyPhase,
+    FlipTerminalSource, PendingGuestWriteRange, PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE,
+    SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT, SameQueueDmaFillReject, SharedEventDrawReject,
+    SharedEventFence, SharedEventGlobalBufferVersion, SharedEventHostEffectLatencyPhase,
     SharedEventHostEffectLatencyState, SharedEventHostEffectLatencyStatistics,
     SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
@@ -5133,59 +5132,6 @@ fn per_queue_required_drain_has_one_deadline_and_continues_after_terminal_error(
 }
 
 #[test]
-fn per_queue_flush_clears_only_its_transient_bindings() {
-    let (_sender, receiver) = gpu_event_channel();
-    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
-    enable_per_queue_batches(&mut presenter);
-    let device = presenter.device.as_ref().expect("Metal device").clone();
-    let key = GlobalBufferCacheKey {
-        base_address: 0x7000_0000,
-        byte_count: 4,
-    };
-
-    for queue_id in [0, 41] {
-        open_per_queue_batch(&mut presenter, queue_id);
-        presenter
-            .guest_queue_batches
-            .get_mut(&queue_id)
-            .expect("queue state")
-            .transient_global_buffer_cache
-            .insert(
-                key,
-                CachedGlobalBuffer {
-                    bytes: vec![queue_id as u8; 4],
-                    buffer: device.new_buffer(4, MTLResourceOptions::StorageModeShared),
-                    offset: 0,
-                },
-            );
-    }
-    presenter.set_active_guest_queue(Some(41));
-    presenter
-        .flush_guest_command_batch(
-            FlushPolicy::Required,
-            GuestBatchFlushReason::CommandProcessorBarrier,
-        )
-        .expect("q41 flush commits");
-
-    assert!(
-        presenter.guest_queue_batches[&0]
-            .transient_global_buffer_cache
-            .contains_key(&key),
-        "q41 flush must retain q0 transient bindings"
-    );
-    assert!(
-        presenter.guest_queue_batches[&41]
-            .transient_global_buffer_cache
-            .is_empty(),
-        "the flushed queue rotates its own transient bindings"
-    );
-    assert!(presenter.guest_queue_batches[&0].open_batch.is_some());
-    presenter
-        .wait_for_guest_command_batches()
-        .expect("test queues drain");
-}
-
-#[test]
 fn shared_event_checkpoint_retains_gpu_only_global_version_journal() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
@@ -5642,9 +5588,9 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
 
 #[test]
 fn disjoint_direct_draw_admission_is_default_disabled() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     presenter.shared_event_direct_draw_admission = false;
@@ -5706,14 +5652,14 @@ fn disjoint_direct_draw_admission_is_default_disabled() {
     presenter
         .wait_for_guest_command_batches()
         .expect("default-OFF acknowledgement and producer settle");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
 fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     presenter.shared_event_direct_draw_admission = true;
@@ -5737,10 +5683,11 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
     }));
 
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
-    assert_eq!(presenter.statistics.shared_event_draw_attempts, 1);
+    let draw_attempts = presenter.statistics.shared_event_draw_attempts;
+    assert!(draw_attempts >= 1, "the queued draw must reach preflight");
     assert_eq!(
-        presenter.statistics.shared_event_draw_disjoint_candidates,
-        1
+        presenter.statistics.shared_event_draw_disjoint_candidates, draw_attempts,
+        "a cold pipeline completion may retry the draw, but every retry must remain disjoint"
     );
     assert_eq!(presenter.statistics.shared_event_host_blocks, 0);
     assert_eq!(
@@ -5812,14 +5759,14 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
         metal::MTLCommandBufferStatus::Completed
     );
     assert_eq!(read_test_label(label), 1);
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
 fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     presenter.shared_event_direct_draw_admission = true;
@@ -5869,7 +5816,7 @@ fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
     presenter
         .wait_for_guest_command_batches()
         .expect("overlapping draw host gate and producer settle");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
@@ -5879,9 +5826,9 @@ fn same_queue_wait_reg_mem_elides_the_redundant_self_event() {
     // that the queue's own gpuSyncPostProducer RELEASE_MEM (queueEndOfPipeAction, sync.cpp:749)
     // wrote earlier in the same command stream; on one MTLCommandQueue Metal FIFO order already
     // reproduces that ordering, so no GPU event wait is needed.
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, label) = mapped_test_label();
@@ -5928,14 +5875,14 @@ fn same_queue_wait_reg_mem_elides_the_redundant_self_event() {
     presenter
         .wait_for_guest_command_batches()
         .expect("the elided same-queue producer settles");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
 fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     presenter.shared_event_direct_draw_admission = true;
@@ -5996,7 +5943,7 @@ fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
     presenter
         .wait_for_guest_command_batches()
         .expect("incomplete-producer host gate and producer settle");
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
@@ -6185,9 +6132,9 @@ fn shared_event_host_effect_readiness_queries_only_exact_required_state() {
 
 #[test]
 fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, label) = mapped_test_label();
@@ -6284,7 +6231,7 @@ fn release_only_queue_opens_an_exact_shared_event_producer_batch() {
             .is_empty(),
         "host-retired producers no longer need cross-queue resource forwarding"
     );
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
@@ -6550,9 +6497,9 @@ fn unresolved_or_ambiguous_signal_writes_make_the_checkpoint_unsafe() {
 
 #[test]
 fn exact_registered_waits_chain_without_intermediate_host_acknowledgements() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, first_label) = mapped_test_label();
@@ -6636,14 +6583,14 @@ fn exact_registered_waits_chain_without_intermediate_host_acknowledgements() {
     assert_eq!(read_test_label(second_label), 1);
     assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
     assert!(!presenter.receiver.blocked_queues.contains_key(&0));
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
 fn registered_wait_ordering_rejects_missing_checkpoint_and_recycled_label() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, label) = mapped_test_label();
@@ -6692,7 +6639,7 @@ fn registered_wait_ordering_rejects_missing_checkpoint_and_recycled_label() {
 
     let _ = presenter.gpu_wait_fences.take(old_id);
     remu_gpu::retire_gpu_wait(new_id);
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]
@@ -7372,9 +7319,9 @@ fn same_queue_immediate_fill_refuses_replaced_destination_without_cache_transiti
 
 #[test]
 fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain() {
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
     let (sender, receiver) = gpu_event_channel();
-    remu_gpu::install_event_sink(sender);
+    remu_gpu::install_thread_local_event_sink(sender);
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     enable_per_queue_batches(&mut presenter);
     let (_label_space, label) = mapped_test_label();
@@ -7435,7 +7382,7 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
         .wait_for_guest_command_batches()
         .expect("cross-queue release and acknowledgement settle");
     assert_eq!(read_test_label(label), 1);
-    remu_gpu::clear_event_sink();
+    remu_gpu::clear_thread_local_event_sink();
 }
 
 #[test]

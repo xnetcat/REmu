@@ -7,16 +7,13 @@ use super::{
     MetalPresenter, PendingTextureReadback, RESIDENT_WRITEBACK_DISCARDED,
     RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
     RESIDENT_WRITEBACK_PUBLISHED_BYTES, ResidentGuestTexture, SpanQueryOrder, StaleSource,
-    TextureReadbackLayout, TextureWritebackOutcome, capture_interval, diagnostic_dump_glyph_draw,
+    TextureReadbackLayout, capture_interval, diagnostic_dump_glyph_draw,
     diagnostic_dump_target_before_pixel_shader, diagnostic_dump_target_index_count,
-    diagnostic_dump_target_minimum_draw, diagnostic_scanout_writer,
-    encode_mode27_mip_chain_into_raw, evaluation_samples_glyph_atlas, half_float_to_f32,
-    half_float_to_srgb_unorm8, half_float_to_unorm8, linear_unorm8_to_srgb_unorm8,
-    mode27_mip_chain_layout, retire_multisample_textures_overlapping_writeback,
-    retire_sampled_textures_overlapping_writeback, snapshot_watched_guest_range,
-    texture_element_layout, unsigned_float_to_f32, unsigned_float_to_srgb_unorm8,
-    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear,
+    diagnostic_dump_target_minimum_draw, diagnostic_scanout_writer, evaluation_samples_glyph_atlas,
+    half_float_to_f32, half_float_to_srgb_unorm8, half_float_to_unorm8,
+    linear_unorm8_to_srgb_unorm8, retire_multisample_textures_overlapping_writeback,
+    retire_sampled_textures_overlapping_writeback, unsigned_float_to_f32,
+    unsigned_float_to_srgb_unorm8,
 };
 use metal::{
     Device, MTLBlitOption, MTLOrigin, MTLPixelFormat, MTLResourceOptions, MTLSize, MTLStorageMode,
@@ -530,6 +527,7 @@ impl PendingTextureReadback {
         Self::encode_mip_after_event(device, queue, texture, descriptor, 0, Some(ready))
     }
 
+    #[cfg(test)]
     pub(super) fn encode_mip(
         device: &Device,
         queue: &metal::CommandQueue,
@@ -1099,6 +1097,7 @@ pub(super) fn read_texture_linear_after_event(
         .finish()
 }
 
+#[cfg(test)]
 pub(super) fn read_texture_mip_linear(
     device: &Device,
     queue: &metal::CommandQueue,

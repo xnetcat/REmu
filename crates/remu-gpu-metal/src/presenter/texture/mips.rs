@@ -5,16 +5,21 @@ use super::super::GuestMipChainLayout;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
     MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState, ResidentGuestTexture,
-    ResidentTextureMap, WriteWatchRefresh, comparison_depth32_upload,
-    compressed_texture_block_extent, copy_mode27_mip_level_to_linear,
-    decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
-    record_mode27_work_detail, record_texture_work, refresh_resident_texture_write_watch,
-    resident_texture_for_sample, sampled_texture_usage, snapshot_watched_guest_range,
-    trace_resident_texture_removal, watch_resident_texture,
+    ResidentTextureMap, WriteWatchRefresh, copy_mode27_mip_level_to_linear,
+    mode27_mip_chain_layout, record_mode27_work_detail, record_texture_work,
+    refresh_resident_texture_write_watch, resident_texture_for_sample,
+    snapshot_watched_guest_range, trace_resident_texture_removal, watch_resident_texture,
 };
+#[cfg(test)]
+use super::{
+    comparison_depth32_upload, compressed_texture_block_extent, decode_mode5_mip_chain_from_raw,
+    decode_mode27_mip_chain_from_raw, sampled_texture_usage,
+};
+#[cfg(test)]
+use metal::NSRange;
 use metal::{
     CommandBufferRef, Device, MTLOrigin, MTLRegion, MTLSize, MTLStorageMode, MTLTextureType,
-    MTLTextureUsage, NSRange, Texture, TextureDescriptor,
+    MTLTextureUsage, Texture, TextureDescriptor,
 };
 use remu_shader::ImageBinding;
 use std::ffi::c_void;
@@ -459,6 +464,7 @@ fn create_mipmapped_guest_texture_from_layout(
     Ok(texture)
 }
 
+#[cfg(test)]
 fn comparison_pixel_format(format: metal::MTLPixelFormat) -> metal::MTLPixelFormat {
     match format {
         metal::MTLPixelFormat::R16Unorm => metal::MTLPixelFormat::Depth16Unorm,
@@ -466,6 +472,7 @@ fn comparison_pixel_format(format: metal::MTLPixelFormat) -> metal::MTLPixelForm
     }
 }
 
+#[cfg(test)]
 fn create_exact_sampled_mip_texture(
     device: &Device,
     descriptor: DecodedImageDescriptor,
@@ -625,6 +632,8 @@ fn create_exact_sampled_mip_texture(
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(test)]
+#[allow(dead_code)] // Kept as the mode-5 differential oracle even though no runtime path calls it.
 pub(crate) fn create_exact_mode5_sampled_mip_view(
     device: &Device,
     descriptor: DecodedImageDescriptor,
@@ -702,6 +711,7 @@ pub(crate) fn create_exact_mode5_sampled_mip_view(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn create_exact_mode27_sampled_mip_view(
     device: &Device,
     descriptor: DecodedImageDescriptor,

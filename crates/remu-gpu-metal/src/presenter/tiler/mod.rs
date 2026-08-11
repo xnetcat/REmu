@@ -21,12 +21,11 @@ mod equations;
 mod msl;
 
 pub(crate) use encode::{
-    GpuTilerView, encode_gpu_publish_to_guest, encode_gpu_publish_to_guest_view,
-    encode_gpu_upload_from_guest, encode_gpu_upload_from_guest_view, gpu_tiler_owns_descriptor,
+    GpuTilerView, encode_gpu_publish_to_guest, encode_gpu_upload_from_guest,
+    encode_gpu_upload_from_guest_view, gpu_tiler_owns_descriptor,
 };
 pub(crate) use end_state::{
-    EndStateWriteClass, classify_end_state_write, lease_validated_reconciliation_ready,
-    refuse_bookkeeping_writeback,
+    EndStateWriteClass, classify_end_state_write, refuse_bookkeeping_writeback,
 };
 #[allow(unused_imports)] // Differential-oracle helpers for tiler encode tests.
 pub(crate) use equations::{
@@ -34,8 +33,4 @@ pub(crate) use equations::{
     mode9_within_block_byte_offset_msl_oracle, mode27_within_block_byte_offset_msl_oracle,
     shift_ceil_u32, tiled_physical_byte_offset,
 };
-pub(crate) use msl::{
-    MODE5_TILER_MSL, MODE9_TILER_MSL, MODE27_TILER_MSL, TilerKernelKind, cached_tiler_library,
-    compile_tiler_library, mode5_tiler_pipelines, mode9_tiler_pipelines, mode27_tiler_pipelines,
-    tiler_kernel_name, tiler_kernel_source,
-};
+pub(crate) use msl::mode27_tiler_pipelines;

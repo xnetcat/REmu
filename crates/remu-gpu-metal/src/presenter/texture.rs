@@ -18,13 +18,11 @@ use super::{
     SAMPLED_ALIAS_WRITEBACK_NANOSECONDS, SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS,
     SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
     SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
-    SampledTextureKey, ScanoutSnapshotTexture, StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES,
-    TEXTURE_DIRTY_VALIDATION_COUNT, TEXTURE_DIRTY_VALIDATION_NANOSECONDS,
-    TEXTURE_DIRTY_VALIDATION_UNCHANGED, TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT,
-    TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT, UploadedImageTexture,
-    WriteWatchRefresh, canonical_texture_bindings, compressed_texture_block_extent,
-    copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z,
-    decode_image_descriptor, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
+    SampledTextureKey, ScanoutSnapshotTexture, StaleSource, TEXTURE_SNAPSHOT_BYTES,
+    TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS, TEXTURE_SNAPSHOT_UNSTABLE_COUNT,
+    UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
+    compressed_texture_block_extent, copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z,
+    decode_image_descriptor, decode_mode27_mip_chain_from_raw,
     depth_sample_view_must_not_steal_depth_authority, fallback_image_descriptor,
     guest_frame_fingerprint, guest_ranges_overlap, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
@@ -40,9 +38,13 @@ use super::{
     texture_element_layout, tiled_block_bytes, tiled_block_dimensions, trace_glyph_atlas,
     trace_image_descriptors, trace_target_sampling, trace_video_target_consumers,
 };
-use remu_memory::{CpuWriteWatchRetirement, read_guest_shared_backing};
 #[cfg(test)]
-use remu_memory::{guest_shared_mapping_identity, write_guest_shared_backing};
+use super::{copy_linear_to_tiled_at_z, decode_mode5_mip_chain_from_raw};
+#[cfg(test)]
+use remu_memory::{
+    CpuWriteWatchRetirement, guest_shared_mapping_identity, read_guest_shared_backing,
+    write_guest_shared_backing,
+};
 mod correlation;
 mod depth_array;
 mod extent;
@@ -67,8 +69,9 @@ pub(crate) use self::lifetime::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_eviction_plan,
 };
+#[cfg(test)]
+pub(crate) use self::mips::create_exact_mode27_sampled_mip_view;
 pub(crate) use self::mips::{
-    create_exact_mode5_sampled_mip_view, create_exact_mode27_sampled_mip_view,
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
@@ -91,7 +94,7 @@ pub(crate) use self::sampled::new_color_alias_texture_view;
 #[cfg(test)]
 pub(crate) use self::sampled::{
     apply_image_destination_select, image_destination_select_is_native,
-    new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload,
+    new_red_blue_swizzled_texture_view, prepare_sampled_texture_upload, sampled_texture_usage,
 };
 pub(crate) use self::sampled::{
     create_sampled_guest_texture, create_sampled_guest_texture_from_guest_gpu,
@@ -99,7 +102,7 @@ pub(crate) use self::sampled::{
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, resident_sample_authority_ok,
     resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
-    sampled_texture_supports_access, sampled_texture_usage, sampled_texture_view_for_binding,
+    sampled_texture_supports_access, sampled_texture_view_for_binding,
 };
 pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
 #[cfg(test)]
@@ -107,15 +110,17 @@ pub(crate) use self::upload::{
     sampled_texture_cache_accepts, sampled_texture_cache_requires_eviction,
 };
 #[cfg(test)]
-pub(crate) use self::watch::guest_texture_raw_range;
 pub(crate) use self::watch::{
-    TextureWritebackOutcome, persistent_sampled_texture_write_watch,
-    refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
-    resident_texture_raw_byte_count, sampled_texture_raw_range,
-    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
-    snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
-    snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
-    watch_sampled_texture, write_watched_guest_range,
+    TextureWritebackOutcome, guest_texture_raw_range, snapshot_watched_guest_texture_raw,
+    write_watched_guest_range,
+};
+pub(crate) use self::watch::{
+    persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
+    refresh_sampled_texture_write_watch, resident_texture_raw_byte_count,
+    sampled_texture_raw_range, sampled_texture_uses_exact_mode5_mips,
+    sampled_texture_uses_exact_mode27_mips, snapshot_guest_texture_raw,
+    snapshot_watched_guest_range, snapshot_watched_sampled_texture_raw, watch_guest_texture,
+    watch_resident_texture, watch_sampled_texture,
 };
 
 /// Metal exposes this C structure by value in the swizzled texture-view Objective-C method.
@@ -186,6 +191,7 @@ pub(super) fn decode_guest_texture_linear_from_raw_at_z(
     Ok(output)
 }
 
+#[cfg(test)]
 pub(super) fn write_guest_texture_linear_into_raw(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],
@@ -194,6 +200,7 @@ pub(super) fn write_guest_texture_linear_into_raw(
     write_guest_texture_linear_into_raw_at_z(descriptor, linear, destination, 0)
 }
 
+#[cfg(test)]
 pub(super) fn write_guest_texture_linear_into_raw_at_z(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],
@@ -235,6 +242,7 @@ pub(super) fn write_guest_texture_linear_into_raw_at_z(
 /// Publication goes through [`remu_memory::GuestRangeLease`] (MASTER-PLAN D3). A revoked lease
 /// returns [`TextureWritebackOutcome::DiscardedStale`] so the caller can demote the resident
 /// (D4-texture) instead of silently publishing into recycled guest memory.
+#[cfg(test)]
 pub(super) fn write_watched_guest_texture_linear(
     descriptor: GuestTextureDescriptor,
     linear: &[u8],

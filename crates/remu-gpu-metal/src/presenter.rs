@@ -220,17 +220,15 @@ use self::submission::{
 };
 use self::texture::{
     RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
-    SpanQueryOrder, TextureWritebackOutcome, WrittenRegion, decode_guest_texture_linear_from_raw,
+    SpanQueryOrder, WrittenRegion, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
     resident_texture_raw_byte_count, retire_multisample_textures_overlapping_writeback,
     retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
-    sampled_texture_raw_range, snapshot_guest_texture_raw, snapshot_watched_guest_range,
-    storage_image_requires_mip_hierarchy, trace_resident_texture_removal, upload_image_textures,
-    write_guest_texture_linear_into_raw_at_z, write_watched_guest_range,
-    write_watched_guest_texture_linear,
+    sampled_texture_raw_range, snapshot_guest_texture_raw, storage_image_requires_mip_hierarchy,
+    trace_resident_texture_removal, upload_image_textures,
 };
 #[cfg(test)]
 use self::texture::{
@@ -245,12 +243,12 @@ use self::texture::{
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
     sampled_texture_key, sampled_texture_view_for_binding, snapshot_guest_texture_linear,
     snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
+    write_watched_guest_texture_linear,
 };
 use self::tiling::{
-    ResourceSpan, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
-    copy_tiled_to_linear_at_z, decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw,
-    depth_sample_view_must_not_steal_depth_authority, effective_linear_pitch,
-    encode_mode27_mip_chain_into_raw, guest_physical_ranges_overlap, guest_ranges_overlap,
+    ResourceSpan, copy_mode27_mip_level_to_linear, copy_tiled_to_linear_at_z,
+    decode_mode27_mip_chain_from_raw, depth_sample_view_must_not_steal_depth_authority,
+    effective_linear_pitch, guest_physical_ranges_overlap, guest_ranges_overlap,
     guest_texture_byte_count, guest_texture_descriptors_have_same_layout,
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
@@ -261,7 +259,8 @@ use self::tiling::{
 };
 #[cfg(test)]
 use self::tiling::{
-    encode_mode5_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
+    copy_linear_to_tiled_at_z, decode_mode5_mip_chain_from_raw, encode_mode5_mip_chain_into_raw,
+    encode_mode27_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
     mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
     mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
@@ -550,6 +549,7 @@ struct GuestTextureDescriptor {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum Mode27WorkOrigin {
     RenderTargetCreate,
+    #[cfg(test)]
     SampledCacheCreate,
     StorageCreate,
 }
@@ -1509,23 +1509,6 @@ impl ResidentGuestTexture {
         );
     }
 
-    /// The publication debt as byte offsets from this resident's declared base address.
-    ///
-    /// `None` means the debt cannot be expressed in that space and the caller must publish the
-    /// whole declared range, which is what every writeback did before the algebra existed.
-    fn gpu_authored_offsets(&self) -> Option<Vec<(u64, u64)>> {
-        let base = self.span?.range_start();
-        Some(
-            self.gpu_authored
-                .runs()
-                .iter()
-                .filter_map(|&(start, end)| {
-                    Some((start.checked_sub(base)?, end.checked_sub(base)?))
-                })
-                .collect(),
-        )
-    }
-
     /// Drops the publication debt after guest RAM was made to agree with Metal.
     ///
     /// Authority is unchanged: the allocation still defines what these bytes mean, RAM merely
@@ -1644,18 +1627,6 @@ enum WriteWatchRefresh {
     Replaced,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-struct GlobalBufferCacheKey {
-    base_address: u64,
-    byte_count: usize,
-}
-
-struct CachedGlobalBuffer {
-    bytes: Vec<u8>,
-    buffer: Buffer,
-    offset: u64,
-}
-
 /// Metal submission state owned by one logical guest GPU queue.
 ///
 /// The B17 per-queue path is the default (plan A1). It deliberately stays separate from the
@@ -1670,7 +1641,6 @@ struct GuestQueueBatchState {
     resource_dependencies: HashMap<SharedEventProducerId, SharedEventSignalCheckpoint>,
     open_batch: Option<GuestCommandBatch>,
     committed_batches: VecDeque<GuestCommandBatch>,
-    transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
 }
 
 #[derive(Clone)]
@@ -2463,11 +2433,8 @@ struct MetalPresenter {
     next_sampled_texture_use: u64,
     sampler_argument_cache: HashMap<SamplerArgumentCacheKey, CachedSamplerArguments>,
     depth_stencil_cache: HashMap<DepthStencilCacheKey, DepthStencilState>,
-    global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
-    transient_global_buffer_cache: HashMap<GlobalBufferCacheKey, CachedGlobalBuffer>,
     guest_global_buffer_cache: HashMap<(GuestSharedMappingIdentity, usize), Buffer>,
     guest_global_buffer_cache_bytes: u64,
-    global_buffer_cache_bytes: usize,
     index_buffer_cache: HashMap<Vec<u32>, Buffer>,
     ngg_meshlet_cache: HashMap<(NggSubgroupLimits, Vec<u32>), CachedNggMeshlets>,
     diagnostic_vertex_position_buffer: Option<Buffer>,
@@ -2694,11 +2661,8 @@ impl MetalPresenter {
             next_sampled_texture_use: 0,
             sampler_argument_cache: HashMap::new(),
             depth_stencil_cache: HashMap::new(),
-            global_buffer_cache: HashMap::new(),
-            transient_global_buffer_cache: HashMap::new(),
             guest_global_buffer_cache: HashMap::new(),
             guest_global_buffer_cache_bytes: 0,
-            global_buffer_cache_bytes: 0,
             index_buffer_cache: HashMap::new(),
             ngg_meshlet_cache: HashMap::new(),
             diagnostic_vertex_position_buffer: None,

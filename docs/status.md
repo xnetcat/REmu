@@ -136,7 +136,19 @@ suite is 756/756. Its former lone failure was a stale synthetic ELF fixture whos
 dynamic data rather than its live FS function; `36593f56` gives the seeded decoder authenticated
 control flow while preserving the deliberately embedded lookalike. The next acceptance point is a
 sparse clean run that passes both prior failures and reaches a real VideoOut flip/frame; until then
-Demon’s Souls is not considered rendering.
+Demon's Souls is not considered rendering.
+
+**2026-08-11 Metal release cleanup (offline; no game run):** the optimized Metal package now builds
+without the previous 41 unused/dead-code warnings. An obsolete captured global byte-cache shell,
+its empty per-queue maps, one unreachable CPU glyph dump, and zero-caller accessors were removed.
+CPU texture readback/writeback and reverse-tiling implementations remain available as test-only
+differential oracles; the live GPU upload, residency publication, and mode-5/9/27 tiler pipelines
+remain production code. The serial Metal suite passes 505/505 active tests (5 ignored), and strict
+all-target lint passes. Queue tests now install thread-local event sinks, and the direct-draw test
+accepts any number of cold-pipeline retries while requiring every retry to preserve the same
+disjoint admission. The suite still runs serially because memory-watch tests share process signal
+and registry state. This reduces release surface and maintenance cost; it is not an FPS claim and
+does not replace the required sparse title validation.
 
 ## Phase 1F (2026-08-06) — execution substrate — CLOSED (on `main` @ `d7414fc`)
 

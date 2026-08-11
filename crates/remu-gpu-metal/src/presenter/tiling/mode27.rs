@@ -278,6 +278,7 @@ pub(crate) fn copy_mode27_mip_level_to_linear(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn copy_linear_to_mode27_mip_level(
     layout: &GuestMipChainLayout,
     level: GuestMipLevelLayout,
@@ -391,6 +392,7 @@ pub(crate) fn decode_mode27_mip_chain_from_raw(
     Ok((layout, decoded))
 }
 
+#[cfg(test)]
 pub(crate) fn encode_mode27_mip_chain_into_raw(
     layout: &GuestMipChainLayout,
     linear_levels: &[Vec<u8>],

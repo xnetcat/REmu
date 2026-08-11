@@ -661,7 +661,7 @@ impl MetalPresenter {
                 dispatch.sequence,
                 diagnostic_dump_compute_texture_minimum_dispatch(),
             )
-            && diagnostic_compute_texture_extent().map_or(true, |(width, height)| {
+            && diagnostic_compute_texture_extent().is_none_or(|(width, height)| {
                 textures.iter().any(|texture| {
                     texture.descriptor.guest.width == width
                         && texture.descriptor.guest.height == height

@@ -631,7 +631,6 @@ impl MetalPresenter {
                 resource_dependencies: std::collections::HashMap::new(),
                 open_batch: None,
                 committed_batches: std::collections::VecDeque::new(),
-                transient_global_buffer_cache: std::collections::HashMap::new(),
             },
         );
         Ok(())
@@ -827,44 +826,6 @@ impl MetalPresenter {
             }
         }
         self.publish_guest_submission_completion(sequence);
-    }
-
-    pub(crate) fn active_transient_global_buffer_cache(
-        &self,
-    ) -> &std::collections::HashMap<
-        super::super::GlobalBufferCacheKey,
-        super::super::CachedGlobalBuffer,
-    > {
-        if !self.per_queue_guest_batches {
-            return &self.transient_global_buffer_cache;
-        }
-        let queue_id = self
-            .active_guest_queue
-            .expect("queue-local cache access requires an active guest queue");
-        &self
-            .guest_queue_batches
-            .get(&queue_id)
-            .expect("active guest queue has batch state")
-            .transient_global_buffer_cache
-    }
-
-    pub(crate) fn active_transient_global_buffer_cache_mut(
-        &mut self,
-    ) -> &mut std::collections::HashMap<
-        super::super::GlobalBufferCacheKey,
-        super::super::CachedGlobalBuffer,
-    > {
-        if !self.per_queue_guest_batches {
-            return &mut self.transient_global_buffer_cache;
-        }
-        let queue_id = self
-            .active_guest_queue
-            .expect("queue-local cache access requires an active guest queue");
-        &mut self
-            .guest_queue_batches
-            .get_mut(&queue_id)
-            .expect("active guest queue has batch state")
-            .transient_global_buffer_cache
     }
 
     pub(crate) fn ensure_open_guest_batch(&mut self, queue: &metal::CommandQueue) {
@@ -1225,10 +1186,6 @@ impl MetalPresenter {
                 .render_pass_ends_for_batch_flush
                 .saturating_add(1);
         }
-        // Writable and oversized bindings are shared only within this ordered batch. Rotating
-        // them here keeps completed writebacks immutable while reducing per-draw Metal allocation
-        // to at most one buffer per unchanged guest address range per batch.
-        self.transient_global_buffer_cache.clear();
         batch.committed_at = Some(Instant::now());
         if self.per_queue_guest_batches
             && let Some(waker) = self.event_loop_waker.clone()
@@ -1305,7 +1262,6 @@ impl MetalPresenter {
                 .render_pass_ends_for_batch_flush
                 .saturating_add(1);
         }
-        state.transient_global_buffer_cache.clear();
         let committed_at = Instant::now();
         batch.committed_at = Some(committed_at);
         if let Some(waker) = completion_waker {
