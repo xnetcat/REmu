@@ -157,7 +157,7 @@ pub(crate) fn pthread_attr_get_stack_address(
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     write_guest_u64(arguments[1], attributes.stack_address);
-    attributes.stack_address
+    0
 }
 
 pub(crate) fn pthread_attr_get_stack_size(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -168,7 +168,7 @@ pub(crate) fn pthread_attr_get_stack_size(arguments: [u64; 6], state: &ProbeDisp
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     write_guest_u64(arguments[1], attributes.stack_size);
-    attributes.stack_size
+    0
 }
 
 pub(crate) fn pthread_attr_get_affinity(arguments: [u64; 6], state: &ProbeDispatchState) -> u64 {
@@ -179,8 +179,7 @@ pub(crate) fn pthread_attr_get_affinity(arguments: [u64; 6], state: &ProbeDispat
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
     write_guest_u64(arguments[1], attributes.affinity_mask);
-    // The Gen5 kernel ABI returns the observable mask in RAX as well as through the output pointer.
-    attributes.affinity_mask
+    0
 }
 
 pub(crate) fn pthread_attr_set_affinity(
