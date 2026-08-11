@@ -362,6 +362,30 @@ struct Mode64kRematerialisationInput {
     tile_mode: u32,
 }
 
+fn mode64k_rematerialisation_input(
+    resident: &ResidentGuestTexture,
+    target_span: ResourceSpan,
+) -> Result<Option<Mode64kRematerialisationInput>, String> {
+    let span = resident
+        .span
+        .ok_or("stale rematerialisation source has no allocation span")?;
+    let debt = resident
+        .gpu_authored
+        .intersect(&RangeSet::for_span(&target_span));
+    if debt.is_empty() {
+        return Ok(None);
+    }
+    let (subresources, linear_length) = gpu_rematerialisation_subresources(resident)?;
+    Ok(Some(Mode64kRematerialisationInput {
+        texture: resident.texture.clone(),
+        span,
+        debt,
+        subresources,
+        linear_length,
+        tile_mode: resident.descriptor.tile_mode,
+    }))
+}
+
 fn gpu_rematerialisation_parameters(
     subresource: Mode64kRematerialisationSubresource,
     resource_base: u64,
@@ -459,6 +483,153 @@ fn encode_linear_buffer_to_texture(
     }
 }
 
+fn promote_mode27_array_mip_hierarchy(
+    device: &Device,
+    command_buffer: &metal::CommandBufferRef,
+    descriptor: DecodedImageDescriptor,
+    resident: &ResidentGuestTexture,
+) -> Result<ResidentGuestTexture, String> {
+    let underlying_mip_count = descriptor
+        .base_mip_level
+        .checked_add(descriptor.mip_level_count)
+        .ok_or("array mip promotion level count overflows")?;
+    let expected_old_span = ResourceSpan::for_image_view(
+        descriptor.guest,
+        0,
+        resident.mip_level_count,
+        13,
+        descriptor.base_array_slice,
+        descriptor.layer_count,
+    )?;
+    if descriptor.texture_type != 13
+        || descriptor.guest.tile_mode != 27
+        || descriptor.guest.pitch != descriptor.guest.width
+        || resident.texture_type != 13
+        || resident.base_array_slice != descriptor.base_array_slice
+        || resident.layer_count != descriptor.layer_count
+        || resident.mip_level_count >= underlying_mip_count
+        || resident.span != expected_old_span
+        || !resident.serves_reads()
+        || resident.texture.texture_type() != MTLTextureType::D2Array
+        || resident.texture.array_length() != u64::from(descriptor.layer_count)
+        || resident.texture.mipmap_level_count() != u64::from(resident.mip_level_count)
+        || resident.texture.pixel_format() != descriptor.guest.pixel_format
+        || super::super::metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
+            != Some(descriptor.guest.bytes_per_pixel)
+    {
+        return Err(format!(
+            "array mip promotion requires one compatible complete uncompressed mode-27 hierarchy: old(type={} base={} layers={} mips={} span={:?} serves_reads={} metal={:?}/{}/{}) requested(type={} base={} layers={} mips={} span={:?})",
+            resident.texture_type,
+            resident.base_array_slice,
+            resident.layer_count,
+            resident.mip_level_count,
+            resident.span,
+            resident.serves_reads(),
+            resident.texture.texture_type(),
+            resident.texture.array_length(),
+            resident.texture.mipmap_level_count(),
+            descriptor.texture_type,
+            descriptor.base_array_slice,
+            descriptor.layer_count,
+            underlying_mip_count,
+            descriptor.span,
+        ));
+    }
+
+    let full_descriptor = DecodedImageDescriptor {
+        base_mip_level: 0,
+        mip_level_count: underlying_mip_count,
+        ..descriptor
+    };
+    let texture = create_sampled_guest_texture_from_guest_gpu(
+        device,
+        command_buffer,
+        full_descriptor,
+        false,
+        true,
+    )?;
+    let blit = command_buffer.new_blit_command_encoder();
+    blit.set_label("REMu preserve GPU-current array mip levels");
+    for local_slice in 0..descriptor.layer_count {
+        for level in 0..resident.mip_level_count {
+            let width = u64::from(
+                descriptor
+                    .guest
+                    .width
+                    .checked_shr(level)
+                    .unwrap_or(0)
+                    .max(1),
+            );
+            let height = u64::from(
+                descriptor
+                    .guest
+                    .height
+                    .checked_shr(level)
+                    .unwrap_or(0)
+                    .max(1),
+            );
+            blit.copy_from_texture(
+                &resident.texture,
+                u64::from(local_slice),
+                u64::from(level),
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize::new(width, height, 1),
+                &texture,
+                u64::from(local_slice),
+                u64::from(level),
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+        }
+    }
+    blit.end_encoding();
+    texture.set_label(&format!(
+        "REMu promoted {}-level {}-slice array image {:#x}",
+        underlying_mip_count, descriptor.layer_count, descriptor.guest.address
+    ));
+
+    let write_watch = watch_sampled_texture(descriptor)?;
+    let (span, declared) = ResidentGuestTexture::declared_authority(&write_watch);
+    if span != descriptor.span {
+        return Err("promoted array mip watch does not match requested span".to_owned());
+    }
+    let gpu_current = resident.gpu_written();
+    let mut promoted = ResidentGuestTexture {
+        texture,
+        component_reorder_view: None,
+        descriptor: descriptor.guest,
+        texture_type: descriptor.texture_type,
+        base_array_slice: descriptor.base_array_slice,
+        layer_count: descriptor.layer_count,
+        mip_level_count: underlying_mip_count,
+        write_watch,
+        span,
+        owned: declared.clone(),
+        gpu_authored: if gpu_current {
+            declared
+        } else {
+            RangeSet::default()
+        },
+        state: ResidencyState::Live,
+        acquire_invalidated: resident.acquire_invalidated,
+        content_version: resident.content_version,
+        gpu_write_watch_generations: Vec::new(),
+        last_use: resident.last_use,
+        activity: resident.activity,
+    };
+    if gpu_current {
+        promoted.note_gpu_write();
+    }
+    eprintln!(
+        "[REMu][METAL] encoded ordered array mip promotion image={:#x} base={} layers={} levels={}->{} gpu_current={gpu_current}",
+        descriptor.guest.address,
+        descriptor.base_array_slice,
+        descriptor.layer_count,
+        resident.mip_level_count,
+        underlying_mip_count,
+    );
+    Ok(promoted)
+}
+
 impl MetalPresenter {
     /// Reconstructs `target_descriptor` from RAM overlaid with every current GPU publication
     /// debt owner. All work stays in the open guest batch: the shared backing is read, never
@@ -469,6 +640,7 @@ impl MetalPresenter {
         target_descriptor: GuestTextureDescriptor,
         target_span: ResourceSpan,
         source_descriptors: &[GuestTextureDescriptor],
+        detached_sources: &[&ResidentGuestTexture],
     ) -> Result<Texture, String> {
         let device = self
             .device
@@ -505,33 +677,33 @@ impl MetalPresenter {
         let destination = target.texture.clone();
         let (target_subresources, target_linear_length) =
             gpu_rematerialisation_subresources(target)?;
-        let mut sources = Vec::with_capacity(source_descriptors.len());
+        let mut sources = Vec::with_capacity(source_descriptors.len() + detached_sources.len());
+        for source in detached_sources {
+            if let Some(source) = mode64k_rematerialisation_input(source, target_span)? {
+                sources.push(source);
+            }
+        }
         for descriptor in source_descriptors {
             let source = self
                 .resident_guest_textures
                 .get(descriptor)
                 .ok_or("stale rematerialisation source disappeared")?;
-            let span = source
-                .span
-                .ok_or("stale rematerialisation source has no allocation span")?;
-            let debt = source
-                .gpu_authored
-                .intersect(&RangeSet::for_span(&target_span));
-            if debt.is_empty() {
-                continue;
+            if let Some(source) = mode64k_rematerialisation_input(source, target_span)? {
+                sources.push(source);
             }
-            let (subresources, linear_length) = gpu_rematerialisation_subresources(source)?;
-            sources.push(Mode64kRematerialisationInput {
-                texture: source.texture.clone(),
-                span,
-                debt,
-                subresources,
-                linear_length,
-                tile_mode: source.descriptor.tile_mode,
-            });
         }
         if sources.is_empty() {
             return Err("GPU retile was requested without a current debt owner".to_owned());
+        }
+        let mut combined_debt = RangeSet::default();
+        for source in &sources {
+            if combined_debt.intersects(&source.debt) {
+                return Err(
+                    "GPU retile reached overlapping publication-debt owners for one target"
+                        .to_owned(),
+                );
+            }
+            combined_debt.insert(&source.debt);
         }
 
         let backing_range = guest_shared_backing_range(target_span.address(), target_span.len())
@@ -1140,6 +1312,7 @@ impl MetalPresenter {
                 target_descriptor,
                 target_span,
                 &owners,
+                &[],
             ) {
                 Ok(destination) => destination,
                 Err(error) => {
@@ -1379,6 +1552,185 @@ impl MetalPresenter {
         Ok(true)
     }
 
+    fn reconcile_partial_mode27_array_mip_hierarchy(
+        &mut self,
+        device: &Device,
+        descriptor: DecodedImageDescriptor,
+    ) -> Result<(), String> {
+        let selected_span = descriptor
+            .span
+            .ok_or("partial array mip hierarchy has no selected span")?;
+        let underlying_mip_count = descriptor
+            .base_mip_level
+            .checked_add(descriptor.mip_level_count)
+            .ok_or("partial array mip hierarchy level count overflows")?;
+        let external_sources = self
+            .resident_guest_textures
+            .overlapping(&selected_span, SpanQueryOrder::ResidentFirst)
+            .into_iter()
+            .filter(|candidate| *candidate != descriptor.guest)
+            .filter(|candidate| {
+                self.resident_guest_textures
+                    .get(candidate)
+                    .is_some_and(|resident| {
+                        resident.is_live()
+                            && resident
+                                .gpu_authored
+                                .intersects(&RangeSet::for_span(&selected_span))
+                    })
+            })
+            .collect::<Vec<_>>();
+        let source = self
+            .resident_guest_textures
+            .get(&descriptor.guest)
+            .ok_or("partial array mip hierarchy disappeared")?;
+        if source.texture_type != descriptor.texture_type
+            || source.base_array_slice != descriptor.base_array_slice
+            || source.layer_count != descriptor.layer_count
+            || source.mip_level_count != underlying_mip_count
+            || source.span != Some(selected_span)
+            || source.serves_reads()
+            || !source.gpu_written()
+        {
+            return Err(format!(
+                "partial array reconciliation requires one exact GPU-current hierarchy: current(type={} base={} layers={} mips={} span={:?} serves_reads={} owned_bytes={} gpu_bytes={}) requested(type={} base={} layers={} mips={} span={:?})",
+                source.texture_type,
+                source.base_array_slice,
+                source.layer_count,
+                source.mip_level_count,
+                source.span,
+                source.serves_reads(),
+                source.owned.byte_count(),
+                source.gpu_authored.byte_count(),
+                descriptor.texture_type,
+                descriptor.base_array_slice,
+                descriptor.layer_count,
+                underlying_mip_count,
+                descriptor.span,
+            ));
+        }
+
+        self.ensure_active_open_guest_batch()?;
+        let command_buffer = {
+            let batch = self
+                .active_open_guest_batch_mut()
+                .expect("guest batch was opened for partial array reconciliation");
+            batch.end_compute_pass();
+            batch.close_active_pass_encoders();
+            batch.command_buffer.clone()
+        };
+        let full_descriptor = DecodedImageDescriptor {
+            base_mip_level: 0,
+            mip_level_count: underlying_mip_count,
+            ..descriptor
+        };
+        let texture = create_sampled_guest_texture_from_guest_gpu(
+            device,
+            &command_buffer,
+            full_descriptor,
+            false,
+            true,
+        )?;
+        texture.set_label(&format!(
+            "REMu reconciled {}-level {}-slice array image {:#x}",
+            underlying_mip_count, descriptor.layer_count, descriptor.guest.address
+        ));
+        let write_watch = watch_sampled_texture(descriptor)?;
+        let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
+        if span != Some(selected_span) {
+            return Err("reconciled array mip watch does not match selected span".to_owned());
+        }
+
+        let old = self
+            .resident_guest_textures
+            .remove(&descriptor.guest)
+            .expect("validated partial array hierarchy exists");
+        let mut combined_debt = old
+            .gpu_authored
+            .intersect(&RangeSet::for_span(&selected_span));
+        for external in &external_sources {
+            let debt = self
+                .resident_guest_textures
+                .get(external)
+                .expect("validated external array owner exists")
+                .gpu_authored
+                .intersect(&RangeSet::for_span(&selected_span));
+            if combined_debt.intersects(&debt) {
+                self.resident_guest_textures.insert(descriptor.guest, old);
+                return Err(
+                    "partial array reconciliation reached overlapping GPU debt owners".to_owned(),
+                );
+            }
+            combined_debt.insert(&debt);
+        }
+        self.resident_guest_textures.insert(
+            descriptor.guest,
+            ResidentGuestTexture {
+                texture,
+                component_reorder_view: None,
+                descriptor: descriptor.guest,
+                texture_type: descriptor.texture_type,
+                base_array_slice: descriptor.base_array_slice,
+                layer_count: descriptor.layer_count,
+                mip_level_count: underlying_mip_count,
+                write_watch,
+                span,
+                owned,
+                gpu_authored: RangeSet::default(),
+                state: ResidencyState::Live,
+                acquire_invalidated: old.acquire_invalidated,
+                content_version: old.content_version,
+                gpu_write_watch_generations: Vec::new(),
+                last_use: old.last_use,
+                activity: old.activity,
+            },
+        );
+        if let Err(error) = self.encode_mode64k_stale_rematerialisation(
+            descriptor.guest,
+            selected_span,
+            &external_sources,
+            &[&old],
+        ) {
+            if let Some(failed) = self.resident_guest_textures.remove(&descriptor.guest) {
+                trace_resident_texture_removal("partial-array-reconciliation-failed", &failed);
+            }
+            self.resident_guest_textures.insert(descriptor.guest, old);
+            return Err(error);
+        }
+
+        self.resident_content_version = self.resident_content_version.saturating_add(1);
+        let version = self.resident_content_version;
+        self.subtract_resident_authority(
+            &selected_span,
+            &RangeSet::for_span(&selected_span),
+            Some(descriptor.guest),
+            StaleSource::Allocation {
+                descriptor: descriptor.guest,
+                content_version: version,
+            },
+            "reconciled-into-array-hierarchy",
+        );
+        let target = self
+            .resident_guest_textures
+            .get_mut(&descriptor.guest)
+            .expect("reconciled array hierarchy exists");
+        target.gpu_authored = combined_debt;
+        target.content_version = version;
+        target.note_gpu_write();
+        let debt_bytes = target.gpu_authored.byte_count();
+        self.record_internal_resident_version(descriptor.guest);
+        eprintln!(
+            "[REMu][METAL] encoded partial array mip reconciliation image={:#x} base={} layers={} mips={} debt_bytes={} external_sources={}",
+            descriptor.guest.address,
+            descriptor.base_array_slice,
+            descriptor.layer_count,
+            underlying_mip_count,
+            debt_bytes,
+            external_sources.len(),
+        );
+        Ok(())
+    }
+
     pub(crate) fn garbage_collect_resident_textures_to_budget(
         &mut self,
         byte_capacity: u64,
@@ -1497,6 +1849,134 @@ impl MetalPresenter {
         let needs_alias_reconciliation = self
             .validated_mip_hierarchy_gpu_alias_source(descriptor)?
             .is_some();
+        let compatible_gpu_growth = self
+            .resident_guest_textures
+            .get(&descriptor.guest)
+            .is_some_and(|resident| {
+                resident.gpu_written()
+                    && resident.texture_type == descriptor.texture_type
+                    && resident.base_array_slice == descriptor.base_array_slice
+                    && resident.layer_count == descriptor.layer_count
+                    && resident.mip_level_count < underlying_mip_count
+                    && ResourceSpan::for_image_view(
+                        descriptor.guest,
+                        0,
+                        resident.mip_level_count,
+                        descriptor.texture_type,
+                        descriptor.base_array_slice,
+                        descriptor.layer_count,
+                    )
+                    .is_ok_and(|span| resident.span == span)
+            });
+        if compatible_gpu_growth {
+            if needs_alias_reconciliation {
+                return Err(format!(
+                    "cannot promote GPU-current array hierarchy {:#x} while an external GPU owner overlaps the grown allocation",
+                    descriptor.guest.address
+                ));
+            }
+            let refresh = refresh_resident_texture_write_watch(
+                self.resident_guest_textures
+                    .get_mut(&descriptor.guest)
+                    .expect("selected array growth source exists"),
+            )?;
+            match refresh {
+                WriteWatchRefresh::Replaced => {
+                    if let Some(resident) = self.resident_guest_textures.remove(&descriptor.guest) {
+                        trace_resident_texture_removal(
+                            "ordered-array-mip-growth-mapping-replaced",
+                            &resident,
+                        );
+                    }
+                }
+                WriteWatchRefresh::Reprotecting => {
+                    return Err(format!(
+                        "GPU-current array hierarchy {:#x} is being reprotected before promotion",
+                        descriptor.guest.address
+                    ));
+                }
+                WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {
+                    let cpu_may_have_changed = self
+                        .resident_guest_textures
+                        .get(&descriptor.guest)
+                        .is_some_and(|resident| {
+                            matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
+                                || resident.write_watch.content_validation_pending()
+                                || resident.write_watch.is_dirty()
+                        });
+                    let content_changed = cpu_may_have_changed
+                        && self
+                            .resident_guest_textures
+                            .get(&descriptor.guest)
+                            .expect("refreshed array growth source exists")
+                            .write_watch
+                            .content_has_changed()?;
+                    if content_changed {
+                        return Err(format!(
+                            "refusing to promote CPU-dirty GPU-current array hierarchy at {:#x}",
+                            descriptor.guest.address
+                        ));
+                    }
+                    self.ensure_active_open_guest_batch()?;
+                    let command_buffer = {
+                        let batch = self
+                            .active_open_guest_batch_mut()
+                            .expect("guest batch was opened for array mip promotion");
+                        batch.end_compute_pass();
+                        batch.close_active_pass_encoders();
+                        batch.command_buffer.clone()
+                    };
+                    let promoted = promote_mode27_array_mip_hierarchy(
+                        device,
+                        &command_buffer,
+                        descriptor,
+                        self.resident_guest_textures
+                            .get(&descriptor.guest)
+                            .expect("validated array growth source exists"),
+                    )?;
+                    if let Some(resident) = self.resident_guest_textures.remove(&descriptor.guest) {
+                        trace_resident_texture_removal(
+                            "ordered-array-mip-growth-source",
+                            &resident,
+                        );
+                    }
+                    self.resident_guest_textures
+                        .insert(descriptor.guest, promoted);
+                    self.resident_content_version = self.resident_content_version.saturating_add(1);
+                    let version = self.resident_content_version;
+                    self.resident_guest_textures
+                        .get_mut(&descriptor.guest)
+                        .expect("promoted array hierarchy exists")
+                        .content_version = version;
+                    self.subtract_resident_authority(
+                        &selected_span,
+                        &RangeSet::for_span(&selected_span),
+                        Some(descriptor.guest),
+                        StaleSource::Allocation {
+                            descriptor: descriptor.guest,
+                            content_version: version,
+                        },
+                        "promoted-into-array-hierarchy",
+                    );
+                    self.active_open_guest_batch_mut()
+                        .expect("array mip promotion batch remains open")
+                        .record_resident_write_footprint(
+                            SharedEventWriteKind::InternalResidentDestination,
+                            Some(selected_span),
+                        );
+                    self.record_internal_resident_version(descriptor.guest);
+                    return resident_texture_for_sample(
+                        self.resident_guest_textures
+                            .get_mut(&descriptor.guest)
+                            .expect("promoted array hierarchy exists"),
+                        descriptor,
+                    )
+                    .ok_or_else(|| {
+                        "promoted array hierarchy cannot represent requested view".to_owned()
+                    });
+                }
+            }
+        }
         let exact_existing = self
             .resident_guest_textures
             .get(&descriptor.guest)
@@ -1553,6 +2033,19 @@ impl MetalPresenter {
                         ));
                     }
                     if exact_existing && !content_changed {
+                        if gpu_written && !complete_authority {
+                            self.reconcile_partial_mode27_array_mip_hierarchy(device, descriptor)?;
+                            return resident_texture_for_sample(
+                                self.resident_guest_textures
+                                    .get_mut(&descriptor.guest)
+                                    .expect("partially reconciled array hierarchy exists"),
+                                descriptor,
+                            )
+                            .ok_or_else(|| {
+                                "partially reconciled array hierarchy cannot represent requested view"
+                                    .to_owned()
+                            });
+                        }
                         if needs_alias_reconciliation {
                             self.rematerialise_gpu_aliases_into_mip_hierarchy(descriptor)?;
                             return resident_texture_for_sample(
@@ -1582,14 +2075,29 @@ impl MetalPresenter {
                 }
             }
         }
-        if self
+        if let Some(resident) = self
             .resident_guest_textures
             .get(&descriptor.guest)
-            .is_some_and(|resident| resident.gpu_written())
+            .filter(|resident| resident.gpu_written())
         {
             return Err(format!(
-                "cannot replace GPU-current array hierarchy at {:#x} with base={} layers={} mips={underlying_mip_count}",
-                descriptor.guest.address, descriptor.base_array_slice, descriptor.layer_count,
+                "cannot replace GPU-current array hierarchy at {:#x}: requested(type={} base={} layers={} mips={underlying_mip_count} span={:?}) current(type={} base={} layers={} mips={} span={:?} state={:?} serves_reads={} owned_bytes={} owned_runs={:?} gpu_bytes={} gpu_runs={:?})",
+                descriptor.guest.address,
+                descriptor.texture_type,
+                descriptor.base_array_slice,
+                descriptor.layer_count,
+                descriptor.span,
+                resident.texture_type,
+                resident.base_array_slice,
+                resident.layer_count,
+                resident.mip_level_count,
+                resident.span,
+                resident.state,
+                resident.serves_reads(),
+                resident.owned.byte_count(),
+                resident.owned.runs(),
+                resident.gpu_authored.byte_count(),
+                resident.gpu_authored.runs(),
             ));
         }
         if let Some(resident) = self.resident_guest_textures.remove(&descriptor.guest) {
