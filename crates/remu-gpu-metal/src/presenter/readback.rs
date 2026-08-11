@@ -205,6 +205,7 @@ impl MetalPresenter {
         let guest_descriptor = resident.descriptor;
         let publish_view = crate::presenter::tiler::GpuTilerView {
             texture_type: resident.texture_type,
+            base_array_slice: resident.base_array_slice,
             layer_count: resident.layer_count,
             mip_level_count: resident.mip_level_count,
         };

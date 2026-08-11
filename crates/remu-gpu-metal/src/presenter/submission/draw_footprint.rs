@@ -240,7 +240,11 @@ fn append_image_range(
     descriptor: super::super::DecodedImageDescriptor,
     byte_count: u64,
 ) -> Result<(), SharedEventDrawReject> {
-    let mut range = DrawFootprintRange::new(kind, descriptor.guest.address, byte_count)?;
+    let span = descriptor.span.ok_or(SharedEventDrawReject::Unresolved)?;
+    if span.len() != byte_count {
+        return Err(SharedEventDrawReject::Unresolved);
+    }
+    let mut range = DrawFootprintRange::new(kind, span.address(), byte_count)?;
     range.image = Some(descriptor);
     ranges.push(range);
     Ok(())
@@ -484,6 +488,7 @@ fn retained_resident_version_is_current(
     if resident.texture.as_ptr() != version.texture.as_ptr()
         || resident.content_version != version.content_version
         || resident.texture_type != version.texture_type
+        || resident.base_array_slice != version.base_array_slice
         || resident.layer_count != version.layer_count
         || resident.mip_level_count != version.mip_level_count
         || resident.span != Some(version.span)
@@ -554,6 +559,7 @@ fn direct_draw_dependencies_are_gpu_orderable(
                                 && version.span.len() == producer.byte_count
                                 && version.descriptor == sampled.guest
                                 && version.texture_type == sampled.texture_type
+                                && version.base_array_slice == sampled.base_array_slice
                                 && version.layer_count == sampled.layer_count
                                 && version.mip_level_count == sampled.mip_level_count.max(1)
                                 && sampled.base_mip_level == 0
@@ -573,6 +579,7 @@ fn direct_draw_dependencies_are_gpu_orderable(
                             && existing.sampled.base_mip_level == sampled.base_mip_level
                             && existing.sampled.mip_level_count == sampled.mip_level_count
                             && existing.sampled.texture_type == sampled.texture_type
+                            && existing.sampled.base_array_slice == sampled.base_array_slice
                             && existing.sampled.layer_count == sampled.layer_count
                     }) {
                         *existing = retained;
@@ -1673,6 +1680,47 @@ mod tests {
     }
 
     #[test]
+    fn image_footprint_starts_at_the_selected_array_slice() {
+        let mut space = GuestAddressSpace::new(64 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(20 * GUEST_PAGE_SIZE).expect("array backing");
+        let address = space
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                20 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping")
+            .get();
+        let width = 64_u32;
+        let height = 64_u32;
+        let encoded_width = width - 1;
+        let mut words = [0_u32; 8];
+        words[0] = u32::try_from(address >> 8).expect("low address fits");
+        words[1] = u32::try_from(address >> 40).expect("high address fits")
+            | (130 << 20)
+            | ((encoded_width & 0x3) << 30);
+        words[2] = (encoded_width >> 2) | ((height - 1) << 14);
+        words[3] = 0xfac | (27 << 20) | (13 << 28);
+        words[4] = (3 << 16) | 4;
+        let sampled = decode_image_descriptor_without_diagnostics(&words)
+            .expect("nonzero-base array descriptor");
+        let (_, byte_count) = sampled_texture_raw_range(sampled).expect("selected range");
+        let mut ranges = Vec::new();
+        append_image_range(
+            &mut ranges,
+            DrawFootprintKind::ImageRead,
+            sampled,
+            u64::try_from(byte_count).expect("byte count fits"),
+        )
+        .expect("image footprint");
+        assert_eq!(ranges[0].guest_address, address + 3 * 65_536);
+        assert_eq!(ranges[0].byte_count, 2 * 65_536);
+    }
+
+    #[test]
     fn same_queue_internal_resident_write_is_versioned_and_admits_the_sampling_draw() {
         // Plan A2: internal writes (mip promotion, stale-read rematerialisation) version their
         // resident on the queue timeline exactly like guest render-target writes, instead of
@@ -1723,6 +1771,7 @@ mod tests {
             texture: texture.clone(),
             descriptor: sampled.guest,
             texture_type: sampled.texture_type,
+            base_array_slice: sampled.base_array_slice,
             layer_count: sampled.layer_count,
             mip_level_count: sampled.mip_level_count,
             content_version: 17,
@@ -1835,6 +1884,7 @@ mod tests {
                     texture,
                     descriptor: sampled.guest,
                     texture_type: sampled.texture_type,
+                    base_array_slice: sampled.base_array_slice,
                     layer_count: sampled.layer_count,
                     mip_level_count: sampled.mip_level_count,
                     content_version: 17,
@@ -1901,6 +1951,7 @@ mod tests {
             texture: resident.texture.clone(),
             descriptor: resident.descriptor,
             texture_type: resident.texture_type,
+            base_array_slice: resident.base_array_slice,
             layer_count: resident.layer_count,
             mip_level_count: resident.mip_level_count,
             content_version: resident.content_version,

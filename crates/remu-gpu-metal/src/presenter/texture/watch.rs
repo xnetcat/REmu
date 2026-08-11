@@ -8,10 +8,9 @@ use super::{
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
-    guest_texture_byte_count, mode5_mip_chain_layout, mode64k_2d_mip_chain_layout,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
-    trace_resident_texture_removal,
+    guest_texture_byte_count, mode64k_2d_mip_chain_layout, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
+    texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
@@ -684,6 +683,7 @@ pub(crate) fn refresh_resident_texture_write_watch(
             let mut renewed = watch_resident_texture(
                 resident.descriptor,
                 resident.texture_type,
+                resident.base_array_slice,
                 resident.layer_count,
                 resident.mip_level_count,
             )?;
@@ -703,12 +703,20 @@ pub(crate) fn refresh_resident_texture_write_watch(
 pub(crate) fn watch_resident_texture(
     descriptor: GuestTextureDescriptor,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
     mip_level_count: u32,
 ) -> Result<GuestTextureWriteWatch, String> {
-    let byte_count =
-        resident_texture_raw_byte_count(descriptor, texture_type, layer_count, mip_level_count)?;
-    GuestTextureWriteWatch::new(descriptor.address, byte_count)
+    let span = ResourceSpan::for_image_view(
+        descriptor,
+        0,
+        mip_level_count,
+        texture_type,
+        base_array_slice,
+        layer_count,
+    )?
+    .ok_or("resident texture selected span overflows")?;
+    GuestTextureWriteWatch::new(span.address(), span.len())
 }
 
 /// Returns the complete guest allocation extent used by a resident texture.
@@ -752,6 +760,7 @@ pub(crate) fn resident_texture_raw_byte_count(
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type,
+        base_array_slice: 0,
         layer_count,
     };
     let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
@@ -775,6 +784,7 @@ pub(crate) fn refresh_sampled_texture_write_watch(
                     key.base_mip_level,
                     key.mip_level_count,
                     key.texture_type,
+                    key.base_array_slice,
                     key.layer_count,
                 )?,
                 // Component selection is lowered into each shader and does not change the host
@@ -783,6 +793,7 @@ pub(crate) fn refresh_sampled_texture_write_watch(
                 base_mip_level: key.base_mip_level,
                 mip_level_count: key.mip_level_count,
                 texture_type: key.texture_type,
+                base_array_slice: key.base_array_slice,
                 layer_count: key.layer_count,
             })?;
             renewed.inherit_content_state_from(&cached.write_watch)?;
@@ -879,66 +890,26 @@ pub(crate) fn watch_guest_texture(
 pub(crate) fn sampled_texture_raw_range(
     descriptor: DecodedImageDescriptor,
 ) -> Result<(usize, usize), String> {
-    let exact_mode5_mip_chain = sampled_texture_uses_exact_mode5_mips(descriptor);
-    let exact_mode64k_mip_chain = sampled_texture_uses_exact_mode64k_2d_mips(descriptor);
-    let byte_count = if exact_mode5_mip_chain || exact_mode64k_mip_chain {
-        if exact_mode64k_mip_chain
-            && (descriptor.texture_type != 9
-                || descriptor.layer_count != 1
-                || super::super::metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
-                    != Some(descriptor.guest.bytes_per_pixel))
-        {
-            return Err(format!(
-                "exact tile-9/27 sampled mip-chain upload requires an uncompressed 2D single-layer resource, got type={} layers={} tile={} base={} count={}",
-                descriptor.texture_type,
-                descriptor.layer_count,
-                descriptor.guest.tile_mode,
-                descriptor.base_mip_level,
-                descriptor.mip_level_count
-            ));
-        }
-        if exact_mode5_mip_chain && !matches!(descriptor.texture_type, 9 | 11 | 13) {
-            return Err(format!(
-                "exact mode-5 sampled mip-chain upload requires a 2D or array resource, got type={} layers={} tile={} base={} count={}",
-                descriptor.texture_type,
-                descriptor.layer_count,
-                descriptor.guest.tile_mode,
-                descriptor.base_mip_level,
-                descriptor.mip_level_count
-            ));
-        }
-        let underlying_mip_count = descriptor
-            .base_mip_level
-            .checked_add(descriptor.mip_level_count)
-            .ok_or("sampled mip range overflows")?;
-        let byte_count = if exact_mode5_mip_chain {
-            mode5_mip_chain_layout(descriptor.guest, underlying_mip_count)?
-                .byte_count
-                .checked_mul(
-                    usize::try_from(descriptor.layer_count)
-                        .map_err(|_| "sampled layer count does not fit usize")?,
-                )
-                .ok_or("mode-5 sampled mip-chain byte count overflows")?
-        } else {
-            mode64k_2d_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count
-        };
-        u64::try_from(byte_count).map_err(|_| "sampled mip-chain byte count does not fit u64")?
-    } else {
-        guest_texture_byte_count(descriptor.guest)
-            .ok_or("sampled texture face byte count overflows")?
-            .checked_mul(u64::from(descriptor.layer_count))
-            .ok_or("sampled texture byte count overflows")?
-    };
-    if descriptor.guest.address < 0x10_000 || byte_count > 512 * 1024 * 1024 {
+    let span = ResourceSpan::for_image_view(
+        descriptor.guest,
+        descriptor.base_mip_level,
+        descriptor.mip_level_count,
+        descriptor.texture_type,
+        descriptor.base_array_slice,
+        descriptor.layer_count,
+    )?
+    .ok_or("sampled texture selected span overflows")?;
+    if span.address() < 0x10_000 || span.len() > 512 * 1024 * 1024 {
         return Err(format!(
-            "invalid sampled texture range address={:#x} bytes={byte_count}",
-            descriptor.guest.address
+            "invalid sampled texture range address={:#x} bytes={}",
+            span.address(),
+            span.len()
         ));
     }
     Ok((
-        usize::try_from(descriptor.guest.address)
+        usize::try_from(span.address())
             .map_err(|_| "sampled texture address does not fit usize")?,
-        usize::try_from(byte_count).map_err(|_| "sampled texture byte count does not fit usize")?,
+        usize::try_from(span.len()).map_err(|_| "sampled texture byte count does not fit usize")?,
     ))
 }
 
@@ -957,9 +928,9 @@ pub(crate) fn sampled_texture_uses_exact_mode64k_2d_mips(
 pub(crate) fn watch_sampled_texture(
     descriptor: DecodedImageDescriptor,
 ) -> Result<GuestTextureWriteWatch, String> {
-    let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
+    let (address, byte_count) = sampled_texture_raw_range(descriptor)?;
     GuestTextureWriteWatch::new(
-        descriptor.guest.address,
+        u64::try_from(address).map_err(|_| "sampled address does not fit u64")?,
         u64::try_from(byte_count).map_err(|_| "sampled byte count does not fit u64")?,
     )
 }
@@ -969,8 +940,12 @@ pub(crate) fn snapshot_watched_sampled_texture_raw(
     descriptor: DecodedImageDescriptor,
     write_watch: &GuestTextureWriteWatch,
 ) -> Result<Vec<u8>, String> {
-    let (_, source_length) = sampled_texture_raw_range(descriptor)?;
-    snapshot_watched_guest_range(descriptor.guest.address, source_length, write_watch)
+    let (source_address, source_length) = sampled_texture_raw_range(descriptor)?;
+    snapshot_watched_guest_range(
+        u64::try_from(source_address).map_err(|_| "sampled address does not fit u64")?,
+        source_length,
+        write_watch,
+    )
 }
 
 #[track_caller]

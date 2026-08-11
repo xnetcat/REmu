@@ -363,6 +363,7 @@ pub(crate) fn sampled_texture_key(
         base_mip_level: descriptor.base_mip_level,
         mip_level_count: descriptor.mip_level_count,
         texture_type: descriptor.texture_type,
+        base_array_slice: descriptor.base_array_slice,
         layer_count: descriptor.layer_count,
         comparison,
     }
@@ -518,6 +519,16 @@ pub(crate) fn resident_texture_for_sample(
         .checked_add(sampled.mip_level_count.max(1))?;
     if resident.mip_level_count < underlying_mip_count {
         return None;
+    }
+    if matches!(sampled.texture_type, 11 | 13)
+        && resident.descriptor == sampled.guest
+        && resident.texture_type == sampled.texture_type
+        && resident.base_array_slice == sampled.base_array_slice
+        && resident.layer_count == sampled.layer_count
+        && sampled.base_mip_level == 0
+        && sampled.mip_level_count.max(1) == resident.mip_level_count
+    {
+        return Some(resident.texture.clone());
     }
     if guest_texture_descriptors_share_depth_sample_storage(
         resident.descriptor,
@@ -729,7 +740,11 @@ pub(crate) fn decode_sampled_texture_linear_from_raw(
         ));
     }
     let mut linear = Vec::new();
-    for (surface_z, face) in raw.chunks_exact(face_bytes).enumerate() {
+    for (local_surface_z, face) in raw.chunks_exact(face_bytes).enumerate() {
+        let surface_z = usize::try_from(descriptor.base_array_slice)
+            .map_err(|_| "sampled base array slice does not fit usize")?
+            .checked_add(local_surface_z)
+            .ok_or("sampled absolute surface index overflows")?;
         linear.extend(decode_guest_texture_linear_from_raw_at_z(
             descriptor.guest,
             face,
@@ -821,6 +836,7 @@ pub(crate) fn create_sampled_guest_texture_from_guest_gpu(
     let texture = device.new_texture(&metal_descriptor);
     let view = GpuTilerView {
         texture_type: descriptor.texture_type,
+        base_array_slice: descriptor.base_array_slice,
         layer_count: descriptor.layer_count,
         mip_level_count: if exact_guest_mips { mip_level_count } else { 1 },
     };

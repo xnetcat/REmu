@@ -7,13 +7,14 @@ use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    ResidentTextureActivityStamp, ResidentTextureMap, SAMPLED_TEXTURE_CACHE_CAPACITY,
-    SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
-    SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey, SpanQueryOrder,
-    UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
-    create_sampled_guest_texture, create_sampled_guest_texture_from_guest_gpu,
-    decode_image_descriptor, ensure_mipmapped_resident_texture_in_map,
-    ensure_resident_texture_in_map, fallback_image_descriptor, guest_texture_byte_count,
+    RangeSet, ResidencyState, ResidentGuestTexture, ResidentTextureActivityStamp,
+    ResidentTextureMap, SAMPLED_TEXTURE_CACHE_CAPACITY, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
+    SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS, SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES,
+    SampledTextureKey, SpanQueryOrder, UploadedImageTexture, WriteWatchRefresh,
+    canonical_texture_bindings, create_sampled_guest_texture,
+    create_sampled_guest_texture_from_guest_gpu, decode_image_descriptor,
+    ensure_mipmapped_resident_texture_in_map, ensure_resident_texture_in_map,
+    fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
@@ -26,7 +27,7 @@ use super::{
     sampled_texture_key, sampled_texture_supports_access, sampled_texture_view_for_binding,
     sampler_uses_normalized_coordinates, storage_image_requires_mip_hierarchy,
     texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
-    trace_resident_texture_removal, trace_target_sampling,
+    trace_resident_texture_removal, trace_target_sampling, watch_sampled_texture,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -295,6 +296,172 @@ fn settle_gpu_sampled_upload(
     Ok(texture)
 }
 
+fn exact_mode27_array_storage_supported(descriptor: super::DecodedImageDescriptor) -> bool {
+    descriptor.texture_type == 13
+        && descriptor.guest.tile_mode == 27
+        && descriptor.base_mip_level == 0
+        && descriptor.mip_level_count == 1
+        && descriptor.layer_count > 0
+        && super::super::metal_uncompressed_bytes_per_pixel(descriptor.guest.pixel_format)
+            == Some(descriptor.guest.bytes_per_pixel)
+}
+
+fn refuse_gpu_authored_array_aliases(
+    descriptor: super::DecodedImageDescriptor,
+    residents: &mut ResidentTextureMap,
+    allow_exact_same_view: bool,
+) -> Result<(), String> {
+    let selected_span = descriptor.span.ok_or("array selected span overflows")?;
+    let selected = RangeSet::for_span(&selected_span);
+    let aliases = residents.overlapping(&selected_span, SpanQueryOrder::ResidentFirst);
+    for alias in aliases {
+        let exact_same_view = alias == descriptor.guest
+            && residents.get(&alias).is_some_and(|resident| {
+                resident.texture_type == descriptor.texture_type
+                    && resident.base_array_slice == descriptor.base_array_slice
+                    && resident.layer_count == descriptor.layer_count
+                    && descriptor.base_mip_level == 0
+                    && resident.mip_level_count == descriptor.mip_level_count
+                    && resident.span == Some(selected_span)
+            });
+        if allow_exact_same_view && exact_same_view {
+            continue;
+        }
+        let refresh = refresh_resident_texture_write_watch(
+            residents
+                .get_mut(&alias)
+                .expect("indexed array alias exists"),
+        )?;
+        if refresh == WriteWatchRefresh::Replaced {
+            if let Some(retired) = residents.remove(&alias) {
+                trace_resident_texture_removal("array-alias-mapping-replaced", &retired);
+            }
+            continue;
+        }
+        let alias_has_selected_gpu_debt = residents.get(&alias).is_some_and(|resident| {
+            resident.is_live() && resident.gpu_authored.intersects(&selected)
+        });
+        if alias_has_selected_gpu_debt {
+            return Err(format!(
+                "refusing array view at {:#x}: overlapping GPU-authored resident at {:#x} owns selected bytes",
+                descriptor.guest.address, alias.address,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn ensure_exact_mode27_array_storage_resident(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    descriptor: super::DecodedImageDescriptor,
+    residents: &mut ResidentTextureMap,
+) -> Result<Texture, String> {
+    if !exact_mode27_array_storage_supported(descriptor) {
+        return Err(format!(
+            "writable array residency requires an uncompressed single-level mode-27 type-13 view, got type={} tile={} base_mip={} mips={} layers={} format={:?} bpe={}",
+            descriptor.texture_type,
+            descriptor.guest.tile_mode,
+            descriptor.base_mip_level,
+            descriptor.mip_level_count,
+            descriptor.layer_count,
+            descriptor.guest.pixel_format,
+            descriptor.guest.bytes_per_pixel,
+        ));
+    }
+    let selected_span = descriptor
+        .span
+        .ok_or("writable array selected span overflows")?;
+    refuse_gpu_authored_array_aliases(descriptor, residents, true)?;
+    let exact_existing = residents.get(&descriptor.guest).is_some_and(|resident| {
+        resident.texture_type == descriptor.texture_type
+            && resident.base_array_slice == descriptor.base_array_slice
+            && resident.layer_count == descriptor.layer_count
+            && resident.mip_level_count == descriptor.mip_level_count
+            && resident.span == descriptor.span
+            && resident.owned.covers(&selected_span)
+    });
+    if exact_existing {
+        let (refresh, cpu_changed, gpu_written) = {
+            let resident = residents
+                .get_mut(&descriptor.guest)
+                .expect("exact array resident still exists");
+            let refresh = refresh_resident_texture_write_watch(resident)?;
+            if refresh == WriteWatchRefresh::Reprotecting {
+                return Err(format!(
+                    "array resident at {:#x} is being reprotected",
+                    descriptor.guest.address
+                ));
+            }
+            let cpu_may_have_changed =
+                matches!(refresh, WriteWatchRefresh::Renewed { was_dirty: true })
+                    || resident.write_watch.content_validation_pending()
+                    || resident.write_watch.is_dirty();
+            let cpu_changed = cpu_may_have_changed && resident.write_watch.content_has_changed()?;
+            (refresh, cpu_changed, resident.gpu_written())
+        };
+        if refresh != WriteWatchRefresh::Replaced && !cpu_changed {
+            return Ok(residents
+                .get(&descriptor.guest)
+                .expect("exact array resident still exists")
+                .texture
+                .clone());
+        }
+        if cpu_changed && gpu_written {
+            return Err(format!(
+                "refusing to merge CPU-dirty guest bytes with dirty array resident at {:#x}",
+                descriptor.guest.address
+            ));
+        }
+    }
+    if let Some(existing) = residents.get(&descriptor.guest)
+        && existing.gpu_written()
+    {
+        return Err(format!(
+            "refusing to replace dirty array resident at {:#x}: existing base={} layers={} mips={} requested base={} layers={} mips={}",
+            descriptor.guest.address,
+            existing.base_array_slice,
+            existing.layer_count,
+            existing.mip_level_count,
+            descriptor.base_array_slice,
+            descriptor.layer_count,
+            descriptor.mip_level_count,
+        ));
+    }
+    if let Some(retired) = residents.remove(&descriptor.guest) {
+        trace_resident_texture_removal("array-storage-view-replaced", &retired);
+    }
+    let write_watch = watch_sampled_texture(descriptor)?;
+    let texture = settle_gpu_sampled_upload(device, queue, descriptor, false, true)?;
+    let (span, owned) = ResidentGuestTexture::declared_authority(&write_watch);
+    if span != Some(selected_span) {
+        return Err("array storage resident watch does not match decoded selected span".to_owned());
+    }
+    residents.insert(
+        descriptor.guest,
+        ResidentGuestTexture {
+            texture: texture.clone(),
+            component_reorder_view: None,
+            descriptor: descriptor.guest,
+            texture_type: descriptor.texture_type,
+            base_array_slice: descriptor.base_array_slice,
+            layer_count: descriptor.layer_count,
+            mip_level_count: descriptor.mip_level_count,
+            write_watch,
+            span,
+            owned,
+            gpu_authored: RangeSet::default(),
+            state: ResidencyState::Live,
+            acquire_invalidated: false,
+            content_version: 0,
+            gpu_write_watch_generations: Vec::new(),
+            last_use: ResidentTextureActivityStamp::default(),
+            activity: super::super::ResidentTextureActivity::enabled(),
+        },
+    );
+    Ok(texture)
+}
+
 pub(crate) fn upload_image_textures(
     trace_stage: &'static str,
     device: &Device,
@@ -386,12 +553,30 @@ pub(crate) fn upload_image_textures(
                 .find(|retained| retained.matches(descriptor))
             {
                 let texture = sampled_texture_view_for_binding(&retained.texture, binding)?;
+                if comparison
+                    && !matches!(
+                        texture.pixel_format(),
+                        MTLPixelFormat::Depth16Unorm | MTLPixelFormat::Depth32Float
+                    )
+                {
+                    return Err(format!(
+                        "image at PC {:#x}: comparison retained array override requires native Metal depth, got {:?}",
+                        binding.pc,
+                        texture.pixel_format(),
+                    ));
+                }
                 return Ok(UploadedImageTexture {
                     texture,
                     descriptor,
                     writable: false,
                     selected_resident: None,
                 });
+            }
+            if !storage && !comparison && descriptor.texture_type == 13 {
+                // A per-face render can own bytes inside this array while guest RAM still holds
+                // the pre-render contents. Until a GPU-to-array reconstruction path exists, a
+                // read-only array upload must fail rather than silently sample that stale RAM.
+                refuse_gpu_authored_array_aliases(descriptor, resident_guest_textures, true)?;
             }
             // Slate/UMG font atlases are single-channel sampled images whose whole glyph
             // rendering depends on the T# destination select reaching the shader. Log the raw
@@ -519,24 +704,70 @@ pub(crate) fn upload_image_textures(
                 .base_mip_level
                 .checked_add(descriptor.mip_level_count.max(1))
                 .ok_or("sampled resident mip range overflows")?;
-            if matches!(descriptor.texture_type, 9 | 10) {
-                let replaced = if let Some(resident) = resident_guest_textures
-                .get_mut(&descriptor.guest)
-                .filter(|resident| {
-                    resident.texture_type == descriptor.texture_type
-                        && resident.layer_count == descriptor.layer_count
-                        && resident.mip_level_count >= underlying_mip_count
-                })
-                {
-                    refresh_resident_texture_write_watch(resident)?
-                        == WriteWatchRefresh::Replaced
-                } else {
-                    false
-                };
-                if replaced
+            if matches!(descriptor.texture_type, 9 | 10 | 13) {
+                let matching_resident = resident_guest_textures
+                    .get(&descriptor.guest)
+                    .is_some_and(|resident| {
+                        resident.texture_type == descriptor.texture_type
+                            && resident.base_array_slice == descriptor.base_array_slice
+                            && resident.layer_count == descriptor.layer_count
+                            && resident.mip_level_count >= underlying_mip_count
+                    });
+                let mut remove_resident = false;
+                if matching_resident {
+                    let (refresh, content_changed, gpu_written, complete_authority) = {
+                        let resident = resident_guest_textures
+                            .get_mut(&descriptor.guest)
+                            .expect("matching image resident exists");
+                        let refresh = refresh_resident_texture_write_watch(resident)?;
+                        let validate_array_content = !comparison
+                            && descriptor.texture_type == 13
+                            && !matches!(
+                                refresh,
+                                WriteWatchRefresh::Replaced
+                                    | WriteWatchRefresh::Reprotecting
+                            );
+                        let content_changed = validate_array_content
+                            && (matches!(
+                                refresh,
+                                WriteWatchRefresh::Renewed { was_dirty: true }
+                            ) || resident.write_watch.content_validation_pending()
+                                || resident.write_watch.is_dirty())
+                            && resident.write_watch.content_has_changed()?;
+                        (
+                            refresh,
+                            content_changed,
+                            resident.gpu_written(),
+                            resident.serves_reads(),
+                        )
+                    };
+                    if !comparison && descriptor.texture_type == 13 {
+                        match refresh {
+                            WriteWatchRefresh::Reprotecting => {
+                                return Err(format!(
+                                    "array resident at {:#x} is being reprotected",
+                                    descriptor.guest.address
+                                ));
+                            }
+                            WriteWatchRefresh::Replaced => remove_resident = true,
+                            WriteWatchRefresh::Active | WriteWatchRefresh::Renewed { .. } => {
+                                if (content_changed || !complete_authority) && gpu_written {
+                                    return Err(format!(
+                                        "refusing array bind at {:#x}: CPU-dirty or partially superseded GPU resident cannot serve the complete selected span",
+                                        descriptor.guest.address
+                                    ));
+                                }
+                                remove_resident = content_changed || !complete_authority;
+                            }
+                        }
+                    } else {
+                        remove_resident = refresh == WriteWatchRefresh::Replaced;
+                    }
+                }
+                if remove_resident
                     && let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
                         trace_resident_texture_removal(
-                            "sample-upload-mapping-replaced",
+                            "sample-upload-array-stale-or-replaced",
                             &resident,
                         );
                     }
@@ -564,7 +795,7 @@ pub(crate) fn upload_image_textures(
                         .max_by_key(|(version, _, _)| *version)
                 })
                 .flatten();
-            let resident_descriptor = matches!(descriptor.texture_type, 9 | 10)
+            let resident_descriptor = matches!(descriptor.texture_type, 9 | 10 | 13)
                 .then(|| {
                     let exact = (!comparison)
                         .then(|| {
@@ -574,12 +805,15 @@ pub(crate) fn upload_image_textures(
                                     // Same-extent GPU images keep answering after neighbour
                                     // ResourceSpan over-report clears serves_reads() (SH EyeAdapt).
                                     (resident.serves_reads()
-                                        || (resident.gpu_written()
+                                        || (descriptor.texture_type == 9
+                                            && resident.gpu_written()
                                             && resident_sample_authority_ok(
                                                 resident,
                                                 descriptor.guest,
                                             )))
                                         && resident.texture_type == descriptor.texture_type
+                                        && resident.base_array_slice
+                                            == descriptor.base_array_slice
                                         && resident.layer_count == descriptor.layer_count
                                         && resident.mip_level_count >= underlying_mip_count
                                 })
@@ -747,11 +981,28 @@ pub(crate) fn upload_image_textures(
                     depth_array_textures
                         .get(&DepthArrayKey {
                             descriptor: descriptor.guest,
+                            base_array_slice: descriptor.base_array_slice,
                             layer_count: descriptor.layer_count,
                         })
                         .map(|entry| entry.texture.clone())
                 })
                 .flatten();
+            if !storage
+                && comparison
+                && descriptor.texture_type == 13
+                && depth_array_resolve.is_none()
+                && render_resolve.is_none()
+            {
+                // Comparison sampling cannot bind a color-array resident directly. If no
+                // complete native depth array or retained render resolve exists, even an exact
+                // same-key color resident is an alias whose unpublished Metal bytes make a
+                // guest-memory depth upload stale.
+                refuse_gpu_authored_array_aliases(
+                    descriptor,
+                    resident_guest_textures,
+                    false,
+                )?;
+            }
             let texture = if !storage
                 && descriptor.guest.height == 1
                 && descriptor.guest.pixel_format == MTLPixelFormat::R16Unorm
@@ -909,6 +1160,24 @@ pub(crate) fn upload_image_textures(
                         true,
                     )?
                 }
+            } else if storage && descriptor.texture_type == 13 {
+                if !exact_mode27_array_storage_supported(descriptor) {
+                    return Err(format!(
+                        "image at PC {:#x}: writable array view is outside exact mode-27 residency support",
+                        binding.pc
+                    ));
+                }
+                // The generic render-resolve probe only refreshes mapping replacement. Exact
+                // writable arrays additionally need to reject a CPU/GPU dirty merge and rebuild
+                // clean Metal content after a watched guest write, so always pass through the
+                // array residency state machine.
+                selected_resident = Some(descriptor.guest);
+                ensure_exact_mode27_array_storage_resident(
+                    device,
+                    queue,
+                    descriptor,
+                    resident_guest_textures,
+                )?
             } else if let Some(texture) = depth_array_resolve {
                 texture
             } else if let Some(texture) = render_resolve {
@@ -1066,10 +1335,10 @@ pub(crate) fn upload_image_textures(
             Ok(UploadedImageTexture {
                 texture,
                 descriptor,
-                // The resident 2D path has exact guest writeback today. A writable 3D image stays
-                // resident in the shared sampled-image cache so later GPU reads see its contents;
-                // it must not invalidate that cache through the 2D writeback path.
-                writable: !fallback && writable && descriptor.texture_type == 9,
+                writable: !fallback
+                    && writable
+                    && (descriptor.texture_type == 9
+                        || exact_mode27_array_storage_supported(descriptor)),
                 selected_resident,
             })
         })

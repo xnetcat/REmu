@@ -1301,6 +1301,7 @@ struct ResidentGuestTexture {
     component_reorder_view: Option<Texture>,
     descriptor: GuestTextureDescriptor,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
     mip_level_count: u32,
     write_watch: GuestTextureWriteWatch,
@@ -1569,6 +1570,7 @@ struct SampledTextureKey {
     base_mip_level: u32,
     mip_level_count: u32,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
     comparison: bool,
 }
@@ -1577,6 +1579,7 @@ struct SampledTextureKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DepthArrayKey {
     descriptor: GuestTextureDescriptor,
+    base_array_slice: u32,
     layer_count: u32,
 }
 
@@ -1901,6 +1904,7 @@ struct SharedEventResidentTextureVersion {
     texture: Texture,
     descriptor: GuestTextureDescriptor,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
     mip_level_count: u32,
     content_version: u64,
@@ -1926,6 +1930,7 @@ impl SharedEventDrawTextureOverride {
             && self.sampled.base_mip_level == sampled.base_mip_level
             && self.sampled.mip_level_count == sampled.mip_level_count
             && self.sampled.texture_type == sampled.texture_type
+            && self.sampled.base_array_slice == sampled.base_array_slice
             && self.sampled.layer_count == sampled.layer_count
     }
 }
@@ -2308,6 +2313,7 @@ struct DecodedImageDescriptor {
     base_mip_level: u32,
     mip_level_count: u32,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
 }
 

@@ -241,6 +241,10 @@ fn gpu_rematerialisation_subresources(
         } else {
             0
         };
+        let absolute_surface_z = resident
+            .base_array_slice
+            .checked_add(surface_z)
+            .ok_or("GPU retile absolute surface index overflows")?;
         result.push(Mode64kRematerialisationSubresource {
             width,
             height,
@@ -258,7 +262,7 @@ fn gpu_rematerialisation_subresources(
                 0
             } else {
                 u64::try_from(super::mode27_surface_z_xor(
-                    usize::try_from(surface_z).expect("surface index fits usize"),
+                    usize::try_from(absolute_surface_z).expect("absolute surface index fits usize"),
                 ))
                 .expect("surface xor fits u64")
             },
@@ -797,6 +801,7 @@ impl MetalPresenter {
                     texture: resident.texture.clone(),
                     descriptor: resident.descriptor,
                     texture_type: resident.texture_type,
+                    base_array_slice: resident.base_array_slice,
                     layer_count: resident.layer_count,
                     mip_level_count: resident.mip_level_count,
                     content_version: resident.content_version,
@@ -1783,6 +1788,7 @@ impl MetalPresenter {
                 component_reorder_view: None,
                 descriptor,
                 texture_type: 9,
+                base_array_slice: 0,
                 layer_count: 1,
                 mip_level_count: 1,
                 write_watch,
@@ -1826,6 +1832,7 @@ impl MetalPresenter {
             base_mip_level: 0,
             mip_level_count: target.mip_level_count,
             texture_type: target.texture_type,
+            base_array_slice: 0,
             layer_count: target.layer_count,
         };
         if !discard_guest_contents && self.rematerialise_stale_resident_for_read(target.texture)? {
@@ -2057,6 +2064,7 @@ impl MetalPresenter {
             base_mip_level: 0,
             mip_level_count: 1,
             texture_type: target.texture_type,
+            base_array_slice: 0,
             layer_count: target.layer_count,
         };
         let write_watch = watch_sampled_texture(descriptor)?;
@@ -2075,6 +2083,7 @@ impl MetalPresenter {
                 component_reorder_view: None,
                 descriptor: target.texture,
                 texture_type: target.texture_type,
+                base_array_slice: 0,
                 layer_count: target.layer_count,
                 mip_level_count: 1,
                 write_watch,
@@ -2316,6 +2325,7 @@ impl MetalPresenter {
             base_mip_level: 0,
             mip_level_count: 1,
             texture_type: DEPTH_ARRAY_TEXTURE_TYPE,
+            base_array_slice: 0,
             layer_count: depth.layer_count,
         };
         let write_watch = watch_sampled_texture(descriptor)?;
@@ -2338,6 +2348,7 @@ impl MetalPresenter {
                 component_reorder_view: None,
                 descriptor: depth.texture,
                 texture_type: DEPTH_ARRAY_TEXTURE_TYPE,
+                base_array_slice: 0,
                 layer_count: depth.layer_count,
                 mip_level_count: 1,
                 write_watch,
@@ -2615,6 +2626,7 @@ impl MetalPresenter {
                         texture: resident.texture.clone(),
                         descriptor: resident.descriptor,
                         texture_type: resident.texture_type,
+                        base_array_slice: resident.base_array_slice,
                         layer_count: resident.layer_count,
                         mip_level_count: resident.mip_level_count,
                         content_version: resident.content_version,
@@ -2867,6 +2879,7 @@ pub(crate) fn ensure_resident_texture_in_map(
             component_reorder_view: None,
             descriptor,
             texture_type: 9,
+            base_array_slice: 0,
             layer_count: 1,
             mip_level_count: 1,
             write_watch,

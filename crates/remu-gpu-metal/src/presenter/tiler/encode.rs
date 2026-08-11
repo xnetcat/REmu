@@ -46,6 +46,7 @@ pub(crate) fn gpu_tiler_owns_descriptor(descriptor: GuestTextureDescriptor) -> b
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GpuTilerView {
     pub texture_type: u32,
+    pub base_array_slice: u32,
     pub layer_count: u32,
     pub mip_level_count: u32,
 }
@@ -53,6 +54,7 @@ pub(crate) struct GpuTilerView {
 impl GpuTilerView {
     pub(crate) const SINGLE_LEVEL_2D: Self = Self {
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
         mip_level_count: 1,
     };
@@ -199,6 +201,12 @@ fn plan_upload_subresources(
             view.texture_type
         ));
     }
+    if !matches!(view.texture_type, 11 | 13) && view.base_array_slice != 0 {
+        return Err(format!(
+            "Phase 1G GPU tiler type {} cannot select base array slice {}",
+            view.texture_type, view.base_array_slice
+        ));
+    }
     if view.mip_level_count > 1
         && descriptor.tile_mode == 0
         && (view.texture_type != 9 || view.layer_count != 1)
@@ -281,6 +289,10 @@ fn plan_upload_subresources(
         } else {
             0
         };
+        let absolute_surface_z = view
+            .base_array_slice
+            .checked_add(surface_z)
+            .ok_or("GPU tiler absolute surface index overflows")?;
         subs.push(DetileSubresource {
             width,
             height,
@@ -297,7 +309,8 @@ fn plan_upload_subresources(
             tail_x,
             tail_y,
             surface_z_xor: u64::try_from(mode27_surface_z_xor(
-                usize::try_from(surface_z).map_err(|_| "surface index does not fit usize")?,
+                usize::try_from(absolute_surface_z)
+                    .map_err(|_| "absolute surface index does not fit usize")?,
             ))
             .map_err(|_| "surface xor does not fit u64")?,
             in_tail: u64::from(in_tail),
@@ -506,14 +519,17 @@ pub(crate) fn encode_gpu_upload_from_guest_view(
         view
     };
     let (subs, guest_bytes, linear_length) = plan_upload_subresources(descriptor, plan_view)?;
-    let (guest, guest_offset) = guest_buffer_for_range(
-        device,
-        descriptor.address,
-        guest_bytes,
-        descriptor.tile_mode,
-    )?;
-    let span =
-        ResourceSpan::for_texture(descriptor).ok_or("Phase 1G: guest texture span overflows")?;
+    let span = ResourceSpan::for_image_view(
+        descriptor,
+        0,
+        plan_view.mip_level_count,
+        plan_view.texture_type,
+        plan_view.base_array_slice,
+        plan_view.layer_count,
+    )?
+    .ok_or("Phase 1G: guest image view span overflows")?;
+    let (guest, guest_offset) =
+        guest_buffer_for_range(device, span.address(), guest_bytes, descriptor.tile_mode)?;
     let resource_base = span.range_start();
     let target_base = span.range_start();
 
@@ -684,14 +700,17 @@ pub(crate) fn encode_gpu_publish_to_guest_view(
         ));
     }
     let (subs, guest_bytes, linear_length) = plan_upload_subresources(descriptor, view)?;
-    let (guest, guest_offset) = guest_buffer_for_range(
-        device,
-        descriptor.address,
-        guest_bytes,
-        descriptor.tile_mode,
-    )?;
-    let span =
-        ResourceSpan::for_texture(descriptor).ok_or("Phase 1G: guest texture span overflows")?;
+    let span = ResourceSpan::for_image_view(
+        descriptor,
+        0,
+        view.mip_level_count,
+        view.texture_type,
+        view.base_array_slice,
+        view.layer_count,
+    )?
+    .ok_or("Phase 1G: guest image view span overflows")?;
+    let (guest, guest_offset) =
+        guest_buffer_for_range(device, span.address(), guest_bytes, descriptor.tile_mode)?;
     let resource_base = span.range_start();
     let target_base = span.range_start();
     let linear = device.new_buffer(linear_length, MTLResourceOptions::StorageModePrivate);
@@ -945,6 +964,7 @@ mod tests {
             bc7,
             GpuTilerView {
                 texture_type: 9,
+                base_array_slice: 0,
                 layer_count: 1,
                 mip_level_count: 7,
             },
@@ -976,6 +996,7 @@ mod tests {
             bc7,
             GpuTilerView {
                 texture_type: 9,
+                base_array_slice: 0,
                 layer_count: 1,
                 mip_level_count: 4,
             },
@@ -995,6 +1016,7 @@ mod tests {
             descriptor(9),
             GpuTilerView {
                 texture_type: 11,
+                base_array_slice: 0,
                 layer_count: 2,
                 mip_level_count: 4,
             },
@@ -1018,6 +1040,7 @@ mod tests {
             rgba8,
             GpuTilerView {
                 texture_type: 9,
+                base_array_slice: 0,
                 layer_count: 1,
                 mip_level_count: 10,
             },
@@ -1103,6 +1126,7 @@ mod tests {
             descriptor(5),
             GpuTilerView {
                 texture_type: 13,
+                base_array_slice: 0,
                 layer_count: 3,
                 mip_level_count: 1,
             },
@@ -1113,5 +1137,28 @@ mod tests {
             guest_bytes,
             guest_texture_byte_count(descriptor(5)).unwrap() * 3
         );
+    }
+
+    #[test]
+    fn plans_nonzero_base_array_with_local_metal_slices_and_absolute_mode27_xor() {
+        let (subs, guest_bytes, _) = plan_upload_subresources(
+            descriptor(27),
+            GpuTilerView {
+                texture_type: 13,
+                base_array_slice: 3,
+                layer_count: 2,
+                mip_level_count: 1,
+            },
+        )
+        .expect("mode-27 nonzero-base array plan");
+        let face_bytes = guest_texture_byte_count(descriptor(27)).expect("face bytes");
+        assert_eq!(guest_bytes, 2 * face_bytes);
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].metal_slice, 0);
+        assert_eq!(subs[1].metal_slice, 1);
+        assert_eq!(subs[0].level_offset, 0);
+        assert_eq!(subs[1].level_offset, face_bytes);
+        assert_eq!(subs[0].surface_z_xor, 0xc00);
+        assert_eq!(subs[1].surface_z_xor, 0x200);
     }
 }

@@ -121,6 +121,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     let write_watch = watch_resident_texture(
         descriptor.guest,
         descriptor.texture_type,
+        descriptor.base_array_slice,
         descriptor.layer_count,
         underlying_mip_count,
     )?;
@@ -145,6 +146,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
     let texture = device.new_texture(&metal_descriptor);
     let view = crate::presenter::tiler::GpuTilerView {
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
         mip_level_count: underlying_mip_count,
     };
@@ -194,6 +196,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             component_reorder_view: None,
             descriptor: descriptor.guest,
             texture_type: descriptor.texture_type,
+            base_array_slice: descriptor.base_array_slice,
             layer_count: descriptor.layer_count,
             mip_level_count: underlying_mip_count,
             write_watch,
@@ -254,6 +257,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
     let write_watch = watch_resident_texture(
         descriptor.guest,
         descriptor.texture_type,
+        descriptor.base_array_slice,
         descriptor.layer_count,
         underlying_mip_count,
     )?;
@@ -369,6 +373,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
         component_reorder_view: None,
         descriptor: descriptor.guest,
         texture_type: descriptor.texture_type,
+        base_array_slice: descriptor.base_array_slice,
         layer_count: descriptor.layer_count,
         mip_level_count: underlying_mip_count,
         write_watch,

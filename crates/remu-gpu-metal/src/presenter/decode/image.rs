@@ -91,13 +91,14 @@ fn decode_image_descriptor_impl(
             "Metal image upload does not yet implement texture type {texture_type}"
         ));
     }
+    let mut base_array_slice = 0;
     let layer_count = if texture_type == 10 {
         (words.get(4).copied().unwrap_or_default() & 0x1fff)
             .checked_add(1)
             .ok_or("3D image depth overflows")?
     } else if texture_type == 11 {
         let last_array_slice = words.get(4).copied().unwrap_or_default() & 0x1fff;
-        let base_array_slice = (words.get(4).copied().unwrap_or_default() >> 16) & 0x1fff;
+        base_array_slice = (words.get(4).copied().unwrap_or_default() >> 16) & 0x1fff;
         if base_array_slice > last_array_slice {
             return Err(format!(
                 "invalid cube array slice range {base_array_slice}..={last_array_slice}"
@@ -113,7 +114,7 @@ fn decode_image_descriptor_impl(
     } else if texture_type == 13 {
         let slices = words.get(4).copied().unwrap_or_default();
         let last_array_slice = slices & 0x1fff;
-        let base_array_slice = (slices >> 16) & 0x1fff;
+        base_array_slice = (slices >> 16) & 0x1fff;
         if base_array_slice > last_array_slice {
             return Err(format!(
                 "invalid array slice range {base_array_slice}..={last_array_slice}"
@@ -149,6 +150,7 @@ fn decode_image_descriptor_impl(
         base_level,
         mip_level_count,
         texture_type,
+        base_array_slice,
         layer_count,
     )?;
     Ok(DecodedImageDescriptor {
@@ -160,6 +162,7 @@ fn decode_image_descriptor_impl(
         base_mip_level: base_level,
         mip_level_count,
         texture_type,
+        base_array_slice,
         layer_count,
     })
 }
@@ -226,6 +229,7 @@ pub(crate) fn fallback_image_descriptor(
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type,
+        base_array_slice: 0,
         layer_count,
     })
 }

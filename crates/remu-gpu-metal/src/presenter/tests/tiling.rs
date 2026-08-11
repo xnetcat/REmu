@@ -420,11 +420,65 @@ fn mode27_volume_detile_applies_each_surface_z_xor() {
             base_mip_level: 0,
             mip_level_count: 1,
             texture_type: 10,
+            base_array_slice: 0,
             layer_count,
         },
         &raw,
     )
     .expect("volume detiles");
+    assert_eq!(decoded, expected);
+}
+
+#[test]
+fn mode27_array_detile_uses_absolute_base_slice_for_surface_xor() {
+    let descriptor = GuestTextureDescriptor {
+        address: 0x1_0000,
+        width: 32,
+        height: 32,
+        pitch: 32,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGB10A2Unorm,
+        bytes_per_pixel: 4,
+    };
+    let face_bytes = usize::try_from(guest_texture_byte_count(descriptor).expect("face size fits"))
+        .expect("face size fits usize");
+    let tight_face_bytes = 32 * 32 * 4;
+    let mut expected = Vec::with_capacity(2 * tight_face_bytes);
+    let mut raw = vec![0_u8; 2 * face_bytes];
+    for (local_slice, absolute_slice) in [3_usize, 4].into_iter().enumerate() {
+        let mut linear = vec![0_u8; tight_face_bytes];
+        for (index, texel) in linear.chunks_exact_mut(4).enumerate() {
+            texel.copy_from_slice(
+                &(u32::try_from(absolute_slice).expect("slice fits") << 24
+                    | u32::try_from(index).expect("texel index fits"))
+                .to_ne_bytes(),
+            );
+        }
+        expected.extend_from_slice(&linear);
+        super::copy_linear_to_tiled_at_z(
+            &linear,
+            descriptor,
+            &mut raw[local_slice * face_bytes..(local_slice + 1) * face_bytes],
+            absolute_slice,
+        )
+        .expect("array slice tiles with absolute surface-Z parity");
+    }
+
+    let decoded = super::decode_sampled_texture_linear_from_raw(
+        super::DecodedImageDescriptor {
+            guest: descriptor,
+            span: super::ResourceSpan::for_image_view(descriptor, 0, 1, 13, 3, 2)
+                .expect("selected array span"),
+            destination_select: 0xfac,
+            base_mip_level: 0,
+            mip_level_count: 1,
+            texture_type: 13,
+            base_array_slice: 3,
+            layer_count: 2,
+        },
+        &raw,
+    )
+    .expect("array detiles");
     assert_eq!(decoded, expected);
 }
 
