@@ -15,6 +15,12 @@
 
 use super::{FiberData, FiberJumpContext};
 
+/// Kept in RSI across a non-returning jump so a crash report can identify which ownership path
+/// supplied the context without logging every hot fiber transfer.
+pub(super) const JUMP_SOURCE_FIBER_RESUME: u64 = 1;
+pub(super) const JUMP_SOURCE_ENTRY_RETURN: u64 = 2;
+pub(super) const JUMP_SOURCE_RETURN_TO_THREAD: u64 = 3;
+
 /// Saves the caller's resumable state into `context`.
 ///
 /// Returns 0 when it saves and 1 when execution resumes here through [`fiber_long_jmp`], exactly
@@ -58,7 +64,7 @@ pub(super) unsafe extern "C" fn fiber_set_jmp(_context: *mut FiberJumpContext) -
 #[cfg(target_arch = "x86_64")]
 #[unsafe(naked)]
 #[unsafe(export_name = "remu_fiber_long_jmp")]
-pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberJumpContext) -> ! {
+pub(super) unsafe extern "C" fn fiber_long_jmp(_context: *mut FiberJumpContext, _source: u64) -> ! {
     core::arch::naked_asm!(
         // Restore the saved rounding and masking bits while keeping the live exception flags,
         // which are sticky status the resumed code may still be reading.
