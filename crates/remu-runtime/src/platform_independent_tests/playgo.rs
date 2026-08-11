@@ -119,7 +119,7 @@ fn playgo_reports_the_sdk_full_install_speed_value() {
 }
 
 #[test]
-fn playgo_exposes_only_enabled_chunks_from_the_unpacked_package_manifest() {
+fn playgo_exposes_every_declared_chunk_but_not_chunksets_from_the_package_manifest() {
     let temporary = super::TemporaryTestDirectory::new("playgo-chunks");
     std::fs::write(
         temporary.path.join("playgo-chunkdefs.xml"),
@@ -160,16 +160,16 @@ fn playgo_exposes_only_enabled_chunks_from_the_unpacked_package_manifest() {
         ),
         0
     );
-    assert_eq!(count, 2);
-    assert_eq!(chunks, [0, 2, u16::MAX, u16::MAX]);
+    assert_eq!(count, 3);
+    assert_eq!(chunks, [0, 1, 2, u16::MAX]);
 
-    let disabled = 1_u16;
+    let disabled_placeholder = 1_u16;
     let mut locus = 0xcc_u8;
     assert_eq!(
         play_go_get_locus(
             [
                 1,
-                (&raw const disabled).addr() as u64,
+                (&raw const disabled_placeholder).addr() as u64,
                 1,
                 (&raw mut locus).addr() as u64,
                 0,
@@ -177,7 +177,7 @@ fn playgo_exposes_only_enabled_chunks_from_the_unpacked_package_manifest() {
             ],
             &state,
         ),
-        sce_kernel_error(0x80b2_000c)
+        0
     );
-    assert_eq!(locus, 0xcc);
+    assert_eq!(locus, 3);
 }

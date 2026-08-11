@@ -985,7 +985,7 @@ struct RuntimeServiceState {
     message_dialog_button: u32,
     play_go_initialized: bool,
     play_go_open: bool,
-    /// Package chunk identifiers discovered from the unpacked title metadata.
+    /// Declared package chunk identifiers discovered from the unpacked title metadata.
     ///
     /// Empty means the metadata was unavailable; PlayGo then exposes the mandatory launch chunk
     /// (zero) instead of claiming that every possible 16-bit identifier belongs to the package.
