@@ -535,12 +535,20 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 let backward = target_pc <= instruction.pc;
                 let backward_visits = path.backward_branch_visits(instruction.pc);
                 // SCC is produced entirely by scalar instructions that this evaluator executes,
-                // so its branch direction is exact. Exploring the opposite SCC edge on every
-                // scalar-loop iteration creates thousands of impossible paths and can exhaust the
-                // global path budget. EXEC and VCC may be changed by skipped vector instructions;
-                // retain alternate-edge discovery only for those runtime-vector conditions.
+                // so its branch direction is exact for this dispatch. Metal must nevertheless
+                // type-check the resource instructions on the other side of a forward SCC branch.
+                // Explore that edge once as a supplemental path so its own scalar descriptor loads
+                // feed those resources instead of fabricating them from the initial user pointer.
+                // Never fork backward SCC edges: doing so on every scalar-loop iteration creates
+                // thousands of impossible states and can exhaust the global path budget. EXEC and
+                // VCC branches retain their existing alternate-edge discovery because skipped
+                // vector instructions can change their direction at runtime.
+                let forward_scalar_condition = !backward
+                    && (instruction.opcode.is("SCbranchScc0")
+                        || instruction.opcode.is("SCbranchScc1"));
                 if self.options.discover_static_control_flow
-                    && branch_condition_depends_on_vector_state(instruction.opcode)
+                    && (branch_condition_depends_on_vector_state(instruction.opcode)
+                        || forward_scalar_condition)
                     && (!backward || backward_visits == 0)
                 {
                     let alternate_index = if taken {

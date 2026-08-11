@@ -7,7 +7,7 @@
 use super::*;
 
 #[test]
-fn gives_unreachable_scalar_memory_a_zero_binding_without_reading_it() {
+fn discovers_scalar_memory_across_a_forward_scc_branch() {
     let mut memory = TestMemory::default();
     memory.write(0x2000, &0x1122_3344_u32.to_le_bytes());
     memory.write(0x3000, &0xaabb_ccdd_u32.to_le_bytes());
@@ -56,10 +56,14 @@ fn gives_unreachable_scalar_memory_a_zero_binding_without_reading_it() {
     );
 
     let evaluation = evaluate_shader(&memory, &shader, EvaluationOptions::default())
-        .expect("the exact scalar branch should skip its unreachable load");
+        .expect("the forward scalar branch should retain resources from both paths");
 
     assert_eq!(evaluation.scalar_registers[7], 0xaabb_ccdd);
-    assert_eq!(evaluation.scalar_memory_reads, vec![(0x3000, 0xaabb_ccdd)]);
+    assert_eq!(evaluation.scalar_registers[6], 0);
+    assert_eq!(
+        evaluation.scalar_memory_reads,
+        vec![(0x2000, 0x1122_3344), (0x3000, 0xaabb_ccdd)]
+    );
     assert_eq!(evaluation.global_memory_bindings.len(), 2);
     assert_eq!(
         evaluation.global_memory_bindings[0]
@@ -67,7 +71,7 @@ fn gives_unreachable_scalar_memory_a_zero_binding_without_reading_it() {
             .as_slice(),
         [16]
     );
-    assert_eq!(evaluation.global_memory_bindings[1].base_address, 0);
+    assert_eq!(evaluation.global_memory_bindings[1].base_address, 0x2000);
     assert_eq!(
         evaluation.global_memory_bindings[1]
             .instruction_pcs
