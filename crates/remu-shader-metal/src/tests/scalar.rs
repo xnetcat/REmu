@@ -359,6 +359,46 @@ fn s_brev_b32_leaves_the_scalar_condition_alone() {
 }
 
 #[test]
+fn lowers_unary_first_set_and_destination_bit_update_without_touching_scc() {
+    let first_set = compile_vector_instruction(
+        Instruction {
+            pc: 0x44,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::Known("SFF1I32B32"),
+            words: vec![0],
+            sources: vec![Operand::scalar(10)],
+            destinations: vec![Operand::scalar(12)],
+            control: None,
+        },
+        MetalShaderStage::Compute,
+    );
+    assert!(first_set.source.contains("remu_s_10 == 0u ? 0xFFFFFFFFu"));
+    assert!(first_set.source.contains("ctz(remu_s_10)"));
+    assert!(first_set.source.contains("remu_s_12 = "));
+    assert_eq!(first_set.source.matches("scc = ").count(), 1);
+
+    for (name, operation) in [
+        ("SBitset0B32", "& ~(1u << (remu_s_10 & 31u))"),
+        ("SBitset1B32", "| (1u << (remu_s_10 & 31u))"),
+    ] {
+        let shader = compile_vector_instruction(
+            Instruction {
+                pc: 0x48,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known(name),
+                words: vec![0],
+                sources: vec![Operand::scalar(10)],
+                destinations: vec![Operand::scalar(12)],
+                control: None,
+            },
+            MetalShaderStage::Compute,
+        );
+        assert!(shader.source.contains(&format!("remu_s_12 {operation}")));
+        assert_eq!(shader.source.matches("scc = ").count(), 1, "{name}");
+    }
+}
+
+#[test]
 fn lowers_shifted_scalar_add_with_its_unsigned_carry_out_condition() {
     for (name, shift) in [
         ("SLshl1AddU32", 1),

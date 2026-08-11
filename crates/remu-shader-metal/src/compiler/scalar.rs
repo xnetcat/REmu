@@ -217,7 +217,31 @@ impl Compiler<'_> {
                 self.line(3, &format!("scc = {result} != 0u;"));
                 return Ok(());
             }
+            "SFF1I32B32" => {
+                self.store_scalar(
+                    destination,
+                    &format!("{left} == 0u ? 0xFFFFFFFFu : ctz({left})"),
+                );
+                return Ok(());
+            }
+            "SBitset0B32" => {
+                self.store_scalar(
+                    destination,
+                    &format!("s[{destination}] & ~(1u << ({left} & 31u))"),
+                );
+                return Ok(());
+            }
+            "SBitset1B32" => {
+                self.store_scalar(
+                    destination,
+                    &format!("s[{destination}] | (1u << ({left} & 31u))"),
+                );
+                return Ok(());
+            }
             _ => {}
+        }
+        if instruction.encoding == ShaderEncoding::Sop1 {
+            return Err(format!("unsupported scalar unary opcode {name}"));
         }
         let right = self.raw_source(instruction, 1)?;
         if matches!(name, "SAddcU32" | "SSubbU32") {

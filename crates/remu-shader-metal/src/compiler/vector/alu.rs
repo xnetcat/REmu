@@ -719,6 +719,11 @@ impl Compiler<'_> {
                 self.raw_source(instruction, 1)?,
                 self.raw_source(instruction, 2)?
             ),
+            "VBfmB32" => format!(
+                "(((1u << ({} & 31u)) - 1u) << ({} & 31u))",
+                self.raw_source(instruction, 0)?,
+                self.raw_source(instruction, 1)?
+            ),
             "VBfeU32" => {
                 let value = self.temp("uint", &self.raw_source(instruction, 0)?);
                 let offset = self.temp(
@@ -892,6 +897,16 @@ impl Compiler<'_> {
                     "isnan({source}) ? 0u : ({source} <= -2147483648.0f ? 0x80000000u : ({source} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int)trunc({source}))))"
                 )
             }
+            "VCvtRpiI32F32" => {
+                // RPI is floor(S0 + 0.5), followed by the architectural saturating i32
+                // conversion. Keep the cast on the finite in-range path because Metal leaves
+                // float-to-int overflow and NaN conversion undefined.
+                let source = self.float_source(instruction, 0)?;
+                let rounded = self.temp("float", &format!("floor({source} + 0.5f)"));
+                format!(
+                    "isnan({rounded}) ? 0u : ({rounded} <= -2147483648.0f ? 0x80000000u : ({rounded} >= 2147483648.0f ? 0x7FFFFFFFu : as_type<uint>((int){rounded})))"
+                )
+            }
             "VCvtFlrI32F32" => {
                 let source = self.temp("float", &self.float_source(instruction, 0)?);
                 // The conversion is floor followed by the architectural saturating F32->I32
@@ -949,6 +964,26 @@ impl Compiler<'_> {
                 self.raw_source(instruction, 0)?,
                 self.raw_source(instruction, 1)?
             ),
+            "VCvtPkU8F32" => {
+                // Convert S0 to saturated unsigned byte, then replace the byte selected by the
+                // low two bits of S1 in the S2 accumulator.
+                let source = self.temp("float", &self.float_source(instruction, 0)?);
+                let byte = self.temp(
+                    "uint",
+                    &format!(
+                        "(isnan({source}) || {source} <= 0.0f) ? 0u : ({source} >= 255.0f ? 0xFFu : (uint)trunc({source}))"
+                    ),
+                );
+                let shift = self.temp(
+                    "uint",
+                    &format!("({} & 3u) * 8u", self.raw_source(instruction, 1)?),
+                );
+                let mask = self.temp("uint", &format!("0xFFu << {shift}"));
+                format!(
+                    "({} & ~{mask}) | (({byte} & 0xFFu) << {shift})",
+                    self.raw_source(instruction, 2)?
+                )
+            }
             "VMadF32" | "VFmaF32" | "VMadAkF32" | "VMadMkF32" | "VFmaAkF32" | "VFmaMkF32" => self
                 .float_result(
                     instruction,
