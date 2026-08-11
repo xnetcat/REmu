@@ -98,7 +98,10 @@ impl Compiler<'_> {
         }
         if self.program.instructions.iter().any(|instruction| {
             matches!(instruction.control, Some(InstructionControl::Vop3p(_)))
-                || instruction.opcode.is("VCvtPkrtzF16F32")
+                || instruction
+                    .opcode
+                    .known_name()
+                    .is_some_and(|name| name.contains("F16"))
         }) {
             emit_vop3p_prelude(&mut source);
         }
