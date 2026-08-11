@@ -6,6 +6,19 @@
 
 use super::*;
 
+fn relative_branch(pc: u32, opcode: &'static str, offset: i16) -> Instruction {
+    let mut branch = instruction(
+        pc,
+        ShaderEncoding::Sopp,
+        opcode,
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    branch.words[0] = u32::from(offset.cast_unsigned());
+    branch
+}
+
 #[test]
 fn preserves_initial_image_descriptors_for_statically_inactive_blocks() {
     let image = ImageControl {
@@ -410,6 +423,1027 @@ fn executes_a_scalar_counted_loop_closed_by_an_unconditional_latch() {
     .expect("scalar counted loop should run to its SCC exit");
 
     assert_eq!(evaluation.scalar_registers[107], 16_388);
+}
+
+#[test]
+fn converges_an_scc_exit_derived_from_exec_in_an_unconditional_latch_loop() {
+    let exit = relative_branch(4, "SCbranchScc0", 3);
+    let internal_exec_branch = relative_branch(8, "SCbranchExecz", 1);
+    let back_edge = relative_branch(16, "SBranch", -5);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SAndn2B64",
+                vec![Operand::scalar(0), Operand::scalar(126)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            internal_exec_branch,
+            instruction(
+                12,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        vec![u32::MAX, u32::MAX],
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        16,
+    )
+    .expect("EXEC-derived SCC loop exit should use vector-loop recurrence discovery");
+}
+
+#[test]
+fn keeps_a_scalar_only_scc_exit_exact_in_an_unconditional_latch_loop() {
+    let exit = relative_branch(4, "SCbranchScc0", 2);
+    let back_edge = relative_branch(12, "SBranch", -4);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(0), Operand::scalar(0)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            instruction(
+                8,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(16),
+        ],
+        vec![u32::MAX, u32::MAX],
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        16,
+    )
+    .expect_err("scalar-only SCC loop exit must remain exact");
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+}
+
+#[test]
+fn converges_a_saveexec_scc_exit_in_an_unconditional_latch_loop() {
+    let exit = relative_branch(4, "SCbranchScc0", 2);
+    let back_edge = relative_branch(12, "SBranch", -4);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SAndSaveexecB64",
+                vec![Operand::scalar(2)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            exit,
+            instruction(
+                8,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(16),
+        ],
+        vec![0, 0, u32::MAX, u32::MAX],
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        16,
+    )
+    .expect("saveexec SCC loop exit should use vector-loop recurrence discovery");
+}
+
+#[test]
+fn converges_an_scc_exit_derived_from_an_arbitrary_vop3b_scalar_destination() {
+    let exit = relative_branch(8, "SCbranchScc0", 2);
+    let back_edge = relative_branch(16, "SBranch", -5);
+    let mut registers = vec![u32::MAX, u32::MAX];
+    registers.resize(22, u32::MAX);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Vop3,
+                "VDivScaleF32",
+                vec![Operand::vector(0), Operand::vector(1), Operand::vector(2)],
+                vec![Operand::vector(3)],
+                Some(InstructionControl::Vop3(crate::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: Some(20),
+                })),
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(0), Operand::scalar(20)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            instruction(
+                12,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        registers,
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect("VOP3B-derived SCC loop exit should use vector-loop recurrence discovery");
+}
+
+#[test]
+fn carries_a_preheader_vop3b_scalar_destination_into_the_loop() {
+    let exit = relative_branch(8, "SCbranchScc0", 2);
+    let back_edge = relative_branch(16, "SBranch", -4);
+    let mut registers = vec![u32::MAX, u32::MAX];
+    registers.resize(22, u32::MAX);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Vop3,
+                "VDivScaleF32",
+                vec![Operand::vector(0), Operand::vector(1), Operand::vector(2)],
+                vec![Operand::vector(3)],
+                Some(InstructionControl::Vop3(crate::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: Some(20),
+                })),
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(0), Operand::scalar(20)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            instruction(
+                12,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        registers,
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect("a preheader vector scalar result must taint the SCC value inside the loop");
+}
+
+#[test]
+fn scalar_constant_overwrites_detaint_exec_and_vcc() {
+    for mask_register in [106, 126] {
+        let exit = relative_branch(8, "SCbranchScc0", 2);
+        let back_edge = relative_branch(16, "SBranch", -5);
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Sop1,
+                    "SMovB64",
+                    vec![Operand::source(128, None)],
+                    vec![Operand::scalar(mask_register)],
+                    None,
+                ),
+                instruction(
+                    4,
+                    ShaderEncoding::Sop2,
+                    "SOrB64",
+                    vec![Operand::scalar(0), Operand::scalar(mask_register)],
+                    vec![Operand::scalar(0)],
+                    None,
+                ),
+                exit,
+                instruction(
+                    12,
+                    ShaderEncoding::Sopp,
+                    "SNop",
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                ),
+                back_edge,
+                end(20),
+            ],
+            vec![u32::MAX, u32::MAX],
+        );
+
+        let error = evaluate_shader_within(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+            20,
+        )
+        .expect_err("a scalar constant mask must keep the SCC loop exact");
+
+        assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+    }
+}
+
+#[test]
+fn vector_compares_retaint_their_implicit_default_masks() {
+    for (opcode, mask_register) in [("VCmpEqF32", 106), ("VCmpxEqF32", 126)] {
+        let exit = relative_branch(12, "SCbranchScc0", 2);
+        let back_edge = relative_branch(20, "SBranch", -6);
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Sop1,
+                    "SMovB64",
+                    vec![Operand::source(128, None)],
+                    vec![Operand::scalar(mask_register)],
+                    None,
+                ),
+                instruction(
+                    4,
+                    ShaderEncoding::Vopc,
+                    opcode,
+                    vec![Operand::vector(0), Operand::vector(1)],
+                    Vec::new(),
+                    None,
+                ),
+                instruction(
+                    8,
+                    ShaderEncoding::Sop2,
+                    "SOrB64",
+                    vec![Operand::scalar(0), Operand::scalar(mask_register)],
+                    vec![Operand::scalar(0)],
+                    None,
+                ),
+                exit,
+                instruction(
+                    16,
+                    ShaderEncoding::Sopp,
+                    "SNop",
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                ),
+                back_edge,
+                end(24),
+            ],
+            vec![u32::MAX, u32::MAX],
+        );
+
+        evaluate_shader_within(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+            24,
+        )
+        .expect("a vector compare must re-taint its implicit lane mask destination");
+    }
+}
+
+#[test]
+fn vcmpx_does_not_retaint_vcc_or_an_sdwa_scalar_destination() {
+    for (mask_register, destinations, control) in [
+        (106, Vec::new(), None),
+        (
+            20,
+            vec![Operand::scalar(20)],
+            Some(InstructionControl::Sdwa(crate::SdwaControl {
+                destination_select: 6,
+                destination_unused: 0,
+                source0_select: 6,
+                source1_select: 6,
+                source0_sign_extend: false,
+                source1_sign_extend: false,
+                absolute_mask: 0,
+                negate_mask: 0,
+                output_modifier: 0,
+                clamp: false,
+                scalar_destination: Some(20),
+            })),
+        ),
+    ] {
+        let exit = relative_branch(12, "SCbranchScc0", 2);
+        let back_edge = relative_branch(20, "SBranch", -6);
+        let shader = state(
+            vec![
+                instruction(
+                    0,
+                    ShaderEncoding::Sop1,
+                    "SMovB64",
+                    vec![Operand::source(128, None)],
+                    vec![Operand::scalar(mask_register)],
+                    None,
+                ),
+                instruction(
+                    4,
+                    ShaderEncoding::Vopc,
+                    "VCmpxEqF32",
+                    vec![Operand::vector(0), Operand::vector(1)],
+                    destinations,
+                    control,
+                ),
+                instruction(
+                    8,
+                    ShaderEncoding::Sop2,
+                    "SOrB64",
+                    vec![Operand::scalar(0), Operand::scalar(mask_register)],
+                    vec![Operand::scalar(0)],
+                    None,
+                ),
+                exit,
+                instruction(
+                    16,
+                    ShaderEncoding::Sopp,
+                    "SNop",
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                ),
+                back_edge,
+                end(24),
+            ],
+            vec![u32::MAX, u32::MAX],
+        );
+
+        let error = evaluate_shader_within(
+            &TestMemory::default(),
+            &shader,
+            EvaluationOptions::default(),
+            24,
+        )
+        .expect_err("VCMPX must not taint a non-EXEC mask destination");
+
+        assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+    }
+}
+
+#[test]
+fn ordinary_vop3_compare_retaints_default_vcc() {
+    let exit = relative_branch(12, "SCbranchScc0", 2);
+    let back_edge = relative_branch(20, "SBranch", -6);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SMovB64",
+                vec![Operand::source(128, None)],
+                vec![Operand::scalar(106)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Vop3,
+                "VCmpEqF32",
+                vec![Operand::vector(0), Operand::vector(1)],
+                vec![Operand::vector(2)],
+                Some(InstructionControl::Vop3(crate::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                })),
+            ),
+            instruction(
+                8,
+                ShaderEncoding::Sop2,
+                "SOrB64",
+                vec![Operand::scalar(0), Operand::scalar(106)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            instruction(
+                16,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(24),
+        ],
+        vec![u32::MAX, u32::MAX],
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        24,
+    )
+    .expect("an ordinary VOP3 compare must taint its implicit default VCC destination");
+}
+
+#[test]
+fn saveexec_destination_retains_only_the_old_exec_taint() {
+    let exit = relative_branch(16, "SCbranchScc1", 2);
+    let back_edge = relative_branch(24, "SBranch", -7);
+    let mut registers = vec![u32::MAX; 22];
+    registers[4] = 0;
+    registers[5] = 0;
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SMovB64",
+                vec![Operand::source(128, None)],
+                vec![Operand::scalar(126)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Vop3,
+                "VDivScaleF32",
+                vec![Operand::vector(0), Operand::vector(1), Operand::vector(2)],
+                vec![Operand::vector(3)],
+                Some(InstructionControl::Vop3(crate::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: Some(20),
+                })),
+            ),
+            instruction(
+                8,
+                ShaderEncoding::Sop1,
+                "SOrSaveexecB64",
+                vec![Operand::scalar(20)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            instruction(
+                12,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(4), Operand::scalar(4)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            exit,
+            instruction(
+                20,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(28),
+        ],
+        registers,
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        28,
+    )
+    .expect_err(
+        "saved old EXEC must remain untainted when only the new EXEC source is vector-tainted",
+    );
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+}
+
+#[test]
+fn saveexec_b32_ignores_exec_hi_taint() {
+    let exit = relative_branch(16, "SCbranchScc1", 2);
+    let back_edge = relative_branch(24, "SBranch", -7);
+    let mut registers = vec![0; 21];
+    registers[20] = u32::MAX;
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SMovB64",
+                vec![Operand::source(128, None)],
+                vec![Operand::scalar(126)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Vop3,
+                "VReadlaneB32",
+                vec![Operand::vector(0), Operand::source(128, None)],
+                vec![Operand::scalar(127)],
+                Some(InstructionControl::Vop3(crate::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                })),
+            ),
+            instruction(
+                8,
+                ShaderEncoding::Sop1,
+                "SOrSaveexecB32",
+                vec![Operand::scalar(20)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            instruction(
+                12,
+                ShaderEncoding::Sop2,
+                "SAndB32",
+                vec![Operand::scalar(4), Operand::scalar(4)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            exit,
+            instruction(
+                20,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(28),
+        ],
+        registers,
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        28,
+    )
+    .expect_err("SaveexecB32 must ignore EXEC_HI when deriving destination, EXEC_LO and SCC taint");
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+}
+
+#[test]
+fn taints_both_halves_of_a_bitreplicate_destination() {
+    let exit = relative_branch(8, "SCbranchScc0", 2);
+    let back_edge = relative_branch(16, "SBranch", -5);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop1,
+                "SBitreplicateB64B32",
+                vec![Operand::scalar(126)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAndB32",
+                vec![Operand::scalar(1), Operand::scalar(1)],
+                vec![Operand::scalar(2)],
+                None,
+            ),
+            exit,
+            instruction(
+                12,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        Vec::new(),
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect("the high half of a mask-derived bitreplicate remains mask-derived");
+}
+
+#[test]
+fn propagates_a_mask_derived_scalar_memory_address_to_the_loaded_value() {
+    let pointer = 0x1000_u64;
+    let mut memory = TestMemory::default();
+    memory.write(pointer, &1_u32.to_le_bytes());
+    let exit = relative_branch(12, "SCbranchScc0", 2);
+    let back_edge = relative_branch(20, "SBranch", -6);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(0), Operand::scalar(126)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Smem,
+                "SLoadDword",
+                vec![Operand::scalar(0)],
+                vec![Operand::scalar(4)],
+                Some(InstructionControl::ScalarMemory(ScalarMemoryControl {
+                    destination_count: 1,
+                    immediate_offset_bytes: 0,
+                    dynamic_offset_register: None,
+                })),
+            ),
+            instruction(
+                8,
+                ShaderEncoding::Sop2,
+                "SAndB32",
+                vec![Operand::scalar(4), Operand::scalar(4)],
+                vec![Operand::scalar(4)],
+                None,
+            ),
+            exit,
+            instruction(
+                16,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(24),
+        ],
+        vec![pointer as u32, (pointer >> 32) as u32],
+    );
+
+    evaluate_shader_within(&memory, &shader, EvaluationOptions::default(), 28)
+        .expect("a load selected by a mask-derived address must keep the loop vector-controlled");
+}
+
+#[test]
+fn does_not_taint_the_register_beside_a_single_dword_vector_scalar_destination() {
+    let exit = relative_branch(8, "SCbranchScc0", 2);
+    let back_edge = relative_branch(16, "SBranch", -5);
+    let mut registers = vec![u32::MAX];
+    registers.resize(22, u32::MAX);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Vop3,
+                "VReadlaneB32",
+                vec![Operand::vector(0), Operand::source(128, None)],
+                vec![Operand::scalar(20)],
+                Some(InstructionControl::Vop3(crate::Vop3Control {
+                    absolute_mask: 0,
+                    negate_mask: 0,
+                    output_modifier: 0,
+                    clamp: false,
+                    operand_select: 0,
+                    scalar_destination: None,
+                })),
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAndB32",
+                vec![Operand::scalar(21), Operand::scalar(21)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            instruction(
+                12,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        registers,
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect_err("V_READLANE_B32 must not taint the neighboring scalar register");
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+}
+
+#[test]
+fn follows_scc_taint_across_a_branch_target() {
+    let skip_unreachable_scalar_definition = relative_branch(4, "SBranch", 1);
+    let exit = relative_branch(12, "SCbranchScc0", 2);
+    let back_edge = relative_branch(20, "SBranch", -6);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SAndn2B64",
+                vec![Operand::scalar(0), Operand::scalar(126)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            skip_unreachable_scalar_definition,
+            instruction(
+                8,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(2), Operand::scalar(2)],
+                vec![Operand::scalar(2)],
+                None,
+            ),
+            exit,
+            instruction(
+                16,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(24),
+        ],
+        vec![u32::MAX, u32::MAX, 0, 0],
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect("the SCC definition reaching through a branch target remains mask-derived");
+}
+
+#[test]
+fn merges_mask_taint_from_one_predecessor_at_an_scc_join() {
+    let select_scalar_arm = relative_branch(0, "SCbranchExecz", 2);
+    let join = relative_branch(8, "SBranch", 1);
+    let exit = relative_branch(16, "SCbranchScc0", 2);
+    let back_edge = relative_branch(24, "SBranch", -7);
+    let shader = state(
+        vec![
+            select_scalar_arm,
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAndn2B64",
+                vec![Operand::scalar(0), Operand::scalar(126)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            join,
+            instruction(
+                12,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(2), Operand::scalar(2)],
+                vec![Operand::scalar(2)],
+                None,
+            ),
+            exit,
+            instruction(
+                20,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(28),
+        ],
+        vec![u32::MAX, u32::MAX, 0, 0],
+    );
+
+    evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        24,
+    )
+    .expect("one mask-derived predecessor makes the SCC join vector-controlled");
+}
+
+#[test]
+fn ignores_an_unreachable_mask_derived_scc_definition_before_a_branch_target() {
+    let skip_unreachable_mask_definition = relative_branch(4, "SBranch", 1);
+    let exit = relative_branch(12, "SCbranchScc0", 2);
+    let back_edge = relative_branch(20, "SBranch", -6);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(0), Operand::scalar(0)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            skip_unreachable_mask_definition,
+            instruction(
+                8,
+                ShaderEncoding::Sop2,
+                "SAndn2B64",
+                vec![Operand::scalar(2), Operand::scalar(126)],
+                vec![Operand::scalar(2)],
+                None,
+            ),
+            exit,
+            instruction(
+                16,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(24),
+        ],
+        vec![u32::MAX, u32::MAX, u32::MAX, u32::MAX],
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect_err("an unreachable mask definition must not taint the scalar SCC loop");
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+}
+
+#[test]
+fn keeps_a_b64_shift_with_a_scalar_s125_count_exact() {
+    let exit = relative_branch(4, "SCbranchScc0", 2);
+    let back_edge = relative_branch(12, "SBranch", -4);
+    let mut registers = vec![u32::MAX, u32::MAX];
+    registers.resize(126, 0);
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SLshlB64",
+                vec![Operand::scalar(0), Operand::scalar(125)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            exit,
+            instruction(
+                8,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(16),
+        ],
+        registers,
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        16,
+    )
+    .expect_err("a 32-bit shift count beside EXEC must not taint the scalar SCC loop");
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
+}
+
+#[test]
+fn keeps_b64_bitmask_controls_beside_exec_exact() {
+    let exit = relative_branch(8, "SCbranchScc0", 2);
+    let back_edge = relative_branch(16, "SBranch", -5);
+    let mut registers = vec![0, 0, u32::MAX, u32::MAX];
+    registers.resize(126, 0);
+    registers[124] = 1;
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Sop2,
+                "SBfmB64",
+                vec![Operand::scalar(124), Operand::scalar(125)],
+                vec![Operand::scalar(0)],
+                None,
+            ),
+            instruction(
+                4,
+                ShaderEncoding::Sop2,
+                "SAndB64",
+                vec![Operand::scalar(0), Operand::scalar(2)],
+                vec![Operand::scalar(2)],
+                None,
+            ),
+            exit,
+            instruction(
+                12,
+                ShaderEncoding::Sopp,
+                "SNop",
+                Vec::new(),
+                Vec::new(),
+                None,
+            ),
+            back_edge,
+            end(20),
+        ],
+        registers,
+    );
+
+    let error = evaluate_shader_within(
+        &TestMemory::default(),
+        &shader,
+        EvaluationOptions::default(),
+        20,
+    )
+    .expect_err("S_BFM_B64 controls beside EXEC must not taint the scalar SCC loop");
+
+    assert!(matches!(error, EvaluationError::ControlFlowLimit { .. }));
 }
 
 #[test]

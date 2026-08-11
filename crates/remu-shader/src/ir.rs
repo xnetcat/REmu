@@ -25,7 +25,7 @@ pub use controls::{
 
 use liveness::{
     evaluation_scalar_liveness, insert_input_scalar_range, insert_scalar_range,
-    instruction_requires_evaluation,
+    instruction_requires_evaluation, scalar_condition_depends_on_vector_mask,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -691,6 +691,21 @@ impl Program {
             .get(index)
             .copied()
             .unwrap_or(false)
+    }
+
+    pub(crate) fn scalar_condition_depends_on_vector_mask(
+        &self,
+        latch_index: usize,
+        condition_index: usize,
+    ) -> bool {
+        if condition_index > latch_index {
+            return false;
+        }
+        self.instructions
+            .get(..=latch_index)
+            .is_some_and(|instructions| {
+                scalar_condition_depends_on_vector_mask(instructions, condition_index)
+            })
     }
 
     #[must_use]
