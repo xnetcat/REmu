@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use std::mem::size_of;
+use std::time::Duration;
 
 use super::AcmEngine;
 use super::abi::{AcmError, AcmFormat, SceAcmBatchCommand, SceAcmBatchInfo, return_error};
-use super::batch::{Command, decode_buffers};
-use super::builders::{append_tagged_test_record, append_test_record};
+use super::batch::{AcmStatistics, BatchPlan, Command, Notification, PendingWrite, decode_buffers};
+use super::builders::{append_tagged_test_record, append_test_record, batch_job_notification};
 
 const SUCCESS: u64 = 0;
 
@@ -30,6 +31,21 @@ struct AlignedBytes([u8; 256]);
 fn write_word(bytes: &mut [u8], index: usize, word: u64) {
     let start = index * 8;
     bytes[start..start + 8].copy_from_slice(&word.to_le_bytes());
+}
+
+fn decode_inline_words(
+    arena: &mut AlignedBytes,
+    words: &[u64],
+) -> Result<super::batch::BatchPlan, AcmError> {
+    arena.0.fill(0);
+    for (index, word) in words.iter().copied().enumerate() {
+        write_word(&mut arena.0, index, word);
+    }
+    decode_buffers(&[SceAcmBatchInfo {
+        buffer: arena.0.as_mut_ptr() as u64,
+        offset: (words.len() * 8) as u64,
+        size: arena.0.len() as u64,
+    }])
 }
 
 fn create_context(engine: &AcmEngine) -> u32 {
@@ -385,4 +401,152 @@ fn destroy_drains_and_reset_cancels() {
         assert_eq!(waiter.join().unwrap(), return_error(AcmError::InvalidBatch));
     });
     assert_eq!(create_context(&engine), 1);
+}
+
+#[test]
+fn every_public_command_id_has_a_typed_decoder_and_reserved_bits_are_rejected() {
+    let mut arena = AlignedBytes([0; 256]);
+    let mut statistics = [0_u32; 6];
+    let mut notification = AlignedBytes([0; 256]);
+    for id in 0_u8..=17 {
+        let mut words = if matches!(id, 2..=5 | 12 | 15) {
+            vec![0, u64::from(id)]
+        } else {
+            vec![u64::from(id)]
+        };
+        match id {
+            11 => words.push(std::ptr::from_mut(&mut statistics) as u64),
+            14 => {
+                words[0] |= 1 << 8;
+                words.push(notification.0.as_mut_ptr() as u64);
+            }
+            _ => {}
+        }
+        assert!(
+            decode_inline_words(&mut arena, &words).is_ok(),
+            "command {id} must have a typed decoder"
+        );
+    }
+    assert_eq!(
+        decode_inline_words(&mut arena, &[18]),
+        Err(AcmError::MalformedBatch)
+    );
+    assert_eq!(
+        decode_inline_words(&mut arena, &[1 | (0xff << 8)]),
+        Err(AcmError::MalformedBatch),
+        "barrier has no public payload fields"
+    );
+}
+
+#[test]
+fn notification_is_written_last_and_failed_batches_publish_no_partial_output() {
+    let mut output = [1_u8, 2, 3, 4];
+    let before = output;
+    let mut notification = AlignedBytes([0; 256]);
+    let plan = BatchPlan {
+        commands: vec![
+            Command::TestWrite(PendingWrite {
+                address: output.as_mut_ptr() as u64,
+                bytes: vec![9, 8, 7, 6],
+            }),
+            Command::TestFault,
+        ],
+        notification: Some(Notification {
+            value: 7,
+            address: notification.0.as_mut_ptr() as u64,
+        }),
+    };
+
+    assert_eq!(
+        super::execute_plan_with_elapsed_for_test(&plan, Duration::from_millis(2)),
+        Err(AcmError::PageFault)
+    );
+    assert_eq!(output, before);
+    assert_eq!(notification.0[0], 0);
+}
+
+#[test]
+fn statistics_scale_real_elapsed_time_and_mark_unavailable_history() {
+    let mut statistics = AcmStatistics {
+        flags: 0,
+        usage_batch: 0,
+        usage_intervals: [0, 1 << 20, u32::MAX],
+        pad: 0,
+    };
+    let plan = BatchPlan {
+        commands: vec![Command::Statistics(super::batch::Statistics {
+            address: address_mut(&mut statistics),
+        })],
+        notification: None,
+    };
+
+    assert_eq!(
+        super::execute_plan_with_elapsed_for_test(&plan, Duration::from_millis(2)),
+        Ok(())
+    );
+    assert!(statistics.usage_batch > 0);
+    assert_eq!(statistics.usage_intervals[0], u32::MAX);
+    assert_ne!(statistics.usage_intervals[1], u32::MAX);
+}
+
+#[test]
+fn notification_builder_is_exact_aligned_and_failure_atomic() {
+    let mut arena = AlignedBytes([0; 256]);
+    let mut info = SceAcmBatchInfo {
+        buffer: arena.0.as_mut_ptr() as u64,
+        offset: 0,
+        size: 16,
+    };
+    let mut notification = AlignedBytes([0xaa; 256]);
+    assert_eq!(
+        batch_job_notification(args(&[
+            address_mut(&mut info),
+            7,
+            notification.0.as_mut_ptr() as u64,
+        ])),
+        SUCCESS
+    );
+    assert_eq!(info.offset, 16);
+    assert!(notification.0[..128].iter().all(|byte| *byte == 0));
+    let plan = decode_buffers(&[info]).unwrap();
+    assert_eq!(plan.notification.unwrap().value, 7);
+
+    let full = info;
+    notification.0.fill(0xaa);
+    assert_eq!(
+        batch_job_notification(args(&[
+            address_mut(&mut info),
+            8,
+            notification.0.as_mut_ptr() as u64,
+        ])),
+        return_error(AcmError::BatchBufferFull)
+    );
+    assert_eq!(info, full);
+    assert!(notification.0.iter().all(|byte| *byte == 0xaa));
+
+    info.offset = 0;
+    assert_eq!(
+        batch_job_notification(args(&[
+            address_mut(&mut info),
+            1,
+            notification.0.as_mut_ptr() as u64 + 1,
+        ])),
+        return_error(AcmError::Alignment)
+    );
+    assert_eq!(info.offset, 0);
+}
+
+#[test]
+fn execution_history_is_bounded_to_256_samples() {
+    let engine = AcmEngine::new();
+    let context = create_context(&engine);
+    for _ in 0..300 {
+        let batch = start_empty_batch(&engine, context, 0).unwrap();
+        assert!(engine.execute_next_for_test());
+        assert_eq!(
+            engine.batch_wait(args(&[u64::from(context), u64::from(batch), 0])),
+            SUCCESS
+        );
+    }
+    assert_eq!(engine.history_len_for_test(), 256);
 }
