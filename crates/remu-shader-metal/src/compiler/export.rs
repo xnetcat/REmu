@@ -42,35 +42,6 @@ pub(crate) fn mesh_ngg_packed_export_sgpr(program: &Program) -> Option<u32> {
     })
 }
 
-/// Locate the VGPR that carries the NGG compacted vertex id used to gate POS export
-/// (typically `V_CMPX_* sN, vM` immediately before the first `EXP POS`).
-pub(crate) fn mesh_export_vertex_vgpr(program: &Program) -> Option<u32> {
-    let exp_pos = program.instructions.iter().position(|instruction| {
-        matches!(
-            instruction.control.as_ref(),
-            Some(InstructionControl::Export(export)) if export.target == 12
-        )
-    })?;
-    for instruction in program.instructions[..exp_pos].iter().rev().take(32) {
-        if !instruction.opcode.starts_with("VCmpx") {
-            continue;
-        }
-        let mut vgpr = None;
-        let mut has_sgpr = false;
-        for source in &instruction.sources {
-            match source.kind {
-                OperandKind::VectorRegister => vgpr = Some(source.value),
-                OperandKind::ScalarRegister => has_sgpr = true,
-                _ => {}
-            }
-        }
-        if has_sgpr {
-            return vgpr;
-        }
-    }
-    None
-}
-
 impl Compiler<'_> {
     pub(crate) fn emit_export(&mut self, instruction: &Instruction) -> Result<(), String> {
         let Some(InstructionControl::Export(export)) = instruction.control.as_ref() else {
@@ -101,32 +72,39 @@ impl Compiler<'_> {
                     self.options.mesh_max_primitive_count
                 ),
             );
+            // A GFX10 primitive word carries 9-bit vertex fields (0..511) while the Metal mesh
+            // declares only mesh_max_vertex_count vertices. An index beyond that range could
+            // never have been exported, and passing it to set_index is undefined behavior in
+            // Metal; keep the degenerate prefill for such primitives instead.
             self.line(
                 4,
                 &format!(
-                    "remu_mesh.set_index(remu_thread_index * 3u + 0u, ({primitive} >> 0u) & 0x1ffu);"
+                    "uint remu_prim_i0 = ({primitive} >> 0u) & 0x1ffu;\n\
+                     \x20           uint remu_prim_i1 = ({primitive} >> 10u) & 0x1ffu;\n\
+                     \x20           uint remu_prim_i2 = ({primitive} >> 20u) & 0x1ffu;\n\
+                     \x20           if (max(max(remu_prim_i0, remu_prim_i1), remu_prim_i2) < {}u) {{",
+                    self.options.mesh_max_vertex_count
                 ),
             );
             self.line(
-                4,
-                &format!(
-                    "remu_mesh.set_index(remu_thread_index * 3u + 1u, ({primitive} >> 10u) & 0x1ffu);"
-                ),
+                5,
+                "remu_mesh.set_index(remu_thread_index * 3u + 0u, remu_prim_i0);",
             );
             self.line(
-                4,
-                &format!(
-                    "remu_mesh.set_index(remu_thread_index * 3u + 2u, ({primitive} >> 20u) & 0x1ffu);"
-                ),
+                5,
+                "remu_mesh.set_index(remu_thread_index * 3u + 1u, remu_prim_i1);",
+            );
+            self.line(
+                5,
+                "remu_mesh.set_index(remu_thread_index * 3u + 2u, remu_prim_i2);",
             );
             if self.options.render_target_array_length > 1 {
                 self.line(
-                    4,
-                    &format!(
-                        "remu_mesh_primitive_source_vertices[remu_thread_index] = {primitive} & 0x1ffu;"
-                    ),
+                    5,
+                    "remu_mesh_primitive_source_vertices[remu_thread_index] = remu_prim_i0;",
                 );
             }
+            self.line(4, "}");
             self.line(3, "}");
             return Ok(());
         }
@@ -161,65 +139,7 @@ impl Compiler<'_> {
                 values[0], values[1], values[2], values[3]
             ),
         );
-        if field == "position" {
-            self.convert_compacted_mesh_position();
-        }
-        self.publish_compacted_mesh_vertex();
         Ok(())
-    }
-
-    /// Convert a compacted mesh position at its POS export. Later PARAM exports publish the
-    /// same already-converted position, while a loop's next POS overwrites it before converting
-    /// again. This avoids repeatedly applying reciprocal-W conversion to one output record.
-    fn convert_compacted_mesh_position(&mut self) {
-        if self.options.stage != MetalShaderStage::Mesh || self.mesh_export_vertex_vgpr.is_none() {
-            return;
-        }
-        const VTX_XY_FMT: u32 = 1 << 8;
-        const VTX_Z_FMT: u32 = 1 << 9;
-        const VTX_W0_FMT: u32 = 1 << 10;
-        let control = self.options.viewport_transform_control;
-        let xy_predivided = control & VTX_XY_FMT != 0;
-        let z_predivided = control & VTX_Z_FMT != 0;
-        let w_is_w0 = control & VTX_W0_FMT != 0;
-        if !xy_predivided && !z_predivided && w_is_w0 {
-            return;
-        }
-        let w0 = if w_is_w0 {
-            "remu_out.position.w".to_owned()
-        } else {
-            "1.0f / remu_out.position.w".to_owned()
-        };
-        self.line(3, &format!("if (exec) {{ float remu_position_w0 = {w0};"));
-        if xy_predivided {
-            self.line(4, "remu_out.position.xy *= remu_position_w0;");
-        }
-        if z_predivided {
-            self.line(4, "remu_out.position.z *= remu_position_w0;");
-        }
-        self.line(4, "remu_out.position.w = remu_position_w0;");
-        self.line(3, "}");
-    }
-
-    /// Publish the current `remu_out` under the guest compacted vertex id so Metal
-    /// `set_vertex(i, …)` receives the payload that EXP wrote for vertex `i`, not the
-    /// payload left in the arbitrary thread that happens to own `remu_thread_index == i`.
-    /// Direct publication is also required for full-LDS shaders: a threadgroup staging array
-    /// would exceed Metal's 32-KiB limit even though the guest allocation itself is valid.
-    fn publish_compacted_mesh_vertex(&mut self) {
-        let Some(vgpr) = self.mesh_export_vertex_vgpr else {
-            return;
-        };
-        if self.options.stage != MetalShaderStage::Mesh {
-            return;
-        }
-        self.line(
-            3,
-            &format!(
-                "if (exec && v[{vgpr}] < {}u) remu_mesh.set_vertex(v[{vgpr}], remu_out);",
-                self.options.mesh_max_vertex_count
-            ),
-        );
     }
 
     fn emit_vertex_misc_export(
@@ -248,16 +168,13 @@ impl Compiler<'_> {
             ),
             MetalShaderStage::Mesh => {
                 let max = self.options.mesh_max_vertex_count;
-                match self.mesh_export_vertex_vgpr {
-                    Some(vgpr) => (
-                        format!("remu_mesh_render_target_indices[v[{vgpr}]]"),
-                        format!(" && v[{vgpr}] < {max}u"),
-                    ),
-                    None => (
-                        "remu_mesh_render_target_indices[remu_thread_index]".to_owned(),
-                        format!(" && remu_thread_index < {max}u"),
-                    ),
-                }
+                // NGG hardware assigns the export slot from the exporting thread's workgroup
+                // invocation index; the guest's own compaction already moved each surviving
+                // vertex into the exporting thread (Mesa ac_nir_lower_ngg contract).
+                (
+                    "remu_mesh_render_target_indices[remu_thread_index]".to_owned(),
+                    format!(" && remu_thread_index < {max}u"),
+                )
             }
             _ => return Ok(()),
         };
@@ -313,7 +230,6 @@ impl Compiler<'_> {
                 );
             }
         }
-        self.publish_compacted_mesh_vertex();
         Ok(())
     }
 

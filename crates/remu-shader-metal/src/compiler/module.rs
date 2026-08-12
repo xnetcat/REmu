@@ -666,6 +666,17 @@ impl Compiler<'_> {
                      \x20           | ((remu_mesh_wave_count & 0xfu) << 28u);\n\
                      \x20   }}\n",
                 );
+                if contains_register_reference(&self.body, 's', 2) {
+                    // Merged NGG SGPR s2 is gs_tg_info: [11:0] ordered_id (unused here),
+                    // [20:12] workgroup input vertex count, [30:22] workgroup input primitive
+                    // count (Mesa ac_nir_lower_intrinsics_to_args.c). Non-culling NGG shaders
+                    // build the GS_ALLOC_REQ M0 payload directly from these fields; leaving s2
+                    // unseeded publishes a zero primitive count and erases the whole draw.
+                    source.push_str(
+                        "    s[2] = ((remu_mesh_input_vertex_count & 0x1ffu) << 12u)\n\
+                         \x20       | ((remu_mesh_input_primitive_count & 0x1ffu) << 22u);\n",
+                    );
+                }
                 if contains_register_reference(&self.body, 'v', 0) {
                     if !self.options.ngg_primgen_passthrough {
                         source.push_str("    v[0] = remu_mesh_gs_vtx_offset_0;\n");
@@ -712,7 +723,20 @@ impl Compiler<'_> {
         if contains_register_reference(&self.body, 's', EXEC_LO)
             || contains_register_reference(&self.body, 's', EXEC_HI)
         {
-            let (low, high) = self.ballot_words("true");
+            // Hardware launches a merged NGG wave with the full architectural EXEC mask and
+            // the shader narrows it against merged_wave_info (Mesa aco lanecount_to_mask). A
+            // ballot over the Metal threads that happen to exist would zero the tail of a
+            // partial final wave and skew lane counts taken before the guest's own narrowing.
+            let (low, high) = if self.options.stage == MetalShaderStage::Mesh {
+                let high = if self.split_wave64() {
+                    "0xffffffffu"
+                } else {
+                    "0u"
+                };
+                ("0xffffffffu".to_owned(), high.to_owned())
+            } else {
+                self.ballot_words("true")
+            };
             if contains_register_reference(&self.body, 's', EXEC_LO) {
                 let _ = writeln!(source, "    s[{EXEC_LO}] = {low};");
             }
@@ -916,16 +940,17 @@ impl Compiler<'_> {
                         self.options.mesh_max_primitive_count
                     );
                 }
-                // Compacted outputs were published directly at each EXP. Non-compacted mesh
-                // shaders retain one vertex per lane and publish here after position conversion.
-                if self.mesh_export_vertex_vgpr.is_none() {
-                    append_vertex_position_format_conversion(
-                        &mut source,
-                        "remu_out.position",
-                        self.options.viewport_transform_control,
-                        None,
-                    );
-                }
+                // NGG hardware derives the vertex export slot from the exporting thread's
+                // workgroup invocation index (Mesa ac_nir_lower_ngg: compaction moves data
+                // between threads; EXP names no slot). Every lane therefore retains exactly
+                // one output vertex and publishes it here after position conversion; lanes
+                // that never exported publish the degenerate w=0 default record.
+                append_vertex_position_format_conversion(
+                    &mut source,
+                    "remu_out.position",
+                    self.options.viewport_transform_control,
+                    None,
+                );
                 if self.options.diagnostic_capture_vertex_position {
                     let diagnostic_enable_index = self
                         .evaluation
@@ -969,22 +994,14 @@ impl Compiler<'_> {
                          \x20   }}"
                     );
                 }
-                if self.mesh_export_vertex_vgpr.is_some() {
-                    source.push_str(
-                        "    if (remu_thread_index == 0u) {\n\
-                         \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
-                         \x20   }\n",
-                    );
-                } else {
-                    let _ = writeln!(
-                        source,
-                        "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                         \x20   if (remu_thread_index == 0u) {{\n\
-                         \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
-                         \x20   }}",
-                        self.options.mesh_max_vertex_count
-                    );
-                }
+                let _ = writeln!(
+                    source,
+                    "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                     \x20   if (remu_thread_index == 0u) {{\n\
+                     \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
+                     \x20   }}",
+                    self.options.mesh_max_vertex_count
+                );
             }
         }
         source.push_str("}\n");

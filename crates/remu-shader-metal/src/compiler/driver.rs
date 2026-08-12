@@ -15,7 +15,7 @@ use crate::compiler::control_flow::{
     ControlFlowLowering, LoweringFailure, analyze_control_flow, branch_target,
     combined_lowering_error, dispatcher_basic_blocks, scalar_branch_taken_condition,
 };
-use crate::compiler::export::{mesh_export_vertex_vgpr, mesh_ngg_packed_export_sgpr};
+use crate::compiler::export::mesh_ngg_packed_export_sgpr;
 use crate::compiler::image::{
     ImageKind, image_component_type, is_storage_image, is_writable_image,
 };
@@ -286,29 +286,18 @@ impl<'a> Compiler<'a> {
                 METAL_THREADGROUP_MEMORY_LIMIT_BYTES
             )));
         }
-        // Compacted-vertex EXP indexing is architectural NGG export layout (PRIM indices name
-        // compacted slots). It still requires proven Q5 NggRegisters so an unproven mesh ABI
-        // cannot invent capacity. The GFX10 empty-workaround count rewrite stays deleted:
-        // detecting that pattern without proven registers is a loud refuse; with proof the
-        // guest GS_ALLOC_REQ / M0 sequence lowers as-is.
-        let mesh_export_vertex_vgpr = if options.stage == MetalShaderStage::Mesh {
-            mesh_export_vertex_vgpr(program)
-        } else {
-            None
-        };
-        if options.stage == MetalShaderStage::Mesh && !options.ngg_registers_proven {
-            if mesh_ngg_packed_export_sgpr(program).is_some() {
-                return Err(MetalCompileError::InvalidInterface(
-                    "NGG GFX10 empty-workaround / packed export-count sequence requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing the title-specific snapshot/restore peephole"
-                        .into(),
-                ));
-            }
-            if mesh_export_vertex_vgpr.is_some() {
-                return Err(MetalCompileError::InvalidInterface(
-                    "NGG compacted-vertex EXP gate requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing compacted-record staging without SDK sizing"
-                        .into(),
-                ));
-            }
+        // The GFX10 empty-workaround count rewrite stays deleted: detecting that pattern
+        // without proven registers is a loud refuse; with proof the guest GS_ALLOC_REQ / M0
+        // sequence lowers as-is. Vertex export slots need no heuristic: NGG hardware derives
+        // the slot from the exporting thread's workgroup invocation index.
+        if options.stage == MetalShaderStage::Mesh
+            && !options.ngg_registers_proven
+            && mesh_ngg_packed_export_sgpr(program).is_some()
+        {
+            return Err(MetalCompileError::InvalidInterface(
+                "NGG GFX10 empty-workaround / packed export-count sequence requires proven NggRegisters (Q5 mesh_from_ngg_registers); refusing the title-specific snapshot/restore peephole"
+                    .into(),
+            ));
         }
 
         let compiler = Self {
@@ -323,10 +312,6 @@ impl<'a> Compiler<'a> {
             image_kinds,
             image_slots,
             control_flow,
-            mesh_export_vertex_vgpr: options
-                .ngg_registers_proven
-                .then_some(mesh_export_vertex_vgpr)
-                .flatten(),
         };
         let total_threadgroup_memory = compiler.total_threadgroup_memory_bytes();
         if total_threadgroup_memory.is_none_or(|bytes| bytes > METAL_THREADGROUP_MEMORY_LIMIT_BYTES)

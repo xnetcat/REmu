@@ -566,22 +566,32 @@ fn empty_workaround_ngg_program() -> Program {
 }
 
 #[test]
-fn compacted_vertex_exp_gate_refuses_without_proven_ngg_registers() {
-    // Poppy Slate UI: EXP gated by `V_CMPX_GT_U32 s4, v18`. J3 deletes the staged-vertex
-    // peephole; without Q5-proven registers the pattern must fail loudly.
+fn cmpx_gated_vertex_exp_lowers_without_a_slot_heuristic() {
+    // Poppy Slate UI: EXP gated by `V_CMPX_GT_U32 s4, v18`. NGG hardware derives the vertex
+    // export slot from the exporting thread's workgroup invocation index (Mesa
+    // ac_nir_lower_ngg: compaction moves data between threads; EXP names no slot), so the
+    // compare is an ordinary EXEC gate and needs no proven-register peephole.
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
     options.wave_lane_count = 64;
-    let error = compile_msl(&program, &empty_evaluation(), &options)
-        .expect_err("unproven compacted-vertex EXP must refuse");
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("a V_CMPX-gated EXP is ordinary NGG output and must lower");
     assert!(
-        error.to_string().contains("proven NggRegisters"),
-        "loud refuse must name the Q5 proof requirement: {error}"
+        shader
+            .source
+            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
+        "mesh vertices must publish at the thread's own invocation index: {}",
+        shader.source
+    );
+    assert!(
+        !shader.source.contains("set_vertex(v[18]") && !shader.source.contains("set_vertex(remu_v_18"),
+        "no compacted-slot VGPR indexing may survive: {}",
+        shader.source
     );
 }
 
 #[test]
-fn proven_ngg_registers_publish_compacted_vertex_exports_by_compacted_id() {
+fn proven_ngg_registers_publish_vertex_exports_by_thread_index() {
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh_from_ngg_registers(
         2,
@@ -597,20 +607,17 @@ fn proven_ngg_registers_publish_compacted_vertex_exports_by_compacted_id() {
     );
     options.wave_lane_count = 64;
     let shader = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("proven NggRegisters lower compacted EXP through direct Metal records");
+        .expect("proven NggRegisters lower gated EXP through direct Metal records");
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)")
-            || shader
-                .source
-                .contains("remu_mesh.set_vertex(v[18], remu_out)"),
-        "EXP must publish remu_out under the compacted vertex VGPR: {}",
+            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
+        "EXP must publish remu_out at the exporting thread's invocation index: {}",
         shader.source
     );
     assert!(
         !shader.source.contains("remu_mesh_staged_vertices"),
-        "compacted output must not allocate a second threadgroup copy beside guest LDS"
+        "mesh output must not allocate a second threadgroup copy beside guest LDS"
     );
 }
 
@@ -1200,4 +1207,151 @@ fn generated_ds_msl_compiles_with_apple_metal_in_every_valid_stage() {
         );
     }
     std::fs::remove_dir_all(directory).expect("remove Metal DS test directory");
+}
+
+#[test]
+fn mesh_prologue_seeds_gs_tg_info_workgroup_counts_into_s2() {
+    // Merged NGG SGPR s2 is gs_tg_info; its [20:12]/[30:22] fields carry the workgroup input
+    // vertex/primitive counts (Mesa ac_nir_lower_intrinsics_to_args.c). Non-culling NGG
+    // shaders build the GS_ALLOC_REQ M0 payload straight from them, so an unseeded s2 would
+    // publish zero primitives and erase the draw.
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(2)],
+                destinations: vec![Operand::scalar(80)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 128, 128, 128);
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options).expect("mesh lowering");
+    assert!(
+        shader
+            .source
+            .contains("= ((remu_mesh_input_vertex_count & 0x1ffu) << 12u)"),
+        "s2 must carry the workgroup input vertex count in [20:12]: {}",
+        shader.source
+    );
+    assert!(
+        shader
+            .source
+            .contains("((remu_mesh_input_primitive_count & 0x1ffu) << 22u)"),
+        "s2 must carry the workgroup input primitive count in [30:22]: {}",
+        shader.source
+    );
+}
+
+#[test]
+fn mesh_prim_export_guards_vertex_indices_against_metal_capacity() {
+    // A GFX10 primitive word carries 9-bit vertex fields (0..511) while the Metal mesh
+    // declares only mesh_max_vertex_count vertices. Feeding a larger index to set_index is
+    // undefined behavior in Metal, so such primitives must keep their degenerate prefill.
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Exp,
+                opcode: Opcode::Known("Exp"),
+                words: vec![0, 0],
+                sources: vec![
+                    Operand::vector(0),
+                    Operand::vector(0),
+                    Operand::vector(0),
+                    Operand::vector(0),
+                ],
+                destinations: Vec::new(),
+                control: Some(InstructionControl::Export(ExportControl {
+                    target: 20,
+                    enable_mask: 1,
+                    compressed: false,
+                    done: false,
+                    valid_mask: false,
+                })),
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 64, 64, 64);
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options).expect("mesh lowering");
+    assert!(
+        shader
+            .source
+            .contains("if (max(max(remu_prim_i0, remu_prim_i1), remu_prim_i2) < 64u) {"),
+        "EXP PRIM must skip primitives whose indices exceed the Metal vertex capacity: {}",
+        shader.source
+    );
+}
+
+#[test]
+fn mesh_entry_exec_is_the_full_architectural_wave_mask() {
+    // Hardware launches a merged NGG wave with the full architectural EXEC and the shader
+    // narrows it against merged_wave_info. A ballot over existing Metal threads would zero
+    // the tail of a partial final wave before the guest's own narrowing runs.
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(126)],
+                destinations: vec![Operand::scalar(80)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(127)],
+                destinations: vec![Operand::scalar(81)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96);
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options).expect("mesh lowering");
+    assert!(
+        shader.source.contains("remu_s_126 = 0xffffffffu;")
+            && shader.source.contains("remu_s_127 = 0xffffffffu;"),
+        "split-wave64 mesh entry EXEC must be the full 64-lane mask: {}",
+        shader.source
+    );
 }
