@@ -159,12 +159,15 @@ impl NggRegisters {
     ///
     /// SDK `ShShaderResource2Gs::getLdsSize()` (registerstructs.h:12154-12157):
     /// `((m_regs[0].m_value & 0x07f80000u) >> 12)`. That getter returns a dword count: the
-    /// 8-bit field in bits `[26:19]` is scaled by the GFX10 allocation granule of 128 dwords.
-    /// Convert those dwords to bytes before sizing Metal threadgroup memory (field `1` → 512
-    /// bytes; field `0x40` → 32 KiB).
+    /// 8-bit field in bits `[26:19]` is scaled by the GFX10 *encode* granule of 128 dwords
+    /// (512 bytes). Hardware then allocates in 1024-byte granules on GFX10.3 (Mesa
+    /// `ac_shader_get_lds_alloc_granularity`), so a shader may legally address up to the
+    /// 1-KiB-aligned size; sizing Metal threadgroup memory below that guards out valid
+    /// accesses in the rounded tail (field `1` → 1 KiB; field `0x11` → 9,216 bytes).
     #[must_use]
     pub const fn lds_size_bytes(self) -> u32 {
-        ((self.pgm_rsrc2 & 0x07f8_0000) >> 12) * 4
+        let encoded_bytes = ((self.pgm_rsrc2 & 0x07f8_0000) >> 12) * 4;
+        (encoded_bytes + 1023) & !1023
     }
 
     /// Maximum geometry output vertices, from `VGT_GS_MAX_VERT_OUT`.
@@ -495,8 +498,13 @@ impl MetalCompileOptions {
         let subgroup_verts = registers.max_verts_per_subgroup();
         let vertex_capacity = if subgroup_verts != 0 {
             subgroup_verts
-        } else {
+        } else if registers.gs_max_output_vertices() != 0 {
             registers.gs_max_output_vertices()
+        } else {
+            // A no-GS pipeline leaves VGT_GS_MAX_VERT_OUT inactive; with
+            // GE_MAX_OUTPUT_PER_SUBGROUP also zero the natural capacity is one vertex per
+            // input thread. Collapsing to 1 would silently drop every vertex slot above 0.
+            mesh_threadgroup_size
         }
         .clamp(1, 256);
         let allocated_vector_register_count = registers

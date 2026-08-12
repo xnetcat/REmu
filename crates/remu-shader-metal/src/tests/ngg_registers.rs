@@ -110,15 +110,16 @@ fn subgroup_vertex_cap_is_the_ten_bit_ge_max_output_field() {
 #[test]
 fn pgm_rsrc2_lds_size_follows_the_sdk_shshaderresource2gs_layout() {
     // SDK `ShShaderResource2Gs::getLdsSize()` (registerstructs.h:12154-12157):
-    // `((m_regs[0].m_value & 0x07f80000u) >> 12)`. The result is a count of dwords,
-    // so the byte reservation is four times that value.
+    // `((m_regs[0].m_value & 0x07f80000u) >> 12)`. The result is a count of dwords in
+    // 512-byte encode granules; GFX10.3 hardware then allocates in 1024-byte granules
+    // (Mesa ac_shader_get_lds_alloc_granularity), so odd 512-byte encodes round up.
     for (field, bytes) in [
         (0u32, 0u32),
-        (1, 512),
-        (0x11, 8704),
+        (1, 1024),
+        (0x11, 9216),
         (0x40, 32768),
         (0x80, 65536),
-        (0xff, 130560),
+        (0xff, 131072),
     ] {
         assert_eq!(
             NggRegisters {
@@ -164,7 +165,8 @@ fn silent_hill_lut_draw_lds_covers_its_captured_vertex_payload() {
         primgen_passthrough: false,
     }
     .lds_size_bytes();
-    assert_eq!(bytes, 8704);
+    // 0x11 encode granules = 8,704 bytes encoded; GFX10.3 allocates align(8704, 1024) = 9,216.
+    assert_eq!(bytes, 9216);
     assert!(bytes > 0x1d20);
 }
 
