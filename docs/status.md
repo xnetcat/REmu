@@ -4,6 +4,46 @@ This records what each subsystem actually implements and its next concrete gap. 
 a timeout, or the absence of `unimplemented` log lines is never treated as a compatibility claim;
 completion means stable interactive game progress with correct output and measured performance.
 
+## Silent Hill 3D campaign (updated 2026-08-13) — mesh contract fixed; title never presents
+
+**Mesa-contract mesh fixes landed (not yet visually validated).** `6f19764e` publishes NGG mesh
+vertex exports at the exporting thread's workgroup invocation index (the V_CMPX slot-guess
+heuristic is deleted; Mesa `ac_nir_lower_ngg` is explicit that compaction moves data between
+threads and EXP names no slot), restores the degenerate w=0 default fill for unexported slots,
+seeds merged-NGG s2 (`gs_tg_info` workgroup input counts — non-culling NGG shaders build
+GS_ALLOC_REQ M0 from it and previously published zero primitives), guards EXP PRIM indices
+against `mesh_max_vertex_count`, and seeds mesh entry EXEC with the full architectural mask.
+`b1fb1f48` rounds `lds_size_bytes` to GFX10.3's 1024-byte allocation granule
+(Mesa `ac_shader_get_lds_alloc_granularity`) and stops the no-GS vertex capacity collapsing
+to 1. `97714cc2` adds a one-time `[REMu][WAVE64-CENSUS]` per wave64 program. Full audit
+reports: `~/Documents/REmu-research/silent-hill/ngg-mesa-audit-20260812.md` and
+`wave64-split-audit-20260812.md` (recommends lane-doubling; on-device probe verified Metal's
+simdgroup packing matches the tid>>5 split assumption on this M4).
+
+**Why no visual validation:** across 8 bounded runs (f11a0ea3, 7c277f4d, and the new commits)
+the title screen never presented a single frame. Three stacked causes, none a rendering defect:
+(1) pipeline creation does not persist across runs (~350-490 PSO creations per run, q0
+`blocked:pipeline` ~1-2s each, serialized against execution); (2) executor throughput ~500-700
+draws/s with GPU 1-9% idle during the title's ~8.6k-draw frames (≈15s/frame — note this
+contradicts the July "GPU 94-99% saturated" profile; the bottleneck moved to the CPU side);
+(3) an intermittent RenderThread-starve wedge — presenter work queue stuck at `Q W3 P0 F0`
+with q0/q33 empty, all flip joins published, no WAIT-FLIP-DONE blocks logged — after which UE's
+own 120s watchdog fires `GameThread timed out waiting for RenderThread` and its crash handler
+SIGSEGVs at guest pc 0x809044770 (this is the July `20260726T224230Z` failure mode; the raw
+"SIGSEGV" in run tails is the handler, not memory corruption). Wedge evidence:
+`$TMPDIR/remu-runs/20260812T223410Z-*` and `20260812T224100Z-*`.
+
+**Long-standing noise, not blockers:** ~500-1000 draws/run dropped with "neither an enabled
+color target nor an active depth target" (target_mask=0, target=0x0, incl. ps=800e73/800da3
+occurrences) appear identically in the codex-era `depthfix` run that DID reach NEW GAME.
+
+**Next:** (1) instrument the W3 wedge — when the work queue is non-empty with both guest queues
+drained for >10s, log the stuck events' identities; fix the wedge; (2) with presentation
+reliable, visually judge the title 3D background against the mesh-contract fixes; (3) wave64
+Phase 0 gate → lane-doubled compute (0x800c7e then FFT 0x80095b) per the split audit.
+The Dreaming Sarah regression gate is unusable (dump copy missing /app0/shaders/water.vert;
+crashes at ~2s since 2026-08-05 — environmental, do not bisect).
+
 ## Silent Hill present (updated 2026-08-10) — NEW GAME 3D background black
 
 **Checkpoint correction:** the content-warning hallway is 2D. The first assessable 3D scene is
