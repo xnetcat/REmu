@@ -20,7 +20,7 @@ use super::{
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, shader_scalar_metadata_for_registers,
     storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    log_wave64_hazard_census, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 use metal::{MTLPixelFormat, MTLResourceOptions, MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
@@ -161,6 +161,9 @@ impl MetalPresenter {
             .map_err(|_| "Metal compute execution width does not fit u32")?;
         let dynamic_lds = bindings.threadgroup_memory_bytes;
         let wave64_split_safe = compute_program_can_split_wave64(&snapshot.program);
+        if dispatch.launch.wave_lane_count == 64 {
+            log_wave64_hazard_census(&snapshot.program, "compute");
+        }
         validate_compute_launch_for_metal(
             dispatch.launch,
             execution_width,

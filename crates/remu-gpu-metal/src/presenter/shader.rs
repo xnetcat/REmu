@@ -40,8 +40,8 @@ pub(crate) use self::program::{
     ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask, pixel_scalars,
     procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
     reconcile_pixel_input_controls_with_export_producers, rectangle_coordinate_parameter_mask,
-    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
-    vertex_parameter_export_mask, wave64_split_blockers,
+    log_wave64_hazard_census, shader_scalar_metadata_for_registers,
+    validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
 pub(crate) use self::program::{
@@ -569,6 +569,7 @@ impl MetalPresenter {
                         export.program.address
                     ));
                 }
+                log_wave64_hazard_census(&export.program, "mesh");
                 mesh_options.wave_lane_count = 64;
                 // SDK PGM_RSRC1 reports VGPRs in wave32 units and explicitly requires
                 // dividing by two for wave64 execution.

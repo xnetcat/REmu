@@ -192,6 +192,78 @@ pub(crate) fn compute_program_can_split_wave64(program: &Program) -> bool {
     wave64_split_blockers(program).is_empty()
 }
 
+/// One-time diagnostic census of split-wave64 hazard classes in a guest program.
+///
+/// The 2026-08-12 split-wave64 audit (REmu-research/silent-hill) showed the substring-based
+/// `wave64_split_blockers` passes nearly every construct whose semantics are half-local under
+/// the two-SIMD32-halves model. Until the lane-doubled lowering lands, this census names which
+/// hazard classes each wave64 program actually uses, so a live run's wrong output can be
+/// attributed to a concrete class without an instrumented rebuild. Logging only; no behavior
+/// change.
+pub(crate) fn log_wave64_hazard_census(program: &Program, stage: &str) {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static LOGGED: Mutex<Option<HashSet<u64>>> = Mutex::new(None);
+    {
+        let mut logged = LOGGED.lock().unwrap();
+        if !logged
+            .get_or_insert_with(HashSet::new)
+            .insert(program.address)
+        {
+            return;
+        }
+    }
+    let mut readlane = 0u32;
+    let mut readfirstlane = 0u32;
+    let mut mbcnt_mask = 0u32;
+    let mut bcnt1_b64 = 0u32;
+    let mut scc_branch = 0u32;
+    let mut exec_branch = 0u32;
+    let mut mask64_ops = 0u32;
+    let mut barriers = 0u32;
+    for instruction in &program.instructions {
+        let Some(name) = instruction.opcode.known_name() else {
+            continue;
+        };
+        match name {
+            "VReadlaneB32" => readlane += 1,
+            "VReadfirstlaneB32" => readfirstlane += 1,
+            "SBcnt1I32B64" => bcnt1_b64 += 1,
+            "SBarrier" => barriers += 1,
+            "SCbranchScc0" | "SCbranchScc1" => scc_branch += 1,
+            "SCbranchExecz" | "SCbranchExecnz" | "SCbranchVccz" | "SCbranchVccnz" => {
+                exec_branch += 1;
+            }
+            _ => {
+                if name.starts_with("VMbcnt")
+                    && instruction
+                        .sources
+                        .iter()
+                        .any(|source| source.kind == OperandKind::ScalarRegister)
+                {
+                    mbcnt_mask += 1;
+                }
+                if name.ends_with("B64")
+                    && ["SAnd", "SOr", "SXor", "SNand", "SNor", "SXnor"]
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                {
+                    mask64_ops += 1;
+                }
+            }
+        }
+    }
+    if readlane + readfirstlane + mbcnt_mask + bcnt1_b64 + scc_branch + exec_branch + mask64_ops
+        == 0
+    {
+        return;
+    }
+    eprintln!(
+        "[REMu][WAVE64-CENSUS] stage={stage} program={:#x} readlane={readlane} readfirstlane={readfirstlane} mbcnt_mask={mbcnt_mask} bcnt1_b64={bcnt1_b64} scc_branch={scc_branch} exec_branch={exec_branch} mask64_ops={mask64_ops} barriers={barriers}",
+        program.address
+    );
+}
+
 pub(crate) fn wave64_split_blockers(program: &Program) -> Vec<String> {
     let mut blockers = Vec::new();
     for instruction in &program.instructions {

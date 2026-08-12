@@ -163,7 +163,8 @@ use self::shader::{
     is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
     ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_scalars,
     procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
+    log_wave64_hazard_census, shader_scalar_metadata_for_registers,
+    validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{

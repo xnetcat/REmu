@@ -65,8 +65,8 @@ use super::{
     shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
     snapshot_guest_texture_raw, spans_overlap, storage_image_requires_mip_hierarchy,
     trace_glyph_atlas, trace_image_descriptors, trace_msaa_writes, trace_scanout_writes,
-    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
-    video_target_binding_summary, wave64_split_blockers,
+    log_wave64_hazard_census, trace_target_sampling, upload_image_textures,
+    validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
