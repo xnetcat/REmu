@@ -1487,11 +1487,22 @@ static EQUEUE_WAKEUPS_SIGNALLED: AtomicU64 = AtomicU64::new(0);
 static EQUEUE_WAITS_ENTERED: AtomicU64 = AtomicU64::new(0);
 static EQUEUE_WAITS_RETURNED: AtomicU64 = AtomicU64::new(0);
 
-/// Guest threads currently inside a blocking `sceKernelWaitEqueue`, by thread handle.
+/// A guest thread currently inside a blocking `sceKernelWaitEqueue`.
+struct BlockedEqueueWaiter {
+    equeue: u64,
+    since_nanos: u64,
+    /// Carried because it is the whole diagnosis: an idle "IoService" or "FAPREventQueueListener"
+    /// parked for a minute is normal, while "AgcInterruptThread" or "RHIThread" parked for seconds
+    /// is the wedge. Without the name every blocked listener reads as a suspect.
+    thread_name: String,
+}
+
+/// Guest threads currently blocked in `sceKernelWaitEqueue`, by thread handle.
 ///
 /// Read with `try_lock` by the reporter, so a blocked waiter can be named together with the depth of
 /// the equeue it is waiting on — the "events present but the wait is not returning" fork.
-static EQUEUE_BLOCKED_WAITERS: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+static EQUEUE_BLOCKED_WAITERS: Mutex<BTreeMap<u64, BlockedEqueueWaiter>> =
+    Mutex::new(BTreeMap::new());
 
 /// Registers a blocking equeue wait for the reporter, and deregisters it on every exit path.
 struct EqueueWaitRegistration {
@@ -1502,7 +1513,14 @@ impl EqueueWaitRegistration {
     fn enter(thread: u64, equeue: u64) -> Self {
         EQUEUE_WAITS_ENTERED.fetch_add(1, Ordering::Relaxed);
         if let Ok(mut waiters) = EQUEUE_BLOCKED_WAITERS.lock() {
-            waiters.insert(thread, (equeue, guest_import_trace_nanos()));
+            waiters.insert(
+                thread,
+                BlockedEqueueWaiter {
+                    equeue,
+                    since_nanos: guest_import_trace_nanos(),
+                    thread_name: current_guest_thread_name(),
+                },
+            );
         }
         Self { thread }
     }
@@ -1522,10 +1540,22 @@ fn report_equeue_delivery(stale_after_nanos: u64) {
     let (inserted, coalesced) = event_state::equeue_insertion_counts();
     let drained = AGC_DRAINED_BACKEND_IDS.load(Ordering::Relaxed);
     let claimed = AGC_CLAIMED_BACKEND_IDS.load(Ordering::Relaxed);
-    let blocked = EQUEUE_BLOCKED_WAITERS
-        .try_lock()
-        .map(|waiters| waiters.clone())
-        .unwrap_or_default();
+    let blocked = EQUEUE_BLOCKED_WAITERS.try_lock().map_or_else(
+        |_| Vec::new(),
+        |waiters| {
+            waiters
+                .iter()
+                .map(|(&thread, waiter)| {
+                    (
+                        thread,
+                        waiter.equeue,
+                        waiter.since_nanos,
+                        waiter.thread_name.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        },
+    );
     eprintln!(
         "[REMu][EQUEUE] backend_newest={} drained={drained} claimed={claimed} inserted={inserted} coalesced={coalesced} waits={}/{} wakes={} blocked={}",
         remu_gpu::gpu_completed_submission_sequence(),
@@ -1535,20 +1565,32 @@ fn report_equeue_delivery(stale_after_nanos: u64) {
         blocked.len(),
     );
     let now = guest_import_trace_nanos();
-    for (thread, (equeue, since)) in blocked {
+    for (thread, equeue, since, thread_name) in blocked {
         let blocked_nanos = now.saturating_sub(since);
         if blocked_nanos < stale_after_nanos {
             continue;
         }
         // The fork: events already queued for this equeue means delivery reached it and the wait is
-        // not returning; zero means nothing ever arrived for it.
-        let depths = event_state::try_equeue_snapshot(equeue);
+        // not returning; zero means nothing ever arrived for it. `filters` separates the two idle
+        // cases — a listener with no registrations is parked by construction, not starving.
+        let snapshot = event_state::try_equeue_snapshot(equeue);
+        let unknown = || "unknown".to_owned();
         eprintln!(
-            "[REMu][EQUEUE][BLOCKED] thread={thread:#x} equeue={equeue:#x} blocked_ms={} events_for_equeue={} events_total={} arms={}",
+            "[REMu][EQUEUE][BLOCKED] thread={thread_name:?}/{thread:#x} equeue={equeue:#x} blocked_ms={} events_for_equeue={} events_total={} arms={} filters={}",
             blocked_nanos / 1_000_000,
-            depths.map_or_else(|| "unknown".to_owned(), |(_, mine, _)| mine.to_string()),
-            depths.map_or_else(|| "unknown".to_owned(), |(total, _, _)| total.to_string()),
-            depths.map_or_else(|| "unknown".to_owned(), |(_, _, arms)| arms.to_string()),
+            snapshot
+                .as_ref()
+                .map_or_else(unknown, |snapshot| snapshot.events_for_equeue.to_string()),
+            snapshot
+                .as_ref()
+                .map_or_else(unknown, |snapshot| snapshot.events_total.to_string()),
+            snapshot
+                .as_ref()
+                .map_or_else(unknown, |snapshot| snapshot.arms.to_string()),
+            snapshot.as_ref().map_or_else(unknown, |snapshot| format!(
+                "{:?}",
+                snapshot.filters
+            )),
         );
     }
 }

@@ -119,21 +119,34 @@ pub(crate) fn equeue_insertion_counts() -> (u64, u64) {
     )
 }
 
-/// Pending-event total, per-equeue count for `equeue`, and outstanding AGC arms.
+/// What a blocked waiter's equeue currently holds.
+pub(crate) struct EqueueSnapshot {
+    pub(crate) events_total: usize,
+    pub(crate) events_for_equeue: usize,
+    pub(crate) arms: usize,
+    /// Event filters registered on this equeue. An equeue with no registrations is a listener
+    /// parked on a source that was never armed — idle by construction, not starving.
+    pub(crate) filters: Vec<i16>,
+}
+
+/// Snapshot of `equeue`, or `None` when the lock is busy.
 ///
-/// `None` when the lock is busy. A bare `try_read` for the same reason as
-/// [`try_carried_agc_completion_depth`]: the reporter must never block on the state it describes.
-pub(crate) fn try_equeue_snapshot(equeue: u64) -> Option<(usize, usize, usize)> {
-    cell().try_read().ok().map(|events| {
-        (
-            events.pending_events.len(),
-            events
-                .pending_events
-                .iter()
-                .filter(|event| event.equeue == equeue)
-                .count(),
-            events.pending_agc_completions.len() + events.pending_agc_user_interrupts.len(),
-        )
+/// A bare `try_read` for the same reason as [`try_carried_agc_completion_depth`]: the reporter must
+/// never block on the state it describes.
+pub(crate) fn try_equeue_snapshot(equeue: u64) -> Option<EqueueSnapshot> {
+    cell().try_read().ok().map(|events| EqueueSnapshot {
+        events_total: events.pending_events.len(),
+        events_for_equeue: events
+            .pending_events
+            .iter()
+            .filter(|event| event.equeue == equeue)
+            .count(),
+        arms: events.pending_agc_completions.len() + events.pending_agc_user_interrupts.len(),
+        filters: events
+            .kernel_event_registrations
+            .keys()
+            .filter_map(|&(registered, filter, _)| (registered == equeue).then_some(filter))
+            .collect(),
     })
 }
 
