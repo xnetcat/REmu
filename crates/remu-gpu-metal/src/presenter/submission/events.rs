@@ -801,6 +801,36 @@ impl OrderedGpuEventReceiver {
     }
 
     pub(crate) fn queue_diagnostics(&self) -> String {
+        // The host-source queue can block (for example on a flip-safety wait) while every guest
+        // queue prints empty/none; the 2026-08-12 RenderThread-starve wedge was invisible here
+        // for exactly that reason. Always append the host queue's state.
+        let host_blocked = self
+            .host_block
+            .as_ref()
+            .map_or("none".to_owned(), |reason| match reason {
+                QueueBlockReason::GuestMemoryWait(wait) => format!("memory:{:#x}", wait.address),
+                QueueBlockReason::GuestMemoryWaitPendingTerminal(wait) => {
+                    format!("memory-terminal:{:#x}", wait.address)
+                }
+                QueueBlockReason::GuestSharedEventHostEffect { .. } => {
+                    "shared-event-host".to_owned()
+                }
+                QueueBlockReason::FlipSafetyWait(wait) => format!(
+                    "flip-safety:{:#x}/index:{}/required:{:?}",
+                    wait.address, wait.buffer_index, wait.required_flip_sequence
+                ),
+                QueueBlockReason::GraphicsPipeline(key) => format!(
+                    "pipeline:{:#x}/{:#x}",
+                    key.export_shader_address, key.pixel_shader_address
+                ),
+                QueueBlockReason::ComputePipeline(key) => {
+                    format!("compute-pipeline:{:#x}", key.program_identity.0.address)
+                }
+            });
+        let host = format!(
+            "host:pending:{}/blocked:{host_blocked}",
+            self.host_events.len()
+        );
         self.queue_order
             .iter()
             .take(8)
@@ -886,6 +916,7 @@ impl OrderedGpuEventReceiver {
                     submissions.len()
                 ))
             })
+            .chain(std::iter::once(host))
             .collect::<Vec<_>>()
             .join("; ")
     }

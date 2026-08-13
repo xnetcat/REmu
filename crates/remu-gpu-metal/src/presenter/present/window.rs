@@ -507,6 +507,32 @@ impl MetalPresenter {
             if !queue_diagnostics.is_empty() {
                 eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
             }
+            // A flip-safety wait blocks against this prefix; an entry that never turns safe
+            // parks the host queue forever while every guest queue prints empty (the
+            // 2026-08-12 RenderThread-starve wedge). Name the first gap so a wedged run
+            // identifies the exact flip sequence whose safety never arrived.
+            if !self.flip_buffer_safety.is_empty() {
+                let unsafe_entries = self
+                    .flip_buffer_safety
+                    .iter()
+                    .filter(|(_, safety)| !safety.safe)
+                    .take(3)
+                    .map(|(sequence, safety)| {
+                        format!(
+                            "{sequence}@{:#x}/index:{}/age_ms:{:.0}",
+                            safety.address,
+                            safety.buffer_index,
+                            safety.accepted_at.elapsed().as_secs_f64() * 1000.0
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "[REMu][PERF-FLIP-SAFETY] prefix={} entries={} unsafe=[{unsafe_entries}]",
+                    self.safe_flip_sequence_prefix,
+                    self.flip_buffer_safety.len(),
+                );
+            }
             let wait_dependencies = self.receiver.blocked_wait_dependency_diagnostics();
             if !wait_dependencies.is_empty() {
                 eprintln!("[REMu][PERF-QUEUE-WAITS] {wait_dependencies}");
