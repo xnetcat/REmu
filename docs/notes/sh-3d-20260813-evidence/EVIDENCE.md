@@ -40,3 +40,25 @@ The two remaining corruption stages line up with the split-wave64 audit's ranked
 compute compaction off-by-32 (V_MBCNT on a half-local mask; phases 1-2, shaders
 0x800c7e / 0x80095b). Next implementation step is Phase 1: lane-doubled compute for
 single-wave (64-thread) groups.
+
+## Wave64 hazard census (live, 2026-08-13 runs)
+
+`[REMu][WAVE64-CENSUS]` inventory of the title's wave64 compute programs (once per address):
+
+- FFT/bloom family `0x800959/0x80095b/0x800973`: scc_branch 7-8, exec_branch 6-24,
+  barriers 80-160, **mbcnt_mask=0, bcnt1_b64=0** — the split-audit §1.3 compaction
+  hypothesis does NOT apply to these; their hazard classes are half-local SCC/EXEC
+  branch decisions and whole-group barriers under 16 guest waves (the Metal-illegal
+  class), plus the epoch-desync deadlock exposure of the pair rendezvous.
+- Shadow-mask kernels `0x800838/0x80085d`: mask64_ops=26 each with exec_branch=2 —
+  B64 mask arithmetic is half-local today; a wrong mask here zeroes downstream
+  lighting, which matches the all-zero `800a69` output.
+- `0x800a13`: readlane=67 — the 4-KiB readlane table + its two whole-group barriers
+  per site; illegal in multi-wave groups when reached inside structured control flow.
+- No wave64 compute program in the census uses V_MBCNT on a mask SGPR or
+  S_BCNT1_I32_B64, so lane-doubling Phase 1/2 should be validated against the branch
+  and barrier classes first.
+
+Lane-doubling (split-audit §3b) remains the strategy; this census fixes the
+validation targets: shadow-mask kernels first (small, mask64-heavy, feeds lighting),
+then the FFT family.
