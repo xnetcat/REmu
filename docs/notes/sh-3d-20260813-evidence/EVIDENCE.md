@@ -190,3 +190,15 @@ frames. Remaining darkness: the scene renders several stops too dark; the last k
 zeroed input is the 1024x512 R16Float sky-transmittance LUT (0x8051d1-class) — zero
 transmittance suppresses sky/ambient radiance. Next: serve that LUT (same residency
 class) and re-measure exposure.
+
+## Darkness suspect: the transmittance LUT rides the mip-promotion path
+
+The 1024x512 R16Float sky-transmittance LUT (0x803fb4/0x8051d1 per run) is sampled with
+explicit LODs and REmu promotes it through "ordered mip promotion levels 1->5"
+(gpu_current=false for 1-4): if the base level is zero at promotion time, every
+synthesized mip is zero — audit finding #12 (authored-mip synthesis) meeting the same
+residency timing. Discriminating dump prepared but not yet landed (needs
+REMU_DUMP_COMPUTE_TEXTURE_DIR + EXTENT=1024x512; runs currently die early to the
+intermittent guest-crash family before the LUT phase). If the compute writer's output is
+nonzero, extend the residency serving to the mip-promotion source; if zero, the writer's
+WAVE64-CENSUS entry names the hazard.
