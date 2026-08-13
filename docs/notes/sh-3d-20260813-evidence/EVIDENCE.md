@@ -364,3 +364,20 @@ a one-line reorder (register before invoke_guest_module_initializers), landing a
 in-flight acceptance gauntlet. Frozen import counters during the stall (waits/wakes flat)
 already rule out import-polling: the entry thread is parked or in translated code — the fixed
 registration's phase field decides which.
+
+## W3 final state (Codex sign-off + corrections)
+- GameThread stack-confirmed healthy: timed poll loop at guest PC 0x801be228e (within-thread
+  split 356/440 samples in the wait — NOTE: 440 is the capture's total sample count for EVERY
+  thread, a denominator, not a load signal).
+- The census is STRUCTURALLY blind to timed-poll threads: re-entering import_dispatch every
+  timeout resets staleness, so the GameThread never crosses the 2s threshold. Registration
+  (a6c003cf+d5cda1d4+b2830c8b) fires correctly AND the thread stays absent from stale-gated
+  reports — future silence there is NOT a broken instrument. An always-listed line is needed
+  if the GameThread should appear periodically.
+- Import counters froze because everything ELSE stopped while this thread kept cycling.
+- Eliminated (evidence-backed): completion path, equeue delivery, condvar core, mutex
+  identity, AMPR, the heap-table encoder, presenter livelock (fixed, n=5), and the GameThread
+  itself. The standoff: GameThread polls a fence; RenderThread waits untimed for commands.
+- Next discriminator implementation notes: the untimed [STALL] branch only reports when
+  REMU_TRACE_STALL_SECONDS is set (keep in recipe); read condvar/mutex guest objects via
+  read_guest_shared_backing, never raw pointers.
