@@ -78,3 +78,14 @@ The background is black rather than the reference's foggy rooftop: deferred ligh
 still outputs zero (see the stage table above). The overlay is a validation instrument
 and an interim visual improvement, not a fix — the renderer fix remains the lane-doubled
 wave64 lowering, after which bloom/TAA get re-enabled.
+
+## Negative result: shadows/AO/SSR/fog off does NOT light the scene (run 20260813T075925Z)
+
+Adding `r.ShadowQuality=0, r.CapsuleShadows=0, r.DistanceFieldShadowing=0,
+r.DistanceFieldAO=0, r.AmbientOcclusionLevels=0, r.SSR.Quality=0, r.SSGI.Quality=0,
+r.VolumetricFog=0, r.VolumetricCloud=0, r.LightShaftQuality=0` to the overlay keeps the
+menu pixel-clean but the 3D background stays exactly black
+(`title-menu-noshadows-still-black.png`, gamma-boosted 0.45). The zero-lighting cause is
+therefore inside the deferred lighting pixel shaders (800a69 direct / 8009c4 sky) or their
+non-occlusion inputs — the split-wave64 audit's pixel mask classes — not the occlusion
+kernels they sample.
