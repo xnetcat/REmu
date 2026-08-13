@@ -2971,9 +2971,13 @@ fn report_longest_blocked_guest_threads(
                     .ok()
                     .and_then(|index| telemetry.nids.get(index))
                     .map_or("?", String::as_str);
+                // Phase distinguishes a thread parked inside REmu from one running or spinning in
+                // translated guest code; without it the guest-entry thread reads as "blocked" while
+                // its dispatch_index still names whatever import it last made.
                 (
                     age,
                     record.name.as_str(),
+                    GuestImportTracePhase::from_u8(record.phase.load(Ordering::Acquire)).name(),
                     nid_display_name(nid).unwrap_or(nid),
                     record.integer_argument0.load(Ordering::Acquire),
                     record.thread,
@@ -2983,13 +2987,13 @@ fn report_longest_blocked_guest_threads(
         .collect::<Vec<_>>();
     let current = blocked
         .iter()
-        .map(|(_, _, _, _, thread)| *thread)
+        .map(|(_, _, _, _, _, thread)| *thread)
         .collect::<BTreeSet<_>>();
     let entered = blocked
         .iter()
-        .filter(|(_, _, _, _, thread)| !previously_blocked.contains(thread))
-        .map(|(age, name, import, argument0, _)| {
-            format!("{name}:{}ms:{import}:{argument0:#x}", age / 1_000_000)
+        .filter(|(_, _, _, _, _, thread)| !previously_blocked.contains(thread))
+        .map(|(age, name, phase, import, argument0, _)| {
+            format!("{name}:{}ms:{phase}:{import}:{argument0:#x}", age / 1_000_000)
         })
         .collect::<Vec<_>>();
     let left = previously_blocked.difference(&current).count();
@@ -3001,8 +3005,8 @@ fn report_longest_blocked_guest_threads(
     let longest = blocked
         .iter()
         .take(4)
-        .map(|(age, name, import, argument0, _)| {
-            format!("{name}:{}ms:{import}:{argument0:#x}", age / 1_000_000)
+        .map(|(age, name, phase, import, argument0, _)| {
+            format!("{name}:{}ms:{phase}:{import}:{argument0:#x}", age / 1_000_000)
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -3127,6 +3131,52 @@ fn start_guest_import_trace_reporter() {
                 }
             })
             .expect("guest import trace reporter must start");
+    });
+}
+
+/// Registers the thread that runs the guest entry point, before it enters guest code.
+///
+/// Every other trace record is created lazily on a thread's first import, which silently excludes
+/// any thread that never calls one. The guest entry thread — which becomes the title's main and
+/// game thread — turned out to be exactly such a thread: across three captured wedges it never
+/// appeared in a 55-thread quiescence census, and its absence was indistinguishable from "not
+/// blocked" when in fact it was never observed at all.
+///
+/// Registering it here gives it a record whose age grows whenever it stops transitioning through
+/// imports. That is the fork the census could not previously make: a large age in phase `Guest`
+/// means it is running or spinning in translated guest code, while a large age in
+/// `in-import-dispatch` means it is blocked inside REmu. `guest_return_address` is seeded with the
+/// entry address so the record names a position even before its first import stamps a real one.
+fn register_guest_entry_trace_record(entry_address: u64) {
+    if !trace_guest_threads() {
+        return;
+    }
+    start_guest_import_trace_reporter();
+    GUEST_IMPORT_TRACE_RECORD.with(|current| {
+        if !current.get().is_null() {
+            return;
+        }
+        let record = Arc::new(GuestImportTraceRecord {
+            thread: current_guest_thread_handle(),
+            name: format!("{}(guest-entry)", current_guest_thread_name()),
+            active: AtomicBool::new(true),
+            phase: AtomicU8::new(GuestImportTracePhase::Guest as u8),
+            dispatch_index: AtomicU64::new(0),
+            integer_argument0: AtomicU64::new(0),
+            integer_argument1: AtomicU64::new(0),
+            guest_return_address: AtomicU64::new(entry_address),
+            guest_rsp: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            transition_sequence: AtomicU64::new(0),
+            reported_sequence: AtomicU64::new(0),
+            transition_nanos: AtomicU64::new(guest_import_trace_nanos()),
+        });
+        let pointer = Arc::as_ptr(&record);
+        GUEST_IMPORT_TRACE_RECORDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(record);
+        current.set(pointer);
     });
 }
 
@@ -9583,6 +9633,7 @@ fn probe_entry(
         start_diagnostic_timeout(timeout_seconds);
     }
     remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::GuestEntryBegin);
+    register_guest_entry_trace_record(image.memory.entry_address().get());
     let return_value = invoke_guest_entry_with_exit(
         image.memory.entry_address().get(),
         (&raw const parameters).addr() as u64,
