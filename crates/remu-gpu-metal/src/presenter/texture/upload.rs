@@ -666,8 +666,17 @@ pub(crate) fn upload_image_textures(
                                 .filter(|resident| {
                                     // Same-extent GPU images keep answering after neighbour
                                     // ResourceSpan over-report clears serves_reads() (SH EyeAdapt).
+                                    // When even gpu_authored was fully subtracted by an
+                                    // overlapping allocation, the executed texels still live in
+                                    // Metal; while the CPU verifiably has not rewritten the
+                                    // range, serving them beats uploading unpublished guest RAM
+                                    // (SH title light attenuation: written BGRA8, authority
+                                    // taken, sampled back as zeros → black lighting).
                                     (resident.serves_reads()
-                                        || (resident.gpu_written()
+                                        || ((resident.gpu_written()
+                                            || (resident.is_live()
+                                                && resident.gpu_content_executed
+                                                && resident.metal_content_cpu_clean()))
                                             && resident_sample_authority_ok(
                                                 resident,
                                                 descriptor.guest,

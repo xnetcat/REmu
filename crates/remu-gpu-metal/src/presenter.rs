@@ -1317,6 +1317,14 @@ struct ResidentGuestTexture {
     /// This is the publication debt the guest is owed, and it is what `gpu_written()` reports.
     /// Bookkeeping settles must not clear it without publishing — that lies that guest RAM agrees.
     gpu_authored: RangeSet,
+    /// Sticky: the Metal allocation has held executed GPU output at least once.
+    ///
+    /// Authority subtraction (a neighbour's over-broad `ResourceSpan`, an overlapping alias
+    /// bind) clears `owned`/`gpu_authored` as bookkeeping, but the executed texels survive in
+    /// Metal. The Silent Hill title light-attenuation input is sampled through exactly this
+    /// state; serving the resident beats uploading unpublished (zero) guest RAM whenever the
+    /// CPU verifiably has not rewritten the range.
+    gpu_content_executed: bool,
     /// `Live` unless every owned byte was taken by another writer or by the CPU.
     state: ResidencyState,
     /// ACQUIRE_MEM proved guest bytes diverged from the Metal copy, but no consumer has bound
@@ -1435,6 +1443,14 @@ impl ResidentGuestTexture {
         self.is_live() && self.span.is_none_or(|span| self.owned.covers(&span))
     }
 
+    /// Conservative read-only check that the CPU has not written the range since Metal last
+    /// became authoritative. Any pending validation or generation drift reports not-clean.
+    fn metal_content_cpu_clean(&self) -> bool {
+        !self.write_watch.is_dirty()
+            && !self.write_watch.content_validation_pending()
+            && self.write_watch.generations() == self.gpu_write_watch_generations
+    }
+
     /// Gives up `taken`, demoting to `source` when the last owned byte goes with it.
     fn subtract_authority(&mut self, taken: &RangeSet, source: StaleSource) {
         self.owned.subtract(taken);
@@ -1496,6 +1512,7 @@ impl ResidentGuestTexture {
 
     /// Records a GPU write of `written` bytes: authority is claimed and the debt grows with it.
     fn note_gpu_authored(&mut self, written: &RangeSet) {
+        self.gpu_content_executed = true;
         self.owned.insert(written);
         self.gpu_authored.insert(written);
         self.state = ResidencyState::Live;
