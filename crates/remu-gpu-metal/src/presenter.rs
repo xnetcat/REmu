@@ -1523,13 +1523,41 @@ impl ResidentGuestTexture {
                 // An armed, undirtied write watch proves no CPU store since arming; generation
                 // drift and pending validation are renewal bookkeeping, not guest writes. Only a
                 // dirty watch needs the (baseline-dependent) fingerprint comparison.
-                let cpu_rewrote = self.write_watch.is_dirty()
-                    && self.write_watch.content_has_changed().unwrap_or(true);
+                let watch_dirty = self.write_watch.is_dirty();
+                let cpu_rewrote =
+                    watch_dirty && self.write_watch.content_has_changed().unwrap_or(true);
                 if !cpu_rewrote {
                     self.note_gpu_write();
                     self.state = ResidencyState::Live;
                     OWNED_RECLAIM_EXECUTED.fetch_add(1, Ordering::Relaxed);
                     return true;
+                }
+                if self.descriptor.width >= 1_280 && self.descriptor.height >= 720 {
+                    // Sample what the verification is trusting: an all-zero RAM head means the
+                    // "CPU write" was a zero-fill (a DMA clear executed host-side, or a guest
+                    // memset) — content that should live on the GPU timeline — while real data
+                    // means the transient pool was genuinely reused for CPU content.
+                    static LOGGED: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 16 || sequence.is_power_of_two() {
+                        // Guest memory is host-mapped at the guest VA and the write watch only
+                        // removes write permission, so a read of the live descriptor is safe.
+                        let head = unsafe {
+                            std::slice::from_raw_parts(self.descriptor.address as *const u8, 64)
+                        }
+                        .iter()
+                        .take_while(|&&byte| byte == 0)
+                        .count();
+                        eprintln!(
+                            "[REMu][METAL][RECLAIM-REJECTED] sequence={sequence} address={:#x} {}x{} {:?} watch_dirty={watch_dirty} zero_head={head:?} version={}",
+                            self.descriptor.address,
+                            self.descriptor.width,
+                            self.descriptor.height,
+                            self.descriptor.pixel_format,
+                            self.content_version,
+                        );
+                    }
                 }
             }
             return false;
