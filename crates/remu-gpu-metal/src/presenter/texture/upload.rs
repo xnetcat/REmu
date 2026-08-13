@@ -202,14 +202,19 @@ fn borrowed_near_image_binding(
     candidates.sort_by_key(|delta| (delta.abs(), -*delta));
     for delta in candidates {
         let slot = anchor.wrapping_add_signed(delta);
-        // SAFETY: probes the staging arena the evaluator just read this submission.
-        let now = unsafe { std::slice::from_raw_parts(slot as *const u32, 8) };
+        let mut bytes = [0_u8; 32];
+        if !remu_memory::read_guest_shared_backing(slot, &mut bytes) {
+            continue;
+        }
+        let now: [u32; 8] = std::array::from_fn(|index| {
+            u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().expect("dword"))
+        });
         if (now[3] >> 28) < 8 {
             continue;
         }
         let mut corrected = binding.clone();
         corrected.resource_descriptor.clear();
-        corrected.resource_descriptor.extend_from_slice(now);
+        corrected.resource_descriptor.extend_from_slice(&now);
         if decode_image_descriptor(&corrected.resource_descriptor).is_ok() {
             static LOGGED: AtomicUsize = AtomicUsize::new(0);
             let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -231,15 +236,19 @@ fn late_resolved_image_binding(
 ) -> Option<remu_shader::ImageBinding> {
     let words = &binding.resource_descriptor;
     let source = descriptor_source_address(evaluation, words)?;
-    // SAFETY: the evaluator read these exact guest dwords for this submission, and the draw
-    // that names them is still in flight; the mapping outlives this upload.
-    let now = unsafe { std::slice::from_raw_parts(source as *const u32, 8) };
-    if now == &words[..] {
+    let mut bytes = [0_u8; 32];
+    if !remu_memory::read_guest_shared_backing(source, &mut bytes) {
+        return None;
+    }
+    let now: [u32; 8] = std::array::from_fn(|index| {
+        u32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().expect("dword"))
+    });
+    if now == words[..] {
         return None;
     }
     let mut corrected = binding.clone();
     corrected.resource_descriptor.clear();
-    corrected.resource_descriptor.extend_from_slice(now);
+    corrected.resource_descriptor.extend_from_slice(&now);
     decode_image_descriptor(&corrected.resource_descriptor).ok()?;
     Some(corrected)
 }
@@ -605,11 +614,15 @@ pub(crate) fn upload_image_textures(
                         // "stable table pointer, rewritten descriptors" hazard — and the fix
                         // is upload-time revalidation, not decode surgery.
                         let now = source.map(|address| {
-                            // SAFETY: the evaluator read these exact guest dwords this
-                            // submission; the mapping outlives the draw that named it.
-                            let words = unsafe {
-                                std::slice::from_raw_parts(address as *const u32, 8)
-                            };
+                            let mut bytes = [0_u8; 32];
+                            if !remu_memory::read_guest_shared_backing(address, &mut bytes) {
+                                return "unmapped".to_owned();
+                            }
+                            let words: [u32; 8] = std::array::from_fn(|index| {
+                                u32::from_le_bytes(
+                                    bytes[index * 4..index * 4 + 4].try_into().expect("dword"),
+                                )
+                            });
                             format!("{words:08x?}")
                         });
                         // If a well-formed T# (DWORD3 type nibble >= 8) sits at a small offset
@@ -619,12 +632,14 @@ pub(crate) fn upload_image_textures(
                             let mut offsets = Vec::new();
                             for delta in (-0x100_i64..=0x100).step_by(16) {
                                 let candidate = address.wrapping_add_signed(delta);
-                                // SAFETY: probes the staging arena the evaluator just read;
-                                // 16-byte alignment keeps each read inside one page of it.
-                                let word3 = unsafe {
-                                    (candidate as *const u32).add(3).read_unaligned()
-                                };
-                                if (word3 >> 28) >= 8 {
+                                let mut bytes = [0_u8; 4];
+                                if !remu_memory::read_guest_shared_backing(
+                                    candidate.wrapping_add(12),
+                                    &mut bytes,
+                                ) {
+                                    continue;
+                                }
+                                if (u32::from_le_bytes(bytes) >> 28) >= 8 {
                                     offsets.push(format!("{delta:+#x}"));
                                 }
                             }
