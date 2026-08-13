@@ -177,3 +177,16 @@ SAMPLED-MISS pairings and the same 800a69 dump).
 
 Note: guest crashes (the UE-watchdog family) now occur most runs between 46-350s and are
 the main iteration obstacle; the title menu presents continuously when runs survive.
+
+## First presented title frame with 3D scene content (run 20260813T103355Z, ce0f0cb3)
+
+`title-scene-first-presented-boosted.png` (gamma 0.45 boost of the raw efc capture at
+t=367s): the reference composition — foggy bright region right-of-center, rooftop
+structure lower-left, menu/logo on top — is present in a PRESENTED frame for the first
+time. The compatible-arm tentative acceptance + resolve-stage fingerprint oracle
+(cc4ccdb1..ce0f0cb3) connected the lighting chain through to the screen. The run also
+survived its full 425s window (first full survival of the day) and presented 29 distinct
+frames. Remaining darkness: the scene renders several stops too dark; the last known
+zeroed input is the 1024x512 R16Float sky-transmittance LUT (0x8051d1-class) — zero
+transmittance suppresses sky/ambient radiance. Next: serve that LUT (same residency
+class) and re-measure exposure.
