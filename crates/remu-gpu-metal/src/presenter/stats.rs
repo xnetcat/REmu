@@ -419,6 +419,7 @@ pub(super) static OWNED_DEMOTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Demoted residents re-taken by a bind that overwrites every texel, at no copy cost.
 pub(super) static OWNED_RECLAIM_DISCARD: AtomicU64 = AtomicU64::new(0);
+pub(super) static OWNED_RECLAIM_EXECUTED: AtomicU64 = AtomicU64::new(0);
 
 /// Demoted allocations restored by reusing a compatible Metal texture view.
 pub(super) static OWNED_REMATERIALISE_VIEW: AtomicU64 = AtomicU64::new(0);

@@ -183,7 +183,8 @@ use self::stats::process_resident_bytes;
 use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE,
-    OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_REMATERIALISE_BLIT,
+    OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_RECLAIM_EXECUTED,
+    OWNED_REMATERIALISE_BLIT,
     OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED,
     OWNED_REMATERIALISE_FAILED_CPU_GPU, OWNED_REMATERIALISE_FAILED_LAYOUT,
     OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
@@ -1493,6 +1494,18 @@ impl ResidentGuestTexture {
             return true;
         }
         if !discard_guest_contents {
+            // Authority subtraction (a neighbour's over-broad span) leaves the executed texels
+            // in Metal while `owned`/`gpu_authored` read empty. Replacing the allocation would
+            // re-upload unpublished guest RAM — zeros — into a target the guest binds with its
+            // contents preserved (SH title light attenuation → black deferred lighting). While
+            // the CPU verifiably has not rewritten the range, the Metal texels are the current
+            // contents; reclaim them exactly like the discard path and let the following mark
+            // re-establish ownership.
+            if self.gpu_content_executed && self.metal_content_cpu_clean() {
+                self.state = ResidencyState::Live;
+                OWNED_RECLAIM_EXECUTED.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
             return false;
         }
         self.state = ResidencyState::Live;
