@@ -1453,3 +1453,21 @@ pub(super) fn shared_backing_record_count(backing_id: u64) -> usize {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .backing_record_count(backing_id)
 }
+
+/// Snapshot of every live shared guest mapping: (guest address, byte length, backing id,
+/// backing offset). The table view a whole-memory dump walks.
+pub fn guest_shared_mapping_table() -> Vec<(u64, u64, u64, u64)> {
+    shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|(address, record)| {
+            (
+                *address,
+                record.end.saturating_sub(*address),
+                record.backing.id(),
+                record.backing_offset,
+            )
+        })
+        .collect()
+}

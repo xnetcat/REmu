@@ -117,6 +117,7 @@ pub(crate) fn probe(path: &Path, import_limit: usize, timeout_seconds: u32) -> E
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("eboot.bin");
+    spawn_timed_guest_memory_dump();
     let outcome = linked.probe_entry(
         image_name,
         &module_report.app_root,
@@ -171,6 +172,7 @@ fn run_game_metal(path: &Path, import_limit: usize, timeout_seconds: u32) -> Exi
     // Preserve command-stream order with bounded memory. If Metal is compiling a pipeline, the
     // queue eventually applies backpressure to the guest instead of dropping work or growing
     // without limit.
+    spawn_timed_guest_memory_dump();
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_event_sink(sender.clone());
     remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::EventSinkInstalled);
@@ -242,4 +244,69 @@ fn load_process_image(
         report.app_root.display()
     );
     Ok((image, report))
+}
+
+/// `REMU_DUMP_MEMORY_AT_SECONDS=N`: snapshot every shared guest mapping to
+/// `$REMU_CAPTURE_DIR/memdump/` N seconds after guest entry, for offline analysis of live
+/// structures (descriptor heaps, staged tables, render-target RAM) at a chosen moment — e.g.
+/// parked at a title menu. Reads go through the checked shared-backing path, so a mapping
+/// retired mid-dump skips instead of faulting.
+fn spawn_timed_guest_memory_dump() {
+    let Some(seconds) = std::env::var("REMU_DUMP_MEMORY_AT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let directory = std::env::var_os("REMU_CAPTURE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("memdump");
+    let _ = std::thread::Builder::new()
+        .name("remu-memdump".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+            if let Err(error) = std::fs::create_dir_all(&directory) {
+                eprintln!("[REMu][MEMDUMP] cannot create {}: {error}", directory.display());
+                return;
+            }
+            let table = remu_memory::guest_shared_mapping_table();
+            let mut index = std::fs::File::create(directory.join("mappings.tsv")).ok();
+            let mut dumped = 0_u64;
+            for (address, length, backing_id, backing_offset) in &table {
+                use std::io::Write as _;
+                if let Some(index) = index.as_mut() {
+                    let _ = writeln!(
+                        index,
+                        "{address:#x}\t{length:#x}\t{backing_id}\t{backing_offset:#x}"
+                    );
+                }
+                let path = directory.join(format!("mem-{address:016x}.bin"));
+                let Ok(mut file) = std::fs::File::create(&path) else {
+                    continue;
+                };
+                let mut chunk = vec![0_u8; 16 * 1024 * 1024];
+                let mut cursor = 0_u64;
+                while cursor < *length {
+                    let step = chunk.len().min((*length - cursor) as usize);
+                    if !remu_memory::read_guest_shared_backing(
+                        address + cursor,
+                        &mut chunk[..step],
+                    ) {
+                        break;
+                    }
+                    if file.write_all(&chunk[..step]).is_err() {
+                        break;
+                    }
+                    cursor += step as u64;
+                    dumped += step as u64;
+                }
+            }
+            eprintln!(
+                "[REMu][MEMDUMP] wrote {} mappings, {} MiB, to {}",
+                table.len(),
+                dumped / (1024 * 1024),
+                directory.display()
+            );
+        });
 }

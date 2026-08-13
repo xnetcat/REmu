@@ -516,6 +516,7 @@ impl MetalPresenter {
             pixel_input_controls.map(remu_shader_metal::PixelInputControl::from_register);
         pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
         pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
+        pixel_options.runtime_heap_tables = runtime_heap_tables_enabled();
         let pixel_msl =
             remu_shader_metal::compile_msl(pixel_program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
@@ -816,3 +817,10 @@ impl MetalPresenter {
     }
 }
 pub(super) const SHADER_COMPILE_QUEUE_CAPACITY: usize = 64;
+
+/// Whether translated shaders resolve dynamically-indexed image descriptors through runtime
+/// heap texture tables (REMU_HEAP_TABLES=1). Off by default while the encoder stage matures.
+pub(super) fn runtime_heap_tables_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REMU_HEAP_TABLES").is_some_and(|value| value == "1"))
+}
