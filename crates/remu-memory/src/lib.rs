@@ -13,6 +13,11 @@ use thiserror::Error;
 mod async_debug_log;
 pub use async_debug_log::{DEBUG_LOG_VARIABLE, debug_log_enabled, debug_log_line};
 
+mod async_stderr;
+pub use async_stderr::{
+    SYNC_STDERR_VARIABLE, crash_output_fd, flush_async_stderr, install_async_stderr,
+};
+
 mod guest_write_journal;
 pub use guest_write_journal::{
     GUEST_WRITE_JOURNAL_VARIABLE, GuestWriteSite, address_looks_poisoned, dump_guest_write_journal,

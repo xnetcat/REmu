@@ -67,6 +67,16 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // All stderr diagnostics become asynchronous for the whole process: authoring threads pay
+    // for a pipe copy, one pump thread pays for the file. REMU_SYNC_STDERR=1 opts out.
+    remu_memory::install_async_stderr();
+    let code = main_command();
+    // Exit-path reports ([REMu][REPORT]) must land in the log before the process ends.
+    remu_memory::flush_async_stderr();
+    code
+}
+
+fn main_command() -> ExitCode {
     match Arguments::parse().command {
         Command::Inspect { path } => inspect(&path),
         Command::HostInfo => {

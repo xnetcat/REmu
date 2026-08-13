@@ -675,10 +675,11 @@ fn emit_entry(
 fn write_diagnostic(buffer: &DiagnosticBuffer) {
     let message = buffer.as_slice();
     // SAFETY: `write` is async-signal-safe and the buffer outlives the call. Short writes are
-    // ignored because this is a last-chance crash diagnostic.
+    // ignored because this is a last-chance crash diagnostic. The preserved real stderr is used
+    // because bytes queued in the asynchronous stderr pipe die with the process.
     unsafe {
         libc::write(
-            libc::STDERR_FILENO,
+            crate::crash_output_fd(),
             message.as_ptr().cast::<std::ffi::c_void>(),
             message.len(),
         );
