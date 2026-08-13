@@ -763,14 +763,18 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         {
             return Ok(());
         }
-        let descriptor_index_is_runtime = (0..IMAGE_DESCRIPTOR_DWORDS).any(|index| {
-            let register = control.scalar_resource as usize + index;
-            self.valu_scalar_destinations
-                .get(register)
-                .copied()
-                .unwrap_or(false)
-                || self.stale_seeded.get(register).copied().unwrap_or(false)
-        });
+        // A supplemental binding is fabricated from initial user data for a scalar path the
+        // evaluation never executed; its snapshot is a seed, not an observed descriptor, so
+        // it is runtime-resolved by definition.
+        let descriptor_index_is_runtime = supplemental
+            || (0..IMAGE_DESCRIPTOR_DWORDS).any(|index| {
+                let register = control.scalar_resource as usize + index;
+                self.valu_scalar_destinations
+                    .get(register)
+                    .copied()
+                    .unwrap_or(false)
+                    || self.stale_seeded.get(register).copied().unwrap_or(false)
+            });
         if descriptor_index_is_runtime {
             static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
