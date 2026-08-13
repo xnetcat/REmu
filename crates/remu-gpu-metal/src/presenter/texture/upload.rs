@@ -170,6 +170,61 @@ pub(crate) fn descriptor_source_address(
     })
 }
 
+/// Experiment gate: adopt the nearest texture-typed staged slot for a refused type-0 SRD.
+///
+/// The SH title's menu assembles its overlay T# on the GPU from CPU-staged neighbours; if the
+/// assembly is a copy, the borrowed slot renders the intended texture and proves the source
+/// relationship. Diagnostic-only until that proof lands — armed with REMU_BORROW_NEAR_SRD=1.
+fn borrow_near_descriptor_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("REMU_BORROW_NEAR_SRD").is_some_and(|value| value == "1")
+    })
+}
+
+fn borrowed_near_image_binding(
+    evaluation: &ShaderEvaluation,
+    binding: &remu_shader::ImageBinding,
+) -> Option<remu_shader::ImageBinding> {
+    if !borrow_near_descriptor_enabled() {
+        return None;
+    }
+    let words = &binding.resource_descriptor;
+    let anchor = descriptor_source_address(evaluation, words)
+        .or_else(|| {
+            evaluation
+                .scalar_memory_reads
+                .iter()
+                .find(|(_, value)| Some(value) == words.first())
+                .map(|(address, _)| *address)
+        })?;
+    let mut candidates: Vec<i64> = (-0x100..=0x100).step_by(16).collect();
+    candidates.sort_by_key(|delta| (delta.abs(), -*delta));
+    for delta in candidates {
+        let slot = anchor.wrapping_add_signed(delta);
+        // SAFETY: probes the staging arena the evaluator just read this submission.
+        let now = unsafe { std::slice::from_raw_parts(slot as *const u32, 8) };
+        if (now[3] >> 28) < 8 {
+            continue;
+        }
+        let mut corrected = binding.clone();
+        corrected.resource_descriptor.clear();
+        corrected.resource_descriptor.extend_from_slice(now);
+        if decode_image_descriptor(&corrected.resource_descriptor).is_ok() {
+            static LOGGED: AtomicUsize = AtomicUsize::new(0);
+            let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+            if sequence <= 16 || sequence.is_power_of_two() {
+                eprintln!(
+                    "[REMu][METAL][IMAGE-BORROW] sequence={sequence} pc={:#x} anchor={anchor:#x} delta={delta:+#x} words={:08x?}",
+                    binding.pc, corrected.resource_descriptor,
+                );
+            }
+            return Some(corrected);
+        }
+    }
+    None
+}
+
 fn late_resolved_image_binding(
     evaluation: &ShaderEvaluation,
     binding: &remu_shader::ImageBinding,
@@ -494,7 +549,10 @@ pub(crate) fn upload_image_textures(
             // rewrite has architecturally happened.
             let late_resolved = decode_image_descriptor(&binding.resource_descriptor)
                 .is_err()
-                .then(|| late_resolved_image_binding(evaluation, binding))
+                .then(|| {
+                    late_resolved_image_binding(evaluation, binding)
+                        .or_else(|| borrowed_near_image_binding(evaluation, binding))
+                })
                 .flatten();
             let binding = if let Some(corrected) = late_resolved.as_ref() {
                 static LOGGED: AtomicUsize = AtomicUsize::new(0);
