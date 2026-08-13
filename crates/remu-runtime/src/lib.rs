@@ -2947,11 +2947,19 @@ impl Drop for GuestImportTracePhaseGuard {
 ///
 /// This re-reports unconditionally, so ages grow monotonically and the ordering is readable
 /// directly off the last line before the fatal.
+///
+/// Ordering by age alone is not enough, because the longest-blocked threads are worker-pool
+/// listeners that parked at boot and never had work: they carry the largest ages while being pure
+/// bystanders. In a quiescence the informative thread is the LAST one to park, and sorting by age
+/// puts it at the bottom where the truncation hides it. So the newly-blocked set is reported
+/// separately — it names each thread's park moment directly, it is empty on a healthy run, and it
+/// cannot be crowded out by bystanders.
 fn report_longest_blocked_guest_threads(
     records: &[Arc<GuestImportTraceRecord>],
     telemetry: &ImportTelemetry,
     now: u64,
     stale_after_nanos: u64,
+    previously_blocked: &mut BTreeSet<u64>,
 ) {
     let mut blocked = records
         .iter()
@@ -2968,26 +2976,41 @@ fn report_longest_blocked_guest_threads(
                     record.name.as_str(),
                     nid_display_name(nid).unwrap_or(nid),
                     record.integer_argument0.load(Ordering::Acquire),
+                    record.thread,
                 )
             })
         })
         .collect::<Vec<_>>();
+    let current = blocked
+        .iter()
+        .map(|(_, _, _, _, thread)| *thread)
+        .collect::<BTreeSet<_>>();
+    let entered = blocked
+        .iter()
+        .filter(|(_, _, _, _, thread)| !previously_blocked.contains(thread))
+        .map(|(age, name, import, argument0, _)| {
+            format!("{name}:{}ms:{import}:{argument0:#x}", age / 1_000_000)
+        })
+        .collect::<Vec<_>>();
+    let left = previously_blocked.difference(&current).count();
+    *previously_blocked = current;
     if blocked.is_empty() {
         return;
     }
     blocked.sort_unstable_by(|left, right| right.0.cmp(&left.0));
-    // The head of the list is what matters; a full census every two seconds would bury it.
-    let census = blocked
+    let longest = blocked
         .iter()
-        .take(8)
-        .map(|(age, name, import, argument0)| {
+        .take(4)
+        .map(|(age, name, import, argument0, _)| {
             format!("{name}:{}ms:{import}:{argument0:#x}", age / 1_000_000)
         })
         .collect::<Vec<_>>()
         .join(" ");
     eprintln!(
-        "[REMu][BLOCKED-CENSUS] blocked={} longest_first {census}",
-        blocked.len()
+        "[REMu][BLOCKED-CENSUS] blocked={} entered={} left={left} newly_blocked=[{}] longest_first {longest}",
+        blocked.len(),
+        entered.len(),
+        entered.join(" "),
     );
 }
 
@@ -3017,6 +3040,7 @@ fn start_guest_import_trace_reporter() {
                 let stale_after_nanos =
                     u64::try_from(STALE_AFTER.as_nanos()).unwrap_or(u64::MAX);
                 let mut reported_agc_counters = (u64::MAX, u64::MAX, u64::MAX);
+                let mut previously_blocked_threads = BTreeSet::new();
                 loop {
                     std::thread::sleep(STALE_AFTER);
                     report_dispatch_write_holder(stale_after_nanos);
@@ -3059,6 +3083,7 @@ fn start_guest_import_trace_reporter() {
                         &telemetry,
                         now,
                         stale_after_nanos,
+                        &mut previously_blocked_threads,
                     );
                     for record in records {
                         if !record.active.load(Ordering::Acquire) {
