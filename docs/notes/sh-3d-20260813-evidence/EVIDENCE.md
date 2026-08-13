@@ -150,3 +150,15 @@ logical target" from "reused for something else". All six iterations' instrument
 reclaim_executed counter) are in tree and give B15 its acceptance signals: at the SH
 title, reclaim_executed > 0, SAMPLED-MISS = 0, 800a69 exports nonzero, rooftop visible.
 All changes are conservative (verification-gated) and the full suite stays green.
+
+## Final probe round: the families separate (runs 20260813T0942..0955)
+
+ACQUIRE-REJECT sampling shows the per-frame-replaced RGBA16Float 1080p targets carry REAL
+guest-RAM data (zero_head=0/64, watch genuinely dirty) — these are legitimately republished
+ping-pong buffers (GPU write → writeback publish → RAM → re-upload), a slow-but-correct
+cycle, NOT the black-lighting chain. The black chain remains the sampled-side class
+(attenuation RGBA8/BGRA8, resident=None, RAM zeros). At least three distinct buffer
+lifecycles interleave at the same sizes; point probes keep landing on the wrong family.
+This is the strongest confirmation yet that content authority needs B15's per-range version
+ledger rather than further predicate patches. All probes in tree are gated and cheap; they
+are B15's live acceptance instrumentation.
