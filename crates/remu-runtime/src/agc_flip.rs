@@ -362,13 +362,26 @@ pub(crate) fn request_agc_submission_completion_for_sequence(
 ) -> bool {
     annotate_submission_flips(&mut events, sequence);
     events.push(remu_gpu::GpuEvent::SubmissionBoundary(sequence));
-    if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+    // Arm before publishing. The backend can complete an empty or fence-only submission the moment
+    // it dequeues the event, and the consumer that converts completions into guest equeue entries
+    // matches them against this list; arming afterwards leaves a window in which the completion
+    // arrives, finds nothing to match, and is discarded while this arm waits forever.
+    {
         let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
         event_state
             .pending_agc_completions
             .push_back((sequence, queue_id));
+    }
+    // Deliberately not holding the event lock across the publish: the GPU event channel is a
+    // blocking bounded queue, and stalling every event-state reader behind it is the failure class
+    // this ordering exists to avoid.
+    if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         true
     } else {
+        let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
+        event_state
+            .pending_agc_completions
+            .retain(|&entry| entry != (sequence, queue_id));
         false
     }
 }
@@ -396,11 +409,18 @@ pub(crate) fn request_agc_compute_submission_completion_for_sequence(
     // through the driver-wide AGC user interrupt below; also routing it through the owner's
     // graphics-filter event makes the guest retire the same ACB/RHI storage twice.
     let queue_id = owner.saturating_add(1);
-    if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
+    // Armed before publishing, for the reason given in the graphics twin above.
+    {
         let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
         event_state.pending_agc_user_interrupts.push_back(sequence);
+    }
+    if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         true
     } else {
+        let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
+        event_state
+            .pending_agc_user_interrupts
+            .retain(|&pending| pending != sequence);
         false
     }
 }
