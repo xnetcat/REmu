@@ -1008,6 +1008,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
             resident_write_footprint_complete: true,
             render_pass: None,
             compute_encoder: None,
+            encoded_event_waits: 0,
             max_encoded_signal: None,
             signal_checkpoints: Vec::new(),
             completion_sequences: vec![77],
