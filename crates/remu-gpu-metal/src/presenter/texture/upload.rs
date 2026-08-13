@@ -451,14 +451,27 @@ pub(crate) fn upload_image_textures(
                         // descriptor-table address is what a write trace must watch, because a
                         // stable table pointer can front descriptors rewritten between
                         // evaluation and execution.
-                        let reads = evaluation
+                        let source = evaluation
                             .scalar_memory_reads
                             .iter()
-                            .map(|(address, dwords)| format!("{address:#x}+{dwords}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
+                            .find(|(_, value)| {
+                                Some(value) == binding.resource_descriptor.first()
+                            })
+                            .map(|(address, _)| *address);
+                        // Upload runs at execute time, evaluation ran at decode time. A slot
+                        // that holds a texture descriptor NOW was rewritten in between — the
+                        // "stable table pointer, rewritten descriptors" hazard — and the fix
+                        // is upload-time revalidation, not decode surgery.
+                        let now = source.map(|address| {
+                            // SAFETY: the evaluator read these exact guest dwords this
+                            // submission; the mapping outlives the draw that named it.
+                            let words = unsafe {
+                                std::slice::from_raw_parts(address as *const u32, 8)
+                            };
+                            format!("{words:08x?}")
+                        });
                         eprintln!(
-                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd scalar_reads=[{reads}]",
+                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd source={source:x?} now={now:?}",
                             binding.pc, binding.opcode, binding.resource_descriptor,
                         );
                     }
