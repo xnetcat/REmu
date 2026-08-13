@@ -37,8 +37,8 @@ impl Compiler<'_> {
         // image ops can index their table with the value the shader actually computed.
         {
             let mut shadow = String::new();
-            for (base, heap) in self.heap_tables.values() {
-                if *heap == binding_index
+            for (base, heaps) in self.heap_tables.values() {
+                if heaps.contains(&binding_index)
                     && instruction.destinations.first().is_some_and(|destination| {
                         destination.kind == OperandKind::ScalarRegister
                             && destination.value == *base
@@ -48,6 +48,10 @@ impl Compiler<'_> {
                     let _ = writeln!(
                         shadow,
                         "    remu_srd_slot_{base} = ({address}) / 32u;"
+                    );
+                    let _ = writeln!(
+                        shadow,
+                        "    remu_srd_heap_{base} = {binding_index}u;"
                     );
                 }
             }

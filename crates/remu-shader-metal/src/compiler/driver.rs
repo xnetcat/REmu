@@ -335,16 +335,14 @@ impl<'a> Compiler<'a> {
                         heaps.insert(heap);
                     }
                 }
-                match (heaps.len(), heaps.into_iter().next()) {
-                    (1, Some(heap)) => {
-                        heap_tables.insert(binding_index, (base, heap));
-                    }
-                    (count, _) => {
-                        eprintln!(
-                            "[REMu][MSL][HEAP-TABLE] pc={:#x} srsrc=s{base}: {count} candidate heaps; keeping snapshot",
-                            binding.pc,
-                        );
-                    }
+                if heaps.is_empty() {
+                    eprintln!(
+                        "[REMu][MSL][HEAP-TABLE] pc={:#x} srsrc=s{base}: no SMEM heap covers the base; keeping snapshot",
+                        binding.pc,
+                    );
+                } else {
+                    heap_tables
+                        .insert(binding_index, (base, heaps.into_iter().collect::<Vec<_>>()));
                 }
             }
         }
@@ -486,8 +484,11 @@ impl<'a> Compiler<'a> {
                 sampler_count,
                 threadgroup_memory_bytes,
                 heap_texture_tables: {
-                    let mut heaps: Vec<usize> =
-                        self.heap_tables.values().map(|(_, heap)| *heap).collect();
+                    let mut heaps: Vec<usize> = self
+                        .heap_tables
+                        .values()
+                        .flat_map(|(_, heaps)| heaps.iter().copied())
+                        .collect();
                     heaps.sort_unstable();
                     heaps.dedup();
                     heaps

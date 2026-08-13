@@ -49,9 +49,11 @@ pub(crate) struct Compiler<'a> {
     pixel_interpolations: BTreeMap<u32, PixelInterpolation>,
     image_kinds: Vec<ImageKind>,
     image_slots: ImageBindingSlotMap,
-    /// Image binding index -> (srsrc base SGPR, heap global-binding index) for bindings whose
-    /// descriptor index resolves only at runtime; empty unless options.runtime_heap_tables.
-    pub(crate) heap_tables: std::collections::BTreeMap<usize, (u32, usize)>,
+    /// Image binding index -> (srsrc base SGPR, candidate heap global-binding indices) for
+    /// bindings whose descriptor index resolves only at runtime; empty unless
+    /// options.runtime_heap_tables. Several heaps mean the base is loaded from different
+    /// SMEM sources across control-flow paths and the shader selects at runtime.
+    pub(crate) heap_tables: std::collections::BTreeMap<usize, (u32, Vec<usize>)>,
     control_flow: ControlFlowLowering,
 }
 
@@ -95,8 +97,8 @@ impl Compiler<'_> {
     }
 
     /// The heap-table route for one image binding, when analysis produced one.
-    pub(crate) fn runtime_heap_table(&self, binding_index: usize) -> Option<(u32, usize)> {
-        self.heap_tables.get(&binding_index).copied()
+    pub(crate) fn runtime_heap_table(&self, binding_index: usize) -> Option<&(u32, Vec<usize>)> {
+        self.heap_tables.get(&binding_index)
     }
 
     fn split_wave64(&self) -> bool {

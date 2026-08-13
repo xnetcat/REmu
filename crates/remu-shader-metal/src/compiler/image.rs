@@ -83,8 +83,15 @@ impl Compiler<'_> {
     /// resolves only at runtime (docs/design/2026-08-13-runtime-image-descriptor-fetch.md) will
     /// instead index a heap texture table by the shadow slot the SMEM lowering maintains.
     pub(crate) fn texture_expression(&self, binding_index: usize) -> String {
-        if let Some((base, heap)) = self.runtime_heap_table(binding_index) {
-            return format!("remu_heap_{heap}.tex[min(remu_srd_slot_{base}, 15u)]");
+        if let Some((base, heaps)) = self.runtime_heap_table(binding_index) {
+            let slot = format!("min(remu_srd_slot_{base}, 15u)");
+            let mut expression = format!("remu_heap_{}.tex[{slot}]", heaps[0]);
+            for heap in &heaps[1..] {
+                expression = format!(
+                    "(remu_srd_heap_{base} == {heap}u ? remu_heap_{heap}.tex[{slot}] : {expression})"
+                );
+            }
+            return expression;
         }
         format!("tex{binding_index}")
     }

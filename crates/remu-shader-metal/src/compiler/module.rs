@@ -235,8 +235,11 @@ impl Compiler<'_> {
             ));
         }
         {
-            let mut heaps: Vec<usize> =
-                self.heap_tables.values().map(|(_, heap)| *heap).collect();
+            let mut heaps: Vec<usize> = self
+                .heap_tables
+                .values()
+                .flat_map(|(_, heaps)| heaps.iter().copied())
+                .collect();
             heaps.sort_unstable();
             heaps.dedup();
             for (ordinal, heap) in heaps.iter().enumerate() {
@@ -368,6 +371,7 @@ impl Compiler<'_> {
             bases.dedup();
             for base in bases {
                 let _ = writeln!(source, "    uint remu_srd_slot_{base} = 0u;");
+                let _ = writeln!(source, "    uint remu_srd_heap_{base} = 0xffffffffu;");
             }
         }
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
