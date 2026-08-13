@@ -15,6 +15,7 @@ use super::{
     decode_image_descriptor, ensure_mipmapped_resident_texture_in_map,
     ensure_resident_texture_in_map, fallback_image_descriptor, guest_texture_byte_count,
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
+    guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
@@ -720,7 +721,9 @@ pub(crate) fn upload_image_textures(
                                     // Exact same-address images may remain gpu-authored after a
                                     // neighbour partially supersedes owned-byte accounting; bind
                                     // through same-image / colour-view eligibility instead of
-                                    // uploading unpublished guest RAM.
+                                    // uploading unpublished guest RAM. Executed-content
+                                    // candidates are accepted tentatively; the resolve stage
+                                    // holds the mutable borrow and fingerprint-verifies them.
                                     && (resident.serves_reads()
                                         || resident_color_view_sample_is_eligible(
                                             resident,
@@ -731,7 +734,13 @@ pub(crate) fn upload_image_textures(
                                             resident,
                                             descriptor,
                                             comparison,
-                                        ))
+                                        )
+                                        || (!comparison
+                                            && resident.gpu_content_executed
+                                            && guest_texture_descriptors_share_color_view_storage(
+                                                resident.descriptor,
+                                                descriptor.guest,
+                                            )))
                             })
                             .max_by_key(|resident| {
                                 // Prefer a Depth* DB surface over a same-address R32/R16 sample
