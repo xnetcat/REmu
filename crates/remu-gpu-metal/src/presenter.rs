@@ -1484,6 +1484,24 @@ impl ResidentGuestTexture {
     fn reclaim_for_bind(&mut self, discard_guest_contents: bool) -> bool {
         // Consumer-aware ACQUIRE demotion: invalidate at first consumer bind, not at acquire.
         if self.acquire_invalidated && !discard_guest_contents {
+            if self.gpu_content_executed
+                && self.descriptor.width >= 1_280
+                && self.descriptor.height >= 720
+            {
+                static LOGGED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][RECLAIM-BLOCKED] gate=acquire-invalidated sequence={sequence} address={:#x} {}x{} {:?} version={}",
+                        self.descriptor.address,
+                        self.descriptor.width,
+                        self.descriptor.height,
+                        self.descriptor.pixel_format,
+                        self.content_version,
+                    );
+                }
+            }
             self.demote(StaleSource::GuestMemory);
             return false;
         }
