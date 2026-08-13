@@ -794,7 +794,7 @@ pub(crate) fn upload_image_textures(
                     let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if sequence <= 32 || sequence.is_power_of_two() {
                         eprintln!(
-                            "[REMu][METAL][SAMPLED-MISS] sequence={sequence} address={:#x} sampled={:?}/{}x{}/tile{} resident={:?}/{}x{}/tile{} live={} serves_reads={} gpu_written={} version={} mips={}/{} layers={}/{}",
+                            "[REMu][METAL][SAMPLED-MISS] sequence={sequence} address={:#x} sampled={:?}/{}x{}/tile{} resident={:?}/{}x{}/tile{} live={} serves_reads={} gpu_written={} executed={} cpu_clean={} version={} mips={}/{} layers={}/{}",
                             descriptor.guest.address,
                             descriptor.guest.pixel_format,
                             descriptor.guest.width,
@@ -807,6 +807,8 @@ pub(crate) fn upload_image_textures(
                             resident.is_live(),
                             resident.serves_reads(),
                             resident.gpu_written(),
+                            resident.gpu_content_executed,
+                            resident.metal_content_cpu_clean(),
                             resident.content_version,
                             resident.mip_level_count,
                             descriptor.mip_level_count,

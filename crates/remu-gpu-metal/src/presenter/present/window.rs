@@ -4,6 +4,7 @@
 use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
 use super::super::{
     OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD,
+    OWNED_RECLAIM_EXECUTED,
     OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
     OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
     OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
@@ -746,12 +747,13 @@ impl MetalPresenter {
                 owned_runs += resident.owned.runs().len();
             }
             eprintln!(
-                "[REMu][PERF-TEXTURE-OWNED] live={live} stale={stale} owned={:.1}MiB/{owned_runs} runs debt={:.1}MiB survived={} demoted={} reclaim_discard={} rematerialise={}/{}/{}/{} failed={}({}/{}/{}/{}) coarsened={} unresolved={} fallback={}",
+                "[REMu][PERF-TEXTURE-OWNED] live={live} stale={stale} owned={:.1}MiB/{owned_runs} runs debt={:.1}MiB survived={} demoted={} reclaim_discard={} reclaim_executed={} rematerialise={}/{}/{}/{} failed={}({}/{}/{}/{}) coarsened={} unresolved={} fallback={}",
                 owned_bytes as f64 / (1024.0 * 1024.0),
                 debt_bytes as f64 / (1024.0 * 1024.0),
                 OWNED_SUBTRACT_TENANTS_SURVIVED.swap(0, Ordering::Relaxed),
                 OWNED_DEMOTIONS.swap(0, Ordering::Relaxed),
                 OWNED_RECLAIM_DISCARD.swap(0, Ordering::Relaxed),
+                OWNED_RECLAIM_EXECUTED.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_VIEW.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_BLIT.swap(0, Ordering::Relaxed),
                 OWNED_REMATERIALISE_DETILE.swap(0, Ordering::Relaxed),
