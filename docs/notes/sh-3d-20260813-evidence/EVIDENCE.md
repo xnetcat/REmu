@@ -267,3 +267,14 @@ memory ever holds the texture descriptor. Bridges landed (late-resolve, producer
 OOB-tolerant source matcher) are correct for their classes but inert here by construction.
 The menu-background delta is therefore strictly an ACM-engine work item: runtime descriptor
 fetch at GPU execution order. All other elements of the NEW GAME screen match the reference.
+
+## Borrow experiment (REMU_BORROW_NEAR_SRD=1)
+Adopting the nearest texture-typed staged slot for refused type-0 SRDs eliminates every
+refusal (37-64 → 0 across four runs; all borrows resolve to one 2D texture, consistent with
+a single noise/mask asset and the GPU-assembly-copies-from-neighbours theory). Probes now go
+through read_guest_shared_backing after raw-pointer probing SIGBUSed the host twice. Visual
+verdict needs a parked menu: menu timing varies 95-200s with metallib-cache warmth, so fixed
+press schedules overshoot warm boots and undershoot cold ones; parking reliably requires the
+W3 fix. Resume: REMU_BORROW_NEAR_SRD=1 + schedule 12..140/HOLD 1000 + compare the parked menu
+against the reference; correct background → promote borrow to principled copy-source
+resolution; wrong texture → ACM engine (a9dc0021).
