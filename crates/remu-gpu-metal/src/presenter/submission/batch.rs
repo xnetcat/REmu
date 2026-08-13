@@ -2178,11 +2178,27 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
         .map(|(shader, (count, threads))| format!("cs={shader:#x}x{count}/threads={threads}"))
         .collect::<Vec<_>>()
         .join(",");
+    // The GPU duration covers every encoder in the command buffer, not only the summarized
+    // draws/dispatches; upload, writeback, and guest-write volumes are printed so a buffer whose
+    // time is spent in blit work is not blamed on its one small draw.
+    let upload_bytes: usize = batch.global_upload_chunks.iter().map(|chunk| chunk.used).sum();
+    let writeback_bytes: u64 = batch
+        .guest_write_ranges
+        .iter()
+        .map(|range| range.byte_count)
+        .sum();
     eprintln!(
         "[REMu][SLOW-CB] gpu_ms={:.0} queue={:?} draws={draw_count} computes={compute_count} \
+         uploads={}/{}KiB guest_writes={}/{}KiB global_writebacks={} memory_writes={} \
          top_ps=[{pixels}] top_cs=[{computes}]",
         gpu_execution.as_secs_f64() * 1000.0,
         batch.queue_id,
+        batch.global_upload_chunks.len(),
+        upload_bytes / 1024,
+        batch.guest_write_ranges.len(),
+        writeback_bytes / 1024,
+        batch.global_writebacks.len(),
+        batch.memory_writes.len(),
     );
 }
 
