@@ -248,3 +248,14 @@ static evaluation resolves to the wrong entry. The same run wedged silently t=23
 variant that RECOVERS; UE's 120s watchdog converts the longer ones into the pc=0x809044770
 crash-handler fatal). Persistent metallib + render-pipeline archives exist under
 ~/Library/Caches/REMu/metal; warm runs shrink the storm.
+
+## Menu background: GPU-written descriptor tables (task #12, mechanism closed)
+Three probes settled it: (1) refusal now names the SRD's source slot from the evaluation's
+scalar-read journal; (2) upload-time re-read of that slot still shows V#/sentinel content
+(so not a late CPU write — late-resolve landed anyway for that class); (3) a neighborhood
+scan finds a real T# consistently at +0x60 while the sampled slot is +0x40, and hand-decoding
+the raw MIMG words confirms SRSRC=s32←table+0x40 is decoded correctly. Conclusion: the +0x40
+descriptor is produced by GPU work within the frame; no CPU-time read can observe it. The fix
+is the planned ACM runtime-descriptor-fetch engine (docs 2026-08-12/13 design+plan): scalar
+descriptor loads whose source is GPU-authored must become GPU-execution-time buffer reads.
+Until then the static overlay renders unmasked and occludes the rooftop scene at the menu.
