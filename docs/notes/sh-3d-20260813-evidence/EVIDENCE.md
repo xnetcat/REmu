@@ -278,3 +278,51 @@ press schedules overshoot warm boots and undershoot cold ones; parking reliably 
 W3 fix. Resume: REMU_BORROW_NEAR_SRD=1 + schedule 12..140/HOLD 1000 + compare the parked menu
 against the reference; correct background → promote borrow to principled copy-source
 resolution; wrong texture → ACM engine (a9dc0021).
+
+## RETRACTIONS AND RE-DIAGNOSIS (Codex rescue review, 2026-08-13 late)
+
+**Retracted:** the "first presented frame with real 3D scene composition" claim (run
+20260813T103355Z, t=347) and the transmittance-LUT lead that descends from it. Independent
+pixel analysis shows that frame is the same full-screen binary speckle field as scene-free
+frames; the "rooftop composition" was the speckle's density envelope. **Retracted:** the
+borrow experiment as a fix — a borrow-enabled parked menu frame is 97.6% bit-identical to the
+pre-borrow control (mean |diff| 1.30/255, residual = menu highlight animation). The borrow
+code has been removed.
+
+**Corrected symptom model:** the menu background is NOT a static overlay hiding a scene. The
+presented pattern is a frozen (bit-identical across runs and processes, no temporal noise
+averaging) binary white-noise mask, 24-86% exact-black by region with constant non-black
+brightness — a density map, not a composite. There is no scene underneath to reveal.
+
+**Corrected descriptor diagnosis:** "GPU-written descriptor table" was never differentiated
+from a simpler cause. The IMAGE-REFUSE `source=` anchor was a single-dword coincidence match
+(weak); the strong 4-of-8 matcher finding NO contiguous source is itself evidence the refused
+words were never one SMEM vector. Refusal words from run 154633Z (eight consecutive integers;
+packed 16-bit arrays) are index tables, not descriptors — the signature of loading from a
+WRONG ADDRESS. Root-cause candidates in the evaluator (remu-shader):
+1. VALU instructions are skipped without invalidating scalar destinations (ir.rs:583-594,
+   liveness.rs:10-27) — V_READFIRSTLANE_B32/V_READLANE_B32/VOP3b carry-outs leave stale SGPRs
+   that then feed SMEM dynamic offsets (resources.rs:383-390): wrong descriptor slot by
+   multiples of 0x20. SLOAD_DESCRIPTOR_HEAP_MIN_BYTES already acknowledges this for buffers;
+   buffers self-correct at runtime (compiler/memory/global.rs:25-34 lowers the offset as a
+   runtime register read) — images bake the snapshot, hence the asymmetry.
+2. VCC is never computed (VOPC pushes no destinations) so `s_and exec,vcc` + `s_cbranch_scc0`
+   always evaluates taken with no fork; skipped blocks get descriptors fabricated from
+   initial user data (resources.rs:315-345) — also yields non-null type-0 refusals.
+
+**Proper fixes (no shortcuts):** (a) evaluator soundness — execute or explicitly invalidate
+VALU scalar destinations and fork on uncomputable SCC branches, with provenance recording
+(dest SGPR ↔ guest address) so diagnostics are real; (b) runtime descriptor fetch for
+dynamically-indexed images, reusing the buffers' runtime-offset lowering — the scoped-correct
+form of the ACM plan. (c) W3: the RenderThread parks on the PROBE_DISPATCH write lock; holder
+candidates ranked: av_player_add_source's double avformat_open_input under the guard,
+LibavDemuxSession::open, POSIX open/stat (read_dir per path component) — all must move to the
+pre-lock tier like their libKernel twins; plus the AGC grow-callback self-deadlock class
+(guest code executed under the write guard re-entering a stateful import). Holder-identity
+instrumentation (~35 lines: holder thread/import/timestamp atomics + stale-import reporter
+printout) names it in one run.
+
+**Menu-background discriminator (next run):** dump the pre-composite scene target and the
+composite draw's inputs at the menu (scanout-writer path, MIN_DRAW=0 trap noted) and read
+black=N/M — is the scene target black BEFORE the overlay draws, or does the overlay destroy
+it? Everything branches on that answer.
