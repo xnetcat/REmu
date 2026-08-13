@@ -1514,9 +1514,15 @@ fn report_dispatch_write_holder(stale_after_nanos: u64) {
 // may park on a guest synchronization object: the guest thread that would release it cannot reach
 // its own release call without this same lock, so the whole process wedges. Test builds turn that
 // class into a failed assertion instead of a hang.
-#[cfg(test)]
+//
+// Release builds keep the counter to detect the other member of that family: re-entering the write
+// lock on a thread that already holds it. That is reachable today, because the AGC command-buffer
+// grow callbacks (agc_dcb.rs, agc_acb.rs, agc_driver.rs) run guest code from
+// `dispatch_extended_import`, i.e. under the guard, and a guest callback is free to call a stateful
+// import. std's RwLock is not re-entrant, so the second acquisition deadlocks permanently with no
+// diagnostic at all.
 thread_local! {
-    static DISPATCH_WRITE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DISPATCH_WRITE_DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Write access to [`PROBE_DISPATCH`], timed for the guard's complete lifetime.
@@ -1550,7 +1556,6 @@ impl Drop for DispatchWriteGuard<'_> {
         DISPATCH_WRITE_HOLDER_SINCE_NANOS.store(0, Ordering::Release);
         let held = self.acquired_at.elapsed();
         drop(self.guard.take());
-        #[cfg(test)]
         DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
         remu_gpu::record_dispatch_lock_acquire_wait(self.acquire_wait);
         remu_gpu::record_dispatch_lock_hold(held);
@@ -1563,12 +1568,20 @@ pub(crate) fn lock_probe_dispatch_for_write(
 ) -> DispatchWriteGuard<'_> {
     let _hierarchy =
         dispatch_locks::LockHierarchyGuard::enter(dispatch_locks::LockLevel::ProbeDispatch);
+    // Reported before the acquisition that will never complete: std's RwLock is not re-entrant, so
+    // this thread is about to deadlock against itself and no later code will run to explain why.
+    if DISPATCH_WRITE_DEPTH.with(Cell::get) > 0 {
+        eprintln!(
+            "[REMu][DISPATCH-LOCK][REENTRY] thread={:#x} import_index={} — write lock re-entered on a thread that already holds it; this will not complete",
+            current_guest_thread_handle(),
+            CURRENT_IMPORT_DISPATCH_INDEX.with(Cell::get),
+        );
+    }
     let started = Instant::now();
     let guard = lock
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let acquire_wait = started.elapsed();
-    #[cfg(test)]
     DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get() + 1));
     DISPATCH_WRITE_HOLDER_THREAD.store(current_guest_thread_handle(), Ordering::Relaxed);
     DISPATCH_WRITE_HOLDER_INDEX.store(
