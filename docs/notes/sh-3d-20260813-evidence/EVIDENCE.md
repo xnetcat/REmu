@@ -354,3 +354,13 @@ Full report: memdump-heap-analysis.md. Headlines:
   (word0<<8)|((word1&0xff)<<40); landed code already correct); cap 16 not 512; anchor the walk
   to the binding base's phase and stop at the first non-decoding slot; assert the slot formula's
   phase; tighten the T# predicate by cross-checking residents.
+
+## Instrument lesson (Codex self-report, guest-entry registration)
+a6c003cf's entry-thread registration never fired: module initializers run imports first, the
+lazy trace guard wins the thread-local race, and the guard's null-check early-returns forever.
+A healthy run and a broken instrument look identical — both print nothing. Permanent rule:
+every instrument needs a liveness line at startup (the AGC-COUNTERS sentinel pattern). Fix is
+a one-line reorder (register before invoke_guest_module_initializers), landing after the
+in-flight acceptance gauntlet. Frozen import counters during the stall (waits/wakes flat)
+already rule out import-polling: the entry thread is parked or in translated code — the fixed
+registration's phase field decides which.
