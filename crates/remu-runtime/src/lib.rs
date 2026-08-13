@@ -1460,6 +1460,20 @@ const MAXIMUM_CARRIED_AGC_COMPLETIONS: usize = 4096;
 /// equeue would have to take the event-state write lock just to discover there is nothing carried.
 static AGC_UNCLAIMED_COMPLETIONS_CARRIED: AtomicBool = AtomicBool::new(false);
 
+// Lock-free mirrors of the AGC completion counters.
+//
+// The authoritative ledger is `AgcCompletionTelemetry`, reachable only under the dispatch write
+// lock. The import-trace reporter must never take that lock: it runs precisely when the lock may be
+// unavailable, and blocking there would silence the one thread still reporting during a wedge.
+//
+// Mirroring matters because `report_diagnostic_stall_attribution` — the only place [STALL-AGC] and
+// therefore these counters are printed — runs solely from the diagnostic-timeout watchdog. A run
+// killed by a guest fatal never reaches it, so on exactly the runs worth diagnosing the counters
+// were invisible. These make them visible every reporter tick instead.
+static AGC_UNMATCHED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
+static AGC_RECLAIMED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
+static AGC_EVICTED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
+
 const KERNEL_EVENT_FILTER_GRAPHICS: i16 = -14;
 const KERNEL_EVENT_FILTER_USER: i16 = -11;
 /// Gen5 AP/AMPR command-buffer completion. The Gen4 filter set ends at the high-resolution timer,
@@ -2827,9 +2841,31 @@ fn start_guest_import_trace_reporter() {
                 const STALE_AFTER: Duration = Duration::from_secs(2);
                 let stale_after_nanos =
                     u64::try_from(STALE_AFTER.as_nanos()).unwrap_or(u64::MAX);
+                let mut reported_agc_counters = (u64::MAX, u64::MAX, u64::MAX);
                 loop {
                     std::thread::sleep(STALE_AFTER);
                     report_dispatch_write_holder(stale_after_nanos);
+                    // Printed on change, or whenever completions are being carried, so a healthy
+                    // run stays quiet while a wedge reports every tick.
+                    let agc_counters = (
+                        AGC_UNMATCHED_BACKEND_IDS.load(Ordering::Relaxed),
+                        AGC_RECLAIMED_BACKEND_IDS.load(Ordering::Relaxed),
+                        AGC_EVICTED_BACKEND_IDS.load(Ordering::Relaxed),
+                    );
+                    let carried = event_state::try_carried_agc_completion_depth();
+                    if agc_counters != reported_agc_counters || carried.is_some_and(|d| d > 0) {
+                        reported_agc_counters = agc_counters;
+                        eprintln!(
+                            "[REMu][AGC-COUNTERS] unmatched={} reclaimed={} evicted={} carried={}",
+                            agc_counters.0,
+                            agc_counters.1,
+                            agc_counters.2,
+                            carried.map_or_else(
+                                || "unknown".to_owned(),
+                                |depth| depth.to_string()
+                            ),
+                        );
+                    }
                     let now = guest_import_trace_nanos();
                     let records = GUEST_IMPORT_TRACE_RECORDS
                         .lock()
@@ -5984,6 +6020,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                 .unmatched_backend_ids
                 .saturating_add(1);
             state.agc_completion_telemetry.last_unmatched_backend_id = Some(sequence);
+            AGC_UNMATCHED_BACKEND_IDS.fetch_add(1, Ordering::Relaxed);
         }
     }
     for &sequence in claimed.difference(&drained) {
@@ -5994,6 +6031,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
             .reclaimed_backend_ids
             .saturating_add(1);
         state.agc_completion_telemetry.last_reclaimed_backend_id = Some(sequence);
+        AGC_RECLAIMED_BACKEND_IDS.fetch_add(1, Ordering::Relaxed);
     }
     let mut carried = completed
         .difference(&claimed)
@@ -6009,6 +6047,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                 .agc_completion_telemetry
                 .evicted_backend_ids
                 .saturating_add(1);
+            AGC_EVICTED_BACKEND_IDS.fetch_add(1, Ordering::Relaxed);
         }
     }
     AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(!carried.is_empty(), Ordering::Release);

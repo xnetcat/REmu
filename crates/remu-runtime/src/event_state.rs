@@ -70,6 +70,18 @@ pub(crate) fn lock_event_state_for_read() -> (
     (hierarchy, guard)
 }
 
+/// Carried-completion depth, or `None` when the lock is busy.
+///
+/// A diagnostic peek for the import-trace reporter. Deliberately bare `try_read`: it takes no
+/// hierarchy guard because it acquires nothing else and never waits, and a reporter that blocked
+/// here would go silent during the wedge it exists to describe.
+pub(crate) fn try_carried_agc_completion_depth() -> Option<usize> {
+    cell()
+        .try_read()
+        .ok()
+        .map(|events| events.unclaimed_agc_completions.len())
+}
+
 pub(crate) fn reset_event_state() {
     let mut state = cell()
         .write()
