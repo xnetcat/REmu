@@ -678,6 +678,29 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     &mut path.exec_mask,
                     &mut path.scalar_condition,
                 )?;
+                // Scalar ALU carries staleness: a pointer or offset combined from a
+                // stale-seeded register is itself stale-seeded, and a result computed only
+                // from clean inputs washes the taint off its destination.
+                let tainted = instruction.sources.iter().any(|source| {
+                    source.kind == OperandKind::ScalarRegister
+                        && (self
+                            .valu_scalar_destinations
+                            .get(source.value as usize)
+                            .copied()
+                            .unwrap_or(false)
+                            || self
+                                .stale_seeded
+                                .get(source.value as usize)
+                                .copied()
+                                .unwrap_or(false))
+                });
+                for destination in &instruction.destinations {
+                    if destination.kind == OperandKind::ScalarRegister
+                        && (destination.value as usize) < SCALAR_REGISTER_COUNT
+                    {
+                        self.stale_seeded[destination.value as usize] = tainted;
+                    }
+                }
             } else if let Some(InstructionControl::ScalarMemory(control)) = &instruction.control {
                 self.execute_scalar_load(instruction, *control, &mut path.registers)?;
             } else if let Some(InstructionControl::GlobalMemory(control)) = &instruction.control {
