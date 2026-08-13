@@ -768,6 +768,45 @@ pub(crate) fn upload_image_textures(
                     }
                 })
                 .flatten();
+            if resident_descriptor.is_none()
+                && matches!(descriptor.texture_type, 9)
+                && descriptor.guest.width >= 1_280
+                && descriptor.guest.height >= 720
+            {
+                // A large screen-space sample about to fall back to guest RAM while a resident
+                // holds this exact address under another key is the black-lighting signature
+                // (SH title: light attenuation written BGRA8, sampled RGBA8, resident excluded).
+                // Name the excluding state so the eligibility fix targets the right predicate.
+                if let Some(resident) = resident_guest_textures
+                    .values()
+                    .find(|resident| resident.descriptor.address == descriptor.guest.address)
+                {
+                    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                    let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 32 || sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL][SAMPLED-MISS] sequence={sequence} address={:#x} sampled={:?}/{}x{}/tile{} resident={:?}/{}x{}/tile{} live={} serves_reads={} gpu_written={} version={} mips={}/{} layers={}/{}",
+                            descriptor.guest.address,
+                            descriptor.guest.pixel_format,
+                            descriptor.guest.width,
+                            descriptor.guest.height,
+                            descriptor.guest.tile_mode,
+                            resident.descriptor.pixel_format,
+                            resident.descriptor.width,
+                            resident.descriptor.height,
+                            resident.descriptor.tile_mode,
+                            resident.is_live(),
+                            resident.serves_reads(),
+                            resident.gpu_written(),
+                            resident.content_version,
+                            resident.mip_level_count,
+                            descriptor.mip_level_count,
+                            resident.layer_count,
+                            descriptor.layer_count,
+                        );
+                    }
+                }
+            }
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {
                 let resident = resident_guest_textures.get_mut(&resident_descriptor)?;
                 let version = resident.content_version;
