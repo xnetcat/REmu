@@ -1489,8 +1489,11 @@ impl ResidentGuestTexture {
         // CPU rewrite still demotes; over-broad ACQUIRE ranges no longer destroy the only copy
         // of executed screen content (SH title light attenuation → black deferred lighting).
         if self.acquire_invalidated && !discard_guest_contents {
+            // An armed, undirtied write watch proves the CPU wrote nothing since arming; only a
+            // dirty watch needs the (baseline-dependent) fingerprint comparison.
             let cpu_rewrote = !self.gpu_content_executed
-                || self.write_watch.content_has_changed().unwrap_or(true);
+                || (self.write_watch.is_dirty()
+                    && self.write_watch.content_has_changed().unwrap_or(true));
             if cpu_rewrote {
                 self.demote(StaleSource::GuestMemory);
                 return false;
@@ -1517,15 +1520,13 @@ impl ResidentGuestTexture {
             // re-establish ownership. Generation drift from watch renewal is not a guest store;
             // mirror the Active-arm fingerprint verification and re-anchor on a false positive.
             if self.gpu_content_executed {
-                let possibly_changed = self.write_watch.content_validation_pending()
-                    || self.write_watch.is_dirty()
-                    || self.write_watch.generations() != self.gpu_write_watch_generations;
-                let cpu_rewrote = possibly_changed
+                // An armed, undirtied write watch proves no CPU store since arming; generation
+                // drift and pending validation are renewal bookkeeping, not guest writes. Only a
+                // dirty watch needs the (baseline-dependent) fingerprint comparison.
+                let cpu_rewrote = self.write_watch.is_dirty()
                     && self.write_watch.content_has_changed().unwrap_or(true);
                 if !cpu_rewrote {
-                    if possibly_changed {
-                        self.note_gpu_write();
-                    }
+                    self.note_gpu_write();
                     self.state = ResidencyState::Live;
                     OWNED_RECLAIM_EXECUTED.fetch_add(1, Ordering::Relaxed);
                     return true;
