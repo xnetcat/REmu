@@ -151,15 +151,23 @@ pub(crate) fn descriptor_source_address(
     }
     let reads: std::collections::BTreeMap<u64, u32> =
         evaluation.scalar_memory_reads.iter().copied().collect();
-    reads
-        .iter()
-        .find(|(address, value)| {
-            **value == words[0]
-                && (1..8).all(|index| {
-                    reads.get(&(**address + 4 * index as u64)) == Some(&words[index])
-                })
-        })
-        .map(|(address, _)| *address)
+    reads.iter().find_map(|(address, value)| {
+        if *value != words[0] {
+            return None;
+        }
+        // A component past the sourcing V#'s bounds zeroes its register without a journal
+        // entry, so absent entries may only stand in for zero dwords; four matched entries
+        // keep an eight-dword coincidence out of reach.
+        let mut present = 1;
+        for (index, word) in words.iter().enumerate().skip(1) {
+            match reads.get(&(address + 4 * index as u64)) {
+                Some(read) if read == word => present += 1,
+                None if *word == 0 => {}
+                _ => return None,
+            }
+        }
+        (present >= 4).then_some(*address)
+    })
 }
 
 fn late_resolved_image_binding(
