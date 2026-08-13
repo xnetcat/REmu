@@ -176,6 +176,72 @@ impl MetalPresenter {
                                         )
                                     });
                                 if texture.is_none() {
+                                    // Compatible residents next (colour-view/same-image), then
+                                    // the sampled cache, then a GPU-tiler upload from guest
+                                    // RAM: the descriptor is a valid T# naming a real asset,
+                                    // and a placeholder here multiplies the scene to black.
+                                    let compatible = self
+                                        .resident_guest_textures
+                                        .values()
+                                        .find(|resident| {
+                                            super::texture::resident_color_view_sample_is_eligible(
+                                                resident, decoded, false,
+                                            ) || super::texture::resident_same_image_sample_is_eligible(
+                                                resident, decoded, false,
+                                            )
+                                        })
+                                        .map(|resident| resident.descriptor);
+                                    if let Some(descriptor) = compatible
+                                        && let Some(resident) =
+                                            self.resident_guest_textures.get_mut(&descriptor)
+                                    {
+                                        texture =
+                                            super::texture::resident_texture_for_sample(
+                                                resident, decoded,
+                                            );
+                                    }
+                                }
+                                if texture.is_none() {
+                                    let key = super::texture::sampled_texture_key(
+                                        decoded, false,
+                                    );
+                                    texture = self
+                                        .sampled_texture_cache
+                                        .get(&key)
+                                        .map(|cached| cached.texture.clone());
+                                    if texture.is_none() {
+                                        let queue = self.active_guest_command_queue()?.clone();
+                                        let command_buffer = queue.new_command_buffer();
+                                        match super::texture::create_sampled_guest_texture_from_guest_gpu(
+                                            device,
+                                            command_buffer,
+                                            decoded,
+                                            false,
+                                            false,
+                                        ) {
+                                            Ok(created) => {
+                                                command_buffer.commit();
+                                                texture = Some(created);
+                                            }
+                                            Err(error) => {
+                                                static LOGGED: std::sync::atomic::AtomicUsize =
+                                                    std::sync::atomic::AtomicUsize::new(0);
+                                                let sequence = LOGGED.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                ) + 1;
+                                                if sequence <= 8
+                                                    || sequence.is_power_of_two()
+                                                {
+                                                    eprintln!(
+                                                        "[REMu][HEAP-TABLE] sequence={sequence} slot upload failed: {error}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if texture.is_none() {
                                     static LOGGED: std::sync::atomic::AtomicUsize =
                                         std::sync::atomic::AtomicUsize::new(0);
                                     let sequence = LOGGED
