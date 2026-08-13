@@ -1,7 +1,8 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use remu_memory::notify_guest_memory_written;
@@ -372,6 +373,64 @@ fn av_player_probe_video(path: &Path) -> Option<(u32, u32, f64, Duration)> {
 
 fn av_player_probe_has_audio(path: &Path) -> bool {
     av_player_libav::probe_has_audio(path)
+}
+
+/// Geometry and audio presence for one media source: what `sceAvPlayerAddSource` has to learn
+/// before it can install a source, and the only two things it needs the container for.
+type AvPlayerSourceProbe = (u32, u32, f64, Duration, bool);
+
+/// Successful container probes, keyed by host path.
+///
+/// Each probe is a full `avformat_open_input` plus `find_stream_info`, and AddSource performs two
+/// of them. Memoizing lets [`av_player_prewarm_source_probe`] pay that cost from the pre-lock
+/// import tier while the installer below still reads a value under the dispatch write guard.
+///
+/// Only successes are retained. A probe that fails on flaky storage must be retried rather than
+/// remembered, or one bad read would make the source permanently unplayable for the process.
+static AV_PLAYER_SOURCE_PROBES: OnceLock<Mutex<HashMap<PathBuf, AvPlayerSourceProbe>>> =
+    OnceLock::new();
+
+fn av_player_source_probes() -> &'static Mutex<HashMap<PathBuf, AvPlayerSourceProbe>> {
+    AV_PLAYER_SOURCE_PROBES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Probes `path`, reusing a previous successful probe of the same file.
+fn av_player_probe_source(path: &Path) -> Option<AvPlayerSourceProbe> {
+    if let Some(cached) = av_player_source_probes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .copied()
+    {
+        return Some(cached);
+    }
+    let (width, height, frames_per_second, duration) = av_player_probe_video(path)?;
+    let probe = (
+        width,
+        height,
+        frames_per_second,
+        duration,
+        av_player_probe_has_audio(path),
+    );
+    av_player_source_probes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), probe);
+    Some(probe)
+}
+
+/// Resolves and probes an AddSource argument list before the dispatch write lock is taken.
+///
+/// Runs from the pre-lock import tier purely for its cache side effect: every outcome, including
+/// an unreadable argument or an unresolvable source, is discarded here and rediscovered by
+/// [`av_player_add_source`] under the guard, which remains the single authority on what AddSource
+/// returns. Resolution uses the published path-roots snapshot rather than `ProbeDispatchState`, so
+/// nothing here touches the dispatch lock.
+pub(crate) fn av_player_prewarm_source_probe(source: &str) {
+    let game_root = crate::path_roots::path_roots_game_root();
+    if let Some(host_path) = av_player_resolve_source(&game_root, source) {
+        let _ = av_player_probe_source(&host_path);
+    }
 }
 
 /// Clamps a media source path at the application filesystem root.
@@ -884,7 +943,8 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
         eprintln!("[REMu][AVPLAYER] rejected source outside app0: {source:?}");
         return sce_kernel_error(AV_PLAYER_ERROR_OPERATION_FAILED);
     };
-    let Some((width, height, frames_per_second, duration)) = av_player_probe_video(&host_path)
+    let Some((width, height, frames_per_second, duration, has_audio)) =
+        av_player_probe_source(&host_path)
     else {
         eprintln!(
             "[REMu][AVPLAYER] could not probe source guest={source:?} host={}",
@@ -901,7 +961,7 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
     player.height = height;
     player.frames_per_second = frames_per_second;
     player.duration = duration;
-    player.has_audio = av_player_probe_has_audio(&host_path);
+    player.has_audio = has_audio;
     player.active_session = true;
     player.paused = false;
     if player.auto_start {
@@ -947,33 +1007,52 @@ pub(crate) fn av_player_add_source(arguments: [u64; 6], state: &mut ProbeDispatc
     0
 }
 
-pub(crate) fn av_player_add_source_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+/// Reads the URI out of an `sceAvPlayerAddSourceEx` source-details structure.
+///
+/// Every rejection the caller cares about is a `None` here; the caller maps that to
+/// `AV_PLAYER_ERROR_INVALID_PARAMS`. Touches guest memory only, never dispatch state, so the
+/// pre-lock probe warmer can use it too.
+fn av_player_source_details_uri(arguments: [u64; 6]) -> Option<String> {
     let details = arguments[2];
     if arguments[1] != 0 || details == 0 {
-        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+        return None;
     }
     if !process_guest_range_has_read_access(details, 12) {
-        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+        return None;
     }
     let source_address = read_guest_u64(details);
-    let length = u64::from(read_guest_u32(details + 8));
-    let Ok(length) = usize::try_from(length) else {
-        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
-    };
+    let length = usize::try_from(u64::from(read_guest_u32(details + 8))).ok()?;
     if source_address == 0 || length == 0 {
-        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+        return None;
     }
     if !process_guest_range_has_read_access(source_address, length) {
-        return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
+        return None;
     }
     // SAFETY: the source-details URI pairs this pointer with the exact readable byte length.
     let bytes = unsafe { std::slice::from_raw_parts(source_address as *const u8, length) };
-    let Ok(source) = std::str::from_utf8(bytes) else {
+    std::str::from_utf8(bytes).ok().map(ToOwned::to_owned)
+}
+
+pub(crate) fn av_player_add_source_ex(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+    let Some(source) = av_player_source_details_uri(arguments) else {
         return sce_kernel_error(AV_PLAYER_ERROR_INVALID_PARAMS);
     };
     let terminated = format!("{}\0", source.trim_end_matches('\0'));
     let forwarded = [arguments[0], terminated.as_ptr() as u64, 0, 0, 0, 0];
     av_player_add_source(forwarded, state)
+}
+
+/// Pre-lock entry point for the AddSource family: resolves the source and probes its container
+/// before `import_dispatch` takes the dispatch write guard.
+pub(crate) fn av_player_prewarm_add_source(nid: &str, arguments: [u64; 6]) {
+    let source = match nid {
+        "KMcEa+rHsIo" => read_guest_cstring(arguments[1]),
+        "x8uvuFOPZhU" => av_player_source_details_uri(arguments),
+        _ => None,
+    };
+    if let Some(source) = source {
+        av_player_prewarm_source_probe(&source);
+    }
 }
 
 fn av_player_start_decoder(player: &mut AvPlayerInstance, audio: bool) -> bool {

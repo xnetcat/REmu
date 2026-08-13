@@ -3634,6 +3634,11 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             .store(index, import_routes::ImportRoute::Fd);
         return ProbeImportReturn::integer(result);
     }
+    // AddSource opens the media container twice to learn its geometry and whether it carries audio.
+    // Those are the longest host operations any import performs, and on slow storage they are
+    // effectively unbounded. Warm them here, off the guard; the locked installer below reads the
+    // memo and remains the only authority on what AddSource returns.
+    av_player::av_player_prewarm_add_source(nid, call_args);
     if nid == "fzyMKs9kim0" {
         remu_gpu::record_dispatch_import(remu_gpu::DispatchImportFamily::Equeue);
         // An untimed equeue wait must park without retaining the process-wide dispatch lock.
