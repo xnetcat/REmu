@@ -716,7 +716,18 @@ pub(crate) fn upload_image_textures(
                                             resident,
                                             descriptor,
                                             comparison,
-                                        )))
+                                        // A render target demoted from gpu-written authority (an
+                                        // ACQUIRE or watch invalidation between frames) still
+                                        // holds its last executed contents. A colour-view sample
+                                        // of that surface must bind it — falling through to
+                                        // guest RAM reads bytes hardware never wrote back (the
+                                        // SH title menu layer: rendered BGRA8, sampled RGBA8,
+                                        // composited black every frame).
+                                        ) || (resident.gpu_content_executed
+                                            && guest_texture_descriptors_share_color_view_storage(
+                                                resident.descriptor,
+                                                descriptor.guest,
+                                            ))))
                                         || resident_depth_sample_is_eligible(resident, descriptor))
                                     // Exact same-address images may remain gpu-authored after a
                                     // neighbour partially supersedes owned-byte accounting; bind
