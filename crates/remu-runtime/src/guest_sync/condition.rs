@@ -313,6 +313,7 @@ where
         // the thread is parked with no record of what it wanted. Wake periodically to name the
         // wait once; the predicate is unchanged, so this cannot alter wait semantics.
         let mut reported = false;
+        let mut report_ticks = 0_u32;
         loop {
             let (next_cond, wait_result) = entry
                 .wake
@@ -335,14 +336,35 @@ where
                 released_spuriously = true;
                 break;
             }
-            if !reported {
+            if report_ticks < 30 {
+                report_ticks += 1;
                 reported = true;
                 let notifies = cond.notifies;
+                // The guarded guest state beside the condvar and mutex objects discriminates
+                // the two stall classes across ticks: static bytes while the producer cycles
+                // means the enqueue is gated; changing bytes (queued work) beside a parked
+                // waiter means a wake was missed. Checked reads only — a diagnostic that can
+                // fault is worse than none.
+                let peek = |address: u64| -> String {
+                    let mut bytes = [0_u8; 32];
+                    if remu_memory::read_guest_shared_backing(address, &mut bytes) {
+                        let words: [u32; 8] = std::array::from_fn(|index| {
+                            u32::from_le_bytes(
+                                bytes[index * 4..index * 4 + 4].try_into().expect("dword"),
+                            )
+                        });
+                        format!("{words:08x?}")
+                    } else {
+                        "unmapped".to_owned()
+                    }
+                };
                 eprintln!(
-                    "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies} since_wait={}",
+                    "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies} since_wait={} cond_obj={} mutex_obj={}",
                     report_after.as_secs(),
                     current_guest_thread_name(),
                     notifies.saturating_sub(notifies_at_wait),
+                    peek(condition),
+                    peek(mutex_address),
                 );
                 if !STALL_SNAPSHOT_EMITTED.swap(true, Ordering::Relaxed) {
                     drop(cond);
