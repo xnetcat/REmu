@@ -2937,6 +2937,60 @@ impl Drop for GuestImportTracePhaseGuard {
     }
 }
 
+/// Prints the guest threads that have been blocked longest, ordered, every reporter tick.
+///
+/// The per-record `[THREAD][STALE]` line reports once per transition, so a thread that parks and
+/// never transitions again is announced once at an age of about four seconds and then goes quiet
+/// forever. That is fine for spotting a hiccup and useless for a wedge: it cannot say which thread
+/// stopped FIRST, and in a whole-process quiescence the first one to park is the root cause while
+/// every other is cascade.
+///
+/// This re-reports unconditionally, so ages grow monotonically and the ordering is readable
+/// directly off the last line before the fatal.
+fn report_longest_blocked_guest_threads(
+    records: &[Arc<GuestImportTraceRecord>],
+    telemetry: &ImportTelemetry,
+    now: u64,
+    stale_after_nanos: u64,
+) {
+    let mut blocked = records
+        .iter()
+        .filter(|record| record.active.load(Ordering::Acquire))
+        .filter_map(|record| {
+            let age = now.saturating_sub(record.transition_nanos.load(Ordering::Acquire));
+            (age >= stale_after_nanos).then(|| {
+                let nid = usize::try_from(record.dispatch_index.load(Ordering::Acquire))
+                    .ok()
+                    .and_then(|index| telemetry.nids.get(index))
+                    .map_or("?", String::as_str);
+                (
+                    age,
+                    record.name.as_str(),
+                    nid_display_name(nid).unwrap_or(nid),
+                    record.integer_argument0.load(Ordering::Acquire),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if blocked.is_empty() {
+        return;
+    }
+    blocked.sort_unstable_by(|left, right| right.0.cmp(&left.0));
+    // The head of the list is what matters; a full census every two seconds would bury it.
+    let census = blocked
+        .iter()
+        .take(8)
+        .map(|(age, name, import, argument0)| {
+            format!("{name}:{}ms:{import}:{argument0:#x}", age / 1_000_000)
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    eprintln!(
+        "[REMu][BLOCKED-CENSUS] blocked={} longest_first {census}",
+        blocked.len()
+    );
+}
+
 fn trace_guest_threads() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -3000,6 +3054,12 @@ fn start_guest_import_trace_reporter() {
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .clone();
+                    report_longest_blocked_guest_threads(
+                        &records,
+                        &telemetry,
+                        now,
+                        stale_after_nanos,
+                    );
                     for record in records {
                         if !record.active.load(Ordering::Acquire) {
                             continue;
