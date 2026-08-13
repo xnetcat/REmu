@@ -1455,6 +1455,61 @@ const KERNEL_EVENT_FILTER_VIDEO_OUT: i16 = -13;
 
 static PROBE_DISPATCH: OnceLock<RwLock<ProbeDispatchState>> = OnceLock::new();
 
+// Identity of the thread currently holding `PROBE_DISPATCH` for write. A wedged guest RenderThread
+// parks in `lock_probe_dispatch_for_write` and reports itself as stalled, but the hold time is only
+// recorded once the guard is released, so the holder is invisible for exactly as long as it matters.
+// These three slots name it while it is still stuck.
+//
+// `DISPATCH_WRITE_HOLDER_SINCE_NANOS` is the publication point: it is stored last on acquisition and
+// cleared first on release, so a non-zero read means the thread and import beside it were published
+// before it. A reader can still pair a fresh timestamp with the previous holder's identity if it is
+// descheduled mid-read; that is acceptable for a diagnostic and never blocks the holder.
+static DISPATCH_WRITE_HOLDER_THREAD: AtomicU64 = AtomicU64::new(0);
+static DISPATCH_WRITE_HOLDER_INDEX: AtomicU64 = AtomicU64::new(u64::MAX);
+static DISPATCH_WRITE_HOLDER_SINCE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Dispatch index of the import this thread is currently serving, so the holder slot can name
+    /// the NID rather than just the thread. `u64::MAX` means "not inside an import".
+    static CURRENT_IMPORT_DISPATCH_INDEX: Cell<u64> = const { Cell::new(u64::MAX) };
+}
+
+/// Prints the dispatch write lock's holder when it has been held longer than `stale_after_nanos`.
+///
+/// Pairs with the `[REMu][THREAD][STALE]` line the import-trace reporter emits for the *waiting*
+/// thread: together they name both ends of a wedge. A holder that is also the stalled thread means
+/// the guard was re-entered on one thread (the AGC grow-callback class), which is a different fault
+/// from a holder blocked on host I/O.
+fn report_dispatch_write_holder(stale_after_nanos: u64) {
+    let since = DISPATCH_WRITE_HOLDER_SINCE_NANOS.load(Ordering::Acquire);
+    if since == 0 {
+        return;
+    }
+    let held_nanos = guest_import_trace_nanos().saturating_sub(since);
+    if held_nanos < stale_after_nanos {
+        return;
+    }
+    let index = DISPATCH_WRITE_HOLDER_INDEX.load(Ordering::Relaxed);
+    let telemetry = IMPORT_TELEMETRY
+        .get()
+        .and_then(|telemetry| telemetry.try_read().ok())
+        .map(|telemetry| Arc::clone(&telemetry));
+    let nid = telemetry
+        .as_ref()
+        .and_then(|telemetry| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| telemetry.nids.get(index))
+        })
+        .map_or("?", String::as_str);
+    eprintln!(
+        "[REMu][DISPATCH-LOCK][HELD] holder_thread={:#x} held_ms={} nid={nid} import={}",
+        DISPATCH_WRITE_HOLDER_THREAD.load(Ordering::Relaxed),
+        held_nanos / 1_000_000,
+        nid_display_name(nid).unwrap_or("unknown"),
+    );
+}
+
 // Counts the `PROBE_DISPATCH` write guards this thread holds. Nothing reachable while one is alive
 // may park on a guest synchronization object: the guest thread that would release it cannot reach
 // its own release call without this same lock, so the whole process wedges. Test builds turn that
@@ -1490,6 +1545,9 @@ impl std::ops::DerefMut for DispatchWriteGuard<'_> {
 
 impl Drop for DispatchWriteGuard<'_> {
     fn drop(&mut self) {
+        // Retire the holder identity before releasing, so no reader can attribute this thread's
+        // hold to a successor that has already taken the lock.
+        DISPATCH_WRITE_HOLDER_SINCE_NANOS.store(0, Ordering::Release);
         let held = self.acquired_at.elapsed();
         drop(self.guard.take());
         #[cfg(test)]
@@ -1512,6 +1570,14 @@ pub(crate) fn lock_probe_dispatch_for_write(
     let acquire_wait = started.elapsed();
     #[cfg(test)]
     DISPATCH_WRITE_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    DISPATCH_WRITE_HOLDER_THREAD.store(current_guest_thread_handle(), Ordering::Relaxed);
+    DISPATCH_WRITE_HOLDER_INDEX.store(
+        CURRENT_IMPORT_DISPATCH_INDEX.with(Cell::get),
+        Ordering::Relaxed,
+    );
+    // Published last: a non-zero timestamp is what makes the two slots above readable. Never store
+    // zero here, or the holder would advertise itself as absent.
+    DISPATCH_WRITE_HOLDER_SINCE_NANOS.store(guest_import_trace_nanos().max(1), Ordering::Release);
     DispatchWriteGuard {
         guard: Some(guard),
         acquire_wait,
@@ -2735,6 +2801,7 @@ fn start_guest_import_trace_reporter() {
                     u64::try_from(STALE_AFTER.as_nanos()).unwrap_or(u64::MAX);
                 loop {
                     std::thread::sleep(STALE_AFTER);
+                    report_dispatch_write_holder(stale_after_nanos);
                     let now = guest_import_trace_nanos();
                     let records = GUEST_IMPORT_TRACE_RECORDS
                         .lock()
@@ -3279,6 +3346,8 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
         eprintln!("[REMu][IMPORT] invalid stub index {index}");
         terminate_probe(87);
     };
+    // Names this import as the dispatch lock's holder if it goes on to take the write guard.
+    CURRENT_IMPORT_DISPATCH_INDEX.with(|current| current.set(index as u64));
     if matches!(nid, "3kg7rT0NQIs" | "FJrT5LuUBAU") {
         guest_pthread_exit(call_args[0]);
     }
@@ -9616,6 +9685,9 @@ fn report_diagnostic_stall_attribution() {
     }
     drop(events);
     guest_sync::report_condition_stall_attribution();
+    // Any hold still live at a stall dump is worth naming, however brief: the read below uses
+    // `try_read`, so a busy dispatch lock is exactly the case this attribution cannot otherwise see.
+    report_dispatch_write_holder(0);
 
     let dispatch_state = PROBE_DISPATCH
         .get()
