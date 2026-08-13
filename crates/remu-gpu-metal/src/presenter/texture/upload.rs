@@ -873,13 +873,19 @@ pub(crate) fn upload_image_textures(
                 // A candidate accepted only through executed content must pass the mutable
                 // fingerprint oracle: a genuine CPU rewrite means guest RAM is the current
                 // content and the ordinary upload below must serve it instead.
-                if !resident.serves_reads() && !resident.gpu_written() {
+                if !resident.gpu_written() {
+                    // Any candidate standing only on executed content must lose to a genuine
+                    // CPU rewrite: host-side producers (AvPlayer video frames, streamed
+                    // uploads) publish through guest RAM, and binding a stale resident over
+                    // them both shows wrong pixels and perturbs their watch state mid-write.
                     let cpu_rewrote = resident.write_watch.is_dirty()
                         && resident.write_watch.content_has_changed().unwrap_or(true);
                     if cpu_rewrote {
                         return None;
                     }
-                    resident.note_gpu_write();
+                    if !resident.serves_reads() {
+                        resident.note_gpu_write();
+                    }
                 }
                 let version = resident.content_version;
                 resident_texture_for_sample(resident, descriptor)
