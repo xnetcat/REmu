@@ -532,7 +532,13 @@ pub(crate) fn upload_image_textures(
                 // black 1x1 hides the bad bind (title compositor BG samples as solid black).
                 // Null SRDs still take the optional-bind fallback below; non-null type-0 must
                 // loud-refuse so the draw is attributable instead of silently modulated.
-                if !is_null && texture_type == 0 {
+                if binding.descriptor_index_is_runtime
+                    && super::super::shader::runtime_heap_tables_enabled()
+                {
+                    // The heap table supplies this sample's texture at runtime; the snapshot
+                    // is a stale slot by construction and its tex slot is unreferenced MSL.
+                    // Bind the fallback quietly instead of refusing the draw.
+                } else if !is_null && texture_type == 0 {
                     static LOGGED: AtomicUsize = AtomicUsize::new(0);
                     if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
                         // The words came from one of these evaluation-time scalar reads; the
