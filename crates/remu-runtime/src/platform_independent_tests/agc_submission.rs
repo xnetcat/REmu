@@ -694,6 +694,95 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
     assert_eq!(state.agc_completion_telemetry.unmatched_backend_ids, 0);
 }
 
+/// A backend completion observed before its arm is recorded must still be delivered.
+///
+/// This is the W3 lost-wakeup race: the presenter can retire an empty or fence-only submission
+/// while the submitting thread is still between publishing the event and recording the arm. The
+/// completion set is drained destructively, so before the carry it was counted as an unmatched
+/// backend ID and destroyed, and the guest's sceKernelWaitEqueue never returned.
+#[test]
+fn a_backend_completion_arriving_before_its_arm_is_still_delivered() {
+    let _serial = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // The suite runs in a fixed order against process-wide completion state, so establish the
+    // preconditions rather than inherit whatever the previous test left behind.
+    let mut state = ProbeDispatchState::default();
+    crate::event_state::with_event_state_mut(|e| {
+        e.pending_agc_completions.clear();
+        e.pending_agc_user_interrupts.clear();
+        e.unclaimed_agc_completions.clear();
+        e.pending_events.clear();
+    });
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+    // Settles the carried-completions flag to false now that nothing is carried.
+    crate::refresh_completed_agc_submissions(&mut state);
+    let mut state = ProbeDispatchState::default();
+
+    let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
+    crate::event_state::with_event_state_mut(|e| {
+        e.kernel_equeues.insert(3);
+    });
+    assert_eq!(
+        crate::kernel_register_event(
+            &mut state,
+            3,
+            0x20,
+            crate::KERNEL_EVENT_FILTER_GRAPHICS,
+            0x1234_5678,
+        ),
+        0
+    );
+
+    // The backend completes and the interrupt thread drains, all before the arm exists.
+    remu_gpu::record_gpu_submission_completed(sequence);
+    crate::refresh_completed_agc_submissions(&mut state);
+    assert_eq!(
+        crate::event_state::with_event_state(|e| e.pending_events.len()),
+        0,
+        "nothing is deliverable yet: the arm has not been recorded"
+    );
+    assert_eq!(
+        state.agc_completion_telemetry.unmatched_backend_ids, 1,
+        "the completion is deferred, and counted once"
+    );
+
+    // The submitting thread now records the arm, losing the race.
+    crate::event_state::with_event_state_mut(|e| {
+        e.pending_agc_completions.push_back((sequence, 0x20));
+    });
+    crate::refresh_completed_agc_submissions(&mut state);
+
+    let event = crate::event_state::with_event_state(|e| {
+        e.pending_events
+            .front()
+            .cloned()
+            .expect("carried completion must be delivered once its arm lands")
+    });
+    assert_eq!(event.equeue, 3);
+    assert_eq!(event.ident, 0x20);
+    assert_eq!(event.filter, crate::KERNEL_EVENT_FILTER_GRAPHICS);
+    assert_eq!(event.user_data, 0x1234_5678);
+    assert_eq!(
+        state.agc_completion_telemetry.reclaimed_backend_ids, 1,
+        "delivery came from the carry, not from a fresh drain"
+    );
+    assert_eq!(
+        state.agc_completion_telemetry.unmatched_backend_ids, 1,
+        "a carried sequence must not be recounted on every refresh"
+    );
+    assert!(
+        crate::event_state::with_event_state(|e| e.unclaimed_agc_completions.is_empty()),
+        "a claimed completion must not stay carried"
+    );
+
+    crate::event_state::with_event_state_mut(|e| {
+        e.pending_events.clear();
+        e.kernel_event_registrations.clear();
+        e.kernel_equeues.remove(&3);
+    });
+}
+
 #[test]
 fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
     let _serial = GPU_EVENT_SINK_TEST

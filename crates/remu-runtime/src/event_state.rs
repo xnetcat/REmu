@@ -20,6 +20,13 @@ pub(crate) struct EventState {
     pub(crate) pending_video_out_flips: VecDeque<PendingVideoOutFlip>,
     pub(crate) pending_agc_completions: VecDeque<(u64, u64)>,
     pub(crate) pending_agc_user_interrupts: VecDeque<u64>,
+    /// Backend completions the runtime has drained but could not yet turn into a guest event.
+    ///
+    /// The backend's completion set is drained destructively, so a completion observed before its
+    /// arm is recorded — or before the guest registers the equeue event it belongs to — used to be
+    /// counted and thrown away, leaving the arm to wait forever. Carrying it here makes delivery
+    /// level-triggered: every refresh reconsiders it until it is claimed or evicted.
+    pub(crate) unclaimed_agc_completions: BTreeSet<u64>,
 }
 
 static EVENT_STATE: OnceLock<RwLock<EventState>> = OnceLock::new();

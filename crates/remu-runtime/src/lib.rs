@@ -1440,10 +1440,25 @@ struct AgcCompletionTelemetry {
     missing_graphics_registration: u64,
     missing_user_interrupt_registration: u64,
     unmatched_backend_ids: u64,
+    reclaimed_backend_ids: u64,
+    evicted_backend_ids: u64,
     last_refreshed_graphics: Option<u64>,
     last_refreshed_compute: Option<u64>,
     last_unmatched_backend_id: Option<u64>,
+    last_reclaimed_backend_id: Option<u64>,
 }
+
+/// Upper bound on backend completions held awaiting an arm or an equeue registration.
+///
+/// Generous relative to the handful of submissions in flight at once, so a live wait is never
+/// evicted, while still bounding the set if a guest registers an equeue it then never services.
+const MAXIMUM_CARRIED_AGC_COMPLETIONS: usize = 4096;
+
+/// True while `EventState::unclaimed_agc_completions` is non-empty.
+///
+/// Lets the completion refresh keep its lock-free early return: without it every poll of an idle
+/// equeue would have to take the event-state write lock just to discover there is nothing carried.
+static AGC_UNCLAIMED_COMPLETIONS_CARRIED: AtomicBool = AtomicBool::new(false);
 
 const KERNEL_EVENT_FILTER_GRAPHICS: i16 = -14;
 const KERNEL_EVENT_FILTER_USER: i16 = -11;
@@ -5904,16 +5919,26 @@ pub(crate) fn discard_kernel_events_into(
 
 fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
     const AGC_USER_INTERRUPT_EVENT: u64 = 0x1800;
-    let completed = remu_gpu::take_gpu_completed_submission_ids()
+    let drained = remu_gpu::take_gpu_completed_submission_ids()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    if completed.is_empty() {
+    // Nothing drained and nothing carried: the common case, and it must stay off the event lock.
+    if drained.is_empty() && !AGC_UNCLAIMED_COMPLETIONS_CARRIED.load(Ordering::Acquire) {
         return;
     }
+    let (_event_hierarchy, mut events) = event_state::lock_event_state_for_write();
+    events.unclaimed_agc_completions.extend(drained.iter().copied());
+    if events.unclaimed_agc_completions.is_empty() {
+        AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(false, Ordering::Release);
+        return;
+    }
+    // Reconsider carried completions alongside the freshly drained ones: an arm that lost the race
+    // to its own completion, or a registration the guest had not made yet, becomes deliverable on a
+    // later pass rather than being lost.
+    let completed = std::mem::take(&mut events.unclaimed_agc_completions);
     let newest_completed = completed.iter().next_back().copied().unwrap_or_default();
     let mut completed_queues = Vec::new();
     let mut claimed = BTreeSet::new();
-    let (_event_hierarchy, mut events) = event_state::lock_event_state_for_write();
     events.pending_agc_completions.retain(|&(sequence, ident)| {
         if completed.contains(&sequence) {
             completed_queues.push((sequence, ident));
@@ -5934,12 +5959,43 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         }
     });
     for &sequence in completed.difference(&claimed) {
-        state.agc_completion_telemetry.unmatched_backend_ids = state
-            .agc_completion_telemetry
-            .unmatched_backend_ids
-            .saturating_add(1);
-        state.agc_completion_telemetry.last_unmatched_backend_id = Some(sequence);
+        // Counted once, when the sequence is first deferred. Carried sequences are reconsidered
+        // every refresh, so counting them each pass would report a single deferral as thousands.
+        if drained.contains(&sequence) {
+            state.agc_completion_telemetry.unmatched_backend_ids = state
+                .agc_completion_telemetry
+                .unmatched_backend_ids
+                .saturating_add(1);
+            state.agc_completion_telemetry.last_unmatched_backend_id = Some(sequence);
+        }
     }
+    for &sequence in claimed.difference(&drained) {
+        // A completion that arrived before its arm and was matched on a later pass. Non-zero here
+        // is the lost-wakeup race being caught rather than dropped.
+        state.agc_completion_telemetry.reclaimed_backend_ids = state
+            .agc_completion_telemetry
+            .reclaimed_backend_ids
+            .saturating_add(1);
+        state.agc_completion_telemetry.last_reclaimed_backend_id = Some(sequence);
+    }
+    let mut carried = completed
+        .difference(&claimed)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    // Backend sequences increase monotonically, so the smallest carried entries are the least
+    // likely to ever find an arm. Evicting from the front bounds the set without discarding the
+    // recent completions a live wait is actually blocked on.
+    while carried.len() > MAXIMUM_CARRIED_AGC_COMPLETIONS {
+        if let Some(&oldest) = carried.iter().next() {
+            carried.remove(&oldest);
+            state.agc_completion_telemetry.evicted_backend_ids = state
+                .agc_completion_telemetry
+                .evicted_backend_ids
+                .saturating_add(1);
+        }
+    }
+    AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(!carried.is_empty(), Ordering::Release);
+    events.unclaimed_agc_completions = carried;
     let mut queued = false;
     for (sequence, completed_ident) in completed_queues {
         // `sceAgcDriverAddEqEvent` registers one hardware queue by ID. Queue zero is graphics and
@@ -5964,6 +6020,15 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                 .agc_completion_telemetry
                 .missing_graphics_registration
                 .saturating_add(1);
+            // The guest has not registered this queue's equeue event yet. Consuming the completion
+            // here would strand the submission exactly as the arm race did, so restore both halves
+            // and let a later refresh deliver it once the registration exists.
+            events
+                .pending_agc_completions
+                .push_back((sequence, completed_ident));
+            events.unclaimed_agc_completions.insert(sequence);
+            AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(true, Ordering::Release);
+            continue;
         }
         for (equeue, ident, filter, user_data) in registrations {
             event_state::queue_kernel_event_into(
@@ -6022,6 +6087,12 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                 .agc_completion_telemetry
                 .missing_user_interrupt_registration
                 .saturating_add(1);
+            // Same restoration as the graphics path: the driver-wide user interrupt may not be
+            // registered yet, and dropping the completion here would strand the compute submission.
+            events.pending_agc_user_interrupts.push_back(sequence);
+            events.unclaimed_agc_completions.insert(sequence);
+            AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(true, Ordering::Release);
+            continue;
         }
         for (equeue, ident, filter, user_data) in registrations {
             event_state::queue_kernel_event_into(
@@ -9684,7 +9755,7 @@ fn report_diagnostic_stall_attribution() {
         .count();
     if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
         eprintln!(
-            "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?}",
+            "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?} reclaimed_backend={}@{:?} carried_backend={} evicted_backend={}",
             submission_count,
             backend_unclaimed.len(),
             events.pending_agc_completions.len(),
@@ -9705,6 +9776,10 @@ fn report_diagnostic_stall_attribution() {
             telemetry.missing_user_interrupt_registration,
             telemetry.unmatched_backend_ids,
             telemetry.last_unmatched_backend_id,
+            telemetry.reclaimed_backend_ids,
+            telemetry.last_reclaimed_backend_id,
+            events.unclaimed_agc_completions.len(),
+            telemetry.evicted_backend_ids,
         );
     } else {
         eprintln!(
