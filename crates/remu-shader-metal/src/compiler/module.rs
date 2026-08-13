@@ -134,6 +134,13 @@ impl Compiler<'_> {
         if uses_lds_memory {
             emit_data_share_prelude(&mut source);
         }
+        if !self.heap_tables.is_empty() {
+            // One argument-buffer layout serves every heap: 512 texture handles, indexed by
+            // the shadow descriptor slot the SMEM lowering maintains at runtime.
+            source.push_str(
+                "struct RemuHeapTable {\n    metal::array<texture2d<float>, 512> tex [[id(0)]];\n};\n\n",
+            );
+        }
         if sampler_count != 0 && !direct_sampler_bindings {
             source.push_str("struct RemuSamplers {\n");
             for slot in 0..sampler_count {
@@ -226,6 +233,19 @@ impl Compiler<'_> {
             parameters.push(format!(
                 "{texture_kind}<{component}{access}> tex{index} [[texture({index})]]"
             ));
+        }
+        {
+            let mut heaps: Vec<usize> =
+                self.heap_tables.values().map(|(_, heap)| *heap).collect();
+            heaps.sort_unstable();
+            heaps.dedup();
+            for (ordinal, heap) in heaps.iter().enumerate() {
+                // Slots after the sampler argument buffer: initial_s, samplers, then tables.
+                parameters.push(format!(
+                    "constant RemuHeapTable& remu_heap_{heap} [[buffer({})]]",
+                    initial_index + 2 + ordinal
+                ));
+            }
         }
         if direct_sampler_bindings {
             for slot in 0..sampler_count {
@@ -341,6 +361,15 @@ impl Compiler<'_> {
             }
         }
         source.push_str("    /* REMU_REGISTER_STATE */\n");
+        {
+            let mut bases: Vec<u32> =
+                self.heap_tables.values().map(|(base, _)| *base).collect();
+            bases.sort_unstable();
+            bases.dedup();
+            for base in bases {
+                let _ = writeln!(source, "    uint remu_srd_slot_{base} = 0u;");
+            }
+        }
         source.push_str("    bool exec = true;\n    bool vcc = false;\n    bool scc = false;\n");
         if self
             .program

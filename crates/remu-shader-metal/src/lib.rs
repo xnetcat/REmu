@@ -562,6 +562,9 @@ pub struct MetalBindingLayout {
     pub sampler_count: u32,
     /// Dynamic threadgroup-memory length that the compute encoder must bind at index zero.
     pub threadgroup_memory_bytes: u32,
+    /// Runtime heap texture tables: (global-memory binding index of the descriptor heap,
+    /// Metal buffer slot expecting the argument buffer of 512 texture handles).
+    pub heap_texture_tables: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -684,6 +687,7 @@ pub fn compile_procedural_rectangle_vertex(
             texture_count: 0,
             sampler_count: 0,
             threadgroup_memory_bytes: 0,
+            heap_texture_tables: Vec::new(),
         },
         vertex_inputs: Vec::new(),
         interpolated_attribute_count,

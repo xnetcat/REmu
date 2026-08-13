@@ -485,6 +485,23 @@ impl<'a> Compiler<'a> {
                 texture_count: self.image_slots.texture_count,
                 sampler_count,
                 threadgroup_memory_bytes,
+                heap_texture_tables: {
+                    let mut heaps: Vec<usize> =
+                        self.heap_tables.values().map(|(_, heap)| *heap).collect();
+                    heaps.sort_unstable();
+                    heaps.dedup();
+                    heaps
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, heap)| {
+                            (
+                                u32::try_from(*heap).unwrap_or(u32::MAX),
+                                u32::try_from(initial_scalar_buffer_index as usize + 2 + ordinal)
+                                    .unwrap_or(u32::MAX),
+                            )
+                        })
+                        .collect()
+                },
             },
             vertex_inputs: self.evaluation.vertex_inputs.clone(),
             interpolated_attribute_count: self

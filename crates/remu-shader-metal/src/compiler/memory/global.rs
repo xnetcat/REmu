@@ -32,6 +32,27 @@ impl Compiler<'_> {
                 format_u32(control.immediate_offset_bytes.cast_unsigned())
             ),
         );
+        // Maintain the runtime descriptor-slot shadow: an SMEM load that fills a heap-table
+        // base register also records which 32-byte heap slot the T# came from, so mapped
+        // image ops can index their table with the value the shader actually computed.
+        {
+            let mut shadow = String::new();
+            for (base, heap) in self.heap_tables.values() {
+                if *heap == binding_index
+                    && instruction.destinations.first().is_some_and(|destination| {
+                        destination.kind == OperandKind::ScalarRegister
+                            && destination.value == *base
+                    })
+                {
+                    use std::fmt::Write as _;
+                    let _ = writeln!(
+                        shadow,
+                        "    remu_srd_slot_{base} = ({address}) / 32u;"
+                    );
+                }
+            }
+            self.body.push_str(&shadow);
+        }
         for (index, destination) in instruction.destinations.iter().enumerate() {
             if destination.kind != OperandKind::ScalarRegister {
                 return Err("scalar load has a non-scalar destination".to_owned());
