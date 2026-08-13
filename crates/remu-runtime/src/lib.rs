@@ -5741,13 +5741,20 @@ fn kernel_register_event(
     filter: i16,
     user_data: u64,
 ) -> u64 {
-    let (_h, mut events) = event_state::lock_event_state_for_write();
-    if !events.kernel_equeues.contains(&equeue) {
-        return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+    {
+        let (_h, mut events) = event_state::lock_event_state_for_write();
+        if !events.kernel_equeues.contains(&equeue) {
+            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        }
+        events
+            .kernel_event_registrations
+            .insert((equeue, filter, ident), user_data);
     }
-    events
-        .kernel_event_registrations
-        .insert((equeue, filter, ident), user_data);
+    // A completion carried for want of exactly this registration is now deliverable, and no
+    // backend notification is coming to prompt a re-poll. Notified outside the event lock.
+    if agc_completions_are_carried() {
+        notify_kernel_equeue_waiters();
+    }
     0
 }
 
@@ -5863,6 +5870,16 @@ fn agc_driver_add_eq_event(arguments: [u64; 6], state: &mut ProbeDispatchState) 
 
 fn kernel_equeue_wake() -> &'static (Mutex<u64>, Condvar) {
     KERNEL_EQUEUE_WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+}
+
+/// True while backend completions are held awaiting an arm or an equeue registration.
+///
+/// Recording an arm or a registration can make a carried completion deliverable, but neither
+/// action wakes an equeue waiter on its own — only the backend's completion notifier does. A
+/// waiter that already consumed the completion notification would otherwise sleep until some
+/// unrelated event arrived. Callers that supply the missing half consult this and notify.
+pub(crate) fn agc_completions_are_carried() -> bool {
+    AGC_UNCLAIMED_COMPLETIONS_CARRIED.load(Ordering::Acquire)
 }
 
 pub(crate) fn notify_kernel_equeue_waiters() {

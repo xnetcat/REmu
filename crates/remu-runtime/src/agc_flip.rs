@@ -372,6 +372,11 @@ pub(crate) fn request_agc_submission_completion_for_sequence(
             .pending_agc_completions
             .push_back((sequence, queue_id));
     }
+    // If this arm is the missing half of a completion already carried, the waiter has consumed the
+    // backend's notification and will not re-poll on its own. Notified outside the event lock.
+    if crate::agc_completions_are_carried() {
+        notify_kernel_equeue_waiters();
+    }
     // Deliberately not holding the event lock across the publish: the GPU event channel is a
     // blocking bounded queue, and stalling every event-state reader behind it is the failure class
     // this ordering exists to avoid.
@@ -413,6 +418,9 @@ pub(crate) fn request_agc_compute_submission_completion_for_sequence(
     {
         let (_h, mut event_state) = crate::event_state::lock_event_state_for_write();
         event_state.pending_agc_user_interrupts.push_back(sequence);
+    }
+    if crate::agc_completions_are_carried() {
+        notify_kernel_equeue_waiters();
     }
     if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         true
