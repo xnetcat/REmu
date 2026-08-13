@@ -2647,6 +2647,9 @@ impl MetalPresenter {
             None
         };
         let shader_compiler_workers = shader_compiler_worker_count();
+        // Arm the slow-command-buffer reporter here so its announce line proves the instrument is
+        // live even in a run where no guest batch ever reaches terminal completion.
+        let _ = submission::slow_command_buffer_threshold();
         eprintln!(
             "[REMu][METAL] compiler workers={shader_compiler_workers} sampled texture cache={} entries/{} MiB resident texture cache={} MiB exact-shared-event-readiness=true retired-fence-range-bookkeeping=false",
             SAMPLED_TEXTURE_CACHE_CAPACITY,

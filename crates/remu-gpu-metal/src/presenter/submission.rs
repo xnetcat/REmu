@@ -43,6 +43,7 @@ pub(crate) use self::batch::{
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
     collect_shared_event_global_versions, completed_command_buffer_gpu_duration,
     describe_guest_batch, guest_batch_writes_overlap, merge_guest_batch_result,
+    slow_command_buffer_threshold,
 };
 pub(crate) use self::draw_footprint::{
     SHARED_EVENT_DRAW_REJECT_COUNT, SharedEventDrawReject, program_memory_is_completely_covered,

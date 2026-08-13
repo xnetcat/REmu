@@ -1092,8 +1092,9 @@ impl MetalPresenter {
     ) -> Result<(), String> {
         self.record_shared_event_ack_terminal(&batch.command_buffer);
         let result = self.finish_terminal_guest_batch(batch, execution_error, &mut timer);
-        self.statistics.gpu_execution_time +=
-            completed_command_buffer_gpu_duration(&batch.command_buffer);
+        let gpu_execution = completed_command_buffer_gpu_duration(&batch.command_buffer);
+        report_slow_guest_command_buffer(batch, gpu_execution);
+        self.statistics.gpu_execution_time += gpu_execution;
         timer.mark(
             &mut self.statistics.terminal_publication,
             TerminalPublicationPhase::GpuTimeQuery,
@@ -2041,6 +2042,114 @@ impl MetalPresenter {
             self.publish_guest_submission_completion(sequence);
         }
     }
+}
+
+/// GPU-execution threshold above which a completed guest command buffer is reported with a
+/// per-shader work summary. The crawl investigation needs the shader addresses responsible for
+/// multi-second command buffers; wall-clock queue time is excluded so a buffer parked behind an
+/// older one is not blamed for its predecessor's cost.
+pub(crate) fn slow_command_buffer_threshold() -> Duration {
+    static THRESHOLD: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        let milliseconds = std::env::var("REMU_SLOW_CB_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(250);
+        eprintln!(
+            "[REMu][SLOW-CB] armed: reporting guest command buffers whose GPU execution exceeds \
+             {milliseconds}ms (REMU_SLOW_CB_MS overrides)"
+        );
+        Duration::from_millis(milliseconds)
+    })
+}
+
+fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Duration) {
+    if gpu_execution < slow_command_buffer_threshold() {
+        return;
+    }
+    let mut draw_count = 0_usize;
+    let mut compute_count = 0_usize;
+    // Per pixel shader: draw count, summed indices*instances, largest target extent seen.
+    let mut pixel_shaders: std::collections::BTreeMap<u64, (usize, u64, u64, [u32; 2])> =
+        std::collections::BTreeMap::new();
+    // Per compute shader: dispatch count, summed thread volume.
+    let mut compute_shaders: std::collections::BTreeMap<u64, (usize, u64)> =
+        std::collections::BTreeMap::new();
+    for item in &batch.work {
+        match item {
+            GuestBatchWork::Draw {
+                pixel,
+                index_count,
+                instance_count,
+                target,
+                extent,
+                ..
+            } => {
+                draw_count += 1;
+                let entry = pixel_shaders.entry(*pixel).or_insert((0, 0, *target, *extent));
+                entry.0 += 1;
+                entry.1 = entry
+                    .1
+                    .saturating_add(u64::from(*index_count) * u64::from(*instance_count));
+                if u64::from(extent[0]) * u64::from(extent[1])
+                    > u64::from(entry.3[0]) * u64::from(entry.3[1])
+                {
+                    entry.2 = *target;
+                    entry.3 = *extent;
+                }
+            }
+            GuestBatchWork::Compute {
+                shader,
+                grid,
+                threads_per_group,
+                ..
+            } => {
+                compute_count += 1;
+                let threads = match grid {
+                    remu_gpu::ComputeGrid::Threadgroups(groups) => groups
+                        .iter()
+                        .map(|&count| u64::from(count))
+                        .product::<u64>()
+                        .saturating_mul(
+                            threads_per_group
+                                .iter()
+                                .map(|&count| u64::from(count))
+                                .product(),
+                        ),
+                    remu_gpu::ComputeGrid::Threads(threads) => {
+                        threads.iter().copied().product()
+                    }
+                };
+                let entry = compute_shaders.entry(*shader).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 = entry.1.saturating_add(threads);
+            }
+        }
+    }
+    let mut pixels = pixel_shaders.into_iter().collect::<Vec<_>>();
+    pixels.sort_unstable_by_key(|(_, (count, ..))| std::cmp::Reverse(*count));
+    let pixels = pixels
+        .iter()
+        .take(6)
+        .map(|(shader, (count, indices, target, extent))| {
+            format!("ps={shader:#x}x{count}/idx={indices}/max_target={target:#x}@{extent:?}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut computes = compute_shaders.into_iter().collect::<Vec<_>>();
+    computes.sort_unstable_by_key(|(_, (_, threads))| std::cmp::Reverse(*threads));
+    let computes = computes
+        .iter()
+        .take(6)
+        .map(|(shader, (count, threads))| format!("cs={shader:#x}x{count}/threads={threads}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[REMu][SLOW-CB] gpu_ms={:.0} queue={:?} draws={draw_count} computes={compute_count} \
+         top_ps=[{pixels}] top_cs=[{computes}]",
+        gpu_execution.as_secs_f64() * 1000.0,
+        batch.queue_id,
+    );
 }
 
 pub(crate) fn completed_command_buffer_gpu_duration(command_buffer: &CommandBuffer) -> Duration {
