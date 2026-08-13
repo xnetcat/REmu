@@ -1296,7 +1296,14 @@ impl MetalPresenter {
             .resident_guest_textures
             .get(&descriptor.guest)
             .is_some_and(|resident| {
-                resident.gpu_written()
+                // Executed content whose authority bookkeeping was subtracted still lives in
+                // the Metal base; with a verifiably clean watch it must take the copying
+                // promotion, not the guest-RAM rebuild (SH title sky-transmittance LUT: zero
+                // mips from a zero-RAM rebuild left the whole scene several stops dark).
+                (resident.gpu_written()
+                    || (resident.is_live()
+                        && resident.gpu_content_executed
+                        && resident.metal_content_cpu_clean()))
                     && resident.texture_type == 9
                     && resident.layer_count == 1
                     && resident.mip_level_count < underlying_mip_count
