@@ -89,3 +89,19 @@ menu pixel-clean but the 3D background stays exactly black
 therefore inside the deferred lighting pixel shaders (800a69 direct / 8009c4 sky) or their
 non-occlusion inputs — the split-wave64 audit's pixel mask classes — not the occlusion
 kernels they sample.
+
+## Lighting zero root cause: lost resident, not shader math (run 20260813T080939Z)
+
+Targeted dump of direct-light draw 32974 (es=800bff/ps=800a69, fullscreen tri, bloom-only
+overlay): all 746,496 covered pixels export exactly 0.0 (pixel_outputs min=max=mean=0), no
+non-finite values, target ends (0,0,0,α). The shader's screen-space input at 0x801e8f0000
+(sampled 1920x1080 RGBA8, tile 27) has **resident=None, writer=None** — served from guest
+RAM, which is zero — while overlap_writers records a GPU draw that wrote the same address
+as a BGRA8 1080p target (its own sampled input an 80x40 BC7). Light x attenuation(0) = 0.
+The zero-lighting class is therefore lost sampled residents falling back to unpublished
+guest RAM (the B15 residency/alias-lifetime class), NOT split-wave64 pixel math. The
+shadows-off permutation stayed black too — consistent with the same lost-resident fallback
+on that permutation's other utility inputs.
+
+Discriminator queued: dump the 0x801e8f0000 writer at write time (nonzero at write =>
+residency loss confirmed; zero at write => fault moves up the writer's chain).
