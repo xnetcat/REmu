@@ -672,11 +672,13 @@ pub(crate) fn upload_image_textures(
                                     // range, serving them beats uploading unpublished guest RAM
                                     // (SH title light attenuation: written BGRA8, authority
                                     // taken, sampled back as zeros → black lighting).
+                                    // Executed-content candidates are accepted tentatively even
+                                    // with a dirty watch; the resolve stage below holds the
+                                    // mutable borrow and runs the fingerprint verification.
                                     (resident.serves_reads()
                                         || ((resident.gpu_written()
                                             || (resident.is_live()
-                                                && resident.gpu_content_executed
-                                                && resident.metal_content_cpu_clean()))
+                                                && resident.gpu_content_executed))
                                             && resident_sample_authority_ok(
                                                 resident,
                                                 descriptor.guest,
@@ -820,6 +822,17 @@ pub(crate) fn upload_image_textures(
             }
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {
                 let resident = resident_guest_textures.get_mut(&resident_descriptor)?;
+                // A candidate accepted only through executed content must pass the mutable
+                // fingerprint oracle: a genuine CPU rewrite means guest RAM is the current
+                // content and the ordinary upload below must serve it instead.
+                if !resident.serves_reads() && !resident.gpu_written() {
+                    let cpu_rewrote = resident.write_watch.is_dirty()
+                        && resident.write_watch.content_has_changed().unwrap_or(true);
+                    if cpu_rewrote {
+                        return None;
+                    }
+                    resident.note_gpu_write();
+                }
                 let version = resident.content_version;
                 resident_texture_for_sample(resident, descriptor)
                     .map(|texture| (resident_descriptor, version, texture))
