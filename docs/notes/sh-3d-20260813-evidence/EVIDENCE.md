@@ -238,3 +238,13 @@ watch materialization suspect); font-atlas glyphs partially missing.
   never returns. Lock-free imports (RTC, event flags) keep flowing; state-locked ones stop.
 - Host-side `sample` at wedge time is the decisive instrument; sample `pgrep -x remu` — the
   `-f` pattern matches the run-game.sh bash wrapper instead.
+
+## NEW GAME screen reached (run 20260813T134345Z)
+Parked at the title menu t=198-353s: logo, menu entries, prompts, copyright all correct and
+animating. Background is the static-glitch overlay at full strength; the rooftop scene behind
+it is hidden. Lead: PS 0x809ca50000 pc=0x84 ImageSampleB refused 51x — evaluated SRD is two
+consecutive buffer V#s (descriptor-table head), i.e. dynamically-indexed bindless T# fetch that
+static evaluation resolves to the wrong entry. The same run wedged silently t=23-175 (W3
+variant that RECOVERS; UE's 120s watchdog converts the longer ones into the pc=0x809044770
+crash-handler fatal). Persistent metallib + render-pipeline archives exist under
+~/Library/Caches/REMu/metal; warm runs shrink the storm.
