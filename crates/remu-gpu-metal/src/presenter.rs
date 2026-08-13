@@ -1445,11 +1445,10 @@ impl ResidentGuestTexture {
     }
 
     /// Conservative read-only check that the CPU has not written the range since Metal last
-    /// became authoritative. Any pending validation or generation drift reports not-clean.
+    /// became authoritative. An armed, undirtied watch proves no CPU store; generation drift
+    /// alone is renewal bookkeeping, not a guest write, so it does not report not-clean.
     fn metal_content_cpu_clean(&self) -> bool {
-        !self.write_watch.is_dirty()
-            && !self.write_watch.content_validation_pending()
-            && self.write_watch.generations() == self.gpu_write_watch_generations
+        !self.write_watch.is_dirty() && !self.write_watch.content_validation_pending()
     }
 
     /// Gives up `taken`, demoting to `source` when the last owned byte goes with it.
