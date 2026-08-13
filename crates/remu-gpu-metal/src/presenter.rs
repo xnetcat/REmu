@@ -1500,11 +1500,22 @@ impl ResidentGuestTexture {
             // contents preserved (SH title light attenuation → black deferred lighting). While
             // the CPU verifiably has not rewritten the range, the Metal texels are the current
             // contents; reclaim them exactly like the discard path and let the following mark
-            // re-establish ownership.
-            if self.gpu_content_executed && self.metal_content_cpu_clean() {
-                self.state = ResidencyState::Live;
-                OWNED_RECLAIM_EXECUTED.fetch_add(1, Ordering::Relaxed);
-                return true;
+            // re-establish ownership. Generation drift from watch renewal is not a guest store;
+            // mirror the Active-arm fingerprint verification and re-anchor on a false positive.
+            if self.gpu_content_executed {
+                let possibly_changed = self.write_watch.content_validation_pending()
+                    || self.write_watch.is_dirty()
+                    || self.write_watch.generations() != self.gpu_write_watch_generations;
+                let cpu_rewrote = possibly_changed
+                    && self.write_watch.content_has_changed().unwrap_or(true);
+                if !cpu_rewrote {
+                    if possibly_changed {
+                        self.note_gpu_write();
+                    }
+                    self.state = ResidencyState::Live;
+                    OWNED_RECLAIM_EXECUTED.fetch_add(1, Ordering::Relaxed);
+                    return true;
+                }
             }
             return false;
         }
