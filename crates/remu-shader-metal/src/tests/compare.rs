@@ -173,6 +173,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
             wave64_lane_doubled: false,
+        runtime_heap_tables: false,
         },
     )
     .expect("compute compare should lower");

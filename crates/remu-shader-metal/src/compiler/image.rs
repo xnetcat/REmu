@@ -77,6 +77,20 @@ pub(crate) fn image_component_type(binding: &ImageBinding) -> &'static str {
 }
 
 impl Compiler<'_> {
+    /// The MSL expression naming the texture for one image binding.
+    ///
+    /// The snapshot path binds a fixed `tex{index}` parameter. Bindings whose descriptor index
+    /// resolves only at runtime (docs/design/2026-08-13-runtime-image-descriptor-fetch.md) will
+    /// instead index a heap texture table by the shadow slot the SMEM lowering maintains.
+    pub(crate) fn texture_expression(&self, binding_index: usize) -> String {
+        if let Some((base, heap)) = self.runtime_heap_table(binding_index) {
+            return format!("remu_heap_{heap}.tex[min(remu_srd_slot_{base}, 511u)]");
+        }
+        format!("tex{binding_index}")
+    }
+}
+
+impl Compiler<'_> {
     pub(crate) fn emit_image(&mut self, instruction: &Instruction) -> Result<(), String> {
         let Some(InstructionControl::Image(image)) = instruction.control.as_ref() else {
             return Err("missing image control".to_owned());
@@ -153,20 +167,21 @@ impl Compiler<'_> {
         image: &ImageControl,
         binding_index: usize,
     ) -> Result<(), String> {
+        let tex = self.texture_expression(binding_index);
         let mip = self.temp("uint", &self.image_uint_address(image, 0));
         let kind = self.image_kinds[binding_index];
-        let width = self.temp("uint", &format!("tex{binding_index}.get_width({mip})"));
-        let height = self.temp("uint", &format!("tex{binding_index}.get_height({mip})"));
+        let width = self.temp("uint", &format!("{tex}.get_width({mip})"));
+        let height = self.temp("uint", &format!("{tex}.get_height({mip})"));
         // AMD Z is depth for 3D, otherwise array/cube layer count (or 1 for plain 2D).
         let metal_dim = metal_image_dimension(kind);
         let depth = if metal_dim == 2 {
-            self.temp("uint", &format!("tex{binding_index}.get_depth({mip})"))
+            self.temp("uint", &format!("{tex}.get_depth({mip})"))
         } else if metal_dim == 3 || image.is_array {
-            self.temp("uint", &format!("tex{binding_index}.get_array_size()"))
+            self.temp("uint", &format!("{tex}.get_array_size()"))
         } else {
             self.temp("uint", "1u")
         };
-        let levels = self.temp("uint", &format!("tex{binding_index}.get_num_mip_levels()"));
+        let levels = self.temp("uint", &format!("{tex}.get_num_mip_levels()"));
         let components = [width, height, depth, levels];
         let mut values = Vec::with_capacity(4);
         for (component, value) in components.iter().enumerate() {
@@ -219,6 +234,7 @@ impl Compiler<'_> {
         _name: &str,
         binding_index: usize,
     ) -> Result<(), String> {
+        let tex = self.texture_expression(binding_index);
         // GFX10 DIM describes the address operand layout, while the descriptor selects the actual
         // Metal resource view. Unreal can execute DIM=2/5 instructions through a single-layer 2D
         // descriptor; consume the extra address only when that descriptor really is a 3D or 2D
@@ -274,7 +290,7 @@ impl Compiler<'_> {
             } else {
                 "get_depth"
             };
-            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
+            format!(" && {z} >= 0 && {z} < (int){tex}.{extent}()")
         });
         let coordinates = if is_3d {
             format!(
@@ -294,11 +310,11 @@ impl Compiler<'_> {
         } else {
             String::new()
         };
-        self.line(3, &format!("if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {{"));
+        self.line(3, &format!("if (exec && {x} >= 0 && {y} >= 0 && {x} < (int){tex}.get_width() && {y} < (int){tex}.get_height(){z_bounds}) {{"));
         self.line(
             4,
             &format!(
-                "tex{binding_index}.write(vec<{kind}, 4>({}, {}, {}, {}), {coordinates}{layer_argument});",
+                "{tex}.write(vec<{kind}, 4>({}, {}, {}, {}), {coordinates}{layer_argument});",
                 logical_components[0],
                 logical_components[1],
                 logical_components[2],
@@ -315,6 +331,7 @@ impl Compiler<'_> {
         _name: &str,
         binding_index: usize,
     ) -> Result<(), String> {
+        let tex = self.texture_expression(binding_index);
         let image_kind = self.image_kinds[binding_index];
         let metal_dim = metal_image_dimension(image_kind);
         let is_3d = metal_dim == 2;
@@ -349,7 +366,7 @@ impl Compiler<'_> {
             } else {
                 "get_depth"
             };
-            format!(" && {z} >= 0 && {z} < (int)tex{binding_index}.{extent}()")
+            format!(" && {z} >= 0 && {z} < (int){tex}.{extent}()")
         });
         let coordinates = if is_3d {
             format!(
@@ -378,7 +395,7 @@ impl Compiler<'_> {
         self.line(
             3,
             &format!(
-                "if (exec && {x} >= 0 && {y} >= 0 && {x} < (int)tex{binding_index}.get_width() && {y} < (int)tex{binding_index}.get_height(){z_bounds}) {loaded} = tex{binding_index}.read({coordinates}{layer_argument});"
+                "if (exec && {x} >= 0 && {y} >= 0 && {x} < (int){tex}.get_width() && {y} < (int){tex}.get_height(){z_bounds}) {loaded} = {tex}.read({coordinates}{layer_argument});"
             ),
         );
         let destination_select = self.image_destination_select(image);
@@ -474,6 +491,7 @@ impl Compiler<'_> {
         binding_index: usize,
         sampler_slot: u32,
     ) -> Result<String, String> {
+        let tex = self.texture_expression(binding_index);
         let kind = self.image_kinds[binding_index];
         let metal_dim = metal_image_dimension(kind);
         let is_gather = name.starts_with("ImageGather4");
@@ -658,14 +676,14 @@ impl Compiler<'_> {
                 self.temp(
                     "float3",
                     &format!(
-                        "{coordinates} + float3((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}), (float){offset_z} / (float)tex{binding_index}.get_depth({mip}))"
+                        "{coordinates} + float3((float){offset_x} / (float){tex}.get_width({mip}), (float){offset_y} / (float){tex}.get_height({mip}), (float){offset_z} / (float){tex}.get_depth({mip}))"
                     ),
                 )
             } else {
                 self.temp(
                     "float2",
                     &format!(
-                        "{coordinates} + float2((float){offset_x} / (float)tex{binding_index}.get_width({mip}), (float){offset_y} / (float)tex{binding_index}.get_height({mip}))"
+                        "{coordinates} + float2((float){offset_x} / (float){tex}.get_width({mip}), (float){offset_y} / (float){tex}.get_height({mip}))"
                     ),
                 )
             };
@@ -704,7 +722,7 @@ impl Compiler<'_> {
                     self.temp(
                         "uint",
                         &format!(
-                            "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                            "min(uint(rint(max({coordinates}.z, 0.0f))), {tex}.get_array_size() - 1u)"
                         ),
                     ),
                 )
@@ -717,7 +735,7 @@ impl Compiler<'_> {
                     self.temp(
                         "uint",
                         &format!(
-                            "min(uint(rint(max({coordinates}.z, 0.0f))), tex{binding_index}.get_array_size() - 1u)"
+                            "min(uint(rint(max({coordinates}.z, 0.0f))), {tex}.get_array_size() - 1u)"
                         ),
                     ),
                 )
@@ -788,7 +806,7 @@ impl Compiler<'_> {
             self.temp(
                 &vector_kind,
                 &format!(
-                    "tex{binding_index}.gather_compare({sampler}, {coordinate_arguments}, {compare}, {native_offset})"
+                    "{tex}.gather_compare({sampler}, {coordinate_arguments}, {compare}, {native_offset})"
                 ),
             )
         } else if is_gather {
@@ -802,7 +820,7 @@ impl Compiler<'_> {
                 self.temp(
                     &vector_kind,
                     &format!(
-                        "tex{binding_index}.gather({sampler}, {coordinate_arguments}, {native_offset}, component::{component})"
+                        "{tex}.gather({sampler}, {coordinate_arguments}, {native_offset}, component::{component})"
                     ),
                 )
             });
@@ -831,7 +849,7 @@ impl Compiler<'_> {
             let compared = self.temp(
                 "float",
                 &format!(
-                    "tex{binding_index}.sample_compare({sampler}, {coordinate_arguments}, {compare}{extra}{sample_offset})"
+                    "{tex}.sample_compare({sampler}, {coordinate_arguments}, {compare}{extra}{sample_offset})"
                 ),
             );
             self.temp(
@@ -842,7 +860,7 @@ impl Compiler<'_> {
             self.temp(
                 &vector_kind,
                 &format!(
-                    "tex{binding_index}.sample({sampler}, {coordinate_arguments}{extra}{sample_offset})"
+                    "{tex}.sample({sampler}, {coordinate_arguments}{extra}{sample_offset})"
                 ),
             )
         };

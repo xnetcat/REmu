@@ -296,6 +296,10 @@ pub struct MetalCompileOptions {
     /// every mask SGPR hold exact architectural values and wave-internal ordering needs only
     /// `simdgroup_barrier`. See docs/design/2026-08-13-wave64-lane-doubling.md.
     pub wave64_lane_doubled: bool,
+    /// Resolve dynamically-indexed image descriptors through runtime heap texture tables
+    /// instead of the evaluation snapshot (docs/design/2026-08-13-runtime-image-descriptor-
+    /// fetch.md). Off by default until the encoder stage binds the tables.
+    pub runtime_heap_tables: bool,
 }
 
 impl MetalCompileOptions {
@@ -331,6 +335,7 @@ impl MetalCompileOptions {
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
             wave64_lane_doubled: false,
+            runtime_heap_tables: false,
         }
     }
 
@@ -369,6 +374,7 @@ impl MetalCompileOptions {
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
             wave64_lane_doubled: false,
+            runtime_heap_tables: false,
         }
     }
 
@@ -403,6 +409,7 @@ impl MetalCompileOptions {
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
             wave64_lane_doubled: false,
+            runtime_heap_tables: false,
         }
     }
 
@@ -437,6 +444,7 @@ impl MetalCompileOptions {
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
             wave64_lane_doubled: false,
+            runtime_heap_tables: false,
         }
     }
 
@@ -485,6 +493,7 @@ impl MetalCompileOptions {
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
             wave64_lane_doubled: false,
+            runtime_heap_tables: false,
         }
     }
 

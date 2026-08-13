@@ -300,6 +300,55 @@ impl<'a> Compiler<'a> {
             ));
         }
 
+
+        // Runtime heap tables (docs/design/2026-08-13-runtime-image-descriptor-fetch.md):
+        // map each flagged image binding to the SMEM heap it must index at execution time.
+        // A base fed by several distinct heaps across paths keeps the snapshot with a loud
+        // log — correctness over coverage until multi-heap tables are needed.
+        let mut heap_tables = std::collections::BTreeMap::new();
+        if options.runtime_heap_tables {
+            for (binding_index, binding) in evaluation.image_bindings.iter().enumerate() {
+                if !binding.descriptor_index_is_runtime {
+                    continue;
+                }
+                let base = binding.control.scalar_resource;
+                let mut heaps = std::collections::BTreeSet::new();
+                for instruction in &program.instructions {
+                    if !matches!(
+                        instruction.control.as_ref(),
+                        Some(remu_shader::InstructionControl::ScalarMemory(_))
+                    ) {
+                        continue;
+                    }
+                    let covers_base = instruction.destinations.iter().any(|destination| {
+                        destination.kind == remu_shader::OperandKind::ScalarRegister
+                            && destination.value == base
+                    });
+                    if !covers_base {
+                        continue;
+                    }
+                    if let Some(heap) = evaluation
+                        .global_memory_bindings
+                        .iter()
+                        .position(|global| global.instruction_pcs.contains(&instruction.pc))
+                    {
+                        heaps.insert(heap);
+                    }
+                }
+                match (heaps.len(), heaps.into_iter().next()) {
+                    (1, Some(heap)) => {
+                        heap_tables.insert(binding_index, (base, heap));
+                    }
+                    (count, _) => {
+                        eprintln!(
+                            "[REMu][MSL][HEAP-TABLE] pc={:#x} srsrc=s{base}: {count} candidate heaps; keeping snapshot",
+                            binding.pc,
+                        );
+                    }
+                }
+            }
+        }
+
         let compiler = Self {
             program,
             evaluation,
@@ -311,6 +360,7 @@ impl<'a> Compiler<'a> {
             pixel_interpolations,
             image_kinds,
             image_slots,
+            heap_tables,
             control_flow,
         };
         let total_threadgroup_memory = compiler.total_threadgroup_memory_bytes();
