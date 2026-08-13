@@ -705,3 +705,18 @@ thread-local capture today, so the second option is new code, not a rewiring of 
 | Storage / save data | Read-only app filesystem access and initial save transactions; dumps are never modified. | Complete namespace, path, permission, iteration, atomicity, durability, quota, slot, dialog, and concurrency semantics with crash-consistency tests. |
 | Input | Keyboard-backed pad state and opt-in deterministic input sequences. | Complete handle lifetime, disconnect, timestamps, dead zones, motion/touchpad, controller mapping, and focus semantics as titles exercise them. |
 | Configuration / telemetry | Environment-controlled presentation, capture, Metal compiler, and diagnostics; bounded logarithmic log checkpoints; opt-in VM tracing; live window-title performance statistics; per-run summaries. | A versioned, documented configuration file with strict precedence and validation, plus structured persistence of the live counters. |
+
+### 2026-08-13 (later): title background compositing fixed; crash A/B closed
+- Black title/menu background root-caused and fixed: executed colour-view residents
+  (rendered BGRA8, sampled RGBA8, authority demoted between frames) were rejected by the
+  compatible-sample selection group and fell through to never-written guest RAM. Fixed in
+  the selection group; SAMPLED-MISS 40+→0; content-warning screen presents its full 3D
+  corridor scene.
+- The unverified clause caused 4/4 guest crashes at the intro video (stale resident bound
+  over AvPlayer-staged frames); causality proven by A/B (0/2 with clause disabled). Repair:
+  resolve-stage fingerprint oracle for every non-gpu-written candidate (d67867d5).
+- Process-wide async stderr (fd-2 pipe + pump thread, crash dumps on preserved real fd,
+  REMU_SYNC_STDERR=1 opt-out) and REMU_DEBUG_LOG async subsystem log (draws, computes with
+  writable bindings, DMA, residency exits, presents, AMPR) landed for all future triage.
+- Open: park-at-menu press timing under post-fix boot pace; font-atlas glyph gaps on the
+  warning screen; wave64 lane-doubling for bloom re-enable.
