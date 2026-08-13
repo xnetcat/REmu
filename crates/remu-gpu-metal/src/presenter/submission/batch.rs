@@ -2067,10 +2067,19 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
     if gpu_execution < slow_command_buffer_threshold() {
         return;
     }
+    struct SlowPixelShader {
+        draw_count: usize,
+        index_total: u64,
+        target: u64,
+        extent: [u32; 2],
+        export: u64,
+        export_msl_bytes: usize,
+        pixel_msl_bytes: usize,
+        dispatcher: bool,
+    }
     let mut draw_count = 0_usize;
     let mut compute_count = 0_usize;
-    // Per pixel shader: draw count, summed indices*instances, largest target extent seen.
-    let mut pixel_shaders: std::collections::BTreeMap<u64, (usize, u64, u64, [u32; 2])> =
+    let mut pixel_shaders: std::collections::BTreeMap<u64, SlowPixelShader> =
         std::collections::BTreeMap::new();
     // Per compute shader: dispatch count, summed thread volume.
     let mut compute_shaders: std::collections::BTreeMap<u64, (usize, u64)> =
@@ -2083,19 +2092,34 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
                 instance_count,
                 target,
                 extent,
+                export,
+                export_msl_bytes,
+                pixel_msl_bytes,
+                export_dispatcher,
+                pixel_dispatcher,
                 ..
             } => {
                 draw_count += 1;
-                let entry = pixel_shaders.entry(*pixel).or_insert((0, 0, *target, *extent));
-                entry.0 += 1;
-                entry.1 = entry
-                    .1
+                let entry = pixel_shaders.entry(*pixel).or_insert(SlowPixelShader {
+                    draw_count: 0,
+                    index_total: 0,
+                    target: *target,
+                    extent: *extent,
+                    export: *export,
+                    export_msl_bytes: *export_msl_bytes,
+                    pixel_msl_bytes: *pixel_msl_bytes,
+                    dispatcher: *export_dispatcher || *pixel_dispatcher,
+                });
+                entry.draw_count += 1;
+                entry.index_total = entry
+                    .index_total
                     .saturating_add(u64::from(*index_count) * u64::from(*instance_count));
+                entry.dispatcher |= *export_dispatcher || *pixel_dispatcher;
                 if u64::from(extent[0]) * u64::from(extent[1])
-                    > u64::from(entry.3[0]) * u64::from(entry.3[1])
+                    > u64::from(entry.extent[0]) * u64::from(entry.extent[1])
                 {
-                    entry.2 = *target;
-                    entry.3 = *extent;
+                    entry.target = *target;
+                    entry.extent = *extent;
                 }
             }
             GuestBatchWork::Compute {
@@ -2127,12 +2151,22 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
         }
     }
     let mut pixels = pixel_shaders.into_iter().collect::<Vec<_>>();
-    pixels.sort_unstable_by_key(|(_, (count, ..))| std::cmp::Reverse(*count));
+    pixels.sort_unstable_by_key(|(_, entry)| std::cmp::Reverse(entry.draw_count));
     let pixels = pixels
         .iter()
         .take(6)
-        .map(|(shader, (count, indices, target, extent))| {
-            format!("ps={shader:#x}x{count}/idx={indices}/max_target={target:#x}@{extent:?}")
+        .map(|(shader, entry)| {
+            format!(
+                "ps={shader:#x}x{}/es={:#x}/msl={}+{}B/disp={}/idx={}/max_target={:#x}@{:?}",
+                entry.draw_count,
+                entry.export,
+                entry.export_msl_bytes,
+                entry.pixel_msl_bytes,
+                entry.dispatcher,
+                entry.index_total,
+                entry.target,
+                entry.extent,
+            )
         })
         .collect::<Vec<_>>()
         .join(",");
