@@ -537,6 +537,81 @@ pub(crate) fn guest_write_alias_segments(
 /// range is only partially mapped, the fallback retains the alias-intersection behavior used by
 /// GPU hazard tracking.
 #[must_use]
+/// Tests many candidate ranges against one fixed range under a single registry read.
+///
+/// [`guest_shared_backing_ranges_overlap`] takes the registry lock and resolves BOTH sides on every
+/// call, so scanning N candidates costs N lock acquisitions and 2N resolutions. The presenter runs
+/// exactly that scan per binding against every queued batch's write set, which makes the cost grow
+/// with submission backlog — deep enough and the presenter spends its budget in these scans instead
+/// of retiring work, starving the guest's fences.
+///
+/// The argument order matches `guest_shared_backing_ranges_overlap(candidate, .., fixed, ..)` and
+/// must stay that way: the relation is NOT symmetric. When only one side resolves to a backing, the
+/// resolved side is walked against the other side's VIRTUAL range, so swapping them changes the
+/// answer. Only the fixed side's resolution and the lock can be hoisted; each candidate still
+/// resolves individually.
+pub fn guest_shared_backing_any_range_overlaps(
+    candidates: impl IntoIterator<Item = (u64, u64)>,
+    fixed: u64,
+    fixed_byte_count: u64,
+) -> bool {
+    if fixed_byte_count == 0 {
+        return false;
+    }
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixed_resolved = resolve_shared_backing_range(&mappings, fixed, fixed_byte_count);
+    let fixed_virtual_end = fixed.checked_add(fixed_byte_count);
+    candidates
+        .into_iter()
+        .any(|(candidate, candidate_byte_count)| {
+            if candidate_byte_count == 0 {
+                return false;
+            }
+            let Some((candidate_backing, candidate_start, candidate_end)) =
+                resolve_shared_backing_range(&mappings, candidate, candidate_byte_count)
+            else {
+                return false;
+            };
+            if let Some((fixed_backing, fixed_start, fixed_end)) = &fixed_resolved {
+                return candidate_backing.id() == fixed_backing.id()
+                    && ranges_overlap(candidate_start, candidate_end, *fixed_start, *fixed_end);
+            }
+            let Some(fixed_virtual_end) = fixed_virtual_end else {
+                return false;
+            };
+            mappings
+                .backing_records(candidate_backing.id())
+                .any(|(mapping_start, record)| {
+                    let Some(mapping_length) = record.end.checked_sub(mapping_start) else {
+                        return false;
+                    };
+                    let Some(mapping_physical_end) =
+                        record.backing_offset.checked_add(mapping_length)
+                    else {
+                        return false;
+                    };
+                    let intersection_start = record.backing_offset.max(candidate_start);
+                    let intersection_end = mapping_physical_end.min(candidate_end);
+                    if intersection_start >= intersection_end {
+                        return false;
+                    }
+                    let Some(alias_start) =
+                        mapping_start.checked_add(intersection_start - record.backing_offset)
+                    else {
+                        return false;
+                    };
+                    let Some(alias_end) =
+                        alias_start.checked_add(intersection_end - intersection_start)
+                    else {
+                        return false;
+                    };
+                    ranges_overlap(alias_start, alias_end, fixed, fixed_virtual_end)
+                })
+        })
+}
+
 pub fn guest_shared_backing_ranges_overlap(
     left: u64,
     left_byte_count: u64,

@@ -9,7 +9,8 @@ use super::{
     SharedEventDirectComputePlan, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
     describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
-    guest_physical_ranges_overlap, metal_buffer_with_bytes, prepare_ngg_meshlets,
+    guest_physical_ranges_overlap, guest_ranges_overlap, metal_buffer_with_bytes,
+    prepare_ngg_meshlets,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -19,7 +20,8 @@ use metal::{
 };
 use remu_memory::{
     GuestSharedBackingRange, GuestSharedMappingIdentity, guest_shared_backing_identity,
-    guest_shared_backing_range, read_guest_shared_backing,
+    guest_shared_backing_any_range_overlaps, guest_shared_backing_range,
+    read_guest_shared_backing,
 };
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
@@ -1364,25 +1366,36 @@ fn queued_global_read_source_in_batch_prefix(
     let global_writebacks = &batch.global_writebacks[..global_writeback_count];
     let guest_write_ranges = &batch.guest_write_ranges[..guest_write_range_count];
     let memory_writes = &batch.memory_writes[..memory_write_count];
+    // Every write in the batch used to be tested with `guest_physical_ranges_overlap`, which takes
+    // the shared-mapping registry lock and resolves both sides per candidate. That is one lock and
+    // two resolutions for each of the four collections' entries, per binding, per queued batch —
+    // the cost the presenter livelocks in once the submission backlog grows.
+    //
+    // `∃c. virtual(c) ∨ physical(c)` is `(∃c. virtual(c)) ∨ (∃c. physical(c))`, so the cheap virtual
+    // pass runs first over everything and the registry is touched only when nothing matched
+    // virtually — then once, for the whole scan, rather than once per candidate.
+    let physical_candidates = || {
+        global_versions
+            .iter()
+            .map(|version| (version.guest_address, version.byte_count))
+            .chain(global_writebacks.iter().filter_map(|writeback| {
+                u64::try_from(writeback.byte_count)
+                    .ok()
+                    .map(|length| (writeback.guest_address, length))
+            }))
+            .chain(
+                guest_write_ranges
+                    .iter()
+                    .map(|range| (range.address, range.byte_count)),
+            )
+    };
     let overlaps = memory_writes
         .iter()
         .any(|write| write.overlaps(address, byte_count))
-        || global_versions.iter().any(|version| {
-            guest_physical_ranges_overlap(
-                version.guest_address,
-                version.byte_count,
-                address,
-                byte_count,
-            )
+        || physical_candidates().any(|(candidate, candidate_byte_count)| {
+            guest_ranges_overlap(candidate, candidate_byte_count, address, byte_count)
         })
-        || global_writebacks.iter().any(|writeback| {
-            u64::try_from(writeback.byte_count).is_ok_and(|length| {
-                guest_physical_ranges_overlap(writeback.guest_address, length, address, byte_count)
-            })
-        })
-        || guest_write_ranges.iter().any(|range| {
-            guest_physical_ranges_overlap(range.address, range.byte_count, address, byte_count)
-        });
+        || guest_shared_backing_any_range_overlaps(physical_candidates(), address, byte_count);
     if !overlaps {
         return QueuedGlobalReadSource::None;
     }
