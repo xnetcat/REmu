@@ -9627,13 +9627,18 @@ fn probe_entry(
     start_abi_gap_reporter();
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     resolve_pending_ifunc_relocations(image);
+    // Before the module initializers, not after: they call imports, so the lazy path in
+    // GuestImportTraceGuard::enter would create this thread's record first and the registration
+    // below would find a non-null thread-local and silently do nothing. That is exactly what
+    // happened — a6c003cf never fired once, and a broken instrument is indistinguishable from a
+    // healthy run because both print nothing.
+    register_guest_entry_trace_record(image.memory.entry_address().get());
     invoke_guest_module_initializers(&image.module_initializers, 0, 0);
     remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::ModuleInitializersComplete);
     if timeout_seconds != 0 {
         start_diagnostic_timeout(timeout_seconds);
     }
     remu_gpu::record_startup_milestone(remu_gpu::StartupMilestone::GuestEntryBegin);
-    register_guest_entry_trace_record(image.memory.entry_address().get());
     let return_value = invoke_guest_entry_with_exit(
         image.memory.entry_address().get(),
         (&raw const parameters).addr() as u64,
