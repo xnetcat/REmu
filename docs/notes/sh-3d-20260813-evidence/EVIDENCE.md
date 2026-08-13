@@ -123,3 +123,30 @@ is needed for lighting.
 Toward the reference NEW GAME screen: menu/UI pixel-clean (bloom off), geometry coherent,
 lighting = this one residency fix, stripes = wave64 FFT (re-enable bloom after
 lane-doubling).
+
+## Lighting reclaim iteration trail (2026-08-13, commits 2ee64123..b817679b)
+
+Six instrumented iterations on the light-attenuation lifetime, each eliminating one gate:
+1. Sticky `gpu_content_executed` + read-only clean check — misses persisted
+   (`executed=true cpu_clean=false`: generations drift on renewal).
+2. Fingerprint verification in reclaim_for_bind — still zero reclaims.
+3. RECLAIM-BLOCKED probe: named `acquire-invalidated` as a gate on 0x8041db0000
+   (RGBA16F 1080p, every frame).
+4. ACQUIRE fingerprint verification — still zero reclaims.
+5. ENSURE-REPLACE probe: at removal, `acquire_invalidated=false, retirement=None` —
+   the executed arm itself declines.
+6. Watch-oracle (`is_dirty` primary, fingerprint fallback) — still zero reclaims and
+   ENSURE-REPLACE still fires: the watch is genuinely dirty AND content genuinely
+   changed. The guest CPU really writes these pages between GPU uses (transient-pool
+   reuse), so no local predicate can decide whether Metal or RAM holds the logical
+   resource's current bytes.
+
+Conclusion: content identity across transient-pool reuse requires the B15
+versioned-ownership rewrite (owned range sets + Stale-as-versioning per
+MASTER-REWORK-PLAN B15), with the mapping/backing identity
+(GuestSharedMappingIdentity) distinguishing "same allocation reused for the same
+logical target" from "reused for something else". All six iterations' instruments
+(SAMPLED-MISS with self-describing state, ENSURE-REPLACE, RECLAIM-BLOCKED,
+reclaim_executed counter) are in tree and give B15 its acceptance signals: at the SH
+title, reclaim_executed > 0, SAMPLED-MISS = 0, 800a69 exports nonzero, rooftop visible.
+All changes are conservative (verification-gated) and the full suite stays green.
