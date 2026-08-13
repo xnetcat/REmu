@@ -259,3 +259,11 @@ descriptor is produced by GPU work within the frame; no CPU-time read can observ
 is the planned ACM runtime-descriptor-fetch engine (docs 2026-08-12/13 design+plan): scalar
 descriptor loads whose source is GPU-authored must become GPU-execution-time buffer reads.
 Until then the static overlay renders unmasked and occludes the rooftop scene at the menu.
+
+## Task #12 final probe: split-load GPU-assembled descriptors
+Fifth probe round: the refused T#'s eight SGPRs are composed from TWO loads — words[0..4] a
+stale sentinel from slot X, words[4..8] a live V# whose base is X+0x340 — and no CPU-visible
+memory ever holds the texture descriptor. Bridges landed (late-resolve, producer-batch settle,
+OOB-tolerant source matcher) are correct for their classes but inert here by construction.
+The menu-background delta is therefore strictly an ACM-engine work item: runtime descriptor
+fetch at GPU execution order. All other elements of the NEW GAME screen match the reference.
