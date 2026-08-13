@@ -57,3 +57,42 @@ Per image binding whose descriptor chain is flagged stale (the evaluator now com
 
 - VCC branch forking (second evaluator hole) is separable; land after the fetch.
 - W3 lock moves (task #9) first or in parallel: verification runs must stop wedging.
+
+## Stage 2/3 implementation anchors (from code, 2026-08-13)
+
+Stage 1 (landed 53b08ab0): ImageBinding.descriptor_index_is_runtime set by the evaluator
+(valu_scalar_destinations + stale_seeded propagation through execute_scalar_load).
+
+Stage 2 — compiler (remu-shader-metal):
+- Texture parameters: compiler/module.rs:190-229 emits `tex{index} [[texture(index)]]` per
+  image_kinds entry. For flagged bindings, replace with a heap-table argument buffer:
+  `constant RemuHeapTable& remu_heap_{N} [[buffer(...)]]` where
+  `struct RemuHeapTable { metal::array<texture2d<float>, REMU_HEAP_CAP> tex; };`
+  (REMU_HEAP_CAP 512; encoder logs+clamps beyond).
+- Slot shadow: compiler/memory/global.rs::emit_scalar_memory already computes
+  `address = dynamic + imm` per SMEM; when its destination range covers a flagged image op's
+  srsrc base, also emit `remu_srd_slot_s{base} = ({address}) / 32u;` and record the SMEM's
+  global binding index N as the heap id for that base (compile-time map; multi-heap per base
+  across paths → fall back to snapshot with a loud log for now).
+- Sample site: compiler/image.rs::emit_image_sample (:469) and load/store siblings — for
+  flagged binding_index, texture expression becomes
+  `remu_heap_{N}.tex[min(remu_srd_slot_s{base}, REMU_HEAP_CAP-1u)]` instead of `tex{index}`.
+- Options/contract: the binding list handed to remu-gpu-metal must mark heap-table entries
+  (binding index N + guest span) instead of a single resolved texture; extend the shader
+  bindings struct in lib.rs.
+
+Stage 3 — encoder (remu-gpu-metal):
+- Pipeline key must include the flagged/table shape (presenter/shader/program.rs
+  compute_pipeline_key + graphics equivalent) so snapshot and table variants never collide.
+- Per draw with table bindings: walk the SMEM binding's guest span (already validated by the
+  evaluator's global binding) in 32-byte steps; decode_image_descriptor per slot; resolve
+  each valid T# through the existing sampled-texture upload path (dedup identical
+  descriptors); write handles into an MTLArgumentEncoder-built buffer;
+  useResource(.read, textures) on the encoder for residency; fallback texture for
+  non-decoding slots.
+- Cache the table per (binding span content-version) — residency machinery already versions
+  the span; rebuild only on version change.
+
+Regression gates: PPSA02929 unchanged (uniform-indexed → snapshot path must remain);
+remu-shader-metal's 2 irreducible-dispatcher test failures are PRE-EXISTING (A/B verified),
+do not attribute them to this build.
