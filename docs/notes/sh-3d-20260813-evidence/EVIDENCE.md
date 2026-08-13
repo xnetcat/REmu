@@ -202,3 +202,14 @@ REMU_DUMP_COMPUTE_TEXTURE_DIR + EXTENT=1024x512; runs currently die early to the
 intermittent guest-crash family before the LUT phase). If the compute writer's output is
 nonzero, extend the residency serving to the mip-promotion source; if zero, the writer's
 WAVE64-CENSUS entry names the hazard.
+
+## Stability note (runs 20260813T1043..1113)
+
+The scene-behind-menu visibility is not yet stable run-to-run: the ce0f0cb3 survivor
+showed the composition at t=367s; two 9ac36970 survivors presented the menu continuously
+(8 live frames, t=261-407) but with the fog region at exact (0,0,0) in sampled captures.
+Candidates: transient fade windows vs residency race nondeterminism vs the 9ac36970
+promotion widening; discrimination needs either the intermittent guest-crash fix (task 9,
+UE-watchdog family — now the top iteration gate) or continuous interactive observation
+rather than 8-10s capture sampling. All lighting-chain commits remain conservative
+(verification-gated) and suite-green.
