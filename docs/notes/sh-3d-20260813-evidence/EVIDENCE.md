@@ -230,3 +230,11 @@ Verification: SAMPLED-MISS 40+→0; content-warning screen now presents its full
 background (previously text-over-black). New blockers: crash family kills runs pre-menu
 (SIGSEGV null pc=0x802816015 @40s; SIGBUS texture read 0x805b2a0000 @70s, no journal writer —
 watch materialization suspect); font-atlas glyphs partially missing.
+
+## W3 wedge capture notes (2026-08-13 late)
+- Wedge reproduces in the in-game load window; silent variant exists (no UE fatal — presents
+  stop, process idles to external shutdown). Presenter provably idle (queues empty) during it.
+- RenderThread's last acts in fatal variants: sceAvPlayerStop → STOP delivered → sceAvPlayerClose
+  never returns. Lock-free imports (RTC, event flags) keep flowing; state-locked ones stop.
+- Host-side `sample` at wedge time is the decisive instrument; sample `pgrep -x remu` — the
+  `-f` pattern matches the run-game.sh bash wrapper instead.
