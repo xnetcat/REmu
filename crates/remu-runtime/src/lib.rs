@@ -9323,6 +9323,19 @@ fn write_abi_gap_summary() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     eprintln!("[REMu][REPORT] --- ABI gap summary ---");
+    // A traced guest range plus an armed write journal answers "who wrote these bytes" at exit,
+    // not only at crash time. Anchor on the range head and midpoint so both halves report.
+    if remu_memory::guest_write_journal_enabled()
+        && let Ok(range) = std::env::var("REMU_TRACE_GUEST_WRITE_RANGE")
+        && let Some((start, end)) = range.split_once(':')
+        && let (Ok(start), Ok(end)) = (
+            u64::from_str_radix(start.trim_start_matches("0x"), 16),
+            u64::from_str_radix(end.trim_start_matches("0x"), 16),
+        )
+        && end > start
+    {
+        remu_memory::dump_guest_write_journal(start, &[start + (end - start) / 2, end - 1]);
+    }
     for (reason, count) in DECLINED_SHADER_REASONS
         .iter()
         .zip(&DECLINED_SHADER_REGISTRATIONS)

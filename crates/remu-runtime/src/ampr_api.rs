@@ -67,6 +67,11 @@ fn positional_file_read(
     destination: &mut [u8],
     offset: u64,
 ) -> std::io::Result<usize> {
+    remu_memory::debug_log!(
+        "ampr",
+        "read offset={offset:#x} bytes={:#x}",
+        destination.len()
+    );
     let mut delay = std::time::Duration::from_millis(20);
     for attempt in 0..5_u32 {
         match positional_file_read_once(file, destination, offset) {

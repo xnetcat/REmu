@@ -95,6 +95,15 @@ impl MetalPresenter {
                 self.display.map(|display| (display.width, display.height)),
             )
         };
+        remu_memory::debug_log!(
+            "present",
+            "flip={} source={presentation_source} scanout={:?}",
+            self.uploaded_flip_sequence,
+            active_translated_scanout.map(|scanout| format!(
+                "{:#x}/{}x{}",
+                scanout.address, scanout.width, scanout.height
+            ))
+        );
         let snapshot_wait = (presentation_source == "translated")
             .then_some(snapshot_ready)
             .flatten()

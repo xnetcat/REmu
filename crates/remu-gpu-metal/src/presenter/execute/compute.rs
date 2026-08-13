@@ -144,6 +144,39 @@ impl MetalPresenter {
             .clone();
         let queue = self.active_guest_command_queue()?;
 
+        if remu_memory::debug_log_enabled() {
+            let mut writes = String::new();
+            for binding in &evaluation.global_memory_bindings {
+                if binding.writable {
+                    use std::fmt::Write as _;
+                    let _ = write!(
+                        writes,
+                        " gw={:#x}+{:#x}",
+                        binding.base_address, binding.byte_count
+                    );
+                }
+            }
+            for binding in &evaluation.image_bindings {
+                if binding.opcode.starts_with("ImageStore")
+                    || binding.opcode.starts_with("ImageAtomic")
+                {
+                    use std::fmt::Write as _;
+                    let address = u64::from(binding.resource_descriptor.first().copied().
+                        unwrap_or(0))
+                        << 8;
+                    let _ = write!(writes, " iw={address:#x}");
+                }
+            }
+            remu_memory::debug_log!(
+                "compute",
+                "seq={} program={:#x} groups={:?} wave{}{}",
+                dispatch.sequence,
+                dispatch.shader_address,
+                dispatch.launch.group_count,
+                dispatch.launch.wave_lane_count,
+                writes
+            );
+        }
         let pipeline_key = compute_pipeline_key(dispatch, evaluation, &snapshot.program);
         if self.failed_compute_pipelines.contains(&pipeline_key) {
             return Err("compute pipeline previously failed to compile".to_owned());

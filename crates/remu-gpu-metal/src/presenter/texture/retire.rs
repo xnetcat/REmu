@@ -20,6 +20,17 @@ pub(crate) fn trace_resident_texture_demotion(reason: &str, resident: &ResidentG
 }
 
 fn trace_resident_texture_exit(kind: &str, reason: &str, resident: &ResidentGuestTexture) {
+    remu_memory::debug_log!(
+        "residency",
+        "{kind} reason={reason} address={:#x} {}x{} {:?} version={} gpu_written={} live={:?}",
+        resident.descriptor.address,
+        resident.descriptor.width,
+        resident.descriptor.height,
+        resident.descriptor.pixel_format,
+        resident.content_version,
+        resident.gpu_written(),
+        resident.is_live()
+    );
     static ENABLED: OnceLock<bool> = OnceLock::new();
     if !*ENABLED.get_or_init(|| std::env::var_os("REMU_TRACE_TEXTURE_RESIDENCY").is_some()) {
         return;

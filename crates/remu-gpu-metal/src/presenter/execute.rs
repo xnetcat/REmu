@@ -785,6 +785,29 @@ impl MetalPresenter {
             activity_stamp,
             shared_event_texture_overrides,
         )?;
+        if remu_memory::debug_log_enabled() {
+            let mut listed = String::new();
+            for target in &targets {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    listed,
+                    " tgt={:#x}/{:?}/{}x{}",
+                    target.texture.address,
+                    target.texture.pixel_format,
+                    target.texture.width,
+                    target.texture.height
+                );
+            }
+            remu_memory::debug_log!(
+                "draw",
+                "seq={} es={:#x} ps={:#x} flip={}{}",
+                draw.sequence,
+                draw.export_shader_address,
+                draw.pixel_shader_address,
+                self.next_flip_sequence,
+                listed
+            );
+        }
         let diagnostic_scanout_target = targets.iter().copied().find(|target| {
             diagnostic_scanout_writer_target_selected(
                 draw.pixel_shader_address,

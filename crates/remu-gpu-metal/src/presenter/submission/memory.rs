@@ -485,6 +485,15 @@ impl MetalPresenter {
             return Err("immediate DMA fill unexpectedly retained a source snapshot".to_owned());
         }
         record_diagnostic_memory_copy(&copy);
+        remu_memory::debug_log!(
+            "dma",
+            "copy src={:#x} dst={:#x} bytes={:#x} selectors={}/{}",
+            copy.source_address,
+            copy.destination_address,
+            copy.byte_count,
+            copy.source_selection,
+            copy.destination_selection
+        );
         trace_diagnostic_guest_write("dma-copy", copy.destination_address, copy.byte_count);
         if copy.source_selection != 2 {
             trace_diagnostic_guest_write("dma-copy-source", copy.source_address, copy.byte_count);
