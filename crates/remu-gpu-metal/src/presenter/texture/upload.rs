@@ -130,6 +130,45 @@ fn trace_glyph_atlas_linear(
     }
 }
 
+/// Re-fetches an undecodable image descriptor from the guest slot that supplied it.
+///
+/// The evaluation's scalar-read journal names every (address, dword) it observed. A T# is
+/// fetched as one contiguous vector, so its eight snapshot dwords sit at eight consecutive
+/// recorded addresses — matching all eight in order identifies the slot with no per-register
+/// provenance plumbing. The slot is re-read at upload (execute) order; the result is used only
+/// when it decodes as a texture, so a coincidental match cannot bind garbage.
+fn late_resolved_image_binding(
+    evaluation: &ShaderEvaluation,
+    binding: &remu_shader::ImageBinding,
+) -> Option<remu_shader::ImageBinding> {
+    let words = &binding.resource_descriptor;
+    if words.len() != 8 || words.iter().all(|word| *word == 0) {
+        return None;
+    }
+    let reads: std::collections::BTreeMap<u64, u32> =
+        evaluation.scalar_memory_reads.iter().copied().collect();
+    let source = reads
+        .iter()
+        .find(|(address, value)| {
+            **value == words[0]
+                && (1..8).all(|index| {
+                    reads.get(&(**address + 4 * index as u64)) == Some(&words[index])
+                })
+        })
+        .map(|(address, _)| *address)?;
+    // SAFETY: the evaluator read these exact guest dwords for this submission, and the draw
+    // that names them is still in flight; the mapping outlives this upload.
+    let now = unsafe { std::slice::from_raw_parts(source as *const u32, 8) };
+    if now == &words[..] {
+        return None;
+    }
+    let mut corrected = binding.clone();
+    corrected.resource_descriptor.clear();
+    corrected.resource_descriptor.extend_from_slice(now);
+    decode_image_descriptor(&corrected.resource_descriptor).ok()?;
+    Some(corrected)
+}
+
 pub(crate) fn sampled_texture_cache_accepts(
     resident_bytes: u64,
     byte_capacity: Option<u64>,
@@ -428,6 +467,31 @@ pub(crate) fn upload_image_textures(
     canonical_bindings
         .into_iter()
         .map(|binding| {
+            // Evaluation reads descriptors at decode time; the guest may rewrite the staged
+            // table before this draw executes ("stable table pointer, rewritten descriptors").
+            // When the snapshot no longer decodes, locate its source among the recorded scalar
+            // reads and prefer what that slot holds now — upload runs at execute order, so the
+            // rewrite has architecturally happened.
+            let late_resolved = decode_image_descriptor(&binding.resource_descriptor)
+                .is_err()
+                .then(|| late_resolved_image_binding(evaluation, binding))
+                .flatten();
+            let binding = if let Some(corrected) = late_resolved.as_ref() {
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][IMAGE-LATE-RESOLVE] sequence={sequence} pc={:#x} opcode={} stale={:08x?} now={:08x?}",
+                        binding.pc,
+                        binding.opcode,
+                        binding.resource_descriptor,
+                        corrected.resource_descriptor,
+                    );
+                }
+                corrected
+            } else {
+                binding
+            };
             let writable = is_writable_image_opcode(binding.opcode);
             let storage = is_storage_image_opcode(binding.opcode);
             let comparison = image_is_comparison(binding.opcode);
