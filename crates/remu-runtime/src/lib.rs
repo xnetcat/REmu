@@ -4203,10 +4203,21 @@ fn dispatch_kernel_file_import(
 /// process-wide dispatch write lock (plan C2 step 1).
 fn dispatch_kernel_path_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
     Some(match nid {
+        // Raw libKernel error convention.
         "1G3lF1Gg1k8" => guest_files::guest_kernel_open_prelock(arguments),
         "1-LFLmRFxxM" => guest_files::guest_kernel_mkdir_prelock(arguments),
         "naInUjYt3so" => guest_files::guest_kernel_rmdir_prelock(arguments),
         "eV9wAD2riIA" => guest_files::guest_kernel_stat_prelock(arguments),
+        // POSIX wrappers translate kernel errors to -1 and guest errno. Their raw twins above have
+        // been pre-lock since plan C2 step 1, but these were left behind the write guard, so a
+        // path resolution walking one `read_dir` per component on slow storage stalled every other
+        // stateful import in the process.
+        "6c3rCVE-fTU" | "wuCroIGjt2g" => {
+            guest_posix_file_result(guest_files::guest_kernel_open_prelock(arguments))
+        }
+        "E6ao34wPw+U" => {
+            guest_posix_file_result(guest_files::guest_kernel_stat_prelock(arguments))
+        }
         _ => return None,
     })
 }
