@@ -534,9 +534,30 @@ pub(crate) fn upload_image_textures(
                             };
                             format!("{words:08x?}")
                         });
+                        // If a well-formed T# (DWORD3 type nibble >= 8) sits at a small offset
+                        // from the snapshot's source slot, the failure is a base/slot mapping
+                        // delta, not a missing descriptor; print each candidate offset.
+                        let nearby = source.map(|address| {
+                            let mut offsets = Vec::new();
+                            for delta in (-0x100_i64..=0x100).step_by(16) {
+                                let candidate = address.wrapping_add_signed(delta);
+                                // SAFETY: probes the staging arena the evaluator just read;
+                                // 16-byte alignment keeps each read inside one page of it.
+                                let word3 = unsafe {
+                                    (candidate as *const u32).add(3).read_unaligned()
+                                };
+                                if (word3 >> 28) >= 8 {
+                                    offsets.push(format!("{delta:+#x}"));
+                                }
+                            }
+                            offsets.join(",")
+                        });
                         eprintln!(
-                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd source={source:x?} now={now:?}",
-                            binding.pc, binding.opcode, binding.resource_descriptor,
+                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd source={source:x?} now={now:?} texture_like_nearby=[{}]",
+                            binding.pc,
+                            binding.opcode,
+                            binding.resource_descriptor,
+                            nearby.unwrap_or_default(),
                         );
                     }
                     return Err(format!(
