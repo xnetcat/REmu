@@ -138,7 +138,7 @@ impl Compiler<'_> {
             // One argument-buffer layout serves every heap: 512 texture handles, indexed by
             // the shadow descriptor slot the SMEM lowering maintains at runtime.
             source.push_str(
-                "struct RemuHeapTable {\n    metal::array<texture2d<float>, 512> tex [[id(0)]];\n};\n\n",
+                "struct RemuHeapTable {\n    metal::array<texture2d<float>, 16> tex [[id(0)]];\n};\n\n",
             );
         }
         if sampler_count != 0 && !direct_sampler_bindings {

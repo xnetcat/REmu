@@ -2570,6 +2570,8 @@ struct MetalPresenter {
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
+    /// 1x1 opaque-black texture bound into unresolved runtime heap-table slots.
+    heap_table_placeholder: Option<Texture>,
     next_sampled_texture_use: u64,
     sampler_argument_cache: HashMap<SamplerArgumentCacheKey, CachedSamplerArguments>,
     depth_stencil_cache: HashMap<DepthStencilCacheKey, DepthStencilState>,
@@ -2801,6 +2803,7 @@ impl MetalPresenter {
             sampled_texture_cache: HashMap::new(),
             sampled_texture_write_watches: HashMap::new(),
             fallback_texture_cache: HashMap::new(),
+            heap_table_placeholder: None,
             next_sampled_texture_use: 0,
             sampler_argument_cache: HashMap::new(),
             depth_stencil_cache: HashMap::new(),

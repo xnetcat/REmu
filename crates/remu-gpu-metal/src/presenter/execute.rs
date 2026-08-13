@@ -121,6 +121,123 @@ pub(super) const fn metal_scissor_rect_for_draw(
 
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
+
+    /// Builds the pixel stage's runtime heap texture tables (stage 3 of
+    /// docs/design/2026-08-13-runtime-image-descriptor-fetch.md).
+    ///
+    /// Each table walks its SMEM binding's guest span in 32-byte steps from the binding's own
+    /// base phase and stops at the first slot that does not decode as a texture: the measured
+    /// resource blobs are mixed-width records, so a fixed-window walk would misparse past the
+    /// table's end. Slots resolve through live residents first; unresolved slots bind a black
+    /// placeholder and report once, so a miss reads as a named gap rather than garbage.
+    fn build_pixel_heap_texture_tables(
+        &mut self,
+        device: &metal::Device,
+        pixel_function: &metal::Function,
+        evaluation: &remu_shader::ShaderEvaluation,
+        tables: &[(u32, u32)],
+    ) -> Result<Vec<(u32, metal::Buffer, Vec<metal::Texture>)>, String> {
+        const HEAP_TABLE_SLOTS: u64 = 16;
+        let mut built = Vec::with_capacity(tables.len());
+        for (global_index, buffer_slot) in tables {
+            let binding = evaluation
+                .global_memory_bindings
+                .get(*global_index as usize)
+                .ok_or("heap texture table names a missing global binding")?;
+            let base = binding.base_address;
+            let argument_encoder =
+                pixel_function.new_argument_encoder(u64::from(*buffer_slot));
+            let argument_buffer = device.new_buffer(
+                argument_encoder.encoded_length(),
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            argument_encoder.set_argument_buffer(&argument_buffer, 0);
+            let mut resolved: Vec<metal::Texture> = Vec::new();
+            let mut walking = true;
+            let placeholder = self.heap_table_placeholder_texture(device)?;
+            for slot in 0..HEAP_TABLE_SLOTS {
+                let mut texture: Option<metal::Texture> = None;
+                if walking {
+                    let mut bytes = [0_u8; 32];
+                    if remu_memory::read_guest_shared_backing(base + slot * 32, &mut bytes) {
+                        let words: [u32; 8] = std::array::from_fn(|index| {
+                            u32::from_le_bytes(
+                                bytes[index * 4..index * 4 + 4].try_into().expect("dword"),
+                            )
+                        });
+                        match super::decode::decode_image_descriptor(&words) {
+                            Ok(decoded) => {
+                                texture = self
+                                    .resident_guest_textures
+                                    .get_mut(&decoded.guest)
+                                    .and_then(|resident| {
+                                        super::texture::resident_texture_for_sample(
+                                            resident, decoded,
+                                        )
+                                    });
+                                if texture.is_none() {
+                                    static LOGGED: std::sync::atomic::AtomicUsize =
+                                        std::sync::atomic::AtomicUsize::new(0);
+                                    let sequence = LOGGED
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                        + 1;
+                                    if sequence <= 16 || sequence.is_power_of_two() {
+                                        eprintln!(
+                                            "[REMu][HEAP-TABLE] sequence={sequence} slot={slot} descriptor at {:#x} has no serving resident ({:?} {}x{})",
+                                            base + slot * 32,
+                                            decoded.guest.pixel_format,
+                                            decoded.guest.width,
+                                            decoded.guest.height,
+                                        );
+                                    }
+                                }
+                            }
+                            Err(_) => walking = false,
+                        }
+                    } else {
+                        walking = false;
+                    }
+                }
+                let bound = texture.unwrap_or_else(|| placeholder.clone());
+                argument_encoder.set_texture(slot, &bound);
+                resolved.push(bound);
+            }
+            built.push((*buffer_slot, argument_buffer, resolved));
+        }
+        Ok(built)
+    }
+
+    /// A 1x1 opaque-black texture for unresolved heap-table slots, created once per device.
+    fn heap_table_placeholder_texture(
+        &mut self,
+        device: &metal::Device,
+    ) -> Result<metal::Texture, String> {
+        if let Some(texture) = self.heap_table_placeholder.as_ref() {
+            return Ok(texture.clone());
+        }
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_width(1);
+        descriptor.set_height(1);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        let texture = device.new_texture(&descriptor);
+        texture.replace_region(
+            metal::MTLRegion {
+                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
+                size: metal::MTLSize {
+                    width: 1,
+                    height: 1,
+                    depth: 1,
+                },
+            },
+            0,
+            [0_u8, 0, 0, 255].as_ptr().cast(),
+            4,
+        );
+        self.heap_table_placeholder = Some(texture.clone());
+        Ok(texture)
+    }
+
     pub(super) fn execute_compiled_draw(
         &mut self,
         draw: &IndexedDraw,
@@ -918,6 +1035,8 @@ impl MetalPresenter {
             pixel_scalar_buffer_index,
             vertex_sampler_buffer_index,
             pixel_sampler_buffer_index,
+            vertex_heap_texture_tables,
+            pixel_heap_texture_tables,
             uses_mesh_stage,
             uses_procedural_rectangle_stage,
             vertex_msl_bytes,
@@ -1024,6 +1143,8 @@ impl MetalPresenter {
                 compiled.pixel.bindings.initial_scalar_buffer_index,
                 compiled.vertex.bindings.sampler_argument_buffer_index,
                 compiled.pixel.bindings.sampler_argument_buffer_index,
+                compiled.vertex.bindings.heap_texture_tables.clone(),
+                compiled.pixel.bindings.heap_texture_tables.clone(),
                 compiled.uses_mesh_stage,
                 compiled.uses_procedural_rectangle_stage,
                 compiled.vertex.source.len(),
@@ -1152,6 +1273,15 @@ impl MetalPresenter {
             &pixel_function,
             pixel_sampler_buffer_index,
             pixel_evaluation,
+        )?;
+        if !vertex_heap_texture_tables.is_empty() {
+            return Err("vertex-stage heap texture tables are not yet encodable".to_owned());
+        }
+        let pixel_heap_tables = self.build_pixel_heap_texture_tables(
+            &device,
+            &pixel_function,
+            pixel_evaluation,
+            &pixel_heap_texture_tables,
         )?;
         let export_global_argument_buffer = create_global_argument_buffer(
             &device,
@@ -1881,6 +2011,16 @@ impl MetalPresenter {
             }
             for (index, texture) in pixel_texture_indices.iter().zip(&pixel_textures) {
                 encoder.set_fragment_texture(*index, Some(&texture.texture));
+            }
+            for (buffer_slot, argument_buffer, textures) in &pixel_heap_tables {
+                encoder.set_fragment_buffer(
+                    u64::from(*buffer_slot),
+                    Some(argument_buffer),
+                    0,
+                );
+                for texture in textures {
+                    encoder.use_resource(texture, metal::MTLResourceUsage::Read);
+                }
             }
             if let (Some(index), Some(buffer)) =
                 (vertex_sampler_buffer_index, export_sampler_buffer.as_ref())
