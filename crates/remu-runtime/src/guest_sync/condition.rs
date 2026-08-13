@@ -336,8 +336,17 @@ where
                 released_spuriously = true;
                 break;
             }
-            if report_ticks < 30 {
-                report_ticks += 1;
+            report_ticks += 1;
+            // A healthy run parks dozens of idle pool threads in unbounded waits; per-tick
+            // reports from all of them bury the engine-thread signal a wedge run needs (746
+            // bystander lines in run 20260813T225147Z). Frame-pipeline threads keep every
+            // tick; everything else backs off to power-of-two ticks, so an idle thread costs
+            // a handful of lines per run while a wedged engine thread never goes quiet.
+            let thread_name = current_guest_thread_name();
+            let frame_pipeline_thread = ["Render", "RHI", "Agc", "GameThread"]
+                .iter()
+                .any(|marker| thread_name.contains(marker));
+            if frame_pipeline_thread || report_ticks.is_power_of_two() {
                 reported = true;
                 let notifies = cond.notifies;
                 // The guarded guest state beside the condvar and mutex objects discriminates
@@ -359,9 +368,8 @@ where
                     }
                 };
                 eprintln!(
-                    "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies} since_wait={} cond_obj={} mutex_obj={}",
+                    "[REMu][STALL] condition wait exceeded {}s thread={thread_name:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies} since_wait={} cond_obj={} mutex_obj={}",
                     report_after.as_secs(),
-                    current_guest_thread_name(),
                     notifies.saturating_sub(notifies_at_wait),
                     peek(condition),
                     peek(mutex_address),
