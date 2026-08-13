@@ -157,7 +157,7 @@ fn shared_event_texture_override_bypasses_replaced_guest_mapping_at_bind() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding {
+        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
             pc: 0x40,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -322,7 +322,7 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding {
+        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
             pc: 0x60,
             opcode: Opcode::Known("ImageLoad"),
             control: ImageControl {
@@ -468,7 +468,7 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding {
+        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
             pc: 0x80,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -598,7 +598,7 @@ fn r32_depth_sample_keeps_depth32_after_later_empty_r32_mark_written() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding {
+        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
             pc: 0x80,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -1764,7 +1764,7 @@ fn load_before_store_binds_one_read_write_array_texture() {
         d16: false,
         unorm: false,
     };
-    let mut store = ImageBinding {
+    let mut store = ImageBinding { descriptor_index_is_runtime: false,
         pc: 0x38,
         opcode: Opcode::Known("ImageStore"),
         control: control.clone(),
@@ -1772,7 +1772,7 @@ fn load_before_store_binds_one_read_write_array_texture() {
         sampler_descriptor: Vec::new().into(),
         mip_level: None,
     };
-    let load = ImageBinding {
+    let load = ImageBinding { descriptor_index_is_runtime: false,
         pc: 0x30,
         opcode: Opcode::Known("ImageLoad"),
         control,
@@ -1865,7 +1865,7 @@ fn ordinary_storage_load_does_not_promote_a_full_mip_view() {
     assert_eq!(descriptor.guest.tile_mode, 9);
     assert_eq!(descriptor.base_mip_level, 0);
     assert_eq!(descriptor.mip_level_count, 9);
-    let mut binding = ImageBinding {
+    let mut binding = ImageBinding { descriptor_index_is_runtime: false,
         pc: 0x190,
         opcode: Opcode::Known("ImageLoad"),
         control: ImageControl {
@@ -1894,7 +1894,7 @@ fn ordinary_storage_load_does_not_promote_a_full_mip_view() {
 
 #[test]
 fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
-    let binding = ImageBinding {
+    let binding = ImageBinding { descriptor_index_is_runtime: false,
         pc: 0x50,
         opcode: Opcode::Known("ImageSample"),
         control: ImageControl {

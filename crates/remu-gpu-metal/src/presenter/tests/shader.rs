@@ -1098,7 +1098,7 @@ fn runtime_upload_representatives_follow_canonical_texture_and_sampler_slots() {
         d16: false,
         unorm: false,
     };
-    let binding = |pc, opcode, descriptor: Vec<u32>| ImageBinding {
+    let binding = |pc, opcode, descriptor: Vec<u32>| ImageBinding { descriptor_index_is_runtime: false,
         pc,
         opcode: remu_shader::Opcode::Known(opcode),
         control: control.clone(),
@@ -1149,7 +1149,7 @@ fn graphics_shader_cache_key_normalizes_dynamic_image_formats_and_swizzles() {
         initial_scalar_registers: vec![0; 16].into(),
         scalar_registers: vec![0; 16].into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding {
+        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
             pc: 0x20,
             opcode: remu_shader::Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -1445,7 +1445,7 @@ kernel void remu_sampler_cache_test(
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding {
+        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
             pc: 0x100,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {

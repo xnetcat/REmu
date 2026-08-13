@@ -380,6 +380,14 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             || read_scalar_pair(registers, scalar_base).unwrap_or_default(),
             |descriptor| descriptor.base_address,
         );
+        let offset_is_stale = control.dynamic_offset_register.is_some_and(|register| {
+            self.valu_scalar_destinations
+                .get(register as usize)
+                .copied()
+                .unwrap_or(false)
+        }) || (scalar_base as usize + 1 < SCALAR_REGISTER_COUNT
+            && (self.stale_seeded[scalar_base as usize]
+                || self.stale_seeded[scalar_base as usize + 1]));
         if let Some(register) = control.dynamic_offset_register
             && self
                 .valu_scalar_destinations
@@ -513,6 +521,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 );
                 self.scalar_memory_reads.insert(component_address, value);
                 registers[destination.value as usize] = value;
+                self.stale_seeded[destination.value as usize] = offset_is_stale;
             }
             return Ok(());
         }
@@ -536,6 +545,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             let value = u32::from_le_bytes(bytes);
             self.scalar_memory_reads.insert(component_address, value);
             registers[destination.value as usize] = value;
+            self.stale_seeded[destination.value as usize] = offset_is_stale;
         }
         Ok(())
     }
@@ -753,12 +763,15 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         {
             return Ok(());
         }
-        if (0..IMAGE_DESCRIPTOR_DWORDS).any(|index| {
+        let descriptor_index_is_runtime = (0..IMAGE_DESCRIPTOR_DWORDS).any(|index| {
+            let register = control.scalar_resource as usize + index;
             self.valu_scalar_destinations
-                .get(control.scalar_resource as usize + index)
+                .get(register)
                 .copied()
                 .unwrap_or(false)
-        }) {
+                || self.stale_seeded.get(register).copied().unwrap_or(false)
+        });
+        if descriptor_index_is_runtime {
             static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             if sequence <= 32 || sequence.is_power_of_two() {
@@ -782,6 +795,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         .then(|| resolve_image_mip_level(self.state, instruction.pc, control))
         .flatten();
         let binding = ImageBinding {
+            descriptor_index_is_runtime,
             pc: instruction.pc,
             opcode: instruction.opcode,
             control: control.clone(),

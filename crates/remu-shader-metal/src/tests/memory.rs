@@ -273,7 +273,7 @@ fn complete_memory_program() -> (Program, ShaderEvaluation) {
         });
     let mut identity_image_descriptor = vec![0; 8];
     identity_image_descriptor[3] = 0xfac;
-    evaluation.image_bindings.push(remu_shader::ImageBinding {
+    evaluation.image_bindings.push(remu_shader::ImageBinding { descriptor_index_is_runtime: false,
         pc: image_pc,
         opcode: Opcode::Known("ImageLoad"),
         control: image_control,
@@ -283,7 +283,7 @@ fn complete_memory_program() -> (Program, ShaderEvaluation) {
     });
     let mut swizzled_store_descriptor = identity_image_descriptor;
     swizzled_store_descriptor[3] = 0x9f5;
-    evaluation.image_bindings.push(remu_shader::ImageBinding {
+    evaluation.image_bindings.push(remu_shader::ImageBinding { descriptor_index_is_runtime: false,
         pc: image_store_pc,
         opcode: Opcode::Known("ImageStore"),
         control: image_store_control,

@@ -10,6 +10,10 @@ use super::{ComputeSystemRegisters, ImageControl, Opcode};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ImageBinding {
     pub pc: u32,
+    /// The descriptor's index chain passes through registers only unevaluated VALU
+    /// instructions write (readlane family, carry-outs): the snapshot below points at a
+    /// stale heap slot and the binding must resolve through a runtime heap texture table.
+    pub descriptor_index_is_runtime: bool,
     pub opcode: Opcode,
     pub control: ImageControl,
     pub resource_descriptor: SmallVec<[u32; 8]>,

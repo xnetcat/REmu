@@ -162,6 +162,9 @@ struct Evaluator<'a, M> {
     /// Registers some unevaluated VALU instruction writes (readlane family, carry-outs);
     /// a consumer reading one as an SMEM offset or descriptor source holds a stale seed.
     valu_scalar_destinations: [bool; SCALAR_REGISTER_COUNT],
+    /// Registers whose current value was loaded through a stale (VALU-written) SMEM offset;
+    /// image descriptors drawn from them must resolve through a runtime heap table.
+    stale_seeded: [bool; SCALAR_REGISTER_COUNT],
     initial_registers: [u32; SCALAR_REGISTER_COUNT],
     final_registers: [u32; SCALAR_REGISTER_COUNT],
     pending_paths: Vec<ScalarPath>,
@@ -291,6 +294,7 @@ fn evaluate_shader_within(
         state,
         options,
         valu_scalar_destinations,
+        stale_seeded: [false; SCALAR_REGISTER_COUNT],
         initial_registers: registers,
         final_registers: registers,
         pending_paths: Vec::with_capacity(4),

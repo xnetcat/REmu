@@ -468,7 +468,7 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![remu_shader::ImageBinding {
+        image_bindings: vec![remu_shader::ImageBinding { descriptor_index_is_runtime: false,
             pc: 0,
             opcode: remu_shader::Opcode::Known("ImageSample"),
             control: remu_shader::ImageControl {
