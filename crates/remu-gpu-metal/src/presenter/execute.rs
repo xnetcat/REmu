@@ -145,6 +145,27 @@ impl MetalPresenter {
                 .get(*global_index as usize)
                 .ok_or("heap texture table names a missing global binding")?;
             let base = binding.base_address;
+            // Content-hash the table's slot bytes: identical tables recur at hundreds of
+            // guest addresses (bump-allocated per-draw blobs), and rebuilding per draw feeds
+            // the presenter-livelock class this path must never worsen.
+            let mut content = [0_u8; 512];
+            let content_known =
+                remu_memory::read_guest_shared_backing(base, &mut content);
+            if content_known {
+                let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+                for byte in content {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                hash ^= u64::from(*buffer_slot);
+                if let Some((buffer, textures)) = self.heap_table_cache.get(&hash) {
+                    built.push((*buffer_slot, buffer.clone(), textures.clone()));
+                    continue;
+                }
+                self.pending_heap_table_hash = Some(hash);
+            } else {
+                self.pending_heap_table_hash = None;
+            }
             let argument_encoder =
                 pixel_function.new_argument_encoder(u64::from(*buffer_slot));
             let argument_buffer = device.new_buffer(
@@ -267,6 +288,13 @@ impl MetalPresenter {
                 let bound = texture.unwrap_or_else(|| placeholder.clone());
                 argument_encoder.set_texture(slot, &bound);
                 resolved.push(bound);
+            }
+            if let Some(hash) = self.pending_heap_table_hash.take() {
+                self.heap_table_cache
+                    .insert(hash, (argument_buffer.clone(), resolved.clone()));
+                if self.heap_table_cache.len() > 2048 {
+                    self.heap_table_cache.clear();
+                }
             }
             built.push((*buffer_slot, argument_buffer, resolved));
         }

@@ -2572,6 +2572,12 @@ struct MetalPresenter {
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
     /// 1x1 opaque-black texture bound into unresolved runtime heap-table slots.
     heap_table_placeholder: Option<Texture>,
+    /// Content-hash cache of encoded heap texture tables: the same table bytes recur at
+    /// hundreds of guest addresses per frame (bump-allocated per-draw blobs), so hashing the
+    /// slot bytes collapses per-draw rebuilds into lookups.
+    heap_table_cache: HashMap<u64, (metal::Buffer, Vec<Texture>)>,
+    /// Hash of the table currently being built, for insertion after resolution.
+    pending_heap_table_hash: Option<u64>,
     next_sampled_texture_use: u64,
     sampler_argument_cache: HashMap<SamplerArgumentCacheKey, CachedSamplerArguments>,
     depth_stencil_cache: HashMap<DepthStencilCacheKey, DepthStencilState>,
@@ -2804,6 +2810,8 @@ impl MetalPresenter {
             sampled_texture_write_watches: HashMap::new(),
             fallback_texture_cache: HashMap::new(),
             heap_table_placeholder: None,
+            heap_table_cache: HashMap::new(),
+            pending_heap_table_hash: None,
             next_sampled_texture_use: 0,
             sampler_argument_cache: HashMap::new(),
             depth_stencil_cache: HashMap::new(),
