@@ -1473,7 +1473,7 @@ impl MetalPresenter {
                 let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if sequence <= 16 || sequence.is_power_of_two() {
                     eprintln!(
-                        "[REMu][METAL][ENSURE-REPLACE] sequence={sequence} address={:#x} {}x{} {:?} version={} acquire_invalidated={} watch_retirement={:?}",
+                        "[REMu][METAL][ENSURE-REPLACE] sequence={sequence} address={:#x} {}x{} {:?} version={} acquire_invalidated={} watch_retirement={:?} texture_type={} layer_count={} mip_level_count={}",
                         resident.descriptor.address,
                         resident.descriptor.width,
                         resident.descriptor.height,
@@ -1481,6 +1481,9 @@ impl MetalPresenter {
                         resident.content_version,
                         resident.acquire_invalidated,
                         resident.write_watch.retirement(),
+                        resident.texture_type,
+                        resident.layer_count,
+                        resident.mip_level_count,
                     );
                 }
             }
