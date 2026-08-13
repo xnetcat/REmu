@@ -35,7 +35,7 @@ const AMPR_FAILED_COMPLETION_VALUE: u64 = u64::MAX;
 /// recorded token, so the guest can identify which request the error belongs to.
 const AMPR_EVENT_FLAG_ERROR: u16 = 0x4000;
 
-fn positional_file_read(
+fn positional_file_read_once(
     file: &std::fs::File,
     destination: &mut [u8],
     offset: u64,
@@ -53,6 +53,47 @@ fn positional_file_read(
         let _ = (file, destination, offset);
         Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
     }
+}
+
+/// Reads with a bounded retry on transient I/O errors.
+///
+/// Removable/USB-bridge volumes intermittently fail a positional read with EIO and recover on
+/// the next attempt; surfacing the first failure turns into a guest LowLevelFatalError ("Apr
+/// read failure 80020002") that kills the whole title. Genuine persistent failures still
+/// surface after the last attempt. Retries stay short and bounded so a truly dead volume
+/// costs under half a second per read rather than hanging.
+fn positional_file_read(
+    file: &std::fs::File,
+    destination: &mut [u8],
+    offset: u64,
+) -> std::io::Result<usize> {
+    let mut delay = std::time::Duration::from_millis(20);
+    for attempt in 0..5_u32 {
+        match positional_file_read_once(file, destination, offset) {
+            Ok(read) => {
+                if attempt != 0 {
+                    eprintln!(
+                        "[REMu][AMPR] transient read failure recovered after {attempt} retries offset={offset:#x} bytes={}",
+                        destination.len(),
+                    );
+                }
+                return Ok(read);
+            }
+            Err(error)
+                if attempt < 4
+                    && matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::TimedOut
+                    )
+                    || attempt < 4 && error.raw_os_error() == Some(5) =>
+            {
+                std::thread::sleep(delay);
+                delay *= 2;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("bounded retry loop returns on the final attempt")
 }
 
 pub(crate) fn ampr_command_order(command_buffer: u64) -> &'static Mutex<()> {
