@@ -86,9 +86,25 @@ pub(crate) fn guest_condition_init(address: u64) -> u64 {
     if lookup_condition_by_handle(address).is_some() {
         return sce_kernel_error(SCE_KERNEL_ERROR_BUSY);
     }
-    let Some(_) = read_pthread_slot(address) else {
+    let Some(previous_handle) = read_pthread_slot(address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
+    // Forking a condition that still has parked waiters strands them permanently: every later
+    // signal resolves to the new object, so nothing can ever release their tickets. Silent today.
+    if let Some(previous) = lookup_condition_by_handle(previous_handle) {
+        let state = previous
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.waiters.is_empty() {
+            eprintln!(
+                "[REMu][COND][FORK] init over live condition slot={address:#x} previous_handle={previous_handle:#x} stranded_waiters={} notifies={} thread={:?}",
+                state.waiters.len(),
+                state.notifies,
+                current_guest_thread_name(),
+            );
+        }
+    }
     // Always overwrite the slot with a fresh control block (same pointer-typedef rule as mutexes).
     let guest_object = guest_calloc(1, GUEST_PTHREAD_OBJECT_SIZE);
     if guest_object == 0 {

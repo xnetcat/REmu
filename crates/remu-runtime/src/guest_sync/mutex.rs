@@ -260,9 +260,29 @@ pub(crate) fn guest_mutex_init(address: u64, attributes: PthreadMutexAttrState) 
         );
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
-    let Some(_) = read_pthread_slot(address) else {
+    let Some(previous_handle) = read_pthread_slot(address) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     };
+    // Overwriting below is deliberate (see the comment there), but it forks identity: threads that
+    // resolved before this point keep using the old object while later ones use the new one. That is
+    // harmless for a dead object and fatal for a held one — mutual exclusion is gone, and the loser
+    // can never be unlocked because its owner's unlock resolves to the new object. Nothing else in
+    // the process reports this, so report it here rather than let it stay invisible.
+    if let Some(previous) = lookup_mutex_by_handle(previous_handle) {
+        let state = previous
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.owner.is_some() || state.waiters != 0 {
+            eprintln!(
+                "[REMu][MUTEX][FORK] init over live mutex slot={address:#x} previous_handle={previous_handle:#x} owner_thread={:#x} recursion={} waiters={} thread={:?}",
+                state.owner_guest_thread,
+                state.recursion,
+                state.waiters,
+                current_guest_thread_name(),
+            );
+        }
+    }
     // Always publish a fresh control block into the slot. Identity is the handle value
     // (`pthread_mutex_t` is a pointer typedef), not durable ownership of the slot address.
     // Scream creates recursive mutexes in stack locals, returns the handle by value into a
