@@ -336,3 +336,21 @@ causal chain to the missing menu scene is closed: stale descriptor indices → m
 wrong/black → BasePass writes black → no scene. The fix is the runtime image-descriptor fetch
 (buffer-style runtime-offset lowering) + branch forking; acceptance = STALE-VALU counts
 consumed, BasePass black% drops, rooftop visible vs reference.
+
+## Memdump heap analysis (Codex, run 171206Z) — stage-3 geometry corrected
+Full report: memdump-heap-analysis.md. Headlines:
+- **No descriptor heap exists in this title.** Largest 32-byte-strided T# run in 2.32 GiB = 15
+  descriptors. The tables are ~6.6k small per-draw MIXED-WIDTH resource blobs (16/24/32-byte
+  records; UE4-PS5 resource-table shape) from a bump allocator; only 23.5% start 32B-aligned
+  (dominant phase +16).
+- **RETRACTED: the "split-load GPU-assembled descriptor" reading.** The refused 8 dwords are ONE
+  contiguous 32-byte read straddling two adjacent 16-byte records (sentinel + next entry, which
+  is a V#). Stale-index-in-kind confirmed; miss granularity is 16 bytes, not 0x20 multiples.
+  Five of nine refusal sources show the identical sentinel with the nearest real T# at exactly
+  -0x58 — structural, not random.
+- **Cache must be content-keyed:** 6,641 table instances collapse to 847 distinct contents
+  (7.84x); spans move every draw, so span-keyed caching gets ~0 hits.
+- Stage-3 corrections adopted: route ALL decoding through decode_image_descriptor (base formula
+  (word0<<8)|((word1&0xff)<<40); landed code already correct); cap 16 not 512; anchor the walk
+  to the binding base's phase and stop at the first non-decoding slot; assert the slot formula's
+  phase; tighten the T# predicate by cross-checking residents.

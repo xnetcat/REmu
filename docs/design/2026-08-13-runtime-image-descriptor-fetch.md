@@ -96,3 +96,17 @@ Stage 3 — encoder (remu-gpu-metal):
 Regression gates: PPSA02929 unchanged (uniform-indexed → snapshot path must remain);
 remu-shader-metal's 2 irreducible-dispatcher test failures are PRE-EXISTING (A/B verified),
 do not attribute them to this build.
+
+## Geometry corrections from the t=100 memory dump (memdump-heap-analysis.md)
+
+The heap model is wrong for this title: there are no large heaps, only per-draw mixed-width
+resource blobs (max 15 T#s, records of 16/24/32 bytes, 76.5% of tables NOT 32B-aligned,
+contents duplicated 7.84x across moving spans). Stage 3 adjustments:
+1. REMU_HEAP_CAP: 512 -> 16.
+2. Walk anchored at the SMEM binding base's phase; stop at the first slot that fails
+   decode_image_descriptor; never blind-stride a fixed window.
+3. The shadow-slot formula ((base_offset+dynamic+imm)/32) is sound only when the array phase
+   equals the binding base phase — assert at build, fall back loudly otherwise.
+4. Argument-buffer cache keyed on CONTENT HASH of the table bytes, not guest span.
+5. Decode strictly through decode_image_descriptor and cross-check decoded slots against
+   known residents before trusting them.
