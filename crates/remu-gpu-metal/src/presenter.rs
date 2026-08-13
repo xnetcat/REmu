@@ -1491,10 +1491,36 @@ impl ResidentGuestTexture {
         if self.acquire_invalidated && !discard_guest_contents {
             // An armed, undirtied write watch proves the CPU wrote nothing since arming; only a
             // dirty watch needs the (baseline-dependent) fingerprint comparison.
+            let watch_dirty = self.write_watch.is_dirty();
             let cpu_rewrote = !self.gpu_content_executed
-                || (self.write_watch.is_dirty()
-                    && self.write_watch.content_has_changed().unwrap_or(true));
+                || (watch_dirty && self.write_watch.content_has_changed().unwrap_or(true));
             if cpu_rewrote {
+                if self.gpu_content_executed
+                    && self.descriptor.width >= 1_280
+                    && self.descriptor.height >= 720
+                {
+                    static LOGGED: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 24 || sequence.is_power_of_two() {
+                        // Guest memory is host-mapped at the guest VA; the watch only removes
+                        // write permission, so this read of the live descriptor is safe.
+                        let zero_head = unsafe {
+                            std::slice::from_raw_parts(self.descriptor.address as *const u8, 64)
+                        }
+                        .iter()
+                        .take_while(|&&byte| byte == 0)
+                        .count();
+                        eprintln!(
+                            "[REMu][METAL][ACQUIRE-REJECT] sequence={sequence} address={:#x} {}x{} {:?} watch_dirty={watch_dirty} zero_head={zero_head}/64 version={}",
+                            self.descriptor.address,
+                            self.descriptor.width,
+                            self.descriptor.height,
+                            self.descriptor.pixel_format,
+                            self.content_version,
+                        );
+                    }
+                }
                 self.demote(StaleSource::GuestMemory);
                 return false;
             }
