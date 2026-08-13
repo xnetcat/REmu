@@ -3154,8 +3154,20 @@ fn register_guest_entry_trace_record(entry_address: u64) {
     start_guest_import_trace_reporter();
     GUEST_IMPORT_TRACE_RECORD.with(|current| {
         if !current.get().is_null() {
+            // Instruments must announce themselves: a silent decline is indistinguishable
+            // from a healthy run, and this exact ambiguity has already cost two captures.
+            // SAFETY: the record is alive for the thread's lifetime; the pointer was
+            // published by this thread's own guard.
+            let existing = unsafe { &*current.get() };
+            eprintln!(
+                "[REMu][ENTRY-TRACE] declined: thread already carries record name={:?} — module init or an earlier caller won the race",
+                existing.name,
+            );
             return;
         }
+        eprintln!(
+            "[REMu][ENTRY-TRACE] registered guest entry thread record entry={entry_address:#x}"
+        );
         let record = Arc::new(GuestImportTraceRecord {
             thread: current_guest_thread_handle(),
             name: format!("{}(guest-entry)", current_guest_thread_name()),
