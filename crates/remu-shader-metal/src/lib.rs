@@ -289,6 +289,13 @@ pub struct MetalCompileOptions {
     /// they will lower NGG glyph sequences; without it those patterns fail loudly instead of
     /// applying a title-specific heuristic.
     pub ngg_registers_proven: bool,
+    /// Lower a wave64 threadgroup program by carrying two guest lanes per Metal thread on one
+    /// SIMD32 group, instead of splitting the wave across two SIMD32 groups.
+    ///
+    /// Under this mapping guest wave scope equals Metal simdgroup scope, so 64-bit EXEC/VCC and
+    /// every mask SGPR hold exact architectural values and wave-internal ordering needs only
+    /// `simdgroup_barrier`. See docs/design/2026-08-13-wave64-lane-doubling.md.
+    pub wave64_lane_doubled: bool,
 }
 
 impl MetalCompileOptions {
@@ -323,6 +330,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            wave64_lane_doubled: false,
         }
     }
 
@@ -360,6 +368,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            wave64_lane_doubled: false,
         }
     }
 
@@ -393,6 +402,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            wave64_lane_doubled: false,
         }
     }
 
@@ -426,6 +436,7 @@ impl MetalCompileOptions {
             wave_lane_count,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            wave64_lane_doubled: false,
         }
     }
 
@@ -473,6 +484,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            wave64_lane_doubled: false,
         }
     }
 

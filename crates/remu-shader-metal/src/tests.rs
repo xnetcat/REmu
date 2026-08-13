@@ -206,6 +206,7 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
             wave_lane_count: 32,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
+            wave64_lane_doubled: false,
         },
     )
     .expect("vector instruction should lower")
