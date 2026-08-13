@@ -1449,6 +1449,26 @@ impl MetalPresenter {
             }
         }
         if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+            if resident.gpu_content_executed
+                && resident.descriptor.width >= 1_280
+                && resident.descriptor.height >= 720
+            {
+                static LOGGED: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL][ENSURE-REPLACE] sequence={sequence} address={:#x} {}x{} {:?} version={} acquire_invalidated={} watch_retirement={:?}",
+                        resident.descriptor.address,
+                        resident.descriptor.width,
+                        resident.descriptor.height,
+                        resident.descriptor.pixel_format,
+                        resident.content_version,
+                        resident.acquire_invalidated,
+                        resident.write_watch.retirement(),
+                    );
+                }
+            }
             trace_resident_texture_removal("ensure-exact-resident-replaced", &resident);
         }
         let shared_resident = self
