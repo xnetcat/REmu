@@ -447,8 +447,18 @@ pub(crate) fn upload_image_textures(
                 if !is_null && texture_type == 0 {
                     static LOGGED: AtomicUsize = AtomicUsize::new(0);
                     if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+                        // The words came from one of these evaluation-time scalar reads; the
+                        // descriptor-table address is what a write trace must watch, because a
+                        // stable table pointer can front descriptors rewritten between
+                        // evaluation and execution.
+                        let reads = evaluation
+                            .scalar_memory_reads
+                            .iter()
+                            .map(|(address, dwords)| format!("{address:#x}+{dwords}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
                         eprintln!(
-                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd",
+                            "[REMu][METAL][IMAGE-REFUSE] pc={:#x} opcode={} words={:08x?} error={error} reason=non-null-type-0-buffer-srd scalar_reads=[{reads}]",
                             binding.pc, binding.opcode, binding.resource_descriptor,
                         );
                     }
