@@ -326,3 +326,13 @@ printout) names it in one run.
 composite draw's inputs at the menu (scanout-writer path, MIN_DRAW=0 trap noted) and read
 black=N/M — is the scene target black BEFORE the overlay draws, or does the overlay destroy
 it? Everything branches on that answer.
+
+## Mechanism confirmed (run 20260813T163916Z)
+The evaluator instrument reports 43 SMEM dynamic offsets and 43 image descriptors drawing on
+unevaluated-VALU-written SGPRs (STALE-VALU-OFFSET / STALE-VALU-DESCRIPTOR name the shader PCs).
+Combined with the discriminator (run 163003Z: 352 BasePass draws leave scene targets 99-100%
+black; the entire lighting chain carries 97% black; tonemap/cover present it faithfully), the
+causal chain to the missing menu scene is closed: stale descriptor indices → materials sample
+wrong/black → BasePass writes black → no scene. The fix is the runtime image-descriptor fetch
+(buffer-style runtime-offset lowering) + branch forking; acceptance = STALE-VALU counts
+consumed, BasePass black% drops, rooftop visible vs reference.
