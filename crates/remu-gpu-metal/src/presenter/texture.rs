@@ -101,7 +101,9 @@ pub(crate) use self::sampled::{
     resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
     sampled_texture_supports_access, sampled_texture_usage,
 };
-pub(crate) use self::upload::{comparison_depth32_upload, upload_image_textures};
+pub(crate) use self::upload::{
+    comparison_depth32_upload, descriptor_source_address, upload_image_textures,
+};
 #[cfg(test)]
 pub(crate) use self::upload::{
     sampled_texture_cache_accepts, sampled_texture_cache_requires_eviction,

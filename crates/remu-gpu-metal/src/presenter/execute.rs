@@ -755,6 +755,42 @@ impl MetalPresenter {
             work: draw.sequence,
             flip: self.next_flip_sequence,
         };
+        // GFX10 titles assemble per-draw descriptor tables with GPU work in the same frame; a
+        // T# snapshot taken at decode time then reads as the slot's previous contents and the
+        // sample would be refused. When the slot lies in a pending batch's writable output,
+        // settle those batches first — writable-global writeback publishes the descriptor and
+        // the upload path's late-resolve re-reads it — mirroring the hardware ordering where
+        // the sample's memory dependency serializes through the producing dispatch.
+        for evaluation in [export_evaluation, pixel_evaluation] {
+            for binding in &evaluation.image_bindings {
+                if binding.resource_descriptor.iter().all(|word| *word == 0)
+                    || super::decode::decode_image_descriptor(&binding.resource_descriptor)
+                        .is_ok()
+                {
+                    continue;
+                }
+                let Some(source) =
+                    super::texture::descriptor_source_address(evaluation, &binding.resource_descriptor)
+                else {
+                    continue;
+                };
+                if self.any_guest_batch(|batch| {
+                    super::submission::guest_batch_writes_overlap(batch, source, 32)
+                }) {
+                    static LOGGED: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+                    let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if sequence <= 16 || sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL][DESCRIPTOR-SETTLE] sequence={sequence} draw={} pc={:#x} source={source:#x}",
+                            draw.sequence, binding.pc,
+                        );
+                    }
+                    self.wait_for_guest_command_batches()?;
+                    break;
+                }
+            }
+        }
         let export_textures = upload_image_textures(
             "vertex",
             &device,

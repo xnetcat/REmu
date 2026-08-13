@@ -137,17 +137,21 @@ fn trace_glyph_atlas_linear(
 /// recorded addresses — matching all eight in order identifies the slot with no per-register
 /// provenance plumbing. The slot is re-read at upload (execute) order; the result is used only
 /// when it decodes as a texture, so a coincidental match cannot bind garbage.
-fn late_resolved_image_binding(
+/// Locates the guest slot an eight-dword descriptor snapshot was fetched from.
+///
+/// A T# is fetched as one contiguous vector, so its snapshot dwords sit at eight consecutive
+/// addresses of the evaluation's scalar-read journal; matching all eight in order identifies
+/// the slot with no per-register provenance plumbing.
+pub(crate) fn descriptor_source_address(
     evaluation: &ShaderEvaluation,
-    binding: &remu_shader::ImageBinding,
-) -> Option<remu_shader::ImageBinding> {
-    let words = &binding.resource_descriptor;
+    words: &[u32],
+) -> Option<u64> {
     if words.len() != 8 || words.iter().all(|word| *word == 0) {
         return None;
     }
     let reads: std::collections::BTreeMap<u64, u32> =
         evaluation.scalar_memory_reads.iter().copied().collect();
-    let source = reads
+    reads
         .iter()
         .find(|(address, value)| {
             **value == words[0]
@@ -155,7 +159,15 @@ fn late_resolved_image_binding(
                     reads.get(&(**address + 4 * index as u64)) == Some(&words[index])
                 })
         })
-        .map(|(address, _)| *address)?;
+        .map(|(address, _)| *address)
+}
+
+fn late_resolved_image_binding(
+    evaluation: &ShaderEvaluation,
+    binding: &remu_shader::ImageBinding,
+) -> Option<remu_shader::ImageBinding> {
+    let words = &binding.resource_descriptor;
+    let source = descriptor_source_address(evaluation, words)?;
     // SAFETY: the evaluator read these exact guest dwords for this submission, and the draw
     // that names them is still in flight; the mapping outlives this upload.
     let now = unsafe { std::slice::from_raw_parts(source as *const u32, 8) };
