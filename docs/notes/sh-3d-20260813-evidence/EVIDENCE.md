@@ -381,3 +381,41 @@ registration's phase field decides which.
 - Next discriminator implementation notes: the untimed [STALL] branch only reports when
   REMU_TRACE_STALL_SECONDS is set (keep in recipe); read condvar/mutex guest objects via
   read_guest_shared_backing, never raw pointers.
+
+## 2026-08-14 overnight: the crawl is the defect
+
+**Retraction:** the "wedged vs healthy" memdump byte-diff (runs 225147Z vs 171206Z) is void —
+telemetry shows 171206Z was itself wedged from t=72 (fps=0, draws=0 to end of run). Both dumps
+show legitimately empty parked TaskGraph queues; the comparison discriminated nothing.
+
+**Reframe:** telemetry across all 157 PPSA10112 runs shows the 3D/menu phase at 0.6-4 fps on
+every revision back through f11a0ea3 (pre-session). Two shapes: CRAWL (draws continue at
+~150-1000/s, fps 0-4) and WEDGE (draws stop entirely; 231521Z: committed_batches=0, queues
+empty, pending events at idle floor, no fatal line — guest stops submitting, no hung Metal
+buffer). The load hypothesis is refuted by inversion: 15 runs launched at loadavg 1.4-2.6 all
+crawled; the only three runs with fps>15 after t=60 launched at loadavg 18-34 and were showing
+cheap content (video/quote card). run.json records vm_loadavg per run.
+
+**Direct visual proof:** run 233217Z parked at the health-warning screen t=93-205 (presses
+ended at 84s; Continue needed ~91s). The 3D corridor renders CORRECTLY at ~1.4 fps — static
+content, continuous ~150 draws/s, ~700ms/frame.
+
+**[REMu][SLOW-CB] instrument** (74ba8c26, extended b0b4bb33 translation-mode fields, 82ce4c32
+event-wait counts, blit volumes 340e03ae): terminal completion reports per-shader work
+summaries for command buffers with GPU execution >= REMU_SLOW_CB_MS (default 250ms; armed
+announce at startup). First catches: mesh-stage pairs with 308-516KB export MSL where a SINGLE
+72x41-target draw of 78-744 indices costs 158-289ms GPU, recurring across frames (NGG-MESH
+logs show groups=1x1 — dispatch size is not the cost). Caveats under investigation: GPU
+duration spans encodeWaitForEvent stalls (encoded_event_waits now printed) and all blit
+encoders (upload/writeback volumes now printed). If the cost is real work, ~250ms × N tiny UI
+draws per frame IS the crawl.
+
+**GameThreadWaitForTask identity confirmed** by disassembly (SELF entry table → inner ELF at
+0x1a0 → phdr walk; line constant 0x4b9=1209 feeds the fatal; the wait PC 0x801be228e is the
+Event->Wait(~33ms cvar quantum) loop). Fatal at t=184 in 231521Z = 120s after draws stopped.
+
+**Instrument hygiene:** stall-report idle flood fixed (9de4b9db): Render/RHI/Agc/GameThread
+report every tick, other threads back off to power-of-two ticks. Runtime suite baseline
+corrected: 665/12 deterministic at adaba20e AND at HEAD (worktree-verified; "668/9" was
+stale); gpu-metal 504/0 single-threaded (the parallel-run failures are the known
+order-dependence).
