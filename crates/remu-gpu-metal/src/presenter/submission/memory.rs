@@ -485,6 +485,10 @@ impl MetalPresenter {
             return Err("immediate DMA fill unexpectedly retained a source snapshot".to_owned());
         }
         record_diagnostic_memory_copy(&copy);
+        trace_diagnostic_guest_write("dma-copy", copy.destination_address, copy.byte_count);
+        if copy.source_selection != 2 {
+            trace_diagnostic_guest_write("dma-copy-source", copy.source_address, copy.byte_count);
+        }
 
         if copy.source_selection == 2 {
             if !copy.destination_address.is_multiple_of(4) || !copy.byte_count.is_multiple_of(4) {
