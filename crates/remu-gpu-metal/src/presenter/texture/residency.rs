@@ -1439,7 +1439,8 @@ impl MetalPresenter {
                 static LOGGED: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if sequence <= 16 || sequence.is_power_of_two() {
+                let unthrottled = !matches!(refresh, WriteWatchRefresh::Active);
+                if unthrottled || sequence <= 16 || sequence.is_power_of_two() {
                     eprintln!(
                         "[REMu][METAL][ENSURE-REFRESH] sequence={sequence} address={:#x} refresh={refresh:?} upload_guest_contents={upload_guest_contents} version={}",
                         resident.descriptor.address, resident.content_version,
