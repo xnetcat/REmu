@@ -6,6 +6,7 @@
 
 #![allow(dead_code)] // with_/reset helpers exercised in tests; production still uses lock_* directly.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::dispatch_locks::{LockHierarchyGuard, LockLevel, held_lock_level};
@@ -103,12 +104,46 @@ pub(crate) fn queue_kernel_event(event: KernelQueuedEvent) {
     queue_kernel_event_into(&mut events, event);
 }
 
+/// Kernel events pushed as new entries, and those merged into an already-pending entry.
+///
+/// Coalescing is correct by BSD `kevent` semantics — `fflags` accumulates — but it means N backend
+/// completions can surface to the guest as one returned event. A high coalesce count beside a
+/// starving waiter is evidence the guest counts returned events rather than reading `fflags`.
+static EQUEUE_EVENTS_INSERTED: AtomicU64 = AtomicU64::new(0);
+static EQUEUE_EVENTS_COALESCED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn equeue_insertion_counts() -> (u64, u64) {
+    (
+        EQUEUE_EVENTS_INSERTED.load(Ordering::Relaxed),
+        EQUEUE_EVENTS_COALESCED.load(Ordering::Relaxed),
+    )
+}
+
+/// Pending-event total, per-equeue count for `equeue`, and outstanding AGC arms.
+///
+/// `None` when the lock is busy. A bare `try_read` for the same reason as
+/// [`try_carried_agc_completion_depth`]: the reporter must never block on the state it describes.
+pub(crate) fn try_equeue_snapshot(equeue: u64) -> Option<(usize, usize, usize)> {
+    cell().try_read().ok().map(|events| {
+        (
+            events.pending_events.len(),
+            events
+                .pending_events
+                .iter()
+                .filter(|event| event.equeue == equeue)
+                .count(),
+            events.pending_agc_completions.len() + events.pending_agc_user_interrupts.len(),
+        )
+    })
+}
+
 pub(crate) fn queue_kernel_event_into(events: &mut EventState, mut event: KernelQueuedEvent) {
     if let Some(pending) = events.pending_events.iter_mut().find(|pending| {
         pending.equeue == event.equeue
             && pending.ident == event.ident
             && pending.filter == event.filter
     }) {
+        EQUEUE_EVENTS_COALESCED.fetch_add(1, Ordering::Relaxed);
         event.fflags = pending.fflags.saturating_add(1).max(event.fflags);
         event.agc_graphics_completions = pending
             .agc_graphics_completions
@@ -118,6 +153,7 @@ pub(crate) fn queue_kernel_event_into(events: &mut EventState, mut event: Kernel
             .saturating_add(event.agc_user_interrupts);
         *pending = event;
     } else {
+        EQUEUE_EVENTS_INSERTED.fetch_add(1, Ordering::Relaxed);
         events.pending_events.push_back(event);
     }
 }

@@ -1474,6 +1474,85 @@ static AGC_UNMATCHED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
 static AGC_RECLAIMED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
 static AGC_EVICTED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
 
+// Completion-delivery leg counters. `unmatched=0 carried=0` during a live starve says every id that
+// was drained found its arm, but says nothing about whether anything was drained at all — a backend
+// that never published looks identical. These separate the legs:
+//
+//   backend_newest flat while arms > 0   -> the completion was never published (upstream)
+//   drained advancing, inserted flat     -> claimed but never became an event (ident match at insert)
+//   inserted advancing, waiter blocked   -> delivered but the wait does not return (predicate/wake)
+static AGC_DRAINED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
+static AGC_CLAIMED_BACKEND_IDS: AtomicU64 = AtomicU64::new(0);
+static EQUEUE_WAKEUPS_SIGNALLED: AtomicU64 = AtomicU64::new(0);
+static EQUEUE_WAITS_ENTERED: AtomicU64 = AtomicU64::new(0);
+static EQUEUE_WAITS_RETURNED: AtomicU64 = AtomicU64::new(0);
+
+/// Guest threads currently inside a blocking `sceKernelWaitEqueue`, by thread handle.
+///
+/// Read with `try_lock` by the reporter, so a blocked waiter can be named together with the depth of
+/// the equeue it is waiting on — the "events present but the wait is not returning" fork.
+static EQUEUE_BLOCKED_WAITERS: Mutex<BTreeMap<u64, (u64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// Registers a blocking equeue wait for the reporter, and deregisters it on every exit path.
+struct EqueueWaitRegistration {
+    thread: u64,
+}
+
+impl EqueueWaitRegistration {
+    fn enter(thread: u64, equeue: u64) -> Self {
+        EQUEUE_WAITS_ENTERED.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut waiters) = EQUEUE_BLOCKED_WAITERS.lock() {
+            waiters.insert(thread, (equeue, guest_import_trace_nanos()));
+        }
+        Self { thread }
+    }
+}
+
+impl Drop for EqueueWaitRegistration {
+    fn drop(&mut self) {
+        EQUEUE_WAITS_RETURNED.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut waiters) = EQUEUE_BLOCKED_WAITERS.lock() {
+            waiters.remove(&self.thread);
+        }
+    }
+}
+
+/// Prints the state of every completion-delivery leg, plus any waiter blocked past the threshold.
+fn report_equeue_delivery(stale_after_nanos: u64) {
+    let (inserted, coalesced) = event_state::equeue_insertion_counts();
+    let drained = AGC_DRAINED_BACKEND_IDS.load(Ordering::Relaxed);
+    let claimed = AGC_CLAIMED_BACKEND_IDS.load(Ordering::Relaxed);
+    let blocked = EQUEUE_BLOCKED_WAITERS
+        .try_lock()
+        .map(|waiters| waiters.clone())
+        .unwrap_or_default();
+    eprintln!(
+        "[REMu][EQUEUE] backend_newest={} drained={drained} claimed={claimed} inserted={inserted} coalesced={coalesced} waits={}/{} wakes={} blocked={}",
+        remu_gpu::gpu_completed_submission_sequence(),
+        EQUEUE_WAITS_ENTERED.load(Ordering::Relaxed),
+        EQUEUE_WAITS_RETURNED.load(Ordering::Relaxed),
+        EQUEUE_WAKEUPS_SIGNALLED.load(Ordering::Relaxed),
+        blocked.len(),
+    );
+    let now = guest_import_trace_nanos();
+    for (thread, (equeue, since)) in blocked {
+        let blocked_nanos = now.saturating_sub(since);
+        if blocked_nanos < stale_after_nanos {
+            continue;
+        }
+        // The fork: events already queued for this equeue means delivery reached it and the wait is
+        // not returning; zero means nothing ever arrived for it.
+        let depths = event_state::try_equeue_snapshot(equeue);
+        eprintln!(
+            "[REMu][EQUEUE][BLOCKED] thread={thread:#x} equeue={equeue:#x} blocked_ms={} events_for_equeue={} events_total={} arms={}",
+            blocked_nanos / 1_000_000,
+            depths.map_or_else(|| "unknown".to_owned(), |(_, mine, _)| mine.to_string()),
+            depths.map_or_else(|| "unknown".to_owned(), |(total, _, _)| total.to_string()),
+            depths.map_or_else(|| "unknown".to_owned(), |(_, _, arms)| arms.to_string()),
+        );
+    }
+}
+
 const KERNEL_EVENT_FILTER_GRAPHICS: i16 = -14;
 const KERNEL_EVENT_FILTER_USER: i16 = -11;
 /// Gen5 AP/AMPR command-buffer completion. The Gen4 filter set ends at the high-resolution timer,
@@ -2852,6 +2931,7 @@ fn start_guest_import_trace_reporter() {
                         AGC_RECLAIMED_BACKEND_IDS.load(Ordering::Relaxed),
                         AGC_EVICTED_BACKEND_IDS.load(Ordering::Relaxed),
                     );
+                    report_equeue_delivery(stale_after_nanos);
                     let carried = event_state::try_carried_agc_completion_depth();
                     if agc_counters != reported_agc_counters || carried.is_some_and(|d| d > 0) {
                         reported_agc_counters = agc_counters;
@@ -5919,6 +5999,7 @@ pub(crate) fn agc_completions_are_carried() -> bool {
 }
 
 pub(crate) fn notify_kernel_equeue_waiters() {
+    EQUEUE_WAKEUPS_SIGNALLED.fetch_add(1, Ordering::Relaxed);
     let wake = kernel_equeue_wake();
     let mut generation = wake
         .0
@@ -5985,6 +6066,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(false, Ordering::Release);
         return;
     }
+    AGC_DRAINED_BACKEND_IDS.fetch_add(drained.len() as u64, Ordering::Relaxed);
     // Reconsider carried completions alongside the freshly drained ones: an arm that lost the race
     // to its own completion, or a registration the guest had not made yet, becomes deliverable on a
     // later pass rather than being lost.
@@ -6011,6 +6093,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
             true
         }
     });
+    AGC_CLAIMED_BACKEND_IDS.fetch_add(claimed.len() as u64, Ordering::Relaxed);
     for &sequence in completed.difference(&claimed) {
         // Counted once, when the sequence is first deferred. Carried sequences are reconsidered
         // every refresh, so counting them each pass would report a single deferral as thousands.
@@ -6311,6 +6394,8 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
     let deadline = timeout_microseconds
         .and_then(|microseconds| Instant::now().checked_add(Duration::from_micros(microseconds)));
     let guest_thread = current_guest_thread_handle();
+    // Deregisters on every exit path, including the error returns below.
+    let _registration = EqueueWaitRegistration::enter(guest_thread, arguments[0]);
     let mut stall_reported = false;
     if wait_sequence <= 64 || wait_sequence.is_power_of_two() {
         let thread_name = current_guest_thread_name();
