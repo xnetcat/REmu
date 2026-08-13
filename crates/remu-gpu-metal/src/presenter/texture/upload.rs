@@ -827,6 +827,34 @@ pub(crate) fn upload_image_textures(
                             descriptor.layer_count,
                         );
                     }
+                } else if let Some(resident) = resident_guest_textures.values().find(|resident| {
+                    resident.descriptor.width == descriptor.guest.width
+                        && resident.descriptor.height == descriptor.guest.height
+                        && resident.descriptor.pixel_format == descriptor.guest.pixel_format
+                        && resident.descriptor.address.abs_diff(descriptor.guest.address)
+                            <= 0x40000
+                }) {
+                    // No resident at the sampled base, but one of identical shape sits a few
+                    // 64 KiB pages away: the render-target/SRD base-offset aliasing signature.
+                    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                    let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
+                    if sequence <= 32 || sequence.is_power_of_two() {
+                        eprintln!(
+                            "[REMu][METAL][SAMPLED-NEAR] sequence={sequence} sampled={:#x} resident={:#x} delta={:#x} {:?}/{}x{}/tile{}v{} live={} serves_reads={} gpu_written={} version={}",
+                            descriptor.guest.address,
+                            resident.descriptor.address,
+                            descriptor.guest.address.abs_diff(resident.descriptor.address),
+                            descriptor.guest.pixel_format,
+                            descriptor.guest.width,
+                            descriptor.guest.height,
+                            descriptor.guest.tile_mode,
+                            resident.descriptor.tile_mode,
+                            resident.is_live(),
+                            resident.serves_reads(),
+                            resident.gpu_written(),
+                            resident.content_version,
+                        );
+                    }
                 }
             }
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {
