@@ -159,6 +159,9 @@ struct Evaluator<'a, M> {
     memory: &'a M,
     state: &'a ShaderState,
     options: EvaluationOptions,
+    /// Registers some unevaluated VALU instruction writes (readlane family, carry-outs);
+    /// a consumer reading one as an SMEM offset or descriptor source holds a stale seed.
+    valu_scalar_destinations: [bool; SCALAR_REGISTER_COUNT],
     initial_registers: [u32; SCALAR_REGISTER_COUNT],
     final_registers: [u32; SCALAR_REGISTER_COUNT],
     pending_paths: Vec<ScalarPath>,
@@ -258,10 +261,36 @@ fn evaluate_shader_within(
     write_scalar_pair(&mut registers, 106, 0, &mut exec_mask);
     write_scalar_pair(&mut registers, 126, exec_mask, &mut exec_mask);
 
+    // Resource discovery never simulates vector ALU, yet VALU forms with scalar destinations
+    // (V_READFIRSTLANE/V_READLANE, VOP3b carry-outs) are how compilers materialize non-uniform
+    // descriptor indices. An SMEM offset or descriptor register fed by one holds a stale seed
+    // here, so mark those registers and let the consumers report the dependency loudly instead
+    // of silently fetching from the wrong slot.
+    let mut valu_scalar_destinations = [false; SCALAR_REGISTER_COUNT];
+    for instruction in &state.program.instructions {
+        if !matches!(
+            instruction.encoding,
+            ShaderEncoding::Vop1
+                | ShaderEncoding::Vop2
+                | ShaderEncoding::Vop3
+                | ShaderEncoding::Vopc
+        ) {
+            continue;
+        }
+        for destination in &instruction.destinations {
+            if destination.kind == OperandKind::ScalarRegister
+                && (destination.value as usize) < SCALAR_REGISTER_COUNT
+            {
+                valu_scalar_destinations[destination.value as usize] = true;
+            }
+        }
+    }
+
     let mut evaluator = Evaluator {
         memory,
         state,
         options,
+        valu_scalar_destinations,
         initial_registers: registers,
         final_registers: registers,
         pending_paths: Vec::with_capacity(4),

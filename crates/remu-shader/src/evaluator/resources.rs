@@ -380,6 +380,24 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
             || read_scalar_pair(registers, scalar_base).unwrap_or_default(),
             |descriptor| descriptor.base_address,
         );
+        if let Some(register) = control.dynamic_offset_register
+            && self
+                .valu_scalar_destinations
+                .get(register as usize)
+                .copied()
+                .unwrap_or(false)
+        {
+            static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if sequence <= 32 || sequence.is_power_of_two() {
+                eprintln!(
+                    "[REMu][EVAL][STALE-VALU-OFFSET] sequence={sequence} pc={:#x} opcode={} soffset=s{register} value={:#x} — offset register is VALU-written and unevaluated",
+                    instruction.pc,
+                    instruction.opcode,
+                    registers.get(register as usize).copied().unwrap_or_default(),
+                );
+            }
+        }
         let dynamic_offset = control
             .dynamic_offset_register
             .and_then(|register| registers.get(register as usize))
@@ -734,6 +752,21 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 .any(|binding| binding.pc == instruction.pc)
         {
             return Ok(());
+        }
+        if (0..IMAGE_DESCRIPTOR_DWORDS).any(|index| {
+            self.valu_scalar_destinations
+                .get(control.scalar_resource as usize + index)
+                .copied()
+                .unwrap_or(false)
+        }) {
+            static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let sequence = LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if sequence <= 32 || sequence.is_power_of_two() {
+                eprintln!(
+                    "[REMu][EVAL][STALE-VALU-DESCRIPTOR] sequence={sequence} pc={:#x} opcode={} srsrc=s{} — descriptor register range is VALU-written and unevaluated",
+                    instruction.pc, instruction.opcode, control.scalar_resource,
+                );
+            }
         }
         let resource_descriptor =
             copy_registers::<8>(registers, control.scalar_resource, IMAGE_DESCRIPTOR_DWORDS)
