@@ -150,6 +150,7 @@ impl MetalPresenter {
             batch
                 .command_buffer
                 .encode_wait_for_event(&producer_event, fence.value());
+            batch.encoded_event_waits = batch.encoded_event_waits.saturating_add(1);
             consumer
                 .host_dependencies
                 .entry(fence.producer())

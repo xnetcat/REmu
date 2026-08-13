@@ -1718,6 +1718,7 @@ fn new_guest_command_batch(
         resident_write_footprint_complete: true,
         render_pass: None,
         compute_encoder: None,
+        encoded_event_waits: 0,
         max_encoded_signal: None,
         signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
@@ -2188,11 +2189,12 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
         .map(|range| range.byte_count)
         .sum();
     eprintln!(
-        "[REMu][SLOW-CB] gpu_ms={:.0} queue={:?} draws={draw_count} computes={compute_count} \
-         uploads={}/{}KiB guest_writes={}/{}KiB global_writebacks={} memory_writes={} \
-         top_ps=[{pixels}] top_cs=[{computes}]",
+        "[REMu][SLOW-CB] gpu_ms={:.0} queue={:?} event_waits={} draws={draw_count} \
+         computes={compute_count} uploads={}/{}KiB guest_writes={}/{}KiB global_writebacks={} \
+         memory_writes={} top_ps=[{pixels}] top_cs=[{computes}]",
         gpu_execution.as_secs_f64() * 1000.0,
         batch.queue_id,
+        batch.encoded_event_waits,
         batch.global_upload_chunks.len(),
         upload_bytes / 1024,
         batch.guest_write_ranges.len(),

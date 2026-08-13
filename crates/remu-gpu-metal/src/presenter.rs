@@ -1976,6 +1976,10 @@ struct GuestCommandBatch {
     resident_write_footprint_complete: bool,
     render_pass: Option<OpenGuestRenderPass>,
     compute_encoder: Option<ComputeCommandEncoder>,
+    /// Cross-queue producer waits encoded on this command buffer. GPUStartTime→GPUEndTime spans
+    /// them, so a batch's measured GPU duration is only attributable to its own work when this
+    /// is zero.
+    encoded_event_waits: u32,
     /// Highest SharedEvent signal encoded at an exact command-stream point in this batch.
     max_encoded_signal: Option<SharedEventFence>,
     signal_checkpoints: Vec<SharedEventSignalCheckpoint>,
