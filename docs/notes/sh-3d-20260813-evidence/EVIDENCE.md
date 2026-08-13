@@ -105,3 +105,21 @@ on that permutation's other utility inputs.
 
 Discriminator queued: dump the 0x801e8f0000 writer at write time (nonzero at write =>
 residency loss confirmed; zero at write => fault moves up the writer's chain).
+
+## Residency loss confirmed (run 20260813T082409Z, REMU_DUMP_SHADOW_CONSUMER=1)
+
+The attenuation writer (draw 24427, ps=0x8007c5, 1296-index grid, BGRA8 1080p target
+0x8026bb0000) produces a fully-populated image at write time: every pixel nonzero
+(magnitude_nz=2,073,600), first pixel [ff,ff,ff,ff], range 0..1, fingerprint
+def1793351704b43. Combined with the light-pass record (its sample of the same-class buffer:
+resident=None → zero guest RAM), the zero-lighting mechanism is closed: the GPU-written
+attenuation resident is retired between writer and consumer and the sampled upload serves
+unpublished guest RAM. Fix territory: sampled-cache upload must not serve zero RAM for
+addresses whose bytes are GPU-owned (PERF-TEXTURE-OWNED spans) — retain, rebind
+(BGRA<->RGBA view), or rematerialize instead. The existing rematerialise path reports 0
+attempts at these samples. This is the B15 residency/alias-lifetime class; no wave64 work
+is needed for lighting.
+
+Toward the reference NEW GAME screen: menu/UI pixel-clean (bloom off), geometry coherent,
+lighting = this one residency fix, stripes = wave64 FFT (re-enable bloom after
+lane-doubling).
