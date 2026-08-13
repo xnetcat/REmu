@@ -62,3 +62,19 @@ single-wave (64-thread) groups.
 Lane-doubling (split-audit §3b) remains the strategy; this census fixes the
 validation targets: shadow-mask kernels first (small, mask64-heavy, feeds lighting),
 then the FFT family.
+
+## Live attribution: the stripes ARE the FFT bloom (2026-08-13, run 20260813T074744Z)
+
+`title-menu-clean-nobloom.png`: the presented NEW GAME screen with a UE config overlay
+(`REMU_OVERLAY_DIR` ps5engine.ini `[SystemSettings]`) setting `r.BloomQuality=0`
+(+`r.PostProcessAAQuality=0`, motion blur/lens flare/fringe off). The FFT family
+(`0x80095b` et al.) never dispatches (zero log references), and the title screen presents
+with the logo, menu, prompts and copyright pixel-clean — zero green/magenta striping.
+Contrast the user's live capture of the same screen without the overlay (full-frame
+striping over everything but the logo). This closes the striping attribution: the split
+wave64 FFT bloom convolution is the sole stripe source in the presented title frame.
+
+The background is black rather than the reference's foggy rooftop: deferred lighting
+still outputs zero (see the stage table above). The overlay is a validation instrument
+and an interim visual improvement, not a fix — the renderer fix remains the lane-doubled
+wave64 lowering, after which bloom/TAA get re-enabled.
