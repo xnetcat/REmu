@@ -517,6 +517,31 @@ impl MetalPresenter {
         pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
         pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
         pixel_options.runtime_heap_tables = runtime_heap_tables_enabled();
+        // The evaluator flags index-driven runtime descriptors; snapshots that fail to decode
+        // for TEMPORAL reasons (transient per-draw arenas holding other record types at
+        // evaluation time) carry no evaluator-visible taint. The presenter sees the failure
+        // directly, so it routes those bindings to the heap tables here, at compile time.
+        let mut pixel_evaluation_with_tables;
+        let pixel_evaluation = if pixel_options.runtime_heap_tables
+            && pixel_evaluation.image_bindings.iter().any(|binding| {
+                !binding.descriptor_index_is_runtime
+                    && !binding.resource_descriptor.iter().all(|word| *word == 0)
+                    && super::decode::decode_image_descriptor(&binding.resource_descriptor)
+                        .is_err()
+            }) {
+            pixel_evaluation_with_tables = pixel_evaluation.clone();
+            for binding in &mut pixel_evaluation_with_tables.image_bindings {
+                if !binding.resource_descriptor.iter().all(|word| *word == 0)
+                    && super::decode::decode_image_descriptor(&binding.resource_descriptor)
+                        .is_err()
+                {
+                    binding.descriptor_index_is_runtime = true;
+                }
+            }
+            &pixel_evaluation_with_tables
+        } else {
+            pixel_evaluation
+        };
         let pixel_msl =
             remu_shader_metal::compile_msl(pixel_program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
