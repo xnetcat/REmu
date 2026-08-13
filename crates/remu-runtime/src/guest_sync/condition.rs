@@ -241,6 +241,11 @@ where
         .state
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // `notifies` is cumulative over the condition object's whole life and is never reset, so on a
+    // hot condition it says nothing about the wait in front of you: 7688-and-stalled is equally
+    // consistent with "signalled constantly, our wake was lost" and "not signalled once since we
+    // parked". The delta against this snapshot is the number that separates them.
+    let notifies_at_wait = cond.notifies;
     let (timed_out, interrupted) = if let Some(timeout) = timeout_usec {
         let duration = Duration::from_micros(timeout);
         let mut expired = false;
@@ -271,10 +276,11 @@ where
                 if !reported {
                     reported = true;
                     eprintln!(
-                        "[REMu][STALL] timed condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} timeout_usec={timeout} notifies={}",
+                        "[REMu][STALL] timed condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} timeout_usec={timeout} notifies={} since_wait={}",
                         report_after.as_secs(),
                         current_guest_thread_name(),
                         cond.notifies,
+                        cond.notifies.saturating_sub(notifies_at_wait),
                     );
                 }
                 if stall_break_enabled() {
@@ -333,9 +339,10 @@ where
                 reported = true;
                 let notifies = cond.notifies;
                 eprintln!(
-                    "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies}",
+                    "[REMu][STALL] condition wait exceeded {}s thread={:?} handle={guest_thread:#x} ticket={waiter} condition={condition:#x} mutex={mutex_address:#x} notifies={notifies} since_wait={}",
                     report_after.as_secs(),
-                    current_guest_thread_name()
+                    current_guest_thread_name(),
+                    notifies.saturating_sub(notifies_at_wait),
                 );
                 if !STALL_SNAPSHOT_EMITTED.swap(true, Ordering::Relaxed) {
                     drop(cond);
