@@ -162,3 +162,18 @@ lifecycles interleave at the same sizes; point probes keep landing on the wrong 
 This is the strongest confirmation yet that content authority needs B15's per-range version
 ledger rather than further predicate patches. All probes in tree are gated and cheap; they
 are B15's live acceptance instrumentation.
+
+## Residency fixes take hold (runs 20260813T1009..1027, commits cc4ccdb1..a1f62f37)
+
+After the reclaim + resolve-stage-oracle changes: SAMPLED-MISS residents now show
+live=true serves_reads=true gpu_written=true (the executed content SURVIVES — previously
+stripped to nothing every frame), the residual miss classes changed composition (first
+enumerated: BC3 block-view pairs, sampled=BC3_RGBA/7800x7800/tile9 vs
+resident=RGBA32Uint/1950x1950/tile9 — the compressed-storage-view compatibility gap,
+audit finding #10 territory), and the direct-light dump moved for the first time:
+pixel_outputs covered=746496 nonzero=513280 (alpha writes land; previously zero), RGB
+radiance still 0.0 — one remaining zeroed input upstream (enumerate via the now-healthy
+SAMPLED-MISS pairings and the same 800a69 dump).
+
+Note: guest crashes (the UE-watchdog family) now occur most runs between 46-350s and are
+the main iteration obstacle; the title menu presents continuously when runs survive.
