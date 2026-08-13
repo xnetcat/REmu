@@ -1483,27 +1483,23 @@ impl ResidentGuestTexture {
     /// that follows, which is the one window in which a `Live` resident owns nothing.
     fn reclaim_for_bind(&mut self, discard_guest_contents: bool) -> bool {
         // Consumer-aware ACQUIRE demotion: invalidate at first consumer bind, not at acquire.
+        // An ACQUIRE over a GPU-executed, never-published target cannot make guest RAM
+        // authoritative by itself — the hardware has no GPU→guest flush, so RAM holds current
+        // bytes only if the CPU actually wrote them. Verify with the watch fingerprint: a real
+        // CPU rewrite still demotes; over-broad ACQUIRE ranges no longer destroy the only copy
+        // of executed screen content (SH title light attenuation → black deferred lighting).
         if self.acquire_invalidated && !discard_guest_contents {
-            if self.gpu_content_executed
-                && self.descriptor.width >= 1_280
-                && self.descriptor.height >= 720
-            {
-                static LOGGED: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let sequence = LOGGED.fetch_add(1, Ordering::Relaxed) + 1;
-                if sequence <= 16 || sequence.is_power_of_two() {
-                    eprintln!(
-                        "[REMu][METAL][RECLAIM-BLOCKED] gate=acquire-invalidated sequence={sequence} address={:#x} {}x{} {:?} version={}",
-                        self.descriptor.address,
-                        self.descriptor.width,
-                        self.descriptor.height,
-                        self.descriptor.pixel_format,
-                        self.content_version,
-                    );
-                }
+            let cpu_rewrote = !self.gpu_content_executed
+                || self.write_watch.content_has_changed().unwrap_or(true);
+            if cpu_rewrote {
+                self.demote(StaleSource::GuestMemory);
+                return false;
             }
-            self.demote(StaleSource::GuestMemory);
-            return false;
+            self.acquire_invalidated = false;
+            self.note_gpu_write();
+            self.state = ResidencyState::Live;
+            OWNED_RECLAIM_EXECUTED.fetch_add(1, Ordering::Relaxed);
+            return true;
         }
         if discard_guest_contents {
             self.acquire_invalidated = false;
