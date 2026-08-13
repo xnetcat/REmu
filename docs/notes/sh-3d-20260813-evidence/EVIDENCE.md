@@ -213,3 +213,20 @@ promotion widening; discrimination needs either the intermittent guest-crash fix
 UE-watchdog family — now the top iteration gate) or continuous interactive observation
 rather than 8-10s capture sampling. All lighting-chain commits remain conservative
 (verification-gated) and suite-green.
+
+## 2026-08-13 (later): black-background root cause — CLOSED
+
+Chain walked with post-draw images: composite pass wrote black into the pre-scanout LDR buffer
+while upstream scene targets were 30-35% lit. Instrumented broadly (async debug log
+`REMU_DEBUG_LOG=1`; journal range dump at exit). Eliminated: eye adaptation, 64KB base offset
+(SAMPLED-NEAR probe, 0 hits), DMA/global-writeback/memcpy writers (journal, 0 entries).
+
+Root cause per `[SAMPLED-MISS]`: layer rendered **BGRA8**, sampled **RGBA8**, resident
+`gpu_written=false executed=true serves_reads=true` — the compatible-arm *selection group*
+lacked the executed-content colour-view clause (it existed only in the serve-family gate), so
+the sampler used guest RAM (black, never written back). Fix in upload.rs selection group.
+
+Verification: SAMPLED-MISS 40+→0; content-warning screen now presents its full 3D corridor
+background (previously text-over-black). New blockers: crash family kills runs pre-menu
+(SIGSEGV null pc=0x802816015 @40s; SIGBUS texture read 0x805b2a0000 @70s, no journal writer —
+watch materialization suspect); font-atlas glyphs partially missing.
