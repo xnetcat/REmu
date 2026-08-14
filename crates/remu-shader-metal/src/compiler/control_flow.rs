@@ -189,15 +189,19 @@ pub(crate) fn analyze_control_flow(
     // class for those shapes. Anything the structurer demotes to Dispatcher falls through to the
     // legacy Forward/Dispatcher arms below — loud in the sense that we never emit structured MSL
     // from an unproven tree (silently-wrong pixels risk).
-    let cfg = build_control_flow_graph(program);
-    let structured = cfg.structure();
-    if structured_cfg_is_fully_reducible(&structured)
-        && structured_cfg_needs_structured_emission(&structured)
-    {
-        return Ok(ControlFlowLowering::Structured {
-            tree: structured,
-            blocks: cfg.blocks().to_vec(),
-        });
+    let legacy_control_flow =
+        std::env::var_os("REMU_LEGACY_CONTROL_FLOW").is_some_and(|value| value == "1");
+    if !legacy_control_flow {
+        let cfg = build_control_flow_graph(program);
+        let structured = cfg.structure();
+        if structured_cfg_is_fully_reducible(&structured)
+            && structured_cfg_needs_structured_emission(&structured)
+        {
+            return Ok(ControlFlowLowering::Structured {
+                tree: structured,
+                blocks: cfg.blocks().to_vec(),
+            });
+        }
     }
 
     let forward_only = program
