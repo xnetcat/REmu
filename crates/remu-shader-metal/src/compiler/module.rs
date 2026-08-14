@@ -1097,7 +1097,6 @@ impl Compiler<'_> {
                     }
                     source.push_str(
                         "    if (remu_thread_index < remu_mesh_input_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                         \x20   threadgroup_barrier(mem_flags::mem_device);\n\
                          \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(remu_mesh_input_primitive_count);\n",
                     );
                     source.push_str("}\n");
