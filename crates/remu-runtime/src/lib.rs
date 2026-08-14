@@ -74,7 +74,7 @@ use std::ffi::CString;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, Once, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -512,7 +512,6 @@ struct ProbeDispatchState {
     np_game_intent: np::GameIntentState,
     np_trophy: np::TrophyState,
     agc_submission_count: u64,
-    agc_completion_telemetry: AgcCompletionTelemetry,
     save_root: PathBuf,
     /// Guest mount table for `/app0`, `/download0`, `/temp0`, and (later) save slots (G2).
     vfs: vfs::VfsState,
@@ -1089,12 +1088,6 @@ struct VideoOutState {
     height: u32,
     display_buffers: Vec<u64>,
     display_buffer_attributes: Vec<Option<VideoOutBufferAttributes>>,
-    flip_events: BTreeMap<u64, u64>,
-    /// Equeues registered with `sceVideoOutAddVblankEvent`, keyed by queue handle.
-    vblank_events: BTreeMap<u64, u64>,
-    completed_flip_count: u64,
-    /// Most recently completed flip, which `sceVideoOutGetFlipStatus` reports until the next one.
-    last_completed_flip: Option<CompletedVideoOutFlip>,
 }
 
 /// Completion record `sceVideoOutGetFlipStatus` reads back to a title pacing its frames.
@@ -1490,6 +1483,7 @@ static EQUEUE_WAITS_RETURNED: AtomicU64 = AtomicU64::new(0);
 /// A guest thread currently inside a blocking `sceKernelWaitEqueue`.
 struct BlockedEqueueWaiter {
     equeue: u64,
+    wake: Arc<event_state::EqueueWake>,
     since_nanos: u64,
     /// Carried because it is the whole diagnosis: an idle "IoService" or "FAPREventQueueListener"
     /// parked for a minute is normal, while "AgcInterruptThread" or "RHIThread" parked for seconds
@@ -1510,18 +1504,20 @@ struct EqueueWaitRegistration {
 }
 
 impl EqueueWaitRegistration {
-    fn enter(thread: u64, equeue: u64) -> Self {
+    fn enter(thread: u64, equeue: u64, wake: Arc<event_state::EqueueWake>) -> Self {
         EQUEUE_WAITS_ENTERED.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut waiters) = EQUEUE_BLOCKED_WAITERS.lock() {
-            waiters.insert(
+        EQUEUE_BLOCKED_WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
                 thread,
                 BlockedEqueueWaiter {
                     equeue,
+                    wake,
                     since_nanos: guest_import_trace_nanos(),
                     thread_name: current_guest_thread_name(),
                 },
             );
-        }
         Self { thread }
     }
 }
@@ -1529,9 +1525,10 @@ impl EqueueWaitRegistration {
 impl Drop for EqueueWaitRegistration {
     fn drop(&mut self) {
         EQUEUE_WAITS_RETURNED.fetch_add(1, Ordering::Relaxed);
-        if let Ok(mut waiters) = EQUEUE_BLOCKED_WAITERS.lock() {
-            waiters.remove(&self.thread);
-        }
+        EQUEUE_BLOCKED_WAITERS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.thread);
     }
 }
 
@@ -1778,7 +1775,8 @@ static AMPR_COMMAND_ORDER: OnceLock<Vec<Mutex<()>>> = OnceLock::new();
 /// Reusable host storage for APR reads. The pool lock is held only while borrowing or returning a
 /// vector, never during host I/O or watched guest-memory copies.
 static AMPR_READ_STAGING_POOL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-static KERNEL_EQUEUE_WAKE: OnceLock<(Mutex<u64>, Condvar)> = OnceLock::new();
+static KERNEL_COMPLETION_PUMP: OnceLock<SyncSender<()>> = OnceLock::new();
+static KERNEL_COMPLETION_PUMP_FAILED: AtomicBool = AtomicBool::new(false);
 static AUDIO_OUT: OnceLock<Mutex<audio::AudioOutState>> = OnceLock::new();
 static AUDIO_OUT2: OnceLock<Mutex<AudioOut2State>> = OnceLock::new();
 #[cfg(not(target_os = "macos"))]
@@ -2425,7 +2423,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     // side means the GPU seam carries a validated, immutable RGBA image instead of a host path
     // whose lifetime or casing the presenter would have to rediscover.
     let system_splash = load_system_splash(game_root);
-    remu_gpu::install_gpu_completion_notifier(notify_kernel_equeue_waiters);
+    initialize_kernel_completion_pump();
+    remu_gpu::install_gpu_completion_notifier(request_kernel_completion_refresh);
     let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
     let mut state = lock_probe_dispatch_for_write(state);
     let nids = image
@@ -2566,7 +2565,6 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.agc_submission_count = 0;
     agc_dispatch_state::reset_agc_state();
     event_state::reset_event_state();
-    state.agc_completion_telemetry = AgcCompletionTelemetry::default();
     *KERNEL_FILES
         .get_or_init(|| Mutex::new(KernelFileState::default()))
         .lock()
@@ -4012,13 +4010,13 @@ extern "C" fn import_dispatch(frame: *const ImportCallFrame) -> ProbeImportRetur
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     });
-    let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-    let mut state = lock_probe_dispatch_for_write(state);
     // Flip completions are produced asynchronously by Metal. Refresh them at every stateful import
     // boundary instead of only when the guest happens to poll an equeue; VideoOut pending queries
     // and AVPlayer's completed-vblank clock otherwise observe arbitrarily stale state and can hold
     // or skip visible frames. AGC submission completion remains equeue-owned.
-    refresh_completed_video_out_flips(&mut state);
+    refresh_completed_video_out_flips();
+    let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
+    let mut state = lock_probe_dispatch_for_write(state);
     if nid == "H2e8t5ScQGc" {
         let callbacks = take_exit_callbacks(&mut state, Some(call_args[0]));
         drop(state);
@@ -4455,7 +4453,7 @@ fn report_kernel_event_registrations() {
             "[REMu][STALL] registration equeue={equeue:#x} filter={filter} ident={ident:#x} user_data={user_data:#x}"
         );
     }
-    for equeue in &events.kernel_equeues {
+    for equeue in events.kernel_equeues.keys() {
         eprintln!("[REMu][STALL] equeue={equeue:#x} exists");
     }
 }
@@ -5991,17 +5989,19 @@ fn dispatch_extended_import(
 }
 
 /// Destroys an event queue and discards the registrations and undelivered events it owned.
-fn kernel_delete_equeue(handle: u64, state: &mut ProbeDispatchState) -> u64 {
+fn kernel_delete_equeue(handle: u64, _state: &mut ProbeDispatchState) -> u64 {
     let (_h, mut events) = event_state::lock_event_state_for_write();
-    if !events.kernel_equeues.remove(&handle) {
+    let Some(wake) = events.kernel_equeues.remove(&handle) else {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
-    }
+    };
     events
         .kernel_event_registrations
         .retain(|&(equeue, _, _), _| equeue != handle);
-    discard_kernel_events_into(&mut events, state, |event| event.equeue == handle);
+    events.video_out_flip_events.remove(&handle);
+    events.video_out_vblank_events.remove(&handle);
+    discard_kernel_events_into(&mut events, |event| event.equeue == handle);
     drop(events);
-    notify_kernel_equeue_waiters();
+    signal_kernel_equeue_wake(&wake);
     0
 }
 
@@ -6034,7 +6034,9 @@ fn kernel_create_equeue(output: u64, _state: &mut ProbeDispatchState) -> u64 {
     let (_h, mut events) = event_state::lock_event_state_for_write();
     let handle = events.next_equeue.max(1);
     events.next_equeue = handle.saturating_add(1);
-    events.kernel_equeues.insert(handle);
+    events
+        .kernel_equeues
+        .insert(handle, Arc::new(event_state::EqueueWake::default()));
     write_guest_u64(output, handle);
     0
 }
@@ -6048,7 +6050,7 @@ fn kernel_register_event(
 ) -> u64 {
     {
         let (_h, mut events) = event_state::lock_event_state_for_write();
-        if !events.kernel_equeues.contains(&equeue) {
+        if !events.kernel_equeues.contains_key(&equeue) {
             return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
         }
         events
@@ -6058,7 +6060,7 @@ fn kernel_register_event(
     // A completion carried for want of exactly this registration is now deliverable, and no
     // backend notification is coming to prompt a re-poll. Notified outside the event lock.
     if agc_completions_are_carried() {
-        notify_kernel_equeue_waiters();
+        request_kernel_completion_refresh();
     }
     0
 }
@@ -6104,7 +6106,6 @@ fn kernel_trigger_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState
             agc_user_interrupts: 0,
         },
     );
-    notify_kernel_equeue_waiters();
     0
 }
 
@@ -6173,8 +6174,63 @@ fn agc_driver_add_eq_event(arguments: [u64; 6], state: &mut ProbeDispatchState) 
     result
 }
 
-fn kernel_equeue_wake() -> &'static (Mutex<u64>, Condvar) {
-    KERNEL_EQUEUE_WAKE.get_or_init(|| (Mutex::new(0), Condvar::new()))
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn initialize_kernel_completion_pump() {
+    KERNEL_COMPLETION_PUMP.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("REMu kernel completion pump".to_owned())
+            .spawn(move || kernel_completion_pump(receiver))
+            .expect("kernel completion pump must start before GPU completion notification");
+        sender
+    });
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn kernel_completion_pump(receiver: Receiver<()>) {
+    while receiver.recv().is_ok() {
+        refresh_completed_event_sources();
+    }
+}
+
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+fn refresh_completed_event_sources() {
+    refresh_completed_video_out_flips();
+    refresh_completed_agc_submissions();
+}
+
+/// Schedules one completion refresh without blocking the AppKit presenter thread which publishes
+/// batch and flip retirement. A full one-slot channel means a worker pass is already pending.
+pub(crate) fn request_kernel_completion_refresh() {
+    let Some(sender) = KERNEL_COMPLETION_PUMP.get() else {
+        return;
+    };
+    match sender.try_send(()) {
+        Ok(()) | Err(TrySendError::Full(())) => {}
+        Err(TrySendError::Disconnected(())) => {
+            if !KERNEL_COMPLETION_PUMP_FAILED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[REMu][FATAL] kernel completion pump stopped; GPU equeue completions cannot be delivered"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn signal_kernel_equeue_wake(wake: &event_state::EqueueWake) {
+    EQUEUE_WAKEUPS_SIGNALLED.fetch_add(1, Ordering::Relaxed);
+    wake.signal();
+}
+
+pub(crate) fn interrupt_kernel_equeue_waiter(thread: u64) {
+    let wake = EQUEUE_BLOCKED_WAITERS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&thread)
+        .map(|waiter| Arc::clone(&waiter.wake));
+    if let Some(wake) = wake {
+        signal_kernel_equeue_wake(&wake);
+    }
 }
 
 /// True while backend completions are held awaiting an arm or an equeue registration.
@@ -6187,33 +6243,18 @@ pub(crate) fn agc_completions_are_carried() -> bool {
     AGC_UNCLAIMED_COMPLETIONS_CARRIED.load(Ordering::Acquire)
 }
 
-pub(crate) fn notify_kernel_equeue_waiters() {
-    EQUEUE_WAKEUPS_SIGNALLED.fetch_add(1, Ordering::Relaxed);
-    let wake = kernel_equeue_wake();
-    let mut generation = wake
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *generation = generation.wrapping_add(1);
-    wake.1.notify_all();
-}
-
 fn queue_kernel_event(_state: &mut ProbeDispatchState, event: KernelQueuedEvent) {
     event_state::queue_kernel_event(event);
 }
 
-#[allow(dead_code)] // Thin wrapper over discard_kernel_events_into for call sites that own ProbeDispatch.
-fn discard_kernel_events(
-    state: &mut ProbeDispatchState,
-    should_discard: impl FnMut(&KernelQueuedEvent) -> bool,
-) {
+#[allow(dead_code)]
+fn discard_kernel_events(should_discard: impl FnMut(&KernelQueuedEvent) -> bool) {
     let (_h, mut events) = event_state::lock_event_state_for_write();
-    discard_kernel_events_into(&mut events, state, should_discard);
+    discard_kernel_events_into(&mut events, should_discard);
 }
 
 pub(crate) fn discard_kernel_events_into(
     events: &mut event_state::EventState,
-    state: &mut ProbeDispatchState,
     mut should_discard: impl FnMut(&KernelQueuedEvent) -> bool,
 ) {
     let mut cancelled_graphics = 0_u64;
@@ -6228,19 +6269,19 @@ pub(crate) fn discard_kernel_events_into(
             true
         }
     });
-    state
+    events
         .agc_completion_telemetry
-        .cancelled_graphics_notifications = state
+        .cancelled_graphics_notifications = events
         .agc_completion_telemetry
         .cancelled_graphics_notifications
         .saturating_add(cancelled_graphics);
-    state.agc_completion_telemetry.cancelled_user_interrupts = state
+    events.agc_completion_telemetry.cancelled_user_interrupts = events
         .agc_completion_telemetry
         .cancelled_user_interrupts
         .saturating_add(cancelled_user);
 }
 
-fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
+fn refresh_completed_agc_submissions() {
     const AGC_USER_INTERRUPT_EVENT: u64 = 0x1800;
     let drained = remu_gpu::take_gpu_completed_submission_ids()
         .into_iter()
@@ -6250,7 +6291,9 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         return;
     }
     let (_event_hierarchy, mut events) = event_state::lock_event_state_for_write();
-    events.unclaimed_agc_completions.extend(drained.iter().copied());
+    events
+        .unclaimed_agc_completions
+        .extend(drained.iter().copied());
     if events.unclaimed_agc_completions.is_empty() {
         AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(false, Ordering::Release);
         return;
@@ -6287,22 +6330,22 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         // Counted once, when the sequence is first deferred. Carried sequences are reconsidered
         // every refresh, so counting them each pass would report a single deferral as thousands.
         if drained.contains(&sequence) {
-            state.agc_completion_telemetry.unmatched_backend_ids = state
+            events.agc_completion_telemetry.unmatched_backend_ids = events
                 .agc_completion_telemetry
                 .unmatched_backend_ids
                 .saturating_add(1);
-            state.agc_completion_telemetry.last_unmatched_backend_id = Some(sequence);
+            events.agc_completion_telemetry.last_unmatched_backend_id = Some(sequence);
             AGC_UNMATCHED_BACKEND_IDS.fetch_add(1, Ordering::Relaxed);
         }
     }
     for &sequence in claimed.difference(&drained) {
         // A completion that arrived before its arm and was matched on a later pass. Non-zero here
         // is the lost-wakeup race being caught rather than dropped.
-        state.agc_completion_telemetry.reclaimed_backend_ids = state
+        events.agc_completion_telemetry.reclaimed_backend_ids = events
             .agc_completion_telemetry
             .reclaimed_backend_ids
             .saturating_add(1);
-        state.agc_completion_telemetry.last_reclaimed_backend_id = Some(sequence);
+        events.agc_completion_telemetry.last_reclaimed_backend_id = Some(sequence);
         AGC_RECLAIMED_BACKEND_IDS.fetch_add(1, Ordering::Relaxed);
     }
     let mut carried = completed
@@ -6315,7 +6358,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
     while carried.len() > MAXIMUM_CARRIED_AGC_COMPLETIONS {
         if let Some(&oldest) = carried.iter().next() {
             carried.remove(&oldest);
-            state.agc_completion_telemetry.evicted_backend_ids = state
+            events.agc_completion_telemetry.evicted_backend_ids = events
                 .agc_completion_telemetry
                 .evicted_backend_ids
                 .saturating_add(1);
@@ -6324,7 +6367,7 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
     }
     AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(!carried.is_empty(), Ordering::Release);
     events.unclaimed_agc_completions = carried;
-    let mut queued = false;
+    let mut wake_equeues = BTreeSet::new();
     for (sequence, completed_ident) in completed_queues {
         // `sceAgcDriverAddEqEvent` registers one hardware queue by ID. Queue zero is graphics and
         // an ACB queue uses its owner ID (Silent Hill uses 0x20). Broadcasting one queue's
@@ -6338,13 +6381,15 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     .then_some((equeue, ident, filter, user_data))
             })
             .collect::<Vec<_>>();
-        state.agc_completion_telemetry.refreshed_graphics = state
+        events.agc_completion_telemetry.refreshed_graphics = events
             .agc_completion_telemetry
             .refreshed_graphics
             .saturating_add(1);
-        state.agc_completion_telemetry.last_refreshed_graphics = Some(sequence);
+        events.agc_completion_telemetry.last_refreshed_graphics = Some(sequence);
         if registrations.is_empty() {
-            state.agc_completion_telemetry.missing_graphics_registration = state
+            events
+                .agc_completion_telemetry
+                .missing_graphics_registration = events
                 .agc_completion_telemetry
                 .missing_graphics_registration
                 .saturating_add(1);
@@ -6373,11 +6418,13 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     agc_user_interrupts: 0,
                 },
             );
-            state.agc_completion_telemetry.queued_graphics_notifications = state
+            events
+                .agc_completion_telemetry
+                .queued_graphics_notifications = events
                 .agc_completion_telemetry
                 .queued_graphics_notifications
                 .saturating_add(1);
-            queued = true;
+            wake_equeues.insert(equeue);
         }
         if trace_logarithmic_sequence(sequence, 8) {
             eprintln!(
@@ -6403,15 +6450,15 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     .then_some((equeue, ident, filter, user_data))
             })
             .collect::<Vec<_>>();
-        state.agc_completion_telemetry.refreshed_compute = state
+        events.agc_completion_telemetry.refreshed_compute = events
             .agc_completion_telemetry
             .refreshed_compute
             .saturating_add(1);
-        state.agc_completion_telemetry.last_refreshed_compute = Some(sequence);
+        events.agc_completion_telemetry.last_refreshed_compute = Some(sequence);
         if registrations.is_empty() {
-            state
+            events
                 .agc_completion_telemetry
-                .missing_user_interrupt_registration = state
+                .missing_user_interrupt_registration = events
                 .agc_completion_telemetry
                 .missing_user_interrupt_registration
                 .saturating_add(1);
@@ -6437,11 +6484,11 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
                     agc_user_interrupts: 1,
                 },
             );
-            state.agc_completion_telemetry.queued_user_interrupts = state
+            events.agc_completion_telemetry.queued_user_interrupts = events
                 .agc_completion_telemetry
                 .queued_user_interrupts
                 .saturating_add(1);
-            queued = true;
+            wake_equeues.insert(equeue);
         }
         if trace_logarithmic_sequence(sequence, 8) {
             eprintln!(
@@ -6456,27 +6503,35 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
             );
         }
     }
-    if queued {
-        notify_kernel_equeue_waiters();
+    let wakes = wake_equeues
+        .into_iter()
+        .filter_map(|equeue| events.kernel_equeues.get(&equeue).cloned())
+        .collect::<Vec<_>>();
+    drop(events);
+    for wake in wakes {
+        signal_kernel_equeue_wake(&wake);
     }
 }
 
-fn kernel_poll_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> Result<u32, u64> {
+fn kernel_poll_equeue(arguments: [u64; 6]) -> Result<u32, u64> {
     let handle = arguments[0];
     let event_buffer = arguments[1];
     let event_capacity = low_u32(arguments[2]);
     let out_count = arguments[3];
     {
         let (_h, events) = event_state::lock_event_state_for_read();
-        if !events.kernel_equeues.contains(&handle) {
+        if !events.kernel_equeues.contains_key(&handle) {
             return Err(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND));
         }
     }
     if event_buffer == 0 || event_capacity == 0 {
         return Err(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
     }
-    refresh_completed_video_out_flips(state);
-    refresh_completed_agc_submissions(state);
+    // The completion pump normally converts backend retirement before signalling this equeue.
+    // Retain a lock-independent drain here for direct dispatch/tests and for a completion which
+    // raced the pump token; all completion-owned state lives under EventState, never ProbeDispatch.
+    refresh_completed_video_out_flips();
+    refresh_completed_agc_submissions();
     let (_h, mut events) = event_state::lock_event_state_for_write();
     let mut delivered = 0_u32;
     while delivered < event_capacity {
@@ -6500,13 +6555,13 @@ fn kernel_poll_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> Re
         write_guest_u32(output + 0x0c, event.fflags);
         write_guest_u64(output + 0x10, event.data);
         write_guest_u64(output + 0x18, event.user_data);
-        state
+        events
             .agc_completion_telemetry
-            .delivered_graphics_notifications = state
+            .delivered_graphics_notifications = events
             .agc_completion_telemetry
             .delivered_graphics_notifications
             .saturating_add(u64::from(event.agc_graphics_completions));
-        state.agc_completion_telemetry.delivered_user_interrupts = state
+        events.agc_completion_telemetry.delivered_user_interrupts = events
             .agc_completion_telemetry
             .delivered_user_interrupts
             .saturating_add(u64::from(event.agc_user_interrupts));
@@ -6528,8 +6583,8 @@ fn kernel_poll_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> Re
     Ok(delivered)
 }
 
-fn kernel_wait_equeue(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    kernel_poll_equeue(arguments, state).map_or_else(std::convert::identity, |_| 0)
+fn kernel_wait_equeue(arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
+    kernel_poll_equeue(arguments).map_or_else(std::convert::identity, |_| 0)
 }
 
 fn report_kernel_equeue_wait_stall(equeue: u64, guest_thread: u64, report_after: Duration) {
@@ -6548,7 +6603,7 @@ fn report_kernel_equeue_wait_stall(equeue: u64, guest_thread: u64, report_after:
         "[REMu][STALL] equeue wait exceeded {}s thread={:?} handle={guest_thread:#x} equeue={equeue:#x} exists={} registrations={registration_count} pending={pending_count}",
         report_after.as_secs(),
         current_guest_thread_name(),
-        events.kernel_equeues.contains(&equeue),
+        events.kernel_equeues.contains_key(&equeue),
     );
     for (&(_, filter, ident), &user_data) in events
         .kernel_event_registrations
@@ -6583,8 +6638,16 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
     let deadline = timeout_microseconds
         .and_then(|microseconds| Instant::now().checked_add(Duration::from_micros(microseconds)));
     let guest_thread = current_guest_thread_handle();
+    let wake = {
+        let (_h, events) = event_state::lock_event_state_for_read();
+        let Some(wake) = events.kernel_equeues.get(&arguments[0]).cloned() else {
+            return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
+        };
+        wake
+    };
     // Deregisters on every exit path, including the error returns below.
-    let _registration = EqueueWaitRegistration::enter(guest_thread, arguments[0]);
+    let _registration =
+        EqueueWaitRegistration::enter(guest_thread, arguments[0], Arc::clone(&wake));
     let mut stall_reported = false;
     if wait_sequence <= 64 || wait_sequence.is_power_of_two() {
         let thread_name = current_guest_thread_name();
@@ -6597,17 +6660,10 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
         );
     }
     loop {
-        // Snapshot the wake generation without nesting the notifier and dispatch locks. Producers
-        // hold the dispatch lock while enqueueing, so a nested inverse order could deadlock.
-        let generation = *kernel_equeue_wake()
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = {
-            let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
-            let mut state = lock_probe_dispatch_for_write(state);
-            kernel_poll_equeue(arguments, &mut state)
-        };
+        // The equeue generation and EventState are never nested. Snapshot, poll entirely outside
+        // ProbeDispatch, then let `wait_for_change` close the check-to-park race.
+        let generation = wake.snapshot();
+        let result = kernel_poll_equeue(arguments);
         match result {
             Err(error) => return error,
             Ok(count) if count != 0 => {
@@ -6644,35 +6700,15 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
         } else {
             None
         };
-        let wake = kernel_equeue_wake();
-        let wake_state = wake
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *wake_state != generation {
-            continue;
-        }
         if let Some(wait_for) = wait_for {
-            let _ = wake
-                .1
-                .wait_timeout(wake_state, wait_for)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = wake.wait_for_change(generation, Some(wait_for));
         } else if let Some(report_after) = stall_report_interval() {
-            let (wake_state, wait_result) = wake
-                .1
-                .wait_timeout(wake_state, report_after)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            drop(wake_state);
-            if wait_result.timed_out() && !stall_reported {
+            if !wake.wait_for_change(generation, Some(report_after)) && !stall_reported {
                 stall_reported = true;
                 report_kernel_equeue_wait_stall(arguments[0], guest_thread, report_after);
             }
         } else {
-            drop(
-                wake.1
-                    .wait(wake_state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            let _ = wake.wait_for_change(generation, None);
         }
     }
 }
@@ -10049,11 +10085,8 @@ fn report_diagnostic_stall_attribution() {
         .get()
         .and_then(|dispatch| dispatch.try_read().ok())
         .map(|state| state.agc_submission_count);
-    let telemetry = PROBE_DISPATCH
-        .get()
-        .and_then(|dispatch| dispatch.try_read().ok())
-        .map(|state| state.agc_completion_telemetry.clone());
     let (_h, events) = event_state::lock_event_state_for_read();
+    let telemetry = events.agc_completion_telemetry.clone();
     let pending_graphics_range = events
         .pending_agc_completions
         .front()
@@ -10089,7 +10122,7 @@ fn report_diagnostic_stall_attribution() {
         .keys()
         .filter(|(_, filter, ident)| *filter == KERNEL_EVENT_FILTER_USER && *ident == 0x1800)
         .count();
-    if let (Some(submission_count), Some(telemetry)) = (submission_count, telemetry) {
+    if let Some(submission_count) = submission_count {
         eprintln!(
             "[REMu][STALL-AGC] submitted={} backend_newest={gpu_completed} backend_unclaimed={}/{backend_unclaimed_range:?} pending_graphics={}/{pending_graphics_range:?} pending_compute={}/{pending_compute_range:?} refreshed=graphics:{}@{:?},compute:{}@{:?} notifications=graphics:queued{}/delivered{}/cancelled{}/pending{},user:queued{}/delivered{}/cancelled{}/pending{} registrations=graphics:{graphics_registrations}/user:{user_interrupt_registrations} missing_registration=graphics:{}/user:{} unmatched_backend={}@{:?} reclaimed_backend={}@{:?} carried_backend={} evicted_backend={}",
             submission_count,

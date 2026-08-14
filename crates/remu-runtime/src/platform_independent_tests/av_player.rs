@@ -635,7 +635,9 @@ fn av_player_pause_freezes_data_clock_and_resumes_monotonically() {
     let mut audio_info = [0_u8; 40];
     let audio_output = audio_info.as_mut_ptr().addr() as u64;
     for _ in 0..16 {
-        state.video_out.completed_flip_count += 4;
+        crate::event_state::with_event_state_mut(|events| {
+            events.completed_video_out_flip_count += 4;
+        });
         assert_eq!(
             crate::av_player_get_video_data([handle, output, 0, 0, 0, 0], true, &mut state),
             0,

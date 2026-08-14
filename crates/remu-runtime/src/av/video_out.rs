@@ -141,8 +141,10 @@ pub(super) fn video_out_close(arguments: [u64; 6], state: &mut ProbeDispatchStat
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_HANDLE);
     }
     state.video_out.is_open = false;
-    state.video_out.flip_events.clear();
-    state.video_out.vblank_events.clear();
+    crate::event_state::with_event_state_mut(|events| {
+        events.video_out_flip_events.clear();
+        events.video_out_vblank_events.clear();
+    });
     state.video_out.display_buffers.clear();
     state.video_out.display_buffer_attributes.clear();
     video_out_reset_display_clock();
@@ -289,15 +291,19 @@ pub(super) fn video_out_get_flip_status(arguments: [u64; 6], state: &ProbeDispat
     if !guest_object_is_reachable(status, VIDEO_OUT_FLIP_STATUS_SIZE) {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
     }
-    let pending = {
+    let (pending, completed_count, last_completed) = {
         let (_h, events) = crate::event_state::lock_event_state_for_read();
-        u32::try_from(events.pending_video_out_flips.len()).unwrap_or(u32::MAX)
+        (
+            u32::try_from(events.pending_video_out_flips.len()).unwrap_or(u32::MAX),
+            events.completed_video_out_flip_count,
+            events.last_completed_video_out_flip,
+        )
     };
     guest_memset(status, 0, VIDEO_OUT_FLIP_STATUS_SIZE);
-    write_guest_u64(status, state.video_out.completed_flip_count);
+    write_guest_u64(status, completed_count);
     write_guest_u32(status + VIDEO_OUT_FLIP_GC_QUEUE_NUM_OFFSET, 0);
     write_guest_u32(status + VIDEO_OUT_FLIP_PENDING_NUM_OFFSET, pending);
-    let Some(completed) = state.video_out.last_completed_flip else {
+    let Some(completed) = last_completed else {
         return 0;
     };
     write_guest_u64(

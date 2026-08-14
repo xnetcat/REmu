@@ -11,6 +11,16 @@ use super::{
     read_guest_u32, read_guest_u64, targetless_scanout_test_video, video_out_submit_flip,
 };
 
+fn reset_completion_telemetry() {
+    crate::event_state::with_event_state_mut(|events| {
+        events.agc_completion_telemetry = crate::AgcCompletionTelemetry::default();
+    });
+}
+
+fn completion_telemetry() -> crate::AgcCompletionTelemetry {
+    crate::event_state::with_event_state(|events| events.agc_completion_telemetry.clone())
+}
+
 #[test]
 fn register_snapshots_are_shared_until_the_register_file_changes() {
     let mut graphics = crate::AgcGraphicsState::default();
@@ -290,6 +300,7 @@ fn gpu_publication_tickets_admit_an_independent_queue_before_graphics_drains() {
 
     let (publication_done, publication_done_rx) = std::sync::mpsc::channel();
     let (graphics_admitted, graphics_admitted_rx) = std::sync::mpsc::channel();
+    let (release_graphics, release_graphics_rx) = std::sync::mpsc::channel();
     let graphics_done = publication_done.clone();
     let graphics_thread = std::thread::spawn(move || {
         graphics_done
@@ -299,6 +310,9 @@ fn gpu_publication_tickets_admit_an_independent_queue_before_graphics_drains() {
                     graphics_admitted
                         .send(())
                         .expect("test receiver remains alive");
+                    release_graphics_rx
+                        .recv()
+                        .expect("test releases graphics publication");
                 }),
             ))
             .expect("test receiver remains alive");
@@ -325,19 +339,21 @@ fn gpu_publication_tickets_admit_an_independent_queue_before_graphics_drains() {
         .recv_timeout(Duration::from_secs(1))
         .expect("compute is admitted while graphics remains backpressured");
 
-    // The fair coordinator owns the send turn explicitly: q0 takes the first released slot, then
-    // yields before attempting another chunk, so q33 deterministically takes the second.
-    for _ in 0..2 {
-        assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
-    }
+    // Graphics has registered its lane but is paused before its first send. An independent lane
+    // must be able to consume the first released channel slot; a process-global publication lane
+    // would leave compute parked behind graphics here.
+    assert_eq!(receiver.recv(), Ok(remu_gpu::GpuEvent::Shutdown));
     assert_eq!(
         publication_done_rx.recv_timeout(Duration::from_secs(1)),
         Ok((33, true)),
-        "the later compute ticket must publish before the graphics ticket fully drains"
+        "the later compute lane must publish while the registered graphics lane is paused"
     );
+    release_graphics
+        .send(())
+        .expect("graphics publisher remains alive");
 
     let expected_events = remu_gpu::GPU_EVENT_QUEUE_CAPACITY + q0_chunk_count + 1;
-    let mut received_events = 2;
+    let mut received_events = 1;
     while received_events != expected_events {
         receiver.recv().expect("remaining bounded event");
         received_events += 1;
@@ -607,6 +623,7 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reset_completion_telemetry();
     let completed = remu_gpu::gpu_completed_submission_sequence();
     let first = completed.saturating_add(1);
     let second = first.saturating_add(1);
@@ -644,17 +661,14 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
     let mut event = [0_u8; 0x40];
     let mut count = 0_u32;
     assert_eq!(
-        crate::kernel_poll_equeue(
-            [
-                equeue,
-                event.as_mut_ptr().addr() as u64,
-                2,
-                (&raw mut count).addr() as u64,
-                0,
-                0,
-            ],
-            &mut state,
-        ),
+        crate::kernel_poll_equeue([
+            equeue,
+            event.as_mut_ptr().addr() as u64,
+            2,
+            (&raw mut count).addr() as u64,
+            0,
+            0,
+        ]),
         Ok(1)
     );
     assert_eq!(count, 1);
@@ -679,19 +693,14 @@ fn delivers_completed_agc_submissions_through_the_registered_graphics_equeue() {
     assert!(crate::event_state::with_event_state(|e| e
         .pending_agc_completions
         .is_empty()));
-    assert_eq!(state.agc_completion_telemetry.refreshed_graphics, 2);
+    let telemetry = completion_telemetry();
+    assert_eq!(telemetry.refreshed_graphics, 2);
+    assert_eq!(telemetry.queued_graphics_notifications, 2);
     assert_eq!(
-        state.agc_completion_telemetry.queued_graphics_notifications,
-        2
-    );
-    assert_eq!(
-        state
-            .agc_completion_telemetry
-            .delivered_graphics_notifications,
-        2,
+        telemetry.delivered_graphics_notifications, 2,
         "coalescing must preserve both logical completions in the diagnostic ledger"
     );
-    assert_eq!(state.agc_completion_telemetry.unmatched_backend_ids, 0);
+    assert_eq!(telemetry.unmatched_backend_ids, 0);
 }
 
 /// A backend completion observed before its arm is recorded must still be delivered.
@@ -705,9 +714,9 @@ fn a_backend_completion_arriving_before_its_arm_is_still_delivered() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reset_completion_telemetry();
     // The suite runs in a fixed order against process-wide completion state, so establish the
     // preconditions rather than inherit whatever the previous test left behind.
-    let mut state = ProbeDispatchState::default();
     crate::event_state::with_event_state_mut(|e| {
         e.pending_agc_completions.clear();
         e.pending_agc_user_interrupts.clear();
@@ -716,12 +725,15 @@ fn a_backend_completion_arriving_before_its_arm_is_still_delivered() {
     });
     let _ = remu_gpu::take_gpu_completed_submission_ids();
     // Settles the carried-completions flag to false now that nothing is carried.
-    crate::refresh_completed_agc_submissions(&mut state);
+    crate::refresh_completed_agc_submissions();
     let mut state = ProbeDispatchState::default();
 
     let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
     crate::event_state::with_event_state_mut(|e| {
-        e.kernel_equeues.insert(3);
+        e.kernel_equeues.insert(
+            3,
+            std::sync::Arc::new(crate::event_state::EqueueWake::default()),
+        );
     });
     assert_eq!(
         crate::kernel_register_event(
@@ -736,14 +748,15 @@ fn a_backend_completion_arriving_before_its_arm_is_still_delivered() {
 
     // The backend completes and the interrupt thread drains, all before the arm exists.
     remu_gpu::record_gpu_submission_completed(sequence);
-    crate::refresh_completed_agc_submissions(&mut state);
+    crate::refresh_completed_agc_submissions();
     assert_eq!(
         crate::event_state::with_event_state(|e| e.pending_events.len()),
         0,
         "nothing is deliverable yet: the arm has not been recorded"
     );
     assert_eq!(
-        state.agc_completion_telemetry.unmatched_backend_ids, 1,
+        completion_telemetry().unmatched_backend_ids,
+        1,
         "the completion is deferred, and counted once"
     );
 
@@ -751,7 +764,7 @@ fn a_backend_completion_arriving_before_its_arm_is_still_delivered() {
     crate::event_state::with_event_state_mut(|e| {
         e.pending_agc_completions.push_back((sequence, 0x20));
     });
-    crate::refresh_completed_agc_submissions(&mut state);
+    crate::refresh_completed_agc_submissions();
 
     let event = crate::event_state::with_event_state(|e| {
         e.pending_events
@@ -763,12 +776,13 @@ fn a_backend_completion_arriving_before_its_arm_is_still_delivered() {
     assert_eq!(event.ident, 0x20);
     assert_eq!(event.filter, crate::KERNEL_EVENT_FILTER_GRAPHICS);
     assert_eq!(event.user_data, 0x1234_5678);
+    let telemetry = completion_telemetry();
     assert_eq!(
-        state.agc_completion_telemetry.reclaimed_backend_ids, 1,
+        telemetry.reclaimed_backend_ids, 1,
         "delivery came from the carry, not from a fresh drain"
     );
     assert_eq!(
-        state.agc_completion_telemetry.unmatched_backend_ids, 1,
+        telemetry.unmatched_backend_ids, 1,
         "a carried sequence must not be recounted on every refresh"
     );
     assert!(
@@ -788,10 +802,18 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reset_completion_telemetry();
     let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
     let mut state = ProbeDispatchState::default();
     crate::event_state::with_event_state_mut(|e| {
-        e.kernel_equeues.extend([1, 2]);
+        e.kernel_equeues.insert(
+            1,
+            std::sync::Arc::new(crate::event_state::EqueueWake::default()),
+        );
+        e.kernel_equeues.insert(
+            2,
+            std::sync::Arc::new(crate::event_state::EqueueWake::default()),
+        );
     });
     assert_eq!(
         crate::kernel_register_event(
@@ -818,7 +840,7 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
     });
     remu_gpu::record_gpu_submission_completed(sequence);
 
-    crate::refresh_completed_agc_submissions(&mut state);
+    crate::refresh_completed_agc_submissions();
 
     assert!(crate::event_state::with_event_state(|e| e
         .pending_agc_completions
@@ -848,19 +870,17 @@ fn routes_completed_compute_submissions_only_to_the_user_interrupt() {
         }),
         "compute completion must not also wake the owner's graphics event"
     );
-    assert_eq!(state.agc_completion_telemetry.refreshed_compute, 1);
-    assert_eq!(state.agc_completion_telemetry.queued_user_interrupts, 1);
-    assert_eq!(state.agc_completion_telemetry.delivered_user_interrupts, 0);
+    let telemetry = completion_telemetry();
+    assert_eq!(telemetry.refreshed_compute, 1);
+    assert_eq!(telemetry.queued_user_interrupts, 1);
+    assert_eq!(telemetry.delivered_user_interrupts, 0);
 
     let mut delivered = [0_u8; 0x20];
     assert_eq!(
-        crate::kernel_poll_equeue(
-            [1, delivered.as_mut_ptr().addr() as u64, 1, 0, 0, 0],
-            &mut state,
-        ),
+        crate::kernel_poll_equeue([1, delivered.as_mut_ptr().addr() as u64, 1, 0, 0, 0]),
         Ok(1)
     );
-    assert_eq!(state.agc_completion_telemetry.delivered_user_interrupts, 1);
+    assert_eq!(completion_telemetry().delivered_user_interrupts, 1);
 }
 
 #[test]
@@ -868,17 +888,15 @@ fn completion_ledger_identifies_a_backend_id_without_a_runtime_owner() {
     let _serial = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    reset_completion_telemetry();
     let sequence = remu_gpu::gpu_completed_submission_sequence().saturating_add(1);
-    let mut state = ProbeDispatchState::default();
     remu_gpu::record_gpu_submission_completed(sequence);
 
-    crate::refresh_completed_agc_submissions(&mut state);
+    crate::refresh_completed_agc_submissions();
 
-    assert_eq!(state.agc_completion_telemetry.unmatched_backend_ids, 1);
-    assert_eq!(
-        state.agc_completion_telemetry.last_unmatched_backend_id,
-        Some(sequence)
-    );
+    let telemetry = completion_telemetry();
+    assert_eq!(telemetry.unmatched_backend_ids, 1);
+    assert_eq!(telemetry.last_unmatched_backend_id, Some(sequence));
     assert!(crate::event_state::with_event_state(|e| e
         .pending_events
         .is_empty()));
@@ -929,12 +947,15 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         flip_argument,
     });
     assert_eq!(remu_gpu::gpu_flips_pending(), 0);
-    crate::refresh_completed_video_out_flips(&mut state);
+    crate::refresh_completed_video_out_flips();
     assert_eq!(
         crate::video_out_is_flip_pending([1, 0, 0, 0, 0, 0], &mut state),
         0
     );
-    assert_eq!(state.video_out.completed_flip_count, 1);
+    assert_eq!(
+        crate::event_state::with_event_state(|events| events.completed_video_out_flip_count),
+        1
+    );
     assert!(receiver.try_recv().is_err());
     remu_gpu::clear_thread_local_event_sink();
 }

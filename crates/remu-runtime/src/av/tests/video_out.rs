@@ -240,13 +240,15 @@ fn the_flip_status_reports_pending_depth_and_the_last_completed_flip() {
             submit_process_time_counter: 210_000,
         });
     });
-    state.video_out.completed_flip_count = 3;
-    state.video_out.last_completed_flip = Some(CompletedVideoOutFlip {
-        process_time: 111,
-        process_time_counter: 222_000,
-        flip_argument: 0x4242,
-        buffer_index: 1,
-        submit_process_time_counter: 210_000,
+    crate::event_state::with_event_state_mut(|events| {
+        events.completed_video_out_flip_count = 3;
+        events.last_completed_video_out_flip = Some(CompletedVideoOutFlip {
+            process_time: 111,
+            process_time_counter: 222_000,
+            flip_argument: 0x4242,
+            buffer_index: 1,
+            submit_process_time_counter: 210_000,
+        });
     });
     assert_eq!(
         dispatch(

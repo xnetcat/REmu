@@ -262,10 +262,10 @@ pub(crate) fn set_guest_errno(errno: i32) {
 }
 
 /// Removes a user-event registration and any of its events still awaiting delivery.
-fn kernel_delete_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
+fn kernel_delete_user_event(arguments: [u64; 6], _state: &mut ProbeDispatchState) -> u64 {
     let (equeue, ident) = (arguments[0], arguments[1]);
     let (_h, mut events) = crate::event_state::lock_event_state_for_write();
-    if !events.kernel_equeues.contains(&equeue) {
+    if !events.kernel_equeues.contains_key(&equeue) {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     if events
@@ -276,7 +276,7 @@ fn kernel_delete_user_event(arguments: [u64; 6], state: &mut ProbeDispatchState)
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     // An event queued before the interest was withdrawn must not still arrive after it.
-    crate::discard_kernel_events_into(&mut events, state, |event| {
+    crate::discard_kernel_events_into(&mut events, |event| {
         event.equeue == equeue && event.filter == KERNEL_EVENT_FILTER_USER && event.ident == ident
     });
     0

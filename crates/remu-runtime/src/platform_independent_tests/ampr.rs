@@ -554,7 +554,8 @@ fn ampr_completions_are_announced_by_submission_not_registration() {
     let mut state = ProbeDispatchState::default();
     let equeue = 0x4000;
     crate::event_state::with_event_state_mut(|e| {
-        e.kernel_equeues.insert(equeue);
+        e.kernel_equeues
+            .insert(equeue, Arc::new(crate::event_state::EqueueWake::default()));
     });
     assert_eq!(
         kernel_add_ampr_event([equeue, 0x7502, 0xabc, 0, 0, 0], &mut state),
@@ -792,7 +793,8 @@ fn ampr_submit_contains_a_failed_read_and_still_publishes_its_completion() {
     let mut flag = 0_u64;
     let mut state = ProbeDispatchState::default();
     crate::event_state::with_event_state_mut(|e| {
-        e.kernel_equeues.insert(equeue);
+        e.kernel_equeues
+            .insert(equeue, Arc::new(crate::event_state::EqueueWake::default()));
     });
     state.ampr_files.insert(file_id, path.clone());
     ampr_record_read_program(

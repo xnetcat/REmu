@@ -7,7 +7,10 @@ use super::*;
 fn a_user_event_registration_can_be_added_and_withdrawn_again() {
     let mut state = ProbeDispatchState::default();
     crate::event_state::with_event_state_mut(|e| {
-        e.kernel_equeues.insert(7);
+        e.kernel_equeues.insert(
+            7,
+            std::sync::Arc::new(crate::event_state::EqueueWake::default()),
+        );
     });
 
     assert_eq!(

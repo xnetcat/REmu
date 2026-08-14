@@ -7,15 +7,69 @@
 #![allow(dead_code)] // with_/reset helpers exercised in tests; production still uses lock_* directly.
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
 
 use crate::dispatch_locks::{LockHierarchyGuard, LockLevel, held_lock_level};
-use crate::{KernelQueuedEvent, PendingVideoOutFlip};
+use crate::{
+    AgcCompletionTelemetry, CompletedVideoOutFlip, KernelQueuedEvent, PendingVideoOutFlip,
+};
+
+#[derive(Debug, Default)]
+pub(crate) struct EqueueWake {
+    generation: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl EqueueWake {
+    pub(crate) fn snapshot(&self) -> u64 {
+        *self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn signal(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *generation = generation.wrapping_add(1);
+        drop(generation);
+        self.changed.notify_all();
+    }
+
+    /// Waits until a producer advances this equeue's generation. `None` parks indefinitely;
+    /// `Some` returns false only when that exact deadline elapses without a signal.
+    pub(crate) fn wait_for_change(&self, observed: u64, timeout: Option<Duration>) -> bool {
+        let generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *generation != observed {
+            return true;
+        }
+        if let Some(timeout) = timeout {
+            let (generation, result) = self
+                .changed
+                .wait_timeout_while(generation, timeout, |generation| *generation == observed)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            !result.timed_out() || *generation != observed
+        } else {
+            drop(
+                self.changed
+                    .wait_while(generation, |generation| *generation == observed)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            true
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct EventState {
     pub(crate) next_equeue: u64,
-    pub(crate) kernel_equeues: BTreeSet<u64>,
+    pub(crate) kernel_equeues: BTreeMap<u64, Arc<EqueueWake>>,
     pub(crate) kernel_event_registrations: BTreeMap<(u64, i16, u64), u64>,
     pub(crate) pending_events: VecDeque<KernelQueuedEvent>,
     pub(crate) pending_video_out_flips: VecDeque<PendingVideoOutFlip>,
@@ -28,6 +82,11 @@ pub(crate) struct EventState {
     /// counted and thrown away, leaving the arm to wait forever. Carrying it here makes delivery
     /// level-triggered: every refresh reconsiders it until it is claimed or evicted.
     pub(crate) unclaimed_agc_completions: BTreeSet<u64>,
+    pub(crate) agc_completion_telemetry: AgcCompletionTelemetry,
+    pub(crate) video_out_flip_events: BTreeMap<u64, u64>,
+    pub(crate) video_out_vblank_events: BTreeMap<u64, u64>,
+    pub(crate) completed_video_out_flip_count: u64,
+    pub(crate) last_completed_video_out_flip: Option<CompletedVideoOutFlip>,
 }
 
 static EVENT_STATE: OnceLock<RwLock<EventState>> = OnceLock::new();
@@ -87,10 +146,15 @@ pub(crate) fn reset_event_state() {
     let mut state = cell()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let wakes = state.kernel_equeues.values().cloned().collect::<Vec<_>>();
     *state = EventState {
         next_equeue: 1,
         ..EventState::default()
     };
+    drop(state);
+    for wake in wakes {
+        crate::signal_kernel_equeue_wake(&wake);
+    }
 }
 
 #[cfg(test)]
@@ -100,8 +164,14 @@ pub(crate) fn reset_event_state_for_tests() {
 
 /// Queues a kernel event under the EventState lock (coalesce on equeue/ident/filter).
 pub(crate) fn queue_kernel_event(event: KernelQueuedEvent) {
+    let equeue = event.equeue;
     let (_h, mut events) = lock_event_state_for_write();
     queue_kernel_event_into(&mut events, event);
+    let wake = events.kernel_equeues.get(&equeue).cloned();
+    drop(events);
+    if let Some(wake) = wake {
+        crate::signal_kernel_equeue_wake(&wake);
+    }
 }
 
 /// Kernel events pushed as new entries, and those merged into an already-pending entry.
@@ -183,8 +253,10 @@ pub(crate) fn with_event_state<R>(f: impl FnOnce(&EventState) -> R) -> R {
 
 #[cfg(test)]
 mod tests {
-    use super::{lock_event_state_for_write, reset_event_state_for_tests};
+    use super::{EqueueWake, lock_event_state_for_write, reset_event_state_for_tests};
+    use crate::KernelQueuedEvent;
     use crate::dispatch_locks::{LockHierarchyGuard, LockLevel};
+    use std::sync::Arc;
 
     #[test]
     fn event_state_lock_is_usable_without_probe_dispatch() {
@@ -194,11 +266,11 @@ mod tests {
             state.next_equeue = 7;
         }
         crate::event_state::with_event_state_mut(|e| {
-            e.kernel_equeues.insert(7);
+            e.kernel_equeues.insert(7, Arc::new(EqueueWake::default()));
         });
         assert!(crate::event_state::with_event_state(|state| state
             .kernel_equeues
-            .contains(&7)));
+            .contains_key(&7)));
     }
 
     #[test]
@@ -210,10 +282,50 @@ mod tests {
             state.next_equeue = 3;
         }
         crate::event_state::with_event_state_mut(|e| {
-            e.kernel_equeues.insert(3);
+            e.kernel_equeues.insert(3, Arc::new(EqueueWake::default()));
         });
         assert!(crate::event_state::with_event_state(|state| state
             .kernel_equeues
-            .contains(&3)));
+            .contains_key(&3)));
+    }
+
+    #[test]
+    fn equeue_generations_are_isolated_and_pre_wait_signals_are_observed() {
+        let first = EqueueWake::default();
+        let second = EqueueWake::default();
+        let observed_first = first.snapshot();
+        let observed_second = second.snapshot();
+        first.signal();
+        assert!(first.wait_for_change(observed_first, Some(std::time::Duration::ZERO)));
+        assert!(!second.wait_for_change(observed_second, Some(std::time::Duration::ZERO)));
+    }
+
+    #[test]
+    fn event_publication_signals_only_its_target_equeue() {
+        reset_event_state_for_tests();
+        let first = Arc::new(EqueueWake::default());
+        let second = Arc::new(EqueueWake::default());
+        let observed_first = first.snapshot();
+        let observed_second = second.snapshot();
+        crate::event_state::with_event_state_mut(|state| {
+            state.kernel_equeues.insert(1, Arc::clone(&first));
+            state.kernel_equeues.insert(2, Arc::clone(&second));
+        });
+
+        crate::event_state::queue_kernel_event(KernelQueuedEvent {
+            equeue: 1,
+            ident: 7,
+            filter: 3,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            user_data: 0,
+            agc_graphics_completions: 0,
+            agc_user_interrupts: 0,
+        });
+
+        assert!(first.wait_for_change(observed_first, Some(std::time::Duration::ZERO)));
+        assert!(!second.wait_for_change(observed_second, Some(std::time::Duration::ZERO)));
+        reset_event_state_for_tests();
     }
 }
