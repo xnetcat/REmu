@@ -5,7 +5,7 @@ use crate::{
     QUEUED_FLIPS, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
     VIDEO_OUT_ERROR_INVALID_INDEX, VideoOutBufferAttributes, VideoOutState,
     agc_allocate_command_dwords, agc_pm4, emit_agc_gpu_event, kernel_process_time, low_i32,
-    low_u32, notify_kernel_equeue_waiters, publish_gpu_event, queue_kernel_event, read_guest_u32,
+    low_u32, notify_kernel_equeue_waiters, publish_gpu_event, read_guest_u32,
     read_guest_u64, sce_kernel_error, trace_logarithmic_sequence, write_guest_u32,
 };
 
@@ -263,8 +263,8 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 6,
@@ -294,8 +294,8 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in vblank_registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 1,
@@ -311,6 +311,7 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             queued = true;
         }
     }
+    drop(events);
     if queued {
         notify_kernel_equeue_waiters();
     }

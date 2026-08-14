@@ -894,6 +894,8 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         video_out: targetless_scanout_test_video(address),
         ..ProbeDispatchState::default()
     };
+    state.video_out.flip_events.insert(0x44, 0xfeed);
+    state.video_out.vblank_events.insert(0x44, 0xbeef);
     let (sender, receiver) = remu_gpu::gpu_event_channel();
     remu_gpu::install_thread_local_event_sink(sender);
 
@@ -935,6 +937,15 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
         0
     );
     assert_eq!(state.video_out.completed_flip_count, 1);
+    let delivered = crate::event_state::with_event_state_mut(|events| {
+        events
+            .pending_events
+            .drain(..)
+            .filter(|event| event.equeue == 0x44 && event.filter == -13)
+            .map(|event| (event.ident, event.user_data))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(delivered, vec![(6, 0xfeed), (1, 0xbeef)]);
     assert!(receiver.try_recv().is_err());
     remu_gpu::clear_thread_local_event_sink();
 }
