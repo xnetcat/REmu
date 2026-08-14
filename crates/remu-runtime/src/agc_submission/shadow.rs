@@ -153,7 +153,6 @@ pub(crate) fn apply_agc_memory_shadow(address: u64, output: &mut [u8]) {
 pub(crate) struct StagedAgcMemoryCopy {
     pub(crate) shadowed: bool,
     pub(crate) source_snapshot: Option<remu_gpu::GpuMemoryCopySnapshot>,
-    pub(crate) budget_exceeded: Option<AgcMemorySnapshotBudgetExceeded>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,40 +161,24 @@ pub(crate) struct AgcMemorySnapshotBudgetExceeded {
     pub(crate) limit_bytes: usize,
 }
 
-pub(crate) fn stage_agc_memory_copy(copy: &remu_gpu::GpuMemoryCopy) -> StagedAgcMemoryCopy {
-    static RETAIN_EVENT_SNAPSHOTS: OnceLock<bool> = OnceLock::new();
-    let retain_event_snapshots = *RETAIN_EVENT_SNAPSHOTS.get_or_init(|| {
-        std::env::var_os("REMU_AGC_DMA_EVENT_SNAPSHOTS").is_none_or(|value| value != "0")
-    });
-    stage_agc_memory_copy_with_policy(copy, 64 * 1024 * 1024, retain_event_snapshots)
-}
-
-fn stage_agc_memory_copy_with_limit(
+pub(crate) fn stage_agc_memory_copy(
     copy: &remu_gpu::GpuMemoryCopy,
-    max_shadow_total_bytes: usize,
-) -> StagedAgcMemoryCopy {
-    stage_agc_memory_copy_with_policy(copy, max_shadow_total_bytes, true)
-}
-
-fn stage_agc_memory_copy_with_policy(
-    copy: &remu_gpu::GpuMemoryCopy,
-    max_shadow_total_bytes: usize,
-    retain_event_snapshot: bool,
-) -> StagedAgcMemoryCopy {
+) -> Result<StagedAgcMemoryCopy, AgcMemorySnapshotBudgetExceeded> {
     const MAX_SHADOW_COPY_BYTES: u64 = 1024 * 1024;
+    const MAX_SHADOW_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 
     if !agc_memory_shadow_is_active()
         || !matches!(copy.destination_selection, 0 | 3)
         || copy.byte_count == 0
         || copy.byte_count > MAX_SHADOW_COPY_BYTES
     {
-        return StagedAgcMemoryCopy::default();
+        return Ok(StagedAgcMemoryCopy::default());
     }
     let Ok(byte_count) = usize::try_from(copy.byte_count) else {
-        return StagedAgcMemoryCopy::default();
+        return Ok(StagedAgcMemoryCopy::default());
     };
     if !process_guest_range_has_read_access(copy.destination_address, byte_count) {
-        return StagedAgcMemoryCopy::default();
+        return Ok(StagedAgcMemoryCopy::default());
     }
     let requested_bytes = agc_memory_shadow()
         .read()
@@ -203,21 +186,18 @@ fn stage_agc_memory_copy_with_policy(
         .as_ref()
         .map_or(0, |shadow| shadow.retained_bytes)
         .saturating_add(byte_count);
-    if requested_bytes > max_shadow_total_bytes {
-        return StagedAgcMemoryCopy {
-            budget_exceeded: Some(AgcMemorySnapshotBudgetExceeded {
-                requested_bytes,
-                limit_bytes: max_shadow_total_bytes,
-            }),
-            ..StagedAgcMemoryCopy::default()
-        };
+    if requested_bytes > MAX_SHADOW_TOTAL_BYTES {
+        return Err(AgcMemorySnapshotBudgetExceeded {
+            requested_bytes,
+            limit_bytes: MAX_SHADOW_TOTAL_BYTES,
+        });
     }
 
     let (bytes, source_snapshot) = match copy.source_selection {
         0 | 3 => {
             let mut bytes = vec![0_u8; byte_count];
             if !ProcessGuestMemory.read(copy.source_address, &mut bytes) {
-                return StagedAgcMemoryCopy::default();
+                return Ok(StagedAgcMemoryCopy::default());
             }
             // DMA packets are decoded before the asynchronous backend consumes them. A source
             // may therefore name bytes written by an earlier DMA in this same command stream,
@@ -225,23 +205,12 @@ fn stage_agc_memory_copy_with_policy(
             // Snapshot the ordered shadow view, not that stale backing allocation.
             apply_agc_memory_shadow(copy.source_address, &mut bytes);
             let bytes = Arc::<[u8]>::from(bytes);
-            let source_snapshot = if retain_event_snapshot {
-                match remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::clone(&bytes)) {
-                    Ok(snapshot) => Some(snapshot),
-                    Err(error) => {
-                        return StagedAgcMemoryCopy {
-                            budget_exceeded: Some(AgcMemorySnapshotBudgetExceeded {
-                                requested_bytes: error.requested_bytes,
-                                limit_bytes: error.limit_bytes,
-                            }),
-                            ..StagedAgcMemoryCopy::default()
-                        };
-                    }
-                }
-            } else {
-                None
-            };
-            (bytes, source_snapshot)
+            let source_snapshot = remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::clone(&bytes))
+                .map_err(|error| AgcMemorySnapshotBudgetExceeded {
+                    requested_bytes: error.requested_bytes,
+                    limit_bytes: error.limit_bytes,
+                })?;
+            (bytes, Some(source_snapshot))
         }
         2 if copy.destination_address.is_multiple_of(4) && copy.byte_count.is_multiple_of(4) => {
             let value = (copy.source_address as u32).to_le_bytes();
@@ -251,14 +220,14 @@ fn stage_agc_memory_copy_with_policy(
             }
             (Arc::<[u8]>::from(bytes), None)
         }
-        _ => return StagedAgcMemoryCopy::default(),
+        _ => return Ok(StagedAgcMemoryCopy::default()),
     };
 
     let mut shadow = agc_memory_shadow()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(shadow) = shadow.as_mut() else {
-        return StagedAgcMemoryCopy::default();
+        return Ok(StagedAgcMemoryCopy::default());
     };
     shadow.writes.push(AgcMemoryShadowWrite {
         address: copy.destination_address,
@@ -266,19 +235,15 @@ fn stage_agc_memory_copy_with_policy(
     });
     shadow.retained_bytes = shadow.retained_bytes.saturating_add(byte_count);
     AGC_MEMORY_SHADOW_WRITE_COUNT.store(shadow.writes.len(), Ordering::Release);
-    StagedAgcMemoryCopy {
+    Ok(StagedAgcMemoryCopy {
         shadowed: true,
         source_snapshot,
-        budget_exceeded: None,
-    }
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_agc_memory_shadow, begin_agc_memory_shadow, stage_agc_memory_copy,
-        stage_agc_memory_copy_with_limit, stage_agc_memory_copy_with_policy,
-    };
+    use super::{apply_agc_memory_shadow, begin_agc_memory_shadow, stage_agc_memory_copy};
 
     #[test]
     fn dma_snapshot_retention_has_an_exact_one_mibibyte_boundary() {
@@ -293,7 +258,8 @@ mod tests {
             source_selection: 3,
             destination_selection: 3,
             source_snapshot: None,
-        });
+        })
+        .expect("exact-boundary snapshot");
         assert!(exact.shadowed);
         assert_eq!(exact.source_snapshot.as_deref().map(<[u8]>::len), Some(MIB));
 
@@ -304,7 +270,8 @@ mod tests {
             source_selection: 3,
             destination_selection: 3,
             source_snapshot: None,
-        });
+        })
+        .expect("oversized copy remains backend-only");
         assert!(!oversized.shadowed);
         assert!(oversized.source_snapshot.is_none());
     }
@@ -320,7 +287,8 @@ mod tests {
             source_selection: 2,
             destination_selection: 3,
             source_snapshot: None,
-        });
+        })
+        .expect("immediate fill shadow");
         assert!(staged.shadowed);
         assert!(staged.source_snapshot.is_none());
     }
@@ -339,7 +307,8 @@ mod tests {
             source_selection: 3,
             destination_selection: 3,
             source_snapshot: None,
-        });
+        })
+        .expect("first shadowed copy");
         let chained = stage_agc_memory_copy(&remu_gpu::GpuMemoryCopy {
             source_address: intermediate.as_ptr().addr() as u64,
             destination_address: destination.as_ptr().addr() as u64,
@@ -347,7 +316,8 @@ mod tests {
             source_selection: 3,
             destination_selection: 3,
             source_snapshot: None,
-        });
+        })
+        .expect("chained shadowed copy");
 
         assert_eq!(chained.source_snapshot.as_deref(), Some(source.as_slice()));
         let mut observed = destination;
@@ -361,66 +331,5 @@ mod tests {
             destination, [0xcd; 4],
             "decode shadow must not mutate guest RAM"
         );
-    }
-
-    #[test]
-    fn snapshot_budget_exhaustion_preserves_the_ordered_backend_fallback() {
-        let source = [0x11_u8, 0x22, 0x33, 0x44];
-        let destination = [0xcd_u8; 4];
-        let _shadow = begin_agc_memory_shadow();
-        let staged = stage_agc_memory_copy_with_limit(
-            &remu_gpu::GpuMemoryCopy {
-                source_address: source.as_ptr().addr() as u64,
-                destination_address: destination.as_ptr().addr() as u64,
-                byte_count: source.len() as u64,
-                source_selection: 3,
-                destination_selection: 3,
-                source_snapshot: None,
-            },
-            0,
-        );
-
-        assert!(!staged.shadowed);
-        assert!(staged.source_snapshot.is_none());
-        assert_eq!(
-            staged.budget_exceeded,
-            Some(super::AgcMemorySnapshotBudgetExceeded {
-                requested_bytes: source.len(),
-                limit_bytes: 0,
-            })
-        );
-        assert_eq!(destination, [0xcd; 4]);
-        let mut observed = destination;
-        apply_agc_memory_shadow(destination.as_ptr().addr() as u64, &mut observed);
-        assert_eq!(
-            observed, destination,
-            "fallback must not invent an early write"
-        );
-    }
-
-    #[test]
-    fn event_snapshot_rollback_keeps_the_decode_order_shadow() {
-        let source = [0x19_u8, 0x28, 0x37, 0x46];
-        let destination = [0xcd_u8; 4];
-        let _shadow = begin_agc_memory_shadow();
-        let staged = stage_agc_memory_copy_with_policy(
-            &remu_gpu::GpuMemoryCopy {
-                source_address: source.as_ptr().addr() as u64,
-                destination_address: destination.as_ptr().addr() as u64,
-                byte_count: source.len() as u64,
-                source_selection: 3,
-                destination_selection: 3,
-                source_snapshot: None,
-            },
-            source.len(),
-            false,
-        );
-
-        assert!(staged.shadowed);
-        assert!(staged.source_snapshot.is_none());
-        let mut observed = destination;
-        apply_agc_memory_shadow(destination.as_ptr().addr() as u64, &mut observed);
-        assert_eq!(observed, source);
-        assert_eq!(destination, [0xcd; 4]);
     }
 }

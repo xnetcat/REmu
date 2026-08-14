@@ -420,19 +420,13 @@ pub(crate) fn agc_handle_submission_packet(
             AgcDmaData::Copy(mut copy) => {
                 // Descriptor and indirect-argument decoding happens synchronously, so following
                 // packets need to observe this copy before the asynchronous backend reaches it.
-                let staged = stage_agc_memory_copy(&copy);
-                copy.source_snapshot = staged.source_snapshot;
-                if let Some(exceeded) = staged.budget_exceeded {
-                    static DMA_SNAPSHOT_BUDGET_FALLBACK_COUNT: AtomicUsize = AtomicUsize::new(0);
-                    let fallback_sequence =
-                        DMA_SNAPSHOT_BUDGET_FALLBACK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                    if fallback_sequence <= 8 || fallback_sequence.is_power_of_two() {
-                        eprintln!(
-                            "[REMu][AGC][DMA] snapshot budget fallback sequence={fallback_sequence} packet={packet_address:#x} requested_bytes={} limit_bytes={} — preserving ordered DMA without a decode-time snapshot",
-                            exceeded.requested_bytes, exceeded.limit_bytes
-                        );
+                let staged = stage_agc_memory_copy(&copy).map_err(|error| {
+                    AgcSubmissionError::MemorySnapshotBudget {
+                        requested_bytes: error.requested_bytes,
+                        limit_bytes: error.limit_bytes,
                     }
-                }
+                })?;
+                copy.source_snapshot = staged.source_snapshot;
                 static DMA_TRACE_COUNT: AtomicUsize = AtomicUsize::new(0);
                 static DMA_SNAPSHOT_COUNT: AtomicUsize = AtomicUsize::new(0);
                 static DMA_SNAPSHOT_BYTES: AtomicUsize = AtomicUsize::new(0);

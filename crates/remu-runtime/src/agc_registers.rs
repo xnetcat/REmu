@@ -1029,6 +1029,13 @@ impl AgcComputeDispatchError {
 
 #[derive(Debug, Error)]
 pub(crate) enum AgcSubmissionError {
+    #[error(
+        "DMA packet-time snapshot budget exceeded: requested {requested_bytes} bytes, limit {limit_bytes} bytes"
+    )]
+    MemorySnapshotBudget {
+        requested_bytes: usize,
+        limit_bytes: usize,
+    },
     #[error("unsupported PM4 packet type {packet_type} at dword {dword} (header 0x{header:08X})")]
     UnsupportedPacketType {
         dword: u32,
