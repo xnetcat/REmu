@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::counters::{
@@ -46,14 +46,19 @@ struct EventSinkState {
 #[derive(Default)]
 struct PublicationCoordinator {
     next_id: u64,
-    queues: BTreeMap<Option<u64>, VecDeque<u64>>,
-    turns: VecDeque<u64>,
+    lanes: BTreeMap<Option<u64>, Arc<PublicationLane>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Default)]
+struct PublicationLane {
+    queue: Mutex<VecDeque<u64>>,
+    changed: Condvar,
+}
+
+#[derive(Clone)]
 struct Publication {
     id: u64,
-    queue_id: Option<u64>,
+    lane: Arc<PublicationLane>,
 }
 
 struct PublicationGuard {
@@ -74,8 +79,7 @@ pub struct GpuEventPublicationTiming {
 }
 
 static GPU_EVENT_SINK: OnceLock<(Mutex<EventSinkState>, Condvar)> = OnceLock::new();
-static GPU_PUBLICATION_COORDINATOR: OnceLock<(Mutex<PublicationCoordinator>, Condvar)> =
-    OnceLock::new();
+static GPU_PUBLICATION_COORDINATOR: OnceLock<Mutex<PublicationCoordinator>> = OnceLock::new();
 static REPORTED_LINEAR_SUBMISSION_CHUNKING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 static GPU_PUBLICATION_TIMING_SAMPLES: AtomicUsize = AtomicUsize::new(0);
@@ -129,11 +133,11 @@ impl PublicationGuard {
     }
 
     fn wait_turn(&self) {
-        wait_for_publication_turn(self.publication);
+        wait_for_publication_turn(&self.publication);
     }
 
     fn complete_chunk(&mut self, finished: bool) {
-        complete_publication_chunk(self.publication, finished);
+        complete_publication_chunk(&self.publication, finished);
         self.finished = finished;
     }
 }
@@ -141,7 +145,7 @@ impl PublicationGuard {
 impl Drop for PublicationGuard {
     fn drop(&mut self) {
         if !self.finished {
-            abort_publication(self.publication);
+            abort_publication(&self.publication);
         }
     }
 }
@@ -217,120 +221,86 @@ fn register_publication(event: &GpuEvent) -> Publication {
         GpuEvent::QueueSubmission { queue_id, .. } => Some(*queue_id),
         _ => None,
     };
-    let (coordinator, _) = GPU_PUBLICATION_COORDINATOR.get_or_init(|| {
-        (
-            Mutex::new(PublicationCoordinator::default()),
-            Condvar::new(),
-        )
-    });
+    let coordinator =
+        GPU_PUBLICATION_COORDINATOR.get_or_init(|| Mutex::new(PublicationCoordinator::default()));
     let mut coordinator = coordinator
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let id = coordinator.next_id;
     coordinator.next_id = coordinator.next_id.saturating_add(1);
-    let queue = coordinator.queues.entry(queue_id).or_default();
-    let becomes_active = queue.is_empty();
-    queue.push_back(id);
-    if becomes_active {
-        coordinator.turns.push_back(id);
-    }
-    Publication { id, queue_id }
+    let lane = Arc::clone(
+        coordinator
+            .lanes
+            .entry(queue_id)
+            .or_insert_with(|| Arc::new(PublicationLane::default())),
+    );
+    // Register while the lane is still reached through the coordinator lock. No completion path
+    // takes the coordinator, so the fixed coordinator -> lane order cannot invert, and two first
+    // publications cannot create separate lanes for one hardware queue.
+    lane.queue
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push_back(id);
+    Publication { id, lane }
 }
 
-fn wait_for_publication_turn(publication: Publication) {
-    let (coordinator, changed) = GPU_PUBLICATION_COORDINATOR.get_or_init(|| {
-        (
-            Mutex::new(PublicationCoordinator::default()),
-            Condvar::new(),
-        )
-    });
-    let mut coordinator = coordinator
+fn wait_for_publication_turn(publication: &Publication) {
+    let mut queue = publication
+        .lane
+        .queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    while coordinator.turns.front().copied() != Some(publication.id) {
-        coordinator = changed
-            .wait(coordinator)
+    while queue.front().copied() != Some(publication.id) {
+        queue = publication
+            .lane
+            .changed
+            .wait(queue)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 
-fn complete_publication_chunk(publication: Publication, finished: bool) {
-    let (coordinator, changed) = GPU_PUBLICATION_COORDINATOR.get_or_init(|| {
-        (
-            Mutex::new(PublicationCoordinator::default()),
-            Condvar::new(),
-        )
-    });
-    let mut coordinator = coordinator
+fn complete_publication_chunk(publication: &Publication, finished: bool) {
+    // The publication owns its hardware lane until its complete submission has entered the
+    // bounded channel. Independent lanes already make progress concurrently in `SyncSender`, so a
+    // continuation neither rotates through a global turnstile nor wakes any parked publisher.
+    if !finished {
+        return;
+    }
+    let mut queue = publication
+        .lane
+        .queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(
-        coordinator.turns.pop_front(),
+        queue.pop_front(),
         Some(publication.id),
-        "only the current fair-publication turn can complete a chunk"
+        "same-queue publications retain FIFO order"
     );
-    if finished {
-        let next = {
-            let queue = coordinator
-                .queues
-                .get_mut(&publication.queue_id)
-                .expect("registered publication owns a queue");
-            assert_eq!(
-                queue.pop_front(),
-                Some(publication.id),
-                "same-queue publications retain FIFO order"
-            );
-            queue.front().copied()
-        };
-        if let Some(next) = next {
-            coordinator.turns.push_back(next);
-        } else {
-            coordinator.queues.remove(&publication.queue_id);
-        }
-    } else {
-        // One chunk per active hardware queue. Moving this publisher to the back ensures a newly
-        // admitted producer queue gets a bounded-channel slot even while a huge submission is
-        // still being split.
-        coordinator.turns.push_back(publication.id);
-    }
-    changed.notify_all();
+    drop(queue);
+    // A Condvar does not promise which waiter `notify_one` selects. Waking the small queue-local
+    // set lets only its new head pass the predicate without reviving publishers on other queues.
+    publication.lane.changed.notify_all();
 }
 
-fn abort_publication(publication: Publication) {
-    let (coordinator, changed) = GPU_PUBLICATION_COORDINATOR.get_or_init(|| {
-        (
-            Mutex::new(PublicationCoordinator::default()),
-            Condvar::new(),
-        )
-    });
-    let mut coordinator = coordinator
+fn abort_publication(publication: &Publication) {
+    let mut queue = publication
+        .lane
+        .queue
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (was_active, next, empty) = {
-        let Some(queue) = coordinator.queues.get_mut(&publication.queue_id) else {
-            return;
-        };
-        let Some(position) = queue.iter().position(|id| *id == publication.id) else {
-            return;
-        };
-        let was_active = position == 0;
-        queue.remove(position);
-        (was_active, queue.front().copied(), queue.is_empty())
+    let Some(position) = queue.iter().position(|id| *id == publication.id) else {
+        return;
     };
+    let was_active = position == 0;
+    queue.remove(position);
+    drop(queue);
     if was_active {
-        coordinator.turns.retain(|id| *id != publication.id);
-        if let Some(next) = next {
-            coordinator.turns.push_back(next);
-        }
+        publication.lane.changed.notify_all();
     }
-    if empty {
-        coordinator.queues.remove(&publication.queue_id);
-    }
-    changed.notify_all();
 }
 
 fn reset_publication_coordinator() {
-    if let Some((coordinator, _)) = GPU_PUBLICATION_COORDINATOR.get() {
+    if let Some(coordinator) = GPU_PUBLICATION_COORDINATOR.get() {
         *coordinator
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = PublicationCoordinator::default();
@@ -620,6 +590,83 @@ mod isolation_tests {
             "clearing the override restores the process-global path"
         );
         super::clear_event_sink();
+    }
+}
+
+#[cfg(test)]
+mod publication_lane_tests {
+    use super::{
+        complete_publication_chunk, register_publication, reset_publication_coordinator,
+        wait_for_publication_turn,
+    };
+    use crate::GpuEvent;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn chunks_retain_one_lane_without_waking_other_hardware_queues() {
+        reset_publication_coordinator();
+        let graphics = register_publication(&GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: Vec::new(),
+        });
+        let later_graphics = register_publication(&GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: Vec::new(),
+        });
+        let compute = register_publication(&GpuEvent::QueueSubmission {
+            queue_id: 33,
+            events: Vec::new(),
+        });
+        assert!(Arc::ptr_eq(&graphics.lane, &later_graphics.lane));
+        assert!(!Arc::ptr_eq(&graphics.lane, &compute.lane));
+        wait_for_publication_turn(&graphics);
+        wait_for_publication_turn(&compute);
+
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (advanced, advanced_rx) = std::sync::mpsc::channel();
+        let waiting = later_graphics.clone();
+        let waiter = std::thread::spawn(move || {
+            entered.send(()).expect("test receiver remains alive");
+            wait_for_publication_turn(&waiting);
+            advanced.send(()).expect("test receiver remains alive");
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("same-queue waiter starts");
+
+        complete_publication_chunk(&graphics, false);
+        complete_publication_chunk(&compute, true);
+        assert_eq!(
+            advanced_rx.recv_timeout(Duration::from_millis(30)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "a continuation and an independent lane must not advance the same-queue successor"
+        );
+
+        complete_publication_chunk(&graphics, true);
+        advanced_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("finishing the lane advances its successor");
+        waiter.join().expect("same-queue waiter advances");
+        complete_publication_chunk(&later_graphics, true);
+        reset_publication_coordinator();
+    }
+
+    #[test]
+    fn non_submission_events_share_one_lifecycle_lane() {
+        reset_publication_coordinator();
+        let first = register_publication(&GpuEvent::HideHostDialog { sequence: 1 });
+        let second = register_publication(&GpuEvent::HideHostDialog { sequence: 2 });
+        let queue = register_publication(&GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: Vec::new(),
+        });
+        assert!(Arc::ptr_eq(&first.lane, &second.lane));
+        assert!(!Arc::ptr_eq(&first.lane, &queue.lane));
+        complete_publication_chunk(&first, true);
+        complete_publication_chunk(&second, true);
+        complete_publication_chunk(&queue, true);
+        reset_publication_coordinator();
     }
 }
 
