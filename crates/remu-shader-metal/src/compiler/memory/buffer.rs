@@ -466,20 +466,12 @@ impl Compiler<'_> {
             } else {
                 "0u".to_owned()
             };
-            let converted = if self.options.ngg_fixed_allocation_fallback {
-                // The fixed-allocation path is the compatibility ABI for pre-register-proof NGG
-                // programs.  Those programs were translated before formatted-buffer nfmt=9 was
-                // interpreted as sRGB; changing that contract alters UE vertex colors and glyph
-                // UV data.  Preserve the old raw payload only for this explicitly legacy path.
-                format!(
-                    "{number_format} == 9u ? {raw} : remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
-                )
-            } else {
-                format!(
-                    "remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
-                )
-            };
-            canonical.push(self.temp("uint", &format!("{bits} == 0u ? {missing} : {converted}")));
+            canonical.push(self.temp(
+                "uint",
+                &format!(
+                    "{bits} == 0u ? {missing} : remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
+                ),
+            ));
         }
         let component_count = format_component_count(
             instruction
