@@ -199,6 +199,11 @@ pub(crate) fn stage_agc_memory_copy(
             if !ProcessGuestMemory.read(copy.source_address, &mut bytes) {
                 return Ok(StagedAgcMemoryCopy::default());
             }
+            // DMA packets are decoded before the asynchronous backend consumes them. A source
+            // may therefore name bytes written by an earlier DMA in this same command stream,
+            // while the underlying guest mapping still contains its old allocation contents.
+            // Snapshot the ordered shadow view, not that stale backing allocation.
+            apply_agc_memory_shadow(copy.source_address, &mut bytes);
             let bytes = Arc::<[u8]>::from(bytes);
             let source_snapshot = remu_gpu::GpuMemoryCopySnapshot::try_new(Arc::clone(&bytes))
                 .map_err(|error| AgcMemorySnapshotBudgetExceeded {
@@ -238,7 +243,7 @@ pub(crate) fn stage_agc_memory_copy(
 
 #[cfg(test)]
 mod tests {
-    use super::{begin_agc_memory_shadow, stage_agc_memory_copy};
+    use super::{apply_agc_memory_shadow, begin_agc_memory_shadow, stage_agc_memory_copy};
 
     #[test]
     fn dma_snapshot_retention_has_an_exact_one_mibibyte_boundary() {
@@ -286,5 +291,45 @@ mod tests {
         .expect("immediate fill shadow");
         assert!(staged.shadowed);
         assert!(staged.source_snapshot.is_none());
+    }
+
+    #[test]
+    fn chained_dma_snapshot_observes_the_prior_shadowed_copy() {
+        let source = [0x11_u8, 0x22, 0x33, 0x44];
+        let intermediate = [0xcd_u8; 4];
+        let destination = [0xcd_u8; 4];
+        let _shadow = begin_agc_memory_shadow();
+
+        stage_agc_memory_copy(&remu_gpu::GpuMemoryCopy {
+            source_address: source.as_ptr().addr() as u64,
+            destination_address: intermediate.as_ptr().addr() as u64,
+            byte_count: source.len() as u64,
+            source_selection: 3,
+            destination_selection: 3,
+            source_snapshot: None,
+        })
+        .expect("first shadowed copy");
+        let chained = stage_agc_memory_copy(&remu_gpu::GpuMemoryCopy {
+            source_address: intermediate.as_ptr().addr() as u64,
+            destination_address: destination.as_ptr().addr() as u64,
+            byte_count: intermediate.len() as u64,
+            source_selection: 3,
+            destination_selection: 3,
+            source_snapshot: None,
+        })
+        .expect("chained shadowed copy");
+
+        assert_eq!(chained.source_snapshot.as_deref(), Some(source.as_slice()));
+        let mut observed = destination;
+        apply_agc_memory_shadow(destination.as_ptr().addr() as u64, &mut observed);
+        assert_eq!(observed, source);
+        assert_eq!(
+            intermediate, [0xcd; 4],
+            "decode shadow must not mutate guest RAM"
+        );
+        assert_eq!(
+            destination, [0xcd; 4],
+            "decode shadow must not mutate guest RAM"
+        );
     }
 }
