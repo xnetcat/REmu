@@ -508,6 +508,10 @@ impl MetalPresenter {
             if !queue_diagnostics.is_empty() {
                 eprintln!("[REMu][PERF-QUEUES] {queue_diagnostics}");
             }
+            let event_loop_report = self.statistics.event_loop_time.take_report();
+            if !event_loop_report.is_empty() {
+                eprintln!("[REMu][PERF-EVENT-LOOP] {event_loop_report}");
+            }
             // A flip-safety wait blocks against this prefix; an entry that never turns safe
             // parks the host queue forever while every guest queue prints empty (the
             // 2026-08-12 RenderThread-starve wedge). Name the first gap so a wedged run

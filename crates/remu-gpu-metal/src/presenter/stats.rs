@@ -687,6 +687,62 @@ pub(super) fn take_mode27_work_details() -> Vec<(Mode27WorkKey, Mode27WorkAggreg
     snapshot
 }
 
+pub(super) const EVENT_LOOP_CLASS_COUNT: usize = 10;
+pub(super) const EVENT_LOOP_CLASS_NAMES: [&str; EVENT_LOOP_CLASS_COUNT] = [
+    "draw",
+    "compute",
+    "copy-write",
+    "acquire",
+    "release",
+    "wait",
+    "flip",
+    "barrier",
+    "submission",
+    "other",
+];
+
+/// Presenter-thread CPU time spent executing each class of guest GPU event.
+///
+/// The crawl investigation needs to know where the event loop's wall time goes when the GPU is
+/// idle and frames still take seconds; per-class totals over a perf window name the hot event
+/// kind directly, which host sampling cannot reliably do against the Rosetta process.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct EventLoopTimeStatistics {
+    counts: [u64; EVENT_LOOP_CLASS_COUNT],
+    nanos: [u64; EVENT_LOOP_CLASS_COUNT],
+}
+
+impl EventLoopTimeStatistics {
+    pub(super) fn record(&mut self, class: usize, elapsed: Duration) {
+        let class = class.min(EVENT_LOOP_CLASS_COUNT - 1);
+        self.counts[class] = self.counts[class].saturating_add(1);
+        self.nanos[class] = self.nanos[class]
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+    }
+
+    /// Formats the window's non-empty classes ordered by spent time and resets the counters.
+    pub(super) fn take_report(&mut self) -> String {
+        let mut classes = (0..EVENT_LOOP_CLASS_COUNT)
+            .filter(|&index| self.counts[index] != 0)
+            .collect::<Vec<_>>();
+        classes.sort_unstable_by_key(|&index| std::cmp::Reverse(self.nanos[index]));
+        let report = classes
+            .iter()
+            .map(|&index| {
+                format!(
+                    "{}={}/{:.1}ms",
+                    EVENT_LOOP_CLASS_NAMES[index],
+                    self.counts[index],
+                    self.nanos[index] as f64 / 1e6,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        *self = Self::default();
+        report
+    }
+}
+
 impl PresenterStatistics {
     pub(super) fn new() -> Self {
         Self {
@@ -740,6 +796,7 @@ impl PresenterStatistics {
             shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics::default(),
             shared_event_ack_phases: SharedEventAckPhaseStatistics::default(),
             terminal_publication: TerminalPublicationStatistics::default(),
+            event_loop_time: EventLoopTimeStatistics::default(),
             gpu_execution_time: Duration::ZERO,
             presentation_queue_latency: Duration::ZERO,
             last_audio_output_frames: remu_gpu::audio_output_frames(),

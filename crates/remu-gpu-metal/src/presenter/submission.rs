@@ -62,6 +62,29 @@ pub(super) enum SharedEventEventDisposition {
     HostEffect,
 }
 
+/// Maps a guest GPU event to its [`super::stats::EVENT_LOOP_CLASS_NAMES`] slot for the
+/// per-window event-loop time report.
+fn event_loop_class(event: &GpuEvent) -> usize {
+    match event {
+        GpuEvent::IndexedDraw(..) => 0,
+        GpuEvent::ComputeDispatch(..) => 1,
+        GpuEvent::MemoryCopy(..) | GpuEvent::MemoryWrite(..) => 2,
+        GpuEvent::MemoryAcquire(..) => 3,
+        GpuEvent::MemoryRelease(..) => 4,
+        GpuEvent::MemoryWait(..)
+        | GpuEvent::RegisteredMemoryWait { .. }
+        | GpuEvent::WaitFlipDone(..) => 5,
+        GpuEvent::Flip { .. } => 6,
+        GpuEvent::PipelineBarrier(..)
+        | GpuEvent::CommandProcessorBarrier
+        | GpuEvent::DmaSyncBarrier
+        | GpuEvent::RenderBackendFlush(..)
+        | GpuEvent::OcclusionQuery { .. } => 7,
+        GpuEvent::QueueSubmission { .. } | GpuEvent::SubmissionBoundary(..) => 8,
+        _ => 9,
+    }
+}
+
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
     pub(super) fn receive_events(&mut self) -> PresenterFlow {
@@ -196,6 +219,7 @@ impl MetalPresenter {
                 }
             };
             let event_processing_started = Instant::now();
+            let event_class = event_loop_class(&event);
             let event_queue_wait = self.receiver.last_event_queue_wait();
             self.set_active_guest_queue(match source {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
@@ -262,6 +286,9 @@ impl MetalPresenter {
                     // acquire executor after it: a later CPU store belongs to later synchronization
                     // and must remain dirty for the next real resource use.
                     self.receiver.finish_event(source);
+                    self.statistics
+                        .event_loop_time
+                        .record(event_class, event_processing_started.elapsed());
                     continue;
                 }
                 let gpu_orderable = disposition == SharedEventEventDisposition::GpuOrderable;
@@ -808,6 +835,9 @@ impl MetalPresenter {
                 }
             }
             self.receiver.finish_event(source);
+            self.statistics
+                .event_loop_time
+                .record(event_class, event_processing_started.elapsed());
             // Do not let a large guest GPU backlog delay an already-requested presentation.
             // In particular, the first flip can precede creation of its translated scanout
             // texture; once a later draw produces that texture, return to Winit immediately so

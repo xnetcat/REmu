@@ -1911,6 +1911,7 @@ struct PresenterStatistics {
     shared_event_host_effect_latency: SharedEventHostEffectLatencyStatistics,
     shared_event_ack_phases: SharedEventAckPhaseStatistics,
     terminal_publication: TerminalPublicationStatistics,
+    event_loop_time: stats::EventLoopTimeStatistics,
     gpu_execution_time: Duration,
     presentation_queue_latency: Duration,
     last_audio_output_frames: u64,
