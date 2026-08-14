@@ -1566,7 +1566,7 @@ impl MetalPresenter {
             let prepared = prepare_indexed_primitive(draw, indices)?;
             primitive = prepared.1;
             let indices = prepared.0;
-            let buffer = self.cached_index_buffer(&device, indices.as_ref())?;
+            let buffer = self.cached_index_buffer(&device, draw, &indices)?;
             Some((indices, buffer))
         } else {
             None
@@ -1590,7 +1590,7 @@ impl MetalPresenter {
             let limits = key
                 .ngg_subgroup_limits
                 .ok_or("NGG mesh draw is missing subgroup sizing registers")?;
-            self.cached_ngg_meshlets(&device, indices.as_ref(), limits)?
+            self.cached_ngg_meshlets(&device, draw, indices, limits)?
         } else {
             None
         };

@@ -60,9 +60,9 @@ use self::decode::{
     initial_depth_clear_for_target, initial_render_target_clear_color, metal_color_write_mask,
     metal_nonindexed_vertex_count, metal_primitive_type, ngg_mesh_base_vertex,
     noop_placeholder_cover_draw, prepare_indexed_ngg_indices, prepare_indexed_primitive,
-    prepare_ngg_meshlets, prepare_nonindexed_ngg_indices, raw_video_out_texture_descriptor,
-    read_draw_indices, register_value, render_target_cmask_address, render_target_fast_clear_color,
-    sampled_alias_descriptor,
+    prepare_ngg_meshlets, prepare_nonindexed_ngg_indices, primitive_restart_index,
+    raw_video_out_texture_descriptor, read_draw_indices, register_value,
+    render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
@@ -2446,11 +2446,49 @@ struct OpenGuestRenderPass {
 }
 
 #[derive(Clone)]
+struct CachedIndexBuffer {
+    source_indices: Arc<[u32]>,
+    buffer: Buffer,
+}
+
+#[derive(Clone)]
 struct CachedNggMeshlets {
+    source_indices: Arc<[u32]>,
     buffer: Buffer,
     group_count: u64,
     vertex_references: usize,
     primitive_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct IndexBufferCacheKey {
+    source_address: u64,
+    source_byte_count: u64,
+    resource_address: u64,
+    index_offset: u32,
+    index_count: u32,
+    index_size: u32,
+    base_vertex: i32,
+    primitive_type: u32,
+    primitive_restart: Option<u32>,
+    snapshot: remu_gpu::IndexSnapshotIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum NggMeshletSourceKey {
+    Indexed(IndexBufferCacheKey),
+    NonIndexed {
+        first_vertex: u32,
+        vertex_count: u32,
+        base_vertex: i32,
+        primitive_type: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct NggMeshletCacheKey {
+    source: NggMeshletSourceKey,
+    limits: NggSubgroupLimits,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2600,8 +2638,8 @@ struct MetalPresenter {
     guest_global_buffer_cache: HashMap<(GuestSharedMappingIdentity, usize), Buffer>,
     guest_global_buffer_cache_bytes: u64,
     global_buffer_cache_bytes: usize,
-    index_buffer_cache: HashMap<Vec<u32>, Buffer>,
-    ngg_meshlet_cache: HashMap<(NggSubgroupLimits, Vec<u32>), CachedNggMeshlets>,
+    index_buffer_cache: HashMap<IndexBufferCacheKey, CachedIndexBuffer>,
+    ngg_meshlet_cache: HashMap<NggMeshletCacheKey, CachedNggMeshlets>,
     diagnostic_vertex_position_buffer: Option<Buffer>,
     diagnostic_pixel_output_buffer: Option<Buffer>,
     resident_content_version: u64,

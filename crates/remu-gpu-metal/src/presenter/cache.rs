@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedGlobalBuffer, CachedNggMeshlets, CachedSamplerArguments, DecodedDepthTarget,
-    GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch, MetalPresenter,
-    NggSubgroupLimits, PendingGlobalWriteback, PhysicalFootprintRange,
+    CachedGlobalBuffer, CachedIndexBuffer, CachedNggMeshlets, CachedSamplerArguments,
+    DecodedDepthTarget, GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch,
+    IndexBufferCacheKey, MetalPresenter, NggMeshletCacheKey, NggMeshletSourceKey, NggSubgroupLimits,
+    PendingGlobalWriteback, PhysicalFootprintRange,
     SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, SharedEventComputeGlobalBindingPlan,
     SharedEventDirectComputePlan, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
     describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
     guest_physical_ranges_overlap, guest_ranges_overlap, metal_buffer_with_bytes,
-    prepare_ngg_meshlets, effective_global_memory_binding_indices,
+    prepare_ngg_meshlets, primitive_restart_index, effective_global_memory_binding_indices,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -32,6 +33,46 @@ use std::time::Instant;
 
 pub(super) static UPLOAD_GLOBALS_CALLS: AtomicU64 = AtomicU64::new(0);
 pub(super) static UPLOAD_GLOBALS_NANOS: AtomicU64 = AtomicU64::new(0);
+
+impl IndexBufferCacheKey {
+    fn for_draw(draw: &remu_gpu::IndexedDraw) -> Option<Self> {
+        let element_size = match draw.index_size {
+            0 => 2_u64,
+            1 => 4,
+            2 => 1,
+            _ => return None,
+        };
+        let source_offset = u64::from(draw.index_offset).checked_mul(element_size)?;
+        let source_address = draw.index_buffer_address.checked_add(source_offset)?;
+        let source_byte_count = u64::from(draw.index_count).checked_mul(element_size)?;
+        Some(Self {
+            source_address,
+            source_byte_count,
+            resource_address: draw.index_resource_address,
+            index_offset: draw.index_offset,
+            index_count: draw.index_count,
+            index_size: draw.index_size,
+            base_vertex: draw.base_vertex,
+            primitive_type: draw.primitive_type,
+            primitive_restart: primitive_restart_index(draw),
+            snapshot: draw.index_snapshot.as_ref()?.identity(),
+        })
+    }
+}
+
+impl NggMeshletSourceKey {
+    fn for_draw(draw: &remu_gpu::IndexedDraw) -> Option<Self> {
+        if draw.indexed {
+            return IndexBufferCacheKey::for_draw(draw).map(Self::Indexed);
+        }
+        Some(Self::NonIndexed {
+            first_vertex: draw.index_offset,
+            vertex_count: draw.index_count,
+            base_vertex: draw.base_vertex,
+            primitive_type: draw.primitive_type,
+        })
+    }
+}
 
 enum QueuedGlobalReadSource {
     None,
@@ -1339,10 +1380,16 @@ impl MetalPresenter {
     pub(super) fn cached_index_buffer(
         &mut self,
         device: &Device,
-        indices: &[u32],
+        draw: &remu_gpu::IndexedDraw,
+        indices: &std::sync::Arc<[u32]>,
     ) -> Result<Buffer, String> {
-        if let Some(cached) = self.index_buffer_cache.get(indices) {
-            return Ok(cached.clone());
+        let cache_key = IndexBufferCacheKey::for_draw(draw);
+        if let Some(cache_key) = cache_key
+            && let Some(cached) = self.index_buffer_cache.get(&cache_key)
+            && (std::sync::Arc::ptr_eq(&cached.source_indices, indices)
+                || cached.source_indices.as_ref() == indices.as_ref())
+        {
+            return Ok(cached.buffer.clone());
         }
         let byte_count = indices
             .len()
@@ -1356,22 +1403,37 @@ impl MetalPresenter {
             unsafe { std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), byte_count) }
         };
         let buffer = metal_buffer_with_bytes(device, bytes)?;
-        if self.index_buffer_cache.len() >= INDEX_BUFFER_CACHE_CAPACITY {
-            self.index_buffer_cache.clear();
+        if let Some(cache_key) = cache_key {
+            if self.index_buffer_cache.len() >= INDEX_BUFFER_CACHE_CAPACITY {
+                self.index_buffer_cache.clear();
+            }
+            self.index_buffer_cache.insert(
+                cache_key,
+                CachedIndexBuffer {
+                    source_indices: std::sync::Arc::clone(indices),
+                    buffer: buffer.clone(),
+                },
+            );
         }
-        self.index_buffer_cache
-            .insert(indices.to_vec(), buffer.clone());
         Ok(buffer)
     }
 
     pub(super) fn cached_ngg_meshlets(
         &mut self,
         device: &Device,
-        indices: &[u32],
+        draw: &remu_gpu::IndexedDraw,
+        indices: &std::sync::Arc<[u32]>,
         limits: NggSubgroupLimits,
     ) -> Result<Option<CachedNggMeshlets>, String> {
-        let cache_key = (limits, indices.to_vec());
-        if let Some(cached) = self.ngg_meshlet_cache.get(&cache_key) {
+        let cache_key = NggMeshletSourceKey::for_draw(draw).map(|source| NggMeshletCacheKey {
+            source,
+            limits,
+        });
+        if let Some(cache_key) = cache_key
+            && let Some(cached) = self.ngg_meshlet_cache.get(&cache_key)
+            && (std::sync::Arc::ptr_eq(&cached.source_indices, indices)
+                || cached.source_indices.as_ref() == indices.as_ref())
+        {
             return Ok(Some(cached.clone()));
         }
         let prepared = prepare_ngg_meshlets(indices, limits);
@@ -1388,15 +1450,18 @@ impl MetalPresenter {
         let bytes =
             unsafe { std::slice::from_raw_parts(prepared.words.as_ptr().cast::<u8>(), byte_count) };
         let cached = CachedNggMeshlets {
+            source_indices: std::sync::Arc::clone(indices),
             buffer: metal_buffer_with_bytes(device, bytes)?,
             group_count: prepared.group_count,
             vertex_references: prepared.vertex_references,
             primitive_count: prepared.primitive_count,
         };
-        if self.ngg_meshlet_cache.len() >= NGG_MESHLET_CACHE_CAPACITY {
-            self.ngg_meshlet_cache.clear();
+        if let Some(cache_key) = cache_key {
+            if self.ngg_meshlet_cache.len() >= NGG_MESHLET_CACHE_CAPACITY {
+                self.ngg_meshlet_cache.clear();
+            }
+            self.ngg_meshlet_cache.insert(cache_key, cached.clone());
         }
-        self.ngg_meshlet_cache.insert(cache_key, cached.clone());
         Ok(Some(cached))
     }
 }
@@ -2151,12 +2216,17 @@ pub(super) const NGG_MESHLET_CACHE_CAPACITY: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::{
+        CachedIndexBuffer, IndexBufferCacheKey, NggMeshletCacheKey, NggMeshletSourceKey,
         QueuedWriteReadMatch, SharedEventGlobalBufferVersion, contained_global_version_offset,
         contained_guest_write_offset, decode_indirect_dwords, stored_identities_overlap,
     };
-    use crate::presenter::PendingGuestWriteRange;
+    use crate::presenter::{
+        MetalPresenter, NggOutputPrimitiveType, NggSubgroupLimits, PendingGuestWriteRange,
+    };
     use metal::{Buffer, Device, MTLResourceOptions};
+    use remu_gpu::{GpuRegister, gpu_event_channel};
     use remu_memory::GuestSharedMappingIdentity;
+    use std::sync::Arc;
 
     /// The backing the producers below resolved when their write was captured.
     const PRODUCER_BACKING: u64 = 7;
@@ -2174,6 +2244,249 @@ mod tests {
         Device::system_default()
             .expect("Metal device")
             .new_buffer(0x100, MTLResourceOptions::StorageModeShared)
+    }
+
+    fn triangle_limits(maximum_outputs: u32) -> NggSubgroupLimits {
+        NggSubgroupLimits::new(
+            3,
+            1,
+            1,
+            0,
+            maximum_outputs,
+            1,
+            Some(NggOutputPrimitiveType::TriangleStrip),
+            None,
+        )
+        .expect("valid triangle subgroup limits")
+    }
+
+    #[test]
+    fn index_cache_key_covers_range_content_and_transform_inputs() {
+        let mut draw = crate::presenter::tests::indexed_draw(0x20_000, 0, 3);
+        draw.index_resource_address = 0x1f_000;
+        draw.index_offset = 2;
+        draw.base_vertex = -7;
+        draw.primitive_type = 6;
+        draw.index_snapshot = Some([0, 1, 2].into());
+        draw.context_registers = Arc::from([
+            GpuRegister {
+                offset: 0x103,
+                value: 0x1234,
+            },
+            GpuRegister {
+                offset: 0x2a5,
+                value: 1,
+            },
+        ]);
+        let key = IndexBufferCacheKey::for_draw(&draw).expect("immutable indexed draw caches");
+        assert_eq!(key.source_address, 0x20_004);
+        assert_eq!(key.source_byte_count, 6);
+        assert_eq!(key.resource_address, 0x1f_000);
+        assert_eq!(key.primitive_restart, Some(0x1234));
+
+        let shared = draw.clone();
+        assert_eq!(IndexBufferCacheKey::for_draw(&shared), Some(key));
+
+        let mut identical_capture = draw.clone();
+        identical_capture.index_snapshot = Some([0, 1, 2].into());
+        assert_eq!(
+            IndexBufferCacheKey::for_draw(&identical_capture),
+            Some(key),
+            "separate immutable captures of identical bytes must amortize the upload"
+        );
+
+        let mut recycled_va = draw.clone();
+        recycled_va.index_snapshot = Some([0, 1, 3].into());
+        assert_ne!(IndexBufferCacheKey::for_draw(&recycled_va), Some(key));
+
+        let mut different_address = draw.clone();
+        different_address.index_buffer_address += 0x1_000;
+        assert_ne!(IndexBufferCacheKey::for_draw(&different_address), Some(key));
+
+        let mutations: [fn(&mut remu_gpu::IndexedDraw); 5] = [
+            |candidate: &mut remu_gpu::IndexedDraw| candidate.base_vertex += 1,
+            |candidate: &mut remu_gpu::IndexedDraw| candidate.primitive_type = 4,
+            |candidate: &mut remu_gpu::IndexedDraw| candidate.index_offset += 1,
+            |candidate: &mut remu_gpu::IndexedDraw| candidate.index_count += 1,
+            |candidate: &mut remu_gpu::IndexedDraw| candidate.index_size = 1,
+        ];
+        for mutate in mutations {
+            let mut candidate = draw.clone();
+            mutate(&mut candidate);
+            assert_ne!(IndexBufferCacheKey::for_draw(&candidate), Some(key));
+        }
+    }
+
+    #[test]
+    fn immutable_index_caches_reuse_content_but_split_recycled_vas_ranges_and_ngg_limits() {
+        let (_sender, receiver) = gpu_event_channel();
+        let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+        let device = presenter.device.as_ref().expect("Metal device").clone();
+        let mut draw = crate::presenter::tests::indexed_draw(0x20_000, 1, 3);
+        draw.index_snapshot = Some([0, 1, 2].into());
+        let original_indices: Arc<[u32]> = Arc::from([0, 1, 2]);
+
+        let first = presenter
+            .cached_index_buffer(&device, &draw, &original_indices)
+            .expect("first index upload");
+        let reused = presenter
+            .cached_index_buffer(&device, &draw, &original_indices)
+            .expect("same snapshot reuses upload");
+        assert!(std::ptr::eq(first.as_ref(), reused.as_ref()));
+        assert_eq!(presenter.index_buffer_cache.len(), 1);
+
+        let mut identical_capture = draw.clone();
+        identical_capture.index_snapshot = Some([0, 1, 2].into());
+        let identical_indices: Arc<[u32]> = Arc::from([0, 1, 2]);
+        let reused_capture = presenter
+            .cached_index_buffer(&device, &identical_capture, &identical_indices)
+            .expect("identical new capture reuses upload");
+        assert!(std::ptr::eq(first.as_ref(), reused_capture.as_ref()));
+        assert_eq!(presenter.index_buffer_cache.len(), 1);
+
+        let mut recycled_va = draw.clone();
+        recycled_va.index_snapshot = Some([3, 4, 5].into());
+        let replacement_indices: Arc<[u32]> = Arc::from([3, 4, 5]);
+        let replacement = presenter
+            .cached_index_buffer(&device, &recycled_va, &replacement_indices)
+            .expect("recycled VA uploads a distinct immutable version");
+        assert!(!std::ptr::eq(first.as_ref(), replacement.as_ref()));
+        assert_eq!(presenter.index_buffer_cache.len(), 2);
+
+        let mut different_address = draw.clone();
+        different_address.index_buffer_address += 0x1_000;
+        let relocated = presenter
+            .cached_index_buffer(&device, &different_address, &original_indices)
+            .expect("same bytes at another source address use another entry");
+        assert!(!std::ptr::eq(first.as_ref(), relocated.as_ref()));
+        assert_eq!(presenter.index_buffer_cache.len(), 3);
+
+        // Model a 128-bit fingerprint collision by placing different immutable bytes under the
+        // exact target key. The retained snapshot comparison must reject it and replace the
+        // entry; fingerprint equality is only a lookup accelerator, never the correctness check.
+        let original_key = IndexBufferCacheKey::for_draw(&draw).expect("original index key");
+        let forced_collision_buffer = replacement.clone();
+        presenter.index_buffer_cache.insert(
+            original_key,
+            CachedIndexBuffer {
+                source_indices: Arc::clone(&replacement_indices),
+                buffer: forced_collision_buffer.clone(),
+            },
+        );
+        let collision_rebuilt = presenter
+            .cached_index_buffer(&device, &draw, &original_indices)
+            .expect("content mismatch under one fingerprint key rebuilds");
+        assert!(!std::ptr::eq(
+            forced_collision_buffer.as_ref(),
+            collision_rebuilt.as_ref()
+        ));
+        assert_eq!(
+            presenter.index_buffer_cache[&original_key]
+                .source_indices
+                .as_ref(),
+            original_indices.as_ref()
+        );
+
+        let first_limits = triangle_limits(3);
+        let wider_limits = triangle_limits(6);
+        let first_meshlets = presenter
+            .cached_ngg_meshlets(&device, &draw, &original_indices, first_limits)
+            .expect("first meshlet upload")
+            .expect("one triangle produces meshlets");
+        let reused_meshlets = presenter
+            .cached_ngg_meshlets(&device, &draw, &original_indices, first_limits)
+            .expect("same meshlet key reuses upload")
+            .expect("one triangle produces meshlets");
+        assert!(std::ptr::eq(
+            first_meshlets.buffer.as_ref(),
+            reused_meshlets.buffer.as_ref()
+        ));
+
+        let recaptured_meshlets = presenter
+            .cached_ngg_meshlets(
+                &device,
+                &identical_capture,
+                &identical_indices,
+                first_limits,
+            )
+            .expect("identical new capture reuses meshlets")
+            .expect("one triangle produces meshlets");
+        assert!(std::ptr::eq(
+            first_meshlets.buffer.as_ref(),
+            recaptured_meshlets.buffer.as_ref()
+        ));
+        assert_eq!(presenter.ngg_meshlet_cache.len(), 1);
+
+        let replacement_meshlets = presenter
+            .cached_ngg_meshlets(&device, &recycled_va, &replacement_indices, first_limits)
+            .expect("changed recycled-VA capture builds meshlets")
+            .expect("one triangle produces meshlets");
+        assert!(!std::ptr::eq(
+            first_meshlets.buffer.as_ref(),
+            replacement_meshlets.buffer.as_ref()
+        ));
+        assert_eq!(presenter.ngg_meshlet_cache.len(), 2);
+
+        let original_meshlet_key = NggMeshletCacheKey {
+            source: NggMeshletSourceKey::for_draw(&draw).expect("original NGG source"),
+            limits: first_limits,
+        };
+        let replacement_meshlet_key = NggMeshletCacheKey {
+            source: NggMeshletSourceKey::for_draw(&recycled_va)
+                .expect("replacement NGG source"),
+            limits: first_limits,
+        };
+        let forced_meshlet_collision = presenter.ngg_meshlet_cache[&replacement_meshlet_key].clone();
+        let forced_meshlet_buffer = forced_meshlet_collision.buffer.clone();
+        presenter
+            .ngg_meshlet_cache
+            .insert(original_meshlet_key, forced_meshlet_collision);
+        let collision_meshlets = presenter
+            .cached_ngg_meshlets(&device, &draw, &original_indices, first_limits)
+            .expect("content mismatch under one NGG fingerprint key rebuilds")
+            .expect("one triangle produces meshlets");
+        assert!(!std::ptr::eq(
+            forced_meshlet_buffer.as_ref(),
+            collision_meshlets.buffer.as_ref()
+        ));
+        assert_eq!(
+            presenter.ngg_meshlet_cache[&original_meshlet_key]
+                .source_indices
+                .as_ref(),
+            original_indices.as_ref()
+        );
+
+        let relocated_meshlets = presenter
+            .cached_ngg_meshlets(&device, &different_address, &original_indices, first_limits)
+            .expect("same bytes at another address build meshlets")
+            .expect("one triangle produces meshlets");
+        assert!(!std::ptr::eq(
+            first_meshlets.buffer.as_ref(),
+            relocated_meshlets.buffer.as_ref()
+        ));
+        assert_eq!(presenter.ngg_meshlet_cache.len(), 3);
+
+        let wider_meshlets = presenter
+            .cached_ngg_meshlets(&device, &draw, &original_indices, wider_limits)
+            .expect("different limits build another meshlet entry")
+            .expect("one triangle produces meshlets");
+        assert!(!std::ptr::eq(
+            first_meshlets.buffer.as_ref(),
+            wider_meshlets.buffer.as_ref()
+        ));
+        assert_eq!(presenter.ngg_meshlet_cache.len(), 4);
+
+        let source = NggMeshletSourceKey::for_draw(&draw).expect("indexed NGG source");
+        assert_ne!(
+            NggMeshletCacheKey {
+                source,
+                limits: first_limits,
+            },
+            NggMeshletCacheKey {
+                source,
+                limits: wider_limits,
+            }
+        );
     }
 
     fn buffer_offset(result: &QueuedWriteReadMatch) -> Option<u64> {

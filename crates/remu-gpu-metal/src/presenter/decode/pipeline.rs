@@ -785,7 +785,7 @@ pub(crate) fn prepare_indexed_primitive(
     Ok((prepared.into(), primitive))
 }
 
-fn primitive_restart_index(draw: &IndexedDraw) -> Option<u32> {
+pub(crate) fn primitive_restart_index(draw: &IndexedDraw) -> Option<u32> {
     const VGT_MULTI_PRIM_IB_RESET_EN: u32 = 0x2a5;
     const VGT_MULTI_PRIM_IB_RESET_INDX: u32 = 0x103;
 

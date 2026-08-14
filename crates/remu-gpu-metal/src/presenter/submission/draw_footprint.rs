@@ -980,7 +980,7 @@ mod tests {
             index_offset: 0,
             base_vertex: 0,
             index_count: 3,
-            index_snapshot: Some(Arc::from([0, 1, 2])),
+            index_snapshot: Some([0, 1, 2].into()),
             draw_flags: 0,
             primitive_type: 4,
             export_shader_address: 0x1000,
