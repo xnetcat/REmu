@@ -37,7 +37,10 @@ pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WIDTH: usize = 1_920;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT: usize = 1_080;
 
-pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL: usize = 7;
+/// Presence, interpolated UV, four guest export components, and four components sampled directly
+/// from texture slot zero at that UV. The direct sample separates stale resident textures from
+/// guest shader control-flow/export failures without changing ordinary pipelines.
+pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL: usize = 11;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX: u64 = 30;
 

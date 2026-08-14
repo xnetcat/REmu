@@ -892,13 +892,34 @@ impl Compiler<'_> {
                                     .saturating_mul(4),
                             );
                         let field = format!("remu_out.mrt{}", output.guest_slot);
+                        let diagnostic_texture_sample = self
+                            .image_kinds
+                            .first()
+                            .filter(|kind| {
+                                kind.component == "float"
+                                    && !kind.storage
+                                    && !kind.comparison
+                                    && crate::compiler::image::metal_image_dimension(**kind) == 1
+                                    && sampler_count != 0
+                            })
+                            .map(|_| {
+                                let sampler = if direct_sampler_bindings {
+                                    "remu_sampler_0"
+                                } else {
+                                    "remu_samplers.s0"
+                                };
+                                format!(
+                                    "float4 remu_debug_texture = tex0.sample({sampler}, float2(remu_in.attr1[0], remu_in.attr1[1]));\n"
+                                )
+                            });
                         let _ = writeln!(
                             source,
                             "    uint2 remu_debug_pixel_xy = uint2(remu_in.frag_coord.xy);\n\
                              \x20   if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_debug_pixel_xy.x < 1920u && remu_debug_pixel_xy.y < 1080u) {{\n\
-                             \x20       uint remu_debug_pixel_base = (remu_debug_pixel_xy.y * 1920u + remu_debug_pixel_xy.x) * 7u;\n\
+                             \x20       uint remu_debug_pixel_base = (remu_debug_pixel_xy.y * 1920u + remu_debug_pixel_xy.x) * 11u;\n\
                              \x20       atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + 1u], as_type<uint>(remu_in.attr1[0]), memory_order_relaxed);\n\
-                             \x20       atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + 2u], as_type<uint>(remu_in.attr1[1]), memory_order_relaxed);"
+                             \x20       atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + 2u], as_type<uint>(remu_in.attr1[1]), memory_order_relaxed);{}",
+                            diagnostic_texture_sample.as_deref().unwrap_or_default()
                         );
                         let diagnostic_values = self
                             .options
@@ -932,6 +953,15 @@ impl Compiler<'_> {
                                 "        atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + {}u], {value}, memory_order_relaxed);",
                                 component + 3
                             );
+                        }
+                        if diagnostic_texture_sample.is_some() {
+                            for component in 0..4 {
+                                let _ = writeln!(
+                                    source,
+                                    "        atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base + {}u], as_type<uint>(remu_debug_texture[{component}]), memory_order_relaxed);",
+                                    component + 7
+                                );
+                            }
                         }
                         source.push_str(
                             "        atomic_store_explicit(&remu_debug_pixel[remu_debug_pixel_base], 1u, memory_order_relaxed);\n\

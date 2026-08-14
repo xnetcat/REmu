@@ -3672,6 +3672,9 @@ impl MetalPresenter {
                         let mut uv_sum = [0.0_f64; 2];
                         let mut uv_minimum = [f32::INFINITY; 2];
                         let mut uv_maximum = [f32::NEG_INFINITY; 2];
+                        let mut texture_sample_sum = [0.0_f64; 4];
+                        let mut texture_sample_minimum = [f32::INFINITY; 4];
+                        let mut texture_sample_maximum = [f32::NEG_INFINITY; 4];
                         for pixel in words
                             .chunks_exact(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL)
                             .filter(|pixel| pixel[0] != 0)
@@ -3696,6 +3699,21 @@ impl MetalPresenter {
                                     above_one[component] += usize::from(values[component] > 1.0);
                                 }
                             }
+                            let texture_sample: [f32; 4] = std::array::from_fn(|component| {
+                                f32::from_bits(pixel[component + 7])
+                            });
+                            if texture_sample.iter().all(|value| value.is_finite()) {
+                                for component in 0..4 {
+                                    texture_sample_sum[component] +=
+                                        f64::from(texture_sample[component]);
+                                    texture_sample_minimum[component] = texture_sample_minimum
+                                        [component]
+                                        .min(texture_sample[component]);
+                                    texture_sample_maximum[component] = texture_sample_maximum
+                                        [component]
+                                        .max(texture_sample[component]);
+                                }
+                            }
                         }
                         let mean = sum.map(|value| {
                             if finite == 0 {
@@ -3705,6 +3723,13 @@ impl MetalPresenter {
                             }
                         });
                         let uv_mean = uv_sum.map(|value| {
+                            if covered == 0 {
+                                0.0
+                            } else {
+                                value / covered as f64
+                            }
+                        });
+                        let texture_sample_mean = texture_sample_sum.map(|value| {
                             if covered == 0 {
                                 0.0
                             } else {
@@ -3721,6 +3746,9 @@ impl MetalPresenter {
                                 let uv = uv_raw.map(f32::from_bits);
                                 let raw = [words[3], words[4], words[5], words[6]];
                                 let value = raw.map(f32::from_bits);
+                                let texture_sample_raw =
+                                    [words[7], words[8], words[9], words[10]];
+                                let texture_sample = texture_sample_raw.map(f32::from_bits);
                                 (
                                     pixel % DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,
                                     pixel / DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,
@@ -3728,6 +3756,8 @@ impl MetalPresenter {
                                     uv,
                                     raw,
                                     value,
+                                    texture_sample_raw,
+                                    texture_sample,
                                 )
                             })
                             .collect::<Vec<_>>();
@@ -3742,6 +3772,11 @@ impl MetalPresenter {
                             maximum,
                             mean,
                             above_one,
+                            (
+                                texture_sample_minimum,
+                                texture_sample_maximum,
+                                texture_sample_mean,
+                            ),
                             first,
                         ))
                     });

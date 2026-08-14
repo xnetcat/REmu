@@ -61,6 +61,70 @@ fn sampled_images_apply_dynamic_descriptor_component_selection_in_the_shader() {
 }
 
 #[test]
+fn pixel_output_diagnostic_samples_the_bound_texture_before_reporting_guest_export() {
+    let control = ImageControl {
+        dmask: 0xf,
+        vector_address: 0,
+        address_registers: vec![0, 1],
+        vector_data: 4,
+        scalar_resource: 0,
+        scalar_sampler: 8,
+        dimension: 1,
+        is_array: false,
+        glc: false,
+        slc: false,
+        a16: false,
+        d16: false,
+        unorm: false,
+    };
+    let instruction = Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Mimg,
+        opcode: Opcode::Known("ImageSample"),
+        words: vec![0, 0],
+        sources: vec![Operand::vector(0), Operand::vector(1), Operand::scalar(0)],
+        destinations: (4..8).map(Operand::vector).collect(),
+        control: Some(InstructionControl::Image(control.clone())),
+    };
+    let mut evaluation = empty_evaluation();
+    let mut resource_descriptor = vec![0; 8];
+    resource_descriptor[3] = 9 << 28;
+    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+        pc: 0,
+        opcode: Opcode::Known("ImageSample"),
+        control,
+        resource_descriptor: resource_descriptor.into(),
+        sampler_descriptor: vec![0; 4].into(),
+        mip_level: None,
+    });
+    let mut options = MetalCompileOptions::pixel(
+        vec![PixelOutputBinding {
+            guest_slot: 0,
+            host_location: 0,
+            kind: PixelOutputKind::Float,
+            export_format: PixelExportFormat::AbgrFp16,
+        }],
+        0,
+        0,
+    );
+    options.diagnostic_capture_pixel_output = true;
+
+    let shader = compile_msl(&Program::new(0x1000, vec![instruction]), &evaluation, &options)
+        .expect("diagnostic sampled pixel shader should lower");
+    assert!(
+        shader.source.contains(
+            "float4 remu_debug_texture = tex0.sample(remu_samplers.s0, float2(remu_in.attr1[0], remu_in.attr1[1]))"
+        ),
+        "diagnostic must sample the actual bound texture before recording the guest export:\n{}",
+        shader.source
+    );
+    assert!(
+        shader.source.contains("remu_debug_pixel_base + 10u"),
+        "all four raw sample components must be recorded"
+    );
+}
+
+#[test]
 fn a8_font_atlas_select_reads_word_three_of_its_own_descriptor_window() {
     // Poppy Playtime's Slate/UMG font atlas: 1024x1024 R8Unorm data whose T# routes red into
     // ALPHA and zeroes RGB (`destination_select = 0x800`, the PF_A8 pattern). Every other traced
