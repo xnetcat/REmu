@@ -57,9 +57,21 @@ impl RangeSet {
     /// This is the only mutation allowed to coarsen: a union widens the claim, and a wider
     /// authority claim can only cost an extra re-materialisation, never stale pixels.
     pub(crate) fn insert(&mut self, other: &Self) {
+        self.insert_exact(other);
+        self.coarsen_if_fragmented();
+    }
+
+    /// Union in place without the authority set's fragmentation coarsening.
+    ///
+    /// Publication debt uses this operation: widening debt would publish bytes which the GPU did
+    /// not author and can overwrite a newer guest write in one of the holes.
+    fn insert_exact(&mut self, other: &Self) {
         for &(start, end) in &other.runs {
             self.insert_run(start, end);
         }
+    }
+
+    fn coarsen_if_fragmented(&mut self) {
         if self.runs.len() > RANGE_SET_MAX_RUNS
             && let Some((start, end)) = self.bounding_run()
         {
@@ -176,9 +188,65 @@ impl RangeSet {
     }
 }
 
+/// Exact GPU publication debt.
+///
+/// This is deliberately a distinct type from `RangeSet`, which represents authority and may
+/// conservatively coarsen after extreme fragmentation. Debt never coarsens: separated runs remain
+/// separated regardless of count.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GpuDebtSet(RangeSet);
+
+impl GpuDebtSet {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub(crate) fn byte_count(&self) -> u64 {
+        self.0.byte_count()
+    }
+
+    pub(crate) fn runs(&self) -> &[(u64, u64)] {
+        self.0.runs()
+    }
+
+    pub(crate) fn insert(&mut self, other: &RangeSet) {
+        self.0.insert_exact(other);
+    }
+
+    pub(crate) fn subtract(&mut self, other: &RangeSet) {
+        self.0.subtract(other);
+    }
+
+    pub(crate) fn intersect(&self, other: &RangeSet) -> RangeSet {
+        self.0.intersect(other)
+    }
+
+    pub(crate) fn as_ranges(&self) -> &RangeSet {
+        &self.0
+    }
+
+    /// Rebase a whole-allocation debt when a layout migration moves every byte.
+    ///
+    /// Sparse debt cannot be translated without a texel-to-byte proof for both layouts. Refuse it
+    /// rather than widening the holes to the new allocation span.
+    pub(crate) fn rebase_whole_span(
+        &self,
+        old_span: &RangeSet,
+        new_span: RangeSet,
+    ) -> Result<Self, &'static str> {
+        if self.is_empty() {
+            return Ok(Self::default());
+        }
+        if self.as_ranges() != old_span {
+            return Err("sparse GPU debt cannot be rebased across a layout change");
+        }
+        Ok(Self(new_span))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RANGE_SET_MAX_RUNS, RangeSet};
+    use super::{GpuDebtSet, RANGE_SET_MAX_RUNS, RangeSet};
 
     fn set(runs: &[(u64, u64)]) -> RangeSet {
         let mut set = RangeSet::default();
@@ -306,5 +374,37 @@ mod tests {
         }
         assert!(set.runs().len() > RANGE_SET_MAX_RUNS);
         assert!(!set.contains_run(2, 4));
+    }
+
+    #[test]
+    fn gpu_debt_never_coarsens_past_the_authority_run_cap() {
+        let mut debt = GpuDebtSet::default();
+        let run_count = RANGE_SET_MAX_RUNS + 65;
+        for index in 0..u64::try_from(run_count).expect("run count fits u64") {
+            debt.insert(&RangeSet::from_run(index * 4, index * 4 + 2));
+        }
+
+        assert_eq!(debt.runs().len(), run_count);
+        assert_eq!(debt.byte_count(), u64::try_from(run_count).unwrap() * 2);
+        for index in 0..u64::try_from(run_count).unwrap() {
+            assert!(debt.as_ranges().contains_run(index * 4, index * 4 + 2));
+            assert!(!debt.as_ranges().contains_run(index * 4 + 2, index * 4 + 4));
+        }
+    }
+
+    #[test]
+    fn sparse_gpu_debt_refuses_whole_span_layout_rebase_without_widening() {
+        let mut debt = GpuDebtSet::default();
+        let run_count = RANGE_SET_MAX_RUNS + 65;
+        for index in 0..u64::try_from(run_count).unwrap() {
+            debt.insert(&RangeSet::from_run(index * 4, index * 4 + 2));
+        }
+        let before = debt.clone();
+        let old_span = RangeSet::from_run(0, u64::try_from(run_count).unwrap() * 4);
+        let new_span = RangeSet::from_run(0, u64::try_from(run_count + 128).unwrap() * 4);
+
+        assert!(debt.rebase_whole_span(&old_span, new_span).is_err());
+        assert_eq!(debt, before, "a refused promotion leaves exact debt unchanged");
+        assert!(!debt.as_ranges().contains_run(2, 4));
     }
 }

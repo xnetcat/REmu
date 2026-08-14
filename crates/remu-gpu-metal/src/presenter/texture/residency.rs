@@ -17,7 +17,7 @@ use super::{
     OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
     OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
     OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
+    GpuDebtSet, RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
     SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
@@ -912,7 +912,7 @@ impl MetalPresenter {
         }
         let mut owners = Vec::new();
         let mut authority = RangeSet::default();
-        let mut debt = RangeSet::default();
+        let mut debt = GpuDebtSet::default();
         let mut full_owner = None;
         for candidate in candidates {
             if candidate == target_descriptor {
@@ -1738,7 +1738,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -1899,7 +1899,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -2027,7 +2027,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -2296,7 +2296,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -2848,7 +2848,7 @@ pub(crate) fn ensure_resident_texture_in_map(
             write_watch,
             span,
             owned,
-            gpu_authored: RangeSet::default(),
+            gpu_authored: GpuDebtSet::default(),
             gpu_content_executed: false,
             state: ResidencyState::Live,
             acquire_invalidated: false,

@@ -4,7 +4,8 @@
 use super::super::GuestMipChainLayout;
 use super::{
     DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
-    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState, ResidentGuestTexture,
+    GpuDebtSet, MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState,
+    ResidentGuestTexture,
     ResidentTextureMap, WriteWatchRefresh, comparison_depth32_upload,
     compressed_texture_block_extent, copy_mode27_mip_level_to_linear,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
@@ -181,7 +182,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
             write_watch,
             span,
             owned,
-            gpu_authored: RangeSet::default(),
+            gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
             state: ResidencyState::Live,
             acquire_invalidated: false,
@@ -227,6 +228,22 @@ pub(crate) fn promote_resident_mip_hierarchy(
     resident: ResidentGuestTexture,
     origin: Mode27WorkOrigin,
 ) -> Result<ResidentGuestTexture, String> {
+    let previous_declared = resident
+        .span
+        .as_ref()
+        .map(RangeSet::for_span)
+        .unwrap_or_default();
+    if resident.gpu_written()
+        && resident
+            .gpu_authored
+            .rebase_whole_span(&previous_declared, previous_declared.clone())
+            .is_err()
+    {
+        return Err(format!(
+            "cannot promote image {:#x}: sparse GPU publication debt has no proven layout translation",
+            descriptor.guest.address
+        ));
+    }
     let underlying_mip_count = descriptor
         .base_mip_level
         .checked_add(descriptor.mip_level_count)
@@ -338,16 +355,17 @@ pub(crate) fn promote_resident_mip_hierarchy(
         "REMu promoted {}-level image {:#x}",
         underlying_mip_count, descriptor.guest.address
     ));
-    // Adding a level moves every other level's offset inside the chain, so the previous runs name
-    // the wrong bytes. The promotion preserves every level's pixels, so a live allocation stays the
-    // authority for its whole grown range and owes exactly what it owed before, widened to that
-    // range — which is the range the pre-B15 code published anyway. A demoted one answers for
+    // Adding a level moves every other level's offset inside the chain, so sparse old-layout runs
+    // cannot name new-layout bytes. The preflight above permits only empty or exact whole-span debt;
+    // a whole-span debt can be rebased without inventing holes. A demoted allocation answers for
     // nothing, and growing its shape does not give it any bytes back.
     let (span, declared) = ResidentGuestTexture::declared_authority(&write_watch);
     let (owned, gpu_authored) = match (resident.state, resident.gpu_written()) {
-        (ResidencyState::Stale(_), _) => (RangeSet::default(), RangeSet::default()),
-        (ResidencyState::Live, true) => (declared.clone(), declared),
-        (ResidencyState::Live, false) => (declared, RangeSet::default()),
+        (ResidencyState::Stale(_), _) => (RangeSet::default(), GpuDebtSet::default()),
+        (ResidencyState::Live, true) => (declared.clone(), resident.gpu_authored
+            .rebase_whole_span(&previous_declared, declared)
+            .map_err(str::to_owned)?),
+        (ResidencyState::Live, false) => (declared, GpuDebtSet::default()),
     };
     eprintln!(
         "[REMu][METAL] encoded ordered mip promotion image={:#x} {}x{} {:?} levels={}->{} gpu_current={}",

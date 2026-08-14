@@ -72,7 +72,7 @@ pub(crate) use self::mips::{
     create_mipmapped_guest_texture, ensure_mipmapped_resident_texture_in_map,
     promote_resident_mip_hierarchy, storage_image_requires_mip_hierarchy,
 };
-pub(crate) use self::ranges::RangeSet;
+pub(crate) use self::ranges::{GpuDebtSet, RangeSet};
 #[cfg(test)]
 pub(crate) use self::residency::rematerialisation_blit_source_origin_y;
 pub(crate) use self::residency::{

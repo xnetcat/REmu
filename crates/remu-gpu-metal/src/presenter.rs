@@ -222,7 +222,7 @@ use self::submission::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, write_back_pending_globals,
 };
 use self::texture::{
-    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
+    GpuDebtSet, RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
     SpanQueryOrder, TextureWritebackOutcome, WrittenRegion, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible,
@@ -1393,7 +1393,7 @@ struct ResidentGuestTexture {
     ///
     /// This is the publication debt the guest is owed, and it is what `gpu_written()` reports.
     /// Bookkeeping settles must not clear it without publishing — that lies that guest RAM agrees.
-    gpu_authored: RangeSet,
+    gpu_authored: GpuDebtSet,
     /// Sticky: the Metal allocation has held executed GPU output at least once.
     ///
     /// Authority subtraction (a neighbour's over-broad `ResourceSpan`, an overlapping alias
@@ -1545,7 +1545,7 @@ impl ResidentGuestTexture {
             "a replaced mapping proves nothing about its bytes and must be removed, not demoted"
         );
         self.owned = RangeSet::default();
-        self.gpu_authored = RangeSet::default();
+        self.gpu_authored = GpuDebtSet::default();
         self.acquire_invalidated = false;
         self.state = ResidencyState::Stale(source);
         OWNED_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
@@ -1685,7 +1685,7 @@ impl ResidentGuestTexture {
         self.gpu_authored.insert(written);
         self.state = ResidencyState::Live;
         debug_assert!(
-            self.owned.contains_all(&self.gpu_authored),
+            self.owned.contains_all(self.gpu_authored.as_ranges()),
             "a resident may only owe bytes it is the authority for"
         );
         debug_assert!(
@@ -1717,7 +1717,7 @@ impl ResidentGuestTexture {
     /// Authority is unchanged: the allocation still defines what these bytes mean, RAM merely
     /// holds the same value now.
     fn clear_gpu_authored(&mut self) {
-        self.gpu_authored = RangeSet::default();
+        self.gpu_authored = GpuDebtSet::default();
     }
 
     fn note_gpu_write(&mut self) {
