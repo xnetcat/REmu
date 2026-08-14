@@ -44,6 +44,7 @@ mod telemetry;
 mod texture;
 mod tiler;
 mod tiling;
+mod worker_bridge;
 use self::cache::{GLOBAL_UPLOAD_ALIGNMENT, GLOBAL_UPLOAD_CHUNK_BYTE_COUNT};
 use self::decode::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_BLEND0_CONTROL,
