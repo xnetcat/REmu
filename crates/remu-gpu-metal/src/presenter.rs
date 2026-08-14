@@ -73,6 +73,7 @@ use self::decode::{
     SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
     VIDEO_OUT_TILING_MODE_TILE, apply_transparent_premultiplied_fill_clear,
     common_render_target_array_length, decode_fast_clear_color, decode_graphics_wave_state,
+    ngg_fixed_allocation_fallback_for_program,
     decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
     decode_ngg_subgroup_limits_with_uc, decode_render_targets_from_registers,
     decode_scanout_target, disabled_metal_blend_attachment, graphics_shader_resource_key,
@@ -352,6 +353,9 @@ struct NggSubgroupLimits {
     max_output_primitives_per_subgroup: u32,
     output_primitive_type: Option<NggOutputPrimitiveType>,
     threadgroup_threads: u32,
+    /// Selects the original fixed wave64 ABI for a fused NGG program with no linked API GS.
+    /// This is program structure, not a property that can be inferred from stale GS registers.
+    fixed_allocation_fallback: bool,
 }
 
 fn sampled_texture_cache_byte_capacity() -> Option<u64> {

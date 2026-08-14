@@ -7,7 +7,10 @@ use metal::{
     MTLTriangleFillMode, MTLWinding, RenderPipelineDescriptor,
 };
 use remu_gpu::{GpuRegister, ShaderSnapshot};
-use remu_shader::{PixelExportFormat, PixelOutputKind, Program, ShaderEvaluation, decode_program};
+use remu_shader::{
+    Instruction, Opcode, Operand, PixelExportFormat, PixelOutputKind, Program, ShaderEncoding,
+    ShaderEvaluation, decode_program, link_program_continuation,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -33,12 +36,13 @@ use super::{
     guest_texture_descriptors_share_depth_sample_storage, indexed_draw,
     initial_depth_clear_for_target, initial_depth_clear_value, initial_render_target_clear_color,
     is_transparent_premultiplied_fill_blend, metal_color_write_mask, metal_nonindexed_vertex_count,
-    metal_primitive_topology_class, metal_primitive_type, ngg_mesh_base_vertex,
-    ngg_mesh_dispatch_required, noop_placeholder_cover_draw, pixel_input_controls,
-    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
-    prepare_nonindexed_ngg_indices, push_gpu_register, read_draw_indices,
-    read_texture_array_linear, read_texture_linear, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear, render_target_cmask_address, render_target_fast_clear_color,
+    metal_primitive_topology_class, metal_primitive_type,
+    ngg_fixed_allocation_fallback_for_program, ngg_mesh_base_vertex, ngg_mesh_dispatch_required,
+    noop_placeholder_cover_draw, pixel_input_controls, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    push_gpu_register, read_draw_indices, read_texture_array_linear, read_texture_linear,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, render_target_cmask_address,
+    render_target_fast_clear_color,
 };
 
 fn empty_shader_evaluation() -> Arc<ShaderEvaluation> {
@@ -2070,6 +2074,39 @@ fn decodes_captured_ngg_subgroup_limits_and_derives_ninety_six_threads() {
         Some(NggOutputPrimitiveType::TriangleStrip)
     );
     assert_eq!(limits.threadgroup_threads, 96);
+}
+
+#[test]
+fn fixed_ngg_allocation_uses_program_linkage_not_stale_gs_registers() {
+    let no_gs = Program::new(0x1000, Vec::new());
+    assert!(ngg_fixed_allocation_fallback_for_program(&no_gs));
+
+    let front = Program::new(
+        0x2000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::Known("SSetpcB64"),
+            words: vec![0xbe80_2006],
+            sources: vec![Operand::scalar(6)],
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let continuation = Program::new(
+        0x3000,
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sopp,
+            opcode: Opcode::END_PROGRAM,
+            words: vec![0xbf81_0000],
+            sources: Vec::new(),
+            destinations: Vec::new(),
+            control: None,
+        }],
+    );
+    let linked = link_program_continuation(&front, &continuation).expect("linked API GS fixture");
+    assert!(!ngg_fixed_allocation_fallback_for_program(&linked));
 }
 
 #[test]

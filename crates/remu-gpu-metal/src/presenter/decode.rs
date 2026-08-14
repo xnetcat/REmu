@@ -51,7 +51,8 @@ pub(crate) use self::pipeline::{
     decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
     decode_ngg_subgroup_limits_with_uc, disabled_metal_blend_attachment,
     graphics_shader_resource_key, is_transparent_premultiplied_fill_blend,
-    metal_primitive_topology_class, ngg_fullscreen_cover_draw,
+    metal_primitive_topology_class, ngg_fixed_allocation_fallback_for_program,
+    ngg_fullscreen_cover_draw,
 };
 #[cfg(test)]
 pub(crate) use self::scanout::{

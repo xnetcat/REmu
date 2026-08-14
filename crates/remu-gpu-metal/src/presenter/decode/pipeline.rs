@@ -270,6 +270,16 @@ pub(crate) const fn ngg_mesh_base_vertex(draw: &IndexedDraw) -> i32 {
     if draw.indexed { draw.base_vertex } else { 0 }
 }
 
+/// The legacy fixed allocation is selected from the actual fused-program shape. Context GS
+/// registers persist across draws and therefore cannot prove that an ordinary no-GS primitive
+/// shader has a linked API geometry stage.
+pub(crate) fn ngg_fixed_allocation_fallback_for_program(program: &remu_shader::Program) -> bool {
+    !program
+        .instructions
+        .iter()
+        .any(|instruction| program.linked_transfer_target(instruction.pc).is_some())
+}
+
 impl NggSubgroupLimits {
     /// No API geometry shader means `VGT_GS_MAX_VERT_OUT` cannot prove that the guest's
     /// `GS_ALLOC_REQ` payload describes the passthrough primitive shader's live output. REmu's
@@ -277,7 +287,12 @@ impl NggSubgroupLimits {
     /// payload. Keep the register-sized path for a real GS, but retain the fixed allocation for
     /// this otherwise ambiguous no-GS ABI.
     pub(crate) const fn uses_fixed_allocation_fallback(self) -> bool {
-        self.gs_max_vertices_out == 0
+        self.fixed_allocation_fallback
+    }
+
+    pub(crate) const fn with_fixed_allocation_fallback(mut self, enabled: bool) -> Self {
+        self.fixed_allocation_fallback = enabled;
+        self
     }
 
     pub(crate) const fn meshlet_vertex_limit(self) -> u32 {
@@ -381,6 +396,10 @@ impl NggSubgroupLimits {
             max_output_primitives_per_subgroup,
             output_primitive_type,
             threadgroup_threads,
+            // Standalone register decoding cannot inspect the shader program. Preserve the old
+            // zero-register fallback for decoder callers; pipeline-key construction below
+            // replaces this proxy with the actual linked-stage classification.
+            fixed_allocation_fallback: gs_max_vertices_out == 0,
         };
         if limits.es_vertices_per_subgroup == 0
             || limits.gs_primitives_per_subgroup == 0
@@ -1251,7 +1270,12 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         })
         .unwrap_or(0x0cc);
     let ngg_subgroup_limits =
-        decode_ngg_subgroup_limits_with_uc(&draw.context_registers, &draw.user_config_registers)?;
+        decode_ngg_subgroup_limits_with_uc(&draw.context_registers, &draw.user_config_registers)?
+            .map(|limits| {
+                limits.with_fixed_allocation_fallback(ngg_fixed_allocation_fallback_for_program(
+                    export_program,
+                ))
+            });
     let ngg_registers = ngg_subgroup_limits
         .map(|_| {
             decode_ngg_registers_from_state(
