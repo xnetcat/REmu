@@ -10,7 +10,7 @@ use remu_shader::{
     build_control_flow_graph,
 };
 
-use crate::MetalCompileError;
+use crate::{MetalCompileError, MetalShaderStage};
 
 #[derive(Clone, Debug)]
 pub(crate) enum ControlFlowLowering {
@@ -141,6 +141,7 @@ pub(crate) fn scalar_branch_taken_condition(name: &str) -> Result<&'static str, 
 
 pub(crate) fn analyze_control_flow(
     program: &Program,
+    stage: MetalShaderStage,
 ) -> Result<ControlFlowLowering, MetalCompileError> {
     let mut instruction_by_pc = BTreeMap::new();
     for (index, instruction) in program.instructions.iter().enumerate() {
@@ -185,19 +186,24 @@ pub(crate) fn analyze_control_flow(
     }
 
     // Prefer remu-shader's StructuredCfg when it proves a Dispatcher-free reducible tree that
-    // actually needs structured emission (If/Loop). That path deletes the step-cap truncation
-    // class for those shapes. Anything the structurer demotes to Dispatcher falls through to the
-    // legacy Forward/Dispatcher arms below — loud in the sense that we never emit structured MSL
-    // from an unproven tree (silently-wrong pixels risk).
-    let cfg = build_control_flow_graph(program);
-    let structured = cfg.structure();
-    if structured_cfg_is_fully_reducible(&structured)
-        && structured_cfg_needs_structured_emission(&structured)
-    {
-        return Ok(ControlFlowLowering::Structured {
-            tree: structured,
-            blocks: cfg.blocks().to_vec(),
-        });
+    // actually needs structured emission (If/Loop). Pixel shaders deliberately keep the legacy
+    // Forward/Dispatcher lowering: converting their scalar EXEC/SCC control into native MSL
+    // branches changes helper-lane and implicit-derivative behaviour around texture samples. A
+    // captured Superliminal glyph shader produced identical inputs and sampled texture bytes but
+    // transparent output after that conversion. The forward PC form preserves the guest's
+    // wave-wide branch sequencing; backward pixel control flow keeps the honest dispatcher seam.
+    // Other stages retain structured loops and therefore the no-step-cap progress guarantee.
+    if stage != MetalShaderStage::Pixel {
+        let cfg = build_control_flow_graph(program);
+        let structured = cfg.structure();
+        if structured_cfg_is_fully_reducible(&structured)
+            && structured_cfg_needs_structured_emission(&structured)
+        {
+            return Ok(ControlFlowLowering::Structured {
+                tree: structured,
+                blocks: cfg.blocks().to_vec(),
+            });
+        }
     }
 
     let forward_only = program

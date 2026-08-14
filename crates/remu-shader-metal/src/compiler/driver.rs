@@ -255,7 +255,7 @@ impl<'a> Compiler<'a> {
                 ));
             }
         }
-        let control_flow = analyze_control_flow(program)?;
+        let control_flow = analyze_control_flow(program, options.stage)?;
         let split_wave64 = matches!(
             options.stage,
             MetalShaderStage::Compute | MetalShaderStage::Mesh

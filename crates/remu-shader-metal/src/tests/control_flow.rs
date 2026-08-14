@@ -575,6 +575,55 @@ fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arra
 }
 
 #[test]
+fn pixel_forward_branch_preserves_legacy_wave_sequencing() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SCbranchScc1"),
+                words: vec![1],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let shader = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::pixel(Vec::new(), 0, 0),
+    )
+    .expect("forward pixel conditional program should lower");
+
+    assert!(!shader.register_footprint.direct_control_flow);
+    assert!(shader.source.contains("uint pc = 0u;"));
+    assert!(shader.source.contains("if (active && pc == 0u)"));
+    assert!(shader.source.contains("pc = (scc) ? 8u : 4u;"));
+    assert!(!shader.source.contains("while (active)"));
+    assert!(!shader.source.contains("switch (pc)"));
+}
+
+#[test]
 fn structured_if_emits_then_arm_instructions_inline() {
     let program = Program::new(
         0x1000,
