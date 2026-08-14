@@ -596,6 +596,7 @@ struct TextureReadbackLayout {
 
 struct PendingTextureReadback {
     command_buffer: CommandBuffer,
+    completion: completion::CommandBufferCompletion,
     staging: Buffer,
     // Keep the source alive independently of Metal command-buffer retention policy.
     _source: Texture,
@@ -1955,6 +1956,7 @@ enum GuestBatchWork {
 struct GuestCommandBatch {
     queue_id: Option<u64>,
     command_buffer: CommandBuffer,
+    completion: completion::CommandBufferCompletion,
     work: Vec<GuestBatchWork>,
     committed_at: Option<Instant>,
     global_upload_chunks: Vec<GlobalUploadChunk>,
@@ -2894,9 +2896,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
         .map_err(|error| format!("event loop failed: {error}"))?;
     presenter.event_loop_waker = Some(event_loop.create_proxy());
     display_link::start_display_link(event_loop.create_proxy());
-    if presenter.per_queue_guest_batches {
-        eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
-    }
+    eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
     if presenter.shared_event_direct_draw_admission {
         eprintln!(
             "[REMu][METAL] experimental disjoint/fence-versioned/resident-versioned direct-draw SharedEvent admission enabled"

@@ -734,7 +734,15 @@ impl OrderedGpuEventReceiver {
     /// ingested, does not count as runnable: the application can sleep until the producer runs.
     /// A memory wait with no ingested producer does keep polling, because only a CPU store or a
     /// release still sitting in the channel can satisfy it.
-    pub(crate) fn has_runnable_events(&self) -> bool {
+    ///
+    /// When the committed-batch budget and open batch are both full, none of these events can be
+    /// admitted. Reporting the queued front as runnable in that state made AppKit use `Poll` while
+    /// `receive_events` returned without consuming anything. The caller parks until the existing
+    /// Metal completion handler wakes the event loop instead.
+    pub(crate) fn has_runnable_events(&self, guest_submission_backpressure_full: bool) -> bool {
+        if guest_submission_backpressure_full {
+            return false;
+        }
         if self.host_block.is_none() && !self.host_events.is_empty() {
             return true;
         }

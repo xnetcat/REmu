@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::cache::metal_buffer_with_guest_backing_range;
+use super::super::completion::CommandBufferCompletion;
 use super::super::submission::{
     SharedEventEventDisposition, append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
@@ -78,6 +79,7 @@ fn committed_per_queue_test_batch(
     if let Some((event, value)) = wait {
         command_buffer.encode_wait_for_event(event, value);
     }
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     command_buffer.commit();
     presenter
         .guest_queue_batches
@@ -87,6 +89,7 @@ fn committed_per_queue_test_batch(
         .push_back(GuestCommandBatch {
             queue_id: Some(queue_id),
             command_buffer: command_buffer.clone(),
+            completion,
             work: Vec::new(),
             committed_at: Some(Instant::now()),
             global_upload_chunks: Vec::new(),
@@ -510,12 +513,14 @@ fn partial_pipeline_flushes_coalesce_without_reordering_submission_completion() 
 
     let command_buffer = queue.new_command_buffer().to_owned();
     let original_command_buffer = command_buffer.clone();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     let encoder = command_buffer
         .new_render_command_encoder(render_pass)
         .to_owned();
     presenter.open_guest_batch = Some(GuestCommandBatch {
         queue_id: None,
         command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -735,12 +740,14 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
     attachment.set_clear_color(MTLClearColor::new(1.0, 0.0, 0.0, 1.0));
 
     let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     let encoder = command_buffer
         .new_render_command_encoder(render_pass)
         .to_owned();
     presenter.open_guest_batch = Some(GuestCommandBatch {
         queue_id: None,
         command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -804,6 +811,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         .expect("guest Metal queue");
     let command_buffer = queue.new_command_buffer().to_owned();
     let original_command_buffer = command_buffer.clone();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     presenter
         .guest_queue_batches
         .get_mut(&7)
@@ -811,6 +819,7 @@ fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
         .open_batch = Some(GuestCommandBatch {
         queue_id: Some(7),
         command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -2366,9 +2375,12 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
         .as_ref()
         .expect("Metal queue")
         .clone();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     presenter.open_guest_batch = Some(GuestCommandBatch {
         queue_id: None,
-        command_buffer: queue.new_command_buffer().to_owned(),
+        command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -2546,12 +2558,14 @@ fn synchronous_failure_drains_later_batches_and_their_completion_labels() {
     .expect("pin completion label mapping");
     for memory_writes in [vec![invalid], vec![completion]] {
         let command_buffer = queue.new_command_buffer().to_owned();
+        let command_buffer_completion = CommandBufferCompletion::attach(&command_buffer);
         command_buffer.commit();
         presenter
             .committed_guest_batches
             .push_back(GuestCommandBatch {
                 queue_id: None,
                 command_buffer,
+                completion: command_buffer_completion,
                 work: Vec::new(),
                 committed_at: None,
                 global_upload_chunks: Vec::new(),
@@ -2603,6 +2617,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
     let event = device.new_shared_event();
     let command_buffer = queue.new_command_buffer().to_owned();
     command_buffer.encode_wait_for_event(&event, 1);
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     command_buffer.commit();
 
     let (_completion_space, completion_address) = mapped_test_label();
@@ -2611,6 +2626,7 @@ fn timed_out_guest_batch_stays_queued_until_metal_reaches_a_terminal_state() {
         .push_back(GuestCommandBatch {
             queue_id: None,
             command_buffer,
+            completion,
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
@@ -2669,6 +2685,7 @@ fn fill_committed_guest_batch_budget(
 ) {
     for index in 0..MAX_COMMITTED_GUEST_BATCHES {
         let command_buffer = queue.new_command_buffer().to_owned();
+        let completion = CommandBufferCompletion::attach(&command_buffer);
         command_buffer.commit();
         let memory_writes = if index == 0 {
             vec![
@@ -2688,6 +2705,7 @@ fn fill_committed_guest_batch_budget(
             .push_back(GuestCommandBatch {
                 queue_id: None,
                 command_buffer,
+                completion,
                 work: Vec::new(),
                 committed_at: None,
                 global_upload_chunks: Vec::new(),
@@ -2823,9 +2841,12 @@ fn opportunistic_flush_defers_at_the_in_flight_batch_budget() {
 fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     let mut batch = GuestCommandBatch {
         queue_id: None,
-        command_buffer: queue.new_command_buffer().to_owned(),
+        command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -2998,12 +3019,14 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
         MTLResourceOptions::StorageModeShared,
     );
     let first_command_buffer = queue.new_command_buffer().to_owned();
+    let first_completion = CommandBufferCompletion::attach(&first_command_buffer);
     first_command_buffer.commit();
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
             queue_id: None,
             command_buffer: first_command_buffer,
+            completion: first_completion,
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
@@ -3057,12 +3080,14 @@ fn stale_shared_global_writeback_does_not_poison_valid_or_later_ordered_work() {
 
     let (_completion_space, completion_address) = mapped_test_label();
     let second_command_buffer = queue.new_command_buffer().to_owned();
+    let second_completion = CommandBufferCompletion::attach(&second_command_buffer);
     second_command_buffer.commit();
     presenter
         .committed_guest_batches
         .push_back(GuestCommandBatch {
             queue_id: None,
             command_buffer: second_command_buffer,
+            completion: second_completion,
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),
@@ -4214,7 +4239,7 @@ fn pending_terminal_wait_skips_periodic_poll_and_wakes_on_exact_publication() {
     );
 
     assert!(
-        !ordered.has_runnable_events(),
+        !ordered.has_runnable_events(false),
         "an in-flight Metal producer is not producerless runnable work"
     );
     ordered.retry_guest_memory_waits();
@@ -4227,7 +4252,7 @@ fn pending_terminal_wait_skips_periodic_poll_and_wakes_on_exact_publication() {
 
     ordered.retry_guest_memory_waits_overlapping(wait.address, 4);
     assert!(!ordered.blocked_queues.contains_key(&0));
-    assert!(ordered.has_runnable_events());
+    assert!(ordered.has_runnable_events(false));
     assert!(matches!(
         ordered.try_recv(|_| true),
         OrderedEventPoll::Event {
@@ -4351,7 +4376,7 @@ fn blocked_wait_diagnostics_report_both_edges_of_a_cross_queue_cycle() {
     ));
     // Both waits already have an ingested producer, so no CPU store is expected to break the
     // deadlock and the presenter may sleep on its idle deadline instead of spinning.
-    assert!(!ordered.has_runnable_events());
+    assert!(!ordered.has_runnable_events(false));
 }
 
 #[test]
@@ -4359,7 +4384,7 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
     let (sender, receiver) = std::sync::mpsc::channel();
     let mut ordered = OrderedGpuEventReceiver::new(receiver);
     let wait = GpuMemoryWait::memory(0x4000, 1, u64::from(u32::MAX), 3, false);
-    assert!(!ordered.has_runnable_events());
+    assert!(!ordered.has_runnable_events(false));
     sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 0,
@@ -4367,7 +4392,11 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
         })
         .expect("queue memory wait");
     ordered.ingest(1);
-    assert!(ordered.has_runnable_events());
+    assert!(ordered.has_runnable_events(false));
+    assert!(
+        !ordered.has_runnable_events(true),
+        "queued work cannot run while the presenter is at its committed/open-batch limit"
+    );
 
     let source = match ordered.try_recv(|_| true) {
         OrderedEventPoll::Event {
@@ -4390,10 +4419,10 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
     ));
     // Nothing is runnable, but no ingested packet can write the label either, so only a CPU
     // store can release this queue. Keep polling rather than sleeping on an AppKit deadline.
-    assert!(ordered.has_runnable_events());
+    assert!(ordered.has_runnable_events(false));
 
     ordered.retry_guest_memory_waits();
-    assert!(ordered.has_runnable_events());
+    assert!(ordered.has_runnable_events(false));
     let source = match ordered.try_recv(|_| true) {
         OrderedEventPoll::Event {
             source,
@@ -4405,7 +4434,7 @@ fn ordered_receiver_reports_only_dependency_runnable_work() {
         other => panic!("expected retried memory wait, got {other:?}"),
     };
     ordered.finish_event(source);
-    assert!(!ordered.has_runnable_events());
+    assert!(!ordered.has_runnable_events(false));
 }
 
 #[test]

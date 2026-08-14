@@ -1727,9 +1727,15 @@ impl ApplicationHandler for MetalPresenter {
         // macOS coalesces the nominal one-millisecond WaitUntil to roughly a display tick under
         // load; combined with GPU_EVENTS_PER_TICK, that imposed a hard command-throughput ceiling
         // while the presenter thread spent most of its time asleep. Dependency-blocked and empty
-        // queues still take the timed idle path, so a static screen does not busy-spin.
-        if self.receiver.has_runnable_events() {
+        // queues still take the timed idle path, so a static screen does not busy-spin. A full
+        // committed/open-batch budget is different: no queued work can advance until Metal
+        // completes a batch, so park without a deadline and let the batch completion proxy wake
+        // AppKit instead of spinning at 100% CPU.
+        let backpressured = self.guest_submission_backpressure_full();
+        if self.receiver.has_runnable_events(backpressured) {
             event_loop.set_control_flow(ControlFlow::Poll);
+        } else if backpressured {
+            event_loop.set_control_flow(ControlFlow::Wait);
         } else {
             event_loop
                 .set_control_flow(ControlFlow::WaitUntil(Instant::now() + EVENT_POLL_INTERVAL));
