@@ -160,7 +160,7 @@ fn accepts_fragmentless_depth_only_pipeline() {
         supplemental_programs: Arc::from([]),
         metadata: None,
     });
-    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    draw.export_shader_evaluation = Some(empty_shader_evaluation().into());
     append_depth_target_registers(&mut draw, 0x0080_10b5_0000, 256, 256, 0xa000_0003, 0x66);
 
     let key = graphics_pipeline_key(&draw).expect("depth-only draw has a Metal pipeline");
@@ -194,7 +194,7 @@ fn carries_pa_cl_vte_cntl_into_pipeline_key() {
         supplemental_programs: Arc::from([]),
         metadata: None,
     });
-    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    draw.export_shader_evaluation = Some(empty_shader_evaluation().into());
     append_depth_target_registers(&mut draw, 0x0080_10b5_0000, 256, 256, 0xa000_0003, 0x66);
     push_gpu_register(
         &mut draw.context_registers,
@@ -242,7 +242,7 @@ fn recognizes_noop_placeholder_cover_without_attachments() {
         supplemental_programs: Arc::from([]),
         metadata: None,
     });
-    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    draw.export_shader_evaluation = Some(empty_shader_evaluation().into());
     assert!(noop_placeholder_cover_draw(&draw));
     assert!(
         graphics_pipeline_key(&draw)
@@ -261,7 +261,7 @@ fn rejects_fragmentless_pipeline_with_color_writes() {
         supplemental_programs: Arc::from([]),
         metadata: None,
     });
-    draw.export_shader_evaluation = Some(empty_shader_evaluation());
+    draw.export_shader_evaluation = Some(empty_shader_evaluation().into());
     push_gpu_register(
         &mut draw.context_registers,
         GpuRegister {

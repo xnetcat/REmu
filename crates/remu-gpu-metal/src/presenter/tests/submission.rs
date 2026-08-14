@@ -9,8 +9,8 @@ use metal::{
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
     GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw, ShaderSnapshot,
-    gpu_event_channel,
+    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw,
+    ShaderEvaluationSnapshot, ShaderSnapshot, gpu_event_channel,
 };
 
 use remu_memory::{
@@ -203,7 +203,7 @@ fn shared_event_depth_draw(address: u64) -> IndexedDraw {
         global_memory_bindings: Vec::new(),
         compute_system_registers: None,
         vertex_inputs: Vec::new(),
-    }));
+    }).into());
     super::append_depth_target_registers(&mut draw, address, 64, 64, 0xa000_0003, 0x66);
     draw
 }
@@ -394,6 +394,102 @@ fn evaluation_with_global(binding: GlobalMemoryBinding) -> ShaderEvaluation {
         global_memory_bindings: vec![binding],
         compute_system_registers: None,
         vertex_inputs: Vec::new(),
+    }
+}
+
+#[test]
+fn global_upload_uses_readonly_sidecar_without_cloning_shader_evaluation() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.per_queue_guest_batches = false;
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter.command_queue.as_ref().expect("Metal queue").clone();
+    presenter.ensure_open_guest_batch(&queue);
+
+    let evaluation = Arc::new(evaluation_with_global(GlobalMemoryBinding {
+        scalar_address: 4,
+        base_address: 0x12_0000,
+        instruction_pcs: Default::default(),
+        byte_count: 4,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    }));
+    let snapshot = ShaderEvaluationSnapshot::with_readonly_global_data(
+        Arc::clone(&evaluation),
+        vec![Some(Arc::from([0x11, 0x22, 0x33, 0x44]))],
+    )
+    .expect("valid packet sidecar");
+
+    let uploaded = presenter
+        .upload_global_buffers(&device, &snapshot)
+        .expect("sidecar uploads");
+    assert!(Arc::ptr_eq(snapshot.evaluation(), &evaluation));
+    assert!(evaluation.global_memory_bindings[0].data.is_empty());
+    // SAFETY: the upload owns at least four shared bytes beginning at its returned offset.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            uploaded[0]
+                .buffer
+                .contents()
+                .cast::<u8>()
+                .add(uploaded[0].offset as usize),
+            4,
+        )
+    };
+    assert_eq!(bytes, [0x11, 0x22, 0x33, 0x44]);
+}
+
+#[test]
+fn null_global_alias_uses_the_live_bindings_sidecar() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.per_queue_guest_batches = false;
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter.command_queue.as_ref().expect("Metal queue").clone();
+    presenter.ensure_open_guest_batch(&queue);
+
+    let mut evaluation = evaluation_with_global(GlobalMemoryBinding {
+        scalar_address: 4,
+        base_address: 0,
+        instruction_pcs: Default::default(),
+        byte_count: 4,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    });
+    evaluation.global_memory_bindings.push(GlobalMemoryBinding {
+        scalar_address: 4,
+        base_address: 0x12_0000,
+        instruction_pcs: Default::default(),
+        byte_count: 4,
+        data: Vec::new(),
+        writable: false,
+        write_back_to_guest: false,
+    });
+    let snapshot = ShaderEvaluationSnapshot::with_readonly_global_data(
+        Arc::new(evaluation),
+        vec![None, Some(Arc::from([0x51, 0x52, 0x53, 0x54]))],
+    )
+    .expect("valid aliased packet sidecar");
+
+    let uploaded = presenter
+        .upload_global_buffers(&device, &snapshot)
+        .expect("aliased sidecar uploads");
+    assert_eq!(uploaded.len(), 2);
+    for upload in uploaded {
+        // SAFETY: each upload owns at least four shared bytes at its returned offset.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                upload
+                    .buffer
+                    .contents()
+                    .cast::<u8>()
+                    .add(upload.offset as usize),
+                4,
+            )
+        };
+        assert_eq!(bytes, [0x51, 0x52, 0x53, 0x54]);
     }
 }
 
@@ -2011,7 +2107,7 @@ fn same_queue_compute_snapshots_unsnapshotted_physical_global_after_the_gpu_wait
             supplemental_programs: Arc::from([]),
             metadata: None,
         }),
-        shader_evaluation: Some(Arc::new(evaluation)),
+        shader_evaluation: Some(Arc::new(evaluation).into()),
         shader_registers: std::sync::Arc::from([]),
     };
     let plan = presenter
@@ -2024,7 +2120,7 @@ fn same_queue_compute_snapshots_unsnapshotted_physical_global_after_the_gpu_wait
     let uploaded = presenter
         .upload_compute_global_buffers(
             &device,
-            dispatch.shader_evaluation.as_deref().unwrap(),
+            dispatch.shader_evaluation.as_ref().unwrap(),
             Some(&plan),
         )
         .expect("retained physical source forks on the GPU");
@@ -5457,7 +5553,7 @@ fn shared_event_checkpoint_cows_copied_global_version_for_direct_compute() {
             supplemental_programs: Arc::from([]),
             metadata: None,
         }),
-        shader_evaluation: Some(Arc::new(evaluation)),
+        shader_evaluation: Some(Arc::new(evaluation).into()),
         shader_registers: std::sync::Arc::from([]),
     };
     assert!(
@@ -5655,7 +5751,7 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
             supplemental_programs: Arc::from([]),
             metadata: None,
         }),
-        shader_evaluation: Some(Arc::new(evaluation)),
+        shader_evaluation: Some(Arc::new(evaluation).into()),
         shader_registers: std::sync::Arc::from([]),
     };
     let plan = presenter
@@ -5664,7 +5760,7 @@ fn same_queue_direct_compute_cows_one_retained_version_for_exact_writable_aliase
     let uploaded = presenter
         .upload_compute_global_buffers(
             &device,
-            dispatch.shader_evaluation.as_deref().unwrap(),
+            dispatch.shader_evaluation.as_ref().unwrap(),
             Some(&plan),
         )
         .expect("planned retained versions upload");

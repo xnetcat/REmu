@@ -8,7 +8,8 @@ use super::{
     GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuCachePolicy,
     GpuEndOfPipeCbDbAction, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuMemoryAcquire,
     GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuRegister, GpuRenderBackendFlush,
-    GpuWaitOperation, HostPadState, audio_output_frames, audio_progress_age_millis,
+    GpuWaitOperation, HostPadState, ShaderEvaluationSnapshot, audio_output_frames,
+    audio_progress_age_millis,
     audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
     decode_compute_system_registers, emit_event, emit_event_with_admission,
@@ -20,12 +21,104 @@ use super::{
     set_host_pad_state, set_progress_telemetry_enabled, take_gpu_completed_flips,
     take_gpu_completed_submission_ids, take_gpu_wait_latch,
 };
-use std::sync::Mutex;
+use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
 static GPU_COMPLETION_NOTIFICATIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn shader_evaluation_with_globals(
+    global_memory_bindings: Vec<GlobalMemoryBinding>,
+) -> Arc<ShaderEvaluation> {
+    Arc::new(ShaderEvaluation {
+        initial_scalar_registers: Default::default(),
+        scalar_registers: Default::default(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: Vec::new(),
+        global_memory_bindings,
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    })
+}
+
+fn readonly_global(byte_count: usize, data: Vec<u8>) -> GlobalMemoryBinding {
+    GlobalMemoryBinding {
+        scalar_address: 0,
+        base_address: 0x20_000,
+        instruction_pcs: Default::default(),
+        byte_count,
+        data,
+        writable: false,
+        write_back_to_guest: false,
+    }
+}
+
+#[test]
+fn shader_evaluation_snapshot_shares_discovery_and_overrides_only_guest_bytes() {
+    let evaluation = shader_evaluation_with_globals(vec![
+        readonly_global(4, Vec::new()),
+        readonly_global(2, vec![8, 9]),
+    ]);
+    let snapshot = ShaderEvaluationSnapshot::with_readonly_global_data(
+        Arc::clone(&evaluation),
+        vec![Some(Arc::from([1, 2, 3, 4])), None],
+    )
+    .expect("valid read-only sidecar");
+
+    assert!(Arc::ptr_eq(snapshot.evaluation(), &evaluation));
+    assert_eq!(
+        snapshot.global_binding_data(0),
+        Some(&[1, 2, 3, 4][..])
+    );
+    assert_eq!(
+        snapshot.global_binding_data(1),
+        Some(&[8, 9][..])
+    );
+    assert!(evaluation.global_memory_bindings[0].data.is_empty());
+}
+
+#[test]
+fn shader_evaluation_snapshot_rejects_inconsistent_sidecars() {
+    let evaluation = shader_evaluation_with_globals(vec![readonly_global(4, Vec::new())]);
+    assert!(
+        ShaderEvaluationSnapshot::with_readonly_global_data(
+            Arc::clone(&evaluation),
+            Vec::new(),
+        )
+        .is_err()
+    );
+    assert!(
+        ShaderEvaluationSnapshot::with_readonly_global_data(
+            Arc::clone(&evaluation),
+            vec![Some(Arc::from([1, 2, 3]))],
+        )
+        .is_err()
+    );
+
+    let writable = shader_evaluation_with_globals(vec![GlobalMemoryBinding {
+        writable: true,
+        ..readonly_global(4, Vec::new())
+    }]);
+    assert!(
+        ShaderEvaluationSnapshot::with_readonly_global_data(
+            writable,
+            vec![Some(Arc::from([1, 2, 3, 4]))],
+        )
+        .is_err()
+    );
+
+    let already_captured =
+        shader_evaluation_with_globals(vec![readonly_global(4, vec![5, 6, 7, 8])]);
+    assert!(
+        ShaderEvaluationSnapshot::with_readonly_global_data(
+            already_captured,
+            vec![Some(Arc::from([1, 2, 3, 4]))],
+        )
+        .is_err()
+    );
+}
 
 struct ProgressTelemetryReset;
 

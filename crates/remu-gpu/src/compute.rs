@@ -4,10 +4,10 @@
 
 use std::sync::Arc;
 
-use remu_shader::{ComputeSystemRegisters, ShaderEvaluation};
+use remu_shader::ComputeSystemRegisters;
 use thiserror::Error;
 
-use crate::{GpuRegister, ShaderSnapshot};
+use crate::{GpuRegister, ShaderEvaluationSnapshot, ShaderSnapshot};
 
 pub const COMPUTE_START_X_REGISTER: u32 = 0x204;
 
@@ -109,7 +109,7 @@ pub struct ComputeDispatch {
     pub shader_address: u64,
     pub shader_prefix: [u32; 4],
     pub shader: Option<ShaderSnapshot>,
-    pub shader_evaluation: Option<Arc<ShaderEvaluation>>,
+    pub shader_evaluation: Option<ShaderEvaluationSnapshot>,
     pub shader_registers: Arc<[GpuRegister]>,
 }
 

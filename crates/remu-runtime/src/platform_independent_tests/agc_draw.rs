@@ -115,7 +115,7 @@ fn explicit_zero_target_mask_does_not_enable_targetless_scanout_fallback() {
         global_memory_bindings: Vec::new(),
         compute_system_registers: None,
         vertex_inputs: Vec::new(),
-    }));
+    }).into());
     crate::agc_resolve_targetless_scanout(
         &mut graphics,
         &mut draw,
@@ -457,7 +457,7 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
         global_memory_bindings: Vec::new(),
         compute_system_registers: None,
         vertex_inputs: Vec::new(),
-    }));
+    }).into());
     crate::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
     assert_eq!(
         draw.scanout_target, None,
@@ -493,7 +493,7 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
         global_memory_bindings: Vec::new(),
         compute_system_registers: None,
         vertex_inputs: Vec::new(),
-    }));
+    }).into());
     crate::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
     assert_eq!(
         draw.scanout_target.map(|scanout| scanout.address),
