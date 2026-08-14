@@ -781,7 +781,7 @@ mod tests {
     use super::*;
     use metal::foreign_types::ForeignType;
     use metal::{Device, MTLStorageMode, MTLTextureType, MTLTextureUsage, TextureDescriptor};
-    use remu_gpu::{GpuRegister, ShaderSnapshot};
+    use remu_gpu::{GpuRegister, ShaderEvaluationSnapshot, ShaderSnapshot};
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -821,6 +821,15 @@ mod tests {
             compute_system_registers: None,
             vertex_inputs: Vec::new(),
         }
+    }
+
+    fn mutate_evaluation(
+        snapshot: &mut ShaderEvaluationSnapshot,
+        mutate: impl FnOnce(&mut ShaderEvaluation),
+    ) {
+        let mut evaluation = Arc::clone(snapshot.evaluation());
+        mutate(Arc::make_mut(&mut evaluation));
+        *snapshot = evaluation.into();
     }
 
     fn snapshot(address: u64, instructions: Vec<Instruction>) -> ShaderSnapshot {
@@ -1182,8 +1191,8 @@ mod tests {
             sampler_descriptor: Vec::new().into(),
             mip_level: None,
         });
-        draw.export_shader_evaluation = Some(Arc::new(export_evaluation));
-        draw.pixel_shader_evaluation = Some(Arc::new(pixel_evaluation));
+        draw.export_shader_evaluation = Some(Arc::new(export_evaluation).into());
+        draw.pixel_shader_evaluation = Some(Arc::new(pixel_evaluation).into());
         draw
     }
 
@@ -1227,7 +1236,7 @@ mod tests {
             .expect("pixel evaluation")
             .clone();
         pixel.global_memory_bindings[0].writable = false;
-        draw.pixel_shader_evaluation = Some(Arc::new(pixel));
+        draw.pixel_shader_evaluation = Some(Arc::new(pixel).into());
         let footprint = direct_draw_footprint(&draw, false).expect("complete draw footprint");
         assert!(
             footprint
@@ -1302,14 +1311,13 @@ mod tests {
         cases.push((supplemental, SharedEventDrawReject::ShaderCoverage));
 
         let mut missing_image = draw.clone();
-        Arc::make_mut(
+        mutate_evaluation(
             missing_image
                 .export_shader_evaluation
                 .as_mut()
                 .expect("export evaluation"),
-        )
-        .image_bindings
-        .clear();
+            |evaluation| evaluation.image_bindings.clear(),
+        );
         cases.push((missing_image, SharedEventDrawReject::ShaderCoverage));
 
         let mut missing_export = draw.clone();
@@ -1347,72 +1355,74 @@ mod tests {
     fn null_stubs_are_ignored_but_nonnull_unmapped_resources_reject() {
         let (_space, base) = mapped_space(16);
         let mut draw = complete_draw(base);
-        let evaluation = Arc::make_mut(
+        mutate_evaluation(
             draw.export_shader_evaluation
                 .as_mut()
                 .expect("export evaluation"),
+            |evaluation| {
+                evaluation.global_memory_bindings.push(GlobalMemoryBinding {
+                    scalar_address: 99,
+                    base_address: 0,
+                    instruction_pcs: Vec::new().into(),
+                    byte_count: 4,
+                    data: vec![0; 4],
+                    writable: false,
+                    write_back_to_guest: false,
+                });
+                evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+                    pc: 999,
+                    opcode: Opcode::Known("ImageSample"),
+                    control: image_control(),
+                    resource_descriptor: vec![0; 8].into(),
+                    sampler_descriptor: vec![0; 4].into(),
+                    mip_level: None,
+                });
+            },
         );
-        evaluation.global_memory_bindings.push(GlobalMemoryBinding {
-            scalar_address: 99,
-            base_address: 0,
-            instruction_pcs: Vec::new().into(),
-            byte_count: 4,
-            data: vec![0; 4],
-            writable: false,
-            write_back_to_guest: false,
-        });
-        evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
-            pc: 999,
-            opcode: Opcode::Known("ImageSample"),
-            control: image_control(),
-            resource_descriptor: vec![0; 8].into(),
-            sampler_descriptor: vec![0; 4].into(),
-            mip_level: None,
-        });
         direct_draw_footprint(&draw, false).expect("true null stubs add no guest interval");
 
-        let evaluation = Arc::make_mut(
+        mutate_evaluation(
             draw.export_shader_evaluation
                 .as_mut()
                 .expect("export evaluation"),
+            |evaluation| {
+                evaluation.global_memory_bindings.push(GlobalMemoryBinding {
+                    scalar_address: 100,
+                    base_address: 0x7fff_0000_0000,
+                    instruction_pcs: Vec::new().into(),
+                    byte_count: 16,
+                    data: vec![0; 16],
+                    writable: false,
+                    write_back_to_guest: false,
+                });
+            },
         );
-        evaluation.global_memory_bindings.push(GlobalMemoryBinding {
-            scalar_address: 100,
-            base_address: 0x7fff_0000_0000,
-            instruction_pcs: Vec::new().into(),
-            byte_count: 16,
-            data: vec![0; 16],
-            writable: false,
-            write_back_to_guest: false,
-        });
         assert_eq!(
             direct_draw_footprint(&draw, false),
             Err(SharedEventDrawReject::Unresolved)
         );
 
         let mut malformed_image = complete_draw(base);
-        Arc::make_mut(
+        mutate_evaluation(
             malformed_image
                 .export_shader_evaluation
                 .as_mut()
                 .expect("export evaluation"),
-        )
-        .image_bindings[0]
-            .resource_descriptor = vec![1].into();
+            |evaluation| evaluation.image_bindings[0].resource_descriptor = vec![1].into(),
+        );
         assert_eq!(
             direct_draw_footprint(&malformed_image, false),
             Err(SharedEventDrawReject::Unresolved)
         );
 
         let mut overflowing_scalar = complete_draw(base);
-        Arc::make_mut(
+        mutate_evaluation(
             overflowing_scalar
                 .export_shader_evaluation
                 .as_mut()
                 .expect("export evaluation"),
-        )
-        .scalar_memory_reads
-        .push((u64::MAX - 1, 0));
+            |evaluation| evaluation.scalar_memory_reads.push((u64::MAX - 1, 0)),
+        );
         assert_eq!(
             direct_draw_footprint(&overflowing_scalar, false),
             Err(SharedEventDrawReject::Unresolved)
@@ -1425,28 +1435,30 @@ mod tests {
         for pc in [4, 8, 12, 16, 20, 24] {
             let mut draw = complete_draw(base);
             if pc <= 16 {
-                let evaluation = Arc::make_mut(
+                mutate_evaluation(
                     draw.export_shader_evaluation
                         .as_mut()
                         .expect("export evaluation"),
+                    |evaluation| {
+                        evaluation.global_memory_bindings.iter_mut().for_each(|binding| {
+                            binding.instruction_pcs.retain(|covered| *covered != pc);
+                        });
+                        evaluation.vertex_inputs.retain(|binding| binding.pc != pc);
+                        evaluation.image_bindings.retain(|binding| binding.pc != pc);
+                    },
                 );
-                evaluation
-                    .global_memory_bindings
-                    .iter_mut()
-                    .for_each(|binding| binding.instruction_pcs.retain(|covered| *covered != pc));
-                evaluation.vertex_inputs.retain(|binding| binding.pc != pc);
-                evaluation.image_bindings.retain(|binding| binding.pc != pc);
             } else {
-                let evaluation = Arc::make_mut(
+                mutate_evaluation(
                     draw.pixel_shader_evaluation
                         .as_mut()
                         .expect("pixel evaluation"),
+                    |evaluation| {
+                        evaluation.global_memory_bindings.iter_mut().for_each(|binding| {
+                            binding.instruction_pcs.retain(|covered| *covered != pc);
+                        });
+                        evaluation.image_bindings.retain(|binding| binding.pc != pc);
+                    },
                 );
-                evaluation
-                    .global_memory_bindings
-                    .iter_mut()
-                    .for_each(|binding| binding.instruction_pcs.retain(|covered| *covered != pc));
-                evaluation.image_bindings.retain(|binding| binding.pc != pc);
             }
             assert_eq!(
                 direct_draw_footprint(&draw, false),

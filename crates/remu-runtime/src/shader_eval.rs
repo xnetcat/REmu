@@ -287,7 +287,7 @@ fn indices_look_like_u32_read_as_u16(indices: &[u32]) -> bool {
 
 pub(crate) fn snapshot_small_readonly_global_bindings(
     evaluation: Arc<remu_shader::ShaderEvaluation>,
-) -> Result<Arc<remu_shader::ShaderEvaluation>, String> {
+) -> Result<remu_gpu::ShaderEvaluationSnapshot, String> {
     // Unity's transient vertex rings in Superliminal expose five overlapping attribute views
     // whose live ranges are about 76 KiB for an ordinary scene draw. Keeping the old 64 KiB
     // cutoff made those views the only draw inputs read lazily by the presenter, after the guest
@@ -303,11 +303,11 @@ pub(crate) fn snapshot_small_readonly_global_bindings(
             && binding.base_address >= 0x10_000
     });
     if !requires_snapshot {
-        return Ok(evaluation);
+        return Ok(evaluation.into());
     }
 
-    let mut snapshot = (*evaluation).clone();
-    for binding in &mut snapshot.global_memory_bindings {
+    let mut snapshots = vec![None; evaluation.global_memory_bindings.len()];
+    for (index, binding) in evaluation.global_memory_bindings.iter().enumerate() {
         if binding.writable
             || !binding.data.is_empty()
             || binding.byte_count > SNAPSHOT_LIMIT
@@ -322,9 +322,9 @@ pub(crate) fn snapshot_small_readonly_global_bindings(
                 binding.base_address, binding.byte_count
             ));
         }
-        binding.data = data;
+        snapshots[index] = Some(data.into());
     }
-    Ok(Arc::new(snapshot))
+    remu_gpu::ShaderEvaluationSnapshot::with_readonly_global_data(evaluation, snapshots)
 }
 
 fn evaluate_shader_snapshot(
@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn snapshots_transient_vertex_bindings_larger_than_sixty_four_kibibytes() {
-        let source = (0..96 * 1024)
+        let mut source = (0..96 * 1024)
             .map(|offset| u8::try_from(offset & 0xff).unwrap())
             .collect::<Vec<_>>();
         let evaluation = ShaderEvaluation {
@@ -739,8 +739,14 @@ mod tests {
             vertex_inputs: Vec::new(),
         };
 
-        let snapshot =
-            snapshot_small_readonly_global_bindings(Arc::new(evaluation)).expect("snapshot");
-        assert_eq!(snapshot.global_memory_bindings[0].data, source);
+        let evaluation = Arc::new(evaluation);
+        let snapshot = snapshot_small_readonly_global_bindings(Arc::clone(&evaluation))
+            .expect("snapshot");
+        assert!(Arc::ptr_eq(snapshot.evaluation(), &evaluation));
+        assert!(snapshot.global_memory_bindings[0].data.is_empty());
+        assert_eq!(snapshot.captured_global_binding_data(0), Some(&*source));
+
+        source.fill(0xa5);
+        assert_ne!(snapshot.captured_global_binding_data(0), Some(&*source));
     }
 }
