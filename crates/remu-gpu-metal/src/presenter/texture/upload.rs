@@ -3,6 +3,7 @@
 
 use super::super::SharedEventDrawTextureOverride;
 use super::super::capture_target_sample_textures;
+use super::super::read_texture_linear;
 use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
@@ -450,6 +451,25 @@ fn settle_gpu_sampled_upload(
     )?;
     upload_buffer.commit();
     upload_buffer.wait_until_completed();
+    if trace_glyph_atlas()
+        && matches!(
+            descriptor.guest.pixel_format,
+            MTLPixelFormat::R8Unorm | MTLPixelFormat::A8Unorm
+        )
+    {
+        match read_texture_linear(device, queue, &texture, descriptor.guest) {
+            Ok(linear) => trace_glyph_atlas_linear(
+                descriptor.guest,
+                descriptor.destination_select,
+                &[],
+                &linear,
+            ),
+            Err(error) => eprintln!(
+                "[REMu][METAL][GLYPH-CONTENT] readback failed at {:#x}: {error}",
+                descriptor.guest.address,
+            ),
+        }
+    }
     Ok(texture)
 }
 
