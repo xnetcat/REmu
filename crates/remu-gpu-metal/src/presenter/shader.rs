@@ -35,6 +35,7 @@ pub(crate) use self::compile::{
 mod program;
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
+    effective_global_memory_binding_indices,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
     is_storage_image_opcode, is_writable_image_opcode, log_wave64_hazard_census,
@@ -415,7 +416,7 @@ impl MetalPresenter {
             draw.pixel_shader.as_ref(),
             draw.pixel_shader_evaluation.as_ref(),
         ) {
-            (Some(pixel), Some(evaluation)) => (pixel.program.as_ref(), evaluation.as_ref()),
+            (Some(pixel), Some(evaluation)) => (pixel.program.as_ref(), evaluation),
             (None, None) if key.targets.is_empty() && key.depth.is_some() => (
                 fragmentless_pixel_program().as_ref(),
                 fragmentless_pixel_evaluation(),
@@ -560,7 +561,7 @@ impl MetalPresenter {
                 image_binding_fetches_descriptor_at_runtime(binding, true)
                     != binding.descriptor_index_is_runtime
             }) {
-            pixel_evaluation_with_tables = pixel_evaluation.clone();
+            pixel_evaluation_with_tables = (**pixel_evaluation).clone();
             for binding in &mut pixel_evaluation_with_tables.image_bindings {
                 binding.descriptor_index_is_runtime =
                     image_binding_fetches_descriptor_at_runtime(binding, true);

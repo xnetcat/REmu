@@ -4,11 +4,11 @@
 use super::{ComputePipelineKey, ProgramIdentity, image_component_class, register_value};
 #[cfg(test)]
 use crate::presenter::decode::pixel_input_controls;
-use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw};
+use remu_gpu::{ComputeDispatch, GpuRegister, IndexedDraw, ShaderEvaluationSnapshot};
 use remu_shader::{
     InstructionControl, OperandKind, Program, ShaderEvaluation, image_is_comparison,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
 /// Canonical empty pixel program used by depth/stencil-only draws.
@@ -31,16 +31,19 @@ pub(crate) fn fragmentless_pixel_program() -> &'static Arc<Program> {
 /// The generated Metal `fragment void` entry point still carries the backend's scalar-buffer
 /// parameter. Supply one inert dword so normal encoder binding remains valid while the stage has
 /// no guest resources or side effects.
-pub(crate) fn fragmentless_pixel_evaluation() -> &'static ShaderEvaluation {
-    static EVALUATION: OnceLock<ShaderEvaluation> = OnceLock::new();
-    EVALUATION.get_or_init(|| ShaderEvaluation {
-        initial_scalar_registers: std::iter::once(0).collect(),
-        scalar_registers: std::iter::once(0).collect(),
-        scalar_memory_reads: Vec::new(),
-        image_bindings: Vec::new(),
-        global_memory_bindings: Vec::new(),
-        compute_system_registers: None,
-        vertex_inputs: Vec::new(),
+pub(crate) fn fragmentless_pixel_evaluation() -> &'static ShaderEvaluationSnapshot {
+    static EVALUATION: OnceLock<ShaderEvaluationSnapshot> = OnceLock::new();
+    EVALUATION.get_or_init(|| {
+        Arc::new(ShaderEvaluation {
+            initial_scalar_registers: std::iter::once(0).collect(),
+            scalar_registers: std::iter::once(0).collect(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        })
+        .into()
     })
 }
 
@@ -320,6 +323,36 @@ pub(crate) fn effective_global_memory_binding<'a>(
             candidate.scalar_address == binding.scalar_address && candidate.base_address != 0
         })
         .unwrap_or(binding)
+}
+
+/// Resolves every packet binding to its effective cached-evaluation index in one linear pass.
+///
+/// Null stubs can alias a later live binding on the same scalar slot. Returning indices lets
+/// packet sidecars follow that alias without a pointer scan for each upload.
+pub(crate) fn effective_global_memory_binding_indices(
+    evaluation: &ShaderEvaluation,
+) -> Vec<usize> {
+    let mut live_by_scalar = HashMap::new();
+    for (index, binding) in evaluation.global_memory_bindings.iter().enumerate() {
+        if binding.base_address != 0 {
+            live_by_scalar.entry(binding.scalar_address).or_insert(index);
+        }
+    }
+    evaluation
+        .global_memory_bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            if binding.base_address != 0 || binding.byte_count > 4 {
+                index
+            } else {
+                live_by_scalar
+                    .get(&binding.scalar_address)
+                    .copied()
+                    .unwrap_or(index)
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn shader_scalar_metadata(evaluation: &ShaderEvaluation) -> Result<Vec<u32>, String> {

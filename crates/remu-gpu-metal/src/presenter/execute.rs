@@ -913,7 +913,7 @@ impl MetalPresenter {
             draw.pixel_shader.as_ref(),
             draw.pixel_shader_evaluation.as_ref(),
         ) {
-            (Some(_), Some(evaluation)) => evaluation.as_ref(),
+            (Some(_), Some(evaluation)) => evaluation,
             (None, None) if targets.is_empty() && depth.is_some() => {
                 fragmentless_pixel_evaluation()
             }

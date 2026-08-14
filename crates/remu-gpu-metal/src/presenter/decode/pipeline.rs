@@ -1303,7 +1303,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         draw.pixel_shader.as_ref(),
         draw.pixel_shader_evaluation.as_ref(),
     ) {
-        (Some(pixel), Some(evaluation)) => (&pixel.program, evaluation.as_ref(), false),
+        (Some(pixel), Some(evaluation)) => (&pixel.program, evaluation, false),
         (None, None) if targets.is_empty() && depth.is_some() => (
             fragmentless_pixel_program(),
             fragmentless_pixel_evaluation(),

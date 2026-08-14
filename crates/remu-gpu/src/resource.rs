@@ -49,6 +49,111 @@ pub struct ShaderSnapshot {
     pub metadata: Option<Arc<ShaderMetadata>>,
 }
 
+/// One cached shader evaluation together with packet-time copies of transient read-only globals.
+///
+/// Resource discovery is shared across draws through `evaluation`. Only the guest bytes which can
+/// be recycled before the presenter consumes the draw are retained per packet. Keeping the two in
+/// one value makes it impossible to attach a sidecar to a different evaluation accidentally.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ShaderEvaluationSnapshot {
+    evaluation: Arc<ShaderEvaluation>,
+    readonly_global_data: Arc<[Option<Arc<[u8]>>]>,
+}
+
+impl ShaderEvaluationSnapshot {
+    /// Attaches index-aligned packet snapshots to `evaluation` after validating every override.
+    pub fn with_readonly_global_data(
+        evaluation: Arc<ShaderEvaluation>,
+        readonly_global_data: Vec<Option<Arc<[u8]>>>,
+    ) -> Result<Self, String> {
+        if readonly_global_data.len() != evaluation.global_memory_bindings.len() {
+            return Err(format!(
+                "shader evaluation has {} global bindings but {} packet snapshots",
+                evaluation.global_memory_bindings.len(),
+                readonly_global_data.len(),
+            ));
+        }
+        for (index, (binding, data)) in evaluation
+            .global_memory_bindings
+            .iter()
+            .zip(&readonly_global_data)
+            .enumerate()
+        {
+            let Some(data) = data else {
+                continue;
+            };
+            if binding.writable {
+                return Err(format!(
+                    "packet snapshot {index} overrides a writable global binding"
+                ));
+            }
+            if !binding.data.is_empty() {
+                return Err(format!(
+                    "packet snapshot {index} overrides data already captured by evaluation"
+                ));
+            }
+            if data.len() != binding.byte_count {
+                return Err(format!(
+                    "packet snapshot {index} has {} bytes, expected {}",
+                    data.len(),
+                    binding.byte_count,
+                ));
+            }
+        }
+        Ok(Self {
+            evaluation,
+            readonly_global_data: readonly_global_data.into(),
+        })
+    }
+
+    /// The shared resource-discovery result. Draw snapshots never clone its owned vectors.
+    #[must_use]
+    pub fn evaluation(&self) -> &Arc<ShaderEvaluation> {
+        &self.evaluation
+    }
+
+    /// Packet-time bytes for one binding, when that binding needed a transient snapshot.
+    #[must_use]
+    pub fn captured_global_binding_data(&self, index: usize) -> Option<&[u8]> {
+        self.readonly_global_data
+            .get(index)
+            .and_then(Option::as_deref)
+    }
+
+    /// Effective bytes for one binding: packet sidecar first, cached evaluation second.
+    #[must_use]
+    pub fn global_binding_data(&self, index: usize) -> Option<&[u8]> {
+        let binding = self.evaluation.global_memory_bindings.get(index)?;
+        Some(
+            self.captured_global_binding_data(index)
+                .unwrap_or(&binding.data),
+        )
+    }
+}
+
+impl From<Arc<ShaderEvaluation>> for ShaderEvaluationSnapshot {
+    fn from(evaluation: Arc<ShaderEvaluation>) -> Self {
+        Self {
+            evaluation,
+            readonly_global_data: Arc::from([]),
+        }
+    }
+}
+
+impl std::ops::Deref for ShaderEvaluationSnapshot {
+    type Target = ShaderEvaluation;
+
+    fn deref(&self) -> &Self::Target {
+        &self.evaluation
+    }
+}
+
+impl AsRef<ShaderEvaluation> for ShaderEvaluationSnapshot {
+    fn as_ref(&self) -> &ShaderEvaluation {
+        &self.evaluation
+    }
+}
+
 /// Exact GFX10 color-surface state retained for a display buffer that is named by a later
 /// `VideoOut` flip. Some games issue their final sampled blit without rebinding `CB_COLOR`; the
 /// command processor associates that draw with a previously programmed scanout surface instead
@@ -132,8 +237,8 @@ pub struct IndexedDraw {
     pub pixel_shader_prefix: [u32; 4],
     pub export_shader: Option<ShaderSnapshot>,
     pub pixel_shader: Option<ShaderSnapshot>,
-    pub export_shader_evaluation: Option<Arc<ShaderEvaluation>>,
-    pub pixel_shader_evaluation: Option<Arc<ShaderEvaluation>>,
+    pub export_shader_evaluation: Option<ShaderEvaluationSnapshot>,
+    pub pixel_shader_evaluation: Option<ShaderEvaluationSnapshot>,
     pub color_target_address: u64,
     pub scanout_target: Option<GpuScanoutTarget>,
     pub context_registers: Arc<[GpuRegister]>,

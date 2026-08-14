@@ -10,7 +10,7 @@ use super::{
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
     describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
     guest_physical_ranges_overlap, guest_ranges_overlap, metal_buffer_with_bytes,
-    prepare_ngg_meshlets,
+    prepare_ngg_meshlets, effective_global_memory_binding_indices,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -22,6 +22,7 @@ use remu_memory::{
     GuestSharedBackingRange, GuestSharedMappingIdentity, guest_shared_backing_any_range_overlaps,
     guest_shared_backing_identity, guest_shared_backing_range, read_guest_shared_backing,
 };
+use remu_gpu::ShaderEvaluationSnapshot;
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -193,7 +194,7 @@ impl MetalPresenter {
             self.ensure_active_open_guest_batch()?;
             return self.upload_fresh_global_buffer(device, &binding);
         }
-        self.upload_global_buffer_from_source(device, &binding, source)
+        self.upload_global_buffer_from_source(device, &binding, &binding.data, source)
     }
 
     pub(super) fn upload_indirect_dispatch_arguments(
@@ -371,7 +372,7 @@ impl MetalPresenter {
     pub(super) fn upload_global_buffers(
         &mut self,
         device: &Device,
-        evaluation: &ShaderEvaluation,
+        evaluation: &ShaderEvaluationSnapshot,
     ) -> Result<Vec<UploadedGlobalBuffer>, String> {
         let started = Instant::now();
         let uploaded = self.upload_global_buffers_untimed(device, evaluation);
@@ -386,14 +387,14 @@ impl MetalPresenter {
     fn upload_global_buffers_untimed(
         &mut self,
         device: &Device,
-        evaluation: &ShaderEvaluation,
+        evaluation: &ShaderEvaluationSnapshot,
     ) -> Result<Vec<UploadedGlobalBuffer>, String> {
         // Alias null stubs to a live sibling on the same SGPR slot so draw-time Metal buffers and
         // remu_initial_s lengths stay coherent even if evaluation left both entries (glyph tofu).
-        let effective_bindings = evaluation
-            .global_memory_bindings
+        let effective_binding_indices = effective_global_memory_binding_indices(evaluation);
+        let effective_bindings = effective_binding_indices
             .iter()
-            .map(|binding| effective_global_memory_binding(evaluation, binding))
+            .map(|&index| &evaluation.global_memory_bindings[index])
             .collect::<Vec<_>>();
         let sources = effective_bindings
             .iter()
@@ -407,10 +408,17 @@ impl MetalPresenter {
             self.ensure_active_open_guest_batch()?;
             return effective_bindings
                 .into_iter()
+                .zip(effective_binding_indices)
                 .zip(sources)
-                .map(|(binding, source)| {
+                .map(|((binding, binding_index), source)| {
                     if matches!(source, QueuedGlobalReadSource::None) {
-                        self.upload_global_buffer_from_packet(device, binding)
+                        self.upload_global_buffer_from_packet(
+                            device,
+                            binding,
+                            evaluation
+                                .global_binding_data(binding_index)
+                                .ok_or("effective global binding index is out of range")?,
+                        )
                     } else {
                         trace_global_coherence(binding, "synchronized");
                         self.upload_fresh_global_buffer(device, binding)
@@ -420,15 +428,25 @@ impl MetalPresenter {
         }
         effective_bindings
             .into_iter()
+            .zip(effective_binding_indices)
             .zip(sources)
-            .map(|(binding, source)| self.upload_global_buffer_from_source(device, binding, source))
+            .map(|((binding, binding_index), source)| {
+                self.upload_global_buffer_from_source(
+                    device,
+                    binding,
+                    evaluation
+                        .global_binding_data(binding_index)
+                        .ok_or("effective global binding index is out of range")?,
+                    source,
+                )
+            })
             .collect()
     }
 
     pub(super) fn upload_compute_global_buffers(
         &mut self,
         device: &Device,
-        evaluation: &ShaderEvaluation,
+        evaluation: &ShaderEvaluationSnapshot,
         plan: Option<&SharedEventDirectComputePlan>,
     ) -> Result<Vec<UploadedGlobalBuffer>, String> {
         let Some(plan) = plan else {
@@ -437,10 +455,10 @@ impl MetalPresenter {
         if plan.global_bindings.len() != evaluation.global_memory_bindings.len() {
             return Err("shared compute plan/global binding count mismatch".to_owned());
         }
-        let effective_bindings = evaluation
-            .global_memory_bindings
+        let effective_binding_indices = effective_global_memory_binding_indices(evaluation);
+        let effective_bindings = effective_binding_indices
             .iter()
-            .map(|binding| effective_global_memory_binding(evaluation, binding))
+            .map(|&index| &evaluation.global_memory_bindings[index])
             .collect::<Vec<_>>();
         let mut group_destinations: Vec<Option<UploadedGlobalBuffer>> =
             vec![None; effective_bindings.len()];
@@ -497,7 +515,13 @@ impl MetalPresenter {
                 )?);
             } else {
                 uploaded.push(
-                    self.upload_global_buffer_from_packet(device, effective_bindings[index])?,
+                    self.upload_global_buffer_from_packet(
+                        device,
+                        effective_bindings[index],
+                        evaluation
+                            .global_binding_data(effective_binding_indices[index])
+                            .ok_or("effective global binding index is out of range")?,
+                    )?,
                 );
             }
         }
@@ -517,13 +541,14 @@ impl MetalPresenter {
             trace_global_coherence(binding, "synchronized");
             return self.upload_fresh_global_buffer(device, binding);
         }
-        self.upload_global_buffer_from_source(device, binding, source)
+        self.upload_global_buffer_from_source(device, binding, &binding.data, source)
     }
 
     fn upload_global_buffer_from_source(
         &mut self,
         device: &Device,
         binding: &GlobalMemoryBinding,
+        packet_data: &[u8],
         source: QueuedGlobalReadSource,
     ) -> Result<UploadedGlobalBuffer, String> {
         if binding.writable {
@@ -567,7 +592,9 @@ impl MetalPresenter {
             QueuedGlobalReadSource::Synchronize => {
                 unreachable!("synchronizing global sources are handled before upload")
             }
-            QueuedGlobalReadSource::None => self.upload_global_buffer_from_packet(device, binding),
+            QueuedGlobalReadSource::None => {
+                self.upload_global_buffer_from_packet(device, binding, packet_data)
+            }
         }
     }
 
@@ -575,6 +602,7 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         binding: &GlobalMemoryBinding,
+        packet_data: &[u8],
     ) -> Result<UploadedGlobalBuffer, String> {
         // Packet-time snapshots must win over the identity-mapped view. The guest can recycle
         // transient constants and small vertex buffers while this presenter is still compiling
@@ -583,12 +611,12 @@ impl MetalPresenter {
         if binding.writable {
             return self.upload_writable_global_buffer_from_packet(device, binding);
         }
-        if binding.data.len() != binding.byte_count
+        if packet_data.len() != binding.byte_count
             && let Some(uploaded) = self.upload_identity_global_buffer(device, binding)?
         {
             return Ok(uploaded);
         }
-        if binding.data.len() != binding.byte_count {
+        if packet_data.len() != binding.byte_count {
             // Large bindings are deliberately not always captured in the packet. If page
             // alignment crosses an unmapped edge, use the physical-backing registry to copy the
             // exact requested range rather than asking Metal to pin the invalid aligned span.
@@ -601,7 +629,7 @@ impl MetalPresenter {
         let (buffer, offset) = self
             .active_open_guest_batch_mut()
             .ok_or("captured global upload has no open guest batch")?
-            .upload_global_bytes(device, &binding.data)?;
+            .upload_global_bytes(device, packet_data)?;
         Ok(UploadedGlobalBuffer {
             buffer,
             offset,
