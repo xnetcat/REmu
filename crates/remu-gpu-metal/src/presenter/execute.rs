@@ -7,7 +7,8 @@ use super::{
     CompiledComputePipeline, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
     DEFAULT_CB_COLOR_CONTROL, DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
-    DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+    DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL,
+    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
     GuestBatchWork, GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
@@ -1019,7 +1020,7 @@ impl MetalPresenter {
             if self.diagnostic_pixel_output_buffer.is_none() {
                 let byte_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
                     .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)
-                    .and_then(|pixels| pixels.checked_mul(5))
+                    .and_then(|pixels| pixels.checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL))
                     .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
                     .and_then(|bytes| u64::try_from(bytes).ok())
                     .ok_or("diagnostic pixel-output byte count overflow")?;
@@ -2231,25 +2232,42 @@ impl MetalPresenter {
                     .and_then(|buffer| {
                         let word_count = DIAGNOSTIC_PIXEL_OUTPUT_WIDTH
                             .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT)?
-                            .checked_mul(5)?;
+                            .checked_mul(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL)?;
                         // SAFETY: the shared diagnostic buffer is allocated with exactly this
                         // many words and the command batch has completed before this readback.
                         let words = unsafe {
                             std::slice::from_raw_parts(buffer.contents().cast::<u32>(), word_count)
                         };
-                        let covered = words.chunks_exact(5).filter(|pixel| pixel[0] != 0).count();
+                        let covered = words
+                            .chunks_exact(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL)
+                            .filter(|pixel| pixel[0] != 0)
+                            .count();
                         let nonzero = words
-                            .chunks_exact(5)
-                            .filter(|pixel| pixel[0] != 0 && pixel[1..].iter().any(|&v| v != 0))
+                            .chunks_exact(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL)
+                            .filter(|pixel| pixel[0] != 0 && pixel[3..].iter().any(|&v| v != 0))
                             .count();
                         let mut finite = 0_usize;
                         let mut sum = [0.0_f64; 4];
                         let mut minimum = [f32::INFINITY; 4];
                         let mut maximum = [f32::NEG_INFINITY; 4];
                         let mut above_one = [0_usize; 4];
-                        for pixel in words.chunks_exact(5).filter(|pixel| pixel[0] != 0) {
+                        let mut uv_sum = [0.0_f64; 2];
+                        let mut uv_minimum = [f32::INFINITY; 2];
+                        let mut uv_maximum = [f32::NEG_INFINITY; 2];
+                        for pixel in words
+                            .chunks_exact(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL)
+                            .filter(|pixel| pixel[0] != 0)
+                        {
+                            for component in 0..2 {
+                                let value = f32::from_bits(pixel[component + 1]);
+                                if value.is_finite() {
+                                    uv_sum[component] += f64::from(value);
+                                    uv_minimum[component] = uv_minimum[component].min(value);
+                                    uv_maximum[component] = uv_maximum[component].max(value);
+                                }
+                            }
                             let values: [f32; 4] = std::array::from_fn(|component| {
-                                f32::from_bits(pixel[component + 1])
+                                f32::from_bits(pixel[component + 3])
                             });
                             if values.iter().all(|value| value.is_finite()) {
                                 finite += 1;
@@ -2268,24 +2286,36 @@ impl MetalPresenter {
                                 value / finite as f64
                             }
                         });
+                        let uv_mean = uv_sum.map(|value| {
+                            if covered == 0 {
+                                0.0
+                            } else {
+                                value / covered as f64
+                            }
+                        });
                         let first = words
-                            .chunks_exact(5)
+                            .chunks_exact(DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL)
                             .enumerate()
                             .filter(|(_, pixel)| pixel[0] != 0)
                             .take(8)
                             .map(|(pixel, words)| {
-                                let raw = [words[1], words[2], words[3], words[4]];
+                                let uv_raw = [words[1], words[2]];
+                                let uv = uv_raw.map(f32::from_bits);
+                                let raw = [words[3], words[4], words[5], words[6]];
                                 let value = raw.map(f32::from_bits);
                                 (
                                     pixel % DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,
                                     pixel / DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,
+                                    uv_raw,
+                                    uv,
                                     raw,
                                     value,
                                 )
                             })
                             .collect::<Vec<_>>();
                         Some((
-                            covered, nonzero, finite, minimum, maximum, mean, above_one, first,
+                            covered, nonzero, finite, uv_minimum, uv_maximum, uv_mean, minimum,
+                            maximum, mean, above_one, first,
                         ))
                     });
                 eprintln!(

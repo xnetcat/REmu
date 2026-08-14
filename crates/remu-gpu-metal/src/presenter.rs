@@ -65,7 +65,8 @@ use self::diagnostics::parse_diagnostic_hex_address;
 use self::diagnostics::{
     DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX,
     DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
-    DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+    DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL,
+    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     capture_target_sample_textures, diagnostic_capture_pixel_output,
     diagnostic_capture_vertex_position, diagnostic_context_register_snapshot,
