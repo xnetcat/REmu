@@ -3594,7 +3594,7 @@ impl MetalPresenter {
                             // The injected mesh capture writes one record per Metal mesh-local
                             // thread. Guest indices are data read by those threads and do not name
                             // records in this buffer.
-                            (0..24).collect::<Vec<_>>()
+                            (0..64).collect::<Vec<_>>()
                         } else {
                             let mut seen = HashSet::new();
                             indexed_draw
@@ -3628,7 +3628,9 @@ impl MetalPresenter {
                                         words[base + 3],
                                     ];
                                     let value = raw.map(f32::from_bits);
-                                    let registers = words[base + 4..base + 24].to_vec();
+                                    let registers = words
+                                        [base + 4..base + DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX]
+                                        .to_vec();
                                     (index, raw, value, registers)
                                 })
                                 .collect::<Vec<_>>(),
