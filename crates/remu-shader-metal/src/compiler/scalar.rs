@@ -19,6 +19,13 @@ pub(crate) fn destination_scalar(instruction: &Instruction) -> Result<u32, Strin
 
 impl Compiler<'_> {
     pub(crate) fn store_lane_mask(&mut self, register: u32, condition: &str) {
+        // EXEC has its own bookkeeping path. Select it before materializing ballot words so a
+        // split wave64 compare does not emit one unused ballot here and another in
+        // `store_exec_mask`.
+        if register == EXEC_LO {
+            self.store_exec_mask(condition);
+            return;
+        }
         self.invalidate_heap_descriptor_shadows(
             register,
             if self.uses_wave64_lane_mask_pairs() {
@@ -35,7 +42,6 @@ impl Compiler<'_> {
                 // VCC is an architectural pair; keep HI coherent even on wave32.
                 self.line(3, &format!("s[{VCC_HI}] = {high};"));
             }
-            EXEC_LO => self.store_exec_mask(condition),
             register if register < SCALAR_REGISTER_COUNT => {
                 self.line(3, &format!("s[{register}] = {low};"));
                 // Wave32 lane masks occupy a single SGPR. Writing a high half there would
