@@ -1383,9 +1383,9 @@ struct ResidentGuestTexture {
     /// The guest bytes this allocation declares, resolved once at creation.
     ///
     /// `None` disables the range algebra for this resident and leaves it on the descriptor-overlap
-    /// behaviour. Note this is the resident's *whole* range — mip chain, array faces and all —
-    /// while the interval index keys residents by their level-0 span, so the index answers "which
-    /// residents might be involved" and `owned` answers "which bytes are actually theirs".
+    /// behaviour. This is the resident's *whole* range — mip chain, array faces and all — and the
+    /// interval index stores this exact admission-time span. `owned` then answers which bytes in
+    /// that candidate allocation are still authoritative.
     span: Option<ResourceSpan>,
     /// Guest bytes this allocation is the authority for.
     owned: RangeSet,
