@@ -188,6 +188,70 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
 }
 
 #[test]
+fn split_wave64_materializes_one_ballot_for_both_mask_words() {
+    let compare = |name| Instruction {
+        pc: 0,
+        encoding: ShaderEncoding::Vopc,
+        opcode: Opcode::Known(name),
+        words: vec![0],
+        sources: vec![Operand::vector(1), Operand::vector(2)],
+        destinations: Vec::new(),
+        control: None,
+    };
+    let mut options = MetalCompileOptions::compute(0);
+    options.wave_lane_count = 64;
+    options.compute_threadgroup_size = 64;
+
+    let vcc = compile_msl(
+        &Program::new(0x1000, vec![compare("VCmpEqU32")]),
+        &empty_evaluation(),
+        &options,
+    )
+    .expect("wave64 VCC compare should lower");
+    assert_eq!(
+        vcc.source.matches("simd_ballot(").count(),
+        1,
+        "the low/high VCC words must select from one ballot temporary:\n{}",
+        vcc.source,
+    );
+    let ballot_line = vcc
+        .source
+        .lines()
+        .find(|line| line.contains("simd_ballot("))
+        .expect("one ballot temporary");
+    let ballot_name = ballot_line
+        .split_whitespace()
+        .nth(1)
+        .expect("temporary declaration name");
+    assert!(
+        vcc.source
+            .contains(&format!("remu_wave_half == 0u ? {ballot_name} : 0u"))
+            && vcc
+                .source
+                .contains(&format!("remu_wave_half == 0u ? 0u : {ballot_name}")),
+        "both VCC words must consume the same temporary:\n{}",
+        vcc.source,
+    );
+
+    let exec = compile_msl(
+        &Program::new(0x1000, vec![compare("VCmpxEqU32")]),
+        &empty_evaluation(),
+        &options,
+    )
+    .expect("wave64 EXEC compare should lower");
+    assert_eq!(
+        exec.source.matches("simd_ballot(").count(),
+        2,
+        "EXEC initialization and the compare write each need exactly one ballot:\n{}",
+        exec.source,
+    );
+    assert_eq!(
+        exec.source.matches("uint remu_initial_exec_ballot =").count(),
+        1,
+    );
+}
+
+#[test]
 fn pixel_wave64_compare_clears_the_explicit_mask_high_word() {
     let compare = Instruction {
         pc: 0,

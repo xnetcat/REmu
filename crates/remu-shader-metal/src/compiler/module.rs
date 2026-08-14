@@ -823,8 +823,17 @@ impl Compiler<'_> {
                     "0u"
                 };
                 ("0xffffffffu".to_owned(), high.to_owned())
+            } else if self.split_wave64() {
+                let ballot = self.ballot("true");
+                source.push_str("    uint remu_initial_exec_ballot = ");
+                source.push_str(&ballot);
+                source.push_str(";\n");
+                (
+                    "remu_wave_half == 0u ? remu_initial_exec_ballot : 0u".to_owned(),
+                    "remu_wave_half == 0u ? 0u : remu_initial_exec_ballot".to_owned(),
+                )
             } else {
-                self.ballot_words("true")
+                (self.ballot("true"), "0u".to_owned())
             };
             if contains_register_reference(&self.body, 's', EXEC_LO) {
                 let _ = writeln!(source, "    s[{EXEC_LO}] = {low};");

@@ -434,9 +434,10 @@ impl Compiler<'_> {
         }
     }
 
-    fn ballot_words(&self, condition: &str) -> (String, String) {
+    fn ballot_words(&mut self, condition: &str) -> (String, String) {
         let ballot = self.ballot(condition);
         if self.split_wave64() {
+            let ballot = self.temp("uint", &ballot);
             (
                 format!("remu_wave_half == 0u ? {ballot} : 0u"),
                 format!("remu_wave_half == 0u ? 0u : {ballot}"),
