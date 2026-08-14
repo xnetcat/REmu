@@ -392,6 +392,35 @@ fn lowers_shifted_scalar_add_with_its_unsigned_carry_out_condition() {
 }
 
 #[test]
+fn fixed_ngg_compatibility_preserves_legacy_shifted_scalar_add_dataflow() {
+    let program = Program::new(
+        0x1000,
+        vec![Instruction {
+            pc: 0x44,
+            encoding: ShaderEncoding::Sop2,
+            opcode: Opcode::Known("SLshl4AddU32"),
+            words: vec![0],
+            sources: vec![Operand::scalar(10), Operand::scalar(12)],
+            destinations: vec![Operand::scalar(14)],
+            control: None,
+        }],
+    );
+    let mut options = MetalCompileOptions::mesh(0, 16 * 1024, 64, 64, 64);
+    options.ngg_fixed_allocation_fallback = true;
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("fixed-NGG shifted scalar add should lower");
+
+    assert!(
+        shader
+            .source
+            .contains("((remu_s_10 << 4) + remu_s_12)")
+    );
+    assert!(!shader.source.contains("((ulong)remu_s_10 << 4)"));
+    assert!(!shader.source.contains(">> 32) != 0ul"));
+}
+
+#[test]
 fn lowers_unsigned_64_bit_scalar_compare_from_register_pairs() {
     let shader = compile_vector_instruction(
         Instruction {

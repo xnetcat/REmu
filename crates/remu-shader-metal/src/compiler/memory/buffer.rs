@@ -466,12 +466,19 @@ impl Compiler<'_> {
             } else {
                 "0u".to_owned()
             };
-            canonical.push(self.temp(
-                "uint",
-                &format!(
-                    "{bits} == 0u ? {missing} : remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
-                ),
-            ));
+            let converted = if self.options.ngg_fixed_allocation_fallback {
+                // Preserve the pre-sRGB formatted-buffer contract for the fixed wave64 ABI. Its
+                // vertex shaders supplied the known-good Superliminal UI and tone-map payloads
+                // before nfmt=9 was globally reinterpreted as an sRGB color channel.
+                format!(
+                    "{number_format} == 9u ? {raw} : remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
+                )
+            } else {
+                format!(
+                    "remu_format_convert({raw}, {bits}, {number_format}, {data_format}, {component}u)"
+                )
+            };
+            canonical.push(self.temp("uint", &format!("{bits} == 0u ? {missing} : {converted}")));
         }
         let component_count = format_component_count(
             instruction

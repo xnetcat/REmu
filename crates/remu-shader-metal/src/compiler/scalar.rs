@@ -324,17 +324,26 @@ impl Compiler<'_> {
                 )
             }
             "SLshl1AddU32" | "SLshl2AddU32" | "SLshl3AddU32" | "SLshl4AddU32" => {
-                // SCC is the unsigned carry-out of the shifted addition, so the sum has to be
-                // formed at 64-bit width; the shifted-out high bits participate in that carry.
                 let shift = name.as_bytes()[5] - b'0';
-                let wide = self.temp(
-                    "ulong",
-                    &format!("((ulong){left} << {shift}) + (ulong){right}"),
-                );
-                let result = self.temp("uint", &format!("(uint){wide}"));
-                self.store_scalar(destination, &result);
-                self.line(3, &format!("scc = ({wide} >> 32) != 0ul;"));
-                return Ok(());
+                if self.options.ngg_fixed_allocation_fallback {
+                    // The fixed wave64 path is a compatibility ABI. Keep its generated scalar
+                    // dataflow identical to the last verified Superliminal renderer: these
+                    // shifts build descriptor offsets in the VCC register pair, and injecting a
+                    // new SCC write changed the fixed mesh program even though the following
+                    // instruction normally replaces it.
+                    (format!("(({left} << {shift}) + {right})"), None)
+                } else {
+                    // SCC is the unsigned carry-out of the shifted addition, so the sum has to be
+                    // formed at 64-bit width; the shifted-out high bits participate in that carry.
+                    let wide = self.temp(
+                        "ulong",
+                        &format!("((ulong){left} << {shift}) + (ulong){right}"),
+                    );
+                    let result = self.temp("uint", &format!("(uint){wide}"));
+                    self.store_scalar(destination, &result);
+                    self.line(3, &format!("scc = ({wide} >> 32) != 0ul;"));
+                    return Ok(());
+                }
             }
             "SPackLlB32B16" => (
                 format!("(({left} & 0xFFFFu) | (({right} & 0xFFFFu) << 16))"),

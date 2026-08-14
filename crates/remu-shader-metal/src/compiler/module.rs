@@ -751,7 +751,9 @@ impl Compiler<'_> {
                 {
                     source.push_str("    v[4] = 0u;\n");
                 }
-                if contains_register_reference(&self.body, 'v', 5) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 5)
+                {
                     source.push_str(
                         "    v[5] = remu_thread_index < remu_mesh_input_vertex_count ? remu_meshlets[remu_meshlet_base + 2u + remu_thread_index] + remu_draw[2] : 0u;\n",
                     );
@@ -778,6 +780,11 @@ impl Compiler<'_> {
                     }
                     if contains_register_reference(&self.body, 'v', 2) {
                         source.push_str("    v[2] = 0u;\n");
+                    }
+                    if contains_register_reference(&self.body, 'v', 5) {
+                        source.push_str(
+                            "    v[5] = remu_thread_index < remu_mesh_input_vertex_count ? remu_meshlets[remu_meshlet_base + 2u + remu_thread_index] + remu_draw[2] : 0u;\n",
+                        );
                     }
                     if contains_register_reference(&self.body, 'v', 8) {
                         source.push_str("    v[8] = remu_group_id.y;\n");
