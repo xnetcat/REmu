@@ -512,6 +512,24 @@ impl MetalPresenter {
             if !event_loop_report.is_empty() {
                 eprintln!("[REMu][PERF-EVENT-LOOP] {event_loop_report}");
             }
+            // The three candidate terms inside the per-draw cpu-translation span; whichever
+            // dominates this line is the term the crawl fix must cache.
+            let (identity_calls, identity_nanos) =
+                remu_memory::take_guest_shared_identity_statistics();
+            let decode_calls =
+                super::super::decode::DECODE_TARGETS_CALLS.swap(0, Ordering::Relaxed);
+            let decode_nanos =
+                super::super::decode::DECODE_TARGETS_NANOS.swap(0, Ordering::Relaxed);
+            let upload_calls = super::super::cache::UPLOAD_GLOBALS_CALLS.swap(0, Ordering::Relaxed);
+            let upload_nanos = super::super::cache::UPLOAD_GLOBALS_NANOS.swap(0, Ordering::Relaxed);
+            if identity_calls != 0 || decode_calls != 0 || upload_calls != 0 {
+                eprintln!(
+                    "[REMu][PERF-TRANSLATION-TERMS] identity={identity_calls}/{:.1}ms decode-targets={decode_calls}/{:.1}ms upload-globals={upload_calls}/{:.1}ms",
+                    identity_nanos as f64 / 1e6,
+                    decode_nanos as f64 / 1e6,
+                    upload_nanos as f64 / 1e6,
+                );
+            }
             // A flip-safety wait blocks against this prefix; an entry that never turns safe
             // parks the host queue forever while every guest queue prints empty (the
             // 2026-08-12 RenderThread-starve wedge). Name the first gap so a wedged run

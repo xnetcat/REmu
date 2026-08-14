@@ -336,14 +336,36 @@ pub fn guest_shared_backing_identity(
     address: u64,
     byte_count: u64,
 ) -> Option<GuestSharedMappingIdentity> {
+    let started = std::time::Instant::now();
     let mappings = shared_mappings()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    resolve_shared_backing_range(&mappings, address, byte_count).map(
+    let identity = resolve_shared_backing_range(&mappings, address, byte_count).map(
         |(backing, physical_start, _)| GuestSharedMappingIdentity {
             backing_id: backing.id(),
             backing_offset: physical_start,
         },
+    );
+    drop(mappings);
+    IDENTITY_RESOLVE_CALLS.fetch_add(1, Ordering::Relaxed);
+    IDENTITY_RESOLVE_NANOS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    identity
+}
+
+static IDENTITY_RESOLVE_CALLS: AtomicU64 = AtomicU64::new(0);
+static IDENTITY_RESOLVE_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Takes and resets the process-wide call count and total wall time spent resolving shared
+/// backing identities. The per-draw translation cost attribution reads this each perf window;
+/// lock acquisition is included deliberately since contention is part of the cost under study.
+#[must_use]
+pub fn take_guest_shared_identity_statistics() -> (u64, u64) {
+    (
+        IDENTITY_RESOLVE_CALLS.swap(0, Ordering::Relaxed),
+        IDENTITY_RESOLVE_NANOS.swap(0, Ordering::Relaxed),
     )
 }
 

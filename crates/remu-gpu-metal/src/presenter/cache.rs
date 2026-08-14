@@ -26,7 +26,11 @@ use remu_memory::{
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
+
+pub(super) static UPLOAD_GLOBALS_CALLS: AtomicU64 = AtomicU64::new(0);
+pub(super) static UPLOAD_GLOBALS_NANOS: AtomicU64 = AtomicU64::new(0);
 
 enum QueuedGlobalReadSource {
     None,
@@ -366,6 +370,21 @@ impl MetalPresenter {
     }
 
     pub(super) fn upload_global_buffers(
+        &mut self,
+        device: &Device,
+        evaluation: &ShaderEvaluation,
+    ) -> Result<Vec<UploadedGlobalBuffer>, String> {
+        let started = Instant::now();
+        let uploaded = self.upload_global_buffers_untimed(device, evaluation);
+        UPLOAD_GLOBALS_CALLS.fetch_add(1, Ordering::Relaxed);
+        UPLOAD_GLOBALS_NANOS.fetch_add(
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        uploaded
+    }
+
+    fn upload_global_buffers_untimed(
         &mut self,
         device: &Device,
         evaluation: &ShaderEvaluation,

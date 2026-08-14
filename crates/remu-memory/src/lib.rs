@@ -57,6 +57,7 @@ pub use address_space::{
     GuestSharedMapOptions, GuestSharedMappingIdentity, GuestVmaInfo, GuestVmaState,
     LeasePublishOutcome, RequestedAddress, guest_publish_release_fence,
     guest_shared_backing_alias_segments, guest_shared_backing_identity, guest_shared_backing_range,
+    take_guest_shared_identity_statistics,
     guest_shared_backing_any_range_overlaps, guest_shared_backing_ranges_overlap,
     guest_shared_backing_segments, guest_shared_mapping_epoch,
     guest_shared_mapping_identity, guest_shared_mapping_table, load_guest_shared_u32,

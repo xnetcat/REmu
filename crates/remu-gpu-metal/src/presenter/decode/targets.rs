@@ -466,7 +466,25 @@ pub(crate) fn decode_render_target_state(
     })
 }
 
+pub(crate) static DECODE_TARGETS_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DECODE_TARGETS_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn decode_render_targets(
+    draw: &IndexedDraw,
+) -> Result<Vec<DecodedRenderTarget>, String> {
+    let started = std::time::Instant::now();
+    let targets = decode_render_targets_untimed(draw);
+    DECODE_TARGETS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    DECODE_TARGETS_NANOS.fetch_add(
+        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    targets
+}
+
+fn decode_render_targets_untimed(
     draw: &IndexedDraw,
 ) -> Result<Vec<DecodedRenderTarget>, String> {
     let Some(pixel) = draw.pixel_shader.as_ref() else {

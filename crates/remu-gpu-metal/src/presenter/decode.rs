@@ -62,7 +62,8 @@ pub(crate) use self::scanout::{decode_scanout_target, raw_video_out_texture_desc
 pub(crate) use self::targets::{
     common_render_target_array_length, decode_color_eliminate_fast_clear_target,
     decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
-    decode_render_target_format, decode_render_target_state, decode_render_targets,
+    DECODE_TARGETS_CALLS, DECODE_TARGETS_NANOS, decode_render_target_format,
+    decode_render_target_state, decode_render_targets,
     initial_depth_clear_for_target, initial_render_target_clear_color, render_target_cmask_address,
     render_target_fast_clear_color,
 };
