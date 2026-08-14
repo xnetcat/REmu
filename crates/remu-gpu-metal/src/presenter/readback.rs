@@ -1,7 +1,7 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::completion::{commit_and_settle, settle};
+use super::completion::{CommandBufferCompletion, commit_and_settle, settle};
 use super::{
     DecodedRenderTarget, GuestTextureDescriptor, METAL_TEXTURE_BUFFER_ROW_ALIGNMENT,
     MetalPresenter, PendingTextureReadback, RESIDENT_WRITEBACK_DISCARDED,
@@ -606,9 +606,11 @@ impl PendingTextureReadback {
             MTLBlitOption::None,
         );
         encoder.end_encoding();
+        let completion = CommandBufferCompletion::attach(&command_buffer);
         command_buffer.commit();
         Ok(Self {
             command_buffer,
+            completion,
             staging,
             _source: texture.clone(),
             layout,
@@ -617,7 +619,11 @@ impl PendingTextureReadback {
     }
 
     pub(super) fn finish(self) -> Result<Vec<u8>, String> {
-        settle(&self.command_buffer, "Metal texture readback")?;
+        settle(
+            &self.command_buffer,
+            &self.completion,
+            "Metal texture readback",
+        )?;
         let packed_row = usize::try_from(self.layout.packed_bytes_per_row)
             .map_err(|_| "Metal texture readback packed row does not fit usize")?;
         let staging_row = usize::try_from(self.layout.staging_bytes_per_row)

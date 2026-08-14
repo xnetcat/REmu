@@ -277,7 +277,9 @@ pub(crate) fn terminal_shared_event_advance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::presenter::completion::{COMMAND_BUFFER_SETTLE_TIMEOUT, wait_until_settled_within};
+    use crate::presenter::completion::{
+        COMMAND_BUFFER_SETTLE_TIMEOUT, CommandBufferCompletion, wait_until_settled_within,
+    };
     use metal::{Device, MTLCommandBufferStatus, MTLResourceOptions, NSRange};
     use remu_gpu::{GpuEvent, GpuMemoryWait};
     use std::time::Duration;
@@ -493,25 +495,36 @@ mod tests {
         fill.fill_buffer(&source_buffer, NSRange::new(0, byte_count), PRODUCED_BYTE);
         fill.end_encoding();
         producer_commands.encode_signal_event(timeline.event(), fence.value());
+        let consumer_completion = CommandBufferCompletion::attach(&consumer);
+        let producer_completion = CommandBufferCompletion::attach(&producer_commands);
 
         // This order deadlocks if both logical queues are incorrectly routed through one serial
         // MTLCommandQueue: that queue cannot reach the producer signal behind the consumer wait.
         consumer.commit();
         assert!(
-            !wait_until_settled_within(&consumer, Duration::ZERO),
+            !wait_until_settled_within(&consumer, &consumer_completion, Duration::ZERO),
             "consumer unexpectedly completed before its producer was submitted"
         );
         producer_commands.commit();
 
-        let consumer_settled = wait_until_settled_within(&consumer, COMMAND_BUFFER_SETTLE_TIMEOUT);
+        let consumer_settled = wait_until_settled_within(
+            &consumer,
+            &consumer_completion,
+            COMMAND_BUFFER_SETTLE_TIMEOUT,
+        );
         if !consumer_settled {
             // Never leave a GPU wait outstanding when this regression test fails.
             timeline.event().set_signaled_value(fence.value());
-            let _ = wait_until_settled_within(&consumer, COMMAND_BUFFER_SETTLE_TIMEOUT);
+            let _ = wait_until_settled_within(
+                &consumer,
+                &consumer_completion,
+                COMMAND_BUFFER_SETTLE_TIMEOUT,
+            );
         }
         assert!(consumer_settled, "cross-queue consumer did not settle");
         assert!(wait_until_settled_within(
             &producer_commands,
+            &producer_completion,
             COMMAND_BUFFER_SETTLE_TIMEOUT
         ));
         assert_eq!(consumer.status(), MTLCommandBufferStatus::Completed);

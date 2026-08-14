@@ -1,14 +1,14 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use block::ConcreteBlock;
 use metal::{CommandBufferRef, MTLCommandBufferStatus};
 use objc::runtime::Object;
 use objc::{class, msg_send, sel, sel_impl};
 use std::ffi::{CStr, c_char};
 use std::fmt::Write as _;
-use std::sync::OnceLock;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Duration;
 
 /// Longest a host thread blocks on one Metal command buffer before reporting it as stalled.
 ///
@@ -23,15 +23,55 @@ use std::time::{Duration, Instant};
 /// ordered guest completion effects until Metal later reports `Completed` or `Error`.
 pub(crate) const COMMAND_BUFFER_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Yield rather than sleep for this long first. Batches almost always finish inside it, so the
-/// common path keeps `waitUntilCompleted`'s latency instead of paying a sleep quantum per wait.
-const SETTLE_YIELD_PERIOD: Duration = Duration::from_millis(2);
-
-/// Poll granularity once a batch has outlived [`SETTLE_YIELD_PERIOD`] and is worth sleeping on.
-const SETTLE_POLL_INTERVAL: Duration = Duration::from_micros(250);
-
 const METAL_COMMAND_ERROR_TRACE_ENVIRONMENT_VARIABLE: &str = "REMU_TRACE_METAL_COMMAND_ERRORS";
 const METAL_COMMAND_STALL_TRACE_ENVIRONMENT_VARIABLE: &str = "REMU_TRACE_METAL_STALLS";
+
+/// Completion notification registered before a Metal command buffer is committed.
+///
+/// Metal forbids adding completion handlers after `commit`, while most settlement waits happen
+/// later, when a committed guest batch reaches the front of a bounded queue. Keep this signal next
+/// to the command buffer from creation through retirement so those waits can park on a condvar
+/// instead of reading `status` every 250 microseconds.
+#[derive(Clone)]
+pub(crate) struct CommandBufferCompletion {
+    state: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl CommandBufferCompletion {
+    fn pending() -> Self {
+        Self {
+            state: Arc::new((Mutex::new(false), Condvar::new())),
+        }
+    }
+
+    /// Attaches the one handler that makes later bounded waits event-driven. Call before `commit`.
+    pub(crate) fn attach(command_buffer: &CommandBufferRef) -> Self {
+        let completion = Self::pending();
+        let notified = completion.clone();
+        let handler = ConcreteBlock::new(move |_| notified.notify()).copy();
+        command_buffer.add_completed_handler(&handler);
+        completion
+    }
+
+    fn notify(&self) {
+        let (completed, changed) = &*self.state;
+        *completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        changed.notify_all();
+    }
+
+    fn wait_within(&self, timeout: Duration) -> bool {
+        let (completed, changed) = &*self.state;
+        let completed = completed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (completed, _) = changed
+            .wait_timeout_while(completed, timeout, |completed| !*completed)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *completed
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MetalCommandErrorDetail {
@@ -46,31 +86,26 @@ struct MetalCommandErrorDetail {
 
 /// Blocks until `command_buffer` reaches a terminal state, giving up after
 /// [`COMMAND_BUFFER_SETTLE_TIMEOUT`]. Returns whether it settled.
-pub(crate) fn wait_until_settled(command_buffer: &CommandBufferRef) -> bool {
-    wait_until_settled_within(command_buffer, COMMAND_BUFFER_SETTLE_TIMEOUT)
+pub(crate) fn wait_until_settled(
+    command_buffer: &CommandBufferRef,
+    completion: &CommandBufferCompletion,
+) -> bool {
+    wait_until_settled_within(command_buffer, completion, COMMAND_BUFFER_SETTLE_TIMEOUT)
 }
 
 /// [`wait_until_settled`] with an explicit budget, so tests can exercise the timeout directly.
 pub(crate) fn wait_until_settled_within(
     command_buffer: &CommandBufferRef,
+    completion: &CommandBufferCompletion,
     timeout: Duration,
 ) -> bool {
-    let started = Instant::now();
-    loop {
-        if command_buffer_is_settled(command_buffer) {
-            return true;
-        }
-        let waited = started.elapsed();
-        let Some(remaining) = timeout.checked_sub(waited) else {
-            // Re-read once more: the batch may have settled inside the final interval.
-            return command_buffer_is_settled(command_buffer);
-        };
-        if waited < SETTLE_YIELD_PERIOD {
-            thread::yield_now();
-        } else {
-            thread::sleep(SETTLE_POLL_INTERVAL.min(remaining));
-        }
+    if command_buffer_is_settled(command_buffer) {
+        return true;
     }
+    let _ = completion.wait_within(timeout);
+    // The handler records terminal notification, while Metal's status remains the authority for
+    // whether this exact command buffer actually settled. Re-read after both wake and timeout.
+    command_buffer_is_settled(command_buffer)
 }
 
 /// Commits `command_buffer` and reports whether it completed, naming `operation` on failure.
@@ -78,13 +113,18 @@ pub(crate) fn commit_and_settle(
     command_buffer: &CommandBufferRef,
     operation: &str,
 ) -> Result<(), String> {
+    let completion = CommandBufferCompletion::attach(command_buffer);
     command_buffer.commit();
-    settle(command_buffer, operation)
+    settle(command_buffer, &completion, operation)
 }
 
 /// Waits for an already-committed `command_buffer` and reports whether it completed.
-pub(crate) fn settle(command_buffer: &CommandBufferRef, operation: &str) -> Result<(), String> {
-    if !wait_until_settled(command_buffer) {
+pub(crate) fn settle(
+    command_buffer: &CommandBufferRef,
+    completion: &CommandBufferCompletion,
+    operation: &str,
+) -> Result<(), String> {
+    if !wait_until_settled(command_buffer, completion) {
         return Err(settle_timeout_message(operation, command_buffer));
     }
     let status = command_buffer.status();
@@ -321,10 +361,31 @@ unsafe fn objc_string(string: *mut Object) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MetalCommandErrorDetail, command_buffer_native_state_summary,
+        CommandBufferCompletion, MetalCommandErrorDetail, command_buffer_native_state_summary,
         format_command_buffer_failure, format_native_state_summary, metal_command_error_code_name,
     };
     use metal::{Device, MTLCommandBufferStatus};
+    use std::time::Duration;
+
+    #[test]
+    fn completion_signal_wakes_a_parked_waiter() {
+        let completion = CommandBufferCompletion::pending();
+        assert!(
+            !completion.wait_within(Duration::ZERO),
+            "a pending command buffer must not manufacture a completion"
+        );
+
+        let notifier = completion.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            notifier.notify();
+        });
+        assert!(
+            completion.wait_within(Duration::from_secs(2)),
+            "the completion notification must wake the condvar before its deadline"
+        );
+        thread.join().expect("completion notifier");
+    }
 
     #[test]
     fn native_command_error_formatter_classifies_and_escapes_detail() {

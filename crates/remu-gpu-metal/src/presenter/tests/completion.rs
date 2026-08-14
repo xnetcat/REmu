@@ -1,7 +1,9 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::super::completion::{COMMAND_BUFFER_SETTLE_TIMEOUT, wait_until_settled_within};
+use super::super::completion::{
+    COMMAND_BUFFER_SETTLE_TIMEOUT, CommandBufferCompletion, wait_until_settled_within,
+};
 use metal::{Device, MTLCommandBufferStatus};
 use std::time::{Duration, Instant};
 
@@ -14,11 +16,12 @@ fn never_completing_command_buffer_gives_up_instead_of_blocking_forever() {
     let event = device.new_shared_event();
     let command_buffer = queue.new_command_buffer().to_owned();
     command_buffer.encode_wait_for_event(&event, 1);
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     command_buffer.commit();
 
     let timeout = Duration::from_millis(200);
     let started = Instant::now();
-    let settled = wait_until_settled_within(&command_buffer, timeout);
+    let settled = wait_until_settled_within(&command_buffer, &completion, timeout);
     let waited = started.elapsed();
 
     assert!(
@@ -39,6 +42,7 @@ fn never_completing_command_buffer_gives_up_instead_of_blocking_forever() {
     event.set_signaled_value(1);
     assert!(wait_until_settled_within(
         &command_buffer,
+        &completion,
         COMMAND_BUFFER_SETTLE_TIMEOUT
     ));
     assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
@@ -49,10 +53,12 @@ fn completing_command_buffer_settles_within_its_budget() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
     let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     command_buffer.commit();
 
     assert!(wait_until_settled_within(
         &command_buffer,
+        &completion,
         COMMAND_BUFFER_SETTLE_TIMEOUT
     ));
     assert_eq!(command_buffer.status(), MTLCommandBufferStatus::Completed);
@@ -67,10 +73,11 @@ fn exhausted_budget_reports_without_waiting() {
     let event = device.new_shared_event();
     let command_buffer = queue.new_command_buffer().to_owned();
     command_buffer.encode_wait_for_event(&event, 1);
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     command_buffer.commit();
 
     let started = Instant::now();
-    let settled = wait_until_settled_within(&command_buffer, Duration::ZERO);
+    let settled = wait_until_settled_within(&command_buffer, &completion, Duration::ZERO);
     let waited = started.elapsed();
 
     assert!(
@@ -85,6 +92,7 @@ fn exhausted_budget_reports_without_waiting() {
     event.set_signaled_value(1);
     assert!(wait_until_settled_within(
         &command_buffer,
+        &completion,
         COMMAND_BUFFER_SETTLE_TIMEOUT
     ));
 }
