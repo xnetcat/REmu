@@ -2077,7 +2077,7 @@ fn decodes_captured_ngg_subgroup_limits_and_derives_ninety_six_threads() {
 }
 
 #[test]
-fn fixed_ngg_allocation_uses_program_linkage_not_stale_gs_registers() {
+fn fixed_ngg_allocation_is_the_default_for_all_program_shapes() {
     let no_gs = Program::new(0x1000, Vec::new());
     assert!(ngg_fixed_allocation_fallback_for_program(&no_gs));
 
@@ -2106,7 +2106,7 @@ fn fixed_ngg_allocation_uses_program_linkage_not_stale_gs_registers() {
         }],
     );
     let linked = link_program_continuation(&front, &continuation).expect("linked API GS fixture");
-    assert!(!ngg_fixed_allocation_fallback_for_program(&linked));
+    assert!(ngg_fixed_allocation_fallback_for_program(&linked));
 }
 
 #[test]

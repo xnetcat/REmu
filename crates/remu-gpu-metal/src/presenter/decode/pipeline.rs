@@ -270,20 +270,21 @@ pub(crate) const fn ngg_mesh_base_vertex(draw: &IndexedDraw) -> i32 {
     if draw.indexed { draw.base_vertex } else { 0 }
 }
 
-/// The legacy fixed allocation is selected from the actual fused-program shape. Context GS
-/// registers persist across draws and therefore cannot prove that an ordinary no-GS primitive
-/// shader has a linked API geometry stage.
+/// Keep the pre-subgroup-allocation fixed wave64 ABI unless the register-sized path is explicitly
+/// requested for development. The fixed ABI is the last verified path for both ordinary primitive
+/// shaders and linked API geometry shaders; selecting the newer path from program linkage left the
+/// two classes with incompatible mesh publication semantics in real titles.
 pub(crate) fn ngg_fixed_allocation_fallback_for_program(program: &remu_shader::Program) -> bool {
-    static FORCE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *FORCE_LEGACY.get_or_init(|| {
-        let forced = std::env::var_os("REMU_NGG_LEGACY_FIXED")
+    static ENABLE_SUBGROUP_ALLOCATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLE_SUBGROUP_ALLOCATION.get_or_init(|| {
+        let enabled = std::env::var_os("REMU_NGG_SUBGROUP_ALLOCATION")
             .is_some_and(|value| value == "1");
-        if forced {
+        if !enabled {
             eprintln!(
-                "[REMu][METAL] forcing the pre-subgroup-allocation fixed NGG ABI (REMU_NGG_LEGACY_FIXED=1)"
+                "[REMu][METAL] using the verified fixed wave64 NGG ABI; set REMU_NGG_SUBGROUP_ALLOCATION=1 to test register-sized allocation"
             );
         }
-        forced
+        enabled
     }) {
         return true;
     }
