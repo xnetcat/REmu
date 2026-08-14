@@ -32,7 +32,7 @@ impl MetalPresenter {
 /// the current lowering. That failure is not necessarily reported as corrupt: it can instead
 /// leave the first dependent pipeline compilation waiting indefinitely. Bump this token whenever
 /// generated shader interfaces or mesh publication semantics change.
-pub(crate) const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-render-pipeline-v3\0";
+pub(crate) const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-render-pipeline-v4\0";
 
 pub(crate) const SLOW_PIPELINE_ARCHIVE_ADMISSION: Duration = Duration::from_millis(100);
 

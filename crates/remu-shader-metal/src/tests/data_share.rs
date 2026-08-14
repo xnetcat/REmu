@@ -130,20 +130,12 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
             .source
             .contains("remu_mesh.set_primitive_count(remu_mesh_input_primitive_count)")
     );
-    let set_vertex = shader
-        .source
-        .rfind("remu_mesh.set_vertex")
-        .expect("fixed fallback must publish vertices");
-    let publish_barrier = shader.source[set_vertex..]
-        .find("threadgroup_barrier(mem_flags::mem_device)")
-        .map(|offset| set_vertex + offset)
-        .expect("fixed fallback must synchronize mesh output publication");
-    let set_primitive_count = shader.source[publish_barrier..]
-        .find("remu_mesh.set_primitive_count")
-        .map(|offset| publish_barrier + offset)
-        .expect("fixed fallback must publish primitive count");
-    assert!(set_vertex < publish_barrier);
-    assert!(publish_barrier < set_primitive_count);
+    assert!(
+        !shader
+            .source
+            .contains("threadgroup_barrier(mem_flags::mem_device)"),
+        "the verified fixed ABI publishes the mesh object without a device-memory barrier"
+    );
     assert!(!shader.source.contains("remu_mesh_output_primitive_count"));
     assert!(
         !shader
