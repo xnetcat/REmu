@@ -744,6 +744,21 @@ fn formatted_srgb_buffers_decode_color_and_preserve_linear_alpha() {
     }
 }
 
+#[test]
+fn fixed_ngg_compatibility_keeps_legacy_formatted_srgb_payloads_raw() {
+    let (program, evaluation) = complete_memory_program();
+    let mut options = MetalCompileOptions::mesh(0, 16 * 1024, 64, 64, 64);
+    options.ngg_fixed_allocation_fallback = true;
+    options.wave_lane_count = 64;
+    let shader = compile_msl(&program, &evaluation, &options)
+        .expect("legacy fixed-NGG formatted buffer shader should lower");
+
+    assert!(
+        shader.source.matches("== 9u ? t").count() >= 4,
+        "fixed NGG formatted loads must keep every component on the pre-sRGB raw payload contract"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn generated_memory_msl_compiles_with_apple_metal() {
