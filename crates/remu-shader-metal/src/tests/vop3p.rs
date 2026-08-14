@@ -478,6 +478,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 ngg_registers_proven: false,
                 wave64_lane_doubled: false,
         runtime_heap_tables: false,
+                optimization: crate::ShaderOptimizationOptions::LEGACY,
             },
             MetalShaderStage::Mesh => MetalCompileOptions::mesh(0, 16 * 1024, 64, 64, 64),
         };

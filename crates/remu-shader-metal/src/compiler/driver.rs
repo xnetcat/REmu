@@ -5,6 +5,7 @@
 //! validation, initial register state and the opcode class dispatch.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use remu_shader::{
     BasicBlock, Instruction, InstructionControl, OperandKind, Program, ShaderEvaluation,
@@ -28,8 +29,8 @@ use crate::compiler::{
 use crate::{
     Compiler, HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES, HeapTextureTableBinding,
     METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError, MetalCompileOptions,
-    MetalRegisterFootprint, MetalShader, MetalShaderStage, PIXEL_INPUT_CONTROL_COUNT,
-    SCALAR_REGISTER_COUNT, VECTOR_REGISTER_COUNT,
+    MetalOptimizationReport, MetalRegisterFootprint, MetalShader, MetalShaderStage,
+    PIXEL_INPUT_CONTROL_COUNT, SCALAR_REGISTER_COUNT, VECTOR_REGISTER_COUNT,
 };
 
 impl<'a> Compiler<'a> {
@@ -106,6 +107,40 @@ impl<'a> Compiler<'a> {
         if program.instructions.is_empty() {
             return Err(MetalCompileError::EmptyProgram);
         }
+        let optimization_started = Instant::now();
+        let uniformity = (options.optimization.analyzes() && options.optimization.uniformity)
+            .then(|| {
+                remu_shader::analyze_uniformity(
+                    program,
+                    &remu_shader::UniformityInputs::default(),
+                )
+            });
+        let fallback_reasons = uniformity.as_ref().map_or_else(Vec::new, |analysis| {
+            program
+                .instructions
+                .iter()
+                .enumerate()
+                .filter_map(|(index, instruction)| {
+                    analysis
+                        .semantics(index)
+                        .filter(|semantics| !semantics.modeled)
+                        .map(|_| format!("pc {:#x}:unmodeled:{}", instruction.pc, instruction.opcode))
+                })
+                .collect()
+        });
+        let optimization_report = MetalOptimizationReport {
+            mode: options.optimization.mode,
+            analyzed_instructions: uniformity
+                .as_ref()
+                .map_or(0, |analysis| analysis.analyzed_instruction_count() as u64),
+            uniform_values: uniformity
+                .as_ref()
+                .map_or(0, |analysis| analysis.uniform_definition_count() as u64),
+            analysis_nanos: u64::try_from(optimization_started.elapsed().as_nanos())
+                .unwrap_or(u64::MAX),
+            fallback_reasons,
+            ..MetalOptimizationReport::default()
+        };
         validate_interface(options)?;
         if let Some(system_registers) = evaluation.compute_system_registers {
             if options.stage != MetalShaderStage::Compute {
@@ -437,6 +472,7 @@ impl<'a> Compiler<'a> {
             image_slots,
             heap_tables,
             control_flow,
+            optimization_report,
         };
         let total_threadgroup_memory = compiler.total_threadgroup_memory_bytes();
         if total_threadgroup_memory.is_none_or(|bytes| bytes > METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
@@ -547,6 +583,9 @@ impl<'a> Compiler<'a> {
         } else {
             0
         };
+        let emitted_msl_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
+        self.optimization_report.legacy_msl_bytes = emitted_msl_bytes;
+        self.optimization_report.emitted_msl_bytes = emitted_msl_bytes;
         Ok(MetalShader {
             source,
             entry_point: "remu_main".into(),
@@ -603,6 +642,7 @@ impl<'a> Compiler<'a> {
                 })?,
                 direct_control_flow,
             },
+            optimization_report: self.optimization_report,
         })
     }
 

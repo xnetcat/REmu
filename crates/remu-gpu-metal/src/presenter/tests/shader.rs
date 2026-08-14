@@ -78,6 +78,7 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
         initial_scalar_count: 0,
         global_bindings: Vec::new(),
         image_bindings: Vec::new(),
+        shader_optimization: remu_shader_metal::ShaderOptimizationOptions::LEGACY,
     };
     (dispatch, key)
 }
@@ -122,6 +123,27 @@ fn compute_pipeline_key_interner_deduplicates_content_and_separates_mutations() 
         !Arc::ptr_eq(&first, &distinct),
         "a compute pipeline mutation must not alias the original key"
     );
+}
+
+#[test]
+fn optimizer_policy_separates_graphics_and_compute_pipeline_keys() {
+    let on = remu_shader_metal::ShaderOptimizationOptions {
+        mode: remu_shader_metal::ShaderOptimizationMode::On,
+        uniformity: true,
+        licm: true,
+        descriptor_cache: true,
+        constant_bindings: true,
+    };
+
+    let legacy_graphics = super::cold_graphics_pipeline_key();
+    let mut optimized_graphics = legacy_graphics.clone();
+    optimized_graphics.shader_optimization = on;
+    assert_ne!(legacy_graphics, optimized_graphics);
+
+    let (_, legacy_compute) = pending_compute_pipeline();
+    let mut optimized_compute = legacy_compute.clone();
+    optimized_compute.shader_optimization = on;
+    assert_ne!(legacy_compute, optimized_compute);
 }
 
 #[test]
@@ -237,6 +259,7 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
                 initial_scalar_count: 0,
                 global_bindings: Vec::new(),
                 image_bindings: Vec::new(),
+                shader_optimization: remu_shader_metal::ShaderOptimizationOptions::LEGACY,
             }));
     }
     let (dispatch, key) = pending_compute_pipeline();

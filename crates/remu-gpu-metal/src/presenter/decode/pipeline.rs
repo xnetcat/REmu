@@ -1242,6 +1242,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         ngg_subgroup_limits,
         ngg_registers,
         wave_state: decode_graphics_wave_state(&draw.context_registers),
+        shader_optimization: super::super::shader::shader_optimization_options(),
         pixel_depth_export: !fragmentless
             && pixel_depth_export_enabled(&draw.context_registers, depth.is_some()),
         diagnostics: graphics_diagnostic_pipeline_state(

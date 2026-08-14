@@ -5,9 +5,9 @@ use metal::{Device, MeshRenderPipelineDescriptor, RenderPipelineDescriptor};
 use remu_gpu::{ComputeDispatch, GpuEvent, IndexedDraw};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{TryRecvError, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use super::{
@@ -46,6 +46,190 @@ pub(crate) use self::program::{
     shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
     vertex_parameter_export_mask, wave64_split_blockers,
 };
+
+pub(super) fn shader_optimization_options() -> remu_shader_metal::ShaderOptimizationOptions {
+    static OPTIONS: OnceLock<remu_shader_metal::ShaderOptimizationOptions> = OnceLock::new();
+    *OPTIONS.get_or_init(|| {
+        let mode_value = std::env::var("REMU_SHADER_OPT").ok();
+        let options = shader_optimization_options_from_values(
+            mode_value.as_deref(),
+            std::env::var("REMU_SHADER_UNIFORMITY").ok().as_deref(),
+            std::env::var("REMU_SHADER_LICM").ok().as_deref(),
+            std::env::var("REMU_SHADER_DESCRIPTOR_CACHE").ok().as_deref(),
+            std::env::var("REMU_SHADER_CONSTANT_BINDINGS").ok().as_deref(),
+        );
+        if options != remu_shader_metal::ShaderOptimizationOptions::LEGACY {
+            eprintln!(
+                "[REMu][SHADER-OPT] mode={:?} uniformity={} licm={} descriptors={} constant-bindings={}",
+                options.mode,
+                options.uniformity,
+                options.licm,
+                options.descriptor_cache,
+                options.constant_bindings,
+            );
+        }
+        options
+    })
+}
+
+pub(crate) fn shader_optimization_options_from_values(
+    mode: Option<&str>,
+    uniformity: Option<&str>,
+    licm: Option<&str>,
+    descriptor_cache: Option<&str>,
+    constant_bindings: Option<&str>,
+) -> remu_shader_metal::ShaderOptimizationOptions {
+    use remu_shader_metal::{ShaderOptimizationMode, ShaderOptimizationOptions};
+    let mode = match mode.unwrap_or("0") {
+        "0" => ShaderOptimizationMode::Legacy,
+        "analyze" => ShaderOptimizationMode::Analyze,
+        "on" => ShaderOptimizationMode::On,
+        "force" => ShaderOptimizationMode::Force,
+        value => {
+            eprintln!(
+                "[REMu][SHADER-OPT] invalid REMU_SHADER_OPT={value:?}; using legacy lowering"
+            );
+            ShaderOptimizationMode::Legacy
+        }
+    };
+    if mode == ShaderOptimizationMode::Legacy {
+        return ShaderOptimizationOptions::LEGACY;
+    }
+    ShaderOptimizationOptions {
+        mode,
+        uniformity: uniformity != Some("0"),
+        licm: licm != Some("0"),
+        descriptor_cache: descriptor_cache != Some("0"),
+        constant_bindings: constant_bindings != Some("0"),
+    }
+}
+
+#[cfg(test)]
+mod optimization_policy_tests {
+    use super::shader_optimization_options_from_values;
+    use remu_shader_metal::{ShaderOptimizationMode, ShaderOptimizationOptions};
+
+    #[test]
+    fn parses_modes_and_invalid_values_fall_back_to_unambiguous_legacy() {
+        assert_eq!(
+            shader_optimization_options_from_values(None, None, None, None, None),
+            ShaderOptimizationOptions::LEGACY
+        );
+        assert_eq!(
+            shader_optimization_options_from_values(Some("invalid"), None, None, None, None),
+            ShaderOptimizationOptions::LEGACY
+        );
+        for (value, mode) in [
+            ("analyze", ShaderOptimizationMode::Analyze),
+            ("on", ShaderOptimizationMode::On),
+            ("force", ShaderOptimizationMode::Force),
+        ] {
+            assert_eq!(
+                shader_optimization_options_from_values(Some(value), None, None, None, None).mode,
+                mode
+            );
+        }
+    }
+
+    #[test]
+    fn feature_rollbacks_are_independent() {
+        let options = shader_optimization_options_from_values(
+            Some("on"),
+            Some("0"),
+            None,
+            Some("0"),
+            None,
+        );
+        assert!(!options.uniformity);
+        assert!(options.licm);
+        assert!(!options.descriptor_cache);
+        assert!(options.constant_bindings);
+    }
+}
+
+#[derive(Default)]
+struct ShaderOptimizationWindow {
+    started: Option<Instant>,
+    reports: u64,
+    instructions: u64,
+    uniform_values: u64,
+    scalarized_salu: u64,
+    scalarized_smem: u64,
+    hoisted: u64,
+    decoded: u64,
+    reused: u64,
+    fallback_reasons: u64,
+    analysis_nanos: u64,
+    legacy_bytes: u64,
+    emitted_bytes: u64,
+}
+
+fn record_shader_optimization_report(
+    stage: &str,
+    address: u64,
+    report: &remu_shader_metal::MetalOptimizationReport,
+) {
+    if report.mode == remu_shader_metal::ShaderOptimizationMode::Legacy {
+        return;
+    }
+    static WINDOW: OnceLock<Mutex<ShaderOptimizationWindow>> = OnceLock::new();
+    let mut window = WINDOW
+        .get_or_init(|| Mutex::new(ShaderOptimizationWindow::default()))
+        .lock()
+        .unwrap();
+    let now = Instant::now();
+    let first = window.started.is_none();
+    window.started.get_or_insert(now);
+    window.reports = window.reports.saturating_add(1);
+    window.instructions = window
+        .instructions
+        .saturating_add(report.analyzed_instructions);
+    window.uniform_values = window.uniform_values.saturating_add(report.uniform_values);
+    window.scalarized_salu = window
+        .scalarized_salu
+        .saturating_add(report.scalarized_salu);
+    window.scalarized_smem = window
+        .scalarized_smem
+        .saturating_add(report.scalarized_smem);
+    window.hoisted = window.hoisted.saturating_add(report.hoisted_operations);
+    window.decoded = window.decoded.saturating_add(report.decoded_descriptors);
+    window.reused = window.reused.saturating_add(report.reused_descriptors);
+    window.fallback_reasons = window
+        .fallback_reasons
+        .saturating_add(report.fallback_reasons.len() as u64);
+    window.analysis_nanos = window.analysis_nanos.saturating_add(report.analysis_nanos);
+    window.legacy_bytes = window.legacy_bytes.saturating_add(report.legacy_msl_bytes);
+    window.emitted_bytes = window
+        .emitted_bytes
+        .saturating_add(report.emitted_msl_bytes);
+    let elapsed = window
+        .started
+        .map_or_else(Default::default, |started| {
+            now.saturating_duration_since(started)
+        });
+    if first || elapsed.as_secs() >= 5 {
+        eprintln!(
+            "[REMu][PERF-SHADER-OPT] stage={stage} address={address:#x} mode={:?} shaders={} instructions={} uniform={} salu={} smem={} hoisted={} descriptors={}/{} fallbacks={} analysis_ms={:.3} msl_bytes={}/{}",
+            report.mode,
+            window.reports,
+            window.instructions,
+            window.uniform_values,
+            window.scalarized_salu,
+            window.scalarized_smem,
+            window.hoisted,
+            window.decoded,
+            window.reused,
+            window.fallback_reasons,
+            window.analysis_nanos as f64 / 1_000_000.0,
+            window.emitted_bytes,
+            window.legacy_bytes,
+        );
+        *window = ShaderOptimizationWindow {
+            started: Some(now),
+            ..ShaderOptimizationWindow::default()
+        };
+    }
+}
 #[cfg(test)]
 pub(crate) use self::program::{
     lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
@@ -317,9 +501,15 @@ impl MetalPresenter {
         options.compute_threadgroup_size = key.compute_threadgroup_size;
         options.scratch_size_bytes = dispatch.launch.scratch_size_bytes;
         options.allocated_vector_register_count = key.allocated_vector_register_count;
+        options.optimization = key.shader_optimization;
         let lowering_started = Instant::now();
         let lowered = remu_shader_metal::compile_msl(&snapshot.program, evaluation, &options)
             .map_err(|error| format!("compute lowering: {error}"))?;
+        record_shader_optimization_report(
+            "compute",
+            dispatch.shader_address,
+            &lowered.optimization_report,
+        );
         let lowering_duration = lowering_started.elapsed();
         if lowered.stage != remu_shader_metal::MetalShaderStage::Compute {
             return Err("compute lowering returned a non-compute Metal stage".to_owned());
@@ -520,6 +710,7 @@ impl MetalPresenter {
         pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
         pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
         pixel_options.runtime_heap_tables = runtime_heap_tables_enabled();
+        pixel_options.optimization = key.shader_optimization;
         // Normalize every binding onto the predicate the pipeline key was built from, so the
         // lowering cannot select a heap variant for a key that describes the snapshot one.
         let mut pixel_evaluation_with_tables;
@@ -540,6 +731,11 @@ impl MetalPresenter {
         let pixel_msl =
             remu_shader_metal::compile_msl(pixel_program, pixel_evaluation, &pixel_options)
                 .map_err(|error| format!("pixel lowering: {error}"))?;
+        record_shader_optimization_report(
+            "pixel",
+            draw.pixel_shader_address,
+            &pixel_msl.optimization_report,
+        );
         let uses_mesh_stage = key.uses_mesh_stage;
         let mut vertex_options = if uses_mesh_stage {
             let limits = key
@@ -624,6 +820,7 @@ impl MetalPresenter {
         vertex_options.render_target_array_length = key.render_target_array_length;
         vertex_options.vertex_output_control = key.vertex_output_control;
         vertex_options.viewport_transform_control = key.viewport_transform_control;
+        vertex_options.optimization = key.shader_optimization;
         vertex_options.diagnostic_force_visible_clip_depth =
             key.diagnostics.force_visible_clip_depth;
         vertex_options.diagnostic_force_vertex_pattern = key.diagnostics.force_vertex_pattern;
@@ -652,6 +849,11 @@ impl MetalPresenter {
             remu_shader_metal::compile_msl(&export.program, export_evaluation, &vertex_options)
                 .map_err(|error| format!("vertex lowering: {error}"))?
         };
+        record_shader_optimization_report(
+            if uses_mesh_stage { "mesh" } else { "vertex" },
+            draw.export_shader_address,
+            &vertex_msl.optimization_report,
+        );
         let lowering_duration = lowering_started.elapsed();
         if let Some(directory) = std::env::var_os("REMU_DUMP_MSL_DIR")
             && dump_msl_pixel_filter_matches(draw.pixel_shader_address)

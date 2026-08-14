@@ -298,3 +298,38 @@ fn a_shader_that_lowers_today_still_emits_byte_identical_metal_source() {
     assert!(!structured.source.contains("switch (pc)"));
     assert!(!structured.source.contains("if (active && pc =="));
 }
+
+#[test]
+fn analyze_mode_reports_uniformity_without_changing_msl() {
+    let program = direct_reference_program();
+    let legacy = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::compute(0),
+    )
+    .expect("legacy program lowers");
+    let mut options = MetalCompileOptions::compute(0);
+    options.optimization = ShaderOptimizationOptions {
+        mode: ShaderOptimizationMode::Analyze,
+        uniformity: true,
+        licm: true,
+        descriptor_cache: true,
+        constant_bindings: true,
+    };
+    let analyzed = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("analyze-only program lowers");
+
+    assert_eq!(analyzed.source, legacy.source);
+    assert_eq!(
+        analyzed.optimization_report.analyzed_instructions,
+        program.instructions.len() as u64
+    );
+    assert_eq!(
+        analyzed.optimization_report.emitted_msl_bytes,
+        analyzed.optimization_report.legacy_msl_bytes
+    );
+    assert_eq!(
+        analyzed.optimization_report.mode,
+        ShaderOptimizationMode::Analyze
+    );
+}

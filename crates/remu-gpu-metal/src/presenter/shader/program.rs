@@ -124,6 +124,7 @@ pub(crate) fn compute_pipeline_key(
                 )
             })
             .collect(),
+        shader_optimization: super::shader_optimization_options(),
     }
 }
 
