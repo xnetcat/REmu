@@ -26,7 +26,7 @@ use super::{
     apply_pending_guest_memory_writes, apply_transparent_premultiplied_fill_clear,
     canonical_sampler_bindings, canonical_texture_bindings, clear_appkit_persistent_state_override,
     color_operation_is_raster_noop, common_render_target_array_length, comparison_depth32_upload,
-    compile_shader_request_catching_panics, consume_color_metadata_clear,
+    compile_shader_request_catching_panics, compute_pipeline_key, consume_color_metadata_clear,
     consume_depth_metadata_clear, copy_linear_to_tiled_at_z, create_exact_mode27_sampled_mip_view,
     create_sampled_guest_texture, decode_color_eliminate_fast_clear_target,
     decode_color_operation_mode, decode_color_resolve_targets, decode_depth_target,

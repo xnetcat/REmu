@@ -604,7 +604,7 @@ fn image_sample_modifiers_separate_the_clamp_lod_and_derivative_families() {
     );
 }
 
-fn image_binding(dimension: u32, is_array: bool, opcode: &'static str, word3: u32) -> ImageBinding { descriptor_index_is_runtime: false,
+fn image_binding(dimension: u32, is_array: bool, opcode: &'static str, word3: u32) -> ImageBinding {
     let mut resource_descriptor = smallvec::SmallVec::from_slice(&[0_u32; 8]);
     resource_descriptor[0] = 0x1000; // non-null base so the descriptor is live
     resource_descriptor[3] = word3;

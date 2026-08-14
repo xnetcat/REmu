@@ -35,13 +35,14 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_export_uses_general_lds,
-    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask, pixel_scalars,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
-    reconcile_pixel_input_controls_with_export_producers, rectangle_coordinate_parameter_mask,
-    log_wave64_hazard_census, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
+    is_storage_image_opcode, is_writable_image_opcode,
+    ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    program_uses_lds, reconcile_pixel_input_controls_with_export_producers,
+    rectangle_coordinate_parameter_mask, log_wave64_hazard_census,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
+    vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
 pub(crate) use self::program::{
@@ -517,26 +518,18 @@ impl MetalPresenter {
         pixel_options.diagnostic_force_pixel_color = key.diagnostics.force_pixel_color;
         pixel_options.diagnostic_capture_pixel_output = key.diagnostics.capture_pixel_output;
         pixel_options.runtime_heap_tables = runtime_heap_tables_enabled();
-        // The evaluator flags index-driven runtime descriptors; snapshots that fail to decode
-        // for TEMPORAL reasons (transient per-draw arenas holding other record types at
-        // evaluation time) carry no evaluator-visible taint. The presenter sees the failure
-        // directly, so it routes those bindings to the heap tables here, at compile time.
+        // Normalize every binding onto the predicate the pipeline key was built from, so the
+        // lowering cannot select a heap variant for a key that describes the snapshot one.
         let mut pixel_evaluation_with_tables;
         let pixel_evaluation = if pixel_options.runtime_heap_tables
             && pixel_evaluation.image_bindings.iter().any(|binding| {
-                !binding.descriptor_index_is_runtime
-                    && !binding.resource_descriptor.iter().all(|word| *word == 0)
-                    && super::decode::decode_image_descriptor(&binding.resource_descriptor)
-                        .is_err()
+                image_binding_fetches_descriptor_at_runtime(binding, true)
+                    != binding.descriptor_index_is_runtime
             }) {
             pixel_evaluation_with_tables = pixel_evaluation.clone();
             for binding in &mut pixel_evaluation_with_tables.image_bindings {
-                if !binding.resource_descriptor.iter().all(|word| *word == 0)
-                    && super::decode::decode_image_descriptor(&binding.resource_descriptor)
-                        .is_err()
-                {
-                    binding.descriptor_index_is_runtime = true;
-                }
+                binding.descriptor_index_is_runtime =
+                    image_binding_fetches_descriptor_at_runtime(binding, true);
             }
             &pixel_evaluation_with_tables
         } else {
@@ -848,4 +841,38 @@ pub(super) const SHADER_COMPILE_QUEUE_CAPACITY: usize = 64;
 pub(super) fn runtime_heap_tables_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_HEAP_TABLES").is_some_and(|value| value == "1"))
+}
+
+/// Whether one image binding lowers to a runtime heap-table fetch instead of the snapshot
+/// texture, for a stage whose `MetalCompileOptions::runtime_heap_tables` is
+/// `stage_uses_heap_tables`.
+///
+/// The lowering and the pipeline key must both read this one predicate. They used to disagree:
+/// the key carried the raw evaluator flag while the lowering additionally forced the flag on for
+/// snapshots that no longer decode, so the heap and snapshot variants of one program shared a
+/// pipeline cache entry — silently, because the refusal that would have caught it is suppressed
+/// while tables are on (`texture/upload.rs`).
+///
+/// Only the pixel stage sets the option (the export and compute paths never do, and only the
+/// pixel encoder builds tables — `execute.rs::build_pixel_heap_texture_tables`), so those stages
+/// pass `false` and this effective predicate collapses to a constant. The cache key separately
+/// retains the evaluator's raw per-binding flag so extending heap tables to those stages cannot
+/// silently revive the collision.
+pub(super) fn image_binding_fetches_descriptor_at_runtime(
+    binding: &remu_shader::ImageBinding,
+    stage_uses_heap_tables: bool,
+) -> bool {
+    stage_uses_heap_tables
+        && (binding.descriptor_index_is_runtime || snapshot_descriptor_forces_heap_table(binding))
+}
+
+/// A live snapshot descriptor that no longer decodes as a T#.
+///
+/// The evaluator flags index-driven runtime descriptors; snapshots that fail to decode for
+/// TEMPORAL reasons (transient per-draw arenas holding other record types at evaluation time)
+/// carry no evaluator-visible taint. The presenter sees the failure directly, so it routes those
+/// bindings to the heap tables as well.
+fn snapshot_descriptor_forces_heap_table(binding: &remu_shader::ImageBinding) -> bool {
+    !binding.resource_descriptor.iter().all(|word| *word == 0)
+        && super::decode::decode_image_descriptor(&binding.resource_descriptor).is_err()
 }
