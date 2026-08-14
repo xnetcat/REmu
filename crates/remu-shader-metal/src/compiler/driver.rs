@@ -291,6 +291,7 @@ impl<'a> Compiler<'a> {
         // sequence lowers as-is.
         if options.stage == MetalShaderStage::Mesh
             && !options.ngg_registers_proven
+            && !options.ngg_fixed_allocation_fallback
             && mesh_ngg_packed_export_sgpr(program).is_some()
         {
             return Err(MetalCompileError::InvalidInterface(
@@ -303,7 +304,8 @@ impl<'a> Compiler<'a> {
         // vertex record per invocation contract: treating an ordinary V_CMPX source as a
         // compacted output id changes the pre-subgroup-allocation ABI used by older titles.
         let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh
-            && options.ngg_registers_proven)
+            && options.ngg_registers_proven
+            && !options.ngg_fixed_allocation_fallback)
             .then(|| mesh_export_vertex_vgpr(program))
             .flatten();
 

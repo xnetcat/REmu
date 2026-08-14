@@ -11,14 +11,15 @@ use std::time::Instant;
 
 use super::{
     CompiledComputePipeline, CompiledShaderPair, ComputePipelineKey, GraphicsPipelineKey,
-    MetalPresenter, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED,
-    PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL, PersistentRenderPipelineArchive,
-    PipelineCompileCandidate, ProgramIdentity, RenderPipelineArchiveState, ShaderCompileRequest,
-    ShaderCompileResult, ShaderFunctionCache, ShaderFunctionCacheEntry, ShaderFunctionStageCache,
-    diagnostic_disable_blending, dump_msl_compute_filter_matches,
-    dump_msl_instruction_filter_matches, dump_msl_pixel_filter_matches,
-    evaluation_samples_large_linear_video, image_component_class, metal_color_write_mask,
-    register_value, speculative_pipeline_compile_in_flight_capacity, video_target_binding_summary,
+    MetalPresenter, NGG_LEGACY_MESH_LDS_BYTES, NggOutputPrimitiveType, PIPELINE_COMPILE_COMPLETED,
+    PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
+    PersistentRenderPipelineArchive, PipelineCompileCandidate, ProgramIdentity,
+    RenderPipelineArchiveState, ShaderCompileRequest, ShaderCompileResult, ShaderFunctionCache,
+    ShaderFunctionCacheEntry, ShaderFunctionStageCache, diagnostic_disable_blending,
+    dump_msl_compute_filter_matches, dump_msl_instruction_filter_matches,
+    dump_msl_pixel_filter_matches, evaluation_samples_large_linear_video, image_component_class,
+    metal_color_write_mask, register_value, speculative_pipeline_compile_in_flight_capacity,
+    video_target_binding_summary,
 };
 mod archive;
 mod compile;
@@ -35,12 +36,12 @@ pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_export_uses_general_lds,
-    ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask, pixel_scalars,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base, program_uses_lds,
-    reconcile_pixel_input_controls_with_export_producers, rectangle_coordinate_parameter_mask,
-    log_wave64_hazard_census, shader_scalar_metadata_for_registers,
+    is_storage_image_opcode, is_writable_image_opcode, log_wave64_hazard_census,
+    ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    program_uses_lds, reconcile_pixel_input_controls_with_export_producers,
+    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
     validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
 };
 #[cfg(test)]
@@ -50,6 +51,39 @@ pub(crate) use self::program::{
     rectangle_draw_has_incomplete_interface, shader_scalar_metadata,
     truncated_memoryless_ngg_rectangle_cover, unmatched_param_default_control,
 };
+
+fn ngg_mesh_compile_options(
+    interpolated_attribute_count: u32,
+    limits: super::NggSubgroupLimits,
+    registers: Option<remu_shader_metal::NggRegisters>,
+) -> Result<remu_shader_metal::MetalCompileOptions, String> {
+    if limits.uses_fixed_allocation_fallback() {
+        // Recreate the pre-subgroup-allocation compiler mode itself. Starting from
+        // mesh_from_ngg_registers and only shrinking its capacities leaves proof-driven
+        // GS_ALLOC, compacted-export, primgen and ESGS semantics enabled, which is not the
+        // legacy no-GS ABI used by the known-good Superliminal renderer.
+        let mut options = remu_shader_metal::MetalCompileOptions::mesh(
+            interpolated_attribute_count,
+            NGG_LEGACY_MESH_LDS_BYTES,
+            limits.meshlet_vertex_limit(),
+            limits.meshlet_primitive_limit(),
+            limits.metal_threadgroup_threads(),
+        );
+        options.enable_fixed_ngg_allocation_fallback();
+        Ok(options)
+    } else {
+        let registers =
+            registers.ok_or("NGG mesh shader is missing its raw SDK sizing registers")?;
+        // Q5: derive the real linked-GS interface from live SDK register dwords.
+        Ok(
+            remu_shader_metal::MetalCompileOptions::mesh_from_ngg_registers(
+                interpolated_attribute_count,
+                limits.metal_threadgroup_threads(),
+                registers,
+            ),
+        )
+    }
+}
 
 impl MetalPresenter {
     pub(super) fn prefetch_pipeline_compilations(&mut self) {
@@ -526,14 +560,12 @@ impl MetalPresenter {
             && pixel_evaluation.image_bindings.iter().any(|binding| {
                 !binding.descriptor_index_is_runtime
                     && !binding.resource_descriptor.iter().all(|word| *word == 0)
-                    && super::decode::decode_image_descriptor(&binding.resource_descriptor)
-                        .is_err()
+                    && super::decode::decode_image_descriptor(&binding.resource_descriptor).is_err()
             }) {
             pixel_evaluation_with_tables = pixel_evaluation.clone();
             for binding in &mut pixel_evaluation_with_tables.image_bindings {
                 if !binding.resource_descriptor.iter().all(|word| *word == 0)
-                    && super::decode::decode_image_descriptor(&binding.resource_descriptor)
-                        .is_err()
+                    && super::decode::decode_image_descriptor(&binding.resource_descriptor).is_err()
                 {
                     binding.descriptor_index_is_runtime = true;
                 }
@@ -559,23 +591,11 @@ impl MetalPresenter {
                     limits.output_primitive_type
                 ));
             }
-            let registers = key
-                .ngg_registers
-                .ok_or("NGG mesh shader is missing its raw SDK sizing registers")?;
-            // Q5: derive the Metal interface and proof flag from the live SDK register dwords.
-            // Meshlet preparation still uses the more detailed decoded limits above, including
-            // the independent input-primitive bound.
-            // LDS comes from `ShShaderResource2Gs::getLdsSize` via proven `NggRegisters` — never a
-            // hardcoded 16 KiB cushion. Over-allocating guest LDS plus compacted EXP staging is what
-            // pushes Metal mesh pipelines past the 32 KiB threadgroup limit.
-            let mut mesh_options = remu_shader_metal::MetalCompileOptions::mesh_from_ngg_registers(
+            let mut mesh_options = ngg_mesh_compile_options(
                 pixel_msl.interpolated_attribute_count,
-                limits.metal_threadgroup_threads(),
-                registers,
-            );
-            if limits.uses_fixed_allocation_fallback() {
-                mesh_options.enable_fixed_ngg_allocation_fallback();
-            }
+                limits,
+                key.ngg_registers,
+            )?;
             // Wave64 NGG exports (Poppy Playtime UI/LUT quads) gate their exports on
             // 64-bit EXEC masks and compute meshlet thread indices as
             // `s3[27:24] * 64 + v_mbcnt`. Splitting the guest wave across two SIMD32
@@ -851,4 +871,38 @@ pub(super) const SHADER_COMPILE_QUEUE_CAPACITY: usize = 64;
 pub(super) fn runtime_heap_tables_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("REMU_HEAP_TABLES").is_some_and(|value| value == "1"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_ngg_compile_options_restore_the_unproven_legacy_abi() {
+        let limits = super::super::NggSubgroupLimits {
+            es_vertices_per_subgroup: 96,
+            gs_primitives_per_subgroup: 96,
+            gs_instance_primitives_per_subgroup: 96,
+            gs_instance_count: 1,
+            gs_max_vertices_out: 0,
+            max_output_vertices_per_subgroup: 96,
+            primitive_amplification_factor: 1,
+            max_output_primitives_per_subgroup: 96,
+            output_primitive_type: Some(NggOutputPrimitiveType::TriangleStrip),
+            threadgroup_threads: 96,
+            fixed_allocation_fallback: true,
+        };
+
+        let options = ngg_mesh_compile_options(4, limits, None)
+            .expect("fixed no-GS mode must not require stale GS registers");
+        assert_eq!(options.stage, remu_shader_metal::MetalShaderStage::Mesh);
+        assert_eq!(options.lds_size_bytes, NGG_LEGACY_MESH_LDS_BYTES);
+        assert_eq!(options.mesh_max_vertex_count, 64);
+        assert_eq!(options.mesh_max_primitive_count, 64);
+        assert_eq!(options.mesh_threadgroup_size, 64);
+        assert!(!options.ngg_registers_proven);
+        assert!(!options.ngg_primgen_passthrough);
+        assert_eq!(options.ngg_esgs_ring_itemsize, 0);
+        assert!(options.ngg_fixed_allocation_fallback);
+    }
 }
