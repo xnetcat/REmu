@@ -298,14 +298,11 @@ impl<'a> Compiler<'a> {
                     .into(),
             ));
         }
-        // PRIM exports address the compacted vertex domain only when live NGG registers prove
-        // that ABI. The legacy no-GS fixed fallback predates that contract: guest compaction
-        // moves the surviving payload into the exporting lane, and the known-good renderer
-        // publishes that lane's record directly. Guessing a compacted-id VGPR there aliases
-        // unrelated outputs and corrupts Superliminal's late title composite.
+        // PRIM exports address the compacted vertex domain. The fixed no-GS fallback and the
+        // register-proven path both provide a bounded Metal vertex capacity, so a V_CMPX-gated
+        // EXP can publish to its guest compacted id without inventing allocation state.
         let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh
-            && options.ngg_registers_proven
-            && !options.ngg_fixed_allocation_fallback)
+            && (options.ngg_registers_proven || options.ngg_fixed_allocation_fallback))
             .then(|| mesh_export_vertex_vgpr(program))
             .flatten();
 
