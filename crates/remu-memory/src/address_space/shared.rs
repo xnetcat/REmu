@@ -634,6 +634,88 @@ pub fn guest_shared_backing_any_range_overlaps(
         })
 }
 
+/// Tests many candidate ranges against a fixed range whose physical identity was already
+/// resolved by the caller.
+///
+/// This is the hot-path counterpart of [`guest_shared_backing_any_range_overlaps`]: callers that
+/// compare several queued write sets can resolve the read range once, then reuse that identity
+/// without taking this registry lock merely to resolve the fixed side again. Candidates still
+/// lacking a capture-time identity are resolved together under this single read lock. Passing
+/// `None` preserves the original helper's virtual-alias fallback for an unresolved fixed range.
+#[must_use]
+pub fn guest_shared_backing_any_range_overlaps_resolved(
+    candidates: impl IntoIterator<Item = (u64, u64)>,
+    fixed: u64,
+    fixed_byte_count: u64,
+    fixed_identity: Option<GuestSharedMappingIdentity>,
+) -> bool {
+    if fixed_byte_count == 0 {
+        return false;
+    }
+    let mappings = shared_mappings()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fixed_virtual_end = fixed.checked_add(fixed_byte_count);
+    candidates
+        .into_iter()
+        .any(|(candidate, candidate_byte_count)| {
+            if candidate_byte_count == 0 {
+                return false;
+            }
+            let Some((candidate_backing, candidate_start, candidate_end)) =
+                resolve_shared_backing_range(&mappings, candidate, candidate_byte_count)
+            else {
+                return false;
+            };
+            if let Some(fixed_identity) = fixed_identity {
+                let Some(fixed_end) = fixed_identity
+                    .backing_offset
+                    .checked_add(fixed_byte_count)
+                else {
+                    return false;
+                };
+                return candidate_backing.id() == fixed_identity.backing_id
+                    && ranges_overlap(
+                        candidate_start,
+                        candidate_end,
+                        fixed_identity.backing_offset,
+                        fixed_end,
+                    );
+            }
+            let Some(fixed_virtual_end) = fixed_virtual_end else {
+                return false;
+            };
+            mappings
+                .backing_records(candidate_backing.id())
+                .any(|(mapping_start, record)| {
+                    let Some(mapping_length) = record.end.checked_sub(mapping_start) else {
+                        return false;
+                    };
+                    let Some(mapping_physical_end) =
+                        record.backing_offset.checked_add(mapping_length)
+                    else {
+                        return false;
+                    };
+                    let intersection_start = record.backing_offset.max(candidate_start);
+                    let intersection_end = mapping_physical_end.min(candidate_end);
+                    if intersection_start >= intersection_end {
+                        return false;
+                    }
+                    let Some(alias_start) =
+                        mapping_start.checked_add(intersection_start - record.backing_offset)
+                    else {
+                        return false;
+                    };
+                    let Some(alias_end) =
+                        alias_start.checked_add(intersection_end - intersection_start)
+                    else {
+                        return false;
+                    };
+                    ranges_overlap(alias_start, alias_end, fixed, fixed_virtual_end)
+                })
+        })
+}
+
 pub fn guest_shared_backing_ranges_overlap(
     left: u64,
     left_byte_count: u64,

@@ -1209,6 +1209,27 @@ fn physical_range_overlap_compares_aliases_without_requiring_matching_virtual_ad
         guest_shared_backing_identity(continuation.get(), GUEST_PAGE_SIZE),
         Some(first_identity),
     );
+    let _ = take_guest_shared_identity_statistics();
+    assert!(guest_shared_backing_any_range_overlaps_resolved(
+        [(alias.get(), GUEST_PAGE_SIZE)],
+        first.get(),
+        GUEST_PAGE_SIZE,
+        Some(first_identity),
+    ));
+    assert!(!guest_shared_backing_any_range_overlaps_resolved(
+        [
+            (continuation.get(), GUEST_PAGE_SIZE),
+            (unrelated.get(), GUEST_PAGE_SIZE),
+        ],
+        first.get(),
+        GUEST_PAGE_SIZE,
+        Some(first_identity),
+    ));
+    assert_eq!(
+        take_guest_shared_identity_statistics(),
+        (0, 0),
+        "the batched fallback must reuse the fixed identity instead of resolving it again",
+    );
 }
 
 #[test]

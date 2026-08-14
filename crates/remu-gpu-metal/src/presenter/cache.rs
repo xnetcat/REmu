@@ -19,9 +19,9 @@ use metal::{
     MTLResourceOptions, SamplerState, StencilDescriptor,
 };
 use remu_memory::{
-    GuestSharedBackingRange, GuestSharedMappingIdentity, guest_shared_backing_identity,
-    guest_shared_backing_any_range_overlaps, guest_shared_backing_range,
-    read_guest_shared_backing,
+    GuestSharedBackingRange, GuestSharedMappingIdentity,
+    guest_shared_backing_any_range_overlaps_resolved, guest_shared_backing_identity,
+    guest_shared_backing_range, read_guest_shared_backing,
 };
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
@@ -940,16 +940,29 @@ impl MetalPresenter {
     ) -> Result<QueuedGlobalReadSource, String> {
         let byte_count = u64::try_from(binding.byte_count)
             .map_err(|_| "global binding byte count does not fit u64")?;
+        // The read range is loop-invariant across every candidate in every batch below, and its
+        // resolution costs a process-global registry read lock plus a BTreeMap descent. Resolve it
+        // once here; the queued writes already carry the identity they resolved at capture time,
+        // so the whole lookup compares stored identities from this point on.
+        let read_identity = guest_shared_backing_identity(binding.base_address, byte_count);
         if let Some(batch) = self.active_open_guest_batch() {
-            let source =
-                queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
+            let source = queued_global_read_source_in_batch(
+                batch,
+                binding.base_address,
+                byte_count,
+                read_identity,
+            );
             if !matches!(source, QueuedGlobalReadSource::None) {
                 return Ok(stageable_writable_global_source(binding, source));
             }
         }
         for batch in self.active_committed_guest_batches().iter().rev() {
-            let source =
-                queued_global_read_source_in_batch(batch, binding.base_address, byte_count);
+            let source = queued_global_read_source_in_batch(
+                batch,
+                binding.base_address,
+                byte_count,
+                read_identity,
+            );
             if !matches!(source, QueuedGlobalReadSource::None) {
                 return Ok(stageable_writable_global_source(binding, source));
             }
@@ -964,6 +977,7 @@ impl MetalPresenter {
             consumer_queue_id,
             binding.base_address,
             byte_count,
+            read_identity,
         );
         Ok(stageable_writable_global_source(binding, selected))
     }
@@ -973,6 +987,7 @@ impl MetalPresenter {
         consumer_queue_id: u64,
         address: u64,
         byte_count: u64,
+        read_identity: Option<GuestSharedMappingIdentity>,
     ) -> QueuedGlobalReadSource {
         let Some(consumer) = self.guest_queue_batches.get(&consumer_queue_id) else {
             return QueuedGlobalReadSource::None;
@@ -982,7 +997,12 @@ impl MetalPresenter {
             if producer.queue_id() == consumer_queue_id {
                 continue;
             }
-            let source = queued_global_read_source_in_checkpoint(checkpoint, address, byte_count);
+            let source = queued_global_read_source_in_checkpoint(
+                checkpoint,
+                address,
+                byte_count,
+                read_identity,
+            );
             if !merge_queued_global_read_source(&mut selected, source, byte_count) {
                 return QueuedGlobalReadSource::Synchronize;
             }
@@ -1003,14 +1023,15 @@ impl MetalPresenter {
         let Some(consumer) = self.guest_queue_batches.get(&consumer_queue_id) else {
             return false;
         };
+        let read_identity = guest_shared_backing_identity(address, byte_count);
         if consumer.open_batch.as_ref().is_some_and(|batch| {
             !matches!(
-                queued_global_read_source_in_batch(batch, address, byte_count),
+                queued_global_read_source_in_batch(batch, address, byte_count, read_identity),
                 QueuedGlobalReadSource::None
             )
         }) || consumer.committed_batches.iter().any(|batch| {
             !matches!(
-                queued_global_read_source_in_batch(batch, address, byte_count),
+                queued_global_read_source_in_batch(batch, address, byte_count, read_identity),
                 QueuedGlobalReadSource::None
             )
         }) {
@@ -1021,6 +1042,7 @@ impl MetalPresenter {
                 consumer_queue_id,
                 address,
                 byte_count,
+                read_identity,
             ),
             QueuedGlobalReadSource::Buffer {
                 guest_memory: false,
@@ -1048,14 +1070,25 @@ impl MetalPresenter {
             let Ok(byte_count) = u64::try_from(binding.byte_count) else {
                 return false;
             };
+            let read_identity = guest_shared_backing_identity(binding.base_address, byte_count);
             if self.active_open_guest_batch().is_some_and(|batch| {
                 !matches!(
-                    queued_global_read_source_in_batch(batch, binding.base_address, byte_count),
+                    queued_global_read_source_in_batch(
+                        batch,
+                        binding.base_address,
+                        byte_count,
+                        read_identity
+                    ),
                     QueuedGlobalReadSource::None
                 )
             }) || self.active_committed_guest_batches().iter().any(|batch| {
                 !matches!(
-                    queued_global_read_source_in_batch(batch, binding.base_address, byte_count),
+                    queued_global_read_source_in_batch(
+                        batch,
+                        binding.base_address,
+                        byte_count,
+                        read_identity
+                    ),
                     QueuedGlobalReadSource::None
                 )
             }) {
@@ -1066,6 +1099,7 @@ impl MetalPresenter {
                     consumer_queue_id,
                     binding.base_address,
                     byte_count,
+                    read_identity,
                 ),
                 QueuedGlobalReadSource::Buffer {
                     guest_memory: false,
@@ -1362,6 +1396,7 @@ fn queued_global_read_source_in_batch(
     batch: &GuestCommandBatch,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> QueuedGlobalReadSource {
     queued_global_read_source_in_batch_prefix(
         batch,
@@ -1370,6 +1405,7 @@ fn queued_global_read_source_in_batch(
         batch.memory_writes.len(),
         address,
         byte_count,
+        read_identity,
     )
 }
 
@@ -1380,6 +1416,7 @@ fn queued_global_read_source_in_batch_prefix(
     memory_write_count: usize,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> QueuedGlobalReadSource {
     let global_versions = &batch.global_buffer_versions;
     let global_writebacks = &batch.global_writebacks[..global_writeback_count];
@@ -1392,41 +1429,118 @@ fn queued_global_read_source_in_batch_prefix(
     //
     // `∃c. virtual(c) ∨ physical(c)` is `(∃c. virtual(c)) ∨ (∃c. physical(c))`, so the cheap virtual
     // pass runs first over everything and the registry is touched only when nothing matched
-    // virtually — then once, for the whole scan, rather than once per candidate.
+    // virtually.
+    //
+    // The physical pass then compares the identity each producer resolved at capture time against
+    // the read identity resolved once by the caller — the same stored identities the contained_*
+    // helpers below decide on, so the gate admits exactly the candidates those helpers can match.
+    // Memory writes are checked first because any overlap is an unconditional synchronization;
+    // the three forwardable collections are collected below. Only a producer captured before its
+    // range resolved still needs the registry, and those legacy candidates share one locked scan
+    // which reuses `read_identity`; when every candidate has one the whole gate is arithmetic.
     let physical_candidates = || {
         global_versions
             .iter()
-            .map(|version| (version.guest_address, version.byte_count))
+            .map(|version| {
+                (
+                    version.guest_address,
+                    version.byte_count,
+                    version.mapping_identity,
+                )
+            })
             .chain(global_writebacks.iter().filter_map(|writeback| {
-                u64::try_from(writeback.byte_count)
-                    .ok()
-                    .map(|length| (writeback.guest_address, length))
+                u64::try_from(writeback.byte_count).ok().map(|length| {
+                    (
+                        writeback.guest_address,
+                        length,
+                        writeback.mapping_identity(),
+                    )
+                })
             }))
-            .chain(
-                guest_write_ranges
-                    .iter()
-                    .map(|range| (range.address, range.byte_count)),
-            )
+            .chain(guest_write_ranges.iter().map(|range| {
+                (
+                    range.address,
+                    range.byte_count,
+                    Some(range.physical_identity),
+                )
+            }))
     };
-    let overlaps = memory_writes
+    let memory_write_overlaps = memory_writes
         .iter()
         .any(|write| write.overlaps(address, byte_count))
-        || physical_candidates().any(|(candidate, candidate_byte_count)| {
+        || memory_writes.iter().any(|write| {
+            let (_, write_byte_count) = write.range();
+            stored_identities_overlap(
+                write.mapping_identity,
+                write_byte_count,
+                read_identity,
+                byte_count,
+            )
+        })
+        || (memory_writes
+            .iter()
+            .any(|write| write.mapping_identity.is_none())
+            && guest_shared_backing_any_range_overlaps_resolved(
+                memory_writes.iter().filter_map(|write| {
+                    let (write_address, write_byte_count) = write.range();
+                    write
+                        .mapping_identity
+                        .is_none()
+                        .then_some((write_address, write_byte_count))
+                }),
+                address,
+                byte_count,
+                read_identity,
+            ));
+    if memory_write_overlaps {
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    let unresolved_producer_overlaps = physical_candidates().any(
+        |(candidate, candidate_byte_count, candidate_identity)| {
+            candidate_identity.is_none()
+                && !guest_ranges_overlap(candidate, candidate_byte_count, address, byte_count)
+        },
+    )
+        && guest_shared_backing_any_range_overlaps_resolved(
+            physical_candidates().filter_map(
+                |(candidate, candidate_byte_count, candidate_identity)| {
+                    (candidate_identity.is_none()
+                        && !guest_ranges_overlap(
+                            candidate,
+                            candidate_byte_count,
+                            address,
+                            byte_count,
+                        ))
+                    .then_some((candidate, candidate_byte_count))
+                },
+            ),
+            address,
+            byte_count,
+            read_identity,
+        );
+    if unresolved_producer_overlaps {
+        // Producers without a capture-time identity are rare legacy entries. A physical alias is
+        // a real hazard, but it cannot be forwarded safely in the stored-identity domain, so
+        // settle instead of re-resolving the fixed read once per candidate below.
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    let overlaps = physical_candidates().any(|(candidate, candidate_byte_count, _)| {
             guest_ranges_overlap(candidate, candidate_byte_count, address, byte_count)
         })
-        || guest_shared_backing_any_range_overlaps(physical_candidates(), address, byte_count);
+        || physical_candidates().any(|(_, candidate_byte_count, candidate_identity)| {
+            stored_identities_overlap(
+                candidate_identity,
+                candidate_byte_count,
+                read_identity,
+                byte_count,
+            )
+        });
     if !overlaps {
         return QueuedGlobalReadSource::None;
     }
-    if memory_writes.iter().any(|write| {
-        let (write_address, write_byte_count) = write.range();
-        guest_physical_ranges_overlap(write_address, write_byte_count, address, byte_count)
-    }) {
-        return QueuedGlobalReadSource::Synchronize;
-    }
     let mut candidate: Option<(Buffer, u64, bool, Option<GuestSharedMappingIdentity>)> = None;
     for version in global_versions {
-        match contained_global_version_offset(version, address, byte_count) {
+        match contained_global_version_offset(version, address, byte_count, read_identity) {
             QueuedWriteReadMatch::None => {}
             QueuedWriteReadMatch::Synchronize => {
                 return QueuedGlobalReadSource::Synchronize;
@@ -1461,7 +1575,7 @@ fn queued_global_read_source_in_batch_prefix(
         };
     }
     for writeback in global_writebacks {
-        match contained_global_writeback_offset(writeback, address, byte_count) {
+        match contained_global_writeback_offset(writeback, address, byte_count, read_identity) {
             QueuedWriteReadMatch::None => {}
             QueuedWriteReadMatch::Synchronize => {
                 return QueuedGlobalReadSource::Synchronize;
@@ -1484,7 +1598,7 @@ fn queued_global_read_source_in_batch_prefix(
         }
     }
     for range in guest_write_ranges {
-        match contained_guest_write_offset(range, address, byte_count) {
+        match contained_guest_write_offset(range, address, byte_count, read_identity) {
             QueuedWriteReadMatch::None => {}
             QueuedWriteReadMatch::Synchronize => {
                 return QueuedGlobalReadSource::Synchronize;
@@ -1521,17 +1635,79 @@ fn queued_global_read_source_in_checkpoint(
     checkpoint: &SharedEventSignalCheckpoint,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> QueuedGlobalReadSource {
     if checkpoint
         .unresolved_write_ranges
         .iter()
-        .any(|write| unresolved_checkpoint_range_overlaps(write, address, byte_count))
+        .any(|write| {
+            unresolved_checkpoint_range_overlaps(
+                write,
+                address,
+                byte_count,
+                read_identity,
+            )
+        })
+    {
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    if checkpoint
+        .global_versions
+        .iter()
+        .any(|version| {
+            version.mapping_identity.is_none()
+                && !guest_ranges_overlap(
+                    version.guest_address,
+                    version.byte_count,
+                    address,
+                    byte_count,
+                )
+        })
+        && guest_shared_backing_any_range_overlaps_resolved(
+            checkpoint.global_versions.iter().filter_map(|version| {
+                (version.mapping_identity.is_none()
+                    && !guest_ranges_overlap(
+                        version.guest_address,
+                        version.byte_count,
+                        address,
+                        byte_count,
+                    ))
+                .then_some((version.guest_address, version.byte_count))
+            }),
+            address,
+            byte_count,
+            read_identity,
+        )
+    {
+        // A checkpoint producer without a capture-time identity cannot be forwarded in the same
+        // domain as the resolved read. Preserve the hazard by settling it once, without resolving
+        // the fixed read again for every candidate.
+        return QueuedGlobalReadSource::Synchronize;
+    }
+    if checkpoint
+        .unresolved_write_ranges
+        .iter()
+        .any(|write| write.mapping_identity.is_none())
+        && guest_shared_backing_any_range_overlaps_resolved(
+            checkpoint
+                .unresolved_write_ranges
+                .iter()
+                .filter_map(|write| {
+                    write
+                        .mapping_identity
+                        .is_none()
+                        .then_some((write.guest_address, write.byte_count))
+                }),
+            address,
+            byte_count,
+            read_identity,
+        )
     {
         return QueuedGlobalReadSource::Synchronize;
     }
     let mut candidate = None;
     for version in &checkpoint.global_versions {
-        match contained_global_version_offset(version, address, byte_count) {
+        match contained_global_version_offset(version, address, byte_count, read_identity) {
             QueuedWriteReadMatch::None => {}
             QueuedWriteReadMatch::Synchronize => {
                 return QueuedGlobalReadSource::Synchronize;
@@ -1568,19 +1744,15 @@ fn unresolved_checkpoint_range_overlaps(
     write: &super::SharedEventUnresolvedWriteRange,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> bool {
     if super::guest_ranges_overlap(write.guest_address, write.byte_count, address, byte_count) {
         return true;
     }
     let Some(write_identity) = write.mapping_identity else {
-        return guest_physical_ranges_overlap(
-            write.guest_address,
-            write.byte_count,
-            address,
-            byte_count,
-        );
+        return false;
     };
-    let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+    let Some(read_identity) = read_identity else {
         return false;
     };
     write_identity.backing_id == read_identity.backing_id
@@ -1644,10 +1816,33 @@ enum QueuedWriteReadMatch {
     Synchronize,
 }
 
+/// Physical overlap between a queued producer and the read range, using only identities both
+/// sides already resolved — no registry lock. Saturating ends keep the answer on the permissive
+/// side of the contained_* helpers, which bail to `Synchronize` when the same arithmetic overflows.
+fn stored_identities_overlap(
+    candidate_identity: Option<GuestSharedMappingIdentity>,
+    candidate_byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
+    byte_count: u64,
+) -> bool {
+    let (Some(candidate_identity), Some(read_identity)) = (candidate_identity, read_identity)
+    else {
+        return false;
+    };
+    candidate_identity.backing_id == read_identity.backing_id
+        && super::guest_ranges_overlap(
+            candidate_identity.backing_offset,
+            candidate_byte_count,
+            read_identity.backing_offset,
+            byte_count,
+        )
+}
+
 fn contained_global_version_offset(
     version: &SharedEventGlobalBufferVersion,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> QueuedWriteReadMatch {
     let virtual_overlap = super::guest_ranges_overlap(
         version.guest_address,
@@ -1656,7 +1851,7 @@ fn contained_global_version_offset(
         byte_count,
     );
     if let Some(producer_identity) = version.mapping_identity {
-        if let Some(read_identity) = guest_shared_backing_identity(address, byte_count)
+        if let Some(read_identity) = read_identity
             && read_identity.backing_id == producer_identity.backing_id
         {
             let producer_start = producer_identity.backing_offset;
@@ -1686,12 +1881,9 @@ fn contained_global_version_offset(
         if !virtual_overlap {
             return QueuedWriteReadMatch::None;
         }
-    } else if !guest_physical_ranges_overlap(
-        version.guest_address,
-        version.byte_count,
-        address,
-        byte_count,
-    ) {
+    } else if !virtual_overlap {
+        // The caller already batched every identity-less producer through the registry. A
+        // physical match returned Synchronize before this helper; no match is None here.
         return QueuedWriteReadMatch::None;
     }
     let Some(version_end) = version.guest_address.checked_add(version.byte_count) else {
@@ -1722,10 +1914,11 @@ fn contained_guest_write_offset(
     range: &super::PendingGuestWriteRange,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> QueuedWriteReadMatch {
     let virtual_overlap =
         super::guest_ranges_overlap(range.address, range.byte_count, address, byte_count);
-    let Some(read_identity) = guest_shared_backing_identity(address, byte_count) else {
+    let Some(read_identity) = read_identity else {
         return if virtual_overlap {
             QueuedWriteReadMatch::Synchronize
         } else {
@@ -1809,6 +2002,7 @@ fn contained_global_writeback_offset(
     writeback: &PendingGlobalWriteback,
     address: u64,
     byte_count: u64,
+    read_identity: Option<GuestSharedMappingIdentity>,
 ) -> QueuedWriteReadMatch {
     let Ok(writeback_byte_count) = u64::try_from(writeback.byte_count) else {
         return QueuedWriteReadMatch::Synchronize;
@@ -1820,7 +2014,7 @@ fn contained_global_writeback_offset(
         byte_count,
     );
     if let Some(producer_identity) = writeback.mapping_identity() {
-        if let Some(read_identity) = guest_shared_backing_identity(address, byte_count)
+        if let Some(read_identity) = read_identity
             && read_identity.backing_id == producer_identity.backing_id
         {
             let producer_start = producer_identity.backing_offset;
@@ -1853,15 +2047,18 @@ fn contained_global_writeback_offset(
             QueuedWriteReadMatch::None
         };
     }
-    if !guest_physical_ranges_overlap(
-        writeback.guest_address,
-        writeback_byte_count,
-        address,
-        byte_count,
-    ) {
-        return QueuedWriteReadMatch::None;
+    // The caller already batched every identity-less producer through the registry. A physical
+    // match returned Synchronize before this helper; no match is None here.
+    if virtual_overlap {
+        contained_global_writeback_virtual_offset(
+            writeback,
+            address,
+            byte_count,
+            writeback_byte_count,
+        )
+    } else {
+        QueuedWriteReadMatch::None
     }
-    contained_global_writeback_virtual_offset(writeback, address, byte_count, writeback_byte_count)
 }
 
 fn contained_global_writeback_virtual_offset(
@@ -1925,7 +2122,169 @@ pub(super) const NGG_MESHLET_CACHE_CAPACITY: usize = 64;
 
 #[cfg(test)]
 mod tests {
-    use super::decode_indirect_dwords;
+    use super::{
+        QueuedWriteReadMatch, SharedEventGlobalBufferVersion, contained_global_version_offset,
+        contained_guest_write_offset, decode_indirect_dwords, stored_identities_overlap,
+    };
+    use crate::presenter::PendingGuestWriteRange;
+    use metal::{Buffer, Device, MTLResourceOptions};
+    use remu_memory::GuestSharedMappingIdentity;
+
+    /// The backing the producers below resolved when their write was captured.
+    const PRODUCER_BACKING: u64 = 7;
+    /// A different backing object the same guest VA can name after the guest recycles it.
+    const RECYCLED_BACKING: u64 = 9;
+
+    const fn identity(backing_id: u64, backing_offset: u64) -> GuestSharedMappingIdentity {
+        GuestSharedMappingIdentity {
+            backing_id,
+            backing_offset,
+        }
+    }
+
+    fn scratch_buffer() -> Buffer {
+        Device::system_default()
+            .expect("Metal device")
+            .new_buffer(0x100, MTLResourceOptions::StorageModeShared)
+    }
+
+    fn buffer_offset(result: &QueuedWriteReadMatch) -> Option<u64> {
+        match result {
+            QueuedWriteReadMatch::Buffer { offset, .. } => Some(*offset),
+            _ => None,
+        }
+    }
+
+    fn matched_identity(result: &QueuedWriteReadMatch) -> Option<GuestSharedMappingIdentity> {
+        match result {
+            QueuedWriteReadMatch::Buffer {
+                physical_identity, ..
+            } => *physical_identity,
+            _ => None,
+        }
+    }
+
+    /// A producer captured at one VA and a read issued through a second VA over the same physical
+    /// bytes must resolve to the producer buffer at the aliased offset. Both sides are compared
+    /// through the identities they already carry, so no registry lookup happens here.
+    #[test]
+    fn read_aliased_through_a_second_va_forwards_the_producer_buffer() {
+        let version = SharedEventGlobalBufferVersion {
+            buffer: scratch_buffer(),
+            offset: 0,
+            guest_address: 0x1000,
+            byte_count: 0x100,
+            mapping_identity: Some(identity(PRODUCER_BACKING, 0x2000)),
+        };
+        // The read names 0x9000, which shares no virtual bytes with the producer's 0x1000.
+        let matched = contained_global_version_offset(
+            &version,
+            0x9000,
+            0x40,
+            Some(identity(PRODUCER_BACKING, 0x2040)),
+        );
+        assert_eq!(buffer_offset(&matched), Some(0x40));
+        assert_eq!(
+            matched_identity(&matched),
+            Some(identity(PRODUCER_BACKING, 0x2040))
+        );
+
+        let range = PendingGuestWriteRange {
+            address: 0x1000,
+            byte_count: 0x100,
+            buffer: scratch_buffer(),
+            offset: 0x10,
+            physical_identity: identity(PRODUCER_BACKING, 0x2000),
+        };
+        let matched = contained_guest_write_offset(
+            &range,
+            0x9000,
+            0x40,
+            Some(identity(PRODUCER_BACKING, 0x2040)),
+        );
+        assert_eq!(buffer_offset(&matched), Some(0x10 + 0x40));
+        assert_eq!(
+            matched_identity(&matched),
+            Some(identity(PRODUCER_BACKING, 0x2040))
+        );
+    }
+
+    /// The read reuses the producer's VA after the guest recycled it onto a different backing.
+    /// Forwarding by virtual offset would hand the new owner the previous allocation's bytes.
+    #[test]
+    fn read_at_a_recycled_va_does_not_forward_the_previous_backings_buffer() {
+        let range = PendingGuestWriteRange {
+            address: 0x1000,
+            byte_count: 0x100,
+            buffer: scratch_buffer(),
+            offset: 0x10,
+            physical_identity: identity(PRODUCER_BACKING, 0x2000),
+        };
+        let matched = contained_guest_write_offset(
+            &range,
+            0x1000,
+            0x40,
+            Some(identity(RECYCLED_BACKING, 0x2000)),
+        );
+        assert!(matches!(matched, QueuedWriteReadMatch::Synchronize));
+    }
+
+    /// A read whose range has no live shared mapping cannot be compared physically, so the
+    /// producer's virtual range decides: contained reads still forward, disjoint reads do not
+    /// match at all.
+    #[test]
+    fn unresolved_read_identity_falls_back_to_the_producers_virtual_range() {
+        let range = PendingGuestWriteRange {
+            address: 0x1000,
+            byte_count: 0x100,
+            buffer: scratch_buffer(),
+            offset: 0x10,
+            physical_identity: identity(PRODUCER_BACKING, 0x2000),
+        };
+        assert!(matches!(
+            contained_guest_write_offset(&range, 0x9000, 0x40, None),
+            QueuedWriteReadMatch::None
+        ));
+        assert!(matches!(
+            contained_guest_write_offset(&range, 0x1000, 0x40, None),
+            QueuedWriteReadMatch::Synchronize
+        ));
+    }
+
+    /// The batch gate admits a candidate exactly when the two stored identities name overlapping
+    /// bytes of one backing object.
+    #[test]
+    fn stored_identity_overlap_is_scoped_to_a_single_backing() {
+        let producer = Some(identity(PRODUCER_BACKING, 0x2000));
+        assert!(stored_identities_overlap(
+            producer,
+            0x100,
+            Some(identity(PRODUCER_BACKING, 0x2040)),
+            0x40
+        ));
+        // Adjacent, not overlapping.
+        assert!(!stored_identities_overlap(
+            producer,
+            0x100,
+            Some(identity(PRODUCER_BACKING, 0x2100)),
+            0x40
+        ));
+        // Same offsets, different backing object.
+        assert!(!stored_identities_overlap(
+            producer,
+            0x100,
+            Some(identity(RECYCLED_BACKING, 0x2000)),
+            0x40
+        ));
+        // Either side unresolved leaves the candidate to the registry fallback.
+        assert!(!stored_identities_overlap(producer, 0x100, None, 0x40));
+        assert!(!stored_identities_overlap(
+            None,
+            0x100,
+            Some(identity(PRODUCER_BACKING, 0x2000)),
+            0x40
+        ));
+    }
 
     #[test]
     fn indirect_dword_diagnostics_decode_complete_little_endian_words() {
