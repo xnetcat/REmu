@@ -194,9 +194,7 @@ pub(crate) fn analyze_control_flow(
     // conversion. The forward PC form preserves the guest's wave-wide branch sequencing;
     // backward graphics control flow keeps the honest dispatcher seam. Compute and ordinary
     // vertex stages retain structured loops and therefore the no-step-cap progress guarantee.
-    let legacy_control_flow =
-        std::env::var_os("REMU_LEGACY_CONTROL_FLOW").is_some_and(|value| value == "1");
-    if !legacy_control_flow && !matches!(stage, MetalShaderStage::Pixel | MetalShaderStage::Mesh) {
+    if !matches!(stage, MetalShaderStage::Pixel | MetalShaderStage::Mesh) {
         let cfg = build_control_flow_graph(program);
         let structured = cfg.structure();
         if structured_cfg_is_fully_reducible(&structured)
