@@ -819,7 +819,9 @@ impl Compiler<'_> {
             // the shader narrows it against merged_wave_info (Mesa aco lanecount_to_mask). A
             // ballot over the Metal threads that happen to exist would zero the tail of a
             // partial final wave and skew lane counts taken before the guest's own narrowing.
-            let (low, high) = if self.options.stage == MetalShaderStage::Mesh {
+            let (low, high) = if self.options.stage == MetalShaderStage::Mesh
+                && !self.options.ngg_fixed_allocation_fallback
+            {
                 let high = if self.split_wave64() {
                     "0xffffffffu"
                 } else {
