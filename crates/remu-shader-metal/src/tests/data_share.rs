@@ -7,6 +7,96 @@
 use super::*;
 
 #[test]
+fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
+    let program = Program::new(
+        0x1000,
+        vec![
+            Instruction {
+                pc: 0,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(1)],
+                destinations: vec![Operand::vector(9)],
+                control: None,
+            },
+            Instruction {
+                pc: 4,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(2)],
+                destinations: vec![Operand::vector(10)],
+                control: None,
+            },
+            Instruction {
+                pc: 8,
+                encoding: ShaderEncoding::Vop1,
+                opcode: Opcode::Known("VMovB32"),
+                words: vec![0],
+                sources: vec![Operand::vector(8)],
+                destinations: vec![Operand::vector(11)],
+                control: None,
+            },
+            Instruction {
+                pc: 12,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::Known("SSendmsg"),
+                words: vec![0xbf90_0009],
+                sources: vec![Operand {
+                    kind: remu_shader::OperandKind::EncodedConstant,
+                    value: 9,
+                }],
+                destinations: Vec::new(),
+                control: None,
+            },
+            Instruction {
+                pc: 16,
+                encoding: ShaderEncoding::Sopp,
+                opcode: Opcode::END_PROGRAM,
+                words: vec![0xbf81_0000],
+                sources: Vec::new(),
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let mut options = MetalCompileOptions::mesh(0, 0, 256, 256, 256);
+    options.enable_fixed_ngg_allocation_fallback();
+    let shader = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("fixed no-GS mesh ABI should lower");
+
+    assert_eq!(options.mesh_max_vertex_count, 64);
+    assert_eq!(options.mesh_max_primitive_count, 64);
+    assert_eq!(options.mesh_threadgroup_size, 64);
+    assert!(shader.source.contains("remu_group_id.x * 130u"));
+    assert!(shader.source.contains("remu_meshlet_base + 66u"));
+    assert!(
+        shader
+            .source
+            .contains("remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f)")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_v_1 = remu_mesh_primitive_base + remu_thread_index")
+    );
+    assert!(shader.source.contains("remu_v_2 = 0u"));
+    assert!(shader.source.contains("remu_v_8 = remu_group_id.y"));
+    assert!(!shader.source.contains("(remu_s_124 >> 12u) & 0x7ffu"));
+    assert!(
+        shader
+            .source
+            .contains("if (remu_thread_index < remu_mesh_input_vertex_count) remu_mesh.set_vertex")
+    );
+    assert!(
+        shader
+            .source
+            .contains("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+    );
+}
+
+#[test]
 fn lowers_every_decoded_ds_operation_with_architectural_offsets_and_atomics() {
     let program = decoded_ds_program(0x1234, false);
     for (instruction, (_, name)) in program.instructions.iter().zip(DS_OPCODES) {
@@ -584,7 +674,8 @@ fn cmpx_gated_vertex_exp_lowers_without_a_slot_heuristic() {
         shader.source
     );
     assert!(
-        !shader.source.contains("set_vertex(v[18]") && !shader.source.contains("set_vertex(remu_v_18"),
+        !shader.source.contains("set_vertex(v[18]")
+            && !shader.source.contains("set_vertex(remu_v_18"),
         "no compacted-slot VGPR indexing may survive: {}",
         shader.source
     );

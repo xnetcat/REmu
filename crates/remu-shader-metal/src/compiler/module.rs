@@ -365,8 +365,7 @@ impl Compiler<'_> {
         }
         source.push_str("    /* REMU_REGISTER_STATE */\n");
         {
-            let mut bases: Vec<u32> =
-                self.heap_tables.values().map(|(base, _)| *base).collect();
+            let mut bases: Vec<u32> = self.heap_tables.values().map(|(base, _)| *base).collect();
             bases.sort_unstable();
             bases.dedup();
             for base in bases {
@@ -592,21 +591,39 @@ impl Compiler<'_> {
                             .into(),
                     ));
                 }
-                // Default w=0 so threads that never EXP are hardware-clipped. The previous
-                // (0,0,0,1) default mapped to NDC center and produced a central additive haze
-                // whenever GS_ALLOC reserved more vertices than lanes that successfully exported.
-                source.push_str(
-                    "    RemuVsOut remu_out = {};\n\
-                     \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
-                     \x20   uint remu_meshlet_base = remu_group_id.x * 514u;\n\
-                     \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
-                     \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
-                     \x20   uint remu_mesh_input_vertex_count_encoded = remu_mesh_counts & 0xffu;\n\
-                     \x20   uint remu_mesh_input_primitive_count_encoded = (remu_mesh_counts >> 8u) & 0xffu;\n\
-                     \x20   uint remu_mesh_input_vertex_count = remu_mesh_input_vertex_count_encoded == 0u ? 256u : remu_mesh_input_vertex_count_encoded;\n\
-                     \x20   uint remu_mesh_input_primitive_count = remu_mesh_input_primitive_count_encoded == 0u ? 256u : remu_mesh_input_primitive_count_encoded;\n\
-                     \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 258u + remu_thread_index] : 0x80000000u;\n",
-                );
+                if self.options.ngg_fixed_allocation_fallback {
+                    source.push_str(
+                            "    RemuVsOut remu_out = {};\n\
+                             \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
+                             \x20   uint remu_meshlet_base = remu_group_id.x * 130u;\n\
+                             \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
+                             \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
+                             \x20   uint remu_mesh_input_vertex_count = remu_mesh_counts & 0xffu;\n\
+                             \x20   uint remu_mesh_input_primitive_count = (remu_mesh_counts >> 8u) & 0xffu;\n\
+                             \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 66u + remu_thread_index] : 0x80000000u;\n",
+                        );
+                } else {
+                    // Default w=0 so threads that never EXP are hardware-clipped. The previous
+                    // (0,0,0,1) default mapped to NDC center and produced a central additive haze
+                    // whenever GS_ALLOC reserved more vertices than lanes that successfully exported.
+                    source.push_str(
+                            "    RemuVsOut remu_out = {};\n\
+                             \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
+                             \x20   uint remu_meshlet_base = remu_group_id.x * 514u;\n\
+                             \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
+                             \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
+                             \x20   uint remu_mesh_input_vertex_count_encoded = remu_mesh_counts & 0xffu;\n\
+                             \x20   uint remu_mesh_input_primitive_count_encoded = (remu_mesh_counts >> 8u) & 0xffu;\n\
+                             \x20   uint remu_mesh_input_vertex_count = remu_mesh_input_vertex_count_encoded == 0u ? 256u : remu_mesh_input_vertex_count_encoded;\n\
+                             \x20   uint remu_mesh_input_primitive_count = remu_mesh_input_primitive_count_encoded == 0u ? 256u : remu_mesh_input_primitive_count_encoded;\n\
+                             \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 258u + remu_thread_index] : 0x80000000u;\n",
+                        );
+                }
+                if self.options.ngg_fixed_allocation_fallback {
+                    source.push_str(
+                        "    remu_mesh_output_primitive_count = remu_mesh_input_primitive_count;\n",
+                    );
+                }
                 // GS_ALLOC_REQ reserves output slots, but culled or otherwise null primitives do
                 // not necessarily execute EXP PRIM. AMD hardware treats those slots as null.
                 // Metal has no null-primitive flag and consumes every index below the published
@@ -745,6 +762,28 @@ impl Compiler<'_> {
                 }
                 if contains_register_reference(&self.body, 'v', 8) {
                     source.push_str("    v[8] = remu_group_id.y + remu_draw[3];\n");
+                }
+                // Preserve the legacy no-GS input-register contract for the fixed wave64
+                // fallback. Current linked-GS draws use the decoded merged-GS layout above,
+                // but ordinary no-GS shaders from the pre-subgroup-allocation path consume
+                // the packed primitive and primitive ID from v0/v1 and expect v2 cleared.
+                if self.options.ngg_fixed_allocation_fallback {
+                    if contains_register_reference(&self.body, 's', 3) {
+                        source.push_str("    s[3] = remu_mesh_counts;\n");
+                    }
+                    if contains_register_reference(&self.body, 'v', 0) {
+                        source.push_str("    v[0] = remu_mesh_primitive;\n");
+                    }
+                    if contains_register_reference(&self.body, 'v', 1) {
+                        source
+                            .push_str("    v[1] = remu_mesh_primitive_base + remu_thread_index;\n");
+                    }
+                    if contains_register_reference(&self.body, 'v', 2) {
+                        source.push_str("    v[2] = 0u;\n");
+                    }
+                    if contains_register_reference(&self.body, 'v', 8) {
+                        source.push_str("    v[8] = remu_group_id.y;\n");
+                    }
                 }
             }
         }
@@ -1027,13 +1066,21 @@ impl Compiler<'_> {
                          \x20   }}"
                     );
                 }
-                let _ = writeln!(
-                    source,
-                    "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
-                     \x20   if (remu_thread_index == 0u) {{\n\
+                if self.options.ngg_fixed_allocation_fallback {
+                    source.push_str(
+                        "    if (remu_thread_index < remu_mesh_input_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n",
+                    );
+                } else {
+                    let _ = writeln!(
+                        source,
+                        "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);",
+                        self.options.mesh_max_vertex_count
+                    );
+                }
+                source.push_str(
+                    "    if (remu_thread_index == 0u) {\n\
                      \x20       remu_mesh.set_primitive_count(remu_mesh_output_primitives);\n\
-                     \x20   }}",
-                    self.options.mesh_max_vertex_count
+                     \x20   }\n",
                 );
             }
         }

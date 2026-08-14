@@ -875,6 +875,10 @@ fn derives_ngg_subgroup_limits_from_uc_ge_cntl_when_cx_sizing_absent() {
     assert_eq!(limits.gs_max_vertices_out, 0);
     assert_eq!(limits.primitive_amplification_factor, 1);
     assert_eq!(limits.max_output_primitives_per_subgroup, 8);
+    assert!(limits.uses_fixed_allocation_fallback());
+    assert_eq!(limits.meshlet_vertex_limit(), 64);
+    assert_eq!(limits.meshlet_primitive_limit(), 64);
+    assert_eq!(limits.metal_threadgroup_threads(), 64);
 }
 
 #[test]
@@ -905,6 +909,7 @@ fn derives_gs_amplification_from_gs_max_vert_out_not_uc_vertex_group_size() {
     assert_eq!(limits.primitive_amplification_factor, 24);
     assert_eq!(limits.max_output_vertices_per_subgroup, 96);
     assert_eq!(limits.max_output_primitives_per_subgroup, 96);
+    assert!(!limits.uses_fixed_allocation_fallback());
 }
 
 #[test]
@@ -2283,6 +2288,31 @@ fn packs_ngg_inputs_across_more_than_one_guest_wave() {
     assert_eq!(prepared.vertex_references, 66);
     assert_eq!(prepared.primitive_count, 22);
     assert_eq!(prepared.words[0], 66 | (22 << 8));
+}
+
+#[test]
+fn no_gs_ngg_meshlets_use_the_known_good_fixed_wave64_allocation() {
+    let limits = NggSubgroupLimits::new(
+        128,
+        128,
+        128,
+        0,
+        128,
+        1,
+        Some(NggOutputPrimitiveType::TriangleStrip),
+        Some(1),
+    )
+    .expect("no-GS passthrough limits are representable");
+    let indices = (0_u32..66).collect::<Vec<_>>();
+    let prepared = prepare_ngg_meshlets(&indices, limits);
+
+    assert!(limits.uses_fixed_allocation_fallback());
+    assert_eq!(limits.threadgroup_threads, 128);
+    assert_eq!(limits.metal_threadgroup_threads(), 64);
+    assert_eq!(limits.meshlet_words_per_group(), 130);
+    assert_eq!(prepared.group_count, 2);
+    assert_eq!(prepared.words[0], 63 | (21 << 8));
+    assert_eq!(prepared.words[130], 3 | (1 << 8));
 }
 
 #[test]

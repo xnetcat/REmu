@@ -289,6 +289,12 @@ pub struct MetalCompileOptions {
     /// they will lower NGG glyph sequences; without it those patterns fail loudly instead of
     /// applying a title-specific heuristic.
     pub ngg_registers_proven: bool,
+    /// Use the original fixed-wave64 passthrough allocation for a no-API-GS NGG stage.
+    ///
+    /// `VGT_GS_MAX_VERT_OUT == 0` leaves the dynamic `GS_ALLOC_REQ` payload unproven for these
+    /// stages. The presenter enables this compatibility ABI only for that class; linked geometry
+    /// shaders retain their register-sized output allocation.
+    pub ngg_fixed_allocation_fallback: bool,
     /// Lower a wave64 threadgroup program by carrying two guest lanes per Metal thread on one
     /// SIMD32 group, instead of splitting the wave across two SIMD32 groups.
     ///
@@ -334,6 +340,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
         }
@@ -373,6 +380,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
         }
@@ -408,6 +416,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
         }
@@ -443,6 +452,7 @@ impl MetalCompileOptions {
             wave_lane_count,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
         }
@@ -492,6 +502,7 @@ impl MetalCompileOptions {
             wave_lane_count: 32,
             allocated_vector_register_count: VECTOR_REGISTER_COUNT,
             ngg_registers_proven: false,
+            ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
         }
@@ -544,6 +555,16 @@ impl MetalCompileOptions {
                 mesh_threadgroup_size,
             )
         }
+    }
+
+    /// Selects the known-good fixed-wave64 ABI for a no-API-GS passthrough stage whose dynamic
+    /// allocation payload is not architecturally proven by `VGT_GS_MAX_VERT_OUT`.
+    pub fn enable_fixed_ngg_allocation_fallback(&mut self) {
+        debug_assert_eq!(self.stage, MetalShaderStage::Mesh);
+        self.mesh_max_vertex_count = 64;
+        self.mesh_max_primitive_count = 64;
+        self.mesh_threadgroup_size = 64;
+        self.ngg_fixed_allocation_fallback = true;
     }
 }
 

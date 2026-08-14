@@ -617,6 +617,13 @@ impl<'a> Compiler<'a> {
                     if self.options.stage != MetalShaderStage::Mesh {
                         return Ok(());
                     }
+                    // A no-API-GS passthrough stage has no VGT_GS_MAX_VERT_OUT proof for this
+                    // payload. The known-good fixed-wave64 ABI publishes the meshlet's input
+                    // primitive count and intentionally treats GS_ALLOC_REQ as a hardware-only
+                    // provisioning message.
+                    if self.options.ngg_fixed_allocation_fallback {
+                        return Ok(());
+                    }
                     // GFX10 GS_ALLOC_REQ is issued by subgroup zero. M0 carries the actual
                     // allocation: vertices[10:0], primitives[22:12]. Metal has no vertex-count
                     // setter and only thread zero publishes the primitive count, so this value

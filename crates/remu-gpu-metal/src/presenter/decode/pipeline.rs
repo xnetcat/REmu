@@ -42,7 +42,11 @@ use std::sync::atomic::Ordering;
 pub(crate) const NGG_MESHLET_WORDS_PER_GROUP: usize = 514;
 const NGG_MESHLET_STORAGE_VERTICES: usize = 256;
 const NGG_MESHLET_STORAGE_PRIMITIVES: usize = 256;
+const LEGACY_NGG_MESHLET_WORDS_PER_GROUP: usize = 130;
+const LEGACY_NGG_MESHLET_STORAGE_VERTICES: usize = 64;
+const LEGACY_NGG_MESHLET_STORAGE_PRIMITIVES: usize = 64;
 const METAL_MESH_MAX_OUTPUTS: u32 = 256;
+const LEGACY_NGG_FIXED_ALLOCATION: u32 = 64;
 
 /// Cover topologies that memoryless NGG stages emit for fullscreen blits and that currently shard
 /// under the meshlet ABI. Vertex-fetching NGG programs with the same topologies are excluded by
@@ -267,6 +271,63 @@ pub(crate) const fn ngg_mesh_base_vertex(draw: &IndexedDraw) -> i32 {
 }
 
 impl NggSubgroupLimits {
+    /// No API geometry shader means `VGT_GS_MAX_VERT_OUT` cannot prove that the guest's
+    /// `GS_ALLOC_REQ` payload describes the passthrough primitive shader's live output. REmu's
+    /// original, known-good NGG path executed these stages as one fixed wave64 and ignored that
+    /// payload. Keep the register-sized path for a real GS, but retain the fixed allocation for
+    /// this otherwise ambiguous no-GS ABI.
+    pub(crate) const fn uses_fixed_allocation_fallback(self) -> bool {
+        self.gs_max_vertices_out == 0
+    }
+
+    pub(crate) const fn meshlet_vertex_limit(self) -> u32 {
+        if self.uses_fixed_allocation_fallback() {
+            LEGACY_NGG_FIXED_ALLOCATION
+        } else {
+            self.es_vertices_per_subgroup
+        }
+    }
+
+    pub(crate) const fn meshlet_primitive_limit(self) -> u32 {
+        if self.uses_fixed_allocation_fallback() {
+            LEGACY_NGG_FIXED_ALLOCATION
+        } else {
+            self.gs_primitives_per_subgroup
+        }
+    }
+
+    pub(crate) const fn metal_threadgroup_threads(self) -> u32 {
+        if self.uses_fixed_allocation_fallback() {
+            LEGACY_NGG_FIXED_ALLOCATION
+        } else {
+            self.threadgroup_threads
+        }
+    }
+
+    pub(crate) const fn meshlet_storage_vertices(self) -> usize {
+        if self.uses_fixed_allocation_fallback() {
+            LEGACY_NGG_MESHLET_STORAGE_VERTICES
+        } else {
+            NGG_MESHLET_STORAGE_VERTICES
+        }
+    }
+
+    pub(crate) const fn meshlet_storage_primitives(self) -> usize {
+        if self.uses_fixed_allocation_fallback() {
+            LEGACY_NGG_MESHLET_STORAGE_PRIMITIVES
+        } else {
+            NGG_MESHLET_STORAGE_PRIMITIVES
+        }
+    }
+
+    pub(crate) const fn meshlet_words_per_group(self) -> usize {
+        if self.uses_fixed_allocation_fallback() {
+            LEGACY_NGG_MESHLET_WORDS_PER_GROUP
+        } else {
+            NGG_MESHLET_WORDS_PER_GROUP
+        }
+    }
+
     pub(crate) fn new(
         es_vertices_per_subgroup: u32,
         gs_primitives_per_subgroup: u32,
@@ -580,10 +641,13 @@ pub(crate) fn prepare_ngg_meshlets(
     limits: NggSubgroupLimits,
 ) -> PreparedNggMeshlets {
     let primitive_count = indices.len() / 3;
-    let max_vertices = usize::try_from(limits.es_vertices_per_subgroup)
+    let max_vertices = usize::try_from(limits.meshlet_vertex_limit())
         .expect("validated NGG vertex count fits usize");
-    let max_primitives = usize::try_from(limits.gs_primitives_per_subgroup)
+    let max_primitives = usize::try_from(limits.meshlet_primitive_limit())
         .expect("validated NGG primitive count fits usize");
+    let storage_vertices = limits.meshlet_storage_vertices();
+    let storage_primitives = limits.meshlet_storage_primitives();
+    let words_per_group = limits.meshlet_words_per_group();
     let mut words = Vec::new();
     let mut vertices = Vec::<u32>::with_capacity(max_vertices);
     let mut vertex_slots = HashMap::<u32, u32>::with_capacity(max_vertices);
@@ -605,13 +669,10 @@ pub(crate) fn prepare_ngg_meshlets(
         words.push((vertex_count & 0xff) | ((primitive_count & 0xff) << 8));
         words.push(u32::try_from(first_primitive).expect("NGG primitive ID fits u32"));
         words.extend(vertices.iter().copied());
-        words.resize(
-            words.len() + NGG_MESHLET_STORAGE_VERTICES - vertices.len(),
-            0,
-        );
+        words.resize(words.len() + storage_vertices - vertices.len(), 0);
         words.extend(primitives.iter().copied());
         words.resize(
-            words.len() + NGG_MESHLET_STORAGE_PRIMITIVES - primitives.len(),
+            words.len() + storage_primitives - primitives.len(),
             0x8000_0000,
         );
         vertices.clear();
@@ -661,15 +722,15 @@ pub(crate) fn prepare_ngg_meshlets(
 
     // Count all packed vertex records rather than only the final workgroup.
     let vertex_references = words
-        .chunks_exact(NGG_MESHLET_WORDS_PER_GROUP)
+        .chunks_exact(words_per_group)
         .map(|group| {
             let encoded = group[0] & 0xff;
             usize::try_from(if encoded == 0 { 256 } else { encoded })
                 .expect("vertex count fits usize")
         })
         .sum();
-    let group_count = u64::try_from(words.len() / NGG_MESHLET_WORDS_PER_GROUP)
-        .expect("NGG meshlet group count fits u64");
+    let group_count =
+        u64::try_from(words.len() / words_per_group).expect("NGG meshlet group count fits u64");
     PreparedNggMeshlets {
         words: words.into(),
         group_count,

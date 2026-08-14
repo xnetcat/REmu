@@ -172,6 +172,7 @@ fn compute_vector_compares_use_real_simd_lane_ballots() {
             wave_lane_count: 32,
             allocated_vector_register_count: 256,
             ngg_registers_proven: false,
+            ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
         runtime_heap_tables: false,
         },

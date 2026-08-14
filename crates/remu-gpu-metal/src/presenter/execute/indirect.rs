@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::{
-    MetalPresenter, NGG_MESHLET_WORDS_PER_GROUP, NggSubgroupLimits, UploadedGlobalBuffer,
-    compile_metal_compute_library,
+    MetalPresenter, NggSubgroupLimits, UploadedGlobalBuffer, compile_metal_compute_library,
 };
 use metal::{Buffer, ComputePipelineState, Device, MTLSize};
 use std::ffi::c_void;
@@ -61,6 +60,8 @@ kernel void remu_build_indirect_ngg(
     const uint maximum_input_count = config[3];
     const uint primitives_per_group = config[4];
     const uint maximum_group_count = config[5];
+    const uint words_per_group = config[6];
+    const uint vertex_storage_words = config[7];
     const uint first = arguments[2];
     const uint available = indexed
         ? (first < maximum_input_count ? maximum_input_count - first : 0u)
@@ -83,8 +84,8 @@ kernel void remu_build_indirect_ngg(
         mesh_draw[3] = indexed ? arguments[4] : arguments[3];
     }
 
-    const uint group = tid / 514u;
-    const uint word = tid - group * 514u;
+    const uint group = tid / words_per_group;
+    const uint word = tid - group * words_per_group;
     if (group >= maximum_group_count) {
         return;
     }
@@ -99,7 +100,7 @@ kernel void remu_build_indirect_ngg(
         value = (group_vertices & 0xffu) | ((group_primitives & 0xffu) << 8u);
     } else if (word == 1u) {
         value = first_primitive;
-    } else if (word < 258u) {
+    } else if (word < 2u + vertex_storage_words) {
         const uint local_vertex = word - 2u;
         if (local_vertex < group_vertices) {
             const uint primitive_in_group = points ? local_vertex : local_vertex / 3u;
@@ -116,7 +117,7 @@ kernel void remu_build_indirect_ngg(
                 : first + source_element;
         }
     } else {
-        const uint primitive_in_group = word - 258u;
+        const uint primitive_in_group = word - (2u + vertex_storage_words);
         if (primitive_in_group < group_primitives) {
             const uint local = points ? primitive_in_group : primitive_in_group * 3u;
             value = points
@@ -126,7 +127,7 @@ kernel void remu_build_indirect_ngg(
             value = 0x80000000u;
         }
     }
-    meshlets[group * 514u + word] = value;
+    meshlets[group * words_per_group + word] = value;
 }
 ";
 
@@ -239,12 +240,12 @@ impl MetalPresenter {
         }
         let primitives_per_group = if triangle_topology {
             limits
-                .gs_primitives_per_subgroup
-                .min(limits.es_vertices_per_subgroup / 3)
+                .meshlet_primitive_limit()
+                .min(limits.meshlet_vertex_limit() / 3)
         } else {
             limits
-                .gs_primitives_per_subgroup
-                .min(limits.es_vertices_per_subgroup)
+                .meshlet_primitive_limit()
+                .min(limits.meshlet_vertex_limit())
         };
         if primitives_per_group == 0 {
             return Err("indirect NGG subgroup cannot hold one input primitive".to_owned());
@@ -258,9 +259,10 @@ impl MetalPresenter {
         let maximum_group_count = maximum_primitive_count
             .div_ceil(primitives_per_group)
             .max(1);
+        let words_per_group = limits.meshlet_words_per_group();
         let meshlet_byte_count = usize::try_from(maximum_group_count)
             .ok()
-            .and_then(|groups| groups.checked_mul(NGG_MESHLET_WORDS_PER_GROUP))
+            .and_then(|groups| groups.checked_mul(words_per_group))
             .and_then(|words| words.checked_mul(std::mem::size_of::<u32>()))
             .ok_or("indirect NGG meshlet allocation size overflows")?;
         let pipeline = self
@@ -275,6 +277,9 @@ impl MetalPresenter {
             maximum_input_count,
             primitives_per_group,
             maximum_group_count,
+            u32::try_from(words_per_group).expect("meshlet record words fit u32"),
+            u32::try_from(limits.meshlet_storage_vertices())
+                .expect("meshlet vertex storage fits u32"),
         ];
         let (
             meshlets,
@@ -310,10 +315,7 @@ impl MetalPresenter {
                 config.as_ptr().cast::<c_void>(),
             );
             let threads = u64::from(maximum_group_count)
-                .checked_mul(
-                    u64::try_from(NGG_MESHLET_WORDS_PER_GROUP)
-                        .expect("meshlet record size fits u64"),
-                )
+                .checked_mul(u64::try_from(words_per_group).expect("meshlet record size fits u64"))
                 .ok_or("indirect NGG preparation grid overflows")?;
             encoder.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(256, 1, 1));
             encoder.end_encoding();
@@ -426,7 +428,7 @@ kernel void write_arguments(device uint4* output [[buffer(0)]]) {
             unsafe { std::slice::from_raw_parts(index_words.as_ptr().cast::<u8>(), 12) };
         assert!(super::super::super::MetalBytes::new(&arguments).write(0, argument_bytes));
         assert!(super::super::super::MetalBytes::new(&indices).write(0, index_bytes));
-        let config = [1_u32, 0, 4, 6, 2, 1];
+        let config = [1_u32, 0, 4, 6, 2, 1, 514, 256];
         let command = queue.new_command_buffer().to_owned();
         let encoder = command.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&pipeline);

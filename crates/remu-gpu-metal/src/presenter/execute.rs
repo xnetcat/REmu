@@ -2171,7 +2171,7 @@ impl MetalPresenter {
                                         .expect(
                                             "NGG subgroup limits were validated before encoding",
                                         )
-                                        .threadgroup_threads,
+                                        .metal_threadgroup_threads(),
                                 ),
                                 1,
                                 1,
@@ -2241,7 +2241,7 @@ impl MetalPresenter {
                                         .expect(
                                             "NGG subgroup limits were validated before encoding",
                                         )
-                                        .threadgroup_threads,
+                                        .metal_threadgroup_threads(),
                                 ),
                                 1,
                                 1,

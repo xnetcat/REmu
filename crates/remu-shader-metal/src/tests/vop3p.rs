@@ -476,6 +476,7 @@ fn generated_vop3p_conversion_and_lane_msl_compiles_with_apple_metal() {
                 wave_lane_count: 64,
                 allocated_vector_register_count: 256,
                 ngg_registers_proven: false,
+                ngg_fixed_allocation_fallback: false,
                 wave64_lane_doubled: false,
         runtime_heap_tables: false,
             },

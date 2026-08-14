@@ -570,9 +570,12 @@ impl MetalPresenter {
             // pushes Metal mesh pipelines past the 32 KiB threadgroup limit.
             let mut mesh_options = remu_shader_metal::MetalCompileOptions::mesh_from_ngg_registers(
                 pixel_msl.interpolated_attribute_count,
-                limits.threadgroup_threads,
+                limits.metal_threadgroup_threads(),
                 registers,
             );
+            if limits.uses_fixed_allocation_fallback() {
+                mesh_options.enable_fixed_ngg_allocation_fallback();
+            }
             // Wave64 NGG exports (Poppy Playtime UI/LUT quads) gate their exports on
             // 64-bit EXEC masks and compute meshlet thread indices as
             // `s3[27:24] * 64 + v_mbcnt`. Splitting the guest wave across two SIMD32
@@ -785,10 +788,10 @@ impl MetalPresenter {
             let limits = key
                 .ngg_subgroup_limits
                 .expect("mesh pipeline subgroup limits were validated above");
-            descriptor
-                .set_max_total_threads_per_mesh_threadgroup(u64::from(limits.threadgroup_threads));
+            let threadgroup_threads = limits.metal_threadgroup_threads();
+            descriptor.set_max_total_threads_per_mesh_threadgroup(u64::from(threadgroup_threads));
             descriptor.set_mesh_threadgroup_size_is_multiple_of_thread_execution_width(
-                limits.threadgroup_threads.is_multiple_of(32),
+                threadgroup_threads.is_multiple_of(32),
             );
             for (location, target) in key.targets.iter().enumerate() {
                 let attachment = descriptor
