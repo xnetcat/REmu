@@ -7,7 +7,7 @@ use super::super::sampled_texture_cache_byte_capacity;
 use super::{
     CachedSampledTexture, DepthArrayKey, DepthArrayResidentTexture, GuestTextureDescriptor,
     GuestTextureWriteWatch, Mode27WorkOrigin, MultisampleResidentTexture, MultisampleTextureKey,
-    ResidentTextureActivityStamp, ResidentTextureMap, SAMPLED_TEXTURE_CACHE_CAPACITY,
+    ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, SAMPLED_TEXTURE_CACHE_CAPACITY,
     SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS, SAMPLED_TEXTURE_CACHE_DIRTY_RELOADS,
     SAMPLED_TEXTURE_CACHE_HITS, SAMPLED_TEXTURE_CACHE_MISSES, SampledTextureKey, SpanQueryOrder,
     UploadedImageTexture, WriteWatchRefresh, canonical_texture_bindings,
@@ -24,10 +24,10 @@ use super::{
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_same_image_sample_is_eligible, resident_sample_authority_ok,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
-    sampled_texture_key, sampled_texture_supports_access, sampler_uses_normalized_coordinates,
-    storage_image_requires_mip_hierarchy, texture_element_layout,
-    trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
-    trace_target_sampling,
+    sampled_texture_key, sampled_texture_raw_range, sampled_texture_supports_access,
+    sampler_uses_normalized_coordinates, storage_image_requires_mip_hierarchy,
+    texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
+    trace_resident_texture_removal, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;
@@ -629,6 +629,19 @@ pub(crate) fn upload_image_textures(
                     selected_resident: None,
                 });
             }
+            // A sampled SRD can expose a mip tail or multiple array faces beyond the guest
+            // descriptor's level-zero extent. Resolve that complete range once and use the
+            // resident interval index for every selection pass below.
+            let sampled_span = sampled_texture_raw_range(descriptor)
+                .ok()
+                .and_then(|(_, byte_count)| u64::try_from(byte_count).ok())
+                .map(|byte_count| ResourceSpan::new(descriptor.guest.address, byte_count));
+            let resident_candidates = sampled_span
+                .iter()
+                .flat_map(|span| {
+                    resident_guest_textures.overlapping(span, SpanQueryOrder::ResidentFirst)
+                })
+                .collect::<Vec<_>>();
             // Slate/UMG font atlases are single-channel sampled images whose whole glyph
             // rendering depends on the T# destination select reaching the shader. Log the raw
             // descriptor words and the decoded swizzle once per atlas so a tofu report can be
@@ -690,13 +703,8 @@ pub(crate) fn upload_image_textures(
                     let exact = resident_guest_textures
                         .get(&descriptor.guest)
                         .map(|resident| (resident.gpu_written(), resident.content_version));
-                    let aliases = descriptor
-                        .span
+                    let aliases = resident_candidates
                         .iter()
-                        .flat_map(|span| {
-                            resident_guest_textures
-                                .overlapping(span, SpanQueryOrder::ResidentFirst)
-                        })
                         .filter_map(|alias| {
                             let resident = resident_guest_textures.get(&alias)?;
                             Some((
@@ -835,9 +843,18 @@ pub(crate) fn upload_image_textures(
                                 })
                         })
                         .flatten();
-                    let compatible = (descriptor.texture_type == 9).then(|| {
-                        resident_guest_textures
-                            .values()
+                    // If the index found no other resident, no compatibility rule can override a
+                    // valid exact hit. Native-depth and newer GPU-authored aliases still get the
+                    // existing ordering below whenever an overlapping candidate exists.
+                    let compatible = (descriptor.texture_type == 9
+                        && (exact.is_none()
+                            || resident_candidates.iter().any(|candidate| {
+                                exact.is_some_and(|(exact, _, _)| *candidate != exact)
+                            })))
+                    .then(|| {
+                        resident_candidates
+                            .iter()
+                            .filter_map(|candidate| resident_guest_textures.get(candidate))
                             .filter(|resident| {
                                 resident.is_live()
                                     && resident.texture_type == 9

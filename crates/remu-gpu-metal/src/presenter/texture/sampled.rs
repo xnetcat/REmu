@@ -17,9 +17,10 @@ use super::{
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
-    resident_is_depth_array_face, sampled_alias_descriptor, sampled_texture_uses_exact_mode5_mips,
-    sampled_texture_uses_exact_mode27_mips, texture_element_layout, trace_image_descriptors,
-    trace_resident_texture_removal, trace_target_sampling, trace_video_target_consumers,
+    resident_is_depth_array_face, sampled_alias_descriptor, sampled_texture_raw_range,
+    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
+    texture_element_layout, trace_image_descriptors, trace_resident_texture_removal,
+    trace_target_sampling, trace_video_target_consumers,
 };
 use metal::foreign_types::ForeignType;
 use metal::{
@@ -61,12 +62,16 @@ impl MetalPresenter {
                     continue;
                 }
                 let comparison = image_is_comparison(binding.opcode);
-                let sampled_bytes = guest_texture_byte_count(sampled.guest).ok_or_else(|| {
+                let (_, sampled_bytes) = sampled_texture_raw_range(sampled).map_err(|error| {
                     format!(
-                        "image at PC {:#x} has an invalid guest byte extent",
+                        "image at PC {:#x} has an invalid guest byte extent: {error}",
                         binding.pc
                     )
                 })?;
+                let sampled_bytes = u64::try_from(sampled_bytes).map_err(|_| {
+                    format!("image at PC {:#x} byte extent does not fit u64", binding.pc)
+                })?;
+                let sampled_span = ResourceSpan::new(sampled.guest.address, sampled_bytes);
                 // A Gen5 MSAA allocation can expose its shader-readable resolved image through
                 // an overlapping SRD whose base follows the allocation's mask metadata. Keep the
                 // Metal resolve GPU-current so `upload_image_textures` can bind it directly. A
@@ -79,11 +84,22 @@ impl MetalPresenter {
                 // resident/sample pair. Silent Hill has roughly one hundred residents and
                 // performs this query for nearly every draw; the old nested mapping-lock lookup
                 // consumed about one quarter of presenter CPU time in a sampled title workload.
+                let candidates = self
+                    .resident_guest_textures
+                    .overlapping(&sampled_span, SpanQueryOrder::ResidentFirst);
                 aliases.extend(
-                    self.resident_guest_textures
-                        .values()
-                        .filter(|resident| resident.gpu_written())
-                        .filter(|resident| {
+                    candidates
+                        .into_iter()
+                        .filter(|descriptor| {
+                            self.resident_guest_textures
+                                .get(descriptor)
+                                .is_some_and(|resident| resident.gpu_written())
+                        })
+                        .filter(|descriptor| {
+                            let resident = self
+                                .resident_guest_textures
+                                .get(descriptor)
+                                .expect("indexed sampled-alias candidate exists");
                             let overlaps_resident = resident
                                 .write_watch
                                 .overlaps_alias_range(sampled.guest.address, sampled_bytes);
@@ -157,8 +173,7 @@ impl MetalPresenter {
                                 }
                             }
                             aliases_sample
-                        })
-                        .map(|resident| resident.descriptor),
+                        }),
                 );
             }
         }
