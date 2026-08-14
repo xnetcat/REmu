@@ -10,6 +10,9 @@ use crate::{ProcessGuestMemory, process_guest_range_has_read_access};
 
 static AGC_MEMORY_SHADOW_WRITE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+const MAX_SHADOW_COPY_BYTES: u64 = 1024 * 1024;
+const MAX_SHADOW_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug)]
 struct AgcMemoryShadowWrite {
     address: u64,
@@ -164,9 +167,6 @@ pub(crate) struct AgcMemorySnapshotBudgetExceeded {
 pub(crate) fn stage_agc_memory_copy(
     copy: &remu_gpu::GpuMemoryCopy,
 ) -> Result<StagedAgcMemoryCopy, AgcMemorySnapshotBudgetExceeded> {
-    const MAX_SHADOW_COPY_BYTES: u64 = 1024 * 1024;
-    const MAX_SHADOW_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-
     if !agc_memory_shadow_is_active()
         || !matches!(copy.destination_selection, 0 | 3)
         || copy.byte_count == 0
@@ -180,11 +180,30 @@ pub(crate) fn stage_agc_memory_copy(
     if !process_guest_range_has_read_access(copy.destination_address, byte_count) {
         return Ok(StagedAgcMemoryCopy::default());
     }
+    // Only the latest bytes at an address are visible to following packet decoding. A command
+    // stream can legally rewrite one upload destination hundreds of times; charging every
+    // superseded payload against the shadow budget rejects the complete submission even though
+    // the shadow retains just one observable value. Event snapshots still retain every source
+    // independently for ordered backend execution, so removing fully covered shadow writes does
+    // not weaken DMA ordering or source-reuse protection.
+    let superseded_bytes = agc_memory_shadow()
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .map_or(0, |shadow| {
+            shadow
+                .writes
+                .iter()
+                .filter(|write| shadow_write_is_fully_covered(write, copy))
+                .map(|write| write.bytes.len())
+                .sum::<usize>()
+        });
     let requested_bytes = agc_memory_shadow()
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
         .map_or(0, |shadow| shadow.retained_bytes)
+        .saturating_sub(superseded_bytes)
         .saturating_add(byte_count);
     if requested_bytes > MAX_SHADOW_TOTAL_BYTES {
         return Err(AgcMemorySnapshotBudgetExceeded {
@@ -229,6 +248,15 @@ pub(crate) fn stage_agc_memory_copy(
     let Some(shadow) = shadow.as_mut() else {
         return Ok(StagedAgcMemoryCopy::default());
     };
+    let mut removed_bytes = 0_usize;
+    shadow.writes.retain(|write| {
+        let covered = shadow_write_is_fully_covered(write, copy);
+        if covered {
+            removed_bytes = removed_bytes.saturating_add(write.bytes.len());
+        }
+        !covered
+    });
+    shadow.retained_bytes = shadow.retained_bytes.saturating_sub(removed_bytes);
     shadow.writes.push(AgcMemoryShadowWrite {
         address: copy.destination_address,
         bytes,
@@ -241,9 +269,53 @@ pub(crate) fn stage_agc_memory_copy(
     })
 }
 
+fn shadow_write_is_fully_covered(
+    write: &AgcMemoryShadowWrite,
+    copy: &remu_gpu::GpuMemoryCopy,
+) -> bool {
+    let Ok(write_length) = u64::try_from(write.bytes.len()) else {
+        return false;
+    };
+    let Some(write_end) = write.address.checked_add(write_length) else {
+        return false;
+    };
+    let Some(copy_end) = copy.destination_address.checked_add(copy.byte_count) else {
+        return false;
+    };
+    copy.destination_address <= write.address && write_end <= copy_end
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_agc_memory_shadow, begin_agc_memory_shadow, stage_agc_memory_copy};
+
+    #[test]
+    fn repeated_full_range_dma_overwrites_do_not_exhaust_the_shadow_budget() {
+        const COPY_BYTES: usize = 256 * 1024;
+        const COPY_COUNT: usize = 257;
+        let mut source = vec![0x11_u8; COPY_BYTES];
+        let destination = vec![0xcd_u8; COPY_BYTES];
+        let _shadow = begin_agc_memory_shadow();
+
+        for sequence in 0..COPY_COUNT {
+            source[0] = sequence as u8;
+            let staged = stage_agc_memory_copy(&remu_gpu::GpuMemoryCopy {
+                source_address: source.as_ptr().addr() as u64,
+                destination_address: destination.as_ptr().addr() as u64,
+                byte_count: COPY_BYTES as u64,
+                source_selection: 3,
+                destination_selection: 3,
+                source_snapshot: None,
+            })
+            .expect("a fully superseded shadow write must not consume cumulative budget");
+            assert!(staged.shadowed);
+        }
+
+        let mut observed = destination;
+        apply_agc_memory_shadow(observed.as_ptr().addr() as u64, &mut observed);
+        assert_eq!(observed[0], (COPY_COUNT - 1) as u8);
+        assert!(observed[1..].iter().all(|value| *value == 0x11));
+    }
 
     #[test]
     fn dma_snapshot_retention_has_an_exact_one_mibibyte_boundary() {
