@@ -89,6 +89,7 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
         ],
     );
     let mut options = MetalCompileOptions::mesh(0, 0, 256, 256, 256);
+    options.wave_lane_count = 64;
     options.enable_fixed_ngg_allocation_fallback();
     let shader = compile_msl(&program, &empty_evaluation(), &options)
         .expect("fixed no-GS mesh ABI should lower");
@@ -109,8 +110,8 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
             .contains("remu_s_2 = ((remu_mesh_input_vertex_count"),
         "the fixed compatibility ABI must preserve the guest's incoming s2"
     );
-    assert!(shader.source.contains("simd_ballot(true)"));
-    assert!(!shader.source.contains("remu_s_126 = 0xffffffffu;"));
+    assert!(shader.source.contains("remu_s_126 = 0xffffffffu;"));
+    assert!(shader.source.contains("remu_s_127 = 0xffffffffu;"));
     assert!(
         shader
             .source
