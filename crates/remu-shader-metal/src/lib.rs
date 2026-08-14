@@ -564,6 +564,7 @@ impl MetalCompileOptions {
         self.mesh_max_vertex_count = 64;
         self.mesh_max_primitive_count = 64;
         self.mesh_threadgroup_size = 64;
+        self.wave_lane_count = 64;
         self.ngg_fixed_allocation_fallback = true;
     }
 }

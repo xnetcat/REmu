@@ -900,6 +900,7 @@ mod tests {
         assert_eq!(options.mesh_max_vertex_count, 64);
         assert_eq!(options.mesh_max_primitive_count, 64);
         assert_eq!(options.mesh_threadgroup_size, 64);
+        assert_eq!(options.wave_lane_count, 64);
         assert!(!options.ngg_registers_proven);
         assert!(!options.ngg_primgen_passthrough);
         assert_eq!(options.ngg_esgs_ring_itemsize, 0);
