@@ -15,7 +15,7 @@ use crate::compiler::control_flow::{
     ControlFlowLowering, LoweringFailure, analyze_control_flow, branch_target,
     combined_lowering_error, dispatcher_basic_blocks, scalar_branch_taken_condition,
 };
-use crate::compiler::export::mesh_ngg_packed_export_sgpr;
+use crate::compiler::export::{mesh_export_vertex_vgpr, mesh_ngg_packed_export_sgpr};
 use crate::compiler::image::{
     ImageKind, image_component_type, is_storage_image, is_writable_image,
 };
@@ -288,8 +288,7 @@ impl<'a> Compiler<'a> {
         }
         // The GFX10 empty-workaround count rewrite stays deleted: detecting that pattern
         // without proven registers is a loud refuse; with proof the guest GS_ALLOC_REQ / M0
-        // sequence lowers as-is. Vertex export slots need no heuristic: NGG hardware derives
-        // the slot from the exporting thread's workgroup invocation index.
+        // sequence lowers as-is.
         if options.stage == MetalShaderStage::Mesh
             && !options.ngg_registers_proven
             && mesh_ngg_packed_export_sgpr(program).is_some()
@@ -299,7 +298,13 @@ impl<'a> Compiler<'a> {
                     .into(),
             ));
         }
-
+        // PRIM exports address the compacted vertex domain. The fixed no-GS fallback and the
+        // register-proven path both provide a bounded Metal vertex capacity, so a V_CMPX-gated
+        // EXP can publish to its guest compacted id without inventing allocation state.
+        let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh
+            && (options.ngg_registers_proven || options.ngg_fixed_allocation_fallback))
+            .then(|| mesh_export_vertex_vgpr(program))
+            .flatten();
 
         // Runtime heap tables (docs/design/2026-08-13-runtime-image-descriptor-fetch.md):
         // map each flagged image binding to the SMEM heap it must index at execution time.
@@ -360,6 +365,7 @@ impl<'a> Compiler<'a> {
             image_slots,
             heap_tables,
             control_flow,
+            mesh_export_vertex_vgpr,
         };
         let total_threadgroup_memory = compiler.total_threadgroup_memory_bytes();
         if total_threadgroup_memory.is_none_or(|bytes| bytes > METAL_THREADGROUP_MEMORY_LIMIT_BYTES)

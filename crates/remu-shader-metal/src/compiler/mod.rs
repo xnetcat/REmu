@@ -55,6 +55,11 @@ pub(crate) struct Compiler<'a> {
     /// SMEM sources across control-flow paths and the shader selects at runtime.
     pub(crate) heap_tables: std::collections::BTreeMap<usize, (u32, Vec<usize>)>,
     control_flow: ControlFlowLowering,
+    /// VGPR holding the NGG compacted output vertex id that gates EXP (the `vM` in
+    /// `V_CMPX_* sN, vM` immediately before `EXP POS`). When the mesh ABI has an explicit
+    /// capacity, each export publishes directly to that Metal vertex slot so PRIM indices and
+    /// vertex/PARAM records share the same domain.
+    mesh_export_vertex_vgpr: Option<u32>,
 }
 
 impl Compiler<'_> {

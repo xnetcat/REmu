@@ -656,33 +656,33 @@ fn empty_workaround_ngg_program() -> Program {
 }
 
 #[test]
-fn cmpx_gated_vertex_exp_lowers_without_a_slot_heuristic() {
-    // Poppy Slate UI: EXP gated by `V_CMPX_GT_U32 s4, v18`. NGG hardware derives the vertex
-    // export slot from the exporting thread's workgroup invocation index (Mesa
-    // ac_nir_lower_ngg: compaction moves data between threads; EXP names no slot), so the
-    // compare is an ordinary EXEC gate and needs no proven-register peephole.
+fn fixed_ngg_fallback_publishes_compacted_vertex_exports_by_compacted_id() {
+    // Superliminal Slate UI: PRIM records name compacted ids built behind
+    // `V_CMPX_GT_U32 s4, v18`, so its POS/PARAM records must use v18 as well.
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
     options.wave_lane_count = 64;
+    options.enable_fixed_ngg_allocation_fallback();
     let shader = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("a V_CMPX-gated EXP is ordinary NGG output and must lower");
+        .expect("the bounded fixed fallback must lower compacted EXP");
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
-        "mesh vertices must publish at the thread's own invocation index: {}",
+            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)"),
+        "mesh vertices must publish under the compacted vertex id: {}",
         shader.source
     );
     assert!(
-        !shader.source.contains("set_vertex(v[18]")
-            && !shader.source.contains("set_vertex(remu_v_18"),
-        "no compacted-slot VGPR indexing may survive: {}",
+        !shader
+            .source
+            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
+        "the epilogue must not overwrite compacted records by invocation index: {}",
         shader.source
     );
 }
 
 #[test]
-fn proven_ngg_registers_publish_vertex_exports_by_thread_index() {
+fn proven_ngg_registers_publish_vertex_exports_by_compacted_id() {
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh_from_ngg_registers(
         2,
@@ -702,13 +702,15 @@ fn proven_ngg_registers_publish_vertex_exports_by_thread_index() {
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
-        "EXP must publish remu_out at the exporting thread's invocation index: {}",
+            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)"),
+        "EXP must publish remu_out under the compacted vertex id: {}",
         shader.source
     );
     assert!(
-        !shader.source.contains("remu_mesh_staged_vertices"),
-        "mesh output must not allocate a second threadgroup copy beside guest LDS"
+        !shader
+            .source
+            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
+        "the epilogue must not overwrite compacted records by invocation index"
     );
 }
 

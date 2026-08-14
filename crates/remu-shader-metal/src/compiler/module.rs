@@ -1012,17 +1012,17 @@ impl Compiler<'_> {
                         self.options.mesh_max_primitive_count
                     );
                 }
-                // NGG hardware derives the vertex export slot from the exporting thread's
-                // workgroup invocation index (Mesa ac_nir_lower_ngg: compaction moves data
-                // between threads; EXP names no slot). Every lane therefore retains exactly
-                // one output vertex and publishes it here after position conversion; lanes
-                // that never exported publish the degenerate w=0 default record.
-                append_vertex_position_format_conversion(
-                    &mut source,
-                    "remu_out.position",
-                    self.options.viewport_transform_control,
-                    None,
-                );
+                // Compacted outputs publish directly at EXP because PRIM records name that
+                // domain. Mesh programs without a compacted gate retain one vertex per lane and
+                // publish here after position conversion.
+                if self.mesh_export_vertex_vgpr.is_none() {
+                    append_vertex_position_format_conversion(
+                        &mut source,
+                        "remu_out.position",
+                        self.options.viewport_transform_control,
+                        None,
+                    );
+                }
                 if self.options.diagnostic_capture_vertex_position {
                     let diagnostic_enable_index = self
                         .evaluation
@@ -1066,16 +1066,18 @@ impl Compiler<'_> {
                          \x20   }}"
                     );
                 }
-                if self.options.ngg_fixed_allocation_fallback {
-                    source.push_str(
-                        "    if (remu_thread_index < remu_mesh_input_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n",
-                    );
-                } else {
-                    let _ = writeln!(
-                        source,
-                        "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);",
-                        self.options.mesh_max_vertex_count
-                    );
+                if self.mesh_export_vertex_vgpr.is_none() {
+                    if self.options.ngg_fixed_allocation_fallback {
+                        source.push_str(
+                            "    if (remu_thread_index < remu_mesh_input_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n",
+                        );
+                    } else {
+                        let _ = writeln!(
+                            source,
+                            "    if (remu_thread_index < {}u) remu_mesh.set_vertex(remu_thread_index, remu_out);",
+                            self.options.mesh_max_vertex_count
+                        );
+                    }
                 }
                 source.push_str(
                     "    if (remu_thread_index == 0u) {\n\
