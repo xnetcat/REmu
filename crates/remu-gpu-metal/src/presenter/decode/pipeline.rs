@@ -274,6 +274,19 @@ pub(crate) const fn ngg_mesh_base_vertex(draw: &IndexedDraw) -> i32 {
 /// registers persist across draws and therefore cannot prove that an ordinary no-GS primitive
 /// shader has a linked API geometry stage.
 pub(crate) fn ngg_fixed_allocation_fallback_for_program(program: &remu_shader::Program) -> bool {
+    static FORCE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE_LEGACY.get_or_init(|| {
+        let forced = std::env::var_os("REMU_NGG_LEGACY_FIXED")
+            .is_some_and(|value| value == "1");
+        if forced {
+            eprintln!(
+                "[REMu][METAL] forcing the pre-subgroup-allocation fixed NGG ABI (REMU_NGG_LEGACY_FIXED=1)"
+            );
+        }
+        forced
+    }) {
+        return true;
+    }
     !program
         .instructions
         .iter()
