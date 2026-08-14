@@ -3,15 +3,17 @@
 
 use super::super::{
     GPU_EVENTS_PER_TICK, GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER,
-    GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD,
+    GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD, PipelineEventIdentity, compute_pipeline_key,
+    graphics_pipeline_key,
 };
 use super::{
     OrderedEventPoll, OrderedEventSource, OrderedGpuEventReceiver, PipelineCompileCandidate,
-    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent,
+    QueueBlockReason, ScheduledGpuSubmission, ScheduledHostEvent, ScheduledPipelineKey,
     SharedEventHostEffectPendingStatistics,
 };
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, GpuWaitId};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -117,7 +119,71 @@ impl OrderedGpuEventReceiver {
             last_event_ingested_at: None,
             last_event_queue_wait: Duration::ZERO,
             producer_labels: HashMap::new(),
+            pipeline_keys: HashMap::new(),
+            graphics_pipeline_key_interner: Default::default(),
+            compute_pipeline_key_interner: Default::default(),
+            active_pipeline_event: None,
+            #[cfg(test)]
+            graphics_pipeline_key_builds: 0,
+            #[cfg(test)]
+            compute_pipeline_key_builds: 0,
         }
+    }
+
+    fn snapshot_pipeline_key(&mut self, event: &GpuEvent) {
+        let Some(identity) = pipeline_event_identity(event) else {
+            return;
+        };
+        if self.pipeline_keys.contains_key(&identity) {
+            return;
+        }
+        let key =
+            match event {
+                GpuEvent::IndexedDraw(draw) => {
+                    #[cfg(test)]
+                    {
+                        self.graphics_pipeline_key_builds += 1;
+                    }
+                    ScheduledPipelineKey::Graphics(
+                        graphics_pipeline_key(draw)
+                            .map(|key| self.graphics_pipeline_key_interner.intern(key))
+                            .map_err(Arc::<str>::from),
+                    )
+                }
+                GpuEvent::ComputeDispatch(dispatch) => {
+                    let key =
+                        match (
+                            dispatch.shader.as_ref(),
+                            dispatch.shader_evaluation.as_ref(),
+                        ) {
+                            (Some(snapshot), Some(evaluation)) => {
+                                #[cfg(test)]
+                                {
+                                    self.compute_pipeline_key_builds += 1;
+                                }
+                                Some(self.compute_pipeline_key_interner.intern(
+                                    compute_pipeline_key(dispatch, evaluation, &snapshot.program),
+                                ))
+                            }
+                            _ => None,
+                        };
+                    ScheduledPipelineKey::Compute(key)
+                }
+                _ => unreachable!("pipeline event identity only names draw/dispatch events"),
+            };
+        self.pipeline_keys.insert(identity, key);
+    }
+
+    pub(crate) fn pipeline_key(&self, event: &GpuEvent) -> Option<&ScheduledPipelineKey> {
+        self.pipeline_keys.get(&pipeline_event_identity(event)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn pipeline_key_build_counts(&self) -> (usize, usize) {
+        (
+            self.graphics_pipeline_key_builds,
+            self.compute_pipeline_key_builds,
+        )
     }
 
     pub(crate) fn set_event_queue_timing(&mut self, enabled: bool) {
@@ -200,6 +266,7 @@ impl OrderedGpuEventReceiver {
                         self.queue_order.push(queue_id);
                     }
                     for event in &events {
+                        self.snapshot_pipeline_key(event);
                         self.index_queued_event_producers(queue_id, event);
                     }
                     self.submissions.entry(queue_id).or_default().push_back(
@@ -210,11 +277,14 @@ impl OrderedGpuEventReceiver {
                         },
                     );
                 }
-                event => self.host_events.push_back(ScheduledHostEvent {
-                    ingress_sequence,
-                    ingested_at,
-                    event,
-                }),
+                event => {
+                    self.snapshot_pipeline_key(&event);
+                    self.host_events.push_back(ScheduledHostEvent {
+                        ingress_sequence,
+                        ingested_at,
+                        event,
+                    });
+                }
             }
         }
     }
@@ -384,6 +454,12 @@ impl OrderedGpuEventReceiver {
         &mut self,
         mut block_resolved: impl FnMut(&mut QueueBlockReason) -> bool,
     ) -> OrderedEventPoll {
+        // A few diagnostic drop paths intentionally skip `finish_event`. The event itself is gone
+        // when the next poll begins, so release its immutable snapshot here as a backstop. A
+        // genuinely blocked event clears `active_pipeline_event` before being requeued.
+        if let Some(identity) = self.active_pipeline_event.take() {
+            self.pipeline_keys.remove(&identity);
+        }
         self.ingest(dependency_ingress_budget());
         self.blocked_queues.retain(|_, reason| match reason {
             QueueBlockReason::GuestMemoryWait(_)
@@ -439,6 +515,7 @@ impl OrderedGpuEventReceiver {
             self.last_event_queue_wait = host.ingested_at.map_or(Duration::ZERO, |at| {
                 Instant::now().saturating_duration_since(at)
             });
+            self.active_pipeline_event = pipeline_event_identity(&host.event);
             return OrderedEventPoll::Event {
                 source: OrderedEventSource::Host {
                     ingress_sequence: host.ingress_sequence,
@@ -524,11 +601,15 @@ impl OrderedGpuEventReceiver {
             Instant::now().saturating_duration_since(at)
         });
         self.unindex_queued_event_producers(queue_id, &event);
+        self.active_pipeline_event = pipeline_event_identity(&event);
         Some(event)
     }
 
     pub(crate) fn finish_event(&mut self, source: OrderedEventSource) {
         remu_gpu::record_gpu_work_item_processed();
+        if let Some(identity) = self.active_pipeline_event.take() {
+            self.pipeline_keys.remove(&identity);
+        }
         let OrderedEventSource::GuestQueue(queue_id) = source else {
             return;
         };
@@ -556,6 +637,8 @@ impl OrderedGpuEventReceiver {
         event: GpuEvent,
         reason: QueueBlockReason,
     ) {
+        self.snapshot_pipeline_key(&event);
+        self.active_pipeline_event = None;
         match source {
             OrderedEventSource::Host { ingress_sequence } => {
                 self.host_events.push_front(ScheduledHostEvent {
@@ -646,7 +729,7 @@ impl OrderedGpuEventReceiver {
         &mut self,
         receive_limit: usize,
         work_limit: usize,
-        mut include: impl FnMut(&GpuEvent) -> bool,
+        mut include: impl FnMut(&GpuEvent, &ScheduledPipelineKey) -> bool,
     ) -> Vec<PipelineCompileCandidate> {
         self.ingest(receive_limit);
         if work_limit == 0 {
@@ -700,12 +783,17 @@ impl OrderedGpuEventReceiver {
                         .flat_map(|submission| submission.events.iter()),
                 ),
             };
+            let pipeline_keys = &self.pipeline_keys;
             candidates.extend(
                 events
                     // Cache and within-pass duplicate filtering happens before cloning a large
                     // immutable draw or dispatch snapshot.
-                    .filter(|event| include(event))
-                    .filter_map(pipeline_compile_candidate)
+                    .filter(|event| {
+                        pipeline_event_identity(event)
+                            .and_then(|identity| pipeline_keys.get(&identity))
+                            .is_some_and(|key| include(event, key))
+                    })
+                    .filter_map(|event| pipeline_compile_candidate(event, pipeline_keys))
                     .take(per_source_limit)
                     .take(work_limit - candidates.len()),
             );
@@ -1093,13 +1181,35 @@ fn event_is_memory_wait(event: &GpuEvent) -> bool {
     )
 }
 
-fn pipeline_compile_candidate(event: &GpuEvent) -> Option<PipelineCompileCandidate> {
+fn pipeline_event_identity(event: &GpuEvent) -> Option<PipelineEventIdentity> {
     match event {
-        GpuEvent::IndexedDraw(draw) => {
-            Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
+        GpuEvent::IndexedDraw(draw) => Some(PipelineEventIdentity::Graphics(
+            std::ptr::from_ref(draw.as_ref()).addr(),
+        )),
+        GpuEvent::ComputeDispatch(dispatch) => Some(PipelineEventIdentity::Compute(
+            std::ptr::from_ref(dispatch.as_ref()).addr(),
+        )),
+        _ => None,
+    }
+}
+
+fn pipeline_compile_candidate(
+    event: &GpuEvent,
+    pipeline_keys: &HashMap<PipelineEventIdentity, ScheduledPipelineKey>,
+) -> Option<PipelineCompileCandidate> {
+    let key = pipeline_keys.get(&pipeline_event_identity(event)?)?;
+    match (event, key) {
+        (GpuEvent::IndexedDraw(draw), ScheduledPipelineKey::Graphics(key)) => {
+            Some(PipelineCompileCandidate::Graphics {
+                draw: draw.as_ref().clone(),
+                key: key.clone(),
+            })
         }
-        GpuEvent::ComputeDispatch(dispatch) => {
-            Some(PipelineCompileCandidate::Compute(dispatch.as_ref().clone()))
+        (GpuEvent::ComputeDispatch(dispatch), ScheduledPipelineKey::Compute(key)) => {
+            Some(PipelineCompileCandidate::Compute {
+                dispatch: dispatch.as_ref().clone(),
+                key: key.clone(),
+            })
         }
         _ => None,
     }

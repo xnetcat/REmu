@@ -1,14 +1,14 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::super::SharedEventDirectComputePlan;
+use super::super::{ComputePipelineKey, SharedEventDirectComputePlan};
 use super::WrittenRegion;
 use super::{
     FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GuestBatchFlushReason, GuestBatchWork, MetalPresenter,
     ResidencyState, ResidentTextureActivityStamp, SpanQueryOrder, StaleSource,
     append_unique_global_writebacks, append_unique_guest_write_ranges,
     collect_pending_global_writebacks, collect_pending_guest_write_ranges,
-    collect_shared_event_global_versions, compute_pipeline_key, compute_program_can_split_wave64,
+    collect_shared_event_global_versions, compute_program_can_split_wave64,
     create_global_argument_buffer, decode_image_descriptor,
     diagnostic_compute_texture_dispatch_is_eligible,
     diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_overlapping_texture_writers,
@@ -117,6 +117,7 @@ impl MetalPresenter {
     pub(crate) fn execute_compute_dispatch(
         &mut self,
         dispatch: &ComputeDispatch,
+        pipeline_key: Option<&ComputePipelineKey>,
         shared_event_plan: Option<&SharedEventDirectComputePlan>,
     ) -> Result<(), String> {
         self.retire_completed_guest_batches();
@@ -177,13 +178,13 @@ impl MetalPresenter {
                 writes
             );
         }
-        let pipeline_key = compute_pipeline_key(dispatch, evaluation, &snapshot.program);
-        if self.failed_compute_pipelines.contains(&pipeline_key) {
+        let pipeline_key = pipeline_key.ok_or("dispatch has no immutable pipeline-key snapshot")?;
+        if self.failed_compute_pipelines.contains(pipeline_key) {
             return Err("compute pipeline previously failed to compile".to_owned());
         }
         let compiled = self
             .compiled_compute_pipelines
-            .get(&pipeline_key)
+            .get(pipeline_key)
             .ok_or("compute pipeline is not ready")?;
         let pipeline = compiled.pipeline.clone();
         let function = compiled.function.clone();
