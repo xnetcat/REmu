@@ -15,15 +15,15 @@ use std::sync::Arc;
 
 use super::{
     CompiledComputePipeline, ComputePipelineKey, MetalPresenter, OrderedEventPoll,
-    OrderedGpuEventReceiver, ProgramIdentity, QueueBlockReason, ShaderCompileRequest,
-    ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
-    compile_shader_request_catching_panics, compute_launch, compute_pipeline_key,
-    decode_image_descriptor, export_resource_render_stage, fragmentless_pixel_evaluation,
-    fragmentless_pixel_program, graphics_shader_resource_key, image_component_class,
-    lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
-    ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_fullscreen_cover_draw,
-    ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
+    OrderedGpuEventReceiver, PipelineCompileCandidate, PipelineKeyInterner, ProgramIdentity,
+    QueueBlockReason, ShaderCompileRequest, ShaderCompileResult, canonical_sampler_bindings,
+    canonical_texture_bindings, compile_shader_request_catching_panics, compute_launch,
+    compute_pipeline_key, decode_image_descriptor, export_resource_render_stage,
+    fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
+    image_component_class, lift_expanded_vertex_buffer_num_records,
+    missing_vertex_parameter_exports, ngg_export_uses_general_lds, ngg_export_uses_wave64_exec,
+    ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     procedural_rectangle_stage_for_draw, reconcile_pixel_input_controls_with_export_producers,
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
@@ -83,15 +83,97 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
 }
 
 #[test]
+fn graphics_pipeline_key_interner_deduplicates_content_and_separates_mutations() {
+    let mut interner = PipelineKeyInterner::default();
+    let key = super::cold_graphics_pipeline_key();
+    let first = interner.intern(key.clone());
+    let duplicate = interner.intern(key.clone());
+    assert!(
+        Arc::ptr_eq(&first, &duplicate),
+        "equal graphics keys share one immutable allocation"
+    );
+
+    let mut mutated = key;
+    mutated.sample_count = 4;
+    let distinct = interner.intern(mutated);
+    assert_ne!(first.as_ref(), distinct.as_ref());
+    assert!(
+        !Arc::ptr_eq(&first, &distinct),
+        "a graphics pipeline mutation must not alias the original key"
+    );
+}
+
+#[test]
+fn compute_pipeline_key_interner_deduplicates_content_and_separates_mutations() {
+    let mut interner = PipelineKeyInterner::default();
+    let (_, key) = pending_compute_pipeline();
+    let first = interner.intern(key.clone());
+    let duplicate = interner.intern(key.clone());
+    assert!(
+        Arc::ptr_eq(&first, &duplicate),
+        "equal compute keys share one immutable allocation"
+    );
+
+    let mut mutated = key;
+    mutated.lds_size_bytes = 256;
+    let distinct = interner.intern(mutated);
+    assert_ne!(first.as_ref(), distinct.as_ref());
+    assert!(
+        !Arc::ptr_eq(&first, &distinct),
+        "a compute pipeline mutation must not alias the original key"
+    );
+}
+
+#[test]
+fn repeated_pipeline_prefetch_uses_ingress_snapshots_without_rebuilding_keys() {
+    let (sender, receiver) = gpu_event_channel();
+    let draw = super::submission::shared_event_depth_draw(0x4000_0000);
+    let (dispatch, _) = pending_compute_pipeline();
+    sender
+        .send(GpuEvent::QueueSubmission {
+            queue_id: 0,
+            events: vec![
+                GpuEvent::IndexedDraw(Box::new(draw)),
+                GpuEvent::ComputeDispatch(Box::new(dispatch)),
+            ],
+        })
+        .expect("queue graphics and compute snapshots");
+    let mut ordered = OrderedGpuEventReceiver::new(receiver);
+
+    let candidates = ordered.prefetch_pipeline_work(16, 16, |_, _| true);
+    assert_eq!(candidates.len(), 2);
+    assert!(matches!(
+        &candidates[0],
+        PipelineCompileCandidate::Graphics { key: Ok(_), .. }
+    ));
+    assert!(matches!(
+        &candidates[1],
+        PipelineCompileCandidate::Compute { key: Some(_), .. }
+    ));
+    assert_eq!(ordered.pipeline_key_build_counts(), (1, 1));
+
+    for _ in 0..512 {
+        let candidates = ordered.prefetch_pipeline_work(0, 16, |_, _| false);
+        assert!(candidates.is_empty());
+    }
+    assert_eq!(
+        ordered.pipeline_key_build_counts(),
+        (1, 1),
+        "prefetch scans reuse the keys built once at immutable event ingress"
+    );
+}
+
+#[test]
 fn duplicate_compute_pipeline_compile_requests_are_coalesced() {
     let (_gpu_sender, gpu_receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
     let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(4);
     presenter.shader_compile_sender = request_sender;
     let (dispatch, key) = pending_compute_pipeline();
+    let key = Arc::new(key);
 
-    presenter.compile_compute_shader(&dispatch, &key);
-    presenter.compile_compute_shader(&dispatch, &key);
+    presenter.compile_compute_shader(&dispatch, Arc::clone(&key));
+    presenter.compile_compute_shader(&dispatch, Arc::clone(&key));
 
     match request_receiver
         .try_recv()
@@ -125,7 +207,7 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
         let address = 0x6000 + u64::try_from(index).expect("test index fits u64");
         presenter
             .compiling_compute_pipelines
-            .insert(ComputePipelineKey {
+            .insert(Arc::new(ComputePipelineKey {
                 program_identity: ProgramIdentity(Arc::new(Program::new(address, Vec::new()))),
                 lds_size_bytes: 0,
                 compute_threadgroup_size: 64,
@@ -136,9 +218,10 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
                 initial_scalar_count: 0,
                 global_bindings: Vec::new(),
                 image_bindings: Vec::new(),
-            });
+            }));
     }
     let (dispatch, key) = pending_compute_pipeline();
+    let key = Arc::new(key);
     gpu_sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 0,
@@ -155,7 +238,7 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
         "lookahead stops before consuming capacity reserved for a required front"
     );
 
-    presenter.compile_compute_shader(&dispatch, &key);
+    presenter.compile_compute_shader(&dispatch, Arc::clone(&key));
     match request_receiver
         .try_recv()
         .expect("required queue-front compile is queued")
@@ -174,6 +257,7 @@ fn failed_compute_pipeline_compile_is_terminal_and_observable() {
     let (result_sender, result_receiver) = std::sync::mpsc::channel();
     presenter.shader_compile_receiver = result_receiver;
     let (dispatch, key) = pending_compute_pipeline();
+    let key = Arc::new(key);
     presenter.compiling_compute_pipelines.insert(key.clone());
     result_sender
         .send(ShaderCompileResult::Compute {
@@ -199,6 +283,7 @@ fn transient_compile_failure_is_retried_not_terminal() {
     let (result_sender, result_receiver) = std::sync::mpsc::channel();
     presenter.shader_compile_receiver = result_receiver;
     let (dispatch, key) = pending_compute_pipeline();
+    let key = Arc::new(key);
     presenter.compiling_compute_pipelines.insert(key.clone());
     result_sender
         .send(ShaderCompileResult::Compute {
@@ -254,6 +339,7 @@ fn metal_compile_failure_is_transient_for_tool_spawn_errors() {
 #[test]
 fn compiler_panic_publishes_failure_and_releases_the_matching_queue_gate() {
     let (dispatch, key) = pending_compute_pipeline();
+    let key = Arc::new(key);
     let request = ShaderCompileRequest::Compute {
         key: key.clone(),
         dispatch: dispatch.clone(),

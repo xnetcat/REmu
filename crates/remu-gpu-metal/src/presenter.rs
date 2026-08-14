@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use metal::{
@@ -1045,13 +1045,67 @@ struct ComputePipelineKey {
     image_bindings: Vec<(u32, bool, bool, u32, u32, u32, Option<u32>, bool, bool)>,
 }
 
+/// Content-addressed owner for immutable pipeline keys.
+///
+/// The fingerprint selects a small collision bucket; full equality remains the authority. Weak
+/// entries let snapshots and pipeline caches define lifetime without turning the interner into a
+/// second unbounded cache.
+struct PipelineKeyInterner<K> {
+    buckets: HashMap<u64, Vec<Weak<K>>>,
+}
+
+impl<K> Default for PipelineKeyInterner<K> {
+    fn default() -> Self {
+        Self {
+            buckets: HashMap::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> PipelineKeyInterner<K> {
+    fn intern(&mut self, key: K) -> Arc<K> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        let bucket = self.buckets.entry(fingerprint).or_default();
+        let mut interned = None;
+        bucket.retain(|candidate| {
+            let Some(candidate) = candidate.upgrade() else {
+                return false;
+            };
+            if interned.is_none() && candidate.as_ref() == &key {
+                interned = Some(candidate);
+            }
+            true
+        });
+        if let Some(interned) = interned {
+            return interned;
+        }
+        let key = Arc::new(key);
+        bucket.push(Arc::downgrade(&key));
+        key
+    }
+}
+
+#[derive(Clone)]
+enum ScheduledPipelineKey {
+    Graphics(Result<Arc<GraphicsPipelineKey>, Arc<str>>),
+    Compute(Option<Arc<ComputePipelineKey>>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PipelineEventIdentity {
+    Graphics(usize),
+    Compute(usize),
+}
+
 enum ShaderCompileResult {
     Graphics {
-        key: GraphicsPipelineKey,
+        key: Arc<GraphicsPipelineKey>,
         compiled: Result<CompiledShaderPair, String>,
     },
     Compute {
-        key: ComputePipelineKey,
+        key: Arc<ComputePipelineKey>,
         shader_address: u64,
         threads_per_group: [u32; 3],
         compiled: Result<CompiledComputePipeline, String>,
@@ -1060,11 +1114,11 @@ enum ShaderCompileResult {
 
 enum ShaderCompileRequest {
     Graphics {
-        key: GraphicsPipelineKey,
+        key: Arc<GraphicsPipelineKey>,
         draw: IndexedDraw,
     },
     Compute {
-        key: ComputePipelineKey,
+        key: Arc<ComputePipelineKey>,
         dispatch: ComputeDispatch,
     },
 }
@@ -1271,13 +1325,19 @@ enum QueueBlockReason {
         latency: SharedEventHostEffectLatencyState,
     },
     FlipSafetyWait(GpuFlipWait),
-    GraphicsPipeline(GraphicsPipelineKey),
-    ComputePipeline(ComputePipelineKey),
+    GraphicsPipeline(Arc<GraphicsPipelineKey>),
+    ComputePipeline(Arc<ComputePipelineKey>),
 }
 
 enum PipelineCompileCandidate {
-    Graphics(IndexedDraw),
-    Compute(ComputeDispatch),
+    Graphics {
+        draw: IndexedDraw,
+        key: Result<Arc<GraphicsPipelineKey>, Arc<str>>,
+    },
+    Compute {
+        dispatch: ComputeDispatch,
+        key: Option<Arc<ComputePipelineKey>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -1309,6 +1369,14 @@ struct OrderedGpuEventReceiver {
     /// cap are deliberately not counted: an undercount only widens ingress, which is the safe
     /// direction, while an overcount could starve a waiting queue of its producer.
     producer_labels: HashMap<(u64, u64), u32>,
+    pipeline_keys: HashMap<PipelineEventIdentity, ScheduledPipelineKey>,
+    graphics_pipeline_key_interner: PipelineKeyInterner<GraphicsPipelineKey>,
+    compute_pipeline_key_interner: PipelineKeyInterner<ComputePipelineKey>,
+    active_pipeline_event: Option<PipelineEventIdentity>,
+    #[cfg(test)]
+    graphics_pipeline_key_builds: usize,
+    #[cfg(test)]
+    compute_pipeline_key_builds: usize,
 }
 
 #[derive(Debug)]
@@ -2604,21 +2672,21 @@ struct MetalPresenter {
     logged_unsupported_guest_draws: HashSet<([u32; 4], [u32; 4])>,
     captured_guest_frames: HashSet<(u64, u32, u32, u32, u64)>,
     last_guest_capture: Option<Instant>,
-    compiled_shader_pairs: HashMap<GraphicsPipelineKey, CompiledShaderPair>,
-    compiling_shader_pairs: HashSet<GraphicsPipelineKey>,
-    failed_shader_pairs: HashSet<GraphicsPipelineKey>,
+    compiled_shader_pairs: HashMap<Arc<GraphicsPipelineKey>, CompiledShaderPair>,
+    compiling_shader_pairs: HashSet<Arc<GraphicsPipelineKey>>,
+    failed_shader_pairs: HashSet<Arc<GraphicsPipelineKey>>,
     /// Draws whose execution failed after pipeline compilation, keyed by
     /// (export shader address, pixel shader address). Every failing execution counts, not just
     /// the first: a scene pass failing every frame must be visible in every run's perf trail
     /// instead of being silently dropped after one log line.
     dropped_draw_executions: HashMap<(u64, u64), u64>,
-    compiled_compute_pipelines: HashMap<ComputePipelineKey, CompiledComputePipeline>,
-    compiling_compute_pipelines: HashSet<ComputePipelineKey>,
+    compiled_compute_pipelines: HashMap<Arc<ComputePipelineKey>, CompiledComputePipeline>,
+    compiling_compute_pipelines: HashSet<Arc<ComputePipelineKey>>,
     rectangle_indirect_pipeline: Option<ComputePipelineState>,
     ngg_indirect_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_scatter_pipeline: Option<ComputePipelineState>,
     mode27_rematerialisation_gather_pipeline: Option<ComputePipelineState>,
-    failed_compute_pipelines: HashSet<ComputePipelineKey>,
+    failed_compute_pipelines: HashSet<Arc<ComputePipelineKey>>,
     failed_compute_execution: HashSet<u64>,
     /// Compute dispatches whose execution failed, keyed by shader address; same contract as
     /// `dropped_draw_executions`.

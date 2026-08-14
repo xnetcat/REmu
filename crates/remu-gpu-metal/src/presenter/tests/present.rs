@@ -10,6 +10,7 @@ use remu_gpu::{
     gpu_event_channel,
 };
 use remu_shader::PixelOutputKind;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::completion::CommandBufferCompletion;
@@ -1159,7 +1160,7 @@ fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary
     presenter.receiver.block_event(
         source,
         GpuEvent::IndexedDraw(Box::new(cover)),
-        QueueBlockReason::GraphicsPipeline(super::cold_graphics_pipeline_key()),
+        QueueBlockReason::GraphicsPipeline(Arc::new(super::cold_graphics_pipeline_key())),
     );
     assert!(
         presenter

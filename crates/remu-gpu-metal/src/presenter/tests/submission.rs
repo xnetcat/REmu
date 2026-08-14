@@ -184,7 +184,7 @@ fn mapped_test_label() -> (GuestAddressSpace, u64) {
     mapped_test_pages(1)
 }
 
-fn shared_event_depth_draw(address: u64) -> IndexedDraw {
+pub(super) fn shared_event_depth_draw(address: u64) -> IndexedDraw {
     let mut draw = indexed_draw(0, 0, 3);
     draw.indexed = false;
     draw.primitive_type = 7;
@@ -3710,7 +3710,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
     ordered.block_event(
         graphics_source,
         blocked_draw,
-        QueueBlockReason::GraphicsPipeline(key),
+        QueueBlockReason::GraphicsPipeline(Arc::new(key)),
     );
 
     let compute_source = match ordered.try_recv(|_| false) {
@@ -3737,13 +3737,13 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         ordered.try_recv(|_| false),
         OrderedEventPoll::Blocked
     ));
-    let prefetched = ordered.prefetch_pipeline_work(16, 16, |_| true);
+    let prefetched = ordered.prefetch_pipeline_work(16, 16, |_, _| true);
     assert_eq!(
         prefetched
             .iter()
             .filter_map(|candidate| match candidate {
-                PipelineCompileCandidate::Graphics(draw) => Some(draw.sequence),
-                PipelineCompileCandidate::Compute(_) => None,
+                PipelineCompileCandidate::Graphics { draw, .. } => Some(draw.sequence),
+                PipelineCompileCandidate::Compute { .. } => None,
             })
             .collect::<Vec<_>>(),
         [17, 23]
@@ -3863,13 +3863,13 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
         })
         .expect("queue compute submission");
 
-    let prefetched = ordered.prefetch_pipeline_work(16, 16, |_| true);
+    let prefetched = ordered.prefetch_pipeline_work(16, 16, |_, _| true);
     assert_eq!(
         prefetched
             .iter()
             .filter_map(|candidate| match candidate {
-                PipelineCompileCandidate::Graphics(_) => None,
-                PipelineCompileCandidate::Compute(dispatch) => Some(dispatch.sequence),
+                PipelineCompileCandidate::Graphics { .. } => None,
+                PipelineCompileCandidate::Compute { dispatch, .. } => Some(dispatch.sequence),
             })
             .collect::<Vec<_>>(),
         [41]
@@ -3888,7 +3888,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
     ordered.block_event(
         source,
         event,
-        QueueBlockReason::ComputePipeline(key.clone()),
+        QueueBlockReason::ComputePipeline(Arc::new(key.clone())),
     );
     assert!(matches!(
         ordered.try_recv(|_| false),
@@ -3896,7 +3896,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
     ));
 
     match ordered.try_recv(
-        |reason| matches!(reason, QueueBlockReason::ComputePipeline(actual) if actual == &key),
+        |reason| matches!(reason, QueueBlockReason::ComputePipeline(actual) if **actual == key),
     ) {
         OrderedEventPoll::Event {
             source,
@@ -3970,17 +3970,17 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
     let prefetched = ordered.prefetch_pipeline_work(
         16,
         2,
-        |event| !matches!(event, GpuEvent::IndexedDraw(draw) if draw.sequence == 1),
+        |event, _| !matches!(event, GpuEvent::IndexedDraw(draw) if draw.sequence == 1),
     );
 
     assert_eq!(prefetched.len(), 2);
     assert!(matches!(
         &prefetched[0],
-        PipelineCompileCandidate::Graphics(draw) if draw.sequence == 2
+        PipelineCompileCandidate::Graphics { draw, .. } if draw.sequence == 2
     ));
     assert!(matches!(
         &prefetched[1],
-        PipelineCompileCandidate::Compute(dispatch) if dispatch.sequence == 9
+        PipelineCompileCandidate::Compute { dispatch, .. } if dispatch.sequence == 9
     ));
 }
 
