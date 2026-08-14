@@ -93,12 +93,9 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
                 descriptor.guest.address
             )
         })?;
-        let resident = resident_guest_textures
-            .remove(&descriptor.guest)
-            .expect("selected clean mip resident exists");
-        let promoted =
-            promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)?;
-        resident_guest_textures.insert(descriptor.guest, promoted);
+        assert!(resident_guest_textures.try_replace(&descriptor.guest, |resident| {
+            promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)
+        })?);
         return resident_texture_for_sample(
             resident_guest_textures
                 .get_mut(&descriptor.guest)
@@ -107,7 +104,9 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         )
         .ok_or_else(|| "promoted clean mip hierarchy cannot represent storage view".to_owned());
     }
-    if let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
+    if let Some(resident) = resident_guest_textures
+        .retire_clean(&descriptor.guest, "mip-hierarchy-replacement")?
+    {
         trace_resident_texture_removal("mip-hierarchy-replacement", &resident);
     }
     let started = Instant::now();
@@ -225,7 +224,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
     device: &Device,
     command_buffer: &CommandBufferRef,
     descriptor: DecodedImageDescriptor,
-    resident: ResidentGuestTexture,
+    resident: &ResidentGuestTexture,
     origin: Mode27WorkOrigin,
 ) -> Result<ResidentGuestTexture, String> {
     let previous_declared = resident
@@ -392,7 +391,7 @@ pub(crate) fn promote_resident_mip_hierarchy(
         state: resident.state,
         acquire_invalidated: resident.acquire_invalidated,
         content_version: resident.content_version,
-        gpu_write_watch_generations: resident.gpu_write_watch_generations,
+        gpu_write_watch_generations: resident.gpu_write_watch_generations.clone(),
         last_use: resident.last_use,
         activity: resident.activity,
     })

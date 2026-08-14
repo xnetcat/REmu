@@ -1159,9 +1159,9 @@ impl MetalPresenter {
             },
             "rematerialised-into-alias",
         );
-        let mut target = self
+        let target = self
             .resident_guest_textures
-            .remove(&target_descriptor)
+            .get_mut(&target_descriptor)
             .expect("validated stale target still exists");
         target.texture = match rematerialisation {
             StaleReadRematerialisation::View(view) => {
@@ -1185,8 +1185,6 @@ impl MetalPresenter {
         if target.gpu_written() {
             target.note_gpu_write();
         }
-        self.resident_guest_textures
-            .insert(target_descriptor, target);
         self.record_internal_resident_version(target_descriptor);
         Ok(true)
     }
@@ -1227,17 +1225,27 @@ impl MetalPresenter {
                 continue;
             }
             if refresh == WriteWatchRefresh::Replaced {
-                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
-                    trace_resident_texture_removal("pressure-mapping-replaced", &resident);
+                match self
+                    .resident_guest_textures
+                    .retire_clean(&descriptor, "pressure-mapping-replaced")
+                {
+                    Ok(Some(resident)) => {
+                        trace_resident_texture_removal("pressure-mapping-replaced", &resident);
+                        eviction_count += 1;
+                        eviction_bytes = eviction_bytes.saturating_add(allocated_bytes);
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[REMu][METAL] {error}; pinning allocation"),
                 }
-                eviction_count += 1;
-                eviction_bytes = eviction_bytes.saturating_add(allocated_bytes);
                 continue;
             }
 
             let gpu_written = resident.gpu_written();
             if gpu_written && resident.cpu_write_obsoletes_gpu_writeback(refresh)? {
-                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                if let Some(resident) = self
+                    .resident_guest_textures
+                    .retire_clean(&descriptor, "pressure-cpu-reused")?
+                {
                     trace_resident_texture_removal("pressure-cpu-reused", &resident);
                 }
                 eviction_count += 1;
@@ -1250,9 +1258,19 @@ impl MetalPresenter {
                     descriptor,
                     WritebackTrigger::PressureEviction,
                 )?;
+                if self
+                    .resident_guest_textures
+                    .get(&descriptor)
+                    .is_some_and(ResidentGuestTexture::gpu_written)
+                {
+                    continue;
+                }
             }
 
-            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+            if let Some(resident) = self
+                .resident_guest_textures
+                .retire_clean(&descriptor, "pressure-lru")?
+            {
                 trace_resident_texture_removal("pressure-lru", &resident);
             }
             eviction_count += 1;
@@ -1323,19 +1341,16 @@ impl MetalPresenter {
                     .expect("selected GPU-written resident exists"),
             )?;
             if refresh != WriteWatchRefresh::Replaced {
-                let resident = self
-                    .resident_guest_textures
-                    .remove(&descriptor.guest)
-                    .expect("selected GPU-written resident exists");
-                let promoted = promote_resident_mip_hierarchy(
-                    device,
-                    &command_buffer,
-                    descriptor,
-                    resident,
-                    Mode27WorkOrigin::StorageCreate,
-                )?;
-                self.resident_guest_textures
-                    .insert(descriptor.guest, promoted);
+                assert!(self.resident_guest_textures.try_replace(
+                    &descriptor.guest,
+                    |resident| promote_resident_mip_hierarchy(
+                        device,
+                        &command_buffer,
+                        descriptor,
+                        resident,
+                        Mode27WorkOrigin::StorageCreate,
+                    ),
+                )?);
                 self.active_open_guest_batch_mut()
                     .expect("mip-promotion batch remains open")
                     .record_resident_write_footprint(
@@ -1351,7 +1366,10 @@ impl MetalPresenter {
                 )
                 .ok_or_else(|| "promoted storage hierarchy cannot represent view".to_owned());
             }
-            if let Some(resident) = self.resident_guest_textures.remove(&descriptor.guest) {
+            if let Some(resident) = self
+                .resident_guest_textures
+                .retire_clean(&descriptor.guest, "mip-promotion-mapping-replaced")?
+            {
                 trace_resident_texture_removal("mip-promotion-mapping-replaced", &resident);
             }
         }
@@ -1471,7 +1489,10 @@ impl MetalPresenter {
                 WriteWatchRefresh::Replaced => {}
             }
         }
-        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .retire_clean(&descriptor, "resident-replacement")?
+        {
             if resident.gpu_content_executed
                 && resident.descriptor.width >= 1_280
                 && resident.descriptor.height >= 720
@@ -1530,7 +1551,13 @@ impl MetalPresenter {
                     });
                 }
                 WriteWatchRefresh::Replaced => {
-                    if let Some(resident) = self.resident_guest_textures.remove(&shared_resident) {
+                    if let Some(resident) = self
+                        .resident_guest_textures
+                        .retire_clean(
+                            &shared_resident,
+                            "ensure-shared-resident-mapping-replaced",
+                        )?
+                    {
                         trace_resident_texture_removal(
                             "ensure-shared-resident-mapping-replaced",
                             &resident,
@@ -1630,14 +1657,20 @@ impl MetalPresenter {
                     ));
                 }
                 if refresh == WriteWatchRefresh::Replaced {
-                    if let Some(resident) = self.resident_guest_textures.remove(&alias) {
+                    if let Some(resident) = self
+                        .resident_guest_textures
+                        .retire_clean(&alias, "alias-mapping-replaced")?
+                    {
                         trace_resident_texture_removal("alias-mapping-replaced", &resident);
                     }
                 } else if gpu_written {
                     if cpu_write_obsoletes_writeback {
                         // The guest reused this heap range after the last render. Publishing the
                         // old Metal image now would overwrite the new indirect-command bytes.
-                        if let Some(resident) = self.resident_guest_textures.remove(&alias) {
+                        if let Some(resident) = self
+                            .resident_guest_textures
+                            .retire_clean(&alias, "cpu-reused-gpu-alias")?
+                        {
                             trace_resident_texture_removal("cpu-reused-gpu-alias", &resident);
                         }
                         continue;
@@ -1688,7 +1721,10 @@ impl MetalPresenter {
                 WriteWatchRefresh::Replaced => {}
             }
         }
-        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .retire_clean(&descriptor, "ensure-exact-resident-replaced-phase1g")?
+        {
             trace_resident_texture_removal("ensure-exact-resident-replaced-phase1g", &resident);
         }
         let write_watch = watch_guest_texture(descriptor)?;
@@ -1818,10 +1854,6 @@ impl MetalPresenter {
                 batch.command_buffer.clone()
             };
             retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
-            let resident = self
-                .resident_guest_textures
-                .remove(&target.texture)
-                .expect("selected GPU-written target exists");
             let descriptor = DecodedImageDescriptor {
                 guest: target.texture,
                 span: target.span,
@@ -1831,16 +1863,21 @@ impl MetalPresenter {
                 texture_type: target.texture_type,
                 layer_count: target.layer_count,
             };
-            let promoted = promote_resident_mip_hierarchy(
-                device,
-                &command_buffer,
-                descriptor,
-                resident,
-                Mode27WorkOrigin::RenderTargetCreate,
-            )?;
-            let texture = promoted.texture.clone();
-            self.resident_guest_textures
-                .insert(target.texture, promoted);
+            assert!(self.resident_guest_textures.try_replace(&target.texture, |resident| {
+                promote_resident_mip_hierarchy(
+                    device,
+                    &command_buffer,
+                    descriptor,
+                    resident,
+                    Mode27WorkOrigin::RenderTargetCreate,
+                )
+            })?);
+            let texture = self
+                .resident_guest_textures
+                .get(&target.texture)
+                .expect("promoted target remains resident")
+                .texture
+                .clone();
             self.active_open_guest_batch_mut()
                 .expect("mip-promotion batch remains open")
                 .record_resident_write_footprint(
@@ -1853,7 +1890,10 @@ impl MetalPresenter {
                 descriptor: target.texture,
             });
         }
-        if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .retire_clean(&target.texture, "mipmapped-target-resident-replaced")?
+        {
             trace_resident_texture_removal("mipmapped-target-resident-replaced", &resident);
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
@@ -1993,7 +2033,10 @@ impl MetalPresenter {
                 target.texture.address, target.layer_count
             ));
         }
-        if let Some(resident) = self.resident_guest_textures.remove(&target.texture) {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .retire_clean(&target.texture, "layered-target-resident-replaced")?
+        {
             trace_resident_texture_removal("layered-target-resident-replaced", &resident);
         }
         retire_overlapping_sampled_textures(&mut self.sampled_texture_cache, target.span);
@@ -2245,7 +2288,14 @@ impl MetalPresenter {
                         WritebackTrigger::LayeredDepthAlias,
                     )?;
                 }
-                let Some(resident) = self.resident_guest_textures.remove(&alias) else {
+                let Some(resident) = self.resident_guest_textures.retire_clean(
+                    &alias,
+                    if refresh == WriteWatchRefresh::Replaced {
+                        "layered-depth-alias-mapping-replaced"
+                    } else {
+                        "cpu-reused-layered-depth-alias"
+                    },
+                )? else {
                     continue;
                 };
                 if refresh == WriteWatchRefresh::Replaced {
@@ -2258,7 +2308,10 @@ impl MetalPresenter {
                 }
             }
         }
-        if let Some(resident) = self.resident_guest_textures.remove(&depth.texture) {
+        if let Some(resident) = self
+            .resident_guest_textures
+            .retire_clean(&depth.texture, "layered-depth-resident-replaced")?
+        {
             trace_resident_texture_removal("layered-depth-resident-replaced", &resident);
         }
 
@@ -2714,8 +2767,15 @@ impl MetalPresenter {
             }
             if other.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced) {
                 // A replaced mapping proves nothing about any byte, so it cannot be demoted.
-                if let Some(resident) = self.resident_guest_textures.remove(&candidate) {
-                    trace_resident_texture_removal("superseded-mapping-replaced", &resident);
+                match self
+                    .resident_guest_textures
+                    .retire_clean(&candidate, "superseded-mapping-replaced")
+                {
+                    Ok(Some(resident)) => {
+                        trace_resident_texture_removal("superseded-mapping-replaced", &resident);
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("[REMu][METAL] {error}"),
                 }
                 continue;
             }
@@ -2792,7 +2852,10 @@ pub(crate) fn ensure_resident_texture_in_map(
             WriteWatchRefresh::Replaced => {}
         }
     }
-    if let Some(resident) = resident_guest_textures.remove(&descriptor) {
+    if let Some(resident) = resident_guest_textures.retire_clean(
+        &descriptor,
+        "ensure-map-resident-replacement",
+    )? {
         let reason = if resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
         {
             "ensure-map-mapping-replaced"

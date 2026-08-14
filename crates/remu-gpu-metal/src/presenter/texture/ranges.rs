@@ -225,6 +225,10 @@ impl GpuDebtSet {
         &self.0
     }
 
+    pub(crate) fn contains_all(&self, other: &Self) -> bool {
+        self.0.contains_all(&other.0)
+    }
+
     /// Rebase a whole-allocation debt when a layout migration moves every byte.
     ///
     /// Sparse debt cannot be translated without a texel-to-byte proof for both layouts. Refuse it

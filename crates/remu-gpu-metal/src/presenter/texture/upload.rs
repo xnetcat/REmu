@@ -778,7 +778,8 @@ pub(crate) fn upload_image_textures(
                     false
                 };
                 if replaced
-                    && let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
+                    && let Some(resident) = resident_guest_textures
+                        .retire_clean(&descriptor.guest, "sample-upload-mapping-replaced")? {
                         trace_resident_texture_removal(
                             "sample-upload-mapping-replaced",
                             &resident,

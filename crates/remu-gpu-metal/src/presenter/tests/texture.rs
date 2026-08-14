@@ -1218,6 +1218,108 @@ fn late_alias_without_a_cpu_write_preserves_discarded_gpu_contents() {
 }
 
 #[test]
+fn resident_replacement_rolls_back_and_retirement_requires_complete_proof() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let Some(device) = Device::system_default() else {
+        return;
+    };
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(4 * GUEST_PAGE_SIZE).expect("guest physical backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            4 * GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("resident mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let mut residents = ResidentTextureMap::new();
+    ensure_resident_texture_in_map(&device, None, descriptor, &mut residents, false)
+        .expect("clean resident");
+    let span = residents[&descriptor].span.expect("resident span");
+    let clean_version = residents[&descriptor].content_version;
+
+    let clean_failure = residents.try_replace(&descriptor, |_| Err("forced clean failure"));
+    assert_eq!(clean_failure, Err("forced clean failure"));
+    assert_eq!(residents[&descriptor].content_version, clean_version);
+    assert_eq!(
+        residents.overlapping(&span, SpanQueryOrder::ResidentFirst),
+        vec![descriptor],
+        "failed replacement must keep the original interval indexed"
+    );
+
+    residents
+        .get_mut(&descriptor)
+        .expect("resident remains live")
+        .note_gpu_authored_whole_span();
+    let exact_debt = residents[&descriptor].gpu_authored.clone();
+    let dirty_failure = residents.try_replace(&descriptor, |_| Err("forced dirty failure"));
+    assert_eq!(dirty_failure, Err("forced dirty failure"));
+    assert_eq!(residents[&descriptor].gpu_authored, exact_debt);
+    assert!(
+        residents
+            .retire_clean(&descriptor, "test-dirty-clean-retire")
+            .is_err(),
+        "dirty allocation cannot claim a clean retirement"
+    );
+    assert!(residents.contains_key(&descriptor));
+
+    let mut partial = exact_debt.clone();
+    let (start, end) = exact_debt.runs()[0];
+    partial.subtract(&RangeSet::from_run(start + (end - start) / 2, end));
+    let partial_receipt = residents.test_published_disposition(descriptor, partial);
+    assert!(residents.retire(&descriptor, partial_receipt).is_err());
+    assert!(residents.contains_key(&descriptor));
+
+    let stale_target = GuestTextureDescriptor {
+        address: descriptor.address + GUEST_PAGE_SIZE,
+        ..descriptor
+    };
+    let stale_transfer = residents.test_transferred_disposition(
+        descriptor,
+        stale_target,
+        exact_debt.clone(),
+        residents[&descriptor].content_version,
+    );
+    assert!(residents.retire(&descriptor, stale_transfer).is_err());
+    assert!(residents.contains_key(&descriptor));
+    assert_eq!(
+        residents.overlapping(&span, SpanQueryOrder::ResidentFirst),
+        vec![descriptor],
+        "invalid receipts must not mutate the interval index"
+    );
+
+    let complete_receipt = residents.test_published_disposition(descriptor, exact_debt);
+    assert!(
+        residents
+            .retire(&descriptor, complete_receipt)
+            .expect("complete publication proof")
+            .is_some()
+    );
+    assert!(!residents.contains_key(&descriptor));
+    assert!(
+        residents
+            .overlapping(&span, SpanQueryOrder::ResidentFirst)
+            .is_empty()
+    );
+}
+
+#[test]
 fn contiguous_texture_snapshot_and_writeback_retain_direct_mapping_semantics() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
@@ -2527,7 +2629,7 @@ fn resident_pressure_plan_keeps_overlapping_gpu_versions_indivisible() {
 }
 
 #[test]
-fn guest_observable_writeback_retiles_gpu_pixels_and_pressure_eviction_drops_them() {
+fn pressure_eviction_pins_gpu_debt_until_guest_observable_writeback() {
     use remu_memory::{
         GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
         GuestProtection,
@@ -2587,17 +2689,18 @@ fn guest_observable_writeback_retiles_gpu_pixels_and_pressure_eviction_drops_the
     assert_eq!((count, bytes), (0, 0));
     assert!(presenter.resident_guest_textures.contains_key(&descriptor));
 
-    // Host memory pressure is REmu's own event, so the pixels are dropped rather than staged in
-    // a guest range no guest read named. The debt survives for a trigger that does name one.
+    // Host memory pressure is REmu's own event, so it cannot publish into a range no guest read
+    // named and cannot retire the only GPU copy. The dirty allocation stays pinned until a trigger
+    // with a live guest lease settles it.
     let discarded_before = RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
         .load(AtomicOrdering::Relaxed);
     let untouched = snapshot_guest_texture_raw(descriptor).expect("pre-eviction guest bytes");
     let (count, bytes) = presenter
         .garbage_collect_resident_textures_to_budget(0, 2, 8)
         .expect("completed-flip pressure pass");
-    assert_eq!(count, 1);
-    assert!(bytes >= rendered.len() as u64);
-    assert!(!presenter.resident_guest_textures.contains_key(&descriptor));
+    assert_eq!((count, bytes), (0, 0));
+    assert!(presenter.resident_guest_textures.contains_key(&descriptor));
+    assert!(presenter.resident_guest_textures[&descriptor].gpu_written());
     assert_eq!(
         RESIDENT_WRITEBACK_DISCARDED[WritebackTrigger::PressureEviction.index()]
             .load(AtomicOrdering::Relaxed),
@@ -2609,24 +2712,8 @@ fn guest_observable_writeback_retiles_gpu_pixels_and_pressure_eviction_drops_the
         "an eviction the guest never asked for must not write guest memory"
     );
 
-    // The same pixels, published for a trigger that names a guest read of exactly these bytes.
-    let texture = presenter
-        .ensure_resident_texture(&device, descriptor)
-        .expect("rebuilt resident texture")
-        .texture;
-    texture.replace_region(
-        MTLRegion::new_2d(0, 0, 64, 64),
-        0,
-        rendered.as_ptr().cast::<c_void>(),
-        64 * 4,
-    );
-    presenter.mark_resident_texture_written_at(
-        descriptor,
-        ResourceSpan::for_texture(descriptor),
-        None,
-        WrittenRegion::whole_resource(),
-        ResidentTextureActivityStamp { work: 11, flip: 3 },
-    );
+    // The same retained pixels can now be published for a trigger that names a guest read of
+    // exactly these bytes.
     assert!(
         presenter
             .settle_resident_texture_writeback(descriptor, WritebackTrigger::DmaSource)

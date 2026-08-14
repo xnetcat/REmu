@@ -1,8 +1,67 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::{GuestTextureDescriptor, ResidentGuestTexture, ResourceSpan};
+use super::{GpuDebtSet, GuestTextureDescriptor, ResidentGuestTexture, ResourceSpan};
 use std::collections::HashMap;
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static RESIDENT_RETIRE_CLEAN: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_RETIRE_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_RETIRE_TRANSFERRED: AtomicU64 = AtomicU64::new(0);
+static RESIDENT_RETIRE_DIRTY_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidentRetireReason(pub(crate) &'static str);
+
+pub(crate) struct PublishReceipt {
+    source: GuestTextureDescriptor,
+    source_span: Option<ResourceSpan>,
+    covered: GpuDebtSet,
+}
+
+pub(crate) struct TransferReceipt {
+    source: GuestTextureDescriptor,
+    source_span: Option<ResourceSpan>,
+    target: GuestTextureDescriptor,
+    covered: GpuDebtSet,
+    ordered_content_version: u64,
+}
+
+pub(crate) enum RetireDisposition {
+    Clean { reason: ResidentRetireReason },
+    Published { receipt: PublishReceipt },
+    TransferredTo { receipt: TransferReceipt },
+}
+
+#[derive(Debug)]
+pub(crate) enum ResidentRetireError {
+    Dirty {
+        descriptor: GuestTextureDescriptor,
+        reason: &'static str,
+        debt_bytes: u64,
+        debt_runs: usize,
+    },
+    InvalidReceipt(&'static str),
+}
+
+impl fmt::Display for ResidentRetireError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Dirty {
+                descriptor,
+                reason,
+                debt_bytes,
+                debt_runs,
+            } => write!(
+                formatter,
+                "refused dirty resident retirement address={:#x} reason={reason} debt_bytes={debt_bytes:#x} debt_runs={debt_runs}",
+                descriptor.address
+            ),
+            Self::InvalidReceipt(reason) => write!(formatter, "invalid resident retirement receipt: {reason}"),
+        }
+    }
+}
 
 /// `resident_guest_textures` together with an interval index over the residents' spans.
 ///
@@ -49,6 +108,10 @@ impl ResidentTextureMap {
         descriptor: GuestTextureDescriptor,
         resident: ResidentGuestTexture,
     ) -> Option<ResidentGuestTexture> {
+        assert!(
+            !self.textures.contains_key(&descriptor),
+            "resident replacement must retire or take the previous allocation first"
+        );
         // `resident.span` is the admission-time extent of the complete allocation (all mip
         // levels and array layers). Recomputing a span from the descriptor here would index only
         // level zero and could also bind the interval to a mapping installed after admission.
@@ -56,12 +119,147 @@ impl ResidentTextureMap {
         self.textures.insert(descriptor, resident)
     }
 
-    pub(crate) fn remove(
+    /// Builds and atomically installs a replacement while the original resident and index entry
+    /// remain live. A failed builder leaves both source-of-truth structures unchanged.
+    pub(crate) fn try_replace<E>(
         &mut self,
         descriptor: &GuestTextureDescriptor,
-    ) -> Option<ResidentGuestTexture> {
+        build: impl FnOnce(&ResidentGuestTexture) -> Result<ResidentGuestTexture, E>,
+    ) -> Result<bool, E> {
+        let Some(current) = self.textures.get(descriptor) else {
+            return Ok(false);
+        };
+        let replacement = build(current)?;
+        assert_eq!(
+            replacement.descriptor, *descriptor,
+            "transactional replacement cannot change the descriptor key"
+        );
         self.index.remove(descriptor);
-        self.textures.remove(descriptor)
+        self.index.insert(*descriptor, replacement.span);
+        self.textures.insert(*descriptor, replacement);
+        Ok(true)
+    }
+
+    /// The only operation allowed to permanently delete a resident allocation.
+    pub(crate) fn retire(
+        &mut self,
+        descriptor: &GuestTextureDescriptor,
+        disposition: RetireDisposition,
+    ) -> Result<Option<ResidentGuestTexture>, ResidentRetireError> {
+        let Some(resident) = self.textures.get(descriptor) else {
+            return Ok(None);
+        };
+        match &disposition {
+            RetireDisposition::Clean { reason } => {
+                if !resident.gpu_authored.is_empty() {
+                    RESIDENT_RETIRE_DIRTY_REFUSED.fetch_add(1, Ordering::Relaxed);
+                    return Err(ResidentRetireError::Dirty {
+                        descriptor: *descriptor,
+                        reason: reason.0,
+                        debt_bytes: resident.gpu_authored.byte_count(),
+                        debt_runs: resident.gpu_authored.runs().len(),
+                    });
+                }
+            }
+            RetireDisposition::Published { receipt } => {
+                if receipt.source != *descriptor
+                    || receipt.source_span != resident.span
+                    || !receipt.covered.contains_all(&resident.gpu_authored)
+                {
+                    return Err(ResidentRetireError::InvalidReceipt(
+                        "publication receipt does not cover the source debt",
+                    ));
+                }
+            }
+            RetireDisposition::TransferredTo { receipt } => {
+                if receipt.source != *descriptor || receipt.target == *descriptor {
+                    return Err(ResidentRetireError::InvalidReceipt(
+                        "transfer receipt names an invalid source or target",
+                    ));
+                }
+                let Some(target) = self.textures.get(&receipt.target) else {
+                    return Err(ResidentRetireError::InvalidReceipt(
+                        "transfer target is not live",
+                    ));
+                };
+                if receipt.source_span != resident.span
+                    || !resident
+                        .span
+                        .zip(target.span)
+                        .is_some_and(|(source, target)| source.shares_offset_space(&target))
+                    || target.content_version < receipt.ordered_content_version
+                    || !receipt.covered.contains_all(&resident.gpu_authored)
+                    || !target.gpu_authored.contains_all(&resident.gpu_authored)
+                    || !target.owned.contains_all(resident.gpu_authored.as_ranges())
+                {
+                    return Err(ResidentRetireError::InvalidReceipt(
+                        "transfer target does not hold ordered authority and debt",
+                    ));
+                }
+            }
+        }
+        self.index.remove(descriptor);
+        let retired = self.textures.remove(descriptor);
+        match disposition {
+            RetireDisposition::Clean { .. } => {
+                RESIDENT_RETIRE_CLEAN.fetch_add(1, Ordering::Relaxed);
+            }
+            RetireDisposition::Published { .. } => {
+                RESIDENT_RETIRE_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+            }
+            RetireDisposition::TransferredTo { .. } => {
+                RESIDENT_RETIRE_TRANSFERRED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Ok(retired)
+    }
+
+    pub(crate) fn retire_clean(
+        &mut self,
+        descriptor: &GuestTextureDescriptor,
+        reason: &'static str,
+    ) -> Result<Option<ResidentGuestTexture>, String> {
+        self.retire(
+            descriptor,
+            RetireDisposition::Clean {
+                reason: ResidentRetireReason(reason),
+            },
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_published_disposition(
+        &self,
+        source: GuestTextureDescriptor,
+        covered: GpuDebtSet,
+    ) -> RetireDisposition {
+        RetireDisposition::Published {
+            receipt: PublishReceipt {
+                source,
+                source_span: self.get(&source).and_then(|resident| resident.span),
+                covered,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_transferred_disposition(
+        &self,
+        source: GuestTextureDescriptor,
+        target: GuestTextureDescriptor,
+        covered: GpuDebtSet,
+        ordered_content_version: u64,
+    ) -> RetireDisposition {
+        RetireDisposition::TransferredTo {
+            receipt: TransferReceipt {
+                source,
+                source_span: self.get(&source).and_then(|resident| resident.span),
+                target,
+                covered,
+                ordered_content_version,
+            },
+        }
     }
 
     pub(crate) fn keys(&self) -> impl Iterator<Item = &GuestTextureDescriptor> {
