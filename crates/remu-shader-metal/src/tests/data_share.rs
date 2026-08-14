@@ -691,9 +691,10 @@ fn empty_workaround_ngg_program() -> Program {
 }
 
 #[test]
-fn fixed_ngg_fallback_publishes_compacted_vertex_exports_by_compacted_id() {
-    // Superliminal Slate UI: PRIM records name compacted ids built behind
-    // `V_CMPX_GT_U32 s4, v18`, so its POS/PARAM records must use v18 as well.
+fn fixed_ngg_fallback_publishes_vertex_exports_by_exporting_lane() {
+    // The legacy fixed-wave ABI already moves compacted payloads into the exporting lane.
+    // Treating the compare operand as a second output index aliases unrelated records in
+    // Superliminal's late title composite.
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
     options.wave_lane_count = 64;
@@ -703,15 +704,15 @@ fn fixed_ngg_fallback_publishes_compacted_vertex_exports_by_compacted_id() {
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)"),
-        "mesh vertices must publish under the compacted vertex id: {}",
+            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
+        "fixed fallback vertices must publish under the exporting lane: {}",
         shader.source
     );
     assert!(
         !shader
             .source
-            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
-        "the epilogue must not overwrite compacted records by invocation index: {}",
+            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)"),
+        "the fixed fallback must not guess a compacted output id: {}",
         shader.source
     );
 }
