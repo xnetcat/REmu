@@ -555,7 +555,7 @@ pub(crate) fn queue_and_interrupt_guest_exception(
     GUEST_EXCEPTION_PENDING.store(true, Ordering::Release);
     drop(_sync_guard);
     crate::guest_sync::wake_all_guest_sync_for_exception();
-    crate::notify_kernel_equeue_waiters();
+    crate::interrupt_kernel_equeue_waiter(target);
 
     let self_target = target == source && source != 0;
     #[cfg(target_os = "macos")]

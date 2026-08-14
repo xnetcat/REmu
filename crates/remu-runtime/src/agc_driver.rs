@@ -416,9 +416,9 @@ fn submit_graphics(
 /// The event type is a four-byte structure the caller passes in a register, so the upper half of
 /// that register is not part of the value: a registration is matched on the low word alone, or a
 /// deletion issued from a different call site than the registration would never find it.
-fn delete_eq_event(equeue: u64, requested: u64, state: &mut ProbeDispatchState) -> u64 {
+fn delete_eq_event(equeue: u64, requested: u64, _state: &mut ProbeDispatchState) -> u64 {
     let (_h, mut events) = crate::event_state::lock_event_state_for_write();
-    if !events.kernel_equeues.contains(&equeue) {
+    if !events.kernel_equeues.contains_key(&equeue) {
         return sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND);
     }
     let requested = low_u32(requested);
@@ -441,7 +441,7 @@ fn delete_eq_event(equeue: u64, requested: u64, state: &mut ProbeDispatchState) 
             .remove(&(equeue, KERNEL_EVENT_FILTER_GRAPHICS, ident));
         // An interrupt already queued for a listener the guest just cancelled must not surface on
         // the next wait, where it would resolve user data the guest considers released.
-        crate::discard_kernel_events_into(&mut events, state, |event| {
+        crate::discard_kernel_events_into(&mut events, |event| {
             event.equeue == equeue
                 && event.filter == KERNEL_EVENT_FILTER_GRAPHICS
                 && event.ident == ident
@@ -984,6 +984,9 @@ mod tests {
     #[test]
     fn deleting_an_event_drops_its_registration_and_undelivered_interrupts() {
         let mut state = ProbeDispatchState::default();
+        crate::event_state::with_event_state_mut(|events| {
+            events.agc_completion_telemetry = crate::AgcCompletionTelemetry::default();
+        });
         let mut equeue = 0_u64;
         assert_eq!(
             crate::kernel_create_equeue((&raw mut equeue).addr() as u64, &mut state),
@@ -1022,9 +1025,9 @@ mod tests {
             .pending_events
             .is_empty()));
         assert_eq!(
-            state
+            crate::event_state::with_event_state(|events| events
                 .agc_completion_telemetry
-                .cancelled_graphics_notifications,
+                .cancelled_graphics_notifications),
             2
         );
     }

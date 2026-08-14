@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::{
     AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE,
     AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_R_DRAW_INDEX_AUTO, AGC_R_FLIP, CompletedVideoOutFlip,
@@ -5,8 +7,8 @@ use crate::{
     QUEUED_FLIPS, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
     VIDEO_OUT_ERROR_INVALID_INDEX, VideoOutBufferAttributes, VideoOutState,
     agc_allocate_command_dwords, agc_pm4, emit_agc_gpu_event, kernel_process_time, low_i32,
-    low_u32, notify_kernel_equeue_waiters, publish_gpu_event, queue_kernel_event, read_guest_u32,
-    read_guest_u64, sce_kernel_error, trace_logarithmic_sequence, write_guest_u32,
+    low_u32, publish_gpu_event, read_guest_u32, read_guest_u64, request_kernel_completion_refresh,
+    sce_kernel_error, write_guest_u32,
 };
 
 pub(crate) fn video_out_register_buffers2(
@@ -85,7 +87,9 @@ pub(crate) fn video_out_add_flip_event(arguments: [u64; 6], state: &mut ProbeDis
     if equeue == 0 {
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
     }
-    state.video_out.flip_events.insert(equeue, arguments[2]);
+    crate::event_state::with_event_state_mut(|events| {
+        events.video_out_flip_events.insert(equeue, arguments[2]);
+    });
     0
 }
 
@@ -103,7 +107,9 @@ pub(crate) fn video_out_add_vblank_event(
     }
     // OrbisVideoOutInternalEventId::Vblank == 1. Flip uses ident 6; keep them distinct so
     // sceVideoOutGetEventId can classify the queue entry.
-    state.video_out.vblank_events.insert(equeue, arguments[2]);
+    crate::event_state::with_event_state_mut(|events| {
+        events.video_out_vblank_events.insert(equeue, arguments[2]);
+    });
     0
 }
 
@@ -223,12 +229,12 @@ pub(crate) fn queue_video_out_flip_for_video_out(
         });
 }
 
-pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) {
+pub(crate) fn refresh_completed_video_out_flips() {
     let completed = remu_gpu::take_gpu_completed_flips();
     if completed.is_empty() {
         return;
     }
-    let mut queued = false;
+    let mut wake_equeues = BTreeSet::new();
     let (_h, mut events) = crate::event_state::lock_event_state_for_write();
     for completion in completed {
         let Some(index) = events
@@ -246,9 +252,9 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .pending_video_out_flips
             .remove(index)
             .expect("completed flip index was just found");
-        state.video_out.completed_flip_count =
-            state.video_out.completed_flip_count.saturating_add(1);
-        state.video_out.last_completed_flip = Some(CompletedVideoOutFlip {
+        events.completed_video_out_flip_count =
+            events.completed_video_out_flip_count.saturating_add(1);
+        events.last_completed_video_out_flip = Some(CompletedVideoOutFlip {
             process_time: kernel_process_time(false),
             process_time_counter: kernel_process_time(true),
             flip_argument: pending.completion.flip_argument,
@@ -256,15 +262,14 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             submit_process_time_counter: pending.submit_process_time_counter,
         });
         let event_data = 6 | ((pending.completion.flip_argument & 0x0000_ffff_ffff_ffff) << 16);
-        let registrations = state
-            .video_out
-            .flip_events
+        let registrations = events
+            .video_out_flip_events
             .iter()
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 6,
@@ -277,42 +282,41 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                     agc_user_interrupts: 0,
                 },
             );
-            queued = true;
-            if trace_logarithmic_sequence(state.agc_submission_count, 8) {
-                eprintln!(
-                    "[REMu][VIDEO] completed flip handle={} index={} address={:#x} equeue={equeue:#x}",
-                    pending.handle, pending.completion.buffer_index, pending.completion.address,
-                );
-            }
+            wake_equeues.insert(equeue);
         }
         // Flip completion coincides with a display vblank on the console. Wake vblank waiters with
         // OrbisVideoOutInternalEventId::Vblank (ident=1).
-        let vblank_registrations = state
-            .video_out
-            .vblank_events
+        let vblank_registrations = events
+            .video_out_vblank_events
             .iter()
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
+        let completed_flip_count = events.completed_video_out_flip_count;
         for (equeue, user_data) in vblank_registrations {
-            queue_kernel_event(
-                state,
+            crate::event_state::queue_kernel_event_into(
+                &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 1,
                     filter: -13,
                     flags: 0,
                     fflags: 0,
-                    data: state.video_out.completed_flip_count,
+                    data: completed_flip_count,
                     user_data,
                     agc_graphics_completions: 0,
                     agc_user_interrupts: 0,
                 },
             );
-            queued = true;
+            wake_equeues.insert(equeue);
         }
     }
-    if queued {
-        notify_kernel_equeue_waiters();
+    let wakes = wake_equeues
+        .into_iter()
+        .filter_map(|equeue| events.kernel_equeues.get(&equeue).cloned())
+        .collect::<Vec<_>>();
+    drop(events);
+    for wake in wakes {
+        crate::signal_kernel_equeue_wake(&wake);
     }
 }
 
@@ -344,7 +348,6 @@ pub(crate) fn queue_agc_event_write_unlocked(event_type: u32) {
             agc_user_interrupts: 0,
         });
     }
-    notify_kernel_equeue_waiters();
 }
 
 pub(crate) fn request_agc_submission_completion(
@@ -375,7 +378,7 @@ pub(crate) fn request_agc_submission_completion_for_sequence(
     // If this arm is the missing half of a completion already carried, the waiter has consumed the
     // backend's notification and will not re-poll on its own. Notified outside the event lock.
     if crate::agc_completions_are_carried() {
-        notify_kernel_equeue_waiters();
+        request_kernel_completion_refresh();
     }
     // Deliberately not holding the event lock across the publish: the GPU event channel is a
     // blocking bounded queue, and stalling every event-state reader behind it is the failure class
@@ -420,7 +423,7 @@ pub(crate) fn request_agc_compute_submission_completion_for_sequence(
         event_state.pending_agc_user_interrupts.push_back(sequence);
     }
     if crate::agc_completions_are_carried() {
-        notify_kernel_equeue_waiters();
+        request_kernel_completion_refresh();
     }
     if publish_gpu_event(remu_gpu::GpuEvent::QueueSubmission { queue_id, events }) {
         true

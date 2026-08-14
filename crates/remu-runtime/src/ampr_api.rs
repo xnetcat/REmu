@@ -15,8 +15,8 @@ use crate::{
     SCE_KERNEL_ERROR_MEMORY_FAULT, SCE_KERNEL_ERROR_NO_SPACE, SCE_KERNEL_ERROR_NOT_FOUND,
     SCE_KERNEL_ERROR_OUT_OF_MEMORY, current_guest_thread_name, guest_memset,
     kernel_stat_payload_from_metadata, lock_probe_dispatch_for_write, low_u32,
-    notify_kernel_equeue_waiters, process_guest_range_has_read_access, queue_kernel_event,
-    read_guest_u64, resolve_probe_guest_path_with_presence, sce_kernel_error, trace_ampr_reads,
+    process_guest_range_has_read_access, queue_kernel_event, read_guest_u64,
+    resolve_probe_guest_path_with_presence, sce_kernel_error, trace_ampr_reads,
     try_read_process_guest_u64, write_guest_u32, write_guest_u64,
 };
 
@@ -1177,7 +1177,6 @@ fn ampr_publish_command_buffer_completion(
         .get(&arguments[0])
         .map(|command| command.pending_address_writes.clone())
         .unwrap_or_default();
-    let announced = !completions.is_empty();
     if trace_ampr_reads() {
         eprintln!(
             "[REMu][AMPR] submit buffer={:#x} id={id} completions={} words={}",
@@ -1240,9 +1239,6 @@ fn ampr_publish_command_buffer_completion(
                 agc_user_interrupts: 0,
             },
         );
-    }
-    if announced {
-        notify_kernel_equeue_waiters();
     }
     if arguments[2] != 0 {
         write_guest_u64(arguments[2], failure.unwrap_or(0));
