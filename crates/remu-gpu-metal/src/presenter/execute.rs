@@ -71,11 +71,16 @@ use super::{
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
     MTLPrimitiveType, MTLRenderStages, MTLResourceOptions, MTLResourceUsage, MTLScissorRect,
-    MTLSize, MTLTextureType, MTLViewport, RenderPassDescriptor,
+    MTLSize, MTLTextureType, MTLTextureUsage, MTLViewport, RenderPassDescriptor,
 };
 use remu_gpu::IndexedDraw;
+use remu_shader_metal::{
+    HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES, HeapTextureComponent, HeapTextureDimension,
+    HeapTextureTableBinding, HeapTextureTableType,
+};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -119,6 +124,74 @@ pub(super) const fn metal_scissor_rect_for_draw(
     }
 }
 
+fn heap_pixel_format_component(pixel_format: MTLPixelFormat) -> HeapTextureComponent {
+    match pixel_format {
+        MTLPixelFormat::R8Uint
+        | MTLPixelFormat::R16Uint
+        | MTLPixelFormat::R32Uint
+        | MTLPixelFormat::RG8Uint
+        | MTLPixelFormat::RG16Uint
+        | MTLPixelFormat::RG32Uint
+        | MTLPixelFormat::RGBA8Uint
+        | MTLPixelFormat::RGBA16Uint
+        | MTLPixelFormat::RGBA32Uint => HeapTextureComponent::Uint,
+        MTLPixelFormat::R8Sint
+        | MTLPixelFormat::R16Sint
+        | MTLPixelFormat::R32Sint
+        | MTLPixelFormat::RG8Sint
+        | MTLPixelFormat::RG16Sint
+        | MTLPixelFormat::RG32Sint
+        | MTLPixelFormat::RGBA8Sint
+        | MTLPixelFormat::RGBA16Sint
+        | MTLPixelFormat::RGBA32Sint => HeapTextureComponent::Sint,
+        _ => HeapTextureComponent::Float,
+    }
+}
+
+fn heap_descriptor_matches_table_type(
+    decoded: super::DecodedImageDescriptor,
+    table_type: HeapTextureTableType,
+) -> bool {
+    let dimension = match decoded.texture_type {
+        8 | 9 | 14 => HeapTextureDimension::D2,
+        10 => HeapTextureDimension::D3,
+        11 | 12 | 13 | 15 => HeapTextureDimension::D2Array,
+        _ => return false,
+    };
+    dimension == table_type.dimension
+        && if table_type.comparison {
+            matches!(
+                decoded.guest.pixel_format,
+                MTLPixelFormat::R16Unorm | MTLPixelFormat::R32Float
+            )
+        } else {
+            heap_pixel_format_component(decoded.guest.pixel_format) == table_type.component
+        }
+}
+
+fn heap_texture_matches_table_type(
+    texture: &metal::Texture,
+    table_type: HeapTextureTableType,
+) -> bool {
+    let dimension = match texture.texture_type() {
+        MTLTextureType::D2 => HeapTextureDimension::D2,
+        MTLTextureType::D3 => HeapTextureDimension::D3,
+        MTLTextureType::D2Array => HeapTextureDimension::D2Array,
+        _ => return false,
+    };
+    let component_matches = if table_type.comparison {
+        matches!(
+            texture.pixel_format(),
+            MTLPixelFormat::Depth16Unorm | MTLPixelFormat::Depth32Float
+        )
+    } else {
+        heap_pixel_format_component(texture.pixel_format()) == table_type.component
+    };
+    dimension == table_type.dimension
+        && component_matches
+        && super::texture::sampled_texture_supports_access(texture, table_type.writable)
+}
+
 impl MetalPresenter {
     #[allow(clippy::too_many_lines)]
 
@@ -135,39 +208,46 @@ impl MetalPresenter {
         device: &metal::Device,
         pixel_function: &metal::Function,
         evaluation: &remu_shader::ShaderEvaluation,
-        tables: &[(u32, u32)],
+        tables: &[HeapTextureTableBinding],
     ) -> Result<Vec<(u32, metal::Buffer, Vec<metal::Texture>)>, String> {
         const HEAP_TABLE_SLOTS: u64 = 16;
         let mut built = Vec::with_capacity(tables.len());
-        for (global_index, buffer_slot) in tables {
+        for table in tables {
+            if table.descriptor_stride_bytes != HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES {
+                return Err(format!(
+                    "heap texture table {} publishes {}-byte records, compiler requires {}",
+                    table.canonical_texture_slot,
+                    table.descriptor_stride_bytes,
+                    HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES
+                ));
+            }
+            let global_index = table.global_binding_index;
+            let buffer_slot = table.buffer_index;
             let binding = evaluation
                 .global_memory_bindings
-                .get(*global_index as usize)
+                .get(global_index as usize)
                 .ok_or("heap texture table names a missing global binding")?;
             let base = binding.base_address;
             // Content-hash the table's slot bytes: identical tables recur at hundreds of
             // guest addresses (bump-allocated per-draw blobs), and rebuilding per draw feeds
             // the presenter-livelock class this path must never worsen.
-            let mut content = [0_u8; 512];
-            let content_known =
-                remu_memory::read_guest_shared_backing(base, &mut content);
+            let mut content =
+                [0_u8; HEAP_TABLE_SLOTS as usize * HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES as usize];
+            let content_known = remu_memory::read_guest_shared_backing(base, &mut content);
             if content_known {
-                let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-                for byte in content {
-                    hash ^= u64::from(byte);
-                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-                }
-                hash ^= u64::from(*buffer_slot);
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                content.hash(&mut hasher);
+                table.hash(&mut hasher);
+                let hash = hasher.finish();
                 if let Some((buffer, textures)) = self.heap_table_cache.get(&hash) {
-                    built.push((*buffer_slot, buffer.clone(), textures.clone()));
+                    built.push((buffer_slot, buffer.clone(), textures.clone()));
                     continue;
                 }
                 self.pending_heap_table_hash = Some(hash);
             } else {
                 self.pending_heap_table_hash = None;
             }
-            let argument_encoder =
-                pixel_function.new_argument_encoder(u64::from(*buffer_slot));
+            let argument_encoder = pixel_function.new_argument_encoder(u64::from(buffer_slot));
             let argument_buffer = device.new_buffer(
                 argument_encoder.encoded_length(),
                 metal::MTLResourceOptions::StorageModeShared,
@@ -175,12 +255,13 @@ impl MetalPresenter {
             argument_encoder.set_argument_buffer(&argument_buffer, 0);
             let mut resolved: Vec<metal::Texture> = Vec::new();
             let mut walking = true;
-            let placeholder = self.heap_table_placeholder_texture(device)?;
+            let placeholder = self.heap_table_placeholder_texture(device, table.texture_type)?;
             for slot in 0..HEAP_TABLE_SLOTS {
                 let mut texture: Option<metal::Texture> = None;
                 if walking {
-                    let mut bytes = [0_u8; 32];
-                    if remu_memory::read_guest_shared_backing(base + slot * 32, &mut bytes) {
+                    let stride = u64::from(table.descriptor_stride_bytes);
+                    let mut bytes = [0_u8; HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES as usize];
+                    if remu_memory::read_guest_shared_backing(base + slot * stride, &mut bytes) {
                         let words: [u32; 8] = std::array::from_fn(|index| {
                             u32::from_le_bytes(
                                 bytes[index * 4..index * 4 + 4].try_into().expect("dword"),
@@ -188,6 +269,18 @@ impl MetalPresenter {
                         });
                         match super::decode::decode_image_descriptor(&words) {
                             Ok(decoded) => {
+                                if !heap_descriptor_matches_table_type(decoded, table.texture_type)
+                                {
+                                    return Err(format!(
+                                        "heap texture table slot {}:{} decoded {:?}/type {} but canonical texture slot {} requires {:?}",
+                                        global_index,
+                                        slot,
+                                        decoded.guest.pixel_format,
+                                        decoded.texture_type,
+                                        table.canonical_texture_slot,
+                                        table.texture_type
+                                    ));
+                                }
                                 texture = self
                                     .resident_guest_textures
                                     .get_mut(&decoded.guest)
@@ -195,6 +288,9 @@ impl MetalPresenter {
                                         super::texture::resident_texture_for_sample(
                                             resident, decoded,
                                         )
+                                    })
+                                    .filter(|texture| {
+                                        heap_texture_matches_table_type(texture, table.texture_type)
                                     });
                                 if texture.is_none() {
                                     // Compatible residents next (colour-view/same-image), then
@@ -206,9 +302,13 @@ impl MetalPresenter {
                                         .values()
                                         .find(|resident| {
                                             super::texture::resident_color_view_sample_is_eligible(
-                                                resident, decoded, false,
+                                                resident,
+                                                decoded,
+                                                table.texture_type.comparison,
                                             ) || super::texture::resident_same_image_sample_is_eligible(
-                                                resident, decoded, false,
+                                                resident,
+                                                decoded,
+                                                table.texture_type.comparison,
                                             )
                                         })
                                         .map(|resident| resident.descriptor);
@@ -216,20 +316,34 @@ impl MetalPresenter {
                                         && let Some(resident) =
                                             self.resident_guest_textures.get_mut(&descriptor)
                                     {
-                                        texture =
-                                            super::texture::resident_texture_for_sample(
-                                                resident, decoded,
-                                            );
+                                        texture = super::texture::resident_texture_for_sample(
+                                            resident, decoded,
+                                        )
+                                        .filter(
+                                            |texture| {
+                                                heap_texture_matches_table_type(
+                                                    texture,
+                                                    table.texture_type,
+                                                )
+                                            },
+                                        );
                                     }
                                 }
                                 if texture.is_none() {
                                     let key = super::texture::sampled_texture_key(
-                                        decoded, false,
+                                        decoded,
+                                        table.texture_type.comparison,
                                     );
                                     texture = self
                                         .sampled_texture_cache
                                         .get(&key)
-                                        .map(|cached| cached.texture.clone());
+                                        .map(|cached| cached.texture.clone())
+                                        .filter(|texture| {
+                                            heap_texture_matches_table_type(
+                                                texture,
+                                                table.texture_type,
+                                            )
+                                        });
                                     if texture.is_none() {
                                         let queue = self.active_guest_command_queue()?.clone();
                                         let command_buffer = queue.new_command_buffer();
@@ -237,11 +351,22 @@ impl MetalPresenter {
                                             device,
                                             command_buffer,
                                             decoded,
-                                            false,
-                                            false,
+                                            table.texture_type.comparison,
+                                            table.texture_type.writable,
                                         ) {
                                             Ok(created) => {
                                                 command_buffer.commit();
+                                                if !heap_texture_matches_table_type(
+                                                    &created,
+                                                    table.texture_type,
+                                                ) {
+                                                    return Err(format!(
+                                                        "heap table upload for canonical texture slot {} produced incompatible {:?}/{:?}",
+                                                        table.canonical_texture_slot,
+                                                        created.texture_type(),
+                                                        created.pixel_format()
+                                                    ));
+                                                }
                                                 texture = Some(created);
                                             }
                                             Err(error) => {
@@ -271,7 +396,7 @@ impl MetalPresenter {
                                     if sequence <= 16 || sequence.is_power_of_two() {
                                         eprintln!(
                                             "[REMu][HEAP-TABLE] sequence={sequence} slot={slot} descriptor at {:#x} has no serving resident ({:?} {}x{})",
-                                            base + slot * 32,
+                                            base + slot * stride,
                                             decoded.guest.pixel_format,
                                             decoded.guest.width,
                                             decoded.guest.height,
@@ -296,39 +421,76 @@ impl MetalPresenter {
                     self.heap_table_cache.clear();
                 }
             }
-            built.push((*buffer_slot, argument_buffer, resolved));
+            built.push((buffer_slot, argument_buffer, resolved));
         }
         Ok(built)
     }
 
-    /// A 1x1 opaque-black texture for unresolved heap-table slots, created once per device.
+    /// A type-correct 1x1 zero texture for unresolved heap-table slots, created once per device.
     fn heap_table_placeholder_texture(
         &mut self,
         device: &metal::Device,
+        table_type: HeapTextureTableType,
     ) -> Result<metal::Texture, String> {
-        if let Some(texture) = self.heap_table_placeholder.as_ref() {
+        if let Some(texture) = self.heap_table_placeholders.get(&table_type) {
             return Ok(texture.clone());
         }
         let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_texture_type(match table_type.dimension {
+            HeapTextureDimension::D2 => MTLTextureType::D2,
+            HeapTextureDimension::D3 => MTLTextureType::D3,
+            HeapTextureDimension::D2Array => MTLTextureType::D2Array,
+        });
         descriptor.set_width(1);
         descriptor.set_height(1);
-        descriptor.set_pixel_format(metal::MTLPixelFormat::RGBA8Unorm);
+        if table_type.dimension == HeapTextureDimension::D3 {
+            descriptor.set_depth(1);
+        } else if table_type.dimension == HeapTextureDimension::D2Array {
+            descriptor.set_array_length(1);
+        }
+        descriptor.set_pixel_format(if table_type.comparison {
+            MTLPixelFormat::Depth32Float
+        } else {
+            match table_type.component {
+                HeapTextureComponent::Float => MTLPixelFormat::RGBA8Unorm,
+                HeapTextureComponent::Uint => MTLPixelFormat::RGBA8Uint,
+                HeapTextureComponent::Sint => MTLPixelFormat::RGBA8Sint,
+            }
+        });
         descriptor.set_storage_mode(metal::MTLStorageMode::Shared);
+        descriptor.set_usage(if table_type.writable {
+            MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
+        } else {
+            MTLTextureUsage::ShaderRead
+        });
         let texture = device.new_texture(&descriptor);
-        texture.replace_region(
-            metal::MTLRegion {
-                origin: metal::MTLOrigin { x: 0, y: 0, z: 0 },
-                size: metal::MTLSize {
-                    width: 1,
-                    height: 1,
-                    depth: 1,
-                },
-            },
-            0,
-            [0_u8, 0, 0, 255].as_ptr().cast(),
-            4,
-        );
-        self.heap_table_placeholder = Some(texture.clone());
+        let zero = [0_u8; 4];
+        match table_type.dimension {
+            HeapTextureDimension::D2 => texture.replace_region(
+                metal::MTLRegion::new_2d(0, 0, 1, 1),
+                0,
+                zero.as_ptr().cast(),
+                4,
+            ),
+            HeapTextureDimension::D3 => texture.replace_region_in_slice(
+                metal::MTLRegion::new_3d(0, 0, 0, 1, 1, 1),
+                0,
+                0,
+                zero.as_ptr().cast(),
+                4,
+                4,
+            ),
+            HeapTextureDimension::D2Array => texture.replace_region_in_slice(
+                metal::MTLRegion::new_2d(0, 0, 1, 1),
+                0,
+                0,
+                zero.as_ptr().cast(),
+                4,
+                4,
+            ),
+        }
+        self.heap_table_placeholders
+            .insert(table_type, texture.clone());
         Ok(texture)
     }
 
@@ -2113,7 +2275,12 @@ impl MetalPresenter {
                     0,
                 );
                 for texture in textures {
-                    encoder.use_resource(texture, metal::MTLResourceUsage::Read);
+                    let usage = if texture.usage().contains(MTLTextureUsage::ShaderWrite) {
+                        MTLResourceUsage::Read | MTLResourceUsage::Write
+                    } else {
+                        MTLResourceUsage::Read
+                    };
+                    encoder.use_resource(texture, usage);
                 }
             }
             if let (Some(index), Some(buffer)) =

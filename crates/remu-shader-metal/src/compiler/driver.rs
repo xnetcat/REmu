@@ -17,17 +17,19 @@ use crate::compiler::control_flow::{
 };
 use crate::compiler::export::mesh_ngg_packed_export_sgpr;
 use crate::compiler::image::{
-    ImageKind, image_component_type, is_storage_image, is_writable_image,
+    ImageKind, heap_texture_table_type, image_component_type, is_storage_image, is_writable_image,
 };
 use crate::compiler::interface::{PixelInterpolation, interpolation_for_barycentric_vgpr};
 use crate::compiler::memory::is_lds_memory_instruction;
 use crate::compiler::{
-    METAL_THREADGROUP_MEMORY_LIMIT_BYTES, SPLIT_WAVE64_PAIR_STATE_BYTES, is_full_exec_restore,
+    HeapTextureRoute, METAL_THREADGROUP_MEMORY_LIMIT_BYTES, SPLIT_WAVE64_PAIR_STATE_BYTES,
+    is_full_exec_restore, scalar_memory_image_descriptor_offset,
 };
 use crate::{
-    Compiler, METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError,
-    MetalCompileOptions, MetalRegisterFootprint, MetalShader, MetalShaderStage,
-    PIXEL_INPUT_CONTROL_COUNT, SCALAR_REGISTER_COUNT, VECTOR_REGISTER_COUNT,
+    Compiler, HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES, HeapTextureTableBinding,
+    METAL_DIRECT_TEXTURE_LIMIT, MetalBindingLayout, MetalCompileError, MetalCompileOptions,
+    MetalRegisterFootprint, MetalShader, MetalShaderStage, PIXEL_INPUT_CONTROL_COUNT,
+    SCALAR_REGISTER_COUNT, VECTOR_REGISTER_COUNT,
 };
 
 impl<'a> Compiler<'a> {
@@ -300,50 +302,125 @@ impl<'a> Compiler<'a> {
             ));
         }
 
-
         // Runtime heap tables (docs/design/2026-08-13-runtime-image-descriptor-fetch.md):
-        // map each flagged image binding to the SMEM heap it must index at execution time.
-        // A base fed by several distinct heaps across paths keeps the snapshot with a loud
-        // log — correctness over coverage until multi-heap tables are needed.
+        // Map every canonical texture slot to exactly one lowering domain. A slot cannot mix a
+        // fixed snapshot use with a runtime descriptor use, nor can two runtime uses disagree on
+        // their descriptor SGPR/heaps. Canonicalization is intentionally broader than runtime
+        // routing, so disagreement is a loud interface refusal rather than a silent fallback.
+        //
+        // The map is keyed by CANONICAL TEXTURE SLOT — the domain `texture_expression` looks up,
+        // and the one `image_kinds` and the `tex{N}` parameters already use. An evaluation index
+        // is a different domain: `image_binding_slots` merges bindings that share a descriptor,
+        // so the two agree only when that map is the identity, which it exists not to be.
         let mut heap_tables = std::collections::BTreeMap::new();
         if options.runtime_heap_tables {
-            for (binding_index, binding) in evaluation.image_bindings.iter().enumerate() {
-                if !binding.descriptor_index_is_runtime {
-                    continue;
-                }
-                let base = binding.control.scalar_resource;
-                let mut heaps = std::collections::BTreeSet::new();
-                for instruction in &program.instructions {
-                    if !matches!(
-                        instruction.control.as_ref(),
-                        Some(remu_shader::InstructionControl::ScalarMemory(_))
-                    ) {
-                        continue;
+            // `None` is the snapshot lowering; `Some` is one proven runtime route.
+            let mut routes: std::collections::BTreeMap<usize, Option<HeapTextureRoute>> =
+                std::collections::BTreeMap::new();
+            for (evaluation_index, binding) in evaluation.image_bindings.iter().enumerate() {
+                let texture_slot = usize::try_from(image_slots.texture_slots[evaluation_index])
+                    .map_err(|_| {
+                        MetalCompileError::InvalidInterface("texture slot overflow".into())
+                    })?;
+                let route = if binding.descriptor_index_is_runtime {
+                    let base = binding.control.scalar_resource;
+                    let mut heaps = std::collections::BTreeSet::new();
+                    for instruction in &program.instructions {
+                        if !matches!(
+                            instruction.control.as_ref(),
+                            Some(remu_shader::InstructionControl::ScalarMemory(_))
+                        ) {
+                            continue;
+                        }
+                        let Some(descriptor_tuple_offset) =
+                            scalar_memory_image_descriptor_offset(instruction, base)
+                                .map_err(MetalCompileError::InvalidInterface)?
+                        else {
+                            continue;
+                        };
+                        if let Some(heap) = evaluation
+                            .global_memory_bindings
+                            .iter()
+                            .position(|global| global.instruction_pcs.contains(&instruction.pc))
+                        {
+                            let Some(remu_shader::InstructionControl::ScalarMemory(control)) =
+                                instruction.control.as_ref()
+                            else {
+                                unreachable!("descriptor discovery already selected an SMEM load");
+                            };
+                            let dynamic_offset = if let Some(register) =
+                                control.dynamic_offset_register
+                            {
+                                evaluation
+                                    .scalar_registers
+                                    .get(register as usize)
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        MetalCompileError::InvalidInterface(format!(
+                                            "runtime image at pc {:#x} uses missing dynamic offset s{register}",
+                                            binding.pc
+                                        ))
+                                    })?
+                            } else {
+                                0
+                            };
+                            let observed_descriptor_offset = dynamic_offset
+                                .wrapping_add(control.immediate_offset_bytes.cast_unsigned())
+                                .wrapping_add(descriptor_tuple_offset);
+                            if !observed_descriptor_offset
+                                .is_multiple_of(HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES)
+                            {
+                                return Err(MetalCompileError::InvalidInterface(format!(
+                                    "runtime image at pc {:#x} has descriptor phase {} at SMEM pc {:#x}, but its heap binding publishes {}-byte records from phase zero",
+                                    binding.pc,
+                                    observed_descriptor_offset
+                                        % HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES,
+                                    instruction.pc,
+                                    HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES,
+                                )));
+                            }
+                            heaps.insert(heap);
+                        }
                     }
-                    let covers_base = instruction.destinations.iter().any(|destination| {
-                        destination.kind == remu_shader::OperandKind::ScalarRegister
-                            && destination.value == base
-                    });
-                    if !covers_base {
-                        continue;
+                    if heaps.is_empty() {
+                        return Err(MetalCompileError::InvalidInterface(format!(
+                            "runtime image at pc {:#x} uses s{base} without a complete SMEM heap descriptor load",
+                            binding.pc
+                        )));
                     }
-                    if let Some(heap) = evaluation
-                        .global_memory_bindings
-                        .iter()
-                        .position(|global| global.instruction_pcs.contains(&instruction.pc))
-                    {
-                        heaps.insert(heap);
-                    }
-                }
-                if heaps.is_empty() {
-                    eprintln!(
-                        "[REMu][MSL][HEAP-TABLE] pc={:#x} srsrc=s{base}: no SMEM heap covers the base; keeping snapshot",
-                        binding.pc,
-                    );
+                    Some(HeapTextureRoute {
+                        scalar_resource_base: base,
+                        heap_binding_indices: heaps.into_iter().collect(),
+                    })
                 } else {
-                    heap_tables
-                        .insert(binding_index, (base, heaps.into_iter().collect::<Vec<_>>()));
+                    None
+                };
+                match routes.entry(texture_slot) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(route);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => {
+                        if entry.get() != &route {
+                            return Err(MetalCompileError::InvalidInterface(format!(
+                                "canonical texture slot {texture_slot} mixes snapshot/runtime descriptor routes at image pc {:#x}",
+                                binding.pc
+                            )));
+                        }
+                    }
                 }
+            }
+            heap_tables.extend(
+                routes
+                    .into_iter()
+                    .filter_map(|(slot, route)| route.map(|route| (slot, route))),
+            );
+            // A key outside the canonical slot domain would index the wrong `image_kinds` entry
+            // or panic in `emit_image`; refuse the lowering instead.
+            if let Some(slot) = heap_tables.keys().find(|slot| **slot >= image_kinds.len()) {
+                return Err(MetalCompileError::InvalidInterface(format!(
+                    "heap texture table keyed by {slot}, outside the {} canonical texture slots",
+                    image_kinds.len()
+                )));
             }
         }
 
@@ -484,24 +561,27 @@ impl<'a> Compiler<'a> {
                 sampler_count,
                 threadgroup_memory_bytes,
                 heap_texture_tables: {
-                    let mut heaps: Vec<usize> = self
-                        .heap_tables
-                        .values()
-                        .flat_map(|(_, heaps)| heaps.iter().copied())
-                        .collect();
-                    heaps.sort_unstable();
-                    heaps.dedup();
-                    heaps
-                        .iter()
-                        .enumerate()
-                        .map(|(ordinal, heap)| {
-                            (
-                                u32::try_from(*heap).unwrap_or(u32::MAX),
-                                u32::try_from(initial_scalar_buffer_index as usize + 2 + ordinal)
-                                    .unwrap_or(u32::MAX),
-                            )
-                        })
-                        .collect()
+                    let mut tables = Vec::new();
+                    for (texture_slot, route) in &self.heap_tables {
+                        for heap in &route.heap_binding_indices {
+                            let ordinal = tables.len();
+                            tables.push(HeapTextureTableBinding {
+                                global_binding_index: u32::try_from(*heap)
+                                    .expect("validated heap binding fits u32"),
+                                buffer_index: u32::try_from(
+                                    initial_scalar_buffer_index as usize + 2 + ordinal,
+                                )
+                                .expect("validated Metal buffer index fits u32"),
+                                canonical_texture_slot: u32::try_from(*texture_slot)
+                                    .expect("validated canonical texture slot fits u32"),
+                                descriptor_stride_bytes: HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES,
+                                texture_type: heap_texture_table_type(
+                                    self.image_kinds[*texture_slot],
+                                ),
+                            });
+                        }
+                    }
+                    tables
                 },
             },
             vertex_inputs: self.evaluation.vertex_inputs.clone(),

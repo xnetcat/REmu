@@ -8,9 +8,9 @@ use remu_shader::{
     image_sample_modifiers,
 };
 
-use crate::Compiler;
+use crate::{Compiler, HeapTextureComponent, HeapTextureDimension, HeapTextureTableType};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ImageKind {
     pub(crate) component: &'static str,
     pub(crate) storage: bool,
@@ -35,6 +35,62 @@ pub(crate) fn metal_image_dimension(kind: ImageKind) -> u32 {
         11 | 12 | 13 | 15 => 3,
         _ => kind.dimension,
     }
+}
+
+pub(crate) fn heap_texture_table_type(kind: ImageKind) -> HeapTextureTableType {
+    HeapTextureTableType {
+        component: match kind.component {
+            "uint" => HeapTextureComponent::Uint,
+            "int" => HeapTextureComponent::Sint,
+            _ => HeapTextureComponent::Float,
+        },
+        dimension: if kind.comparison {
+            match metal_image_dimension(kind) {
+                3 => HeapTextureDimension::D2Array,
+                _ => HeapTextureDimension::D2,
+            }
+        } else {
+            match metal_image_dimension(kind) {
+                2 => HeapTextureDimension::D3,
+                3 => HeapTextureDimension::D2Array,
+                _ => HeapTextureDimension::D2,
+            }
+        },
+        comparison: kind.comparison,
+        writable: kind.writable,
+    }
+}
+
+/// Complete MSL texture type used by both direct bindings and runtime argument-buffer arrays.
+/// Keeping this in one function prevents a heap path from silently changing component class,
+/// dimension, depth-comparison semantics, or storage access relative to its canonical slot.
+pub(crate) fn metal_texture_declaration(kind: ImageKind) -> String {
+    let access = if kind.writable {
+        ", access::read_write"
+    } else if kind.storage {
+        ", access::read"
+    } else {
+        ""
+    };
+    let metal_dim = metal_image_dimension(kind);
+    let texture_kind = if kind.comparison {
+        match metal_dim {
+            3 => "depth2d_array",
+            _ => "depth2d",
+        }
+    } else {
+        match metal_dim {
+            2 => "texture3d",
+            3 => "texture2d_array",
+            _ => "texture2d",
+        }
+    };
+    let component = if kind.comparison {
+        "float"
+    } else {
+        kind.component
+    };
+    format!("{texture_kind}<{component}{access}>")
 }
 
 const fn image_address_register(image: &ImageControl, component: usize) -> usize {
@@ -83,12 +139,17 @@ impl Compiler<'_> {
     /// resolves only at runtime (docs/design/2026-08-13-runtime-image-descriptor-fetch.md) will
     /// instead index a heap texture table by the shadow slot the SMEM lowering maintains.
     pub(crate) fn texture_expression(&self, binding_index: usize) -> String {
-        if let Some((base, heaps)) = self.runtime_heap_table(binding_index) {
-            let slot = format!("min(remu_srd_slot_{base}, 15u)");
-            let mut expression = format!("remu_heap_{}.tex[{slot}]", heaps[0]);
+        if let Some(route) = self.runtime_heap_table(binding_index) {
+            let base = route.scalar_resource_base;
+            // 0xffffffff is the explicit invalid encoding. Do not clamp it to a valid texture:
+            // an unset, overwritten, misaligned, or out-of-range shadow must fault/refuse loudly
+            // instead of silently sampling slot 0/15.
+            let slot = format!("remu_srd_slot_{base}");
+            let heaps = &route.heap_binding_indices;
+            let mut expression = format!("remu_heap_{binding_index}_{}.tex[{slot}]", heaps[0]);
             for heap in &heaps[1..] {
                 expression = format!(
-                    "(remu_srd_heap_{base} == {heap}u ? remu_heap_{heap}.tex[{slot}] : {expression})"
+                    "(remu_srd_heap_{base} == {heap}u ? remu_heap_{binding_index}_{heap}.tex[{slot}] : {expression})"
                 );
             }
             return expression;

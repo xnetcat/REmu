@@ -6,7 +6,8 @@
 
 use remu_shader::{Instruction, InstructionControl, OperandKind};
 
-use crate::{Compiler, MetalShaderStage, format_u32};
+use crate::compiler::scalar_memory_image_descriptor_offset;
+use crate::{Compiler, HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES, MetalShaderStage, format_u32};
 
 use super::buffer::{raw_load_shape, raw_store_shape};
 
@@ -32,30 +33,19 @@ impl Compiler<'_> {
                 format_u32(control.immediate_offset_bytes.cast_unsigned())
             ),
         );
-        // Maintain the runtime descriptor-slot shadow: an SMEM load that fills a heap-table
-        // base register also records which 32-byte heap slot the T# came from, so mapped
-        // image ops can index their table with the value the shader actually computed.
-        {
-            let mut shadow = String::new();
-            for (base, heaps) in self.heap_tables.values() {
-                if heaps.contains(&binding_index)
-                    && instruction.destinations.first().is_some_and(|destination| {
-                        destination.kind == OperandKind::ScalarRegister
-                            && destination.value == *base
-                    })
-                {
-                    use std::fmt::Write as _;
-                    let _ = writeln!(
-                        shadow,
-                        "    remu_srd_slot_{base} = ({address}) / 32u;"
-                    );
-                    let _ = writeln!(
-                        shadow,
-                        "    remu_srd_heap_{base} = {binding_index}u;"
-                    );
-                }
+        // Discovery and emission share the complete-eight-dword rule. Record the updates now,
+        // then publish them only after the scalar stores (which conservatively invalidate any
+        // overlapping descriptor shadow).
+        let mut shadow_updates = Vec::new();
+        for route in self.heap_tables.values() {
+            if !route.heap_binding_indices.contains(&binding_index) {
+                continue;
             }
-            self.body.push_str(&shadow);
+            if let Some(byte_offset) =
+                scalar_memory_image_descriptor_offset(instruction, route.scalar_resource_base)?
+            {
+                shadow_updates.push((route.scalar_resource_base, byte_offset));
+            }
         }
         for (index, destination) in instruction.destinations.iter().enumerate() {
             if destination.kind != OperandKind::ScalarRegister {
@@ -67,6 +57,30 @@ impl Compiler<'_> {
             let expression =
                 format!("remu_load_u32(b{binding_index}, {address} + {offset}u, {binding_length})");
             self.store_scalar(destination.value, &expression);
+        }
+        for (base, byte_offset) in shadow_updates {
+            let descriptor_address = if byte_offset == 0 {
+                address.clone()
+            } else {
+                self.temp("uint", &format!("{address} + {byte_offset}u"))
+            };
+            let stride = HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES;
+            let valid = self.temp(
+                "bool",
+                &format!(
+                    "({descriptor_address} % {stride}u) == 0u && remu_range_valid({descriptor_address}, {stride}u, {binding_length})"
+                ),
+            );
+            self.line(
+                3,
+                &format!(
+                    "remu_srd_slot_{base} = {valid} ? ({descriptor_address} / {stride}u) : 0xffffffffu;"
+                ),
+            );
+            self.line(
+                3,
+                &format!("remu_srd_heap_{base} = {valid} ? {binding_index}u : 0xffffffffu;"),
+            );
         }
         Ok(())
     }

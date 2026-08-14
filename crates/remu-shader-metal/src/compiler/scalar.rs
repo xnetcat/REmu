@@ -19,6 +19,14 @@ pub(crate) fn destination_scalar(instruction: &Instruction) -> Result<u32, Strin
 
 impl Compiler<'_> {
     pub(crate) fn store_lane_mask(&mut self, register: u32, condition: &str) {
+        self.invalidate_heap_descriptor_shadows(
+            register,
+            if self.uses_wave64_lane_mask_pairs() {
+                2
+            } else {
+                1
+            },
+        );
         let (low, high) = self.ballot_words(condition);
         match register {
             VCC_LO => {
@@ -44,6 +52,7 @@ impl Compiler<'_> {
     }
 
     pub(crate) fn store_exec_mask(&mut self, condition: &str) {
+        self.invalidate_heap_descriptor_shadows(EXEC_LO, 2);
         self.line(3, &format!("exec = {condition};"));
         let (low, high) = self.ballot_words(condition);
         self.line(3, &format!("s[{EXEC_LO}] = {low};"));
@@ -644,6 +653,7 @@ impl Compiler<'_> {
         if register >= SCALAR_REGISTER_COUNT {
             return;
         }
+        self.invalidate_heap_descriptor_shadows(register, 1);
         match register {
             VCC_LO | VCC_HI => {
                 let value = self.temp("uint", expression);
@@ -667,6 +677,7 @@ impl Compiler<'_> {
         if register + 1 >= SCALAR_REGISTER_COUNT {
             return;
         }
+        self.invalidate_heap_descriptor_shadows(register, 2);
         self.line(3, &format!("s[{register}] = (uint){expression};"));
         self.line(
             3,
