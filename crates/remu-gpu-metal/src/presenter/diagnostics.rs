@@ -37,6 +37,8 @@ pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WIDTH: usize = 1_920;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT: usize = 1_080;
 
+pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL: usize = 7;
+
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX: u64 = 30;
 
 /// Whether draw execution is under an opt-in diagnostic which can alter the normal presenter
