@@ -11,7 +11,9 @@ use remu_loader::LoadedExecutable;
 use thiserror::Error;
 
 mod async_debug_log;
-pub use async_debug_log::{DEBUG_LOG_VARIABLE, debug_log_enabled, debug_log_line};
+pub use async_debug_log::{
+    DEBUG_LOG_VARIABLE, debug_log_enabled, debug_log_line, flush_async_debug_log,
+};
 
 mod async_stderr;
 pub use async_stderr::{
