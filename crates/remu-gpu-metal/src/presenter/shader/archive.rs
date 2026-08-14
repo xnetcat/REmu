@@ -25,7 +25,14 @@ impl MetalPresenter {
     }
 }
 
-pub(crate) const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-render-pipeline-v1\0";
+/// Compatibility boundary for Metal's opaque binary pipeline archive.
+///
+/// The archive contains pipelines compiled from REmu's generated MSL, so changing the shader ABI
+/// without changing this token can make Metal accept an archive whose functions no longer match
+/// the current lowering. That failure is not necessarily reported as corrupt: it can instead
+/// leave the first dependent pipeline compilation waiting indefinitely. Bump this token whenever
+/// generated shader interfaces or mesh publication semantics change.
+pub(crate) const METAL_RENDER_PIPELINE_ARCHIVE_FORMAT: &[u8] = b"remu-metal-render-pipeline-v2\0";
 
 pub(crate) const SLOW_PIPELINE_ARCHIVE_ADMISSION: Duration = Duration::from_millis(100);
 
@@ -576,12 +583,16 @@ impl ShaderFunctionCache {
 }
 
 pub(crate) fn metal_render_pipeline_archive_path(device: &Device) -> PathBuf {
+    let digest = metal_render_pipeline_archive_digest(device.name(), std::env::consts::ARCH);
+    metal_cache_root().join(format!("render-{digest}.metallibarchive"))
+}
+
+fn metal_render_pipeline_archive_digest(device_name: &str, architecture: &str) -> String {
     let mut hasher = Sha1::new();
     hasher.update(METAL_RENDER_PIPELINE_ARCHIVE_FORMAT);
-    hasher.update(device.name().as_bytes());
-    hasher.update(std::env::consts::ARCH.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    metal_cache_root().join(format!("render-{digest}.metallibarchive"))
+    hasher.update(device_name.as_bytes());
+    hasher.update(architecture.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -589,10 +600,11 @@ mod tests {
     use super::{
         LOADED_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS, NEW_PIPELINE_ARCHIVE_CHECKPOINT_ADDITIONS,
         PersistentRenderPipelineArchive, RenderPipelineArchiveState,
-        archive_serialization_failure_indicates_poison, pipeline_archive_quarantine_path,
-        quarantine_pipeline_archive,
+        archive_serialization_failure_indicates_poison, metal_render_pipeline_archive_digest,
+        pipeline_archive_quarantine_path, quarantine_pipeline_archive,
     };
     use metal::{BinaryArchiveDescriptor, CompileOptions, Device};
+    use sha1::Digest;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, RwLock};
@@ -617,6 +629,18 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn archive_key_rejects_the_legacy_shader_abi() {
+        let current = metal_render_pipeline_archive_digest("Test GPU", "x86_64");
+        let mut legacy = sha1::Sha1::new();
+        legacy.update(b"remu-metal-render-pipeline-v1\0");
+        legacy.update(b"Test GPU");
+        legacy.update(b"x86_64");
+        let legacy = format!("{:x}", legacy.finalize());
+
+        assert_ne!(current, legacy);
     }
 
     #[test]
