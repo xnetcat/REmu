@@ -594,7 +594,7 @@ impl Compiler<'_> {
                 if self.options.ngg_fixed_allocation_fallback {
                     source.push_str(
                             "    RemuVsOut remu_out = {};\n\
-                             \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f);\n\
+                             \x20   remu_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f);\n\
                              \x20   uint remu_meshlet_base = remu_group_id.x * 130u;\n\
                              \x20   uint remu_mesh_counts = remu_meshlets[remu_meshlet_base + 0u];\n\
                              \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
@@ -680,7 +680,7 @@ impl Compiler<'_> {
                         self.options.render_target_array_length - 1
                     );
                 }
-                // Always seed s[3] for mesh: GFX10 merged NGG shaders read
+                // Seed s[3] for the register-sized mesh ABI: GFX10 merged NGG shaders read
                 // - lane ID as `(s3[27:24] << log2(wave)) + v_mbcnt`
                 // - wave count as `s3[31:28]`, then `(1 << count) - 1` as the reduce mask
                 //   that loads per-wave totals from LDS (Void Terrarium soft/main particles).
@@ -701,9 +701,14 @@ impl Compiler<'_> {
                 } else {
                     (31u32, 5u32)
                 };
-                let _ = write!(
-                    source,
-                    "    {{\n\
+                // The original fixed wave64 ABI predates these synthesized merged-stage SGPRs.
+                // Its shaders consume the incoming guest s2 unchanged and seed s3 directly from
+                // the 130-word meshlet below. Applying the register-sized prologue as well
+                // corrupts live guest scalar data (notably the Superliminal UI vertex selector).
+                if !self.options.ngg_fixed_allocation_fallback {
+                    let _ = write!(
+                        source,
+                        "    {{\n\
                      \x20       uint remu_mesh_wave_index = remu_thread_index >> {wave_shift}u;\n\
                      \x20       uint remu_mesh_wave_base = remu_mesh_wave_index << {wave_shift}u;\n\
                      \x20       uint remu_mesh_wave_vertex_count = min(remu_mesh_input_vertex_count > remu_mesh_wave_base ? remu_mesh_input_vertex_count - remu_mesh_wave_base : 0u, {wave_round}u + 1u);\n\
@@ -715,8 +720,11 @@ impl Compiler<'_> {
                      \x20           | ((remu_mesh_wave_index & 0xfu) << 24u)\n\
                      \x20           | ((remu_mesh_wave_count & 0xfu) << 28u);\n\
                      \x20   }}\n",
-                );
-                if contains_register_reference(&self.body, 's', 2) {
+                    );
+                }
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 's', 2)
+                {
                     // Merged NGG SGPR s2 is gs_tg_info: [11:0] ordered_id (unused here),
                     // [20:12] workgroup input vertex count, [30:22] workgroup input primitive
                     // count (Mesa ac_nir_lower_intrinsics_to_args.c). Non-culling NGG shaders
@@ -727,14 +735,18 @@ impl Compiler<'_> {
                          \x20       | ((remu_mesh_input_primitive_count & 0x1ffu) << 22u);\n",
                     );
                 }
-                if contains_register_reference(&self.body, 'v', 0) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 0)
+                {
                     if !self.options.ngg_primgen_passthrough {
                         source.push_str("    v[0] = remu_mesh_gs_vtx_offset_0;\n");
                     } else {
                         source.push_str("    v[0] = remu_mesh_primitive;\n");
                     }
                 }
-                if contains_register_reference(&self.body, 'v', 1) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 1)
+                {
                     if !self.options.ngg_primgen_passthrough {
                         source.push_str("    v[1] = remu_mesh_gs_vtx_offset_1;\n");
                     } else {
@@ -744,15 +756,21 @@ impl Compiler<'_> {
                         source.push_str("    v[1] = 0u;\n");
                     }
                 }
-                if contains_register_reference(&self.body, 'v', 2) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 2)
+                {
                     // The fixed GFX9-11 merged-GS ABI keeps PrimitiveID in v2 in both ordinary
                     // and NGG passthrough mode. Only the vertex-offset payload moves into v0.
                     source.push_str("    v[2] = remu_mesh_primitive_base + remu_thread_index;\n");
                 }
-                if contains_register_reference(&self.body, 'v', 3) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 3)
+                {
                     source.push_str("    v[3] = 0u;\n");
                 }
-                if contains_register_reference(&self.body, 'v', 4) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 4)
+                {
                     source.push_str("    v[4] = 0u;\n");
                 }
                 if contains_register_reference(&self.body, 'v', 5) {
@@ -760,7 +778,9 @@ impl Compiler<'_> {
                         "    v[5] = remu_thread_index < remu_mesh_input_vertex_count ? remu_meshlets[remu_meshlet_base + 2u + remu_thread_index] + remu_draw[2] : 0u;\n",
                     );
                 }
-                if contains_register_reference(&self.body, 'v', 8) {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && contains_register_reference(&self.body, 'v', 8)
+                {
                     source.push_str("    v[8] = remu_group_id.y + remu_draw[3];\n");
                 }
                 // Preserve the legacy no-GS input-register contract for the fixed wave64
@@ -799,7 +819,9 @@ impl Compiler<'_> {
             // the shader narrows it against merged_wave_info (Mesa aco lanecount_to_mask). A
             // ballot over the Metal threads that happen to exist would zero the tail of a
             // partial final wave and skew lane counts taken before the guest's own narrowing.
-            let (low, high) = if self.options.stage == MetalShaderStage::Mesh {
+            let (low, high) = if self.options.stage == MetalShaderStage::Mesh
+                && !self.options.ngg_fixed_allocation_fallback
+            {
                 let high = if self.split_wave64() {
                     "0xffffffffu"
                 } else {

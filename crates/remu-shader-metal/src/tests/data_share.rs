@@ -40,6 +40,33 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
             },
             Instruction {
                 pc: 12,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(2)],
+                destinations: vec![Operand::scalar(80)],
+                control: None,
+            },
+            Instruction {
+                pc: 16,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(126)],
+                destinations: vec![Operand::scalar(81)],
+                control: None,
+            },
+            Instruction {
+                pc: 20,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SMovB32"),
+                words: vec![0],
+                sources: vec![Operand::scalar(127)],
+                destinations: vec![Operand::scalar(82)],
+                control: None,
+            },
+            Instruction {
+                pc: 24,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::Known("SSendmsg"),
                 words: vec![0xbf90_0009],
@@ -51,7 +78,7 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
                 control: None,
             },
             Instruction {
-                pc: 16,
+                pc: 28,
                 encoding: ShaderEncoding::Sopp,
                 opcode: Opcode::END_PROGRAM,
                 words: vec![0xbf81_0000],
@@ -74,8 +101,16 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
     assert!(
         shader
             .source
-            .contains("remu_out.position = float4(0.0f, 0.0f, 0.0f, 0.0f)")
+            .contains("remu_out.position = float4(0.0f, 0.0f, 0.0f, 1.0f)")
     );
+    assert!(
+        !shader
+            .source
+            .contains("remu_s_2 = ((remu_mesh_input_vertex_count"),
+        "the fixed compatibility ABI must preserve the guest's incoming s2"
+    );
+    assert!(shader.source.contains("simd_ballot(true)"));
+    assert!(!shader.source.contains("remu_s_126 = 0xffffffffu;"));
     assert!(
         shader
             .source
