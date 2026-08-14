@@ -96,7 +96,7 @@ pub(super) fn evaluation_samples_glyph_atlas(evaluation: &ShaderEvaluation) -> b
     evaluation.image_bindings.iter().any(|binding| {
         binding.opcode.starts_with("ImageSample")
             && decode_image_descriptor(&binding.resource_descriptor).is_ok_and(|descriptor| {
-                descriptor.guest.tile_mode == 9
+                matches!(descriptor.guest.tile_mode, 5 | 9)
                     && descriptor.destination_select == 0x800
                     && matches!(
                         descriptor.guest.pixel_format,
@@ -1906,7 +1906,7 @@ mod tests {
     use metal::{Device, MTLResourceOptions};
 
     #[test]
-    fn glyph_draw_match_requires_sampled_mode9_red_atlas_with_alpha_destination() {
+    fn glyph_draw_match_accepts_sampled_thin_1d_red_atlas_with_alpha_destination() {
         let binding = ImageBinding { descriptor_index_is_runtime: false,
             pc: 0,
             opcode: remu_shader::Opcode::Known("ImageSample"),
@@ -1950,6 +1950,10 @@ mod tests {
         };
 
         assert!(evaluation_samples_glyph_atlas(&evaluation));
+
+        let mut thin_1d_atlas = evaluation.clone();
+        thin_1d_atlas.image_bindings[0].resource_descriptor[3] = 0x9050_0800;
+        assert!(evaluation_samples_glyph_atlas(&thin_1d_atlas));
 
         let mut wrong_operation = evaluation.clone();
         wrong_operation.image_bindings[0].opcode = remu_shader::Opcode::Known("ImageLoad");

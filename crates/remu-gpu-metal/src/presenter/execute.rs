@@ -1747,9 +1747,20 @@ impl MetalPresenter {
                     .and_then(|scalar| pixel_scalar_metadata.get(scalar).copied());
                 // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup).
                 static LOGGED: AtomicUsize = AtomicUsize::new(0);
-                if LOGGED.fetch_add(1, Ordering::Relaxed) < 64 {
+                static LAST_DRAW_KIND: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(u64::MAX);
+                static CHANGED: AtomicUsize = AtomicUsize::new(0);
+                let draw_kind =
+                    draw.pixel_shader_address.rotate_left(17) ^ u64::from(draw.index_count);
+                let changed = LAST_DRAW_KIND.swap(draw_kind, Ordering::Relaxed) != draw_kind;
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 64
+                    || (changed && CHANGED.fetch_add(1, Ordering::Relaxed) < 128)
+                {
                     eprintln!(
-                        "[REMu][METAL][GLYPH-SELECT] pc={:#x} scalar_resource={} descriptor_word3={descriptor_word:#010x} descriptor_select={select:#x} seeded_word3={seeded:#010x?} seeded_select={:#x?}",
+                        "[REMu][METAL][GLYPH-SELECT] draw={} ps={:#x} count={} pc={:#x} scalar_resource={} descriptor_word3={descriptor_word:#010x} descriptor_select={select:#x} seeded_word3={seeded:#010x?} seeded_select={:#x?}",
+                        draw.sequence,
+                        draw.pixel_shader_address,
+                        draw.index_count,
                         binding.pc,
                         binding.control.scalar_resource,
                         seeded.map(|word| word & 0xfff),
