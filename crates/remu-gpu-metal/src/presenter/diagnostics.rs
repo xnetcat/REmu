@@ -25,6 +25,9 @@ pub(super) const DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX: usize = 24;
 
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX: u64 = 30;
 
+/// Mesh shaders reserve buffers 29 and 30 for meshlets and draw metadata.
+pub(super) const DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX: u64 = 28;
+
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_WIDTH: usize = 1_920;
 
 pub(super) const DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT: usize = 1_080;

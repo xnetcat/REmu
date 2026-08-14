@@ -5,7 +5,8 @@ use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
     CompiledComputePipeline, DB_DEPTH_CONTROL, DB_DEPTH_SIZE_XY, DB_Z_INFO,
-    DEFAULT_CB_COLOR_CONTROL, DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
+    DEFAULT_CB_COLOR_CONTROL, DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX,
+    DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
     DiagnosticScanoutWriter, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason,
@@ -1313,7 +1314,15 @@ impl MetalPresenter {
                 );
             }
             if let Some(buffer) = diagnostic_vertex_position_buffer.as_ref() {
-                encoder.set_vertex_buffer(DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, Some(buffer), 0);
+                if uses_mesh_stage {
+                    encoder.set_mesh_buffer(DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX, Some(buffer), 0);
+                } else {
+                    encoder.set_vertex_buffer(
+                        DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+                        Some(buffer),
+                        0,
+                    );
+                }
             }
             encoder.set_fragment_bytes(
                 u64::from(pixel_scalar_buffer_index),

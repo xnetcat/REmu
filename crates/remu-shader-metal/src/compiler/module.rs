@@ -212,6 +212,11 @@ impl Compiler<'_> {
         {
             parameters.push("device uint* remu_debug_position [[buffer(30)]]".to_owned());
         }
+        if self.options.stage == MetalShaderStage::Mesh
+            && self.options.diagnostic_capture_vertex_position
+        {
+            parameters.push("device uint* remu_debug_position [[buffer(28)]]".to_owned());
+        }
         if self.options.stage == MetalShaderStage::Pixel
             && self.options.diagnostic_capture_pixel_output
         {
@@ -658,6 +663,30 @@ impl Compiler<'_> {
                          \x20       remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
                          \x20       remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n\
                          \x20   }\n",
+                    );
+                }
+                if self.options.diagnostic_capture_vertex_position {
+                    let diagnostic_enable_index = self
+                        .evaluation
+                        .initial_scalar_registers
+                        .len()
+                        .saturating_add(
+                            self.evaluation
+                                .global_memory_bindings
+                                .len()
+                                .saturating_mul(4),
+                        );
+                    let _ = writeln!(
+                        source,
+                        "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_thread_index < 24u) {{\n\
+                         \x20       uint remu_debug_base = remu_thread_index * 24u;\n\
+                         \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>(remu_out.position.x);\n\
+                         \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>(remu_out.position.y);\n\
+                         \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>(remu_out.position.z);\n\
+                         \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>(remu_out.position.w);\n\
+                         \x20       remu_debug_position[remu_debug_base + 17u] = v[13];\n\
+                         \x20       remu_debug_position[remu_debug_base + 18u] = v[14];\n\
+                         \x20   }}"
                     );
                 }
                 source.push_str(
