@@ -12,6 +12,7 @@ mod inline_constant;
 mod ir;
 mod metadata;
 mod state;
+mod uniformity;
 
 pub use cfg::{
     BasicBlock, BlockExit, BlockId, ControlFlowGraph, Dominators, NaturalLoop, PostDominators,
@@ -40,3 +41,7 @@ pub use ir::{
 };
 pub use metadata::{GuestMemoryReader, MetadataError, read_shader_metadata};
 pub use state::{ShaderStateError, build_shader_state};
+pub use uniformity::{
+    InstructionSemantics, MemoryEffect, MemoryRegion, RegisterRef, UniformityAnalysis,
+    UniformityInputs, ValueId, Variation, analyze_uniformity,
+};
