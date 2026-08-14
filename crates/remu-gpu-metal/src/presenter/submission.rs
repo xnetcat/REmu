@@ -13,10 +13,11 @@ use super::{
     ResourceSpan, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
     SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent,
+    ScheduledPipelineKey,
     SharedEventDirectComputePlan, SharedEventHostEffectLatencyPhase,
     SharedEventHostEffectLatencyState, SharedEventHostEffectPendingStatistics,
-    SharedEventWriteKind, UploadedGlobalBuffer, WriteWatchRefresh, compute_pipeline_key,
-    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader, graphics_pipeline_key,
+    SharedEventWriteKind, UploadedGlobalBuffer, WriteWatchRefresh,
+    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
     guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
     noop_placeholder_cover_draw, pixel_scalars, rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_memory_copy,
@@ -28,7 +29,7 @@ use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
 use remu_memory::guest_shared_backing_identity;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 mod batch;
@@ -221,6 +222,7 @@ impl MetalPresenter {
             let event_processing_started = Instant::now();
             let event_class = event_loop_class(&event);
             let event_queue_wait = self.receiver.last_event_queue_wait();
+            let scheduled_pipeline_key = self.receiver.pipeline_key(&event).cloned();
             self.set_active_guest_queue(match source {
                 OrderedEventSource::GuestQueue(queue_id) => Some(queue_id),
                 OrderedEventSource::Host { .. } => None,
@@ -645,14 +647,14 @@ impl MetalPresenter {
                 }
                 GpuEvent::ComputeDispatch(dispatch) => {
                     trace_video_target_compute_consumer(&dispatch);
-                    if let (Some(snapshot), Some(evaluation)) = (
-                        dispatch.shader.as_ref(),
-                        dispatch.shader_evaluation.as_ref(),
-                    ) {
-                        let key = compute_pipeline_key(&dispatch, evaluation, &snapshot.program);
-                        self.compile_compute_shader(&dispatch, &key);
-                        if !self.compiled_compute_pipelines.contains_key(&key)
-                            && !self.failed_compute_pipelines.contains(&key)
+                    let key = match scheduled_pipeline_key.as_ref() {
+                        Some(ScheduledPipelineKey::Compute(key)) => key.clone(),
+                        _ => None,
+                    };
+                    if let Some(key) = key.as_ref() {
+                        self.compile_compute_shader(&dispatch, Arc::clone(key));
+                        if !self.compiled_compute_pipelines.contains_key(key)
+                            && !self.failed_compute_pipelines.contains(key)
                         {
                             PIPELINE_COMPUTE_GATES.fetch_add(1, Ordering::Relaxed);
                             static LOGGED_COMPUTE_PIPELINE_GATES: AtomicUsize = AtomicUsize::new(0);
@@ -665,13 +667,14 @@ impl MetalPresenter {
                             self.receiver.block_event(
                                 source,
                                 GpuEvent::ComputeDispatch(dispatch),
-                                QueueBlockReason::ComputePipeline(key),
+                                QueueBlockReason::ComputePipeline(Arc::clone(key)),
                             );
                             continue;
                         }
                     }
                     match self.execute_compute_dispatch(
                         &dispatch,
+                        key.as_deref(),
                         shared_event_direct_compute_plan.as_ref(),
                     ) {
                         Ok(()) => {
@@ -710,9 +713,14 @@ impl MetalPresenter {
                         super::stats::note_noop_draw("gpu:noop-cover-placeholder");
                         continue;
                     }
-                    let key = graphics_pipeline_key(&draw);
+                    let key = match scheduled_pipeline_key.as_ref() {
+                        Some(ScheduledPipelineKey::Graphics(key)) => key.clone(),
+                        _ => Err(Arc::<str>::from(
+                            "draw has no immutable pipeline-key snapshot",
+                        )),
+                    };
                     if let Ok(key) = key.as_ref() {
-                        self.compile_draw_shaders(&draw, key);
+                        self.compile_draw_shaders(&draw, Arc::clone(key));
                         if !self.compiled_shader_pairs.contains_key(key)
                             && !self.failed_shader_pairs.contains(key)
                         {
@@ -764,7 +772,7 @@ impl MetalPresenter {
                     };
                     let result = match key.as_ref() {
                         Ok(key) => self.execute_compiled_draw(&draw, key, texture_overrides),
-                        Err(error) => Err(error.clone()),
+                        Err(error) => Err(error.to_string()),
                     };
                     self.record_shared_event_direct_draw_outcome(
                         shared_event_gpu_ordered_draw,
@@ -793,7 +801,7 @@ impl MetalPresenter {
                         {
                             let pixel_scalars = pixel_scalars(&draw);
                             let pipeline_key_error =
-                                key.as_ref().err().map_or("none", |error| error.as_str());
+                                key.as_ref().err().map_or("none", |error| error.as_ref());
                             eprintln!(
                                 "[REMu][METAL] no translated Metal path for es={:#x}/{:x?} ps={:#x}/{:x?} indexed={} count={} instances={} target={:#x} cb_info={:#x} cb_attrib2={:#x} cb_attrib3={:#x} target_mask={:#x} ps_scalars={pixel_scalars:x?} pipeline_key_error={pipeline_key_error}",
                                 draw.export_shader_address,

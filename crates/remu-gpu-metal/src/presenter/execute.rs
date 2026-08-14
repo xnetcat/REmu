@@ -19,7 +19,7 @@ use super::{
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, collect_shared_event_global_versions,
-    color_operation_is_raster_noop, compute_pipeline_key, compute_program_can_split_wave64,
+    color_operation_is_raster_noop, compute_program_can_split_wave64,
     consume_color_metadata_clear, consume_depth_metadata_clear, create_global_argument_buffer,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,

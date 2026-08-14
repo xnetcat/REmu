@@ -5,6 +5,7 @@ use metal::{Device, MeshRenderPipelineDescriptor, RenderPipelineDescriptor};
 use remu_gpu::{ComputeDispatch, GpuEvent, IndexedDraw};
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{TryRecvError, TrySendError};
 use std::time::Instant;
@@ -73,72 +74,72 @@ impl MetalPresenter {
         let mut seen_compute = HashSet::new();
         let candidates =
             self.receiver
-                .prefetch_pipeline_work(512, speculative_available, |event| match event {
-                    GpuEvent::IndexedDraw(draw) => {
-                        super::graphics_pipeline_key(draw).is_ok_and(|key| {
-                            !compiled_shader_pairs.contains_key(&key)
-                                && !compiling_shader_pairs.contains(&key)
-                                && !failed_shader_pairs.contains(&key)
-                                && seen_graphics.insert(key)
-                        })
+                .prefetch_pipeline_work(512, speculative_available, |event, key| {
+                    match (event, key) {
+                        (
+                            GpuEvent::IndexedDraw(_),
+                            super::ScheduledPipelineKey::Graphics(Ok(key)),
+                        ) => {
+                            !compiled_shader_pairs.contains_key(key)
+                                && !compiling_shader_pairs.contains(key)
+                                && !failed_shader_pairs.contains(key)
+                                && seen_graphics.insert(Arc::clone(key))
+                        }
+                        (
+                            GpuEvent::ComputeDispatch(_),
+                            super::ScheduledPipelineKey::Compute(Some(key)),
+                        ) => {
+                            !compiled_compute_pipelines.contains_key(key)
+                                && !compiling_compute_pipelines.contains(key)
+                                && !failed_compute_pipelines.contains(key)
+                                && seen_compute.insert(Arc::clone(key))
+                        }
+                        _ => false,
                     }
-                    GpuEvent::ComputeDispatch(dispatch) => {
-                        let (Some(snapshot), Some(evaluation)) = (
-                            dispatch.shader.as_ref(),
-                            dispatch.shader_evaluation.as_ref(),
-                        ) else {
-                            return false;
-                        };
-                        let key = compute_pipeline_key(dispatch, evaluation, &snapshot.program);
-                        !compiled_compute_pipelines.contains_key(&key)
-                            && !compiling_compute_pipelines.contains(&key)
-                            && !failed_compute_pipelines.contains(&key)
-                            && seen_compute.insert(key)
-                    }
-                    _ => false,
                 });
         for candidate in candidates {
             match candidate {
-                PipelineCompileCandidate::Graphics(draw) => {
-                    if let Ok(key) = super::graphics_pipeline_key(&draw) {
-                        self.compile_draw_shaders(&draw, &key);
-                    }
+                PipelineCompileCandidate::Graphics { draw, key: Ok(key) } => {
+                    self.compile_draw_shaders(&draw, key);
                 }
-                PipelineCompileCandidate::Compute(dispatch) => {
-                    if let (Some(snapshot), Some(evaluation)) = (
-                        dispatch.shader.as_ref(),
-                        dispatch.shader_evaluation.as_ref(),
-                    ) {
-                        let key = compute_pipeline_key(&dispatch, evaluation, &snapshot.program);
-                        self.compile_compute_shader(&dispatch, &key);
-                    }
+                PipelineCompileCandidate::Compute {
+                    dispatch,
+                    key: Some(key),
+                } => {
+                    self.compile_compute_shader(&dispatch, key);
                 }
+                PipelineCompileCandidate::Graphics { key: Err(_), .. }
+                | PipelineCompileCandidate::Compute { key: None, .. } => {}
             }
         }
     }
 
-    pub(super) fn compile_draw_shaders(&mut self, draw: &IndexedDraw, key: &GraphicsPipelineKey) {
-        if self.compiled_shader_pairs.contains_key(key)
-            || self.compiling_shader_pairs.contains(key)
-            || self.failed_shader_pairs.contains(key)
+    pub(super) fn compile_draw_shaders(
+        &mut self,
+        draw: &IndexedDraw,
+        key: Arc<GraphicsPipelineKey>,
+    ) {
+        if self.compiled_shader_pairs.contains_key(&key)
+            || self.compiling_shader_pairs.contains(&key)
+            || self.failed_shader_pairs.contains(&key)
         {
             return;
         }
         let request = ShaderCompileRequest::Graphics {
-            key: key.clone(),
+            key: Arc::clone(&key),
             draw: draw.clone(),
         };
         match self.shader_compile_sender.try_send(request) {
             Ok(()) => {
                 PIPELINE_COMPILE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                self.compiling_shader_pairs.insert(key.clone());
+                self.compiling_shader_pairs.insert(Arc::clone(&key));
             }
             Err(TrySendError::Full(_)) => {
                 PIPELINE_COMPILE_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {
                 PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
-                self.failed_shader_pairs.insert(key.clone());
+                self.failed_shader_pairs.insert(Arc::clone(&key));
                 eprintln!(
                     "[REMu][METAL] Gen5 shader pair es={:#x} ps={:#x} failed: compiler worker stopped",
                     key.export_shader_address, key.pixel_shader_address
@@ -150,29 +151,29 @@ impl MetalPresenter {
     pub(super) fn compile_compute_shader(
         &mut self,
         dispatch: &ComputeDispatch,
-        key: &ComputePipelineKey,
+        key: Arc<ComputePipelineKey>,
     ) {
-        if self.compiled_compute_pipelines.contains_key(key)
-            || self.compiling_compute_pipelines.contains(key)
-            || self.failed_compute_pipelines.contains(key)
+        if self.compiled_compute_pipelines.contains_key(&key)
+            || self.compiling_compute_pipelines.contains(&key)
+            || self.failed_compute_pipelines.contains(&key)
         {
             return;
         }
         let request = ShaderCompileRequest::Compute {
-            key: key.clone(),
+            key: Arc::clone(&key),
             dispatch: dispatch.clone(),
         };
         match self.shader_compile_sender.try_send(request) {
             Ok(()) => {
                 PIPELINE_COMPILE_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-                self.compiling_compute_pipelines.insert(key.clone());
+                self.compiling_compute_pipelines.insert(Arc::clone(&key));
             }
             Err(TrySendError::Full(_)) => {
                 PIPELINE_COMPILE_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
             }
             Err(TrySendError::Disconnected(_)) => {
                 PIPELINE_COMPILE_FAILED.fetch_add(1, Ordering::Relaxed);
-                self.failed_compute_pipelines.insert(key.clone());
+                self.failed_compute_pipelines.insert(Arc::clone(&key));
                 eprintln!(
                     "[REMu][METAL] Gen5 compute cs={:#x} failed: compiler worker stopped",
                     dispatch.shader_address
