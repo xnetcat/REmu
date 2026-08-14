@@ -12,6 +12,7 @@ use super::{
 };
 use remu_gpu::{GpuEvent, GpuMemoryReleaseValue, GpuMemoryWait, GpuWaitId};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -1095,9 +1096,7 @@ fn event_is_memory_wait(event: &GpuEvent) -> bool {
 
 fn pipeline_compile_candidate(event: &GpuEvent) -> Option<PipelineCompileCandidate> {
     match event {
-        GpuEvent::IndexedDraw(draw) => {
-            Some(PipelineCompileCandidate::Graphics(draw.as_ref().clone()))
-        }
+        GpuEvent::IndexedDraw(draw) => Some(PipelineCompileCandidate::Graphics(Arc::clone(draw))),
         GpuEvent::ComputeDispatch(dispatch) => {
             Some(PipelineCompileCandidate::Compute(dispatch.as_ref().clone()))
         }

@@ -1032,7 +1032,7 @@ enum ShaderCompileResult {
 enum ShaderCompileRequest {
     Graphics {
         key: GraphicsPipelineKey,
-        draw: IndexedDraw,
+        draw: Arc<IndexedDraw>,
     },
     Compute {
         key: ComputePipelineKey,
@@ -1247,7 +1247,7 @@ enum QueueBlockReason {
 }
 
 enum PipelineCompileCandidate {
-    Graphics(IndexedDraw),
+    Graphics(Arc<IndexedDraw>),
     Compute(ComputeDispatch),
 }
 

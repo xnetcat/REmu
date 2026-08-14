@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{
@@ -102,7 +103,7 @@ impl MetalPresenter {
             match candidate {
                 PipelineCompileCandidate::Graphics(draw) => {
                     if let Ok(key) = super::graphics_pipeline_key(&draw) {
-                        self.compile_draw_shaders(&draw, &key);
+                        self.compile_draw_shaders(draw, &key);
                     }
                 }
                 PipelineCompileCandidate::Compute(dispatch) => {
@@ -118,7 +119,11 @@ impl MetalPresenter {
         }
     }
 
-    pub(super) fn compile_draw_shaders(&mut self, draw: &IndexedDraw, key: &GraphicsPipelineKey) {
+    pub(super) fn compile_draw_shaders(
+        &mut self,
+        draw: Arc<IndexedDraw>,
+        key: &GraphicsPipelineKey,
+    ) {
         if self.compiled_shader_pairs.contains_key(key)
             || self.compiling_shader_pairs.contains(key)
             || self.failed_shader_pairs.contains(key)
@@ -127,7 +132,7 @@ impl MetalPresenter {
         }
         let request = ShaderCompileRequest::Graphics {
             key: key.clone(),
-            draw: draw.clone(),
+            draw,
         };
         match self.shader_compile_sender.try_send(request) {
             Ok(()) => {

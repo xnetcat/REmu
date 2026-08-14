@@ -115,6 +115,25 @@ fn duplicate_compute_pipeline_compile_requests_are_coalesced() {
 }
 
 #[test]
+fn graphics_compile_request_retains_the_event_draw_arc() {
+    let (_gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
+    presenter.shader_compile_sender = request_sender;
+    let draw = Arc::new(super::indexed_draw(0, 0, 3));
+    let key = super::cold_graphics_pipeline_key();
+
+    presenter.compile_draw_shaders(Arc::clone(&draw), &key);
+
+    match request_receiver.recv().expect("graphics compile request") {
+        ShaderCompileRequest::Graphics {
+            draw: requested, ..
+        } => assert!(Arc::ptr_eq(&requested, &draw)),
+        ShaderCompileRequest::Compute { .. } => panic!("expected graphics compile request"),
+    }
+}
+
+#[test]
 fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
     let (gpu_sender, gpu_receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");

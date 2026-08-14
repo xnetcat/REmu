@@ -28,7 +28,7 @@ use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
 use remu_memory::guest_shared_backing_identity;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 mod batch;
@@ -712,7 +712,7 @@ impl MetalPresenter {
                     }
                     let key = graphics_pipeline_key(&draw);
                     if let Ok(key) = key.as_ref() {
-                        self.compile_draw_shaders(&draw, key);
+                        self.compile_draw_shaders(Arc::clone(&draw), key);
                         if !self.compiled_shader_pairs.contains_key(key)
                             && !self.failed_shader_pairs.contains(key)
                         {
