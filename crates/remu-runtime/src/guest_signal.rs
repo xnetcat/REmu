@@ -3,15 +3,16 @@
 //! Orbis/Prospero expose `sceKernelInstallExceptionHandler` /
 //! `sceKernelRaiseException` rather than raw POSIX `sigaction`/`pthread_kill` to
 //! titles. Unity's Boehm GC stop-the-world path installs SIGUSR1 (30) and raises
-//! it against every worker; the handler must observe a full Orbis `ucontext_t`
-//! (mcontext at `+0x40`) so register roots are collected. Delivery must interrupt
-//! spinning guest threads, not only poll at HLE import boundaries.
+//! it against every worker; the handler observes an Orbis `ucontext_t`
+//! (mcontext at `+0x40`) so register roots are collected. A host signal may wake
+//! the target, but arbitrary guest code cannot run on a POSIX signal stack: guest
+//! handlers may call HLE imports and block, neither of which is async-signal-safe.
 //!
 //! On Darwin under Rosetta the host delivers a real `ucontext_t` whose
 //! `__darwin_mcontext64` integer state is translated into that Orbis layout
-//! (SharpEmu / KytyPS5 reference shape). Host `SIGUSR1` is the interrupt vehicle
-//! for `sceKernelRaiseException`; guest exception type 30 is carried in the
-//! pending queue, not as the host signal number.
+//! (SharpEmu / KytyPS5 reference shape). Host `SIGUSR1` is only a delivery kick
+//! for `sceKernelRaiseException`; guest exception type 30 remains in the pending
+//! queue until the target reaches a safe HLE import boundary.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -331,19 +332,8 @@ pub(crate) fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame)
     if thread == 0 || (!cfg!(test) && !GUEST_EXCEPTION_PENDING.load(Ordering::Acquire)) {
         return;
     }
-    let pending = {
-        let mut delivery = guest_exception_delivery()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if delivery.active.contains(&thread) {
-            return;
-        }
-        let Some(pending) = delivery.pending.remove(&thread) else {
-            return;
-        };
-        GUEST_EXCEPTION_PENDING.store(!delivery.pending.is_empty(), Ordering::Release);
-        delivery.active.insert(thread);
-        pending
+    let Some(pending) = take_deliverable_pending(thread) else {
+        return;
     };
 
     let mut context = GuestExceptionContext([0; ORBIS_UCONTEXT_BYTES]);
@@ -361,33 +351,24 @@ pub(crate) fn deliver_pending_guest_exception_at_import(frame: &ImportCallFrame)
         .remove(&thread);
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn take_pending_for_current_thread() -> Option<PendingGuestException> {
-    let thread = current_guest_thread_handle();
+fn take_deliverable_pending(thread: u64) -> Option<PendingGuestException> {
     if thread == 0 {
         return None;
     }
-    let Ok(mut delivery) = guest_exception_delivery().try_lock() else {
-        return None;
-    };
+    let mut delivery = guest_exception_delivery()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if delivery.active.contains(&thread) {
         return None;
     }
-    let pending = delivery.pending.remove(&thread)?;
+    let pending = *delivery.pending.get(&thread)?;
+    if guest_signal_is_blocked(pending.exception) {
+        return None;
+    }
+    delivery.pending.remove(&thread);
     GUEST_EXCEPTION_PENDING.store(!delivery.pending.is_empty(), Ordering::Release);
     delivery.active.insert(thread);
     Some(pending)
-}
-
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn finish_active_delivery() {
-    let thread = current_guest_thread_handle();
-    if thread == 0 {
-        return;
-    }
-    if let Ok(mut delivery) = guest_exception_delivery().try_lock() {
-        delivery.active.remove(&thread);
-    }
 }
 
 #[cfg_attr(
@@ -401,68 +382,17 @@ fn guest_signal_is_blocked(exception: i32) -> bool {
     GUEST_SIGNAL_MASK.load(Ordering::Acquire) & (1_u64 << exception) != 0
 }
 
-/// Host SIGUSR1 handler: interruptive delivery for `sceKernelRaiseException`.
-#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-extern "C" fn host_delivery_signal_handler(
-    _signal: libc::c_int,
-    _information: *mut libc::siginfo_t,
-    context: *mut c_void,
-) {
-    let Some(pending) = take_pending_for_current_thread() else {
-        return;
-    };
-    if guest_signal_is_blocked(pending.exception) {
-        // Re-queue: the guest asked to block this signal.
-        let thread = current_guest_thread_handle();
-        if let Ok(mut delivery) = guest_exception_delivery().try_lock() {
-            delivery.pending.entry(thread).or_insert(pending);
-            delivery.active.remove(&thread);
-            GUEST_EXCEPTION_PENDING.store(true, Ordering::Release);
-        }
-        return;
-    }
-
-    let mut guest_context = GuestExceptionContext([0; ORBIS_UCONTEXT_BYTES]);
-    // SAFETY: SA_SIGINFO supplies a live Darwin ucontext for this delivery.
-    let translated = unsafe {
-        darwin_x86::fill_orbis_from_darwin(
-            &mut guest_context,
-            context,
-            current_guest_thread_pointer(),
-        )
-    };
-    if !translated {
-        finish_active_delivery();
-        return;
-    }
-
-    eprintln!(
-        "[REMu][KERNEL] delivering interruptive exception type={} handler={:#x}",
-        pending.exception, pending.handler
-    );
-    invoke_guest_exception_handler(pending.exception, pending.handler, &mut guest_context);
-
-    // SAFETY: same live Darwin ucontext; guest may have rewritten registers.
-    unsafe { darwin_x86::apply_orbis_to_darwin(&guest_context, context) };
-    finish_active_delivery();
-}
-
-/// Native arm64 builds never execute guest code; keep the delivery vehicle as a loud no-op.
-#[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
-#[allow(dead_code)] // installed from x86_64-only probe entry; kept for arm64 check completeness
+/// Host SIGUSR1 handler: wake-only delivery kick for `sceKernelRaiseException`.
+///
+/// The pending record was published before `pthread_kill`. Leave it untouched here: locking the
+/// delivery map or calling the guest handler from a POSIX signal context can deadlock when that
+/// handler reaches an HLE import or waits on a guest synchronization primitive.
+#[cfg(target_os = "macos")]
 extern "C" fn host_delivery_signal_handler(
     _signal: libc::c_int,
     _information: *mut libc::siginfo_t,
     _context: *mut c_void,
 ) {
-    let Some(pending) = take_pending_for_current_thread() else {
-        return;
-    };
-    eprintln!(
-        "[REMu][KERNEL] REFUSAL: interruptive exception type={} requires Rosetta x86_64 host context",
-        pending.exception
-    );
-    finish_active_delivery();
 }
 
 /// Installs the host SIGUSR1 delivery vehicle once.
@@ -530,7 +460,7 @@ pub(crate) unsafe extern "C" fn try_deliver_guest_fault(
     true
 }
 
-/// Queues a guest exception and interrupts the target host thread when possible.
+/// Queues a guest exception and nudges the target host thread when possible.
 pub(crate) fn queue_and_interrupt_guest_exception(
     target: u64,
     exception: i32,
@@ -574,7 +504,7 @@ pub(crate) fn queue_and_interrupt_guest_exception(
                 );
             } else {
                 eprintln!(
-                    "[REMu][KERNEL] interruptive exception source={source:#x} target={target:#x} target_name={:?} type={exception} handler={handler:#x}",
+                    "[REMu][KERNEL] nudged cooperative exception source={source:#x} target={target:#x} target_name={:?} type={exception} handler={handler:#x}",
                     target_name.unwrap_or("unknown")
                 );
             }
@@ -732,6 +662,73 @@ mod tests {
         );
         assert_eq!(old2, 1_u64 << 30);
         GUEST_SIGNAL_MASK.store(0, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn blocked_exception_stays_pending_until_a_safe_unmasked_boundary() {
+        const THREAD: u64 = 0x1234;
+        let pending = PendingGuestException {
+            handler: 0x5678,
+            exception: 30,
+        };
+        {
+            let mut delivery = guest_exception_delivery()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.pending.clear();
+            delivery.active.clear();
+            delivery.pending.insert(THREAD, pending);
+        }
+        GUEST_EXCEPTION_PENDING.store(true, Ordering::SeqCst);
+        GUEST_SIGNAL_MASK.store(1_u64 << 30, Ordering::SeqCst);
+
+        assert_eq!(take_deliverable_pending(THREAD), None);
+        assert!(guest_exception_is_pending(THREAD));
+
+        GUEST_SIGNAL_MASK.store(0, Ordering::SeqCst);
+        assert_eq!(take_deliverable_pending(THREAD), Some(pending));
+        let mut delivery = guest_exception_delivery()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(!delivery.pending.contains_key(&THREAD));
+        assert!(delivery.active.remove(&THREAD));
+        GUEST_EXCEPTION_PENDING.store(false, Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_delivery_kick_does_not_consume_pending_guest_code() {
+        const THREAD: u64 = 0x4321;
+        let pending = PendingGuestException {
+            handler: 0x8765,
+            exception: 30,
+        };
+        {
+            let mut delivery = guest_exception_delivery()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            delivery.pending.clear();
+            delivery.active.clear();
+            delivery.pending.insert(THREAD, pending);
+        }
+        GUEST_EXCEPTION_PENDING.store(true, Ordering::SeqCst);
+
+        host_delivery_signal_handler(libc::SIGUSR1, std::ptr::null_mut(), std::ptr::null_mut());
+
+        assert_eq!(
+            guest_exception_delivery()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending
+                .get(&THREAD),
+            Some(&pending)
+        );
+        guest_exception_delivery()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending
+            .clear();
+        GUEST_EXCEPTION_PENDING.store(false, Ordering::SeqCst);
     }
 
     #[test]
