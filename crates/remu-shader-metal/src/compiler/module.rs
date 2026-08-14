@@ -10,6 +10,7 @@ use std::fmt::Write as _;
 use remu_shader::{InstructionControl, PixelOutputKind};
 
 use crate::compiler::control_flow::ControlFlowLowering;
+use crate::compiler::image::metal_texture_declaration;
 use crate::compiler::memory::{
     is_format_buffer_memory, is_lds_memory_instruction, is_writable_memory,
 };
@@ -134,11 +135,12 @@ impl Compiler<'_> {
         if uses_lds_memory {
             emit_data_share_prelude(&mut source);
         }
-        if !self.heap_tables.is_empty() {
-            // One argument-buffer layout serves every heap: 512 texture handles, indexed by
-            // the shadow descriptor slot the SMEM lowering maintains at runtime.
-            source.push_str(
-                "struct RemuHeapTable {\n    metal::array<texture2d<float>, 16> tex [[id(0)]];\n};\n\n",
+        for texture_slot in self.heap_tables.keys().copied() {
+            let kind = self.image_kinds[texture_slot];
+            let declaration = metal_texture_declaration(kind);
+            let _ = writeln!(
+                source,
+                "struct RemuHeapTable_{texture_slot} {{\n    metal::array<{declaration}, 16> tex [[id(0)]];\n}};\n"
             );
         }
         if sampler_count != 0 && !direct_sampler_bindings {
@@ -195,59 +197,25 @@ impl Compiler<'_> {
             "constant uint* remu_initial_s [[buffer({initial_index})]]"
         ));
         for (index, kind) in self.image_kinds.iter().enumerate() {
-            let access = if kind.writable {
-                ", access::read_write"
-            } else if kind.storage {
-                ", access::read"
-            } else {
-                ""
-            };
-            // GCN cube resources are addressed with face-atlas coordinates produced by
-            // V_CUBEID/SC/TC/MA, not with a direction vector, so they bind as 2D arrays and
-            // sampling indexes the face layer directly (see emit_image_sample).
-            let metal_dim = crate::compiler::image::metal_image_dimension(*kind);
-            let texture_kind = if kind.comparison {
-                match metal_dim {
-                    3 => "depth2d_array",
-                    _ => "depth2d",
-                }
-            } else if kind.storage {
-                match metal_dim {
-                    2 => "texture3d",
-                    3 => "texture2d_array",
-                    _ => "texture2d",
-                }
-            } else {
-                // Sampled views follow the SRD TYPE (see metal_image_dimension), not MIMG DIM.
-                match metal_dim {
-                    2 => "texture3d",
-                    3 => "texture2d_array",
-                    _ => "texture2d",
-                }
-            };
-            let component = if kind.comparison {
-                "float"
-            } else {
-                kind.component
-            };
-            parameters.push(format!(
-                "{texture_kind}<{component}{access}> tex{index} [[texture({index})]]"
-            ));
+            let declaration = metal_texture_declaration(*kind);
+            parameters.push(format!("{declaration} tex{index} [[texture({index})]]"));
         }
         {
-            let mut heaps: Vec<usize> = self
-                .heap_tables
-                .values()
-                .flat_map(|(_, heaps)| heaps.iter().copied())
-                .collect();
-            heaps.sort_unstable();
-            heaps.dedup();
-            for (ordinal, heap) in heaps.iter().enumerate() {
-                // Slots after the sampler argument buffer: initial_s, samplers, then tables.
-                parameters.push(format!(
-                    "constant RemuHeapTable& remu_heap_{heap} [[buffer({})]]",
-                    initial_index + 2 + ordinal
-                ));
+            let mut ordinal = 0_usize;
+            for (texture_slot, route) in &self.heap_tables {
+                for heap in &route.heap_binding_indices {
+                    let buffer_index = initial_index + 2 + ordinal;
+                    if buffer_index > 30 {
+                        return Err(MetalCompileError::InvalidInterface(format!(
+                            "runtime heap table for texture slot {texture_slot} needs Metal buffer {buffer_index}, beyond the per-stage limit"
+                        )));
+                    }
+                    // Slots after the sampler argument buffer: initial_s, samplers, then tables.
+                    parameters.push(format!(
+                        "constant RemuHeapTable_{texture_slot}& remu_heap_{texture_slot}_{heap} [[buffer({buffer_index})]]"
+                    ));
+                    ordinal += 1;
+                }
             }
         }
         if direct_sampler_bindings {
@@ -365,11 +333,15 @@ impl Compiler<'_> {
         }
         source.push_str("    /* REMU_REGISTER_STATE */\n");
         {
-            let mut bases: Vec<u32> = self.heap_tables.values().map(|(base, _)| *base).collect();
+            let mut bases: Vec<u32> = self
+                .heap_tables
+                .values()
+                .map(|route| route.scalar_resource_base)
+                .collect();
             bases.sort_unstable();
             bases.dedup();
             for base in bases {
-                let _ = writeln!(source, "    uint remu_srd_slot_{base} = 0u;");
+                let _ = writeln!(source, "    uint remu_srd_slot_{base} = 0xffffffffu;");
                 let _ = writeln!(source, "    uint remu_srd_heap_{base} = 0xffffffffu;");
             }
         }

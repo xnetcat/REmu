@@ -1306,10 +1306,14 @@ pub(crate) fn graphics_pipeline_key_from_targets(
         export_resources: graphics_shader_resource_key(
             export_evaluation,
             program_embeds_global_base(export_program),
+            // The export stage never sets runtime_heap_tables and the encoder builds tables for
+            // the pixel stage only, so an export binding always lowers from the snapshot.
+            false,
         ),
         pixel_resources: graphics_shader_resource_key(
             pixel_evaluation,
             program_embeds_global_base(pixel_program),
+            super::super::shader::runtime_heap_tables_enabled(),
         ),
         export_allocated_vector_register_count: graphics_allocated_vector_register_count(
             &draw.shader_registers,
@@ -1486,9 +1490,15 @@ pub(crate) fn graphics_pipeline_key_from_targets(
     })
 }
 
+/// Builds the resource half of a graphics pipeline key.
+///
+/// `stage_uses_heap_tables` is the stage's `MetalCompileOptions::runtime_heap_tables`; it selects
+/// whether a flagged image binding lowers to a runtime heap-table fetch or to the snapshot
+/// texture, which are two different Metal functions for the same guest program.
 pub(crate) fn graphics_shader_resource_key(
     evaluation: &ShaderEvaluation,
     _embeds_global_base: bool,
+    stage_uses_heap_tables: bool,
 ) -> GraphicsShaderResourceKey {
     let image_slots = evaluation.image_binding_slots();
     GraphicsShaderResourceKey {
@@ -1521,6 +1531,14 @@ pub(crate) fn graphics_shader_resource_key(
                         .map_or(0, |word| (word >> 28) & 0xf),
                     image_slots.texture_slots[index],
                     image_slots.sampler_slots[index],
+                    binding.descriptor_index_is_runtime,
+                    // Heap and snapshot lowerings of one binding produce different Metal
+                    // functions with different bindings; without this the cache serves either
+                    // one for the other.
+                    super::super::shader::image_binding_fetches_descriptor_at_runtime(
+                        binding,
+                        stage_uses_heap_tables,
+                    ),
                 )
             })
             .collect(),

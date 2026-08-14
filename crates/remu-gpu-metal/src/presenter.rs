@@ -739,7 +739,10 @@ struct GraphicsPipelineKey {
 struct GraphicsShaderResourceKey {
     initial_scalar_count: usize,
     global_bindings: Vec<(Vec<u32>, u64, usize, bool)>,
-    image_bindings: Vec<(u32, u32, bool, bool, u32, u32, u32, Option<u32>)>,
+    /// Per image binding: pc, MSL component class, storage, comparison, MIMG dimension, SRD
+    /// texture type, canonical texture slot, canonical sampler slot, the evaluator's runtime-index
+    /// flag, and whether this stage effectively fetches through a heap table.
+    image_bindings: Vec<(u32, u32, bool, bool, u32, u32, u32, Option<u32>, bool, bool)>,
     vertex_inputs: Vec<(u32, u32, u32, u32, u32, u32, u32)>,
 }
 
@@ -1016,7 +1019,10 @@ struct ComputePipelineKey {
     compute_system_registers: Option<remu_shader::ComputeSystemRegisters>,
     initial_scalar_count: usize,
     global_bindings: Vec<(Vec<u32>, u64, usize, bool)>,
-    image_bindings: Vec<(u32, bool, bool, u32, u32, u32, Option<u32>)>,
+    /// Per image binding: MSL component class, storage, comparison, MIMG dimension, SRD texture
+    /// type, canonical texture slot, canonical sampler slot, the evaluator's runtime-index flag,
+    /// and whether this stage effectively fetches through a heap table.
+    image_bindings: Vec<(u32, bool, bool, u32, u32, u32, Option<u32>, bool, bool)>,
 }
 
 enum ShaderCompileResult {
@@ -2585,8 +2591,8 @@ struct MetalPresenter {
     sampled_texture_cache: HashMap<SampledTextureKey, CachedSampledTexture>,
     sampled_texture_write_watches: HashMap<SampledTextureKey, Arc<GuestTextureWriteWatch>>,
     fallback_texture_cache: HashMap<SampledTextureKey, Texture>,
-    /// 1x1 opaque-black texture bound into unresolved runtime heap-table slots.
-    heap_table_placeholder: Option<Texture>,
+    /// Type-correct 1x1 zero textures bound into unresolved runtime heap-table slots.
+    heap_table_placeholders: HashMap<remu_shader_metal::HeapTextureTableType, Texture>,
     /// Content-hash cache of encoded heap texture tables: the same table bytes recur at
     /// hundreds of guest addresses per frame (bump-allocated per-draw blobs), so hashing the
     /// slot bytes collapses per-draw rebuilds into lookups.
@@ -2831,7 +2837,7 @@ impl MetalPresenter {
             sampled_texture_cache: HashMap::new(),
             sampled_texture_write_watches: HashMap::new(),
             fallback_texture_cache: HashMap::new(),
-            heap_table_placeholder: None,
+            heap_table_placeholders: HashMap::new(),
             heap_table_cache: HashMap::new(),
             pending_heap_table_hash: None,
             next_sampled_texture_use: 0,

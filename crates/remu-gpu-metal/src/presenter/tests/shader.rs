@@ -17,12 +17,13 @@ use super::{
     CompiledComputePipeline, ComputePipelineKey, MetalPresenter, OrderedEventPoll,
     OrderedGpuEventReceiver, ProgramIdentity, QueueBlockReason, ShaderCompileRequest,
     ShaderCompileResult, canonical_sampler_bindings, canonical_texture_bindings,
-    compile_shader_request_catching_panics, compute_launch, export_resource_render_stage,
-    fragmentless_pixel_evaluation, fragmentless_pixel_program, graphics_shader_resource_key,
-    image_component_class, lift_expanded_vertex_buffer_num_records,
-    missing_vertex_parameter_exports, ngg_export_uses_general_lds, ngg_export_uses_wave64_exec,
-    ngg_fullscreen_cover_draw, ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
+    compile_shader_request_catching_panics, compute_launch, compute_pipeline_key,
+    decode_image_descriptor, export_resource_render_stage, fragmentless_pixel_evaluation,
+    fragmentless_pixel_program, graphics_shader_resource_key, image_component_class,
+    lift_expanded_vertex_buffer_num_records, missing_vertex_parameter_exports,
+    ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_fullscreen_cover_draw,
+    ngg_memoryless_cover_export_stage, ngg_mesh_draw_supported, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, procedural_rectangle_export_stage,
     procedural_rectangle_stage_for_draw, reconcile_pixel_input_controls_with_export_producers,
     rectangle_coordinate_parameter_mask, rectangle_draw_has_incomplete_interface, sampler_lod_bias,
     sampler_uses_normalized_coordinates, shader_scalar_metadata,
@@ -1072,12 +1073,12 @@ fn graphics_shader_cache_key_keeps_dynamic_global_addresses_out_of_pipeline_iden
     };
 
     assert_eq!(
-        graphics_shader_resource_key(&evaluation(0x7009_0605_ac), false),
-        graphics_shader_resource_key(&evaluation(0x7009_1600_6c), false),
+        graphics_shader_resource_key(&evaluation(0x7009_0605_ac), false, false),
+        graphics_shader_resource_key(&evaluation(0x7009_1600_6c), false, false),
     );
     assert_eq!(
-        graphics_shader_resource_key(&evaluation(0x7009_0605_ac), true),
-        graphics_shader_resource_key(&evaluation(0x7009_1600_6c), true),
+        graphics_shader_resource_key(&evaluation(0x7009_0605_ac), true, false),
+        graphics_shader_resource_key(&evaluation(0x7009_1600_6c), true, false),
     );
 }
 
@@ -1098,7 +1099,8 @@ fn runtime_upload_representatives_follow_canonical_texture_and_sampler_slots() {
         d16: false,
         unorm: false,
     };
-    let binding = |pc, opcode, descriptor: Vec<u32>| ImageBinding { descriptor_index_is_runtime: false,
+    let binding = |pc, opcode, descriptor: Vec<u32>| ImageBinding {
+        descriptor_index_is_runtime: false,
         pc,
         opcode: remu_shader::Opcode::Known(opcode),
         control: control.clone(),
@@ -1149,7 +1151,8 @@ fn graphics_shader_cache_key_normalizes_dynamic_image_formats_and_swizzles() {
         initial_scalar_registers: vec![0; 16].into(),
         scalar_registers: vec![0; 16].into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0x20,
             opcode: remu_shader::Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -1183,8 +1186,135 @@ fn graphics_shader_cache_key_normalizes_dynamic_image_formats_and_swizzles() {
     assert_eq!(image_component_class(&first.image_bindings[0]), 0);
     assert_eq!(image_component_class(&second.image_bindings[0]), 0);
     assert_eq!(
-        graphics_shader_resource_key(&first, false),
-        graphics_shader_resource_key(&second, false),
+        graphics_shader_resource_key(&first, false, false),
+        graphics_shader_resource_key(&second, false, false),
+    );
+}
+
+#[test]
+fn graphics_shader_cache_key_separates_heap_table_and_snapshot_image_lowerings() {
+    // The two descriptors differ only in word 0 — part of the guest base address, which the key
+    // deliberately excludes. Everything the key does carry (component class, SRD texture type,
+    // MIMG dimension, canonical slots) is identical. `unmapped` places the image below the
+    // lowest mapped guest address, so it fails to decode and the presenter forces it onto the
+    // heap-table lowering; that predicate reads fields no key field covers, which is exactly how
+    // the two lowerings used to collide.
+    let decoding = vec![0x1000, 56 << 20, 15, 9 << 28, 0, 0, 0, 0];
+    let unmapped = vec![0, 56 << 20, 15, 9 << 28, 0, 0, 0, 0];
+    assert!(decode_image_descriptor(&decoding).is_ok());
+    assert!(decode_image_descriptor(&unmapped).is_err());
+
+    let evaluation = |descriptor: &[u32], descriptor_index_is_runtime| ShaderEvaluation {
+        initial_scalar_registers: vec![0; 16].into(),
+        scalar_registers: vec![0; 16].into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime,
+            pc: 0x20,
+            opcode: remu_shader::Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: descriptor.to_vec().into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+
+    let snapshot = evaluation(&decoding, false);
+    let flagged = evaluation(&decoding, true);
+    let forced = evaluation(&unmapped, false);
+
+    // With tables on, both routes to the heap lowering must leave the snapshot key.
+    assert_ne!(
+        graphics_shader_resource_key(&snapshot, false, true),
+        graphics_shader_resource_key(&flagged, false, true),
+        "an evaluator-flagged binding lowers to a heap fetch and needs its own pipeline",
+    );
+    assert_ne!(
+        graphics_shader_resource_key(&snapshot, false, true),
+        graphics_shader_resource_key(&forced, false, true),
+        "a binding the presenter forces onto the tables needs its own pipeline",
+    );
+    assert_ne!(
+        graphics_shader_resource_key(&flagged, false, true),
+        graphics_shader_resource_key(&forced, false, true),
+        "the raw evaluator flag remains explicit even when both routes lower through a table",
+    );
+
+    // The evaluator flag remains part of every stage key even when that stage currently lowers
+    // snapshots. This makes enabling compute/export tables incapable of reviving the collision.
+    assert_ne!(
+        graphics_shader_resource_key(&snapshot, false, false),
+        graphics_shader_resource_key(&flagged, false, false),
+    );
+    // A merely undecodable snapshot is effective only while tables are enabled.
+    assert_eq!(
+        graphics_shader_resource_key(&snapshot, false, false),
+        graphics_shader_resource_key(&forced, false, false),
+    );
+}
+
+#[test]
+fn compute_shader_cache_key_carries_each_runtime_descriptor_flag() {
+    let (dispatch, _) = pending_compute_pipeline();
+    let program = dispatch
+        .shader
+        .as_ref()
+        .expect("fixture has a program")
+        .program
+        .clone();
+    let evaluation = |descriptor_index_is_runtime| ShaderEvaluation {
+        initial_scalar_registers: vec![0; 16].into(),
+        scalar_registers: vec![0; 16].into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime,
+            pc: 0x20,
+            opcode: remu_shader::Opcode::Known("ImageSample"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: vec![0x1000, 56 << 20, 15, 9 << 28, 0, 0, 0, 0].into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+
+    assert_ne!(
+        compute_pipeline_key(&dispatch, &evaluation(false), &program),
+        compute_pipeline_key(&dispatch, &evaluation(true), &program),
+        "compute keys must retain the per-binding evaluator flag even while compute heap tables are disabled"
     );
 }
 
@@ -1445,7 +1575,8 @@ kernel void remu_sampler_cache_test(
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0x100,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {

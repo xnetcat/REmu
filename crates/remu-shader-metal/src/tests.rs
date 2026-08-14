@@ -19,6 +19,7 @@ mod conversion;
 mod data_share;
 mod dpp;
 mod golden;
+mod heap_tables;
 mod image;
 mod interface;
 mod lane;

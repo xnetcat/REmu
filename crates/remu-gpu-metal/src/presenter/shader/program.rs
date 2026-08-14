@@ -112,6 +112,12 @@ pub(crate) fn compute_pipeline_key(
                     texture_type,
                     image_slots.texture_slots[index],
                     image_slots.sampler_slots[index],
+                    binding.descriptor_index_is_runtime,
+                    // Constant `false` today: `presenter/shader.rs` sets runtime_heap_tables on
+                    // the pixel options only, so a compute binding always lowers from the
+                    // snapshot. The field is here so that giving compute tables is a one-line
+                    // change at that assignment rather than a silent key collision.
+                    super::image_binding_fetches_descriptor_at_runtime(binding, false),
                 )
             })
             .collect(),

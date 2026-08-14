@@ -584,9 +584,49 @@ pub struct MetalBindingLayout {
     pub sampler_count: u32,
     /// Dynamic threadgroup-memory length that the compute encoder must bind at index zero.
     pub threadgroup_memory_bytes: u32,
-    /// Runtime heap texture tables: (global-memory binding index of the descriptor heap,
-    /// Metal buffer slot expecting the argument buffer of 512 texture handles).
-    pub heap_texture_tables: Vec<(u32, u32)>,
+    /// Runtime heap texture tables, one typed argument buffer per canonical texture slot and
+    /// descriptor heap. Keeping the native type in the published contract lets the encoder
+    /// validate every dynamically selected texture before Metal sees the argument buffer.
+    pub heap_texture_tables: Vec<HeapTextureTableBinding>,
+}
+
+/// Byte stride of one GCN image-resource descriptor in a runtime descriptor table.
+///
+/// The compiler encodes this into the SGPR shadow and the encoder uses the same value to walk the
+/// table. A dynamic address that is not on this stride is encoded as invalid instead of being
+/// rounded down to a different descriptor.
+pub const HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES: u32 = 32;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HeapTextureComponent {
+    Float,
+    Uint,
+    Sint,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HeapTextureDimension {
+    D2,
+    D3,
+    D2Array,
+}
+
+/// Native Metal type required by one runtime heap table.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HeapTextureTableType {
+    pub component: HeapTextureComponent,
+    pub dimension: HeapTextureDimension,
+    pub comparison: bool,
+    pub writable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct HeapTextureTableBinding {
+    pub global_binding_index: u32,
+    pub buffer_index: u32,
+    pub canonical_texture_slot: u32,
+    pub descriptor_stride_bytes: u32,
+    pub texture_type: HeapTextureTableType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

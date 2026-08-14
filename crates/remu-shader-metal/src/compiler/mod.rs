@@ -49,17 +49,66 @@ pub(crate) struct Compiler<'a> {
     pixel_interpolations: BTreeMap<u32, PixelInterpolation>,
     image_kinds: Vec<ImageKind>,
     image_slots: ImageBindingSlotMap,
-    /// Image binding index -> (srsrc base SGPR, candidate heap global-binding indices) for
+    /// Canonical texture slot -> runtime descriptor route for
     /// bindings whose descriptor index resolves only at runtime; empty unless
     /// options.runtime_heap_tables. Several heaps mean the base is loaded from different
     /// SMEM sources across control-flow paths and the shader selects at runtime.
-    pub(crate) heap_tables: std::collections::BTreeMap<usize, (u32, Vec<usize>)>,
+    ///
+    /// The key is the same domain as `image_kinds` and the `tex{N}` parameters, NOT an index
+    /// into `evaluation.image_bindings`; `Compiler::new` converts and refuses anything else.
+    pub(crate) heap_tables: std::collections::BTreeMap<usize, HeapTextureRoute>,
     control_flow: ControlFlowLowering,
     /// VGPR holding the NGG compacted output vertex id that gates EXP (the `vM` in
     /// `V_CMPX_* sN, vM` immediately before `EXP POS`). When the mesh ABI has an explicit
     /// capacity, each export publishes directly to that Metal vertex slot so PRIM indices and
     /// vertex/PARAM records share the same domain.
     mesh_export_vertex_vgpr: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct HeapTextureRoute {
+    pub(crate) scalar_resource_base: u32,
+    pub(crate) heap_binding_indices: Vec<usize>,
+}
+
+/// Byte offset of a complete eight-dword T# within one scalar-memory destination tuple.
+///
+/// Runtime table discovery and shadow emission must use this exact rule. Merely finding the base
+/// SGPR somewhere in a load is insufficient: a short suffix does not define a complete image
+/// descriptor and must be a loud compile refusal instead of a stale slot-0 sample.
+pub(crate) fn scalar_memory_image_descriptor_offset(
+    instruction: &Instruction,
+    scalar_resource_base: u32,
+) -> Result<Option<u32>, String> {
+    let Some(index) = instruction.destinations.iter().position(|destination| {
+        destination.kind == OperandKind::ScalarRegister && destination.value == scalar_resource_base
+    }) else {
+        return Ok(None);
+    };
+    let descriptor = instruction
+        .destinations
+        .get(index..index + 8)
+        .ok_or_else(|| {
+            format!(
+                "scalar load at pc {:#x} reaches image s{scalar_resource_base} without all eight descriptor dwords",
+                instruction.pc
+            )
+        })?;
+    if descriptor.iter().enumerate().any(|(word, destination)| {
+        destination.kind != OperandKind::ScalarRegister
+            || destination.value
+                != scalar_resource_base + u32::try_from(word).expect("eight words fit u32")
+    }) {
+        return Err(format!(
+            "scalar load at pc {:#x} has a non-contiguous image descriptor at s{scalar_resource_base}",
+            instruction.pc
+        ));
+    }
+    u32::try_from(index)
+        .ok()
+        .and_then(|index| index.checked_mul(4))
+        .map(Some)
+        .ok_or_else(|| "scalar image descriptor destination offset overflow".to_owned())
 }
 
 impl Compiler<'_> {
@@ -102,8 +151,33 @@ impl Compiler<'_> {
     }
 
     /// The heap-table route for one image binding, when analysis produced one.
-    pub(crate) fn runtime_heap_table(&self, binding_index: usize) -> Option<&(u32, Vec<usize>)> {
+    pub(crate) fn runtime_heap_table(&self, binding_index: usize) -> Option<&HeapTextureRoute> {
         self.heap_tables.get(&binding_index)
+    }
+
+    /// Invalidate every descriptor shadow whose eight-dword SGPR tuple overlaps this write.
+    /// A later complete SMEM descriptor load re-arms the shadow after storing all eight words.
+    pub(crate) fn invalidate_heap_descriptor_shadows(
+        &mut self,
+        first_register: u32,
+        register_count: u32,
+    ) {
+        let write_end = first_register.saturating_add(register_count);
+        let mut bases: Vec<u32> = self
+            .heap_tables
+            .values()
+            .map(|route| route.scalar_resource_base)
+            .filter(|base| {
+                let descriptor_end = base.saturating_add(8);
+                first_register < descriptor_end && *base < write_end
+            })
+            .collect();
+        bases.sort_unstable();
+        bases.dedup();
+        for base in bases {
+            self.line(3, &format!("remu_srd_slot_{base} = 0xffffffffu;"));
+            self.line(3, &format!("remu_srd_heap_{base} = 0xffffffffu;"));
+        }
     }
 
     fn split_wave64(&self) -> bool {
