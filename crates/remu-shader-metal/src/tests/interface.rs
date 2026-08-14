@@ -284,6 +284,25 @@ fn diagnostic_vertex_capture_records_mesh_outputs_and_registers() {
                 .find("remu_mesh.set_vertex(remu_thread_index, remu_out)")
                 .unwrap()
     );
+
+    options.ngg_fixed_allocation_fallback = true;
+    let fixed = compile_msl(&program, &empty_evaluation(), &options)
+        .expect("fixed compatibility mesh lowers with diagnostics");
+    assert!(
+        fixed
+            .source
+            .contains("remu_debug_position[remu_debug_base + 17u] = remu_v_13;")
+    );
+    assert!(
+        fixed
+            .source
+            .find("remu_debug_position[remu_debug_base + 17u]")
+            .unwrap()
+            < fixed
+                .source
+                .find("remu_mesh.set_vertex(remu_thread_index, remu_out)")
+                .unwrap()
+    );
 }
 
 #[test]
