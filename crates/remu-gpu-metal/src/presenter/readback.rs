@@ -227,11 +227,14 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal command queue is unavailable")?
             .clone();
-        // Prefer the open guest batch when a submit owns a queue. Standalone settles (tests /
-        // out-of-submit DMA/flip paths without an active queue) use a dedicated publish CB.
-        let command_buffer = if self.active_open_guest_batch().is_some()
-            || self.ensure_active_open_guest_batch().is_ok()
-        {
+        // Prefer the open guest batch when a submit owns one. A per-queue submit may not have
+        // opened its batch yet, but the active queue proves that it owns the publish. The legacy
+        // path deliberately does not manufacture an open batch here: outside a translated submit
+        // that would leave the publish uncommitted while reporting it as complete.
+        let submit_owns_publish = self.active_open_guest_batch().is_some()
+            || (self.per_queue_guest_batches && self.active_guest_queue.is_some());
+        let command_buffer = if submit_owns_publish {
+            self.ensure_active_open_guest_batch()?;
             let batch = self
                 .active_open_guest_batch_mut()
                 .expect("guest batch opened for Phase 1G publish");
@@ -242,7 +245,6 @@ impl MetalPresenter {
             buffer.set_label("REMu Phase 1G standalone GPU publish");
             buffer
         };
-        let standalone = self.active_open_guest_batch().is_none();
         crate::presenter::tiler::encode_gpu_publish_to_guest(
             &device,
             &command_buffer,
@@ -250,7 +252,7 @@ impl MetalPresenter {
             &texture,
             &authored,
         )?;
-        if standalone {
+        if !submit_owns_publish {
             command_buffer.commit();
             command_buffer.wait_until_completed();
         }

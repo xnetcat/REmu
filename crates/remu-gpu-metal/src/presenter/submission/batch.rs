@@ -1231,9 +1231,7 @@ impl MetalPresenter {
         // to at most one buffer per unchanged guest address range per batch.
         self.transient_global_buffer_cache.clear();
         batch.committed_at = Some(Instant::now());
-        if self.per_queue_guest_batches
-            && let Some(waker) = self.event_loop_waker.clone()
-        {
+        if let Some(waker) = self.event_loop_waker.clone() {
             attach_guest_batch_completion_waker(&batch.command_buffer, waker);
         }
         batch.command_buffer.commit();

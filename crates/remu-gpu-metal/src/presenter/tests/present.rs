@@ -960,6 +960,7 @@ fn a_superseded_flip_is_completed_when_the_next_flip_replaces_it() {
 fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    presenter.per_queue_guest_batches = true;
     presenter.set_active_guest_queue(Some(7));
     let _ = remu_gpu::take_gpu_completed_flips();
     let queue = presenter

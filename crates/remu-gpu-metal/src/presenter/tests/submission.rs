@@ -798,6 +798,7 @@ fn synchronous_wait_finishes_the_active_render_encoder_before_readback() {
 fn command_processor_barrier_commits_prior_work_without_a_cpu_wait() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
     presenter.set_active_guest_queue(Some(7));
     let queue = presenter
         .active_guest_command_queue()
@@ -7450,11 +7451,11 @@ fn release_binding_wakes_the_exact_registered_wait_in_the_same_presenter_drain()
 }
 
 #[test]
-fn per_queue_batch_flags_default_on_and_honour_the_zero_kill_switch() {
-    use super::super::graduated_flag_enabled;
+fn per_queue_batch_flag_requires_an_explicit_opt_in() {
+    use super::super::opt_in_flag_enabled;
     use std::ffi::OsStr;
-    assert!(graduated_flag_enabled(None));
-    assert!(!graduated_flag_enabled(Some(OsStr::new("0"))));
-    assert!(graduated_flag_enabled(Some(OsStr::new("1"))));
-    assert!(graduated_flag_enabled(Some(OsStr::new(""))));
+    assert!(!opt_in_flag_enabled(None));
+    assert!(!opt_in_flag_enabled(Some(OsStr::new("0"))));
+    assert!(opt_in_flag_enabled(Some(OsStr::new("1"))));
+    assert!(!opt_in_flag_enabled(Some(OsStr::new(""))));
 }

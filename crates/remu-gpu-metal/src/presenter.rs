@@ -388,6 +388,11 @@ fn graduated_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
     value != Some(std::ffi::OsStr::new("0"))
 }
 
+/// Experimental paths remain off unless the environment explicitly opts in with `1`.
+fn opt_in_flag_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
 fn resident_texture_lifetime_diagnostics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -1774,10 +1779,9 @@ struct CachedGlobalBuffer {
 
 /// Metal submission state owned by one logical guest GPU queue.
 ///
-/// The B17 per-queue path is the default (plan A1). It deliberately stays separate from the
-/// legacy shared queue fields below so the `REMU_PER_QUEUE_BATCHES=0` kill-switch preserves the
-/// old object graph and submission behaviour exactly for one cycle, after which the legacy path
-/// is deleted.
+/// The B17 per-queue path remains isolated from the ordered shared-queue fields below. It is an
+/// explicit `REMU_PER_QUEUE_BATCHES=1` development path until its resource dependencies cover the
+/// same ordering guaranteed by the shared queue.
 struct GuestQueueBatchState {
     command_queue: metal::CommandQueue,
     shared_event_timeline: SharedEventTimeline,
@@ -2724,8 +2728,12 @@ impl MetalPresenter {
                 .map_err(|error| format!("could not start Metal compiler worker: {error}"))?;
         }
         drop(shader_compile_results);
+        // Per-queue Metal submission is still missing ordering for some resources that cross
+        // logical guest batches. Superliminal exposes that gap as nondeterministic black or
+        // overexposed menu frames. Keep the single ordered queue as the correctness default while
+        // retaining an explicit opt-in for dependency-model development.
         let per_queue_guest_batches =
-            graduated_flag_enabled(std::env::var_os("REMU_PER_QUEUE_BATCHES").as_deref());
+            opt_in_flag_enabled(std::env::var_os("REMU_PER_QUEUE_BATCHES").as_deref());
         let shared_event_direct_draw_admission = per_queue_guest_batches
             && graduated_flag_enabled(
                 std::env::var_os("REMU_SHARED_EVENT_DIRECT_DRAWS").as_deref(),
@@ -2894,9 +2902,7 @@ pub fn run_presenter(receiver: Receiver<GpuEvent>) -> Result<(), String> {
         .map_err(|error| format!("event loop failed: {error}"))?;
     presenter.event_loop_waker = Some(event_loop.create_proxy());
     display_link::start_display_link(event_loop.create_proxy());
-    if presenter.per_queue_guest_batches {
-        eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
-    }
+    eprintln!("[REMu][METAL] guest-batch completion wakeups enabled");
     if presenter.shared_event_direct_draw_admission {
         eprintln!(
             "[REMu][METAL] experimental disjoint/fence-versioned/resident-versioned direct-draw SharedEvent admission enabled"
