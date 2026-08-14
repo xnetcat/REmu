@@ -186,14 +186,15 @@ pub(crate) fn analyze_control_flow(
     }
 
     // Prefer remu-shader's StructuredCfg when it proves a Dispatcher-free reducible tree that
-    // actually needs structured emission (If/Loop). Pixel shaders deliberately keep the legacy
-    // Forward/Dispatcher lowering: converting their scalar EXEC/SCC control into native MSL
-    // branches changes helper-lane and implicit-derivative behaviour around texture samples. A
-    // captured Superliminal glyph shader produced identical inputs and sampled texture bytes but
-    // transparent output after that conversion. The forward PC form preserves the guest's
-    // wave-wide branch sequencing; backward pixel control flow keeps the honest dispatcher seam.
-    // Other stages retain structured loops and therefore the no-step-cap progress guarantee.
-    if stage != MetalShaderStage::Pixel {
+    // actually needs structured emission (If/Loop). Pixel and mesh shaders deliberately keep the
+    // legacy Forward/Dispatcher lowering: converting their scalar EXEC/SCC control into native
+    // MSL branches changes graphics helper-lane and wave-wide ballot behaviour around texture
+    // samples and vertex publication. A captured Superliminal glyph draw produced identical
+    // inputs, vertex records and sampled texture bytes but transparent fragments after that
+    // conversion. The forward PC form preserves the guest's wave-wide branch sequencing;
+    // backward graphics control flow keeps the honest dispatcher seam. Compute and ordinary
+    // vertex stages retain structured loops and therefore the no-step-cap progress guarantee.
+    if !matches!(stage, MetalShaderStage::Pixel | MetalShaderStage::Mesh) {
         let cfg = build_control_flow_graph(program);
         let structured = cfg.structure();
         if structured_cfg_is_fully_reducible(&structured)

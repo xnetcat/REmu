@@ -575,7 +575,7 @@ fn forward_conditional_control_flow_avoids_the_loop_dispatcher_and_register_arra
 }
 
 #[test]
-fn pixel_forward_branch_preserves_legacy_wave_sequencing() {
+fn pixel_and_mesh_forward_branches_preserve_legacy_wave_sequencing() {
     let program = Program::new(
         0x1000,
         vec![
@@ -621,6 +621,19 @@ fn pixel_forward_branch_preserves_legacy_wave_sequencing() {
     assert!(shader.source.contains("pc = (scc) ? 8u : 4u;"));
     assert!(!shader.source.contains("while (active)"));
     assert!(!shader.source.contains("switch (pc)"));
+
+    let mesh = compile_msl(
+        &program,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(0, 0, 64, 64, 64),
+    )
+    .expect("forward mesh conditional program should lower");
+    assert!(!mesh.register_footprint.direct_control_flow);
+    assert!(mesh.source.contains("uint pc = 0u;"));
+    assert!(mesh.source.contains("if (active && pc == 0u)"));
+    assert!(mesh.source.contains("pc = (scc) ? 8u : 4u;"));
+    assert!(!mesh.source.contains("while (active)"));
+    assert!(!mesh.source.contains("switch (pc)"));
 }
 
 #[test]
