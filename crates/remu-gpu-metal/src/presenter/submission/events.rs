@@ -1201,7 +1201,7 @@ fn pipeline_compile_candidate(
     match (event, key) {
         (GpuEvent::IndexedDraw(draw), ScheduledPipelineKey::Graphics(key)) => {
             Some(PipelineCompileCandidate::Graphics {
-                draw: draw.as_ref().clone(),
+                draw: Arc::clone(draw),
                 key: key.clone(),
             })
         }

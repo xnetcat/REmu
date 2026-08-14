@@ -720,7 +720,7 @@ impl MetalPresenter {
                         )),
                     };
                     if let Ok(key) = key.as_ref() {
-                        self.compile_draw_shaders(&draw, Arc::clone(key));
+                        self.compile_draw_shaders(Arc::clone(&draw), Arc::clone(key));
                         if !self.compiled_shader_pairs.contains_key(key)
                             && !self.failed_shader_pairs.contains(key)
                         {

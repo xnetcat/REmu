@@ -105,7 +105,7 @@ pub enum GpuEvent {
         wait: GpuMemoryWait,
     },
     ComputeDispatch(Box<ComputeDispatch>),
-    IndexedDraw(Box<IndexedDraw>),
+    IndexedDraw(Arc<IndexedDraw>),
     /// An ordered CPU-visible end-of-pipe boundary for one guest graphics submission.
     ///
     /// The backend records this sequence only after all preceding translated GPU work and guest

@@ -1146,7 +1146,7 @@ fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary
     sender
         .send(GpuEvent::QueueSubmission {
             queue_id: 7,
-            events: vec![GpuEvent::IndexedDraw(Box::new(cover.clone()))],
+            events: vec![GpuEvent::IndexedDraw(Arc::new(cover.clone()))],
         })
         .expect("queue the cover draw");
     let source = match presenter.receiver.try_recv(|_| true) {
@@ -1158,7 +1158,7 @@ fn a_cold_pipeline_cover_holds_its_frame_back_from_a_foreign_submission_boundary
     };
     presenter.receiver.block_event(
         source,
-        GpuEvent::IndexedDraw(Box::new(cover)),
+        GpuEvent::IndexedDraw(Arc::new(cover)),
         QueueBlockReason::GraphicsPipeline(Arc::new(super::cold_graphics_pipeline_key())),
     );
     assert!(
