@@ -298,11 +298,12 @@ impl<'a> Compiler<'a> {
                     .into(),
             ));
         }
-        // PRIM exports address the compacted vertex domain. The fixed no-GS fallback and the
-        // register-proven path both provide a bounded Metal vertex capacity, so a V_CMPX-gated
-        // EXP can publish to its guest compacted id without inventing allocation state.
+        // PRIM exports address the compacted vertex domain when the hardware allocation ABI is
+        // proven. The fixed no-GS compatibility path intentionally retains the original one
+        // vertex record per invocation contract: treating an ordinary V_CMPX source as a
+        // compacted output id changes the pre-subgroup-allocation ABI used by older titles.
         let mesh_export_vertex_vgpr = (options.stage == MetalShaderStage::Mesh
-            && (options.ngg_registers_proven || options.ngg_fixed_allocation_fallback))
+            && options.ngg_registers_proven)
             .then(|| mesh_export_vertex_vgpr(program))
             .flatten();
 

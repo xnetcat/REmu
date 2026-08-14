@@ -127,7 +127,13 @@ fn no_gs_fixed_allocation_ignores_gs_alloc_req_and_publishes_meshlet_counts() {
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_primitive_count(remu_mesh_output_primitives)")
+            .contains("remu_mesh.set_primitive_count(remu_mesh_input_primitive_count)")
+    );
+    assert!(!shader.source.contains("remu_mesh_output_primitive_count"));
+    assert!(
+        !shader
+            .source
+            .contains("remu_mesh_primitive_source_vertices")
     );
 }
 
@@ -691,9 +697,9 @@ fn empty_workaround_ngg_program() -> Program {
 }
 
 #[test]
-fn fixed_ngg_fallback_publishes_compacted_vertex_exports_by_compacted_id() {
-    // Superliminal Slate UI: PRIM records name compacted ids built behind
-    // `V_CMPX_GT_U32 s4, v18`, so its POS/PARAM records must use v18 as well.
+fn fixed_ngg_fallback_retains_one_vertex_record_per_invocation() {
+    // The pre-subgroup-allocation no-GS ABI predates compacted-output discovery. An unrelated
+    // V_CMPX source must not replace its lane-local vertex publication domain.
     let program = compacted_vertex_exp_program();
     let mut options = MetalCompileOptions::mesh(2, 16 * 1024, 64, 64, 64);
     options.wave_lane_count = 64;
@@ -703,15 +709,15 @@ fn fixed_ngg_fallback_publishes_compacted_vertex_exports_by_compacted_id() {
     assert!(
         shader
             .source
-            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)"),
-        "mesh vertices must publish under the compacted vertex id: {}",
+            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
+        "fixed NGG vertices must publish under the invocation id: {}",
         shader.source
     );
     assert!(
         !shader
             .source
-            .contains("remu_mesh.set_vertex(remu_thread_index, remu_out)"),
-        "the epilogue must not overwrite compacted records by invocation index: {}",
+            .contains("remu_mesh.set_vertex(remu_v_18, remu_out)"),
+        "fixed NGG must not reinterpret a V_CMPX source as an output id: {}",
         shader.source
     );
 }

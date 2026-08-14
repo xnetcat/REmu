@@ -401,13 +401,17 @@ impl Compiler<'_> {
                 "    threadgroup uint remu_mesh_render_target_indices[{}];",
                 self.options.mesh_max_vertex_count
             );
-            let _ = writeln!(
-                source,
-                "    threadgroup uint remu_mesh_primitive_source_vertices[{}];",
-                self.options.mesh_max_primitive_count
-            );
+            if !self.options.ngg_fixed_allocation_fallback {
+                let _ = writeln!(
+                    source,
+                    "    threadgroup uint remu_mesh_primitive_source_vertices[{}];",
+                    self.options.mesh_max_primitive_count
+                );
+            }
         }
-        if self.options.stage == MetalShaderStage::Mesh {
+        if self.options.stage == MetalShaderStage::Mesh
+            && !self.options.ngg_fixed_allocation_fallback
+        {
             source.push_str("    uint remu_mesh_output_primitive_count = 0u;\n");
         }
         if self.split_wave64() {
@@ -600,7 +604,10 @@ impl Compiler<'_> {
                              \x20   uint remu_mesh_primitive_base = remu_meshlets[remu_meshlet_base + 1u];\n\
                              \x20   uint remu_mesh_input_vertex_count = remu_mesh_counts & 0xffu;\n\
                              \x20   uint remu_mesh_input_primitive_count = (remu_mesh_counts >> 8u) & 0xffu;\n\
-                             \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 66u + remu_thread_index] : 0x80000000u;\n",
+                             \x20   uint remu_mesh_primitive = remu_meshlets[remu_meshlet_base + 66u + remu_thread_index];\n\
+                             \x20   remu_mesh.set_index(remu_thread_index * 3u + 0u, 0u);\n\
+                             \x20   remu_mesh.set_index(remu_thread_index * 3u + 1u, 0u);\n\
+                             \x20   remu_mesh.set_index(remu_thread_index * 3u + 2u, 0u);\n",
                         );
                 } else {
                     // Default w=0 so threads that never EXP are hardware-clipped. The previous
@@ -619,43 +626,42 @@ impl Compiler<'_> {
                              \x20   uint remu_mesh_primitive = remu_thread_index < remu_mesh_input_primitive_count ? remu_meshlets[remu_meshlet_base + 258u + remu_thread_index] : 0x80000000u;\n",
                         );
                 }
-                if self.options.ngg_fixed_allocation_fallback {
-                    source.push_str(
-                        "    remu_mesh_output_primitive_count = remu_mesh_input_primitive_count;\n",
-                    );
-                }
                 // GS_ALLOC_REQ reserves output slots, but culled or otherwise null primitives do
                 // not necessarily execute EXP PRIM. AMD hardware treats those slots as null.
                 // Metal has no null-primitive flag and consumes every index below the published
                 // primitive count, so leaving an unexported slot unwritten feeds undefined
                 // indices to the rasterizer. Initialize every possible slot to a degenerate
                 // triangle; a live EXP PRIM below overwrites its own three indices.
-                let _ = writeln!(
-                    source,
-                    "    for (uint remu_null_primitive = remu_thread_index; remu_null_primitive < {}u; remu_null_primitive += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
-                     \x20       remu_mesh.set_index(remu_null_primitive * 3u + 0u, 0u);\n\
-                     \x20       remu_mesh.set_index(remu_null_primitive * 3u + 1u, 0u);\n\
-                     \x20       remu_mesh.set_index(remu_null_primitive * 3u + 2u, 0u);\n\
-                     \x20   }}",
-                    self.options.mesh_max_primitive_count
-                );
-                if self.options.render_target_array_length > 1 {
-                    let _ = writeln!(
-                        source,
-                        "    for (uint remu_null_vertex = remu_thread_index; remu_null_vertex < {}u; remu_null_vertex += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
-                         \x20       remu_mesh_render_target_indices[remu_null_vertex] = 0u;\n\
-                         \x20   }}",
-                        self.options.mesh_max_vertex_count
-                    );
+                if !self.options.ngg_fixed_allocation_fallback {
                     let _ = writeln!(
                         source,
                         "    for (uint remu_null_primitive = remu_thread_index; remu_null_primitive < {}u; remu_null_primitive += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
-                         \x20       remu_mesh_primitive_source_vertices[remu_null_primitive] = 0u;\n\
+                         \x20       remu_mesh.set_index(remu_null_primitive * 3u + 0u, 0u);\n\
+                         \x20       remu_mesh.set_index(remu_null_primitive * 3u + 1u, 0u);\n\
+                         \x20       remu_mesh.set_index(remu_null_primitive * 3u + 2u, 0u);\n\
                          \x20   }}",
                         self.options.mesh_max_primitive_count
                     );
+                    if self.options.render_target_array_length > 1 {
+                        let _ = writeln!(
+                            source,
+                            "    for (uint remu_null_vertex = remu_thread_index; remu_null_vertex < {}u; remu_null_vertex += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
+                             \x20       remu_mesh_render_target_indices[remu_null_vertex] = 0u;\n\
+                             \x20   }}",
+                            self.options.mesh_max_vertex_count
+                        );
+                        let _ = writeln!(
+                            source,
+                            "    for (uint remu_null_primitive = remu_thread_index; remu_null_primitive < {}u; remu_null_primitive += remu_group_size.x * remu_group_size.y * remu_group_size.z) {{\n\
+                             \x20       remu_mesh_primitive_source_vertices[remu_null_primitive] = 0u;\n\
+                             \x20   }}",
+                            self.options.mesh_max_primitive_count
+                        );
+                    }
                 }
-                if !self.options.ngg_primgen_passthrough {
+                if !self.options.ngg_fixed_allocation_fallback
+                    && !self.options.ngg_primgen_passthrough
+                {
                     // Default GFX10 NGG input ABI. Unlike passthrough mode, SPI supplies six
                     // packed 16-bit ES vertex offsets in v0/v1/v4, the primitive ID in v2 and
                     // the GS invocation ID in v3. No-GS NGG lowering consumes the offsets as
@@ -1016,6 +1022,25 @@ impl Compiler<'_> {
             }
             MetalShaderStage::Compute => {}
             MetalShaderStage::Mesh => {
+                if self.options.ngg_fixed_allocation_fallback {
+                    if self.options.render_target_array_length > 1 {
+                        source.push_str(
+                            "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\
+                             \x20   if (remu_thread_index < remu_mesh_input_primitive_count) {\n\
+                             \x20       RemuPrimitiveOut remu_primitive_out = {};\n\
+                             \x20       uint remu_primitive_source_vertex = remu_mesh_primitive & 0x1ffu;\n\
+                             \x20       remu_primitive_out.render_target_array_index = remu_mesh_render_target_indices[remu_primitive_source_vertex];\n\
+                             \x20       remu_mesh.set_primitive(remu_thread_index, remu_primitive_out);\n\
+                             \x20   }\n",
+                        );
+                    }
+                    source.push_str(
+                        "    if (remu_thread_index < remu_mesh_input_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
+                         \x20   if (remu_thread_index == 0u) remu_mesh.set_primitive_count(remu_mesh_input_primitive_count);\n",
+                    );
+                    source.push_str("}\n");
+                    return scalarize_register_state(&source);
+                }
                 let _ = writeln!(
                     source,
                     "    uint remu_mesh_output_primitives = min(remu_mesh_output_primitive_count, {}u);",

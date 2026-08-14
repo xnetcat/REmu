@@ -95,6 +95,33 @@ impl Compiler<'_> {
     ) -> Result<(), String> {
         if export.target == 20 {
             let primitive = self.temp("uint", &self.raw_source(instruction, 0)?);
+            if self.options.ngg_fixed_allocation_fallback {
+                let lane = self.architectural_lane();
+                self.line(
+                    3,
+                    &format!("if (exec && ({primitive} & 0x80000000u) == 0u) {{"),
+                );
+                self.line(
+                    4,
+                    &format!(
+                        "remu_mesh.set_index({lane} * 3u + 0u, ({primitive} >> 0u) & 0x1ffu);"
+                    ),
+                );
+                self.line(
+                    4,
+                    &format!(
+                        "remu_mesh.set_index({lane} * 3u + 1u, ({primitive} >> 10u) & 0x1ffu);"
+                    ),
+                );
+                self.line(
+                    4,
+                    &format!(
+                        "remu_mesh.set_index({lane} * 3u + 2u, ({primitive} >> 20u) & 0x1ffu);"
+                    ),
+                );
+                self.line(3, "}");
+                return Ok(());
+            }
             self.line(
                 3,
                 &format!(
