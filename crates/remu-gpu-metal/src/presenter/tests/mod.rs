@@ -233,7 +233,7 @@ fn cold_graphics_pipeline_key() -> GraphicsPipelineKey {
     }
 }
 
-fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
+pub(crate) fn indexed_draw(address: u64, index_size: u32, index_count: u32) -> IndexedDraw {
     IndexedDraw {
         sequence: 1,
         indexed: true,

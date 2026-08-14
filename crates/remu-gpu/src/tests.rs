@@ -8,7 +8,7 @@ use super::{
     GPU_EVENT_QUEUE_CAPACITY, GPU_EVENT_SUBMISSION_CHUNK_SIZE, GpuCachePolicy,
     GpuEndOfPipeCbDbAction, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuMemoryAcquire,
     GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuRegister, GpuRenderBackendFlush,
-    GpuWaitOperation, HostPadState, ShaderEvaluationSnapshot, audio_output_frames,
+    GpuWaitOperation, HostPadState, IndexSnapshot, ShaderEvaluationSnapshot, audio_output_frames,
     audio_progress_age_millis,
     audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
@@ -118,6 +118,23 @@ fn shader_evaluation_snapshot_rejects_inconsistent_sidecars() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn index_snapshot_identity_is_stable_and_reusable_for_identical_captures() {
+    let first = IndexSnapshot::from([1, 2, 3]);
+    let shared = first.clone();
+    let same_content_new_capture = IndexSnapshot::from([1, 2, 3]);
+    let changed_content = IndexSnapshot::from([1, 2, 4]);
+
+    assert_eq!(shared.identity(), first.identity());
+    assert!(Arc::ptr_eq(shared.indices(), first.indices()));
+    assert_eq!(same_content_new_capture.identity(), first.identity());
+    assert!(!Arc::ptr_eq(
+        same_content_new_capture.indices(),
+        first.indices()
+    ));
+    assert_ne!(changed_content.identity(), first.identity());
 }
 
 struct ProgressTelemetryReset;

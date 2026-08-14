@@ -1249,7 +1249,7 @@ fn recovers_32_bit_index_buffers_mislabeled_as_16_bit() {
 fn prefers_immutable_index_snapshot_over_recycled_guest_memory() {
     let mut transient_indices = [0_u16, 1, 2, 0, 2, 3];
     let mut draw = indexed_draw(transient_indices.as_ptr().addr() as u64, 0, 6);
-    draw.index_snapshot = Some(std::sync::Arc::from([0_u32, 1, 2, 0, 2, 3]));
+    draw.index_snapshot = Some([0_u32, 1, 2, 0, 2, 3].into());
     transient_indices.fill(0xffff);
 
     assert_eq!(

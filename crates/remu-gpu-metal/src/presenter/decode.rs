@@ -43,7 +43,7 @@ pub(crate) use self::pipeline::{
     graphics_pipeline_key, metal_color_write_mask, metal_nonindexed_vertex_count,
     metal_primitive_type, ngg_mesh_base_vertex, noop_placeholder_cover_draw,
     prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
-    prepare_nonindexed_ngg_indices,
+    prepare_nonindexed_ngg_indices, primitive_restart_index,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
@@ -441,7 +441,7 @@ pub(super) fn pixel_input_controls(registers: &[GpuRegister]) -> [u32; 32] {
 
 pub(super) fn read_draw_indices(draw: &IndexedDraw) -> Option<Arc<[u32]>> {
     if let Some(indices) = &draw.index_snapshot {
-        return Some(indices.clone());
+        return Some(Arc::clone(indices.indices()));
     }
     if draw.index_buffer_address < 0x10_000 || draw.index_count > 65_536 {
         return None;

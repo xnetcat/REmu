@@ -223,7 +223,7 @@ pub(crate) fn draw_primitive_restart_index(draw: &remu_gpu::IndexedDraw) -> Opti
     }
 }
 
-pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<[u32]>> {
+pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<remu_gpu::IndexSnapshot> {
     if !draw.indexed || draw.index_buffer_address < 0x10_000 || draw.index_count > 1_048_576 {
         return None;
     }
@@ -241,9 +241,9 @@ pub(crate) fn snapshot_draw_indices(draw: &remu_gpu::IndexedDraw) -> Option<Arc<
         && indices_look_like_u32_read_as_u16(indices.as_ref())
         && let Some(recovered) = snapshot_draw_indices_with_element_size(draw, 4)
     {
-        return Some(recovered);
+        return Some(recovered.into());
     }
-    Some(indices)
+    Some(indices.into())
 }
 
 fn snapshot_draw_indices_with_element_size(
