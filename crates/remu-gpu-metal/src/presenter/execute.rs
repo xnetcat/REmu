@@ -2207,7 +2207,7 @@ impl MetalPresenter {
                                         index < DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY
                                     }) && seen.insert(*index)
                                 })
-                                .take(24)
+                                .take(64)
                                 .map(|index| {
                                     let base = usize::try_from(index)
                                         .expect("filtered diagnostic vertex index fits usize")
@@ -2219,7 +2219,9 @@ impl MetalPresenter {
                                         words[base + 3],
                                     ];
                                     let value = raw.map(f32::from_bits);
-                                    let registers = words[base + 4..base + 24].to_vec();
+                                    let registers = words
+                                        [base + 4..base + DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX]
+                                        .to_vec();
                                     (index, raw, value, registers)
                                 })
                                 .collect::<Vec<_>>(),

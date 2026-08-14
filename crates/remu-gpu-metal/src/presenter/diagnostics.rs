@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY: usize = 262_144;
 
-pub(super) const DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX: usize = 24;
+pub(super) const DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX: usize = 36;
 
 pub(super) const DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX: u64 = 30;
 

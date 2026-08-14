@@ -619,7 +619,7 @@ impl Compiler<'_> {
                     let _ = writeln!(
                         source,
                         "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_vertex_id < 262144u) {{\n\
-                         \x20       uint remu_debug_base = remu_vertex_id * 24u;\n\
+                         \x20       uint remu_debug_base = remu_vertex_id * 36u;\n\
                          \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>(remu_out.position.x);\n\
                          \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>(remu_out.position.y);\n\
                          \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>(remu_out.position.z);\n\
@@ -680,16 +680,21 @@ impl Compiler<'_> {
                         );
                     let _ = writeln!(
                         source,
-                        "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_thread_index < 24u) {{\n\
-                         \x20       uint remu_debug_base = remu_thread_index * 24u;\n\
+                        "    if (remu_initial_s[{diagnostic_enable_index}] != 0u && remu_thread_index < 64u) {{\n\
+                         \x20       uint remu_debug_base = remu_thread_index * 36u;\n\
                          \x20       remu_debug_position[remu_debug_base + 0u] = as_type<uint>(remu_out.position.x);\n\
                          \x20       remu_debug_position[remu_debug_base + 1u] = as_type<uint>(remu_out.position.y);\n\
                          \x20       remu_debug_position[remu_debug_base + 2u] = as_type<uint>(remu_out.position.z);\n\
-                         \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>(remu_out.position.w);\n\
-                         \x20       remu_debug_position[remu_debug_base + 17u] = v[13];\n\
-                         \x20       remu_debug_position[remu_debug_base + 18u] = v[14];\n\
-                         \x20   }}"
+                         \x20       remu_debug_position[remu_debug_base + 3u] = as_type<uint>(remu_out.position.w);"
                     );
+                    for register in 0..32 {
+                        let _ = writeln!(
+                            source,
+                            "        remu_debug_position[remu_debug_base + {}u] = v[{register}];",
+                            register + 4
+                        );
+                    }
+                    source.push_str("    }\n");
                 }
                 source.push_str(
                     "    if (remu_thread_index < remu_mesh_vertex_count) remu_mesh.set_vertex(remu_thread_index, remu_out);\n\
