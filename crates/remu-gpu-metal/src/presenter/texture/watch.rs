@@ -169,7 +169,10 @@ impl MetalPresenter {
                             "removed-mapping-replaced",
                         );
                     }
-                    if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                    if let Some(resident) = self
+                        .resident_guest_textures
+                        .retire_clean(&descriptor, "acquire-mapping-replaced")?
+                    {
                         trace_resident_texture_removal("acquire-mapping-replaced", &resident);
                     }
                     continue;

@@ -564,7 +564,10 @@ impl MetalPresenter {
                             .expect("collected DMA source texture exists"),
                     )?;
                     if refresh == WriteWatchRefresh::Replaced {
-                        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                        if let Some(resident) = self
+                            .resident_guest_textures
+                            .retire_clean(&descriptor, "dma-source-mapping-replaced")?
+                        {
                             trace_resident_texture_removal(
                                 "dma-source-mapping-replaced",
                                 &resident,
@@ -584,7 +587,10 @@ impl MetalPresenter {
                         .expect("refreshed DMA source texture exists")
                         .cpu_write_obsoletes_gpu_writeback(refresh)?
                     {
-                        if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                        if let Some(resident) = self
+                            .resident_guest_textures
+                            .retire_clean(&descriptor, "cpu-reused-dma-source")?
+                        {
                             trace_resident_texture_removal("cpu-reused-dma-source", &resident);
                         }
                         continue;

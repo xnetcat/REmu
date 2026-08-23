@@ -215,7 +215,10 @@ impl MetalPresenter {
                     .expect("collected sampled alias exists"),
             )?;
             if refresh == WriteWatchRefresh::Replaced {
-                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                if let Some(resident) = self
+                    .resident_guest_textures
+                    .retire_clean(&descriptor, "sampled-alias-mapping-replaced")?
+                {
                     trace_resident_texture_removal("sampled-alias-mapping-replaced", &resident);
                 }
                 continue;
@@ -232,7 +235,10 @@ impl MetalPresenter {
                 .expect("refreshed sampled alias exists")
                 .cpu_write_obsoletes_gpu_writeback(refresh)?
             {
-                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                if let Some(resident) = self
+                    .resident_guest_textures
+                    .retire_clean(&descriptor, "cpu-reused-sampled-alias")?
+                {
                     // The CPU has repurposed this physical heap range since the render that
                     // produced `resident`. Keep the newer bytes authoritative so the following
                     // upload observes the guest's command/resource contents.

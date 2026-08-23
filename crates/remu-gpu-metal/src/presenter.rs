@@ -1785,6 +1785,11 @@ impl ResidentGuestTexture {
                     return Ok(false);
                 }
                 if self.write_watch.content_has_changed()? {
+                    // The watch proves guest RAM replaced the complete watched allocation after
+                    // the GPU ownership boundary. Resolve authority and publication debt before a
+                    // caller requests clean retirement; returning true alone used to let callers
+                    // drop dirty debt directly from the residency map.
+                    self.demote(StaleSource::GuestMemory);
                     return Ok(true);
                 }
                 self.note_gpu_write();

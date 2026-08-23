@@ -940,7 +940,10 @@ impl MetalPresenter {
         let refresh = refresh_resident_texture_write_watch(resident)?;
         match refresh {
             WriteWatchRefresh::Replaced => {
-                if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+                if let Some(resident) = self
+                    .resident_guest_textures
+                    .retire_clean(&descriptor, "scanout-mapping-replaced")?
+                {
                     trace_resident_texture_removal("scanout-mapping-replaced", &resident);
                 }
                 return Ok(());
@@ -954,7 +957,10 @@ impl MetalPresenter {
             .expect("refreshed scanout resident exists")
             .cpu_write_obsoletes_gpu_writeback(refresh)?
         {
-            if let Some(resident) = self.resident_guest_textures.remove(&descriptor) {
+            if let Some(resident) = self
+                .resident_guest_textures
+                .retire_clean(&descriptor, "cpu-reused-scanout")?
+            {
                 trace_resident_texture_removal("cpu-reused-scanout", &resident);
             }
             return Ok(());

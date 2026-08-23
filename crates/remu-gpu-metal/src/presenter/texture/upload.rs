@@ -803,12 +803,11 @@ pub(crate) fn upload_image_textures(
                     false
                 };
                 if replaced
-                    && let Some(resident) = resident_guest_textures.remove(&descriptor.guest) {
-                        trace_resident_texture_removal(
-                            "sample-upload-mapping-replaced",
-                            &resident,
-                        );
-                    }
+                    && let Some(resident) = resident_guest_textures
+                        .retire_clean(&descriptor.guest, "sample-upload-mapping-replaced")?
+                {
+                    trace_resident_texture_removal("sample-upload-mapping-replaced", &resident);
+                }
             }
             let multisample_resolve = (!comparison && descriptor.texture_type == 9)
                 .then(|| {

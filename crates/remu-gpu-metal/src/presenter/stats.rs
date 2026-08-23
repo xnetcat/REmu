@@ -387,6 +387,14 @@ pub(super) static RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS: AtomicU64 = AtomicU64:
 /// whose `gpu_written`, `content_version` and activity never reached a resident that exists.
 pub(super) static RESIDENT_WRITE_ATTRIBUTION_MISSES: AtomicU64 = AtomicU64::new(0);
 
+/// Resident retirements that proved the allocation was clean, published, or transferred.
+pub(super) static RESIDENT_RETIRE_CLEAN: AtomicU64 = AtomicU64::new(0);
+pub(super) static RESIDENT_RETIRE_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+pub(super) static RESIDENT_RETIRE_TRANSFERRED: AtomicU64 = AtomicU64::new(0);
+
+/// Clean-retirement attempts refused because publication debt was still outstanding.
+pub(super) static RESIDENT_RETIRE_DIRTY_REFUSED: AtomicU64 = AtomicU64::new(0);
+
 pub(super) static RESIDENT_DEPTH_SAMPLE_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Times a range set widened its claim instead of tracking every run exactly.

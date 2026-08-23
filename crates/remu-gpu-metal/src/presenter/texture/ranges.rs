@@ -225,9 +225,8 @@ impl GpuDebtSet {
         &self.0
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn contains_all(&self, other: &RangeSet) -> bool {
-        self.0.contains_all(other)
+    pub(crate) fn contains_all(&self, other: &Self) -> bool {
+        self.0.contains_all(&other.0)
     }
 
     /// Rebase a whole-allocation debt when a layout migration moves every byte.
