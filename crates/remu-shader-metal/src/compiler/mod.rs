@@ -58,6 +58,8 @@ pub(crate) struct Compiler<'a> {
     /// into `evaluation.image_bindings`; `Compiler::new` converts and refuses anything else.
     pub(crate) heap_tables: std::collections::BTreeMap<usize, HeapTextureRoute>,
     control_flow: ControlFlowLowering,
+    readfirstlane_site_bases: BTreeMap<u32, usize>,
+    disjoint_readfirstlane_cached_slots: Option<usize>,
     optimization_report: MetalOptimizationReport,
     /// VGPR holding the NGG compacted output vertex id that gates EXP (the `vM` in
     /// `V_CMPX_* sN, vM` immediately before `EXP POS`). When the mesh ABI has an explicit
@@ -329,7 +331,7 @@ impl Compiler<'_> {
     /// second whole-group barrier which otherwise protects a reused record from the next
     /// instruction. Dispatcher shaders and structured loops can revisit a site and must retain the
     /// reused-record protocol.
-    fn disjoint_readfirstlane_slot_count(&self) -> Option<usize> {
+    fn compute_disjoint_readfirstlane_slot_count(&self) -> Option<usize> {
         if !self.split_wave64() || self.control_flow_may_revisit_instruction_sites() {
             return None;
         }
@@ -341,6 +343,34 @@ impl Compiler<'_> {
             .checked_add(readfirstlane_bytes)?;
         (site_count != 0 && total_bytes <= METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
             .then_some(slot_count)
+    }
+
+    /// Builds the cached site-to-exchange-record map from the current disjoint-slot policy.
+    fn plan_disjoint_readfirstlane_layout(&mut self) {
+        let Some(slot_count) = self.compute_disjoint_readfirstlane_slot_count() else {
+            self.readfirstlane_site_bases = BTreeMap::new();
+            self.disjoint_readfirstlane_cached_slots = None;
+            return;
+        };
+        self.disjoint_readfirstlane_cached_slots = Some(slot_count);
+        self.readfirstlane_site_bases = self
+            .program
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.opcode.is("VReadfirstlaneB32"))
+            .enumerate()
+            .map(|(site, instruction)| {
+                (
+                    instruction.pc,
+                    site.checked_mul(SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP)
+                        .expect("the checked total slot count bounds every site base"),
+                )
+            })
+            .collect();
+    }
+
+    fn disjoint_readfirstlane_slot_count(&self) -> Option<usize> {
+        self.disjoint_readfirstlane_cached_slots
     }
 
     fn total_threadgroup_memory_bytes(&self) -> Option<usize> {
@@ -358,13 +388,8 @@ impl Compiler<'_> {
     }
 
     fn disjoint_readfirstlane_site_base(&self, pc: u32) -> Option<usize> {
-        self.disjoint_readfirstlane_slot_count()?;
-        self.program
-            .instructions
-            .iter()
-            .filter(|instruction| instruction.opcode.is("VReadfirstlaneB32"))
-            .position(|instruction| instruction.pc == pc)
-            .and_then(|site| site.checked_mul(SPLIT_WAVE64_HALF_WAVES_PER_THREADGROUP))
+        self.disjoint_readfirstlane_cached_slots?;
+        self.readfirstlane_site_bases.get(&pc).copied()
     }
 
     fn uses_lds_memory(&self) -> bool {

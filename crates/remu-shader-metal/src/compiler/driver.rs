@@ -108,12 +108,9 @@ impl<'a> Compiler<'a> {
             return Err(MetalCompileError::EmptyProgram);
         }
         let optimization_started = Instant::now();
-        let uniformity = (options.optimization.analyzes() && options.optimization.uniformity)
-            .then(|| {
-                remu_shader::analyze_uniformity(
-                    program,
-                    &remu_shader::UniformityInputs::default(),
-                )
+        let uniformity =
+            (options.optimization.analyzes() && options.optimization.uniformity).then(|| {
+                remu_shader::analyze_uniformity(program, &remu_shader::UniformityInputs::default())
             });
         let fallback_reasons = uniformity.as_ref().map_or_else(Vec::new, |analysis| {
             program
@@ -125,10 +122,7 @@ impl<'a> Compiler<'a> {
                         .semantics(index)
                         .filter(|semantics| !semantics.modeled)
                         .map(|_| {
-                            format!(
-                                "pc {:#x}:unmodeled:{}",
-                                instruction.pc, instruction.opcode
-                            )
+                            format!("pc {:#x}:unmodeled:{}", instruction.pc, instruction.opcode)
                         })
                 })
                 .collect()
@@ -473,7 +467,7 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let compiler = Self {
+        let mut compiler = Self {
             program,
             evaluation,
             options,
@@ -486,9 +480,12 @@ impl<'a> Compiler<'a> {
             image_slots,
             heap_tables,
             control_flow,
+            readfirstlane_site_bases: BTreeMap::new(),
+            disjoint_readfirstlane_cached_slots: None,
             optimization_report,
             mesh_export_vertex_vgpr,
         };
+        compiler.plan_disjoint_readfirstlane_layout();
         let total_threadgroup_memory = compiler.total_threadgroup_memory_bytes();
         if total_threadgroup_memory.is_none_or(|bytes| bytes > METAL_THREADGROUP_MEMORY_LIMIT_BYTES)
         {

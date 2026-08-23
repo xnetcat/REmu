@@ -388,6 +388,43 @@ fn acyclic_wave64_readfirstlane_sites_use_disjoint_exchange_records() {
 }
 
 #[test]
+fn captured_acyclic_wave64_site_count_halves_whole_group_barriers() {
+    // Silent Hill's largest captured acyclic compute shader contains 44 static sites. The
+    // previous shared-record protocol emitted two whole-threadgroup barriers for every site.
+    let instructions = (0_u32..44)
+        .map(|site| Instruction {
+            pc: site * 4,
+            encoding: ShaderEncoding::Vop1,
+            opcode: Opcode::Known("VReadfirstlaneB32"),
+            words: vec![0],
+            sources: vec![Operand::vector(4)],
+            destinations: vec![Operand::scalar(44 + site)],
+            control: None,
+        })
+        .collect();
+    let shader = compile_msl(
+        &Program::new(0x1000, instructions),
+        &empty_evaluation(),
+        &MetalCompileOptions::compute_wave(0, 64),
+    )
+    .expect("captured acyclic site count fits the disjoint exchange budget");
+
+    assert!(
+        shader
+            .source
+            .contains("threadgroup uint remu_readfirstlane_values[1408]")
+    );
+    assert_eq!(
+        shader
+            .source
+            .matches("threadgroup_barrier(mem_flags::mem_threadgroup)")
+            .count(),
+        44,
+        "disjoint records retain the producer-consumer barrier and remove only reuse barriers"
+    );
+}
+
+#[test]
 fn declared_but_unused_lds_does_not_consume_threadgroup_memory() {
     let program = Program::new(
         0x1000,
