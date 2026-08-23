@@ -433,6 +433,119 @@ fn identity_targeted_backing_write_is_refused_for_a_virtually_keyed_backing() {
 }
 
 #[test]
+fn stamped_range_uses_epoch_fast_path_and_refreshes_durable_physical_identity() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let stamped = guest_shared_resolve_stamped_range(mapped.get(), GUEST_PAGE_SIZE)
+        .expect("direct mapping resolves with a stamp");
+    assert!(stamped.epoch_is_current());
+    assert!(!stamped.is_virtually_keyed());
+    assert_eq!(stamped.guest_address(), mapped.get());
+    assert_eq!(stamped.byte_count(), GUEST_PAGE_SIZE);
+    assert_eq!(stamped.mapping_token().record_count(), 1);
+
+    let unrelated = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &unrelated,
+            0,
+        )
+        .unwrap();
+    assert!(!stamped.epoch_is_current());
+    let GuestSharedRangeRevalidation::Current(refreshed) = stamped.revalidate() else {
+        panic!("durable physical bytes must survive unrelated epoch drift");
+    };
+    assert_eq!(refreshed.identity(), stamped.identity());
+    assert!(refreshed.epoch_is_current());
+}
+
+#[test]
+fn stamped_virtual_range_rejects_unmap_remap_aba_to_the_same_numbers() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let mapped = memory
+        .map_committed(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .unwrap();
+    let stamped = guest_shared_resolve_stamped_range(mapped.get(), GUEST_PAGE_SIZE)
+        .expect("committed mapping resolves with a stamp");
+    assert!(stamped.is_virtually_keyed());
+
+    memory.unmap(mapped, GUEST_PAGE_SIZE).unwrap();
+    let remapped = memory
+        .map_committed(
+            GuestMapPlacement::Fixed(mapped),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+        )
+        .unwrap();
+    assert_eq!(remapped, mapped);
+    let replacement = guest_shared_resolve_stamped_range(mapped.get(), GUEST_PAGE_SIZE)
+        .expect("recycled committed mapping resolves");
+    assert_eq!(replacement.identity(), stamped.identity());
+    assert_ne!(replacement.mapping_token(), stamped.mapping_token());
+    assert!(matches!(
+        stamped.revalidate(),
+        GuestSharedRangeRevalidation::Replaced
+    ));
+}
+
+#[test]
+fn stamped_resolution_retries_while_the_mapping_epoch_is_odd() {
+    let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).unwrap();
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .unwrap();
+    let mutation = super::shared::begin_shared_mapping_mutation();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let address = mapped.get();
+    let resolver = std::thread::spawn(move || {
+        sender
+            .send(guest_shared_resolve_stamped_range(address, GUEST_PAGE_SIZE))
+            .unwrap();
+    });
+    assert!(
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(10))
+            .is_err(),
+        "an odd epoch must not be accepted"
+    );
+    drop(mutation);
+    let resolved = receiver
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .expect("resolution resumes after mutation")
+        .expect("mapping remains live");
+    assert_eq!(resolved.identity().backing_id, backing.id());
+    resolver.join().unwrap();
+}
+
+#[test]
 fn identity_targeted_backing_write_is_refused_when_live_records_cover_only_part_of_the_range() {
     let mut memory = GuestAddressSpace::new(SPACE_SIZE).unwrap();
     let backing = GuestPhysicalBacking::new(2 * GUEST_PAGE_SIZE).unwrap();

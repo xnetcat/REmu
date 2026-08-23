@@ -13,6 +13,17 @@ struct SharedMappingRecord {
     end: u64,
     backing: GuestPhysicalBacking,
     backing_offset: u64,
+    generation: u64,
+}
+
+static NEXT_SHARED_MAPPING_RECORD_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_shared_mapping_record_generation() -> u64 {
+    NEXT_SHARED_MAPPING_RECORD_GENERATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |generation| {
+            generation.checked_add(1)
+        })
+        .expect("shared-mapping record generation exhausted")
 }
 
 /// Stable physical-backing identity for a byte range in a shared guest mapping.
@@ -20,6 +31,104 @@ struct SharedMappingRecord {
 pub struct GuestSharedMappingIdentity {
     pub backing_id: u64,
     pub backing_offset: u64,
+}
+
+/// Opaque proof naming the exact registry records used to resolve a guest range.
+///
+/// Record generations are process-unique. Unmapping and mapping the same virtual range to the
+/// same numeric backing offset therefore produces a different token and cannot pass an ABA check.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GuestSharedMappingRangeToken {
+    record_generations: Box<[u64]>,
+}
+
+impl GuestSharedMappingRangeToken {
+    #[must_use]
+    pub fn record_count(&self) -> usize {
+        self.record_generations.len()
+    }
+}
+
+/// A full-range physical resolution stamped with the mapping epoch and ABA token.
+#[derive(Clone, Debug)]
+pub struct GuestSharedRangeResolution {
+    guest_address: u64,
+    identity: GuestSharedMappingIdentity,
+    byte_count: u64,
+    mapping_epoch: u64,
+    mapping_token: GuestSharedMappingRangeToken,
+    backing_range: GuestSharedBackingRange,
+}
+
+impl GuestSharedRangeResolution {
+    #[must_use]
+    pub const fn identity(&self) -> GuestSharedMappingIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub const fn guest_address(&self) -> u64 {
+        self.guest_address
+    }
+
+    #[must_use]
+    pub const fn byte_count(&self) -> u64 {
+        self.byte_count
+    }
+
+    #[must_use]
+    pub const fn mapping_epoch(&self) -> u64 {
+        self.mapping_epoch
+    }
+
+    #[must_use]
+    pub const fn mapping_token(&self) -> &GuestSharedMappingRangeToken {
+        &self.mapping_token
+    }
+
+    #[must_use]
+    pub fn is_virtually_keyed(&self) -> bool {
+        self.backing_range.is_virtually_keyed()
+    }
+
+    #[must_use]
+    pub fn backing_range(&self) -> &GuestSharedBackingRange {
+        &self.backing_range
+    }
+
+    /// Cheap validity hint. False requires full re-resolution; true proves no mapping transition
+    /// began since this range was resolved.
+    #[must_use]
+    pub fn epoch_is_current(&self) -> bool {
+        guest_shared_mapping_epoch() == self.mapping_epoch
+    }
+
+    /// Re-resolves this binding after an epoch drift and enforces the backing's ABA policy.
+    #[must_use]
+    pub fn revalidate(&self) -> GuestSharedRangeRevalidation {
+        if self.epoch_is_current() {
+            return GuestSharedRangeRevalidation::Current(self.clone());
+        }
+        let Some(current) = guest_shared_resolve_stamped_range(self.guest_address, self.byte_count)
+        else {
+            return GuestSharedRangeRevalidation::Unmapped;
+        };
+        let same_physical = current.identity == self.identity;
+        let same_token = current.mapping_token == self.mapping_token;
+        if same_physical && (!self.is_virtually_keyed() || same_token) {
+            GuestSharedRangeRevalidation::Current(current)
+        } else {
+            GuestSharedRangeRevalidation::Replaced
+        }
+    }
+}
+
+/// Result of re-resolving a stamped guest range after its epoch changed.
+#[derive(Clone, Debug)]
+pub enum GuestSharedRangeRevalidation {
+    Current(GuestSharedRangeResolution),
+    Replaced,
+    Unmapped,
 }
 
 /// One live CPU mapping that covers a contiguous portion of a GPU-physical backing range.
@@ -104,7 +213,8 @@ impl std::ops::Deref for SharedRegistry {
 }
 
 impl SharedRegistry {
-    fn insert(&mut self, address: u64, record: SharedMappingRecord) {
+    fn insert(&mut self, address: u64, mut record: SharedMappingRecord) {
+        record.generation = next_shared_mapping_record_generation();
         let backing_id = record.backing.id();
         if let Some(previous) = self.by_address.insert(address, record)
             && previous.backing.id() != backing_id
@@ -285,6 +395,119 @@ fn resolve_shared_backing_range(
     Some((first.backing.clone(), physical_start, physical_end))
 }
 
+fn resolved_range_token(
+    mappings: &SharedRegistry,
+    address: u64,
+    physical_start: u64,
+    physical_end: u64,
+    backing_id: u64,
+) -> Option<GuestSharedMappingRangeToken> {
+    let (_, first) = mappings.range(..=address).next_back()?;
+    let mut generations = vec![first.generation];
+    let mut cursor = physical_start;
+    while cursor < physical_end {
+        let (_, record, covered_end) = mappings
+            .backing_records(backing_id)
+            .filter_map(|(mapping_start, record)| {
+                let mapping_length = record.end.checked_sub(mapping_start)?;
+                let backing_end = record.backing_offset.checked_add(mapping_length)?;
+                (record.backing_offset <= cursor && cursor < backing_end).then_some((
+                    mapping_start,
+                    record,
+                    backing_end.min(physical_end),
+                ))
+            })
+            .max_by_key(|(mapping_start, _, covered_end)| (*covered_end, *mapping_start))?;
+        if covered_end <= cursor {
+            return None;
+        }
+        if generations.last().copied() != Some(record.generation)
+            && !generations.contains(&record.generation)
+        {
+            generations.push(record.generation);
+        }
+        cursor = covered_end;
+    }
+    Some(GuestSharedMappingRangeToken {
+        record_generations: generations.into_boxed_slice(),
+    })
+}
+
+fn retained_backing_range(
+    backing: GuestPhysicalBacking,
+    physical_start: u64,
+    physical_end: u64,
+) -> Option<GuestSharedBackingRange> {
+    let page_size = host_page_size().ok()?;
+    let view_start = physical_start - physical_start % page_size;
+    let resource_offset = physical_start.checked_sub(view_start)?;
+    let requested_bytes = physical_end.checked_sub(physical_start)?;
+    let view_byte_count = resource_offset
+        .checked_add(requested_bytes)
+        .and_then(|length| align_up(length, page_size).ok())
+        .and_then(|length| host_size(length).ok())?;
+    view_start
+        .checked_add(u64::try_from(view_byte_count).ok()?)
+        .filter(|end| *end <= backing.size())?;
+
+    Some(GuestSharedBackingRange {
+        view_identity: GuestSharedMappingIdentity {
+            backing_id: backing.id(),
+            backing_offset: view_start,
+        },
+        backing,
+        view_byte_count,
+        resource_offset,
+    })
+}
+
+/// Resolves a complete guest range under an even mapping epoch and returns its retained backing,
+/// physical identity, and mapping-record ABA token as one coherent snapshot.
+#[must_use]
+pub fn guest_shared_resolve_stamped_range(
+    address: u64,
+    byte_count: u64,
+) -> Option<GuestSharedRangeResolution> {
+    loop {
+        let before = guest_shared_mapping_epoch();
+        if before & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let mappings = shared_mappings()
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resolved = resolve_shared_backing_range(&mappings, address, byte_count).and_then(
+            |(backing, physical_start, physical_end)| {
+                let token = resolved_range_token(
+                    &mappings,
+                    address,
+                    physical_start,
+                    physical_end,
+                    backing.id(),
+                )?;
+                let backing_range = retained_backing_range(backing, physical_start, physical_end)?;
+                Some(GuestSharedRangeResolution {
+                    guest_address: address,
+                    identity: GuestSharedMappingIdentity {
+                        backing_id: backing_range.view_identity().backing_id,
+                        backing_offset: physical_start,
+                    },
+                    byte_count,
+                    mapping_epoch: before,
+                    mapping_token: token,
+                    backing_range,
+                })
+            },
+        );
+        drop(mappings);
+        let after = guest_shared_mapping_epoch();
+        if before == after && after & 1 == 0 {
+            return resolved;
+        }
+    }
+}
+
 /// Resolves a live shared guest range to its backing object and byte offset.
 ///
 /// Adjacent virtual mappings are accepted when they name contiguous slices of the same backing.
@@ -385,28 +608,7 @@ pub fn guest_shared_backing_range(
     let (backing, physical_start, physical_end) =
         resolve_shared_backing_range(&mappings, address, byte_count)?;
     drop(mappings);
-
-    let page_size = host_page_size().ok()?;
-    let view_start = physical_start - physical_start % page_size;
-    let resource_offset = physical_start.checked_sub(view_start)?;
-    let requested_bytes = physical_end.checked_sub(physical_start)?;
-    let view_byte_count = resource_offset
-        .checked_add(requested_bytes)
-        .and_then(|length| align_up(length, page_size).ok())
-        .and_then(|length| host_size(length).ok())?;
-    view_start
-        .checked_add(u64::try_from(view_byte_count).ok()?)
-        .filter(|end| *end <= backing.size())?;
-
-    Some(GuestSharedBackingRange {
-        view_identity: GuestSharedMappingIdentity {
-            backing_id: backing.id(),
-            backing_offset: view_start,
-        },
-        backing,
-        view_byte_count,
-        resource_offset,
-    })
+    retained_backing_range(backing, physical_start, physical_end)
 }
 
 fn ranges_overlap(left: u64, left_end: u64, right: u64, right_end: u64) -> bool {
@@ -1428,6 +1630,7 @@ fn unregister_shared_mapping_range_locked(
                 start,
                 SharedMappingRecord {
                     end: address,
+                    generation: 0,
                     ..record.clone()
                 },
             );
@@ -1439,6 +1642,7 @@ fn unregister_shared_mapping_range_locked(
                     end: record.end,
                     backing: record.backing,
                     backing_offset: record.backing_offset + (end - start),
+                    generation: 0,
                 },
             );
         }
@@ -1483,6 +1687,7 @@ fn coalesce_shared_mapping_record(mappings: &mut SharedRegistry, address: u64) {
                 end: current.end,
                 backing: previous.backing,
                 backing_offset: previous.backing_offset,
+                generation: 0,
             },
         );
         merged_start = previous_start;
@@ -1503,6 +1708,7 @@ fn coalesce_shared_mapping_record(mappings: &mut SharedRegistry, address: u64) {
                 end: next.end,
                 backing: current.backing,
                 backing_offset: current.backing_offset,
+                generation: 0,
             },
         );
     }
@@ -1530,6 +1736,7 @@ pub(super) fn register_shared_mapping_range(
             end,
             backing: backing.clone(),
             backing_offset,
+            generation: 0,
         },
     );
     // The VMA layer retains mapping-call boundaries when the guest requests them. The physical

@@ -37,18 +37,19 @@ mod shared;
 pub(crate) use shared::guest_write_alias_segments;
 pub use shared::{
     GuardedBackingWrite, GuestRangeLease, GuestSharedBackingRange, GuestSharedBackingSegment,
-    GuestSharedMappingIdentity, LeasePublishOutcome, guest_publish_release_fence,
-    guest_shared_backing_alias_segments, guest_shared_backing_identity, guest_shared_backing_range,
-    take_guest_shared_identity_statistics,
-    guest_shared_backing_any_range_overlaps, guest_shared_backing_ranges_overlap,
-    guest_shared_backing_segments, guest_shared_mapping_epoch,
-    guest_shared_mapping_identity, guest_shared_mapping_table, load_guest_shared_u32,
-    load_guest_shared_u64,
-    load_guest_visible_u32, load_guest_visible_u64, publish_guest_shared_u32_if_identity,
-    publish_guest_shared_u64_if_identity, read_guest_shared_backing, store_guest_visible_u32,
-    store_guest_visible_u64, write_guest_shared_backing, write_guest_shared_backing_at_identity,
-    write_guest_shared_backing_at_identity_with_baseline, write_guest_shared_backing_if_identity,
-    write_guest_shared_backing_if_identity_and_baseline, write_guest_shared_backing_scattered,
+    GuestSharedMappingIdentity, GuestSharedMappingRangeToken, GuestSharedRangeResolution,
+    GuestSharedRangeRevalidation, LeasePublishOutcome, guest_publish_release_fence,
+    guest_shared_backing_alias_segments, guest_shared_backing_any_range_overlaps,
+    guest_shared_backing_identity, guest_shared_backing_range, guest_shared_backing_ranges_overlap,
+    guest_shared_backing_segments, guest_shared_mapping_epoch, guest_shared_mapping_identity,
+    guest_shared_mapping_table, guest_shared_resolve_stamped_range, load_guest_shared_u32,
+    load_guest_shared_u64, load_guest_visible_u32, load_guest_visible_u64,
+    publish_guest_shared_u32_if_identity, publish_guest_shared_u64_if_identity,
+    read_guest_shared_backing, store_guest_visible_u32, store_guest_visible_u64,
+    take_guest_shared_identity_statistics, write_guest_shared_backing,
+    write_guest_shared_backing_at_identity, write_guest_shared_backing_at_identity_with_baseline,
+    write_guest_shared_backing_if_identity, write_guest_shared_backing_if_identity_and_baseline,
+    write_guest_shared_backing_scattered,
 };
 
 mod reservation;
