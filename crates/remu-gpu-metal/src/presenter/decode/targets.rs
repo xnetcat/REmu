@@ -521,7 +521,10 @@ fn decode_render_targets_untimed(
 ///
 /// The command processor defines MRT0 as the source and MRT1 as the destination. The trigger
 /// shader normally exports only slot zero, so neither `CB_TARGET_MASK` nor the shader export mask
-/// can be used to discover MRT1.
+/// can be used to discover MRT1. Hardware resolve is MSAA MRT0 → single-sample MRT1. Unity's
+/// post stack also names the same packet for a single-sample MRT0 → MRT1 copy of the current
+/// color resident onto the shader-readable surface; rejecting `sample_count==1` left that
+/// destination cleared and later grade sampled zeros.
 pub(crate) fn decode_color_resolve_targets(
     draw: &IndexedDraw,
 ) -> Result<(DecodedRenderTarget, DecodedRenderTarget), String> {
@@ -547,9 +550,9 @@ pub(crate) fn decode_color_resolve_targets(
             destination.texture.height
         ));
     }
-    if source.sample_count <= 1 || destination.sample_count != 1 {
+    if destination.sample_count != 1 || source.sample_count == 0 {
         return Err(format!(
-            "color resolve requires multisample MRT0 and single-sample MRT1, got source={} destination={}",
+            "color resolve requires a readable MRT0 and single-sample MRT1, got source={} destination={}",
             source.sample_count, destination.sample_count
         ));
     }

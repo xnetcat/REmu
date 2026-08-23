@@ -219,7 +219,26 @@ fn pixel_wave64_compare_clears_the_explicit_mask_high_word() {
         destinations: vec![Operand::scalar(20)],
         control: None,
     };
-    let program = Program::new(0x1000, vec![compare, saveexec]);
+    // SOPP simm16=+1: taken target is the second SNop (pc 20); fallthrough is the first (pc 16).
+    let branch = Instruction {
+        pc: 12,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::Known("SCbranchVccz"),
+        words: vec![1],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    };
+    let snop = |pc| Instruction {
+        pc,
+        encoding: ShaderEncoding::Sopp,
+        opcode: Opcode::Known("SNop"),
+        words: vec![0],
+        sources: Vec::new(),
+        destinations: Vec::new(),
+        control: None,
+    };
+    let program = Program::new(0x1000, vec![compare, saveexec, branch, snop(16), snop(20)]);
     let shader = compile_msl(
         &program,
         &empty_evaluation(),
@@ -230,6 +249,37 @@ fn pixel_wave64_compare_clears_the_explicit_mask_high_word() {
     assert!(
         shader.source.contains("remu_s_9 = 0u;"),
         "the absent high half must not retain the neighboring descriptor SGPR"
+    );
+    assert!(
+        shader
+            .source
+            .contains("uint remu_lane [[thread_index_in_simdgroup]]"),
+        "fragment EXEC bits must use the hardware SIMD lane, not a compacted prefix"
+    );
+    assert!(
+        !shader
+            .source
+            .contains("uint remu_lane = simd_prefix_exclusive_sum(1u)"),
+        "compacted prefix-exclusive lane ids discard fragment quads whose hardware lane is not 0..N-1"
+    );
+    assert!(
+        shader.source.contains("remu_s_126 = 0xffffffffu;"),
+        "pixel EXEC must start as a full local SIMD32 mask; fragment simd_ballot(true) returns 0"
+    );
+    assert!(
+        !shader.source.contains("simd_ballot("),
+        "pixel V_CMP / SAVEEXEC must not emit fragment simd_ballot"
+    );
+    assert!(
+        shader.source.contains("exec ? 0xfffffffffffffffful : 0ul")
+            || shader.source.contains("(exec) ? 0xffffffffu : 0u"),
+        "pixel SAVEEXEC must keep this thread's EXEC in every local bit"
+    );
+    assert!(
+        shader.source.contains("simd_or(remu_s_106 | remu_s_107)")
+            || shader.source.contains("simd_or(s[106] | s[107])"),
+        "pixel S_CBRANCH_VCCZ must be wave-any over the per-thread mask pair, not a private bit test:\n{}",
+        shader.source
     );
 }
 

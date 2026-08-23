@@ -2457,6 +2457,135 @@ fn pending_label_value_does_not_satisfy_a_wait_before_terminal_publication() {
 }
 
 #[test]
+fn pending_terminal_wait_settle_continues_the_same_drain_tick() {
+    remu_gpu::clear_event_sink();
+    let (sender, receiver) = gpu_event_channel();
+    remu_gpu::install_event_sink(sender);
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.per_queue_guest_batches = false;
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.open_guest_batch = Some(GuestCommandBatch {
+        queue_id: None,
+        command_buffer: queue.new_command_buffer().to_owned(),
+        work: Vec::new(),
+        committed_at: None,
+        global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
+        global_writebacks: Vec::new(),
+        guest_write_ranges: Vec::new(),
+        memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
+        render_pass: None,
+        compute_encoder: None,
+        encoded_event_waits: 0,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
+        completion_sequences: Vec::new(),
+    });
+    let (_label_space, address) = mapped_test_label();
+    presenter
+        .execute_guest_memory_release(
+            OrderedEventSource::GuestQueue(0),
+            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(2)),
+        )
+        .expect("producer label stays deferred in the open batch");
+    assert_eq!(presenter.pending_guest_memory_value(address, false), Some(2));
+    assert!(presenter.committed_guest_batches.is_empty());
+
+    let wait = GpuMemoryWait::memory(address, 2, u64::from(u32::MAX), 3, false);
+    assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
+        queue_id: 77,
+        events: vec![
+            GpuEvent::MemoryWait(wait),
+            GpuEvent::MemoryRelease(GpuMemoryRelease::label(
+                address,
+                GpuMemoryReleaseValue::Immediate32(9),
+            )),
+        ],
+    }));
+
+    assert_eq!(presenter.receive_events(), super::PresenterFlow::Continue);
+    assert_eq!(
+        presenter.statistics.batch_flushes_for_blocked_wait, 1,
+        "WAIT_REG_MEM must flush the open producer before parking"
+    );
+    assert!(
+        !presenter.receiver.has_pending_terminal_memory_wait(),
+        "settle_pending_terminal_wait_producer must unpark in the same receive_events tick"
+    );
+    assert!(
+        !presenter.receiver.blocked_queues.contains_key(&77),
+        "queue 77 must keep draining after the producer settles"
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("follow-up release commits");
+    assert_eq!(
+        read_test_label(address),
+        9,
+        "the packet after WAIT_REG_MEM must run in the same drain, not the next AppKit tick"
+    );
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn pending_terminal_wait_settle_flushes_open_producer_when_committed_queue_is_empty() {
+    remu_gpu::clear_event_sink();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    presenter.per_queue_guest_batches = false;
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.open_guest_batch = Some(GuestCommandBatch {
+        queue_id: None,
+        command_buffer: queue.new_command_buffer().to_owned(),
+        work: Vec::new(),
+        committed_at: None,
+        global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
+        global_writebacks: Vec::new(),
+        guest_write_ranges: Vec::new(),
+        memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
+        render_pass: None,
+        compute_encoder: None,
+        encoded_event_waits: 0,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
+        completion_sequences: Vec::new(),
+    });
+    let (_label_space, address) = mapped_test_label();
+    presenter
+        .execute_guest_memory_release(
+            OrderedEventSource::GuestQueue(0),
+            GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(2)),
+        )
+        .expect("producer label stays deferred in the open batch");
+    assert!(presenter.committed_guest_batches.is_empty());
+    assert!(presenter.settle_pending_terminal_wait_producer());
+    assert!(
+        presenter.open_guest_batch.is_none(),
+        "Empty committed queue must Required-flush the open producer"
+    );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("flushed producer retires");
+    assert_eq!(read_test_label(address), 2);
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
 fn terminal_gpu_failure_still_publishes_release_and_latches_ordered_wait() {
     let (_sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");

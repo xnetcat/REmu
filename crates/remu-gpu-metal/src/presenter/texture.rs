@@ -31,7 +31,8 @@ use super::{
     guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_offset_alias_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, initial_depth_clear_for_target, is_storage_image_opcode,
     is_writable_image_opcode, mode5_mip_chain_layout, mode27_mip_chain_layout,
     mode27_surface_z_xor, record_mode27_work_detail, record_texture_dirty_work_detail,
@@ -97,8 +98,9 @@ pub(crate) use self::sampled::{
     create_sampled_guest_texture, create_sampled_guest_texture_from_guest_gpu,
     decode_sampled_texture_linear_from_raw, gpu_written_resident_serving_sampled_key,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible, resident_sample_authority_ok,
-    resident_texture_for_sample, sampled_texture_cache_needs_reload, sampled_texture_key,
+    resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_sample_authority_ok, resident_texture_for_sample, resident_volume_sample_is_eligible,
+    sampled_texture_cache_needs_reload, sampled_texture_key,
     sampled_texture_supports_access, sampled_texture_usage,
 };
 pub(crate) use self::upload::{

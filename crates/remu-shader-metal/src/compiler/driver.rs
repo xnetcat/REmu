@@ -685,7 +685,8 @@ impl<'a> Compiler<'a> {
                 let target = branch_target(instruction)?;
                 let fallthrough =
                     next_pc.ok_or_else(|| "conditional branch has no fallthrough".to_owned())?;
-                let condition = scalar_branch_taken_condition(name)?;
+                let condition =
+                    scalar_branch_taken_condition(name, self.uses_per_thread_lane_masks())?;
                 self.line(
                     3,
                     &format!("pc = ({condition}) ? {target}u : {fallthrough}u;"),
@@ -1004,7 +1005,7 @@ impl<'a> Compiler<'a> {
             }
         }
         exchanged_mask_predicate.map_or_else(
-            || scalar_branch_taken_condition(name).map(str::to_owned),
+            || scalar_branch_taken_condition(name, self.uses_per_thread_lane_masks()),
             Ok,
         )
     }

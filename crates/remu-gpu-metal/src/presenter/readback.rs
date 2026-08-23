@@ -815,6 +815,10 @@ fn diagnostic_texture_numeric_components(
             let value = u16::from_le_bytes([*pixel.first()?, *pixel.get(1)?]);
             Some(([unorm16(value), 0.0, 0.0, 0.0], 1))
         }
+        MTLPixelFormat::R32Float | MTLPixelFormat::Depth32Float => {
+            let value = f32::from_le_bytes(pixel.get(..4)?.try_into().ok()?);
+            Some(([f64::from(value), 0.0, 0.0, 0.0], 1))
+        }
         MTLPixelFormat::RGBA16Float => {
             let component = |offset: usize| {
                 pixel

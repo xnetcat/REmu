@@ -16,11 +16,17 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 fn dependency_ingress_budget() -> usize {
-    if remu_gpu::gpu_work_items_pending() > GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD {
-        GPU_EVENTS_PER_TICK.saturating_mul(GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER)
+    let pending = remu_gpu::gpu_work_items_pending();
+    let multiplier = if pending > super::super::GPU_EVENTS_PER_TICK_EXTREME_BACKLOG_THRESHOLD {
+        super::super::GPU_EVENTS_PER_TICK_EXTREME_BACKLOG_MULTIPLIER
+    } else if pending > super::super::GPU_EVENTS_PER_TICK_HEAVY_BACKLOG_THRESHOLD {
+        super::super::GPU_EVENTS_PER_TICK_HEAVY_BACKLOG_MULTIPLIER
+    } else if pending > GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD {
+        GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER
     } else {
-        GPU_EVENTS_PER_TICK
-    }
+        1
+    };
+    GPU_EVENTS_PER_TICK.saturating_mul(multiplier)
 }
 
 /// Largest producer write, in bytes, indexed per 4-byte cell in `producer_labels`.
@@ -583,6 +589,30 @@ impl OrderedGpuEventReceiver {
     pub(crate) fn advance_after(&mut self, queue_id: u64) {
         if let Some(index) = self.queue_order.iter().position(|&id| id == queue_id) {
             self.next_queue_index = (index + 1) % self.queue_order.len().max(1);
+        }
+    }
+
+    pub(crate) fn has_pending_terminal_memory_wait(&self) -> bool {
+        self.blocked_queues.values().any(|reason| {
+            matches!(reason, QueueBlockReason::GuestMemoryWaitPendingTerminal(_))
+        }) || matches!(
+            self.host_block,
+            Some(QueueBlockReason::GuestMemoryWaitPendingTerminal(_))
+        )
+    }
+
+    pub(crate) fn retry_pending_terminal_memory_waits(&mut self) {
+        self.blocked_queues.retain(|_, reason| {
+            !matches!(
+                reason,
+                QueueBlockReason::GuestMemoryWaitPendingTerminal(_)
+            )
+        });
+        if matches!(
+            self.host_block,
+            Some(QueueBlockReason::GuestMemoryWaitPendingTerminal(_))
+        ) {
+            self.host_block = None;
         }
     }
 

@@ -97,11 +97,13 @@ impl MetalPresenter {
         // cross-queue producer waiting in later channel chunks. Then retry suspended queue fronts
         // once; an unsatisfied wait is re-suspended without permitting later work to overtake it.
         self.receiver.retry_guest_memory_waits();
-        // Do not commit more Metal batches while the in-flight budget is exhausted. Keep draining
-        // decoded guest work into the open batch so queue depth (Q W) does not grow just because
-        // the GPU is still executing earlier submissions.
+        // Do not commit more Metal batches while the in-flight budget is exhausted. Settle the
+        // oldest in-flight batch in this tick so the open batch can flush and Q W does not grow
+        // just because the GPU is still executing earlier submissions. If the GPU is still busy,
+        // keep draining: WAIT_REG_MEM still has to settle its producer in this callback, otherwise
+        // the guest channel grows into the 0–2 present/s stall.
         if self.guest_submission_backpressure_full() {
-            return PresenterFlow::Continue;
+            let _ = self.reclaim_in_flight_guest_batch_slot();
         }
         // Feed the existing compile workers from bounded ordered lookahead even while the current
         // queue front is runnable. Waiting until a cold draw or compute dispatch becomes the
@@ -204,6 +206,16 @@ impl MetalPresenter {
                     // Look ahead far enough to feed all compiler workers while memory-wait queues
                     // remain suspended. Prefetching never executes or reorders an event.
                     self.prefetch_pipeline_compilations();
+                    // A WAIT_REG_MEM whose producer is already committed used to end the whole
+                    // AppKit tick. Superliminal's title hits that after a handful of packets, so
+                    // the other ~70k queued items sat until the next wake and present/s stuck at 2.
+                    // Settle that producer now and keep draining this tick.
+                    if self.receiver.has_pending_terminal_memory_wait()
+                        && self.settle_pending_terminal_wait_producer()
+                    {
+                        self.receiver.retry_pending_terminal_memory_waits();
+                        continue;
+                    }
                     return PresenterFlow::Continue;
                 }
                 OrderedEventPoll::Empty => {

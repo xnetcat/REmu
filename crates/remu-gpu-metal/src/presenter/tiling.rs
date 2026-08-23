@@ -24,7 +24,8 @@ pub(crate) use self::descriptors::{
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_offset_alias_storage, guest_texture_descriptors_share_storage,
     render_resolve_candidate_matches, spans_overlap,
 };
 #[cfg(test)]

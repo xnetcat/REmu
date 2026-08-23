@@ -8,8 +8,8 @@ use metal::{
 };
 use remu_gpu::{GpuRegister, ShaderSnapshot};
 use remu_shader::{
-    Instruction, Opcode, Operand, PixelExportFormat, PixelOutputKind, Program, ShaderEncoding,
-    ShaderEvaluation, decode_program, link_program_continuation,
+    ImageBinding, ImageControl, Instruction, Opcode, Operand, PixelExportFormat, PixelOutputKind,
+    Program, ShaderEncoding, ShaderEvaluation, decode_program, link_program_continuation,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -256,6 +256,94 @@ fn recognizes_noop_placeholder_cover_without_attachments() {
 }
 
 #[test]
+fn storage_only_image_store_draw_gets_a_dummy_color_target() {
+    let words = [
+        0xbfa0_0001,
+        0x93ea_ff03,
+        0x0008_0008,
+        0x876b_ff03,
+        0x0000_00ff,
+        0x8f6a_8c6a,
+        0x887c_6a6b,
+        0xbf90_0009,
+        0x906a_8803,
+        0x81ea_6a80,
+        0x90fe_6ac1,
+        0xf800_0941,
+        0x0000_0000,
+        0x81ea_0380,
+        0xbf8c_ff0f,
+        0xbf81_0000,
+    ];
+    let program = decode_program(0x8051_4b00_00, &words).expect("cover program decodes");
+    let snapshot = ShaderSnapshot {
+        header_address: 0,
+        program: Arc::new(program),
+        supplemental_programs: Arc::from([]),
+        metadata: None,
+    };
+    let store = ImageBinding {
+        descriptor_index_is_runtime: false,
+        pc: 0xc38,
+        opcode: Opcode::Known("ImageStore"),
+        control: ImageControl {
+            dmask: 0xf,
+            vector_address: 0,
+            address_registers: vec![0, 1, 2],
+            vector_data: 4,
+            scalar_resource: 0,
+            scalar_sampler: 0,
+            dimension: 2,
+            is_array: false,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+            unorm: false,
+        },
+        // Live Superliminal cover-pass evaluation snapshots a null SRD; the TYPE-10
+        // volume is resolved later from user data. The opcode is the write intent.
+        resource_descriptor: vec![0, 0, 0, 0].into(),
+        sampler_descriptor: Vec::new().into(),
+        mip_level: None,
+    };
+    let mut pixel_evaluation = empty_shader_evaluation().as_ref().clone();
+    pixel_evaluation.image_bindings = vec![store];
+    let mut draw = super::indexed_draw(0, 0, 3);
+    draw.indexed = false;
+    draw.primitive_type = 7;
+    draw.export_shader_address = 0x8051_4b00_00;
+    draw.export_shader = Some(snapshot.clone());
+    // Live Superliminal cover-pass evaluation is skipped: the ES has no resources.
+    draw.export_shader_evaluation = None;
+    draw.pixel_shader_address = 0x8051_4c00_00;
+    draw.pixel_shader = Some(snapshot);
+    draw.pixel_shader_evaluation = Some(Arc::new(pixel_evaluation));
+    // Superliminal programs CB_TARGET_MASK=0 and leaves STENCIL_ENABLE latched
+    // (DB_DEPTH_CONTROL=0x771) without a depth surface.
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0,
+        },
+    );
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: DB_DEPTH_CONTROL,
+            value: 0x0000_0771,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
+    let key = graphics_pipeline_key(&draw)
+        .expect("ImageStore-only LUT bake must produce a Metal pipeline");
+    assert_eq!(key.targets.len(), 1);
+    assert_eq!(key.targets[0].pixel_format, MTLPixelFormat::R8Unorm);
+    assert_eq!(key.targets[0].write_mask, 0);
+}
+
+#[test]
 fn rejects_fragmentless_pipeline_with_color_writes() {
     let mut draw = indexed_draw(0, 0, 3);
     draw.export_shader_address = 0x0080_07a8_0000;
@@ -367,6 +455,52 @@ fn color_resolve_decodes_mrt1_without_a_target_mask_or_shader_export() {
     assert_eq!(destination.guest_slot, 1);
     assert_eq!(destination.texture.address, destination_address);
     assert_eq!(destination.sample_count, 1);
+}
+
+#[test]
+fn color_resolve_decodes_single_sample_mrt0_to_mrt1_copy() {
+    let source_address = 0x0070_1214_0000;
+    let destination_address = 0x0070_6481_0000;
+    let mut draw = indexed_draw(0, 0, 0);
+    append_color_target_registers(
+        &mut draw.context_registers,
+        0,
+        source_address,
+        1_920,
+        1_080,
+        12,
+        7,
+        27,
+    );
+    append_color_target_registers(
+        &mut draw.context_registers,
+        1,
+        destination_address,
+        1_920,
+        1_080,
+        12,
+        7,
+        27,
+    );
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: 0xf,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
+
+    let (source, destination) =
+        decode_color_resolve_targets(&draw).expect("single-sample MRT0-to-MRT1 copy");
+    assert_eq!(source.guest_slot, 0);
+    assert_eq!(source.texture.address, source_address);
+    assert_eq!(source.sample_count, 1);
+    assert_eq!(destination.guest_slot, 1);
+    assert_eq!(destination.texture.address, destination_address);
+    assert_eq!(destination.sample_count, 1);
+    assert_eq!(source.texture.width, 1_920);
+    assert_eq!(destination.texture.width, 1_920);
 }
 
 #[test]

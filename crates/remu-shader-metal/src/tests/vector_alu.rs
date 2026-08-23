@@ -729,7 +729,11 @@ fn lowers_vector_carry_and_borrow_with_wave32_lane_masks() {
     assert!(shader.source.contains(">> 32) != 0ul"));
     assert!(shader.source.contains(" + (ulong)"));
     assert!(shader.source.contains(" < t"));
-    assert!(shader.source.contains("simd_ballot"));
+    assert!(
+        shader.source.contains("? 0xffffffffu : 0u"),
+        "pixel carry/borrow VCC must not depend on fragment simd_ballot"
+    );
+    assert!(!shader.source.contains("simd_ballot"));
     assert!(shader.source.contains("remu_s_12 ="));
     assert!(shader.source.contains("remu_s_106 ="));
 }

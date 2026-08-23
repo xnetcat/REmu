@@ -579,16 +579,19 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         .unwrap_or_default();
     let export_shader = agc_shader_snapshot(shaders, export_shader_address);
     let pixel_shader = agc_shader_snapshot(shaders, pixel_shader_address);
-    // AGC default CB_TARGET_MASK is 0. With no depth and no memory side effects the color path is
-    // a hardware no-op, but the command processor still retires the draw — emit the event for
-    // queue ordering and skip only the expensive shader evaluation (Unity prep streams hit this).
+    // AGC default CB_TARGET_MASK is 0. With no depth, no pixel shader, and no export
+    // memory side effects the color path is a hardware no-op — emit the event for
+    // queue ordering and skip the expensive shader evaluation (Unity prep streams).
+    // A programmed pixel shader still has to run: Superliminal bakes its 33³ grade LUT
+    // through a cover + ImageStore with TARGET_MASK=0. The snapshot prefix often has no
+    // Store opcode yet, so opcode scanning cannot be the skip authority.
     let skip_shader_evaluation = graphics
         .context_registers
         .get(&AGC_CB_TARGET_MASK)
         .is_some_and(|&mask| mask == 0)
         && !agc_has_active_depth_state(&graphics.context_registers)
-        && !agc_shader_has_memory_side_effects(export_shader.as_ref())
-        && !agc_shader_has_memory_side_effects(pixel_shader.as_ref());
+        && pixel_shader_address == 0
+        && !agc_shader_has_memory_side_effects(export_shader.as_ref());
     let mut draw = remu_gpu::IndexedDraw {
         sequence: graphics.emitted_draws,
         indexed,

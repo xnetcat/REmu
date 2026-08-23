@@ -251,7 +251,9 @@ impl Compiler<'_> {
                 parameters.push("uint remu_vertex_id [[vertex_id]]".to_owned());
                 parameters.push("uint remu_instance_id [[instance_id]]".to_owned());
             }
-            MetalShaderStage::Pixel => {}
+            MetalShaderStage::Pixel => {
+                parameters.push("uint remu_lane [[thread_index_in_simdgroup]]".to_owned());
+            }
             MetalShaderStage::Compute => {
                 if uses_lds_memory {
                     parameters
@@ -452,14 +454,18 @@ impl Compiler<'_> {
             }
             ControlFlowLowering::Direct(_) | ControlFlowLowering::Structured { .. } => {}
         }
+        if self.options.stage == MetalShaderStage::Vertex {
+            // Vertex functions reject [[thread_index_in_simdgroup]]. Vertex waves are launched
+            // densely enough that the exclusive prefix of 1 matches the hardware lane index.
+            source.push_str("    uint remu_lane = simd_prefix_exclusive_sum(1u);\n");
+        }
         if matches!(
             self.options.stage,
             MetalShaderStage::Vertex | MetalShaderStage::Pixel
         ) {
-            // Graphics stages cannot declare thread_index_in_simdgroup, but the exclusive prefix
-            // of one is the architectural lane index. Wave operations are emitted before the
-            // EXEC-guarded write, keeping every host lane converged at simdgroup intrinsics.
-            source.push_str("    uint remu_lane = simd_prefix_exclusive_sum(1u);\n");
+            // Pixel remu_lane is the [[thread_index_in_simdgroup]] parameter. Reconstructing it
+            // with simd_prefix_exclusive_sum(1) numbers active fragment threads 0..N-1 while
+            // simd_ballot / EXEC still use hardware lane bits, so most quads discard.
             let lane_file_width = if self.options.wave_lane_count == 64 {
                 64
             } else {
@@ -804,10 +810,14 @@ impl Compiler<'_> {
             // the shader narrows it against merged_wave_info (Mesa aco lanecount_to_mask). A
             // ballot over the Metal threads that happen to exist would zero the tail of a
             // partial final wave and skew lane counts taken before the guest's own narrowing.
-            let (low, high) = if self.options.stage == MetalShaderStage::Mesh
-                && !self.options.ngg_fixed_allocation_fallback
+            // Pixel coverage is already applied by Metal rasterization; `simd_ballot(true)` in
+            // a fragment function is undefined and observed to return 0, after which S_WQM
+            // plus an EXEC restore discards every launched quad.
+            let (low, high) = if (self.options.stage == MetalShaderStage::Mesh
+                && !self.options.ngg_fixed_allocation_fallback)
+                || self.options.stage == MetalShaderStage::Pixel
             {
-                let high = if self.split_wave64() {
+                let high = if self.split_wave64() || self.uses_wave64_lane_mask_pairs() {
                     "0xffffffffu"
                 } else {
                     "0u"

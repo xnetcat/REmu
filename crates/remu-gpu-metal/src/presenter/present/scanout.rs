@@ -15,6 +15,7 @@ use metal::{
     MTLTextureType, MTLTextureUsage, Texture, TextureDescriptor,
 };
 use remu_gpu::GpuHostImage;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -143,6 +144,7 @@ impl MetalPresenter {
             }
         }
         self.pending_scanout_write_address = None;
+        self.compositor_post_stack_active = false;
         self.redraw_pending = true;
         if trace_scanout_writes() {
             eprintln!(
@@ -515,7 +517,250 @@ impl MetalPresenter {
         Ok(())
     }
 
+    fn display_sized_presentable_color(&self, descriptor: GuestTextureDescriptor) -> bool {
+        self.display.is_some_and(|display| {
+            descriptor.width == display.width
+                && descriptor.height == display.height
+                && descriptor.address != 0
+                && Self::presentable_scanout_color_format(descriptor.pixel_format)
+        })
+    }
+
+    fn is_offscreen_compositor_surface(&self, descriptor: GuestTextureDescriptor) -> bool {
+        self.display_sized_presentable_color(descriptor)
+            && !self
+                .registered_video_out_buffers
+                .contains(&descriptor.address)
+            && self
+                .pending_flip
+                .is_none_or(|flip| flip.address != descriptor.address)
+    }
+
+    fn latest_compositor_write(
+        writes: &HashMap<u64, (u64, GuestTextureDescriptor)>,
+        samples: &HashMap<u64, u64>,
+        unsampled_only: bool,
+    ) -> Option<GuestTextureDescriptor> {
+        writes
+            .iter()
+            .filter(|(address, (written, _))| {
+                !unsampled_only
+                    || samples.get(*address).copied().unwrap_or(0) < *written
+            })
+            .max_by_key(|(_, (written, _))| *written)
+            .map(|(_, (_, descriptor))| *descriptor)
+    }
+
+    fn refresh_pending_compositor_scanout(&mut self) {
+        // Scene lighting (G-buffer / deferred / forward) is the warehouse-lit 1080p
+        // image. Fullscreen bloom / ACES / grade-inherit write HDR or clipped white
+        // into the same or another display-sized target and must not replace it.
+        self.pending_compositor_scanout = Self::latest_compositor_write(
+            &self.compositor_scene_writes,
+            &self.compositor_scanout_samples,
+            false,
+        );
+    }
+
+    fn compositor_pass_is_fullscreen_post(&self) -> bool {
+        // Bloom / TAA / uber sample the 1080p HDR camera. Those passes are not
+        // always 3-vertex covers (compute, 8-index blits, dual-source). Any HDR
+        // sample means this write is post, not the warehouse-lit scene.
+        self.compositor_pass_sampled_grade
+            || self.compositor_pass_sampled_hdr
+            || self.compositor_pass_sampled_lut_after_hdr
+    }
+
+    /// Copies scene color into a private texture when fullscreen post is about to
+    /// overwrite that same address. No-op when post writes a different ping-pong.
+    pub(crate) fn preserve_compositor_scene_before_hdr_targets(
+        &mut self,
+        targets: impl IntoIterator<Item = GuestTextureDescriptor>,
+    ) {
+        if !self.compositor_pass_is_fullscreen_post() {
+            return;
+        }
+        if self.compositor_scene_frozen.is_some() {
+            return;
+        }
+        let Some(scene) = self.pending_compositor_scanout else {
+            return;
+        };
+        if !targets.into_iter().any(|target| target.address == scene.address) {
+            return;
+        }
+        let Some(source) = self.resident_guest_textures.get(&scene).map(|resident| {
+            (
+                resident.descriptor,
+                resident.texture.clone(),
+            )
+        }) else {
+            return;
+        };
+        let Some(device) = self.device.clone() else {
+            return;
+        };
+        let snapshot = self.ensure_compositor_scene_snapshot_texture(&device, source.0);
+        if let Some(batch) = self.active_open_guest_batch_mut() {
+            batch.close_active_pass_encoders();
+            let blit = batch.command_buffer.new_blit_command_encoder();
+            blit.set_label("REMu compositor scene freeze");
+            blit.copy_from_texture(
+                &source.1,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+                MTLSize::new(u64::from(source.0.width), u64::from(source.0.height), 1),
+                &snapshot,
+                0,
+                0,
+                MTLOrigin { x: 0, y: 0, z: 0 },
+            );
+            blit.end_encoding();
+            self.compositor_scene_frozen = Some((source.0, snapshot));
+        }
+    }
+
+    fn ensure_compositor_scene_snapshot_texture(
+        &mut self,
+        device: &metal::Device,
+        descriptor: GuestTextureDescriptor,
+    ) -> Texture {
+        if let Some((frozen_descriptor, texture)) = self.compositor_scene_frozen.as_ref()
+            && frozen_descriptor.width == descriptor.width
+            && frozen_descriptor.height == descriptor.height
+            && frozen_descriptor.pixel_format == descriptor.pixel_format
+        {
+            return texture.clone();
+        }
+        let metal_descriptor = TextureDescriptor::new();
+        metal_descriptor.set_texture_type(MTLTextureType::D2);
+        metal_descriptor.set_pixel_format(descriptor.pixel_format);
+        metal_descriptor.set_width(u64::from(descriptor.width));
+        metal_descriptor.set_height(u64::from(descriptor.height));
+        metal_descriptor.set_storage_mode(MTLStorageMode::Private);
+        metal_descriptor.set_usage(MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite);
+        let texture = device.new_texture(&metal_descriptor);
+        texture.set_label("REMu compositor scene snapshot");
+        texture
+    }
+
+    /// Records a color write that may be the frame's compositor output.
+    ///
+    /// Fast-clear elimination must not call this: it rewrites a 1080p target with the
+    /// clear color and would steal scanout from the graded backbuffer.
+    pub(crate) fn note_compositor_scanout_write(&mut self, descriptor: GuestTextureDescriptor) {
+        let presentable = self.display_sized_presentable_color(descriptor);
+        let offscreen = self.is_offscreen_compositor_surface(descriptor);
+        let sampled_any = self.compositor_pass_sampled_hdr
+            || self.compositor_pass_sampled_lut
+            || self.compositor_pass_sampled_grade;
+        let likely_clear = self.compositor_pass_fullscreen && !sampled_any;
+        let fullscreen_post = self.compositor_pass_is_fullscreen_post();
+        // Geometry / lighting: high vertex count, or a non-post presentable write before
+        // bloom/uber. Fullscreen HDR/ACES and UI-on-grade stay out of scene scanout.
+        let scene_write = presentable
+            && !likely_clear
+            && !fullscreen_post
+            && !self.compositor_post_stack_active;
+        if fullscreen_post {
+            self.compositor_post_stack_active = true;
+        }
+        if presentable && !scene_write {
+            self.compositor_lut_writes.remove(&descriptor.address);
+        }
+        if !offscreen && !scene_write && !fullscreen_post {
+            if presentable {
+                self.refresh_pending_compositor_scanout();
+            }
+            return;
+        }
+        self.compositor_scanout_sequence = self.compositor_scanout_sequence.saturating_add(1);
+        if offscreen {
+            self.compositor_scanout_writes.insert(
+                descriptor.address,
+                (self.compositor_scanout_sequence, descriptor),
+            );
+            if self.compositor_pass_sampled_hdr {
+                self.compositor_grade_writes.insert(
+                    descriptor.address,
+                    (self.compositor_scanout_sequence, descriptor),
+                );
+            }
+        }
+        if fullscreen_post {
+            self.compositor_lut_writes.insert(
+                descriptor.address,
+                (self.compositor_scanout_sequence, descriptor),
+            );
+        }
+        if scene_write {
+            self.compositor_scene_writes.insert(
+                descriptor.address,
+                (self.compositor_scanout_sequence, descriptor),
+            );
+            self.compositor_scene_frozen = None;
+        }
+        self.refresh_pending_compositor_scanout();
+    }
+
+    pub(crate) fn begin_compositor_pass_samples(&mut self) {
+        self.compositor_pass_sampled_hdr = false;
+        self.compositor_pass_sampled_lut = false;
+        self.compositor_pass_sampled_lut_after_hdr = false;
+        self.compositor_pass_sampled_grade = false;
+        self.compositor_pass_fullscreen = false;
+    }
+
+    pub(crate) fn note_compositor_pass_sampled_hdr(&mut self, descriptor: GuestTextureDescriptor) {
+        if descriptor.pixel_format == MTLPixelFormat::RGBA16Float
+            && self.display_sized_presentable_color(descriptor)
+        {
+            self.compositor_pass_sampled_hdr = true;
+        }
+    }
+
+    /// GFX10 TYPE 10 is a 3D image. Color grading LUTs are compact volumes (Unity 33³), not
+    /// display-sized render targets.
+    pub(crate) fn note_compositor_pass_sampled_volume(
+        &mut self,
+        texture_type: u32,
+        width: u32,
+        height: u32,
+        layer_count: u32,
+    ) {
+        if texture_type == 10
+            && (8..=64).contains(&width)
+            && (8..=64).contains(&height)
+            && layer_count >= 16
+        {
+            self.compositor_pass_sampled_lut = true;
+            if self.compositor_pass_sampled_hdr {
+                self.compositor_pass_sampled_lut_after_hdr = true;
+            }
+        }
+    }
+
+    /// Marks a display-sized color sample so ping-pong intermediates drop out of scanout.
+    pub(crate) fn note_compositor_scanout_sample(&mut self, descriptor: GuestTextureDescriptor) {
+        if !self.display_sized_presentable_color(descriptor) {
+            return;
+        }
+        self.compositor_scanout_sequence = self.compositor_scanout_sequence.saturating_add(1);
+        self.compositor_scanout_samples
+            .insert(descriptor.address, self.compositor_scanout_sequence);
+        if self.compositor_lut_writes.contains_key(&descriptor.address) {
+            self.compositor_pass_sampled_grade = true;
+        }
+        self.refresh_pending_compositor_scanout();
+    }
+
     pub(crate) fn note_pending_flip_target_write(&mut self, descriptor: GuestTextureDescriptor) {
+        self.note_compositor_scanout_write(descriptor);
+        self.note_registered_video_out_write(descriptor);
+    }
+
+    pub(crate) fn note_registered_video_out_write(&mut self, descriptor: GuestTextureDescriptor) {
         if !self.matches_registered_video_out_scanout(descriptor) {
             return;
         }
@@ -720,6 +965,18 @@ impl MetalPresenter {
         Ok(())
     }
 
+    fn presentable_scanout_color_format(format: MTLPixelFormat) -> bool {
+        matches!(
+            format,
+            MTLPixelFormat::RGBA8Unorm
+                | MTLPixelFormat::RGBA8Unorm_sRGB
+                | MTLPixelFormat::BGRA8Unorm
+                | MTLPixelFormat::BGRA8Unorm_sRGB
+                | MTLPixelFormat::RGBA16Float
+                | MTLPixelFormat::RGB10A2Unorm
+        )
+    }
+
     pub(crate) fn translated_scanout_source(
         &self,
         address: u64,
@@ -730,7 +987,7 @@ impl MetalPresenter {
         // version. A synthetic direct target is only a fallback for streams whose CB state was
         // absent, so it must never outrank newer resident compositor output at the same VideoOut
         // address.
-        let resident = self
+        let exact = self
             .resident_guest_textures
             .values()
             .filter(|resident| {
@@ -739,8 +996,37 @@ impl MetalPresenter {
                     && resident.descriptor.width == width
                     && resident.descriptor.height == height
             })
-            .max_by_key(|resident| resident.content_version)
-            .map(|resident| (resident.descriptor, resident.texture.clone(), "resident"));
+            .max_by_key(|resident| resident.content_version);
+        // Frozen scene copy taken before fullscreen post overwrote that address.
+        // Live resident at the same VA is HDR/bloom after that point.
+        if let Some((descriptor, texture)) = self.compositor_scene_frozen.as_ref()
+            && descriptor.width == width
+            && descriptor.height == height
+        {
+            return Some((*descriptor, texture.clone(), "compositor"));
+        }
+        // Last scene lighting write this flip. Do not scan every 1080p HDR ping-pong
+        // by content_version — those present as blown-white or crushed-dark.
+        let compositor = self.pending_compositor_scanout.and_then(|descriptor| {
+            self.resident_guest_textures.values().find(|resident| {
+                resident.descriptor.address == descriptor.address
+                    && resident.descriptor.width == width
+                    && resident.descriptor.height == height
+                    && resident.is_live()
+                    && (resident.serves_reads()
+                        || resident.gpu_written()
+                        || resident.gpu_content_executed)
+            })
+        });
+        let resident = if let Some(compositor) = compositor {
+            Some((
+                compositor.descriptor,
+                compositor.texture.clone(),
+                "compositor",
+            ))
+        } else {
+            exact.map(|resident| (resident.descriptor, resident.texture.clone(), "resident"))
+        };
         let direct = self
             .direct_scanout_textures
             .get(&address)
@@ -805,7 +1091,12 @@ impl MetalPresenter {
             .as_ref()
             .ok_or("Metal device is unavailable")?
             .clone();
-        let snapshot = self.ensure_scanout_snapshot_texture(&device, descriptor);
+        // Capture and present look up the snapshot by the flipped VideoOut address. The
+        // selected resident may be a later compositor at a different VA; keep the flip
+        // address as the cache key so both paths sample the copy we just blitted.
+        let mut snapshot_descriptor = descriptor;
+        snapshot_descriptor.address = address;
+        let snapshot = self.ensure_scanout_snapshot_texture(&device, snapshot_descriptor);
         // End and commit every producer encoder before the flip, then order the snapshot copy:
         // a queue-sourced flip rides its producing queue and publishes a fence for the legacy
         // host queue's presentation side; a host-sourced flip snapshots on the host queue behind
@@ -855,6 +1146,7 @@ impl MetalPresenter {
             width,
             height,
             sequence,
+            source: descriptor,
             snapshot_ready,
             snapshotted_content_version,
         });
@@ -879,10 +1171,11 @@ impl MetalPresenter {
         // K1: lock-free bounded sampler (was a mutex-guarded HashSet dedup on the
         // per-present scanout snapshot path).
         static LOGGED_TRANSLATED_SCANOUTS: AtomicUsize = AtomicUsize::new(0);
-        if LOGGED_TRANSLATED_SCANOUTS.fetch_add(1, Ordering::Relaxed) < 64 {
+        if LOGGED_TRANSLATED_SCANOUTS.fetch_add(1, Ordering::Relaxed) < 256 {
             eprintln!(
-                "[REMu][METAL] snapshotted translated {source} scanout sequence={} at {address:#x} {}x{} format={:?} tile={}",
+                "[REMu][METAL] snapshotted translated {source} scanout sequence={} at {address:#x} from={:#x} {}x{} format={:?} tile={}",
                 sequence,
+                descriptor.address,
                 descriptor.width,
                 descriptor.height,
                 descriptor.pixel_format,
@@ -904,6 +1197,12 @@ impl MetalPresenter {
         else {
             return;
         };
+        // Flip snapshots the compositor after preceding draws. The next frame's HDR camera
+        // write is a different VA and must not replace this flip's graded snapshot — that
+        // retarget presented crushed-dark HDR while capture of the same ping-pong blew white.
+        if descriptor.address != active.source.address {
+            return;
+        }
         let current_version = self
             .resident_guest_textures
             .get(&descriptor)

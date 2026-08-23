@@ -18,12 +18,14 @@ use super::{
     guest_texture_descriptors_have_same_layout, guest_texture_descriptors_overlap,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_offset_alias_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
     persistent_sampled_texture_write_watch, refresh_resident_texture_write_watch,
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible, resident_sample_authority_ok,
+    resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_sample_authority_ok, resident_volume_sample_is_eligible,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
     sampled_texture_key, sampled_texture_supports_access, sampler_uses_normalized_coordinates,
     storage_image_requires_mip_hierarchy, texture_element_layout,
@@ -855,6 +857,28 @@ pub(crate) fn upload_image_textures(
                                 })
                         })
                         .flatten();
+                    let compatible_volume = (descriptor.texture_type == 10).then(|| {
+                        resident_guest_textures
+                            .values()
+                            .filter(|resident| {
+                                resident_volume_sample_is_eligible(
+                                    resident,
+                                    descriptor,
+                                    comparison,
+                                )
+                            })
+                            .max_by_key(|resident| {
+                                (resident.gpu_written(), resident.content_version)
+                            })
+                            .map(|resident| {
+                                (
+                                    resident.descriptor,
+                                    resident.gpu_written(),
+                                    resident.content_version,
+                                )
+                            })
+                    })
+                    .flatten();
                     let compatible = (descriptor.texture_type == 9).then(|| {
                         resident_guest_textures
                             .values()
@@ -875,6 +899,10 @@ pub(crate) fn upload_image_textures(
                                             descriptor,
                                             comparison,
                                         ) || resident_same_image_sample_is_eligible(
+                                            resident,
+                                            descriptor,
+                                            comparison,
+                                        ) || resident_offset_alias_sample_is_eligible(
                                             resident,
                                             descriptor,
                                             comparison,
@@ -908,6 +936,11 @@ pub(crate) fn upload_image_textures(
                                             descriptor,
                                             comparison,
                                         )
+                                        || resident_offset_alias_sample_is_eligible(
+                                            resident,
+                                            descriptor,
+                                            comparison,
+                                        )
                                         || (!comparison
                                             && resident.gpu_content_executed
                                             && guest_texture_descriptors_share_color_view_storage(
@@ -934,6 +967,7 @@ pub(crate) fn upload_image_textures(
                     // GPU-authored native depth view over that empty shadow so depth_native hits.
                     // Also prefer Depth* when a later empty R32 "writer" bumped content_version
                     // without being allowed to demote the DB (Silent Hill title 801ac2).
+                    let compatible = compatible.or(compatible_volume);
                     match (exact, compatible) {
                         (
                             Some((exact_descriptor, _, _)),
@@ -943,6 +977,17 @@ pub(crate) fn upload_image_textures(
                                 compatible_descriptor,
                                 exact_descriptor,
                                 descriptor.destination_select,
+                            ) =>
+                        {
+                            Some(compatible_descriptor)
+                        }
+                        (
+                            Some((exact_descriptor, _, _)),
+                            Some((compatible_descriptor, true, _)),
+                        ) if exact_descriptor != compatible_descriptor
+                            && guest_texture_descriptors_share_offset_alias_storage(
+                                compatible_descriptor,
+                                descriptor.guest,
                             ) =>
                         {
                             Some(compatible_descriptor)
@@ -962,9 +1007,10 @@ pub(crate) fn upload_image_textures(
                 })
                 .flatten();
             if resident_descriptor.is_none()
-                && matches!(descriptor.texture_type, 9)
-                && descriptor.guest.width >= 1_280
-                && descriptor.guest.height >= 720
+                && (descriptor.texture_type == 10
+                    || (matches!(descriptor.texture_type, 9)
+                        && descriptor.guest.width >= 1_280
+                        && descriptor.guest.height >= 720))
             {
                 // A large screen-space sample about to fall back to guest RAM while a resident
                 // holds this exact address under another key is the black-lighting signature
@@ -1028,6 +1074,36 @@ pub(crate) fn upload_image_textures(
                             resident.content_version,
                         );
                     }
+                }
+            }
+            if descriptor.texture_type == 10 && descriptor.layer_count > 1 {
+                static LOGGED_VOLUMES: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED_VOLUMES.fetch_add(1, Ordering::Relaxed) < 32 {
+                    let resident = resident_descriptor.and_then(|key| {
+                        resident_guest_textures.get(&key).map(|resident| {
+                            format!(
+                                "key={:#x}/tile{}/type{}/layers{} gpu_written={} serves_reads={}",
+                                resident.descriptor.address,
+                                resident.descriptor.tile_mode,
+                                resident.texture_type,
+                                resident.layer_count,
+                                resident.gpu_written(),
+                                resident.serves_reads(),
+                            )
+                        })
+                    });
+                    eprintln!(
+                        "[REMu][METAL][VOLUME-SAMPLE] hit={} op={} sampled={:#x} {}x{}x{} tile={} fmt={:?} writable={} resident={resident:?}",
+                        resident_descriptor.is_some(),
+                        binding.opcode,
+                        descriptor.guest.address,
+                        descriptor.guest.width,
+                        descriptor.guest.height,
+                        descriptor.layer_count,
+                        descriptor.guest.tile_mode,
+                        descriptor.guest.pixel_format,
+                        writable,
+                    );
                 }
             }
             let resident_resolve = resident_descriptor.and_then(|resident_descriptor| {
@@ -1437,10 +1513,10 @@ pub(crate) fn upload_image_textures(
             Ok(UploadedImageTexture {
                 texture,
                 descriptor,
-                // The resident 2D path has exact guest writeback today. A writable 3D image stays
-                // resident in the shared sampled-image cache so later GPU reads see its contents;
-                // it must not invalidate that cache through the 2D writeback path.
-                writable: !fallback && writable && descriptor.texture_type == 9,
+                // Type 10 volumes (Superliminal's 33³ grade LUT) are GPU-authored the same way
+                // as 2D storage images. Leaving them non-writable made later samples re-upload
+                // the unwritten guest bytes and crushed the scene to black.
+                writable: !fallback && writable && matches!(descriptor.texture_type, 9 | 10),
                 selected_resident,
             })
         })

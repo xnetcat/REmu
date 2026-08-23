@@ -14,7 +14,8 @@ use super::{
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_offset_alias_storage, guest_texture_descriptors_share_storage,
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, sampled_alias_descriptor, sampled_texture_uses_exact_mode5_mips,
@@ -391,6 +392,33 @@ pub(crate) fn resident_texture_for_sample(
     if resident.mip_level_count < underlying_mip_count {
         return None;
     }
+    // UAV vs sampled SRDs for the same 3D volume routinely disagree on tile mode
+    // (compute ImageStore is linear; the later composite sample is tiled). The
+    // Metal texture already holds the GPU-authored texels; flattening it to a
+    // D2 view or falling through to guest RAM is Superliminal's title fade.
+    if resident.texture_type == 10
+        && sampled.texture_type == 10
+        && resident.layer_count > 1
+        && resident.layer_count == sampled.layer_count
+        && resident.descriptor.address == sampled.guest.address
+        && resident.descriptor.width == sampled.guest.width
+        && resident.descriptor.height == sampled.guest.height
+        && resident.descriptor.pixel_format == sampled.guest.pixel_format
+    {
+        if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
+        {
+            return Some(resident.texture.clone());
+        }
+        return Some(resident.texture.new_texture_view_from_slice(
+            resident.texture.pixel_format(),
+            MTLTextureType::D3,
+            NSRange::new(
+                u64::from(sampled.base_mip_level),
+                u64::from(sampled.mip_level_count.max(1)),
+            ),
+            NSRange::new(0, 1),
+        ));
+    }
     if guest_texture_descriptors_share_depth_sample_storage(
         resident.descriptor,
         sampled.guest,
@@ -413,6 +441,10 @@ pub(crate) fn resident_texture_for_sample(
     }
     if guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest)
         || guest_texture_descriptors_share_gpu_sample_storage(resident.descriptor, sampled.guest)
+        || guest_texture_descriptors_share_offset_alias_storage(
+            resident.descriptor,
+            sampled.guest,
+        )
     {
         if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
         {
@@ -504,7 +536,60 @@ pub(crate) fn resident_sample_authority_ok(
             && resident.descriptor.tile_mode == sampled.tile_mode)
 }
 
+/// GPU-authored TYPE-10 volume that a later sample names with a different tile mode.
+///
+/// Superliminal bakes its 33³ grade LUT through a compute ImageStore (linear UAV) and
+/// samples it as a tiled SRD. `share_storage` / `share_gpu_sample_storage` both require
+/// matching tile mode, so the existing 2D predicates miss and the composite re-uploads
+/// unpublished guest zeros — warehouse looks correct, then fades to UI-on-black.
+pub(crate) fn resident_volume_sample_is_eligible(
+    resident: &ResidentGuestTexture,
+    sampled: DecodedImageDescriptor,
+    comparison: bool,
+) -> bool {
+    let underlying_mip_count = sampled
+        .base_mip_level
+        .checked_add(sampled.mip_level_count.max(1));
+    !comparison
+        && resident.is_live()
+        && (resident.serves_reads() || resident.gpu_written() || resident.gpu_content_executed)
+        && resident.texture_type == 10
+        && sampled.texture_type == 10
+        && resident.layer_count > 1
+        && resident.layer_count == sampled.layer_count
+        && resident.descriptor.address == sampled.guest.address
+        && resident.descriptor.width == sampled.guest.width
+        && resident.descriptor.height == sampled.guest.height
+        && resident.descriptor.pixel_format == sampled.guest.pixel_format
+        && underlying_mip_count.is_some_and(|count| resident.mip_level_count >= count)
+}
+
 /// Same-format / pitch-tolerant sample of a GPU image that lost full `owned` coverage.
+/// GPU-authored 2D color image sampled through an SRD whose base is a 2 MiB page
+/// (or overlapping VA) away from `CB_COLOR_BASE`.
+///
+/// Superliminal's Uber `_MainTex` is this alias: the warehouse lives at the color
+/// target, the grade pass names `base + 0x200000`, and a later clear of that offset
+/// key used to win the exact-resident match with zeros.
+pub(crate) fn resident_offset_alias_sample_is_eligible(
+    resident: &ResidentGuestTexture,
+    sampled: DecodedImageDescriptor,
+    comparison: bool,
+) -> bool {
+    let underlying_mip_count = sampled
+        .base_mip_level
+        .checked_add(sampled.mip_level_count.max(1));
+    !comparison
+        && resident.is_live()
+        && (resident.serves_reads() || resident.gpu_written() || resident.gpu_content_executed)
+        && resident.texture_type == 9
+        && resident.layer_count == 1
+        && sampled.texture_type == 9
+        && sampled.layer_count == 1
+        && underlying_mip_count.is_some_and(|count| resident.mip_level_count >= count)
+        && guest_texture_descriptors_share_offset_alias_storage(resident.descriptor, sampled.guest)
+}
+
 pub(crate) fn resident_same_image_sample_is_eligible(
     resident: &ResidentGuestTexture,
     sampled: DecodedImageDescriptor,

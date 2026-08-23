@@ -24,17 +24,18 @@ use super::{
     diagnostic_video_chain_selected_draw, evaluation_samples_glyph_atlas,
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
-    graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
-    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
-    pixel_input_controls, procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    register_value, video_target_binding_summary,
+    graphics_allocated_vector_register_count, image_component_class,
+    is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
+    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_input_controls,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base, register_value,
+    video_target_binding_summary, GuestTextureDescriptor,
 };
 use metal::{
-    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPrimitiveTopologyClass,
-    MTLPrimitiveType, MTLTriangleFillMode, MTLWinding,
+    MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPixelFormat,
+    MTLPrimitiveTopologyClass, MTLPrimitiveType, MTLTriangleFillMode, MTLWinding,
 };
 use remu_gpu::IndexedDraw;
-use remu_shader::{PixelExportFormat, ShaderEvaluation, image_is_comparison};
+use remu_shader::{PixelExportFormat, PixelOutputKind, ShaderEvaluation, image_is_comparison};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -1025,6 +1026,67 @@ pub(crate) fn decode_raster_state(draw: &IndexedDraw) -> Result<DecodedRasterSta
     })
 }
 
+/// Extent of the dummy color attachment used so Metal will rasterize a storage-only
+/// ImageStore draw (no guest color or depth target). Superliminal bakes its 33³ grade LUT
+/// this way; 64 covers that slice without pretending to be a scene render target.
+pub(crate) const STORAGE_ONLY_RASTER_EXTENT: u32 = 64;
+
+pub(crate) fn evaluation_writes_storage_image(evaluation: &ShaderEvaluation) -> bool {
+    // A null snapshot SRD still counts. Superliminal's LUT bake cover pass evaluates
+    // with zeroed user SGPRs, so the ImageStore descriptor is recorded as all-zero and
+    // resolved later from live user data. Filtering those out dropped the bake and
+    // crushed the warehouse to black.
+    evaluation
+        .image_bindings
+        .iter()
+        .any(|binding| is_writable_image_opcode(binding.opcode))
+}
+
+pub(crate) fn draw_writes_storage_image(draw: &IndexedDraw) -> bool {
+    if draw
+        .pixel_shader_evaluation
+        .as_ref()
+        .is_some_and(|evaluation| evaluation_writes_storage_image(evaluation))
+    {
+        return true;
+    }
+    draw.pixel_shader.as_ref().is_some_and(|shader| {
+        shader
+            .program
+            .instructions
+            .iter()
+            .any(|instruction| is_writable_image_opcode(instruction.opcode))
+    })
+}
+
+pub(crate) fn storage_only_dummy_render_target() -> DecodedRenderTarget {
+    DecodedRenderTarget {
+        guest_slot: 0,
+        texture: GuestTextureDescriptor {
+            address: 0,
+            width: STORAGE_ONLY_RASTER_EXTENT,
+            height: STORAGE_ONLY_RASTER_EXTENT,
+            pitch: STORAGE_ONLY_RASTER_EXTENT,
+            tile_mode: 0,
+            pixel_format: MTLPixelFormat::R8Unorm,
+            bytes_per_pixel: 1,
+        },
+        span: None,
+        output_kind: PixelOutputKind::Float,
+        write_mask: 0,
+        direct_scanout: false,
+        sample_count: 1,
+        texture_type: 9,
+        layer_count: 1,
+        base_layer: 0,
+        mip_level: 0,
+        mip_level_count: 1,
+        dcc_enabled: false,
+        fast_clear_enabled: false,
+        blend_bypass: true,
+    }
+}
+
 pub(crate) fn graphics_pipeline_key(draw: &IndexedDraw) -> Result<GraphicsPipelineKey, String> {
     let targets = decode_render_targets(draw)?;
     graphics_pipeline_key_from_targets(draw, &targets)
@@ -1189,25 +1251,49 @@ pub(crate) fn graphics_pipeline_key_from_targets(
 ) -> Result<GraphicsPipelineKey, String> {
     let depth = decode_depth_target(draw)?;
     if targets.is_empty() && depth.is_none() {
-        // Depth decode returns Ok(None) when STENCIL_ENABLE is latched without Z ops so color
-        // MRTs can still build a pipeline. A draw with neither color nor depth, but stencil
-        // still enabled, is the unsupported stencil-only case.
-        let control = register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default();
-        if control & 1 != 0 {
+        // A programmed pixel shader with CB_TARGET_MASK=0 and no depth surface is a
+        // side-effect raster (ImageStore / UAV). Superliminal bakes its 33³ grade LUT
+        // this way and leaves STENCIL_ENABLE latched (DB_DEPTH_CONTROL=0x771). Depth
+        // decode already ignores that latch. A dummy Metal color target is attached so
+        // the fragment shader runs; write_mask stays zero so it cannot overwrite guest
+        // color. Evaluation may snapshot a null SRD on the cover pass, so the packet
+        // (PS present, no attachments) is the authority — not a recovered ImageStore.
+        if draw.pixel_shader.is_none() {
+            // Depth decode returns Ok(None) when STENCIL_ENABLE is latched without Z ops
+            // so color MRTs can still build a pipeline. Fragmentless draws with neither
+            // color nor depth, but stencil still enabled, are the unimplemented
+            // stencil-only case.
+            let control =
+                register_value(&draw.context_registers, DB_DEPTH_CONTROL).unwrap_or_default();
+            if control & 1 != 0 {
+                return Err(
+                    "stencil is enabled without an active depth/stencil surface; \
+                     stencil-only targets are not implemented"
+                        .to_owned(),
+                );
+            }
             return Err(
-                "stencil is enabled without an active depth/stencil surface; \
-                 stencil-only targets are not implemented"
-                    .to_owned(),
+                "draw has neither an enabled color target nor an active depth target".to_owned(),
             );
         }
-        return Err(
-            "draw has neither an enabled color target nor an active depth target".to_owned(),
-        );
     }
-    let export_evaluation = draw
-        .export_shader_evaluation
-        .as_ref()
-        .ok_or("draw has no export resource evaluation")?;
+    let export_evaluation = match draw.export_shader_evaluation.as_ref() {
+        Some(evaluation) => evaluation.as_ref(),
+        None => {
+            // Superliminal's LUT bake drives a memoryless cover ES with no export
+            // resources. Evaluation is skipped; an empty evaluation is enough to
+            // compile the covering VS so the pixel ImageStore can run.
+            let cover = draw.export_shader.as_ref().is_some_and(|shader| {
+                ngg_memoryless_cover_export_stage(&shader.program)
+                    || procedural_rectangle_stage_for_draw(&shader.program, draw)
+            });
+            if cover {
+                fragmentless_pixel_evaluation()
+            } else {
+                return Err("draw has no export resource evaluation".to_owned());
+            }
+        }
+    };
     let export_program = &draw
         .export_shader
         .as_ref()
@@ -1397,6 +1483,21 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            if targets.is_empty() && depth.is_none() {
+                let dummy = storage_only_dummy_render_target();
+                // SPI_SHADER_COL_FORMAT is 0 (Zero) on these draws, but the PS still
+                // contains a compressed Float EXP. Zero/Abgr32 are refused by the
+                // lowerer; AbgrFp16 matches that EXP. write_mask stays 0 so Metal
+                // discards the dummy color write.
+                targets.push(RenderTargetPipelineState {
+                    guest_slot: dummy.guest_slot,
+                    pixel_format: dummy.texture.pixel_format,
+                    output_kind: dummy.output_kind,
+                    export_format: PixelExportFormat::AbgrFp16,
+                    write_mask: 0,
+                    blend: disabled_metal_blend_attachment(),
+                });
+            }
             let live_pixel_scalars = Some(std::array::from_fn(|index| {
                 register_value(
                     &draw.shader_registers,

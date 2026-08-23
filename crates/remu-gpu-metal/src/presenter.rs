@@ -227,7 +227,9 @@ use self::texture::{
     SpanQueryOrder, TextureWritebackOutcome, WrittenRegion, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible, resident_texture_activity_stats,
+    resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_volume_sample_is_eligible,
+    resident_texture_activity_stats,
     resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
     resident_texture_raw_byte_count, retire_multisample_textures_overlapping_writeback,
     retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
@@ -259,7 +261,8 @@ use self::tiling::{
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_depth_sample_storage,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_offset_alias_storage, guest_texture_descriptors_share_storage,
     mode5_mip_chain_layout, mode27_mip_chain_layout, mode27_surface_z_xor,
     render_resolve_candidate_matches, spans_overlap, tiled_block_bytes, tiled_block_dimensions,
 };
@@ -295,6 +298,19 @@ const SHARED_HOST_KIND_COUNT: usize = 8;
 const GPU_EVENTS_PER_TICK: usize = 1024;
 const GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD: usize = 256;
 const GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER: usize = 2;
+/// Superliminal's title sits around 2–4k queued GPU events. Waiting until 4096 for the 8×
+/// drain left present/s decaying toward the 0–2 stall while Q W grew ~40 items/s.
+const GPU_EVENTS_PER_TICK_HEAVY_BACKLOG_THRESHOLD: usize = 1_024;
+const GPU_EVENTS_PER_TICK_HEAVY_BACKLOG_MULTIPLIER: usize = 8;
+const GPU_EVENTS_PER_TICK_EXTREME_BACKLOG_THRESHOLD: usize = 16_384;
+const GPU_EVENTS_PER_TICK_EXTREME_BACKLOG_MULTIPLIER: usize = 16;
+/// How long one AppKit drain tick may wait for the oldest Metal batch so a parked WAIT_REG_MEM
+/// or a full in-flight budget can make progress without yielding the whole callback.
+///
+/// Superliminal title batches of 64 translated draws often take longer than a 12 ms poll, so a
+/// short settle returned Pending, skipped the rest of the drain, and left Q W growing into the
+/// 0–2 present/s stall. 48 ms is still well under the WindowServer watchdog.
+const GUEST_BATCH_DRAIN_SETTLE_MILLISECONDS: u64 = 48;
 // Unity can introduce dozens of distinct 200-400 KiB pixel programs at a scene boundary. Four
 // workers let the ordered GPU queue grow by several thousand events while Apple's compiler is
 // busy, which in turn withholds real guest flips and starves the guest audio producers. Each
@@ -543,6 +559,9 @@ struct ActiveTranslatedScanout {
     width: u32,
     height: u32,
     sequence: u64,
+    /// Guest image actually blitted into the private snapshot (compositor or VideoOut).
+    /// Present refresh must not retarget this to a later HDR ping-pong at a different VA.
+    source: GuestTextureDescriptor,
     /// Orders the guest-queue snapshot copy before legacy-queue presentation/tail work.
     snapshot_ready: Option<SharedEventFence>,
     /// Resident `content_version` copied into the private scanout snapshot texture.
@@ -2530,6 +2549,38 @@ struct MetalPresenter {
     pending_flip_target_written_since_boundary: bool,
     /// Registered VideoOut buffer written since the last submission boundary when no flip arrived.
     pending_scanout_write_address: Option<u64>,
+    /// Last display-sized color write that is still a compositor candidate.
+    /// Scene lighting (not fullscreen bloom / ACES / UI-on-grade) outranks later HDR
+    /// ping-pong so scanout stays warehouse-lit after post comes online.
+    pending_compositor_scanout: Option<GuestTextureDescriptor>,
+    compositor_scanout_sequence: u64,
+    compositor_scanout_writes: HashMap<u64, (u64, GuestTextureDescriptor)>,
+    /// Offscreen writes whose producing pass sampled a display-sized RGBA16Float (bloom / TAA).
+    compositor_grade_writes: HashMap<u64, (u64, GuestTextureDescriptor)>,
+    /// Writes whose producing pass sampled a small TYPE-10 3D LUT (tonemap / ACES).
+    compositor_lut_writes: HashMap<u64, (u64, GuestTextureDescriptor)>,
+    /// Display-sized writes from geometry / lighting, not fullscreen post.
+    compositor_scene_writes: HashMap<u64, (u64, GuestTextureDescriptor)>,
+    compositor_scanout_samples: HashMap<u64, u64>,
+    /// True after a fullscreen HDR / LUT-grade / grade-inherit write this flip.
+    /// Later UI-on-HDR writes must not replace the frozen scene snapshot.
+    compositor_post_stack_active: bool,
+    /// Private copy of the scene color taken before post overwrites that address.
+    compositor_scene_frozen: Option<(GuestTextureDescriptor, Texture)>,
+    /// Set for the current draw/dispatch when a sampled image is display-sized RGBA16Float.
+    compositor_pass_sampled_hdr: bool,
+    /// Set when the current pass sampled a compact 3D color LUT.
+    compositor_pass_sampled_lut: bool,
+    /// Set when that LUT sample happened after a display-sized HDR sample in the same
+    /// pass (Unity uber: `_MainTex` then `_LogLut`). A pass that binds the 33³ volume
+    /// first is lighting/voxel, not ACES.
+    compositor_pass_sampled_lut_after_hdr: bool,
+    /// Set when the current pass sampled a buffer previously written by a LUT-grade pass
+    /// (UI / final blit of the tonemap result).
+    compositor_pass_sampled_grade: bool,
+    /// Fullscreen cover (a handful of vertices). Unity uber is a 3-vertex triangle;
+    /// lighting that also samples a 33³ probe is a high-count geometry pass.
+    compositor_pass_fullscreen: bool,
     active_translated_scanout: Option<ActiveTranslatedScanout>,
     next_flip_sequence: u64,
     finalized_flip_sequence: u64,
@@ -2796,6 +2847,20 @@ impl MetalPresenter {
             pending_flip_queue: None,
             pending_flip_target_written_since_boundary: false,
             pending_scanout_write_address: None,
+            pending_compositor_scanout: None,
+            compositor_scanout_sequence: 0,
+            compositor_scanout_writes: HashMap::new(),
+            compositor_grade_writes: HashMap::new(),
+            compositor_lut_writes: HashMap::new(),
+            compositor_scene_writes: HashMap::new(),
+            compositor_scanout_samples: HashMap::new(),
+            compositor_post_stack_active: false,
+            compositor_scene_frozen: None,
+            compositor_pass_sampled_hdr: false,
+            compositor_pass_sampled_lut: false,
+            compositor_pass_sampled_lut_after_hdr: false,
+            compositor_pass_sampled_grade: false,
+            compositor_pass_fullscreen: false,
             active_translated_scanout: None,
             next_flip_sequence: 0,
             finalized_flip_sequence: 0,

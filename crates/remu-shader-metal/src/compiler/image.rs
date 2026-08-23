@@ -846,6 +846,13 @@ impl Compiler<'_> {
             format!(", level({lod})")
         } else if has_bias {
             format!(", bias({bias})")
+        } else if metal_dim == 2 {
+            // 3D LUTs (and other compact volumes) are sampled with color/volume UVs.
+            // Screen-space derivatives of those UVs are not a spatial mip signal;
+            // implicit LOD averages the whole volume and turns ACES into washed HDR.
+            // Guest IMAGE_SAMPLE on TYPE-10 without an explicit LOD is the path Unity
+            // compiles from SAMPLE_TEXTURE3D; lod 0 is the architectural texel.
+            format!(", level(0.0f)")
         } else {
             String::new()
         };

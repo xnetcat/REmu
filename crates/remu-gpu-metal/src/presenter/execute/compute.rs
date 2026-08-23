@@ -15,10 +15,13 @@ use super::{
     diagnostic_target_after_mrt_ready, diagnostic_texture_numeric_range, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    metal_uncompressed_bytes_per_pixel, read_texture_linear, rearm_color_metadata_clear,
+    metal_uncompressed_bytes_per_pixel, read_texture_linear,
+    rearm_color_metadata_clear,
     rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible, shader_scalar_metadata_for_registers,
+    resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_volume_sample_is_eligible,
+    shader_scalar_metadata_for_registers,
     storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
     log_wave64_hazard_census, validate_compute_launch_for_metal, wave64_split_blockers,
 };
@@ -137,6 +140,75 @@ impl MetalPresenter {
             .shader_evaluation
             .as_ref()
             .ok_or("dispatch has no evaluated compute resources")?;
+        {
+            let store_ops = snapshot
+                .program
+                .instructions
+                .iter()
+                .filter(|instruction| is_writable_image_opcode(instruction.opcode))
+                .count();
+            let three_d = matches!(dispatch.launch.threads_per_group, [_, _, z] if z > 1)
+                || matches!(dispatch.launch.group_count, [_, _, z] if z > 1);
+            if store_ops > 0 || three_d {
+                static LOGGED: AtomicUsize = AtomicUsize::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 12 {
+                    let bindings = evaluation
+                        .image_bindings
+                        .iter()
+                        .map(|binding| {
+                            let decoded = decode_image_descriptor(&binding.resource_descriptor)
+                                .map(|descriptor| {
+                                    format!(
+                                        "type={} {}x{}x{} {:#x} {:?}",
+                                        descriptor.texture_type,
+                                        descriptor.guest.width,
+                                        descriptor.guest.height,
+                                        descriptor.layer_count,
+                                        descriptor.guest.address,
+                                        descriptor.guest.pixel_format
+                                    )
+                                })
+                                .unwrap_or_else(|error| error);
+                            format!(
+                                "pc={:#x} op={} null={} {decoded}",
+                                binding.pc,
+                                binding.opcode,
+                                image_resource_descriptor_is_null(&binding.resource_descriptor),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    let globals = evaluation
+                        .global_memory_bindings
+                        .iter()
+                        .enumerate()
+                        .map(|(index, binding)| {
+                            let words = binding
+                                .data
+                                .chunks_exact(4)
+                                .take(8)
+                                .map(|chunk| {
+                                    u32::from_le_bytes(chunk.try_into().expect("dword"))
+                                })
+                                .collect::<Vec<_>>();
+                            format!(
+                                "b{index} {:#x}/{}B wr={} data={words:08x?}",
+                                binding.base_address,
+                                binding.byte_count,
+                                binding.writable,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    eprintln!(
+                        "[REMu][METAL][COMPUTE-IMAGE] seq={} cs={:#x} grid={:?} local={:?} store_ops={store_ops} insns={} bindings={bindings:?} globals={globals:?}",
+                        dispatch.sequence,
+                        dispatch.shader_address,
+                        dispatch.launch.group_count,
+                        dispatch.launch.threads_per_group,
+                        snapshot.program.instructions.len(),
+                    );
+                }
+            }
+        }
         let device = self
             .device
             .as_ref()
@@ -258,6 +330,8 @@ impl MetalPresenter {
                 && self.resident_guest_textures.values().any(|resident| {
                     resident_color_view_sample_is_eligible(resident, descriptor, false)
                         || resident_same_image_sample_is_eligible(resident, descriptor, false)
+                        || resident_offset_alias_sample_is_eligible(resident, descriptor, false)
+                        || resident_volume_sample_is_eligible(resident, descriptor, false)
                         || resident_depth_sample_is_eligible(resident, descriptor)
                 });
             if !is_writable_image_opcode(binding.opcode)
@@ -320,6 +394,18 @@ impl MetalPresenter {
                         true,
                     )?;
                 }
+            } else if descriptor.texture_type == 10
+                && descriptor.layer_count > 1
+                && storage_image_requires_exact_preacquire(
+                    binding.opcode,
+                    has_read_compatible_resident,
+                )
+            {
+                self.ensure_layered_render_target_texture(
+                    &device,
+                    super::storage_volume_as_render_target(descriptor),
+                    false,
+                )?;
             }
         }
         self.synchronize_sampled_aliases(&[evaluation], &[])?;
@@ -363,6 +449,17 @@ impl MetalPresenter {
             activity_stamp,
             &[],
         )?;
+        self.begin_compositor_pass_samples();
+        for texture in textures.iter().filter(|texture| !texture.writable) {
+            self.note_compositor_scanout_sample(texture.descriptor.guest);
+            self.note_compositor_pass_sampled_hdr(texture.descriptor.guest);
+            self.note_compositor_pass_sampled_volume(
+                texture.descriptor.texture_type,
+                texture.descriptor.guest.width,
+                texture.descriptor.guest.height,
+                texture.descriptor.layer_count,
+            );
+        }
         // Some compute passes bind the same guest image as both a read source and a write
         // destination. Snapshot the producer before this dispatch replaces the writer-map entry;
         // the post-dispatch texture dump otherwise attributes an input to the pass consuming it.

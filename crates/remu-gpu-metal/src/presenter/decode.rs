@@ -21,7 +21,8 @@ use super::{
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
-    is_storage_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
     ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw, program_embeds_global_base,
     tiled_block_dimensions, trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
     video_target_binding_summary,
@@ -38,12 +39,14 @@ pub(crate) use self::image::{
     fallback_image_descriptor, image_component_class, sampled_alias_descriptor,
 };
 pub(crate) use self::pipeline::{
-    ColorOperationMode, NGG_MESHLET_WORDS_PER_GROUP, color_operation_is_raster_noop,
-    decode_color_operation_mode, decode_metal_blend_attachment, decode_raster_state,
-    graphics_pipeline_key, metal_color_write_mask, metal_nonindexed_vertex_count,
-    metal_primitive_type, ngg_mesh_base_vertex, noop_placeholder_cover_draw,
-    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
-    prepare_nonindexed_ngg_indices,
+    ColorOperationMode, NGG_MESHLET_WORDS_PER_GROUP, STORAGE_ONLY_RASTER_EXTENT,
+    color_operation_is_raster_noop, decode_color_operation_mode, decode_metal_blend_attachment,
+    decode_raster_state, draw_writes_storage_image, evaluation_writes_storage_image,
+    graphics_pipeline_key,
+    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
+    ngg_mesh_base_vertex, noop_placeholder_cover_draw, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
+    storage_only_dummy_render_target,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{

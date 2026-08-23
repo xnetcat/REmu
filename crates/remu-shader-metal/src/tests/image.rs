@@ -486,6 +486,16 @@ fn native_2d_array_gather_offsets_use_array_texture_overloads() {
 }
 
 #[test]
+fn type10_sample_without_lod_uses_explicit_level_zero() {
+    let shader = compile_offset_sample("ImageSample", 2, 10);
+    assert!(shader.source.contains("texture3d<float> tex0"));
+    assert!(
+        shader.source.contains("level(0.0f)"),
+        "TYPE-10 IMAGE_SAMPLE must not take implicit screen-space LOD"
+    );
+}
+
+#[test]
 fn true_3d_offsets_keep_the_three_axis_coordinate_lowering() {
     let shader = compile_offset_sample("ImageSampleLzO", 2, 10);
 

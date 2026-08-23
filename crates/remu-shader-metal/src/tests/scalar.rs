@@ -299,7 +299,11 @@ fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
         },
         MetalShaderStage::Pixel,
     );
-    assert!(saveexec.source.contains("simd_ballot(exec)"));
+    assert!(
+        saveexec.source.contains("exec ? 0xfffffffffffffffful : 0ul"),
+        "fragment saveexec cannot use simd_ballot; a zero ballot restores EXEC empty and discards the quad"
+    );
+    assert!(!saveexec.source.contains("simd_ballot(exec)"));
     assert!(saveexec.source.contains("& 0xFFFFFFFFul"));
     assert!(saveexec.source.contains("remu_s_20 = (uint)"));
     assert!(saveexec.source.contains("exec = (("));
@@ -317,10 +321,10 @@ fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
         MetalShaderStage::Pixel,
     );
     assert!(
-        saveexec32
-            .source
-            .contains("(uint)(uint64_t)simd_ballot(exec)")
+        saveexec32.source.contains("(exec) ? 0xffffffffu : 0u"),
+        "wave32 fragment saveexec must publish this thread's EXEC in every local SIMD32 bit"
     );
+    assert!(!saveexec32.source.contains("simd_ballot(exec)"));
     assert!(saveexec32.source.contains("s[20] = ") || saveexec32.source.contains("remu_s_20 = "));
     assert!(saveexec32.source.contains("s[126]") || saveexec32.source.contains("remu_s_126"));
     assert!(

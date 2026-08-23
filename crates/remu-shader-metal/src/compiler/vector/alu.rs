@@ -102,7 +102,7 @@ impl Compiler<'_> {
             // zero and is not the same as the SIMD group's own notion of an active thread. A
             // wave with nothing enabled still has to produce a value, and the hardware reads
             // lane zero in that case, which is what the mask of zero falls through to here.
-            let active = self.temp("uint", "(uint)(uint64_t)simd_ballot(exec)");
+            let active = self.temp("uint", &self.ballot("exec"));
             let lane = self.temp("uint", &format!("{active} == 0u ? 0u : ctz({active})"));
             let mut selected = self.temp("uint", &format!("simd_shuffle({value}, (ushort){lane})"));
             if self.split_wave64() {

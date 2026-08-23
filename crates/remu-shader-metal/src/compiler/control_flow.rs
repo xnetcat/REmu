@@ -127,14 +127,25 @@ pub(crate) fn branch_target(instruction: &Instruction) -> Result<u32, String> {
 
 /// MSL boolean expression for a scalar conditional branch's taken edge (same predicates the
 /// dispatcher PC machine uses).
-pub(crate) fn scalar_branch_taken_condition(name: &str) -> Result<&'static str, String> {
+pub(crate) fn scalar_branch_taken_condition(
+    name: &str,
+    reduce_lane_masks: bool,
+) -> Result<String, String> {
+    // Pixel (and Dispatcher vertex) store VCC/EXEC as a per-thread 0/~0 word because
+    // fragment simd_ballot is undefined. S_CBRANCH_{VCC,EXEC}{Z,NZ} is still
+    // wave-uniform on the guest: take the edge if any lane's mask is nonzero.
+    // simd_or of those private words reconstructs that without a real ballot.
     Ok(match name {
-        "SCbranchScc0" => "!scc",
-        "SCbranchScc1" => "scc",
-        "SCbranchVccz" => "(s[106] | s[107]) == 0u",
-        "SCbranchVccnz" => "(s[106] | s[107]) != 0u",
-        "SCbranchExecz" => "(s[126] | s[127]) == 0u",
-        "SCbranchExecnz" => "(s[126] | s[127]) != 0u",
+        "SCbranchScc0" => "!scc".into(),
+        "SCbranchScc1" => "scc".into(),
+        "SCbranchVccz" if reduce_lane_masks => "simd_or(s[106] | s[107]) == 0u".into(),
+        "SCbranchVccnz" if reduce_lane_masks => "simd_or(s[106] | s[107]) != 0u".into(),
+        "SCbranchExecz" if reduce_lane_masks => "simd_or(s[126] | s[127]) == 0u".into(),
+        "SCbranchExecnz" if reduce_lane_masks => "simd_or(s[126] | s[127]) != 0u".into(),
+        "SCbranchVccz" => "(s[106] | s[107]) == 0u".into(),
+        "SCbranchVccnz" => "(s[106] | s[107]) != 0u".into(),
+        "SCbranchExecz" => "(s[126] | s[127]) == 0u".into(),
+        "SCbranchExecnz" => "(s[126] | s[127]) != 0u".into(),
         _ => return Err(format!("not a scalar conditional branch: {name}")),
     })
 }

@@ -30,6 +30,19 @@ impl ResourceSpan {
         ))
     }
 
+    /// Face byte count times `layer_count`. TYPE-10 volumes store depth in the SRD, not in
+    /// `GuestTextureDescriptor`, so the 2D face span would only cover slice 0.
+    pub(crate) fn for_texture_layers(
+        descriptor: GuestTextureDescriptor,
+        layer_count: u32,
+    ) -> Option<Self> {
+        let face = guest_texture_byte_count(descriptor)?;
+        Some(Self::new(
+            descriptor.address,
+            face.checked_mul(u64::from(layer_count.max(1)))?,
+        ))
+    }
+
     pub(crate) fn new(address: u64, len: u64) -> Self {
         Self {
             address,
@@ -357,6 +370,38 @@ pub(crate) fn guest_texture_descriptors_share_byte_storage(
 ///
 /// Pitch only matters for CPU tiling decode. Once the image lives in a Metal resident, same
 /// format + extent + physical storage is enough to bind it directly and skip alias writeback.
+/// GNM large-page size used when an SRD sits just past a render-target allocation.
+pub(crate) const GUEST_GPU_LARGE_PAGE_BYTES: u64 = 2 * 1_024 * 1_024;
+
+/// True when a sample SRD names the same image as a GPU-authored resident through a
+/// base-offset alias (overlapping VA or one 2 MiB GPU page away).
+///
+/// Superliminal's post stack renders the warehouse to `CB_COLOR_BASE` and later samples a
+/// same-extent RGBA16F SRD 2 MiB later. The offset key is admitted as its own cleared
+/// resident, so Uber `_MainTex` reads zeros while the flip-buffer warehouse is still live.
+pub(crate) fn guest_texture_descriptors_share_offset_alias_storage(
+    rendered: GuestTextureDescriptor,
+    sampled: GuestTextureDescriptor,
+) -> bool {
+    if rendered.pixel_format != sampled.pixel_format
+        || rendered.width != sampled.width
+        || rendered.height != sampled.height
+        || rendered.bytes_per_pixel != sampled.bytes_per_pixel
+        || rendered.width == 0
+        || rendered.height == 0
+    {
+        return false;
+    }
+    if guest_texture_descriptors_overlap(rendered, sampled) {
+        return true;
+    }
+    let Some(rendered_bytes) = guest_texture_byte_count(rendered) else {
+        return false;
+    };
+    let delta = rendered.address.abs_diff(sampled.address);
+    delta == GUEST_GPU_LARGE_PAGE_BYTES || delta < rendered_bytes
+}
+
 pub(crate) fn guest_texture_descriptors_share_gpu_sample_storage(
     rendered: GuestTextureDescriptor,
     sampled: GuestTextureDescriptor,
@@ -408,7 +453,7 @@ pub(crate) fn render_resolve_candidate_matches(
     // guest memory. GNM allocators round that allocation to a large GPU page, so the SRD base is
     // just beyond the raw sample storage rather than overlapping CB_COLOR_BASE. This relationship
     // is narrow enough to retain allocation identity while rejecting unrelated same-size targets.
-    const GPU_LARGE_PAGE_BYTES: u64 = 2 * 1_024 * 1_024;
+    const GPU_LARGE_PAGE_BYTES: u64 = GUEST_GPU_LARGE_PAGE_BYTES;
     let Some(multisample_bytes) = guest_texture_byte_count(rendered)
         .and_then(|bytes| bytes.checked_mul(u64::from(sample_count)))
     else {

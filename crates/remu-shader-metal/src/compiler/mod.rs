@@ -241,6 +241,16 @@ impl Compiler<'_> {
             })
     }
 
+    /// Fragment (and Dispatcher vertex) simdgroups cannot prove `simd_ballot` bits match
+    /// `remu_lane`. A zero ballot then `S_WQM` / EXEC restore kills every quad. Mirror this
+    /// thread's predicate across the local SIMD32 word so `(mask >> remu_lane) & 1` is exact
+    /// without a wave reduction.
+    fn uses_per_thread_lane_masks(&self) -> bool {
+        matches!(self.options.stage, MetalShaderStage::Pixel)
+            || (self.options.stage == MetalShaderStage::Vertex
+                && matches!(self.control_flow, ControlFlowLowering::Dispatcher))
+    }
+
     fn control_flow_may_revisit_instruction_sites(&self) -> bool {
         match &self.control_flow {
             ControlFlowLowering::Dispatcher => true,

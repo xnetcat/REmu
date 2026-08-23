@@ -1108,12 +1108,82 @@ impl MetalPresenter {
     }
 
     pub(super) fn gpu_events_per_tick_budget(&self) -> usize {
-        if remu_gpu::gpu_work_items_pending() > super::super::GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD
-        {
-            super::super::GPU_EVENTS_PER_TICK
-                .saturating_mul(super::super::GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER)
+        let pending = remu_gpu::gpu_work_items_pending();
+        let multiplier = if pending > super::super::GPU_EVENTS_PER_TICK_EXTREME_BACKLOG_THRESHOLD {
+            super::super::GPU_EVENTS_PER_TICK_EXTREME_BACKLOG_MULTIPLIER
+        } else if pending > super::super::GPU_EVENTS_PER_TICK_HEAVY_BACKLOG_THRESHOLD {
+            super::super::GPU_EVENTS_PER_TICK_HEAVY_BACKLOG_MULTIPLIER
+        } else if pending > super::super::GPU_EVENTS_PER_TICK_BACKLOG_THRESHOLD {
+            super::super::GPU_EVENTS_PER_TICK_BACKLOG_MULTIPLIER
         } else {
-            super::super::GPU_EVENTS_PER_TICK
+            1
+        };
+        super::super::GPU_EVENTS_PER_TICK.saturating_mul(multiplier)
+    }
+
+    fn drain_settle_deadline() -> Instant {
+        Instant::now()
+            + Duration::from_millis(super::super::GUEST_BATCH_DRAIN_SETTLE_MILLISECONDS)
+    }
+
+    fn settle_oldest_in_flight_guest_batch(&mut self, deadline: Instant) -> FrontBatchSettlement {
+        if self.per_queue_guest_batches {
+            self.settle_next_global_guest_batch(deadline)
+        } else {
+            self.settle_front_guest_batch(deadline)
+        }
+    }
+
+    /// Wait for the oldest in-flight Metal batch so a full submission budget can accept more work
+    /// in this AppKit tick instead of returning and letting the guest channel grow.
+    pub(super) fn reclaim_in_flight_guest_batch_slot(&mut self) -> bool {
+        if !self.guest_submission_backpressure_full() {
+            return true;
+        }
+        match self.settle_oldest_in_flight_guest_batch(Self::drain_settle_deadline()) {
+            FrontBatchSettlement::Retired(_) => {
+                self.retire_completed_guest_batches();
+                !self.guest_submission_backpressure_full()
+            }
+            FrontBatchSettlement::Empty | FrontBatchSettlement::Pending(_) => false,
+        }
+    }
+
+    /// Wait for the oldest committed Metal batch so a parked WAIT_REG_MEM can see its producer.
+    ///
+    /// Superliminal's title stream hits a memory wait after only a few packets. Yielding the
+    /// whole AppKit tick there left ~70k work items queued and pinned present/s at 2. If the
+    /// producer is still in the open batch (an opportunistic flush declined at the in-flight
+    /// cap), submit it and settle that commit in the same tick.
+    pub(crate) fn settle_pending_terminal_wait_producer(&mut self) -> bool {
+        let deadline = Self::drain_settle_deadline();
+        match self.settle_oldest_in_flight_guest_batch(deadline) {
+            FrontBatchSettlement::Retired(_) => {
+                self.retire_completed_guest_batches();
+                true
+            }
+            FrontBatchSettlement::Pending(_) => false,
+            FrontBatchSettlement::Empty => {
+                if self.active_open_guest_batch().is_none() {
+                    return false;
+                }
+                if self
+                    .flush_guest_command_batch(
+                        FlushPolicy::Required,
+                        GuestBatchFlushReason::BlockedWait,
+                    )
+                    .is_err()
+                {
+                    return false;
+                }
+                match self.settle_oldest_in_flight_guest_batch(deadline) {
+                    FrontBatchSettlement::Retired(_) => {
+                        self.retire_completed_guest_batches();
+                        true
+                    }
+                    FrontBatchSettlement::Empty | FrontBatchSettlement::Pending(_) => false,
+                }
+            }
         }
     }
 

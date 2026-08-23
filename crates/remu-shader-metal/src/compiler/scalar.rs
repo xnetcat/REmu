@@ -62,18 +62,15 @@ impl Compiler<'_> {
     /// Wave ballot for packing EXEC/VCC lane masks.
     ///
     /// SharpEmu documents that Metal leaves simdgroup ops undefined inside a divergent
-    /// PC-dispatcher: real `simd_ballot` there corrupts EXEC/VCC and kills whole quads. Graphics
-    /// stages that fall back to the Dispatcher therefore use the single-lane model (bit 0 only).
+    /// PC-dispatcher: real `simd_ballot` there corrupts EXEC/VCC and kills whole quads.
+    /// Fragment functions have the same gap even on Forward/Structured control flow —
+    /// `simd_ballot(true)` is observed to return 0, after which `S_WQM` plus an EXEC restore
+    /// discards the whole coverage mask. Pixel (and Dispatcher vertex) therefore publish this
+    /// thread's predicate in every local SIMD32 bit so `(mask >> remu_lane) & 1` stays exact.
     /// Compute/mesh keep real ballots — the scalar PC keeps the wave in lockstep on that path.
     pub(crate) fn ballot(&self, condition: &str) -> String {
-        if matches!(
-            self.options.stage,
-            crate::MetalShaderStage::Vertex | crate::MetalShaderStage::Pixel
-        ) && matches!(
-            self.control_flow,
-            crate::compiler::control_flow::ControlFlowLowering::Dispatcher
-        ) {
-            format!("({condition}) ? 1u : 0u")
+        if self.uses_per_thread_lane_masks() {
+            format!("({condition}) ? 0xffffffffu : 0u")
         } else {
             format!("(uint)(uint64_t)simd_ballot({condition})")
         }
@@ -370,7 +367,9 @@ impl Compiler<'_> {
         // A split guest wave64 runs as two SIMD32 groups: the first group owns bits 0..31 and the
         // second owns bits 32..63. Keeping masks half-local lets structured EXEC predication and
         // later B64 restore operations remain exact without cross-SIMD communication.
-        let old_expression = if self.split_wave64() {
+        let old_expression = if self.uses_per_thread_lane_masks() {
+            "(exec ? 0xfffffffffffffffful : 0ul)"
+        } else if self.split_wave64() {
             "((ulong)(uint64_t)simd_ballot(exec) << (remu_wave_half * 32u))"
         } else {
             "(ulong)(uint64_t)simd_ballot(exec)"
@@ -414,7 +413,7 @@ impl Compiler<'_> {
         let source = self.raw_source(instruction, 0)?;
         // Wave32 saveexec only updates EXEC_LO. Preserve the active SIMD32 ballot as the old mask
         // so later EXEC restores remain exact for GFX10 wave32 programs.
-        let old = self.temp("uint", "(uint)(uint64_t)simd_ballot(exec)");
+        let old = self.temp("uint", &self.ballot("exec"));
         let expression = match name {
             "SAndSaveexecB32" => format!("({old} & {source})"),
             "SOrSaveexecB32" => format!("({old} | {source})"),

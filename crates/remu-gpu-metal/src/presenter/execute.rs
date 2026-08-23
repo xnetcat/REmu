@@ -55,19 +55,25 @@ use super::{
     image_resource_descriptor_is_null, initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
     metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
+    native_texture_capture_to_bgra, ngg_memoryless_cover_export_stage, ngg_mesh_base_vertex,
+    prepare_indexed_ngg_indices, procedural_rectangle_stage_for_draw,
     prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
     read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_same_image_sample_is_eligible, sampled_image_bindings,
+    resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_volume_sample_is_eligible,
+    sampled_image_bindings,
     shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
     snapshot_guest_texture_raw, spans_overlap, storage_image_requires_mip_hierarchy,
     trace_glyph_atlas, trace_image_descriptors, trace_msaa_writes, trace_scanout_writes,
     log_wave64_hazard_census, trace_target_sampling, upload_image_textures,
     validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
+};
+use super::decode::{
+    storage_only_dummy_render_target, STORAGE_ONLY_RASTER_EXTENT,
 };
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -75,6 +81,7 @@ use metal::{
     MTLSize, MTLTextureType, MTLTextureUsage, MTLViewport, RenderPassDescriptor,
 };
 use remu_gpu::IndexedDraw;
+use remu_shader::PixelOutputKind;
 use remu_shader_metal::{
     HEAP_TEXTURE_DESCRIPTOR_STRIDE_BYTES, HeapTextureComponent, HeapTextureDimension,
     HeapTextureTableBinding, HeapTextureTableType,
@@ -191,6 +198,64 @@ fn heap_texture_matches_table_type(
     dimension == table_type.dimension
         && component_matches
         && super::texture::sampled_texture_supports_access(texture, table_type.writable)
+}
+
+fn storage_volume_as_render_target(
+    descriptor: super::DecodedImageDescriptor,
+) -> super::DecodedRenderTarget {
+    super::DecodedRenderTarget {
+        guest_slot: 0,
+        texture: descriptor.guest,
+        span: descriptor.span,
+        output_kind: PixelOutputKind::Float,
+        write_mask: 0xf,
+        direct_scanout: false,
+        sample_count: 1,
+        texture_type: descriptor.texture_type,
+        layer_count: descriptor.layer_count,
+        base_layer: 0,
+        mip_level: descriptor.base_mip_level,
+        mip_level_count: descriptor.mip_level_count.max(1),
+        dcc_enabled: false,
+        fast_clear_enabled: false,
+        blend_bypass: true,
+    }
+}
+
+fn storage_only_raster_extent(draw: &IndexedDraw) -> (u32, u32) {
+    // Superliminal's LUT bake programs a 1920x1080 cover viewport with CB_TARGET_MASK=0.
+    // A 64x64 dummy clips that cover to a few percent of the LUT. Size the dummy to the
+    // guest viewport so every fragment that ImageStore needs actually runs.
+    let viewport = decode_viewport(draw, 1, 1, GuestScissor::Full);
+    let width = viewport
+        .width
+        .round()
+        .clamp(1.0, 4_096.0) as u32;
+    let height = viewport
+        .height
+        .round()
+        .clamp(1.0, 4_096.0) as u32;
+    (
+        width.max(STORAGE_ONLY_RASTER_EXTENT),
+        height.max(STORAGE_ONLY_RASTER_EXTENT),
+    )
+}
+
+fn storage_only_dummy_color_texture(
+    device: &metal::Device,
+    width: u32,
+    height: u32,
+) -> metal::Texture {
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::R8Unorm);
+    descriptor.set_width(u64::from(width));
+    descriptor.set_height(u64::from(height));
+    descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+    descriptor.set_usage(MTLTextureUsage::RenderTarget);
+    let texture = device.new_texture(&descriptor);
+    texture.set_label("REMu storage-only raster dummy");
+    texture
 }
 
 impl MetalPresenter {
@@ -505,7 +570,7 @@ impl MetalPresenter {
         let started = Instant::now();
         let ack_phase_timing = self.shared_event_ack_phase_timing_enabled();
         let trace = draw.sequence <= 4 || draw.sequence.is_power_of_two();
-        let targets = decode_render_targets(draw)?;
+        let mut targets = decode_render_targets(draw)?;
         let depth = decode_depth_target(draw)?;
         let raster = decode_raster_state(draw)?;
         let diagnostic_depth_draw = diagnostic_dump_depth_export_shader().is_some_and(|expected| {
@@ -605,10 +670,7 @@ impl MetalPresenter {
             if trace_target_sampling() {
                 static LOGGED_COLOR_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
                 let sequence = LOGGED_COLOR_OPERATIONS.fetch_add(1, Ordering::Relaxed) + 1;
-                let target_minimum = diagnostic_dump_target_minimum_draw();
-                let near_target_minimum = draw.sequence >= target_minimum
-                    && draw.sequence < target_minimum.saturating_add(64);
-                if sequence <= 16 || sequence.is_power_of_two() || near_target_minimum {
+                if sequence <= 16 || sequence.is_power_of_two() {
                     eprintln!(
                         "[REMu][METAL][COLOR-OP] draw={} operation={color_operation:?} control={color_control:#010x} targets={targets:?} operated={operation_targets:?}",
                         draw.sequence,
@@ -616,6 +678,57 @@ impl MetalPresenter {
                 }
             }
             return Ok(());
+        }
+        if trace_target_sampling()
+            && targets.iter().any(|target| {
+            target.texture.width == 1_920 && target.texture.height == 1_080
+        }) {
+            static LOGGED_SCENE_HDR: AtomicUsize = AtomicUsize::new(0);
+            let sequence = LOGGED_SCENE_HDR.fetch_add(1, Ordering::Relaxed) + 1;
+            if sequence <= 32 || sequence.is_power_of_two() {
+                let col_format = register_value(&draw.context_registers, 0x1c5).unwrap_or(0);
+                let pipeline_masks = key
+                    .targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            target.guest_slot,
+                            target.write_mask,
+                            target.export_format,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let color_targets = targets
+                    .iter()
+                    .map(|target| {
+                        (
+                            target.texture.address,
+                            target.sample_count,
+                            target.write_mask,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let depth_state = depth.map(|depth| {
+                    (
+                        depth.texture.address,
+                        depth.sample_count,
+                        depth.test_enabled,
+                        depth.write_enabled,
+                        depth.compare,
+                        depth.clear_enabled,
+                        depth.clear_depth,
+                    )
+                });
+                eprintln!(
+                    "[REMu][METAL][SCENE-HDR] n={sequence} draw={} es={:#x} ps={:#x} indexed={} count={} color_control={color_control:#010x} operation={color_operation:?} col_format={col_format:#010x} pipeline_masks={pipeline_masks:?} targets={color_targets:x?} depth={depth_state:?} mesh={}",
+                    draw.sequence,
+                    draw.export_shader_address,
+                    draw.pixel_shader_address,
+                    draw.indexed,
+                    draw.index_count,
+                    key.uses_mesh_stage,
+                );
+            }
         }
         self.capture_scanout_before_pixel_shader(draw, &targets)?;
         if trace_scanout_writes() && draw.sequence >= diagnostic_dump_target_minimum_draw() {
@@ -782,10 +895,20 @@ impl MetalPresenter {
         if !self.compiled_shader_pairs.contains_key(key) {
             return Err("shader pair has no compiled Metal pipeline".to_owned());
         }
-        let export_evaluation = draw
-            .export_shader_evaluation
-            .as_ref()
-            .ok_or("draw has no export resource evaluation")?;
+        let export_evaluation = match draw.export_shader_evaluation.as_ref() {
+            Some(evaluation) => evaluation.as_ref(),
+            None => {
+                let cover = draw.export_shader.as_ref().is_some_and(|shader| {
+                    ngg_memoryless_cover_export_stage(&shader.program)
+                        || procedural_rectangle_stage_for_draw(&shader.program, draw)
+                });
+                if cover {
+                    fragmentless_pixel_evaluation()
+                } else {
+                    return Err("draw has no export resource evaluation".to_owned());
+                }
+            }
+        };
         let pixel_evaluation = match (
             draw.pixel_shader.as_ref(),
             draw.pixel_shader_evaluation.as_ref(),
@@ -870,21 +993,129 @@ impl MetalPresenter {
             .ok_or("Metal device is unavailable")?
             .clone();
         let queue = self.active_guest_command_queue()?;
+        let storage_only_draw = targets.is_empty()
+            && depth.is_none()
+            && draw.pixel_shader.is_some();
+        if storage_only_draw {
+            static LOGGED: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                let bindings = pixel_evaluation
+                    .image_bindings
+                    .iter()
+                    .map(|binding| {
+                        let decoded = decode_image_descriptor(&binding.resource_descriptor)
+                            .map(|descriptor| {
+                                format!(
+                                    "type={} {}x{}x{} {:#x} fmt={:?}",
+                                    descriptor.texture_type,
+                                    descriptor.guest.width,
+                                    descriptor.guest.height,
+                                    descriptor.layer_count,
+                                    descriptor.guest.address,
+                                    descriptor.guest.pixel_format
+                                )
+                            })
+                            .unwrap_or_else(|error| error);
+                        format!(
+                            "pc={:#x} op={} runtime={} null={} {decoded}",
+                            binding.pc,
+                            binding.opcode,
+                            binding.descriptor_index_is_runtime,
+                            image_resource_descriptor_is_null(&binding.resource_descriptor),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let program_summary = draw.pixel_shader.as_ref().map(|shader| {
+                    let image_ops = shader
+                        .program
+                        .instructions
+                        .iter()
+                        .filter(|instruction| {
+                            matches!(
+                                instruction.control,
+                                Some(remu_shader::InstructionControl::Image(_))
+                            )
+                        })
+                        .count();
+                    let store_ops = shader
+                        .program
+                        .instructions
+                        .iter()
+                        .filter(|instruction| is_writable_image_opcode(instruction.opcode))
+                        .count();
+                    format!(
+                        "insns={} image_ops={image_ops} store_ops={store_ops} supplementals={}",
+                        shader.program.instructions.len(),
+                        shader.supplemental_programs.len()
+                    )
+                });
+                eprintln!(
+                    "[REMu][METAL][STORAGE-ONLY] draw={} es={:#x} ps={:#x} extent={}x{} {program_summary:?} bindings={bindings:?}",
+                    draw.sequence,
+                    draw.export_shader_address,
+                    draw.pixel_shader_address,
+                    storage_only_raster_extent(draw).0,
+                    storage_only_raster_extent(draw).1,
+                );
+            }
+        }
+        if let Some(pixel) = draw.pixel_shader.as_ref() {
+            let store_ops = pixel
+                .program
+                .instructions
+                .iter()
+                .filter(|instruction| is_writable_image_opcode(instruction.opcode))
+                .count();
+            if store_ops > 0 {
+                static LOGGED_STORES: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                if LOGGED_STORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+                    let image_ops = pixel
+                        .program
+                        .instructions
+                        .iter()
+                        .filter(|instruction| {
+                            matches!(
+                                instruction.control,
+                                Some(remu_shader::InstructionControl::Image(_))
+                            )
+                        })
+                        .count();
+                    eprintln!(
+                        "[REMu][METAL][IMAGE-STORE-PS] draw={} es={:#x} ps={:#x} targets={} store_ops={store_ops} image_ops={image_ops} insns={} eval_images={}",
+                        draw.sequence,
+                        draw.export_shader_address,
+                        draw.pixel_shader_address,
+                        targets.len(),
+                        pixel.program.instructions.len(),
+                        pixel_evaluation.image_bindings.len(),
+                    );
+                }
+            }
+        }
         // Color attachments determine the framebuffer extent when present. Unreal's early-Z and
         // masked-depth passes intentionally program CB_TARGET_MASK=0, so a depth-only pass derives
         // its extent from DB instead. Rejecting those passes leaves the later depth-equal base
         // pass with an empty depth buffer and makes otherwise valid 3D scenes entirely black.
+        // Storage-only ImageStore draws (Superliminal's 33³ LUT bake) have neither; rasterize
+        // into a dummy Metal color target large enough to cover the bake slice.
+        let (storage_only_width, storage_only_height) = storage_only_draw
+            .then(|| storage_only_raster_extent(draw))
+            .unwrap_or((STORAGE_ONLY_RASTER_EXTENT, STORAGE_ONLY_RASTER_EXTENT));
         let render_width = targets
             .iter()
             .map(|target| (target.texture.width >> target.mip_level).max(1))
             .min()
             .or_else(|| depth.map(|depth| depth.texture.width))
+            .or_else(|| storage_only_draw.then_some(storage_only_width))
             .ok_or("draw has neither a color nor depth attachment")?;
         let render_height = targets
             .iter()
             .map(|target| (target.texture.height >> target.mip_level).max(1))
             .min()
             .or_else(|| depth.map(|depth| depth.texture.height))
+            .or_else(|| storage_only_draw.then_some(storage_only_height))
             .ok_or("draw has neither a color nor depth attachment")?;
         let mut target_textures = Vec::with_capacity(targets.len());
         let mut target_resolve_textures = Vec::with_capacity(targets.len());
@@ -977,6 +1208,21 @@ impl MetalPresenter {
                 target_resolve_textures.push(None);
             }
         }
+        if storage_only_draw {
+            let mut dummy = storage_only_dummy_render_target();
+            dummy.texture.width = storage_only_width;
+            dummy.texture.height = storage_only_height;
+            dummy.texture.pitch = storage_only_width;
+            targets.push(dummy);
+            target_textures.push(storage_only_dummy_color_texture(
+                &device,
+                storage_only_width,
+                storage_only_height,
+            ));
+            target_resolve_textures.push(None);
+            initial_target_clear_colors.push(Some(MTLClearColor::new(0.0, 0.0, 0.0, 0.0)));
+            target_resident_descriptors.push(None);
+        }
         let depth_had_resident_storage = depth.is_some_and(|depth| {
             self.resident_guest_textures.values().any(|resident| {
                 resident.serves_reads()
@@ -1068,6 +1314,8 @@ impl MetalPresenter {
                     && self.resident_guest_textures.values().any(|resident| {
                         resident_color_view_sample_is_eligible(resident, descriptor, false)
                             || resident_same_image_sample_is_eligible(resident, descriptor, false)
+                            || resident_offset_alias_sample_is_eligible(resident, descriptor, false)
+                            || resident_volume_sample_is_eligible(resident, descriptor, false)
                             || resident_depth_sample_is_eligible(resident, descriptor)
                     });
                 if !has_read_compatible_resident {
@@ -1113,6 +1361,17 @@ impl MetalPresenter {
                             true,
                         )?;
                     }
+                } else if descriptor.texture_type == 10
+                    && descriptor.layer_count > 1
+                    && (writable || !has_read_compatible_resident)
+                {
+                    // Superliminal bakes its 33³ grade LUT through a pixel ImageStore to a
+                    // type-10 volume. The 2D storage path cannot own that resource.
+                    self.ensure_layered_render_target_texture(
+                        &device,
+                        storage_volume_as_render_target(descriptor),
+                        false,
+                    )?;
                 }
             }
         }
@@ -1195,6 +1454,363 @@ impl MetalPresenter {
             activity_stamp,
             shared_event_texture_overrides,
         )?;
+        self.begin_compositor_pass_samples();
+        // Unity uber is a 3-vertex cover; lighting that also binds a 33³ probe is not.
+        self.compositor_pass_fullscreen = draw.index_count > 0 && draw.index_count <= 6;
+        for texture in export_textures
+            .iter()
+            .chain(pixel_textures.iter())
+            .filter(|texture| !texture.writable)
+        {
+            self.note_compositor_scanout_sample(texture.descriptor.guest);
+            self.note_compositor_pass_sampled_hdr(texture.descriptor.guest);
+            self.note_compositor_pass_sampled_volume(
+                texture.descriptor.texture_type,
+                texture.descriptor.guest.width,
+                texture.descriptor.guest.height,
+                texture.descriptor.layer_count,
+            );
+        }
+        self.preserve_compositor_scene_before_hdr_targets(
+            targets.iter().map(|target| target.texture),
+        );
+        let post_hdr_target = targets.iter().any(|target| {
+            target.texture.width == 1_920
+                && target.texture.height == 1_080
+                && target.texture.pixel_format == metal::MTLPixelFormat::RGBA16Float
+        });
+        let samples_screen_hdr = pixel_textures.iter().any(|texture| {
+            texture.descriptor.guest.width >= 1_280
+                && texture.descriptor.guest.height >= 720
+                && texture.descriptor.guest.pixel_format == metal::MTLPixelFormat::RGBA16Float
+        });
+        if trace_target_sampling() && post_hdr_target && samples_screen_hdr {
+            static LOGGED_POST_HDR: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED_POST_HDR.fetch_add(1, Ordering::Relaxed) < 24 {
+                let sampled = pixel_textures
+                    .iter()
+                    .map(|texture| {
+                        let resident = self
+                            .resident_guest_textures
+                            .get(&texture.descriptor.guest)
+                            .or_else(|| {
+                                texture
+                                    .selected_resident
+                                    .and_then(|key| self.resident_guest_textures.get(&key))
+                            });
+                        format!(
+                            "{:#x}/{}x{}/{:?}/tile{} gpu={} exec={} selected={:#x?}",
+                            texture.descriptor.guest.address,
+                            texture.descriptor.guest.width,
+                            texture.descriptor.guest.height,
+                            texture.descriptor.guest.pixel_format,
+                            texture.descriptor.guest.tile_mode,
+                            resident.is_some_and(|resident| resident.gpu_written()),
+                            resident.is_some_and(|resident| resident.gpu_content_executed),
+                            texture.selected_resident.map(|key| key.address),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let export_globals = export_evaluation
+                    .global_memory_bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, binding)| {
+                        let head = binding
+                            .data
+                            .chunks_exact(4)
+                            .take(4)
+                            .map(|chunk| {
+                                format!(
+                                    "{:.3}",
+                                    f32::from_le_bytes(chunk.try_into().expect("dword"))
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        format!(
+                            "b{index} {:#x}/{}B wr={} head={head:?}",
+                            binding.base_address, binding.byte_count, binding.writable
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let pixel_globals = pixel_evaluation
+                    .global_memory_bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, binding)| {
+                        let head = binding
+                            .data
+                            .chunks_exact(4)
+                            .take(4)
+                            .map(|chunk| {
+                                format!(
+                                    "{:.3}",
+                                    f32::from_le_bytes(chunk.try_into().expect("dword"))
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        format!(
+                            "b{index} {:#x}/{}B wr={} head={head:?}",
+                            binding.base_address, binding.byte_count, binding.writable
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let dests = targets
+                    .iter()
+                    .map(|target| {
+                        format!(
+                            "{:#x}/{}x{}/{:?}",
+                            target.texture.address,
+                            target.texture.width,
+                            target.texture.height,
+                            target.texture.pixel_format
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[REMu][METAL][POST-HDR] draw={} es={:#x} ps={:#x} indexed={} count={} prim={:#x} dests={dests:?} sampled={sampled:?} export_globals={export_globals:?} pixel_globals={pixel_globals:?}",
+                    draw.sequence,
+                    draw.export_shader_address,
+                    draw.pixel_shader_address,
+                    draw.indexed,
+                    draw.index_count,
+                    draw.primitive_type,
+                );
+            }
+        }
+        if trace_target_sampling()
+            && pixel_textures.iter().any(|texture| {
+            texture.descriptor.texture_type == 10 && texture.descriptor.layer_count >= 32
+        }) {
+            static LOGGED_GRADE: AtomicUsize = AtomicUsize::new(0);
+            if LOGGED_GRADE.fetch_add(1, Ordering::Relaxed) < 8 {
+                let bindings = pixel_textures
+                    .iter()
+                    .map(|texture| {
+                        let resident = self
+                            .resident_guest_textures
+                            .get(&texture.descriptor.guest)
+                            .or_else(|| {
+                                texture.selected_resident.and_then(|key| {
+                                    self.resident_guest_textures.get(&key)
+                                })
+                            });
+                        let preview = (texture.descriptor.guest.width
+                            * texture.descriptor.guest.height
+                            <= 16)
+                            .then(|| {
+                                let bpp = texture.descriptor.guest.bytes_per_pixel.max(1);
+                                let bytes = (texture.descriptor.guest.width
+                                    * texture.descriptor.guest.height
+                                    * bpp) as usize;
+                                let mut raw = vec![0_u8; bytes];
+                                texture.texture.get_bytes(
+                                    raw.as_mut_ptr().cast(),
+                                    u64::from(texture.descriptor.guest.width * bpp),
+                                    metal::MTLRegion::new_2d(
+                                        0,
+                                        0,
+                                        u64::from(texture.descriptor.guest.width),
+                                        u64::from(texture.descriptor.guest.height),
+                                    ),
+                                    0,
+                                );
+                                raw.iter()
+                                    .map(|byte| format!("{byte:02x}"))
+                                    .collect::<Vec<_>>()
+                                    .join("")
+                            });
+                        format!(
+                            "pc_type={} {}x{}x{} {:#x} {:?} tile{} writable={} gpu={} exec={} metal={:?} preview={preview:?}",
+                            texture.descriptor.texture_type,
+                            texture.descriptor.guest.width,
+                            texture.descriptor.guest.height,
+                            texture.descriptor.layer_count,
+                            texture.descriptor.guest.address,
+                            texture.descriptor.guest.pixel_format,
+                            texture.descriptor.guest.tile_mode,
+                            texture.writable,
+                            resident.is_some_and(|resident| resident.gpu_written()),
+                            resident.is_some_and(|resident| resident.gpu_content_executed),
+                            texture.texture.texture_type(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let target_summary = targets
+                    .iter()
+                    .map(|target| {
+                        format!(
+                            "{:#x}/{}x{}/{:?}",
+                            target.texture.address,
+                            target.texture.width,
+                            target.texture.height,
+                            target.texture.pixel_format,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let globals = pixel_evaluation
+                    .global_memory_bindings
+                    .iter()
+                    .enumerate()
+                    .map(|(index, binding)| {
+                        let words = binding
+                            .data
+                            .chunks_exact(4)
+                            .take(64)
+                            .map(|chunk| {
+                                u32::from_le_bytes(chunk.try_into().expect("dword"))
+                            })
+                            .collect::<Vec<_>>();
+                        format!(
+                            "b{index} {:#x}/{}B wr={} data={words:08x?}",
+                            binding.base_address,
+                            binding.byte_count,
+                            binding.writable,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let probe_rgba16f_center = |texture: &metal::Texture, width: u32, height: u32| {
+                    let mut raw = [0_u8; 8];
+                    texture.get_bytes(
+                        raw.as_mut_ptr().cast(),
+                        u64::from(width) * 8,
+                        metal::MTLRegion::new_2d(
+                            u64::from(width / 2),
+                            u64::from(height / 2),
+                            1,
+                            1,
+                        ),
+                        0,
+                    );
+                    [
+                        half_float_to_f32(u16::from_le_bytes([raw[0], raw[1]])),
+                        half_float_to_f32(u16::from_le_bytes([raw[2], raw[3]])),
+                        half_float_to_f32(u16::from_le_bytes([raw[4], raw[5]])),
+                        half_float_to_f32(u16::from_le_bytes([raw[6], raw[7]])),
+                    ]
+                };
+                let scene_means = pixel_textures
+                    .iter()
+                    .filter(|texture| {
+                        texture.descriptor.guest.width >= 1_280
+                            && texture.descriptor.guest.height >= 720
+                            && texture.descriptor.guest.pixel_format
+                                == metal::MTLPixelFormat::RGBA16Float
+                    })
+                    .map(|texture| {
+                        let rgba = probe_rgba16f_center(
+                            &texture.texture,
+                            texture.descriptor.guest.width,
+                            texture.descriptor.guest.height,
+                        );
+                        format!(
+                            "{:#x} center=[{:.4},{:.4},{:.4},{:.4}]",
+                            texture.descriptor.guest.address,
+                            rgba[0],
+                            rgba[1],
+                            rgba[2],
+                            rgba[3],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let mut hdr_residents = self
+                    .resident_guest_textures
+                    .values()
+                    .filter(|resident| {
+                        resident.gpu_written()
+                            && resident.descriptor.width == 1_920
+                            && resident.descriptor.height == 1_080
+                            && resident.descriptor.pixel_format
+                                == metal::MTLPixelFormat::RGBA16Float
+                    })
+                    .collect::<Vec<_>>();
+                hdr_residents.sort_by_key(|resident| resident.descriptor.address);
+                let hdr_centers = hdr_residents
+                    .iter()
+                    .map(|resident| {
+                        let rgba = probe_rgba16f_center(
+                            &resident.texture,
+                            resident.descriptor.width,
+                            resident.descriptor.height,
+                        );
+                        format!(
+                            "{:#x} v{} center=[{:.4},{:.4},{:.4},{:.4}]",
+                            resident.descriptor.address,
+                            resident.content_version,
+                            rgba[0],
+                            rgba[1],
+                            rgba[2],
+                            rgba[3],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let lut_voxels = pixel_textures
+                    .iter()
+                    .filter(|texture| {
+                        texture.descriptor.texture_type == 10
+                            && texture.descriptor.layer_count >= 32
+                            && texture.descriptor.guest.pixel_format
+                                == metal::MTLPixelFormat::RGBA16Float
+                    })
+                    .filter_map(|texture| {
+                        let device = self.device.as_ref()?;
+                        let queue = self.command_queue.as_ref()?;
+                        let packed = read_texture_volume_linear(
+                            device,
+                            queue,
+                            &texture.texture,
+                            texture.descriptor.guest,
+                        )
+                        .ok()?;
+                        let width = texture.descriptor.guest.width as usize;
+                        let height = texture.descriptor.guest.height as usize;
+                        let depth = texture.descriptor.layer_count as usize;
+                        let bpp = texture.descriptor.guest.bytes_per_pixel as usize;
+                        let texel = |x: usize, y: usize, z: usize| {
+                            let index = ((z * height + y) * width + x) * bpp;
+                            if index + 6 > packed.len() {
+                                return "[]".to_owned();
+                            }
+                            format!(
+                                "[{:.3},{:.3},{:.3}]",
+                                half_float_to_f32(u16::from_le_bytes([
+                                    packed[index],
+                                    packed[index + 1]
+                                ])),
+                                half_float_to_f32(u16::from_le_bytes([
+                                    packed[index + 2],
+                                    packed[index + 3]
+                                ])),
+                                half_float_to_f32(u16::from_le_bytes([
+                                    packed[index + 4],
+                                    packed[index + 5]
+                                ])),
+                            )
+                        };
+                        Some(format!(
+                            "{:#x} 000={} mid={} last={}",
+                            texture.descriptor.guest.address,
+                            texel(0, 0, 0),
+                            texel(width / 2, height / 2, depth / 2),
+                            texel(
+                                width.saturating_sub(1),
+                                height.saturating_sub(1),
+                                depth.saturating_sub(1)
+                            ),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "[REMu][METAL][GRADE-PASS] draw={} es={:#x} ps={:#x} indexed={} count={} prim={:#x} targets={target_summary:?} scene={scene_means:?} hdr={hdr_centers:?} lut={lut_voxels:?} bindings={bindings:?} globals={globals:?}",
+                    draw.sequence,
+                    draw.export_shader_address,
+                    draw.pixel_shader_address,
+                    draw.indexed,
+                    draw.index_count,
+                    draw.primitive_type,
+                );
+            }
+        }
         if remu_memory::debug_log_enabled() {
             let mut listed = String::new();
             for target in &targets {
@@ -1239,7 +1855,7 @@ impl MetalPresenter {
             for (stage, evaluation, textures) in [
                 (
                     "vertex",
-                    export_evaluation.as_ref(),
+                    export_evaluation,
                     export_textures.as_slice(),
                 ),
                 ("pixel", pixel_evaluation, pixel_textures.as_slice()),
@@ -4547,7 +5163,9 @@ impl MetalPresenter {
                 activity_stamp,
             );
         }
-        self.note_pending_flip_target_write(target.texture);
+        // Fast-clear elimination fills the target with the clear color. Recording that as
+        // compositor output would present a black 1080p buffer over the graded backbuffer.
+        self.note_registered_video_out_write(target.texture);
         Ok(Some(target.texture))
     }
 }

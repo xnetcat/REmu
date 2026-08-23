@@ -25,12 +25,14 @@ use super::{
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_component_reordered_storage,
     guest_texture_descriptors_share_depth_sample_storage,
-    guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
+    guest_texture_descriptors_share_gpu_sample_storage,
+    guest_texture_descriptors_share_offset_alias_storage, guest_texture_descriptors_share_storage,
     guest_texture_raw_matches, guest_texture_raw_range, image_destination_select_is_native,
     image_resource_descriptor_is_null, mode5_mip_chain_layout, mode27_mip_chain_layout,
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
     rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_same_image_sample_is_eligible,
+    resident_volume_sample_is_eligible,
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
@@ -4500,6 +4502,273 @@ fn same_address_same_format_sample_survives_partial_owned_supersession() {
     assert!(
         !resident_same_image_sample_is_eligible(eye_resident, subrect_sample, false),
         "sub-rect same-address views still require full owned coverage"
+    );
+}
+
+#[test]
+fn volume_sample_reuses_gpu_authored_resident_across_tile_modes() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("volume mapping");
+    let address = mapped.get();
+    let width = 8_u32;
+    let height = 8_u32;
+    let depth = 8_u32;
+    let encoded = address >> 8;
+    let store_words = vec![
+        encoded as u32,
+        ((encoded >> 32) as u32 & 0xff) | 0x0380_0000 | (((width - 1) & 3) << 30),
+        ((width - 1) >> 2) | ((height - 1) << 14),
+        0xa000_0fac,
+        depth - 1,
+        0,
+        0,
+        0,
+    ];
+    let sample_words = vec![
+        encoded as u32,
+        ((encoded >> 32) as u32 & 0xff) | 0x0380_0000 | (((width - 1) & 3) << 30),
+        ((width - 1) >> 2) | ((height - 1) << 14),
+        0xa010_0fac,
+        depth - 1,
+        0,
+        0,
+        0,
+    ];
+    let stored = decode_image_descriptor(&store_words).expect("linear UAV volume");
+    let sampled = decode_image_descriptor(&sample_words).expect("tiled sample volume");
+    assert_eq!(stored.texture_type, 10);
+    assert_eq!(sampled.texture_type, 10);
+    assert_eq!(stored.layer_count, depth);
+    assert_eq!(sampled.layer_count, depth);
+    assert_eq!(stored.guest.address, sampled.guest.address);
+    assert_ne!(stored.guest.tile_mode, sampled.guest.tile_mode);
+    assert!(
+        stored.span.expect("volume span").len()
+            >= guest_texture_byte_count(stored.guest).expect("face") * u64::from(depth)
+    );
+
+    let volume_target = DecodedRenderTarget {
+        guest_slot: 0,
+        texture: stored.guest,
+        span: stored.span,
+        output_kind: remu_shader::PixelOutputKind::Float,
+        write_mask: 0xf,
+        direct_scanout: false,
+        sample_count: 1,
+        texture_type: 10,
+        layer_count: depth,
+        base_layer: 0,
+        mip_level: 0,
+        mip_level_count: 1,
+        dcc_enabled: false,
+        fast_clear_enabled: false,
+        blend_bypass: true,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let selected = presenter
+        .ensure_layered_render_target_texture(&device, volume_target, false)
+        .expect("volume resident");
+    assert_eq!(selected.texture.texture_type(), MTLTextureType::D3);
+    let resident_pointer = selected.texture.as_ptr();
+    presenter.mark_resident_texture_written(stored.guest);
+
+    let resident = &presenter.resident_guest_textures[&stored.guest];
+    assert!(resident.gpu_written());
+    assert!(resident_volume_sample_is_eligible(
+        resident, sampled, false
+    ));
+    assert!(!guest_texture_descriptors_share_storage(
+        stored.guest,
+        sampled.guest
+    ));
+
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
+            pc: 0x40,
+            opcode: Opcode::Known("ImageSampleLz"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1, 2],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 2,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: sample_words.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let uploaded = upload_test_image_textures(&mut presenter, &evaluation);
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0].as_ptr(),
+        resident_pointer,
+        "tiled TYPE-10 sample must bind the GPU-authored volume, not a guest-RAM reupload"
+    );
+    assert_eq!(uploaded[0].texture_type(), MTLTextureType::D3);
+}
+
+#[test]
+fn offset_alias_sample_reuses_overlapping_hdr_resident() {
+    let rendered = GuestTextureDescriptor {
+        address: 0x7064_ad0000,
+        width: 1_920,
+        height: 1_080,
+        pitch: 1_920,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+    };
+    let sampled = GuestTextureDescriptor {
+        address: rendered.address + 0x20_0000,
+        ..rendered
+    };
+    assert!(guest_texture_descriptors_overlap(rendered, sampled));
+    assert!(guest_texture_descriptors_share_offset_alias_storage(
+        rendered, sampled
+    ));
+    let adjacent = GuestTextureDescriptor {
+        address: rendered.address
+            + guest_texture_byte_count(rendered).expect("hdr byte count")
+            + 0x20_0000,
+        ..rendered
+    };
+    assert!(!guest_texture_descriptors_share_offset_alias_storage(
+        rendered, adjacent
+    ));
+}
+
+#[test]
+fn offset_alias_sample_binds_gpu_authored_resident() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(8 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let mapped = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("color mapping");
+    let address = mapped.get();
+    let width = 8_u32;
+    let height = 8_u32;
+    let encoded = address >> 8;
+    let store_words = vec![
+        encoded as u32,
+        ((encoded >> 32) as u32 & 0xff) | 0x0380_0000 | (((width - 1) & 3) << 30),
+        ((width - 1) >> 2) | ((height - 1) << 14),
+        0x9000_0fac,
+    ];
+    let sampled_address = address + 0x20_0000;
+    let sampled_encoded = sampled_address >> 8;
+    let sample_words = vec![
+        sampled_encoded as u32,
+        ((sampled_encoded >> 32) as u32 & 0xff) | 0x0380_0000 | (((width - 1) & 3) << 30),
+        ((width - 1) >> 2) | ((height - 1) << 14),
+        0x9000_0fac,
+    ];
+    let stored = decode_image_descriptor(&store_words).expect("base color image");
+    let sampled = decode_image_descriptor(&sample_words).expect("2MiB-offset sample image");
+    assert_eq!(stored.texture_type, 9);
+    assert_eq!(sampled.texture_type, 9);
+    assert_eq!(stored.guest.width, width);
+    assert_eq!(sampled.guest.width, width);
+    assert_eq!(
+        sampled.guest.address,
+        stored.guest.address + 0x20_0000
+    );
+    assert!(guest_texture_descriptors_share_offset_alias_storage(
+        stored.guest,
+        sampled.guest
+    ));
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let selected = presenter
+        .ensure_resident_texture(&device, stored.guest)
+        .expect("color resident");
+    let resident_pointer = selected.texture.as_ptr();
+    presenter.mark_resident_texture_written(stored.guest);
+
+    let evaluation = ShaderEvaluation {
+        initial_scalar_registers: Vec::new().into(),
+        scalar_registers: Vec::new().into(),
+        scalar_memory_reads: Vec::new(),
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
+            pc: 0x40,
+            opcode: Opcode::Known("ImageSampleLz"),
+            control: ImageControl {
+                dmask: 0xf,
+                vector_address: 0,
+                address_registers: vec![0, 1],
+                vector_data: 4,
+                scalar_resource: 0,
+                scalar_sampler: 8,
+                dimension: 1,
+                is_array: false,
+                glc: false,
+                slc: false,
+                a16: false,
+                d16: false,
+                unorm: false,
+            },
+            resource_descriptor: sample_words.into(),
+            sampler_descriptor: vec![0; 4].into(),
+            mip_level: None,
+        }],
+        global_memory_bindings: Vec::new(),
+        compute_system_registers: None,
+        vertex_inputs: Vec::new(),
+    };
+    let uploaded = upload_test_image_textures(&mut presenter, &evaluation);
+    assert_eq!(uploaded.len(), 1);
+    assert_eq!(
+        uploaded[0].as_ptr(),
+        resident_pointer,
+        "2MiB-offset same-extent sample must bind the GPU-authored color resident"
     );
 }
 

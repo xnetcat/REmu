@@ -1258,6 +1258,256 @@ fn translated_scanout_resolution_prefers_the_current_resident_object() {
 }
 
 #[test]
+fn translated_scanout_prefers_later_compositor_over_untonemapped_video_out() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let texture_bytes: u64 = 64 * 64 * 8;
+    let allocation_size = 16 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(32 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let base = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("guest texture mapping");
+    let video_out = GuestTextureDescriptor {
+        address: base.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA16Float,
+        bytes_per_pixel: 8,
+    };
+    let compositor = GuestTextureDescriptor {
+        address: base.get() + u64::try_from(texture_bytes.next_multiple_of(GUEST_PAGE_SIZE))
+            .expect("compositor offset fits"),
+        ..video_out
+    };
+    let other_flip = GuestTextureDescriptor {
+        address: compositor.address
+            + u64::try_from(texture_bytes.next_multiple_of(GUEST_PAGE_SIZE))
+                .expect("other flip offset fits"),
+        ..video_out
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter.registered_video_out_buffers = vec![video_out.address, other_flip.address];
+    presenter.display = Some(DisplayConfiguration {
+        width: video_out.width,
+        height: video_out.height,
+        pitch: video_out.pitch,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 0,
+    });
+
+    let video_texture = presenter
+        .ensure_resident_texture(&device, video_out)
+        .expect("video-out resident")
+        .texture;
+    presenter.mark_resident_texture_written(video_out);
+    presenter.note_pending_flip_target_write(video_out);
+    let compositor_texture = presenter
+        .ensure_resident_texture(&device, compositor)
+        .expect("compositor resident")
+        .texture;
+    presenter.begin_compositor_pass_samples();
+    presenter.compositor_pass_fullscreen = true;
+    presenter.mark_resident_texture_written(compositor);
+    presenter.note_pending_flip_target_write(compositor);
+    presenter.begin_compositor_pass_samples();
+    presenter.compositor_pass_fullscreen = true;
+    presenter
+        .ensure_resident_texture(&device, other_flip)
+        .expect("other flip resident");
+    presenter.mark_resident_texture_written(other_flip);
+    presenter.note_pending_flip_target_write(other_flip);
+
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("video-out scanout without a LUT-grade write");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(std::ptr::eq(texture.as_ref(), video_texture.as_ref()));
+    assert!(
+        !std::ptr::eq(texture.as_ref(), compositor_texture.as_ref()),
+        "a sample-less fullscreen cover must not replace scene VideoOut"
+    );
+
+    let ping = GuestTextureDescriptor {
+        address: other_flip.address + texture_bytes.next_multiple_of(GUEST_PAGE_SIZE),
+        ..video_out
+    };
+    presenter
+        .ensure_resident_texture(&device, ping)
+        .expect("hdr ping-pong resident");
+    presenter.mark_resident_texture_written(ping);
+    presenter.note_pending_flip_target_write(ping);
+    presenter.compositor_pass_sampled_hdr = true;
+    presenter.mark_resident_texture_written(compositor);
+    presenter.note_pending_flip_target_write(compositor);
+    presenter.compositor_pass_sampled_hdr = false;
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("HDR-sampling bloom is not scanout");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "sampling display-sized HDR (bloom/TAA) must not steal scanout from VideoOut"
+    );
+
+    presenter.begin_compositor_pass_samples();
+    presenter.note_compositor_pass_sampled_volume(10, 33, 33, 33);
+    presenter.note_compositor_pass_sampled_hdr(ping);
+    presenter.mark_resident_texture_written(ping);
+    presenter.note_pending_flip_target_write(ping);
+    presenter.begin_compositor_pass_samples();
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("voxel-first 3D sample is not ACES");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "a pass that samples a 33³ volume before display HDR is not scene scanout after post"
+    );
+
+    presenter.compositor_post_stack_active = false;
+    presenter.begin_compositor_pass_samples();
+    presenter.note_compositor_pass_sampled_hdr(compositor);
+    presenter.note_compositor_pass_sampled_volume(10, 33, 33, 33);
+    presenter.mark_resident_texture_written(compositor);
+    presenter.note_pending_flip_target_write(compositor);
+    presenter.begin_compositor_pass_samples();
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("HDR-sampling lighting/bloom is not scene scanout");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "a pass that samples display HDR is post, not the warehouse-lit scene"
+    );
+
+    presenter.begin_compositor_pass_samples();
+    presenter.compositor_pass_fullscreen = true;
+    presenter.note_compositor_pass_sampled_hdr(compositor);
+    presenter.note_compositor_pass_sampled_volume(10, 33, 33, 33);
+    presenter.mark_resident_texture_written(compositor);
+    presenter.note_pending_flip_target_write(compositor);
+    presenter.begin_compositor_pass_samples();
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("fullscreen LUT tonemap does not replace scene");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "a fullscreen 3D LUT-sampling 1080p write is ACES of post, not scene scanout"
+    );
+
+    presenter.begin_compositor_pass_samples();
+    presenter.note_compositor_scanout_sample(compositor);
+    presenter.mark_resident_texture_written(video_out);
+    presenter.note_pending_flip_target_write(video_out);
+    presenter.begin_compositor_pass_samples();
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("UI blit of LUT-grade onto VideoOut keeps scene");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "sampling the LUT-grade backbuffer and writing VideoOut must not present clipped ACES"
+    );
+
+    presenter.begin_compositor_pass_samples();
+    presenter.compositor_pass_sampled_hdr = true;
+    presenter.compositor_pass_fullscreen = true;
+    presenter.mark_resident_texture_written(ping);
+    presenter.note_pending_flip_target_write(ping);
+    presenter.compositor_pass_sampled_hdr = false;
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("scene lighting outranks a later HDR ping");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "a later HDR ping must not replace scene lighting"
+    );
+
+    presenter.begin_compositor_pass_samples();
+    presenter.compositor_pass_fullscreen = true;
+    presenter.note_compositor_pass_sampled_hdr(video_out);
+    presenter.note_compositor_pass_sampled_volume(10, 33, 33, 33);
+    presenter.mark_resident_texture_written(video_out);
+    presenter.note_pending_flip_target_write(video_out);
+    presenter.begin_compositor_pass_samples();
+    presenter.compositor_pass_sampled_hdr = true;
+    presenter.compositor_pass_fullscreen = true;
+    presenter.mark_resident_texture_written(ping);
+    presenter.note_pending_flip_target_write(ping);
+    presenter.compositor_pass_sampled_hdr = false;
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("fullscreen LUT write to VideoOut does not replace scene");
+    assert_eq!(source, "compositor");
+    assert_eq!(selected.address, video_out.address);
+    assert!(
+        std::ptr::eq(texture.as_ref(), video_texture.as_ref()),
+        "a 3D LUT-sampling write to VideoOut is post, not scene scanout"
+    );
+
+    presenter.compositor_post_stack_active = false;
+    presenter.begin_compositor_pass_samples();
+    presenter.mark_resident_texture_written(video_out);
+    presenter.note_pending_flip_target_write(video_out);
+    presenter.compositor_pass_sampled_hdr = true;
+    presenter.compositor_pass_fullscreen = true;
+    presenter.mark_resident_texture_written(ping);
+    presenter.note_pending_flip_target_write(ping);
+    presenter.compositor_pass_sampled_hdr = false;
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("next-frame camera write is the new scene");
+    assert_eq!(source, "compositor");
+    assert_eq!(
+        selected.address, video_out.address,
+        "the next frame's geometry write to VideoOut becomes scanout until post runs"
+    );
+    assert!(std::ptr::eq(texture.as_ref(), video_texture.as_ref()));
+
+    presenter.compositor_post_stack_active = false;
+    presenter.begin_compositor_pass_samples();
+    presenter.mark_resident_texture_written(compositor);
+    presenter.note_pending_flip_target_write(compositor);
+    let (selected, texture, source) = presenter
+        .translated_scanout_source(video_out.address, video_out.width, video_out.height)
+        .expect("next-frame lighting is scanout");
+    assert_eq!(source, "compositor");
+    assert_eq!(
+        selected.address, compositor.address,
+        "the next frame's lighting write is the warehouse-lit backbuffer"
+    );
+    assert!(std::ptr::eq(
+        texture.as_ref(),
+        compositor_texture.as_ref()
+    ));
+}
+
+#[test]
 fn interactive_tick_captures_a_finalized_flip_before_accepting_its_replacement() {
     let (sender, receiver) = gpu_event_channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");

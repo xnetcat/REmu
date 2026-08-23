@@ -147,7 +147,13 @@ fn decode_image_descriptor_impl(
         guest,
         // The one place a bound image's physical span is resolved. Every later overlap query
         // against this binding reuses it instead of re-entering the shared-mapping registry.
-        span: ResourceSpan::for_texture(guest),
+        // TYPE-10 volumes name depth in word 4; a 2D face span would leave slices 1..N
+        // unwatched and let later samples re-upload unpublished guest RAM.
+        span: if texture_type == 10 && layer_count > 1 {
+            ResourceSpan::for_texture_layers(guest, layer_count)
+        } else {
+            ResourceSpan::for_texture(guest)
+        },
         destination_select,
         base_mip_level: base_level,
         mip_level_count: last_level - base_level + 1,
