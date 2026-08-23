@@ -10219,9 +10219,27 @@ fn start_diagnostic_timeout(timeout_seconds: u32) {
         .ok();
 }
 
+/// Ends the process, but only after the reports it just produced have actually left the buffers.
+///
+/// `_exit` runs no destructors and drains nothing, so the two asynchronous sinks the emulator
+/// installs are both still holding output at this point: `report_end_of_run_diagnostics` above
+/// writes `[REMu][REPORT]` lines into the stderr pipe, and any armed `debug_log!` lines sit in
+/// the writer's channel. Exiting straight from here discarded both — which defeated the reason
+/// [`start_diagnostic_timeout`] exists at all, since a bounded run is bounded precisely so that
+/// somebody can read its end-of-run totals. `remu-cli`'s `main` flushes stderr the same way, but
+/// nothing returns to `main` from here.
+///
+/// Both flushes are bounded and best-effort: a sink that is not draining costs a fraction of a
+/// second and is then abandoned, so no failure mode can convert an exit into a hang. Neither
+/// takes a lock nor allocates — only atomic loads, `ioctl`, and `nanosleep` — which keeps them
+/// usable on the one call path that can reach here from signal context (a guest exception
+/// handler invoked by `host_delivery_signal_handler` calling an exit import), where the
+/// allocating, lock-taking `report_end_of_run_diagnostics` above is already the larger risk.
 fn terminate_probe(code: i32) -> ! {
     report_end_of_run_diagnostics();
     stop_av_player_controller();
+    remu_memory::flush_async_debug_log();
+    remu_memory::flush_async_stderr();
     #[cfg(unix)]
     // SAFETY: `_exit` terminates the isolated CLI probe without unwinding across guest frames.
     unsafe {

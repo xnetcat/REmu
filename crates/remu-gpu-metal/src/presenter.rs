@@ -626,6 +626,7 @@ struct TextureReadbackLayout {
 
 struct PendingTextureReadback {
     command_buffer: CommandBuffer,
+    completion: completion::CommandBufferCompletion,
     staging: Buffer,
     // Keep the source alive independently of Metal command-buffer retention policy.
     _source: Texture,
@@ -1984,6 +1985,7 @@ enum GuestBatchWork {
 struct GuestCommandBatch {
     queue_id: Option<u64>,
     command_buffer: CommandBuffer,
+    completion: completion::CommandBufferCompletion,
     work: Vec<GuestBatchWork>,
     committed_at: Option<Instant>,
     global_upload_chunks: Vec<GlobalUploadChunk>,

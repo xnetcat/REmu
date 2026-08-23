@@ -12,6 +12,7 @@ use remu_gpu::{
 use remu_shader::PixelOutputKind;
 use std::time::{Duration, Instant};
 
+use super::super::completion::CommandBufferCompletion;
 use super::super::{FlipTerminalSource, PendingPresentation};
 use super::{
     DecodedRenderTarget, DisplayConfiguration, GuestCommandBatch, GuestTextureDescriptor,
@@ -989,6 +990,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
     // command buffer never retires, so any flip completion published while it queues has
     // overtaken the frame's effects.
     let outstanding = queue.new_command_buffer().to_owned();
+    let outstanding_completion = CommandBufferCompletion::attach(&outstanding);
     presenter
         .guest_queue_batches
         .get_mut(&7)
@@ -997,6 +999,7 @@ fn a_superseded_flip_defers_its_completion_behind_committed_guest_work() {
         .push_back(GuestCommandBatch {
             queue_id: Some(7),
             command_buffer: outstanding.clone(),
+            completion: outstanding_completion,
             work: Vec::new(),
             committed_at: None,
             global_upload_chunks: Vec::new(),

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::super::completion::{
-    COMMAND_BUFFER_SETTLE_TIMEOUT, command_buffer_failure_message, settle_timeout_message,
-    wait_until_settled_within,
+    COMMAND_BUFFER_SETTLE_TIMEOUT, CommandBufferCompletion, command_buffer_failure_message,
+    settle_timeout_message, wait_until_settled_within,
 };
 use super::super::shared_event::{
     SharedEventBatchTerminalState, SharedEventFence, SharedEventProducerId,
@@ -1187,7 +1187,7 @@ impl MetalPresenter {
         }
     }
 
-    pub(super) fn guest_submission_backpressure_full(&self) -> bool {
+    pub(crate) fn guest_submission_backpressure_full(&self) -> bool {
         self.committed_guest_batch_count() >= super::super::MAX_COMMITTED_GUEST_BATCHES
             && self
                 .active_open_guest_batch()
@@ -1771,9 +1771,11 @@ fn new_guest_command_batch(
     queue_id: Option<u64>,
     command_buffer: CommandBuffer,
 ) -> GuestCommandBatch {
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     GuestCommandBatch {
         queue_id,
         command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -1799,7 +1801,7 @@ fn new_guest_command_batch(
 /// is still outstanding, so callers must retain it rather than treat it as having run.
 fn settle_guest_batch_by(batch: &GuestCommandBatch, deadline: Instant) -> GuestBatchSettlement {
     let budget = deadline.saturating_duration_since(Instant::now());
-    let settled = wait_until_settled_within(&batch.command_buffer, budget);
+    let settled = wait_until_settled_within(&batch.command_buffer, &batch.completion, budget);
     // Only the timeout and failure branches need the batch described, and both are rare. The
     // common path — a batch that completed within budget — must not pay for formatting every
     // draw in the stream, so the description is built lazily after the outcome is known.
