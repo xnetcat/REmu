@@ -182,17 +182,6 @@ impl MetalPresenter {
             ));
         }
         let alias_ranges = resident.write_watch.alias_ranges();
-        // A sampled or multisample view of the same storage would shadow the bytes about to be
-        // published, so both are retired only on the path that really publishes them.
-        retire_sampled_textures_overlapping_writeback(
-            &mut self.sampled_texture_cache,
-            &alias_ranges,
-        );
-        self.note_resident_writeback_published(descriptor);
-        retire_multisample_textures_overlapping_writeback(
-            &mut self.multisample_textures,
-            &alias_ranges,
-        );
         let device = self
             .device
             .as_ref()
@@ -260,7 +249,24 @@ impl MetalPresenter {
             .resident_guest_textures
             .get_mut(&descriptor)
             .ok_or("resident texture disappeared after GPU publish encode")?;
+        // Publication bookkeeping starts here, not before the encode. Every step above can still
+        // refuse — a revoked lease, an absent device or queue, a failed encode — and each one used
+        // to return after authority had already been handed to guest RAM, so every overlapping
+        // resident believed RAM held bytes nothing had written and the next read rebuilt zeros
+        // from it. Clearing the Metal debt and transferring authority describe one transition and
+        // must not be separated by a fallible step.
         resident.clear_gpu_authored();
+        // A sampled or multisample view of the same storage would shadow the published bytes, so
+        // both are retired only on the path that really publishes them.
+        retire_sampled_textures_overlapping_writeback(
+            &mut self.sampled_texture_cache,
+            &alias_ranges,
+        );
+        self.note_resident_writeback_published(descriptor);
+        retire_multisample_textures_overlapping_writeback(
+            &mut self.multisample_textures,
+            &alias_ranges,
+        );
         RESIDENT_WRITEBACK_PUBLISHED[trigger.index()].fetch_add(1, Ordering::Relaxed);
         RESIDENT_WRITEBACK_PUBLISHED_BYTES.fetch_add(published_bytes, Ordering::Relaxed);
         Ok(true)

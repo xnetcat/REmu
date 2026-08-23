@@ -2879,6 +2879,107 @@ fn bookkeeping_trigger_refuses_publish_and_keeps_debt() {
     assert!(!presenter.resident_guest_textures[&descriptor].gpu_written());
 }
 
+/// A publish that fails validation must leave residency exactly as it found it.
+///
+/// Publication bookkeeping used to run before the command queue was validated. A missing queue
+/// therefore handed every overlapping resident's authority to guest RAM and then wrote nothing
+/// there; the next read rebuilt from RAM that no publish ever reached.
+#[test]
+fn failed_publish_leaves_overlapping_resident_authority_untouched() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let allocation_size = 8 * GUEST_PAGE_SIZE;
+    let mut memory = GuestAddressSpace::new(16 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(allocation_size).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            allocation_size,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("resident mapping");
+    let writer = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    // A component-reordered view of the same storage: a second residency key over one byte range.
+    let alias = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        ..writer
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, writer)
+        .expect("writer resident");
+    presenter.mark_resident_texture_written_at(
+        writer,
+        ResourceSpan::for_texture(writer),
+        None,
+        WrittenRegion::whole_resource(),
+        ResidentTextureActivityStamp { work: 10, flip: 1 },
+    );
+    // Admitted after the write, so it holds its own uploaded bytes rather than losing them to the
+    // writer's mark. This is the resident the refused publish must not touch.
+    presenter
+        .ensure_resident_texture(&device, alias)
+        .expect("alias resident");
+    assert!(
+        presenter.resident_guest_textures[&writer].gpu_written(),
+        "setup: the writer must still owe Metal bytes or the publish never starts"
+    );
+    assert!(
+        presenter.resident_guest_textures[&alias].is_live(),
+        "setup: the alias must hold authority or the assertion below proves nothing"
+    );
+    let writer_authority_before = presenter.resident_guest_textures[&writer].owned.clone();
+    let writer_debt_before = presenter.resident_guest_textures[&writer]
+        .gpu_authored
+        .clone();
+    let alias_authority_before = presenter.resident_guest_textures[&alias].owned.clone();
+    let published_before = RESIDENT_WRITEBACK_PUBLISHED[WritebackTrigger::FlipTarget.index()]
+        .load(AtomicOrdering::Relaxed);
+
+    presenter.command_queue = None;
+
+    let error = presenter
+        .settle_resident_texture_writeback(writer, WritebackTrigger::FlipTarget)
+        .expect_err("a missing command queue must fail publication");
+    assert!(
+        error.contains("command queue is unavailable"),
+        "unexpected publish failure: {error}"
+    );
+    assert_eq!(
+        RESIDENT_WRITEBACK_PUBLISHED[WritebackTrigger::FlipTarget.index()]
+            .load(AtomicOrdering::Relaxed),
+        published_before,
+        "a failed publish may not be counted as published"
+    );
+    let writer_after = &presenter.resident_guest_textures[&writer];
+    assert_eq!(writer_after.owned, writer_authority_before);
+    assert_eq!(writer_after.gpu_authored, writer_debt_before);
+    assert!(writer_after.is_live());
+    let alias_after = &presenter.resident_guest_textures[&alias];
+    assert_eq!(
+        alias_after.owned, alias_authority_before,
+        "a failed publish wrote no bytes, so it may not hand the alias's authority to guest RAM"
+    );
+    assert!(alias_after.is_live());
+}
+
 #[test]
 fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
     use remu_memory::{
