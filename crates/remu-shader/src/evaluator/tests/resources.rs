@@ -704,3 +704,125 @@ fn canonicalizes_repeated_image_descriptors_without_merging_type_or_access() {
     assert_eq!(slots.texture_count, 6);
     assert_eq!(slots.sampler_count, 2);
 }
+
+struct ReportedPrefixMemory;
+
+impl GuestMemoryReader for ReportedPrefixMemory {
+    fn read(&self, _address: u64, _output: &mut [u8]) -> bool {
+        false
+    }
+
+    fn readable_prefix_length(&self, _address: u64, maximum_length: usize) -> Option<usize> {
+        Some(maximum_length)
+    }
+}
+
+fn supplemental_global_load_shader() -> ShaderState {
+    let mut branch = instruction(
+        0,
+        ShaderEncoding::Sopp,
+        "SCbranchExecnz",
+        Vec::new(),
+        Vec::new(),
+        None,
+    );
+    branch.words[0] = 1;
+    state(
+        vec![
+            branch,
+            instruction(
+                4,
+                ShaderEncoding::Flat,
+                "GlobalLoadDword",
+                Vec::new(),
+                vec![Operand::vector(0)],
+                Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                    dword_count: 1,
+                    vector_address: 0,
+                    vector_data: 0,
+                    vector_destination: 0,
+                    scalar_address: Some(0),
+                    offset_bytes: 0,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                })),
+            ),
+            end(8),
+        ],
+        vec![0x2000, 0],
+    )
+}
+
+#[test]
+fn represents_untaken_global_memory_paths_without_copying_guest_buffers() {
+    let evaluation = evaluate_shader(
+        &TestMemory::default(),
+        &supplemental_global_load_shader(),
+        EvaluationOptions::default(),
+    )
+    .expect("supplemental resource discovery");
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    assert_eq!(evaluation.global_memory_bindings[0].base_address, 0x2000);
+    assert_eq!(evaluation.global_memory_bindings[0].data, vec![0; 4096]);
+}
+
+#[test]
+fn supplemental_discovery_does_not_fabricate_zeros_when_capture_is_disabled() {
+    let evaluation = evaluate_shader(
+        &ReportedPrefixMemory,
+        &supplemental_global_load_shader(),
+        EvaluationOptions {
+            capture_global_binding_data: false,
+            ..EvaluationOptions::default()
+        },
+    )
+    .expect("supplemental discovery without captured binding data");
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    assert_eq!(evaluation.global_memory_bindings[0].base_address, 0x2000);
+    assert!(evaluation.global_memory_bindings[0].data.is_empty());
+}
+
+#[test]
+fn draw_snapshot_options_cap_binding_byte_count_without_copying() {
+    let shader = state(
+        vec![
+            instruction(
+                0,
+                ShaderEncoding::Flat,
+                "GlobalLoadDword",
+                Vec::new(),
+                vec![Operand::vector(0)],
+                Some(InstructionControl::GlobalMemory(GlobalMemoryControl {
+                    dword_count: 1,
+                    vector_address: 0,
+                    vector_data: 0,
+                    vector_destination: 0,
+                    scalar_address: Some(0),
+                    offset_bytes: 0,
+                    dlc: false,
+                    lds: false,
+                    glc: false,
+                    slc: false,
+                })),
+            ),
+            end(8),
+        ],
+        vec![0x2000, 0],
+    );
+    let evaluation = evaluate_shader(
+        &ReportedPrefixMemory,
+        &shader,
+        EvaluationOptions {
+            maximum_binding_bytes: 1024 * 1024,
+            capture_global_binding_data: false,
+            ..EvaluationOptions::default()
+        },
+    )
+    .expect("draw snapshot options must cap binding extent");
+    assert_eq!(evaluation.global_memory_bindings.len(), 1);
+    assert_eq!(evaluation.global_memory_bindings[0].base_address, 0x2000);
+    assert_eq!(evaluation.global_memory_bindings[0].byte_count, 1024 * 1024);
+    assert!(evaluation.global_memory_bindings[0].data.is_empty());
+}

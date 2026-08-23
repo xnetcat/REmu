@@ -352,10 +352,10 @@ pub(crate) use shader_cache::{
 #[cfg(all(test, target_os = "macos", target_arch = "x86_64"))]
 pub(crate) use shader_cache::{canonical_vertex_record_count, shader_evaluation_user_data_key};
 pub(crate) use shader_eval::{
-    draw_required_vertex_record_count, dump_draw_shader_ir, evaluate_draw_shader_requests_parallel,
-    evaluate_shader_register_snapshot_cached, export_user_data_register,
-    shader_control_flow_summary, shader_evaluation_worker_request, snapshot_draw_indices,
-    snapshot_small_readonly_global_bindings, trace_agc_shader_draw,
+    draw_evaluation_options, draw_required_vertex_record_count, dump_draw_shader_ir,
+    evaluate_draw_shader_requests_parallel, evaluate_shader_register_snapshot_cached,
+    export_user_data_register, shader_control_flow_summary, shader_evaluation_worker_request,
+    snapshot_draw_indices, snapshot_small_readonly_global_bindings, trace_agc_shader_draw,
 };
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]

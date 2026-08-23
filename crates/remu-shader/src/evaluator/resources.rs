@@ -44,6 +44,7 @@ pub(crate) struct BindingRequest {
     pub(crate) requested_bytes: u64,
     pub(crate) writable: bool,
     pub(crate) allow_shorter: bool,
+    pub(crate) supplemental: bool,
 }
 
 pub(crate) fn buffer_descriptor_words(
@@ -402,7 +403,10 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     "[REMu][EVAL][STALE-VALU-OFFSET] sequence={sequence} pc={:#x} opcode={} soffset=s{register} value={:#x} — offset register is VALU-written and unevaluated",
                     instruction.pc,
                     instruction.opcode,
-                    registers.get(register as usize).copied().unwrap_or_default(),
+                    registers
+                        .get(register as usize)
+                        .copied()
+                        .unwrap_or_default(),
                 );
             }
         }
@@ -449,6 +453,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 // the exact components it touches; retain the readable prefix needed by Metal
                 // instead of rejecting a valid sparsely backed descriptor up front.
                 allow_shorter: true,
+                supplemental: false,
             },
         );
         if let Err(error) = binding_result {
@@ -468,6 +473,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     requested_bytes: 4,
                     writable: false,
                     allow_shorter: false,
+                    supplemental: false,
                 },
             )?;
         }
@@ -555,7 +561,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         control: GlobalMemoryControl,
         registers: &[u32; SCALAR_REGISTER_COUNT],
-        _supplemental: bool,
+        supplemental: bool,
     ) -> Result<(), EvaluationError> {
         let Some(scalar_address) = control.scalar_address else {
             // With SADDR=NULL the complete 64-bit address is supplied per lane by VGPRs.
@@ -579,6 +585,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     requested_bytes: 4,
                     writable: false,
                     allow_shorter: false,
+                    supplemental,
                 },
             );
         }
@@ -600,6 +607,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     .saturating_add(prefix_bytes),
                 writable,
                 allow_shorter: true,
+                supplemental,
             },
         )
     }
@@ -609,7 +617,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         instruction: &Instruction,
         control: BufferMemoryControl,
         registers: &[u32; SCALAR_REGISTER_COUNT],
-        _supplemental: bool,
+        supplemental: bool,
     ) -> Result<(), EvaluationError> {
         let writable =
             instruction.opcode.contains("Store") || instruction.opcode.contains("Atomic");
@@ -629,6 +637,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         requested_bytes: 4,
                         writable: false,
                         allow_shorter: false,
+                        supplemental,
                     },
                 );
             }
@@ -655,6 +664,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                     // Never attempt to write a placeholder back through address zero.
                     writable: false,
                     allow_shorter: false,
+                    supplemental,
                 },
             );
         }
@@ -729,6 +739,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         requested_bytes: desired_size.saturating_add(prefix_bytes),
                         writable,
                         allow_shorter: false,
+                        supplemental,
                     },
                 )?;
             }
@@ -744,6 +755,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                 requested_bytes: descriptor.size_bytes.saturating_add(prefix_bytes),
                 writable,
                 allow_shorter: false,
+                supplemental,
             },
         )
     }
@@ -934,6 +946,7 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
                         requested_bytes: 4,
                         writable: false,
                         allow_shorter: false,
+                        supplemental: false,
                     },
                 )
             }
@@ -946,7 +959,9 @@ impl<M: GuestMemoryReader> Evaluator<'_, M> {
         pc: u32,
         request: BindingRequest,
     ) -> Result<(usize, Vec<u8>), EvaluationError> {
-        let data = if request.base_address == 0 {
+        let data = if request.supplemental && self.options.capture_global_binding_data {
+            vec![0; usize::try_from(request.requested_bytes.clamp(4, 4096)).unwrap_or(4)]
+        } else if request.base_address == 0 {
             vec![0; usize::try_from(request.requested_bytes.clamp(4, 4096)).unwrap_or(4)]
         } else if !self.options.capture_global_binding_data {
             let maximum_length = usize::try_from(

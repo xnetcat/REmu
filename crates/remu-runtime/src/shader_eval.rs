@@ -329,6 +329,22 @@ pub(crate) fn snapshot_small_readonly_global_bindings(
     remu_gpu::ShaderEvaluationSnapshot::with_readonly_global_data(evaluation, snapshots)
 }
 
+// Global/buffer descriptors can advertise hundreds of MiB even when a draw touches only a
+// small working set. The evaluator's 16 MiB diagnostic ceiling is too large for per-draw
+// snapshots; generated Metal loads already return zero outside this bounded window.
+const MAX_DRAW_BINDING_SNAPSHOT_BYTES: usize = 1024 * 1024;
+
+pub(crate) fn draw_evaluation_options(
+    required_vertex_record_count: Option<u32>,
+) -> remu_shader::EvaluationOptions {
+    remu_shader::EvaluationOptions {
+        required_vertex_record_count,
+        capture_global_binding_data: false,
+        maximum_binding_bytes: MAX_DRAW_BINDING_SNAPSHOT_BYTES,
+        ..remu_shader::EvaluationOptions::default()
+    }
+}
+
 fn evaluate_shader_snapshot(
     draw: &remu_gpu::IndexedDraw,
     snapshot: &remu_gpu::ShaderSnapshot,
@@ -342,11 +358,7 @@ fn evaluate_shader_snapshot(
         user_data_register,
         scalar_register_base,
         None,
-        remu_shader::EvaluationOptions {
-            required_vertex_record_count,
-            capture_global_binding_data: false,
-            ..remu_shader::EvaluationOptions::default()
-        },
+        draw_evaluation_options(required_vertex_record_count),
     )
 }
 
@@ -366,11 +378,7 @@ pub(crate) fn shader_evaluation_worker_request(
             |offset| shader_registers.get(&offset).copied(),
         )
         .map_err(|error| format!("state-error({error})"))?,
-        options: remu_shader::EvaluationOptions {
-            required_vertex_record_count,
-            capture_global_binding_data: false,
-            ..remu_shader::EvaluationOptions::default()
-        },
+        options: draw_evaluation_options(required_vertex_record_count),
     })
 }
 
@@ -742,8 +750,8 @@ mod tests {
         };
 
         let evaluation = Arc::new(evaluation);
-        let snapshot = snapshot_small_readonly_global_bindings(Arc::clone(&evaluation))
-            .expect("snapshot");
+        let snapshot =
+            snapshot_small_readonly_global_bindings(Arc::clone(&evaluation)).expect("snapshot");
         assert!(Arc::ptr_eq(snapshot.evaluation(), &evaluation));
         assert!(snapshot.global_memory_bindings[0].data.is_empty());
         assert_eq!(snapshot.captured_global_binding_data(0), Some(&*source));

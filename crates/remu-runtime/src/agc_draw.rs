@@ -11,8 +11,8 @@ use crate::{
     AgcGraphicsState, AgcShaderRegistry, AgcSubmissionError, AgcVideoOutTarget, ProcessGuestMemory,
     ShaderEvaluationWorkers, VideoOutState, agc_color_target_state, agc_has_active_depth_state,
     agc_program_address, agc_shader_prefix_snapshot, agc_shader_snapshot,
-    agc_video_out_target_for_address, draw_required_vertex_record_count, dump_draw_shader_ir,
-    emit_agc_gpu_event, evaluate_draw_shader_requests_parallel,
+    agc_video_out_target_for_address, draw_evaluation_options, draw_required_vertex_record_count,
+    dump_draw_shader_ir, emit_agc_gpu_event, evaluate_draw_shader_requests_parallel,
     evaluate_shader_register_snapshot_cached, export_user_data_register, read_guest_u32,
     shader_control_flow_summary, shader_evaluation_worker_request, snapshot_draw_indices,
     snapshot_small_readonly_global_bindings, trace_agc_blend_provenance, trace_agc_draws,
@@ -140,10 +140,7 @@ pub(crate) fn agc_decode_compute_dispatch(
         AGC_COMPUTE_USER_DATA_0,
         0,
         Some(compute_system_registers),
-        remu_shader::EvaluationOptions {
-            capture_global_binding_data: false,
-            ..remu_shader::EvaluationOptions::default()
-        },
+        draw_evaluation_options(None),
         &mut graphics.shader_evaluation_cache,
     )
     .and_then(snapshot_small_readonly_global_bindings)
