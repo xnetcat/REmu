@@ -33,7 +33,8 @@ use super::super::submission::{
     shared_event_host_effect_is_resolved,
 };
 use super::super::{
-    CachedGlobalBuffer, FlipTerminalSource, GlobalBufferCacheKey, PendingGuestWriteRange,
+    CachedGlobalBuffer, FlipTerminalSource, GUEST_BATCH_COMPLETION_CAPACITY, GlobalBufferCacheKey,
+    GlobalUploadChunk, PendingGuestWriteRange,
     PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
     SameQueueDmaFillReject, SharedEventDrawReject, SharedEventFence,
     SharedEventGlobalBufferVersion, SharedEventHostEffectLatencyPhase,
@@ -108,6 +109,36 @@ fn committed_per_queue_test_batch(
             completion_sequences: Vec::new(),
         });
     command_buffer
+}
+
+#[test]
+fn busy_event_loop_retains_batches_but_idle_callbacks_flush() {
+    assert!(!super::super::submission::event_loop_batches_require_flush(
+        true
+    ));
+    assert!(super::super::submission::event_loop_batches_require_flush(
+        false
+    ));
+}
+
+#[test]
+fn retained_busy_batch_has_a_finite_submission_completion_bound() {
+    assert!(GUEST_BATCH_COMPLETION_CAPACITY > 0);
+    assert!(
+        !super::super::submission::guest_batch_completion_capacity_reached(
+            GUEST_BATCH_COMPLETION_CAPACITY - 1,
+        )
+    );
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(
+            GUEST_BATCH_COMPLETION_CAPACITY,
+        )
+    );
+    assert!(
+        super::super::submission::guest_batch_completion_capacity_reached(
+            GUEST_BATCH_COMPLETION_CAPACITY + 1,
+        )
+    );
 }
 
 #[test]
@@ -3164,6 +3195,148 @@ fn guest_batch_global_uploads_are_aligned_and_write_back_from_their_slice() {
 }
 
 #[test]
+fn render_scalar_uploads_are_nonempty_aligned_and_do_not_alias() {
+    let device = Device::system_default().expect("Metal device");
+    let queue = device.new_command_queue();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
+    let mut batch = GuestCommandBatch {
+        queue_id: None,
+        command_buffer,
+        completion,
+        work: Vec::new(),
+        committed_at: None,
+        global_upload_chunks: Vec::new(),
+        global_buffer_versions: Vec::new(),
+        global_writebacks: Vec::new(),
+        guest_write_ranges: Vec::new(),
+        memory_writes: Vec::new(),
+        resident_write_footprint: Vec::new(),
+        resident_texture_versions: Vec::new(),
+        resident_write_footprint_complete: true,
+        render_pass: None,
+        compute_encoder: None,
+        encoded_event_waits: 0,
+        max_encoded_signal: None,
+        signal_checkpoints: Vec::new(),
+        completion_sequences: Vec::new(),
+    };
+    assert!(batch
+        .upload_render_scalar_words(&device, &[])
+        .expect("empty scalar metadata")
+        .is_none());
+    assert!(
+        batch.global_upload_chunks.is_empty(),
+        "empty scalar metadata must not manufacture a Metal resource"
+    );
+    let first_words = [0x1122_3344_u32, 0xaabb_ccdd];
+    let second_words = [0x0102_0304_u32];
+    let (first_buffer, first_offset) = batch
+        .upload_render_scalar_words(&device, &first_words)
+        .expect("first upload")
+        .expect("nonempty upload binds");
+    let (second_buffer, second_offset) = batch
+        .upload_render_scalar_words(&device, &second_words)
+        .expect("second upload")
+        .expect("nonempty upload binds");
+    assert_eq!(first_buffer.contents(), second_buffer.contents());
+    assert_eq!(first_offset, 0);
+    assert_eq!(second_offset, GLOBAL_UPLOAD_ALIGNMENT as u64);
+    assert_ne!(
+        first_offset, second_offset,
+        "draw metadata slices cannot alias"
+    );
+
+    let first_bytes = super::super::MetalBytes::new(&first_buffer)
+        .slice(
+            usize::try_from(first_offset).expect("first offset fits usize"),
+            std::mem::size_of_val(&first_words),
+        )
+        .expect("first scalar slice");
+    let expected_first = first_words
+        .iter()
+        .flat_map(|word| word.to_ne_bytes())
+        .collect::<Vec<_>>();
+    assert_eq!(first_bytes, expected_first);
+
+    let mut destination = [0_u8; 4];
+    let guest_address =
+        u64::try_from(destination.as_mut_ptr() as usize).expect("host pointer fits u64");
+    write_back_pending_globals(&[PendingGlobalWriteback {
+        buffer: second_buffer,
+        offset: second_offset,
+        guest_address,
+        byte_count: destination.len(),
+        lease: None,
+        write_watch: None,
+        original_bytes: vec![0; destination.len()],
+        original_version: None,
+    }])
+    .expect("sliced global writeback");
+    assert_eq!(destination, second_words[0].to_ne_bytes());
+}
+
+#[test]
+fn global_upload_arena_remains_owned_until_terminal_batch_retirement() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
+    let retained = device.new_buffer(256, MTLResourceOptions::StorageModeShared);
+    command_buffer.commit();
+    presenter
+        .committed_guest_batches
+        .push_back(GuestCommandBatch {
+            queue_id: None,
+            command_buffer,
+            completion,
+            work: Vec::new(),
+            committed_at: Some(Instant::now()),
+            global_upload_chunks: vec![GlobalUploadChunk {
+                buffer: retained,
+                used: GLOBAL_UPLOAD_ALIGNMENT,
+            }],
+            global_buffer_versions: Vec::new(),
+            global_writebacks: Vec::new(),
+            guest_write_ranges: Vec::new(),
+            memory_writes: Vec::new(),
+            resident_write_footprint: Vec::new(),
+            resident_texture_versions: Vec::new(),
+            resident_write_footprint_complete: true,
+            render_pass: None,
+            compute_encoder: None,
+            encoded_event_waits: 0,
+            max_encoded_signal: None,
+            signal_checkpoints: Vec::new(),
+            completion_sequences: Vec::new(),
+        });
+    assert_eq!(
+        presenter
+            .committed_guest_batches
+            .front()
+            .expect("submitted batch remains queued")
+            .global_upload_chunks
+            .len(),
+        1,
+        "the committed batch must retain its scalar arena before terminal settlement"
+    );
+
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("batch reaches a terminal Metal state");
+    assert!(
+        presenter.committed_guest_batches.is_empty(),
+        "terminal settlement is the scalar arena's retirement boundary"
+    );
+}
+
+#[test]
 fn global_writeback_preserves_cpu_bytes_the_gpu_did_not_change() {
     // Byte 0: the CPU wrote 7 after capture and the GPU left it alone — preserved.
     // Bytes 1 and 3: the GPU changed them and the CPU never touched them — published.
@@ -5196,6 +5369,60 @@ fn per_queue_boundary_attaches_only_to_its_source_queue() {
             .is_empty(),
         "q0 boundary must not attach to another queue's newest committed batch"
     );
+    presenter
+        .wait_for_guest_command_batches()
+        .expect("test queues drain");
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+}
+
+#[test]
+fn completion_capacity_commits_only_the_source_queue_batch() {
+    let _ = remu_gpu::take_gpu_completed_submission_ids();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    enable_per_queue_batches(&mut presenter);
+
+    open_per_queue_batch(&mut presenter, 41);
+    let foreign = presenter.guest_queue_batches[&41]
+        .open_batch
+        .as_ref()
+        .expect("foreign queue remains open")
+        .command_buffer
+        .clone();
+    open_per_queue_batch(&mut presenter, 0);
+    for index in 0..GUEST_BATCH_COMPLETION_CAPACITY {
+        assert_eq!(
+            presenter.record_guest_submission_boundary(
+                OrderedEventSource::GuestQueue(0),
+                index as u64,
+            ),
+            index + 1 == GUEST_BATCH_COMPLETION_CAPACITY,
+            "only the exact completion bound requests a flush"
+        );
+    }
+    presenter
+        .flush_guest_command_batch(FlushPolicy::Required, GuestBatchFlushReason::WorkCapacity)
+        .expect("completion capacity commits the source queue");
+
+    let source = presenter.guest_queue_batches[&0]
+        .committed_batches
+        .back()
+        .expect("source queue batch committed");
+    assert_eq!(
+        source.completion_sequences.len(),
+        GUEST_BATCH_COMPLETION_CAPACITY
+    );
+    assert!(presenter.guest_queue_batches[&0].open_batch.is_none());
+    assert!(std::ptr::eq(
+        presenter.guest_queue_batches[&41]
+            .open_batch
+            .as_ref()
+            .expect("foreign queue render pass is retained")
+            .command_buffer
+            .as_ref(),
+        foreign.as_ref()
+    ));
+
     presenter
         .wait_for_guest_command_batches()
         .expect("test queues drain");

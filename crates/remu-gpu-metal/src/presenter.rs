@@ -226,7 +226,7 @@ use self::submission::{
     apply_pending_guest_memory_writes, pin_guest_memory_write, write_back_pending_globals,
 };
 use self::texture::{
-    RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
+    GpuDebtSet, RESIDENT_FLIP_AGE_LABELS, RESIDENT_WORK_AGE_LABELS, RangeSet, ResidentTextureMap,
     SpanQueryOrder, TextureWritebackOutcome, WrittenRegion, decode_guest_texture_linear_from_raw,
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible,
@@ -323,6 +323,12 @@ const GUEST_BATCH_DRAIN_SETTLE_MILLISECONDS: u64 = 48;
 /// to WindowServer. Unreal transition scenes can otherwise put hundreds of full-resolution draws
 /// in one command buffer and monopolize the device for seconds.
 const GUEST_BATCH_WORK_CAPACITY: usize = 64;
+/// Bound guest submission completions retained by one open Metal command buffer.
+///
+/// Busy event-loop callbacks may keep compatible render passes open across callbacks, but guest
+/// submission retirement must still have a finite latency even when a queue never becomes idle.
+/// Matching the work bound keeps both retention paths subject to the same submission limit.
+const GUEST_BATCH_COMPLETION_CAPACITY: usize = GUEST_BATCH_WORK_CAPACITY;
 
 /// Maximum number of committed guest batches allowed ahead of the host GPU.
 ///
@@ -1417,9 +1423,9 @@ struct ResidentGuestTexture {
     /// The guest bytes this allocation declares, resolved once at creation.
     ///
     /// `None` disables the range algebra for this resident and leaves it on the descriptor-overlap
-    /// behaviour. Note this is the resident's *whole* range — mip chain, array faces and all —
-    /// while the interval index keys residents by their level-0 span, so the index answers "which
-    /// residents might be involved" and `owned` answers "which bytes are actually theirs".
+    /// behaviour. This is the resident's *whole* range — mip chain, array faces and all — and the
+    /// interval index stores this exact admission-time span. `owned` then answers which bytes in
+    /// that candidate allocation are still authoritative.
     span: Option<ResourceSpan>,
     /// Guest bytes this allocation is the authority for.
     owned: RangeSet,
@@ -1427,7 +1433,7 @@ struct ResidentGuestTexture {
     ///
     /// This is the publication debt the guest is owed, and it is what `gpu_written()` reports.
     /// Bookkeeping settles must not clear it without publishing — that lies that guest RAM agrees.
-    gpu_authored: RangeSet,
+    gpu_authored: GpuDebtSet,
     /// Sticky: the Metal allocation has held executed GPU output at least once.
     ///
     /// Authority subtraction (a neighbour's over-broad `ResourceSpan`, an overlapping alias
@@ -1579,7 +1585,7 @@ impl ResidentGuestTexture {
             "a replaced mapping proves nothing about its bytes and must be removed, not demoted"
         );
         self.owned = RangeSet::default();
-        self.gpu_authored = RangeSet::default();
+        self.gpu_authored = GpuDebtSet::default();
         self.acquire_invalidated = false;
         self.state = ResidencyState::Stale(source);
         OWNED_DEMOTIONS.fetch_add(1, Ordering::Relaxed);
@@ -1719,7 +1725,7 @@ impl ResidentGuestTexture {
         self.gpu_authored.insert(written);
         self.state = ResidencyState::Live;
         debug_assert!(
-            self.owned.contains_all(&self.gpu_authored),
+            self.owned.contains_all(self.gpu_authored.as_ranges()),
             "a resident may only owe bytes it is the authority for"
         );
         debug_assert!(
@@ -1751,7 +1757,7 @@ impl ResidentGuestTexture {
     /// Authority is unchanged: the allocation still defines what these bytes mean, RAM merely
     /// holds the same value now.
     fn clear_gpu_authored(&mut self) {
-        self.gpu_authored = RangeSet::default();
+        self.gpu_authored = GpuDebtSet::default();
     }
 
     fn note_gpu_write(&mut self) {

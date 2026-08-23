@@ -17,7 +17,7 @@ use super::{
     OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
     OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
     OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
-    RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
+    GpuDebtSet, RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
     ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
     SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
     decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
@@ -912,7 +912,7 @@ impl MetalPresenter {
         }
         let mut owners = Vec::new();
         let mut authority = RangeSet::default();
-        let mut debt = RangeSet::default();
+        let mut debt = GpuDebtSet::default();
         let mut full_owner = None;
         for candidate in candidates {
             if candidate == target_descriptor {
@@ -1497,9 +1497,16 @@ impl MetalPresenter {
             }
             trace_resident_texture_removal("ensure-exact-resident-replaced", &resident);
         }
-        let shared_resident = self
-            .resident_guest_textures
-            .values()
+        let resident_candidates = span
+            .iter()
+            .flat_map(|span| {
+                self.resident_guest_textures
+                    .overlapping(span, SpanQueryOrder::ResidentFirst)
+            })
+            .collect::<Vec<_>>();
+        let shared_resident = resident_candidates
+            .iter()
+            .filter_map(|candidate| self.resident_guest_textures.get(candidate))
             .find(|resident| {
                 resident.serves_reads()
                     && resident.texture_type == 9
@@ -1532,9 +1539,9 @@ impl MetalPresenter {
                 }
             }
         }
-        if let Some(gpu_sample_resident) = self
-            .resident_guest_textures
-            .values()
+        if let Some(gpu_sample_resident) = resident_candidates
+            .iter()
+            .filter_map(|candidate| self.resident_guest_textures.get(candidate))
             .filter(|resident| {
                 resident.gpu_written()
                     && resident.serves_reads()
@@ -1558,12 +1565,8 @@ impl MetalPresenter {
                 descriptor: gpu_sample_resident,
             });
         }
-        let mut aliases = span
-            .iter()
-            .flat_map(|span| {
-                self.resident_guest_textures
-                    .overlapping(span, SpanQueryOrder::ResidentFirst)
-            })
+        let mut aliases = resident_candidates
+            .into_iter()
             .filter_map(|alias| {
                 // A demoted alias owes no writeback; its watch is refreshed by the acquire scan
                 // and by the exact-key bind that reclaims or rebuilds it.
@@ -1735,7 +1738,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -1896,7 +1899,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -2024,7 +2027,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -2206,16 +2209,21 @@ impl MetalPresenter {
         let array_bytes = face_bytes
             .checked_mul(u64::from(depth.layer_count))
             .ok_or("layered depth target byte count overflows")?;
+        let array_span = ResourceSpan::new(depth.texture.address, array_bytes);
         let aliases = self
             .resident_guest_textures
-            .values()
-            .filter(|resident| {
-                resident.gpu_written()
-                    && resident
-                        .write_watch
-                        .overlaps_alias_range(depth.texture.address, array_bytes)
+            .overlapping(&array_span, SpanQueryOrder::ResidentFirst)
+            .into_iter()
+            .filter(|candidate| {
+                self.resident_guest_textures
+                    .get(candidate)
+                    .is_some_and(|resident| {
+                        resident.gpu_written()
+                            && resident
+                                .write_watch
+                                .overlaps_alias_range(depth.texture.address, array_bytes)
+                    })
             })
-            .map(|resident| resident.descriptor)
             .collect::<Vec<_>>();
         if !aliases.is_empty() {
             self.wait_for_guest_command_batches()?;
@@ -2288,7 +2296,7 @@ impl MetalPresenter {
                 write_watch,
                 span,
                 owned,
-                gpu_authored: RangeSet::default(),
+                gpu_authored: GpuDebtSet::default(),
                 gpu_content_executed: false,
                 state: ResidencyState::Live,
                 acquire_invalidated: false,
@@ -2475,6 +2483,13 @@ impl MetalPresenter {
     ) {
         self.resident_content_version = self.resident_content_version.saturating_add(1);
         let version = self.resident_content_version;
+        let resident_candidates = span
+            .iter()
+            .flat_map(|span| {
+                self.resident_guest_textures
+                    .overlapping(span, SpanQueryOrder::ResidentFirst)
+            })
+            .collect::<Vec<_>>();
         // The first two arms name the exact allocation the write landed in, whatever state it is
         // in: recording the write is what makes it the authority again. Only the scan may not
         // reach a demoted resident, which answers for no byte and must not be handed any.
@@ -2486,8 +2501,9 @@ impl MetalPresenter {
                     .then_some(descriptor)
             })
             .or_else(|| {
-                self.resident_guest_textures
-                    .values()
+                resident_candidates
+                    .iter()
+                    .filter_map(|candidate| self.resident_guest_textures.get(candidate))
                     .find(|resident| {
                         resident.is_live()
                             && guest_texture_descriptors_share_storage(
@@ -2498,13 +2514,16 @@ impl MetalPresenter {
                     .map(|resident| resident.descriptor)
             });
         if resident_descriptor.is_none()
-            && self.resident_guest_textures.values().any(|resident| {
-                resident.is_live()
-                    && guest_texture_descriptors_share_gpu_sample_storage(
-                        resident.descriptor,
-                        descriptor,
-                    )
-            })
+            && resident_candidates
+                .iter()
+                .filter_map(|candidate| self.resident_guest_textures.get(candidate))
+                .any(|resident| {
+                    resident.is_live()
+                        && guest_texture_descriptors_share_gpu_sample_storage(
+                            resident.descriptor,
+                            descriptor,
+                        )
+                })
         {
             // A resident that only the pitch-tolerant rule can reach served this write, and the
             // caller did not carry its key here. Ownership and content version are now lost.
@@ -2725,8 +2744,13 @@ impl MetalPresenter {
             .contains_key(&descriptor)
             .then_some(descriptor)
             .or_else(|| {
-                self.resident_guest_textures
-                    .values()
+                ResourceSpan::for_texture(descriptor)
+                    .iter()
+                    .flat_map(|span| {
+                        self.resident_guest_textures
+                            .overlapping(span, SpanQueryOrder::ResidentFirst)
+                    })
+                    .filter_map(|candidate| self.resident_guest_textures.get(&candidate))
                     .find(|resident| {
                         resident.is_live()
                             && guest_texture_descriptors_share_storage(
@@ -2824,8 +2848,8 @@ pub(crate) fn ensure_resident_texture_in_map(
             write_watch,
             span,
             owned,
-            gpu_authored: RangeSet::default(),
-                gpu_content_executed: false,
+            gpu_authored: GpuDebtSet::default(),
+            gpu_content_executed: false,
             state: ResidencyState::Live,
             acquire_invalidated: false,
             content_version: 0,

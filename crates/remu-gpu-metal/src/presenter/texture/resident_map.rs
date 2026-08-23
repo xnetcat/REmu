@@ -49,7 +49,10 @@ impl ResidentTextureMap {
         descriptor: GuestTextureDescriptor,
         resident: ResidentGuestTexture,
     ) -> Option<ResidentGuestTexture> {
-        self.index.insert(descriptor);
+        // `resident.span` is the admission-time extent of the complete allocation (all mip
+        // levels and array layers). Recomputing a span from the descriptor here would index only
+        // level zero and could also bind the interval to a mapping installed after admission.
+        self.index.insert(descriptor, resident.span);
         self.textures.insert(descriptor, resident)
     }
 
@@ -125,11 +128,15 @@ impl ResidentSpanIndex {
         }
     }
 
-    pub(crate) fn insert(&mut self, descriptor: GuestTextureDescriptor) {
+    pub(crate) fn insert(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+        span: Option<ResourceSpan>,
+    ) {
         self.remove(&descriptor);
-        // A descriptor whose byte count overflows can never overlap anything, so it is left out
-        // of the index entirely rather than admitted with a degenerate span.
-        let Some(span) = ResourceSpan::for_texture(descriptor) else {
+        // A resident without an admission-time span can never participate in an indexed query.
+        // Do not re-resolve it here: doing so would associate an old resident with a new mapping.
+        let Some(span) = span else {
             return;
         };
         self.virtual_intervals

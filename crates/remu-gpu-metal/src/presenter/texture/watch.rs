@@ -4,7 +4,7 @@
 use super::{
     CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
     GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RangeSet, ResidentGuestTexture, ResourceSpan,
+    GpuDebtSet, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
@@ -231,7 +231,7 @@ impl MetalPresenter {
             if gpu_written {
                 // CPU overwrote GPU-authored bytes: drop publication debt now; demotion still waits
                 // for a consumer bind so unused targets pay nothing.
-                resident.gpu_authored = RangeSet::default();
+                resident.gpu_authored = GpuDebtSet::default();
             }
             RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS.fetch_add(1, Ordering::Relaxed);
         }

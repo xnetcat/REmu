@@ -87,7 +87,6 @@ use remu_shader_metal::{
     HeapTextureTableBinding, HeapTextureTableType,
 };
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2448,16 +2447,6 @@ impl MetalPresenter {
         if key.diagnostics.capture_pixel_output {
             pixel_scalar_metadata.push(u32::from(diagnostic_capture_enabled));
         }
-        let vertex_scalar_byte_count = vertex_scalar_metadata
-            .len()
-            .checked_mul(4)
-            .and_then(|count| u64::try_from(count).ok())
-            .ok_or("vertex scalar byte count overflow")?;
-        let pixel_scalar_byte_count = pixel_scalar_metadata
-            .len()
-            .checked_mul(4)
-            .and_then(|count| u64::try_from(count).ok())
-            .ok_or("pixel scalar byte count overflow")?;
         let indexed_count = indexed_draw
             .as_ref()
             .map(|(indices, _)| u64::try_from(indices.len()).map_err(|_| "index count overflow"))
@@ -2730,6 +2719,30 @@ impl MetalPresenter {
                 &mut batch.guest_write_ranges,
                 pending_guest_write_ranges,
             );
+            let vertex_scalar_binding =
+                batch.upload_render_scalar_words(&device, &vertex_scalar_metadata)?;
+            let pixel_scalar_binding =
+                batch.upload_render_scalar_words(&device, &pixel_scalar_metadata)?;
+            let ngg_mesh_draw_metadata = (uses_mesh_stage
+                && indirect_ngg.is_none()
+                && ngg_mesh_dispatch_required(
+                    scissor,
+                    draw.instance_count,
+                    ngg_meshlets.is_some(),
+                ))
+            .then(|| {
+                [
+                    0_u32,
+                    0_u32,
+                    u32::from_ne_bytes(ngg_mesh_base_vertex(draw).to_ne_bytes()),
+                    0_u32,
+                ]
+            });
+            let ngg_mesh_draw_binding = ngg_mesh_draw_metadata
+                .as_ref()
+                .map(|words| batch.upload_render_scalar_words(&device, words))
+                .transpose()?
+                .flatten();
             if needs_new_render_pass {
                 let key_transition = batch
                     .render_pass
@@ -2871,18 +2884,20 @@ impl MetalPresenter {
                     encoder.set_fragment_buffer(*index, Some(&buffer.buffer), buffer.offset);
                 }
             }
-            if uses_mesh_stage {
-                encoder.set_mesh_bytes(
-                    u64::from(vertex_scalar_buffer_index),
-                    vertex_scalar_byte_count,
-                    vertex_scalar_metadata.as_ptr().cast::<c_void>(),
-                );
-            } else {
-                encoder.set_vertex_bytes(
-                    u64::from(vertex_scalar_buffer_index),
-                    vertex_scalar_byte_count,
-                    vertex_scalar_metadata.as_ptr().cast::<c_void>(),
-                );
+            if let Some((buffer, offset)) = vertex_scalar_binding.as_ref() {
+                if uses_mesh_stage {
+                    encoder.set_mesh_buffer(
+                        u64::from(vertex_scalar_buffer_index),
+                        Some(buffer),
+                        *offset,
+                    );
+                } else {
+                    encoder.set_vertex_buffer(
+                        u64::from(vertex_scalar_buffer_index),
+                        Some(buffer),
+                        *offset,
+                    );
+                }
             }
             if let Some(buffer) = diagnostic_vertex_position_buffer.as_ref() {
                 if uses_mesh_stage {
@@ -2895,11 +2910,13 @@ impl MetalPresenter {
                     );
                 }
             }
-            encoder.set_fragment_bytes(
-                u64::from(pixel_scalar_buffer_index),
-                pixel_scalar_byte_count,
-                pixel_scalar_metadata.as_ptr().cast::<c_void>(),
-            );
+            if let Some((buffer, offset)) = pixel_scalar_binding.as_ref() {
+                encoder.set_fragment_buffer(
+                    u64::from(pixel_scalar_buffer_index),
+                    Some(buffer),
+                    *offset,
+                );
+            }
             if let Some(buffer) = diagnostic_pixel_output_buffer.as_ref() {
                 encoder.set_fragment_buffer(DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, Some(buffer), 0);
             }
@@ -3004,22 +3021,18 @@ impl MetalPresenter {
                         ngg_meshlets.is_some(),
                     ) && let Some(meshlets) = ngg_meshlets.as_ref()
                     {
-                        let mesh_draw = [
-                            0_u32,
-                            0_u32,
-                            u32::from_ne_bytes(ngg_mesh_base_vertex(draw).to_ne_bytes()),
-                            0_u32,
-                        ];
                         encoder.set_mesh_buffer(
                             NGG_MESHLET_BUFFER_INDEX,
                             Some(&meshlets.buffer),
                             0,
                         );
-                        encoder.set_mesh_bytes(
+                        let (mesh_draw_buffer, mesh_draw_offset) = ngg_mesh_draw_binding
+                            .as_ref()
+                            .expect("dispatched NGG mesh draw retained its metadata");
+                        encoder.set_mesh_buffer(
                             NGG_MESH_DRAW_BUFFER_INDEX,
-                            u64::try_from(std::mem::size_of_val(&mesh_draw))
-                                .expect("mesh draw metadata size fits u64"),
-                            mesh_draw.as_ptr().cast::<c_void>(),
+                            Some(mesh_draw_buffer),
+                            *mesh_draw_offset,
                         );
                         static LOGGED_MESH_DRAWS: AtomicUsize = AtomicUsize::new(0);
                         let mesh_sequence = LOGGED_MESH_DRAWS.fetch_add(1, Ordering::Relaxed) + 1;

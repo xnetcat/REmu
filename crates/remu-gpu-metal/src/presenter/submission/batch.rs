@@ -801,32 +801,38 @@ impl MetalPresenter {
         &mut self,
         source: OrderedEventSource,
         sequence: u64,
-    ) {
+    ) -> bool {
         if !self.per_queue_guest_batches {
             if let Some(batch) = self.open_guest_batch.as_mut() {
                 batch.completion_sequences.push(sequence);
+                return super::guest_batch_completion_capacity_reached(
+                    batch.completion_sequences.len(),
+                );
             } else if let Some(batch) = self.committed_guest_batches.back_mut() {
                 batch.completion_sequences.push(sequence);
             } else {
                 self.publish_guest_submission_completion(sequence);
             }
-            return;
+            return false;
         }
         let OrderedEventSource::GuestQueue(queue_id) = source else {
             self.publish_guest_submission_completion(sequence);
-            return;
+            return false;
         };
         if let Some(state) = self.guest_queue_batches.get_mut(&queue_id) {
             if let Some(batch) = state.open_batch.as_mut() {
                 batch.completion_sequences.push(sequence);
-                return;
+                return super::guest_batch_completion_capacity_reached(
+                    batch.completion_sequences.len(),
+                );
             }
             if let Some(batch) = state.committed_batches.back_mut() {
                 batch.completion_sequences.push(sequence);
-                return;
+                return false;
             }
         }
         self.publish_guest_submission_completion(sequence);
+        false
     }
 
     pub(crate) fn active_transient_global_buffer_cache(
@@ -1939,6 +1945,31 @@ impl GuestCommandBatch {
             buffer,
             u64::try_from(offset).map_err(|_| "global upload offset does not fit Metal")?,
         ))
+    }
+
+    /// Retains render-stage scalar metadata in this batch's upload arena.
+    ///
+    /// Metal's inline-byte render bindings are represented internally as buffer resources. On a
+    /// restarted render pass the Metal driver can replay a missing inline resource and
+    /// dereference it while rebuilding the fragment resource list. A real buffer keeps the
+    /// resource identity stable, while ownership by `GuestCommandBatch` keeps its storage live
+    /// until the command buffer reaches a terminal state. Empty metadata is deliberately left
+    /// unbound: the translated shader has no scalar words to read, and manufacturing a zero-byte
+    /// resource would recreate the driver's semantically empty binding edge case.
+    pub(crate) fn upload_render_scalar_words(
+        &mut self,
+        device: &Device,
+        words: &[u32],
+    ) -> Result<Option<(Buffer, u64)>, String> {
+        if words.is_empty() {
+            return Ok(None);
+        }
+        let byte_count = std::mem::size_of_val(words);
+        // SAFETY: `words` is a contiguous live slice, and a `[u8]` permits every alignment and
+        // bit pattern. REmu's Metal shaders consume these native `uint` words on the same
+        // little-endian host that produced them.
+        let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr().cast::<u8>(), byte_count) };
+        self.upload_global_bytes(device, bytes).map(Some)
     }
 
     /// Reserves batch-owned shared storage that a later Metal encoder initializes in full.

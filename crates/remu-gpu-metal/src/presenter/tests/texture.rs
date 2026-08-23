@@ -6206,7 +6206,7 @@ fn resident_span_index_answers_exactly_what_the_linear_overlap_scan_does() {
             continue;
         }
         residents.push(descriptor);
-        index.insert(descriptor);
+        index.insert(descriptor, ResourceSpan::for_texture(descriptor));
     }
     assert_eq!(index.len(), residents.len());
 
@@ -6259,7 +6259,7 @@ fn resident_span_index_matches_the_linear_scan_after_random_inserts_and_removes(
             index.remove(&candidate);
         } else if !live.contains(&candidate) {
             live.push(candidate);
-            index.insert(candidate);
+            index.insert(candidate, ResourceSpan::for_texture(candidate));
         }
         assert_eq!(
             index.len(),
@@ -6277,4 +6277,49 @@ fn resident_span_index_matches_the_linear_scan_after_random_inserts_and_removes(
             );
         }
     }
+}
+
+#[test]
+fn resident_span_index_uses_the_complete_admission_span_and_rebinds_it_atomically() {
+    let (_memory, bases, _mapping_bytes) = index_test_mappings();
+    let descriptor = GuestTextureDescriptor {
+        address: bases[0],
+        width: 64,
+        height: 1,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let level_zero_bytes = guest_texture_byte_count(descriptor).expect("level-zero bytes");
+    let tail = ResourceSpan::new(descriptor.address + level_zero_bytes + 64, 64);
+    let complete_span = ResourceSpan::new(descriptor.address, level_zero_bytes + 256);
+    let mut index = ResidentSpanIndex::new();
+
+    index.insert(descriptor, Some(complete_span));
+    assert_eq!(
+        index.overlapping(&tail, SpanQueryOrder::ResidentFirst),
+        vec![descriptor],
+        "a mip or array tail beyond level zero must remain discoverable"
+    );
+
+    index.insert(descriptor, ResourceSpan::for_texture(descriptor));
+    assert!(
+        index
+            .overlapping(&tail, SpanQueryOrder::ResidentFirst)
+            .is_empty(),
+        "re-insertion must remove the old complete span before installing the replacement"
+    );
+
+    index.remove(&descriptor);
+    assert_eq!(index.len(), 0);
+    assert!(
+        index
+            .overlapping(
+                &ResourceSpan::new(descriptor.address, 1),
+                SpanQueryOrder::ResidentFirst
+            )
+            .is_empty(),
+        "removal must use the stored admission span"
+    );
 }
