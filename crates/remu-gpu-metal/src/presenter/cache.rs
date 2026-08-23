@@ -119,6 +119,15 @@ fn decode_indirect_dwords(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+fn indirect_packet_snapshot<'a>(
+    source: &QueuedGlobalReadSource,
+    packet_snapshot: Option<&'a [u8]>,
+) -> Option<&'a [u8]> {
+    matches!(source, QueuedGlobalReadSource::None)
+        .then_some(packet_snapshot)
+        .flatten()
+}
+
 fn indirect_producer_overlap_summary(
     producer: &GuestCommandBatch,
     address: u64,
@@ -193,8 +202,21 @@ impl MetalPresenter {
         address: u64,
         byte_count: usize,
     ) -> Result<UploadedGlobalBuffer, String> {
+        self.upload_ordered_indirect_arguments_with_snapshot(device, address, byte_count, None)
+    }
+
+    fn upload_ordered_indirect_arguments_with_snapshot(
+        &mut self,
+        device: &Device,
+        address: u64,
+        byte_count: usize,
+        packet_snapshot: Option<&[u8]>,
+    ) -> Result<UploadedGlobalBuffer, String> {
         if byte_count == 0 {
             return Err("indirect argument buffer is empty".to_owned());
+        }
+        if packet_snapshot.is_some_and(|snapshot| snapshot.len() != byte_count) {
+            return Err("indirect argument snapshot length mismatch".to_owned());
         }
         let binding = GlobalMemoryBinding {
             scalar_address: 0,
@@ -214,6 +236,9 @@ impl MetalPresenter {
             .get_or_init(|| std::env::var_os("REMU_TRACE_INDIRECT_BUFFERS").is_some());
         if trace_all || sequence <= 16 || sequence.is_power_of_two() {
             let source_detail = match &source {
+                QueuedGlobalReadSource::None if packet_snapshot.is_some() => {
+                    "packet-snapshot".to_owned()
+                }
                 QueuedGlobalReadSource::None => "guest".to_owned(),
                 QueuedGlobalReadSource::Buffer {
                     buffer,
@@ -235,6 +260,20 @@ impl MetalPresenter {
             self.ensure_active_open_guest_batch()?;
             return self.upload_fresh_global_buffer(device, &binding);
         }
+        if let Some(snapshot) = indirect_packet_snapshot(&source, packet_snapshot) {
+            // The guest command processor owns CPU-provided indirect arguments only until it
+            // fetches them. Presenter-side pipeline compilation can lag far enough for the guest
+            // to recycle that transient allocation before Metal executes the encoded command.
+            // Preserve the values decoded with the packet in that case. A queued GPU producer
+            // still wins above and remains a live Metal-to-Metal dependency.
+            return Ok(UploadedGlobalBuffer {
+                buffer: metal_buffer_with_bytes(device, snapshot)?,
+                offset: 0,
+                guest_memory: false,
+                physical_identity: None,
+                original_version: None,
+            });
+        }
         self.upload_global_buffer_from_source(device, &binding, &binding.data, source)
     }
 
@@ -242,8 +281,20 @@ impl MetalPresenter {
         &mut self,
         device: &Device,
         address: u64,
+        dimensions: [u32; 3],
     ) -> Result<UploadedGlobalBuffer, String> {
-        self.upload_ordered_indirect_arguments(device, address, 3 * std::mem::size_of::<u32>())
+        let mut snapshot = [0_u8; 3 * std::mem::size_of::<u32>()];
+        for (axis, value) in dimensions.into_iter().enumerate() {
+            let start = axis * std::mem::size_of::<u32>();
+            snapshot[start..start + std::mem::size_of::<u32>()]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        self.upload_ordered_indirect_arguments_with_snapshot(
+            device,
+            address,
+            snapshot.len(),
+            Some(&snapshot),
+        )
     }
 
     /// Identifies the queued producer selected for a native indirect argument read.
@@ -2118,8 +2169,9 @@ pub(super) const NGG_MESHLET_CACHE_CAPACITY: usize = 64;
 #[cfg(test)]
 mod tests {
     use super::{
-        QueuedWriteReadMatch, SharedEventGlobalBufferVersion, contained_global_version_offset,
-        contained_guest_write_offset, decode_indirect_dwords, stored_identities_overlap,
+        QueuedGlobalReadSource, QueuedWriteReadMatch, SharedEventGlobalBufferVersion,
+        contained_global_version_offset, contained_guest_write_offset, decode_indirect_dwords,
+        indirect_packet_snapshot, stored_identities_overlap,
     };
     use crate::presenter::PendingGuestWriteRange;
     use metal::{Buffer, Device, MTLResourceOptions};
@@ -2279,6 +2331,32 @@ mod tests {
             Some(identity(PRODUCER_BACKING, 0x2000)),
             0x40
         ));
+    }
+
+    #[test]
+    fn indirect_packet_snapshot_is_only_used_without_a_queued_gpu_producer() {
+        let snapshot = [7_u8, 3, 1];
+
+        assert_eq!(
+            indirect_packet_snapshot(&QueuedGlobalReadSource::None, Some(&snapshot)),
+            Some(snapshot.as_slice())
+        );
+        assert_eq!(
+            indirect_packet_snapshot(
+                &QueuedGlobalReadSource::Buffer {
+                    buffer: scratch_buffer(),
+                    offset: 0,
+                    guest_memory: true,
+                    physical_identity: None,
+                },
+                Some(&snapshot)
+            ),
+            None
+        );
+        assert_eq!(
+            indirect_packet_snapshot(&QueuedGlobalReadSource::Synchronize, Some(&snapshot)),
+            None
+        );
     }
 
     #[test]

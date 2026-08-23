@@ -1031,7 +1031,7 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     assert!(!uploaded.guest_memory);
 
     let indirect = presenter
-        .upload_indirect_dispatch_arguments(&device, 0x12_0010)
+        .upload_indirect_dispatch_arguments(&device, 0x12_0010, [7, 3, 1])
         .expect("indirect arguments forward the queued GPU producer");
     assert!(std::ptr::eq(indirect.buffer.as_ref(), producer.as_ref()));
     assert_eq!(indirect.offset, 48);
@@ -1046,6 +1046,46 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     ));
     assert_eq!(indexed_draw.offset, 48);
     assert!(!indexed_draw.guest_memory);
+}
+
+#[test]
+fn cpu_indirect_dispatch_uses_the_packet_snapshot_after_guest_reuse() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+
+    let mut guest_arguments = [7_u32, 3, 1];
+    let address = guest_arguments.as_mut_ptr().addr() as u64;
+    let packet_snapshot = guest_arguments;
+    guest_arguments = [0x7788_7787, 0x778c_778c, 0x778a_778b];
+
+    let uploaded = presenter
+        .upload_indirect_dispatch_arguments(&device, address, packet_snapshot)
+        .expect("packet-time indirect dimensions upload");
+    let observed = unsafe {
+        std::slice::from_raw_parts(
+            uploaded
+                .buffer
+                .contents()
+                .cast::<u8>()
+                .add(usize::try_from(uploaded.offset).expect("test offset fits usize")),
+            3 * std::mem::size_of::<u32>(),
+        )
+    };
+    let expected = packet_snapshot
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect::<Vec<_>>();
+
+    assert_eq!(observed, expected);
+    assert_ne!(guest_arguments, packet_snapshot);
+    assert!(!uploaded.guest_memory);
 }
 
 #[test]
