@@ -80,7 +80,8 @@ pub use counters::{
 mod resource;
 pub use resource::{
     GpuAdapter, GpuColorTarget, GpuHostImage, GpuProbe, GpuProbeError, GpuRegister,
-    GpuScanoutTarget, GraphicsApi, IndexedDraw, ShaderEvaluationSnapshot, ShaderSnapshot,
+    GpuScanoutTarget, GraphicsApi, IndexSnapshot, IndexSnapshotIdentity, IndexedDraw,
+    ShaderEvaluationSnapshot, ShaderSnapshot,
     agc_color_attrib2_extent,
 };
 

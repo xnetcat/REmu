@@ -49,6 +49,97 @@ pub struct ShaderSnapshot {
     pub metadata: Option<Arc<ShaderMetadata>>,
 }
 
+/// Reusable content identity for an immutable index-buffer capture.
+///
+/// The 128-bit fingerprint records content identity once at capture time without making cache
+/// lookups copy or re-hash the complete index vector. Cache keys pair it with the guest source
+/// address and exact range, so identical packet captures can reuse prepared buffers while changed
+/// bytes at a recycled VA cannot select the old entry.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct IndexSnapshotIdentity {
+    pub fingerprint: u128,
+}
+
+/// Immutable packet-time indices together with a reusable content identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexSnapshot {
+    indices: Arc<[u32]>,
+    identity: IndexSnapshotIdentity,
+}
+
+impl IndexSnapshot {
+    #[must_use]
+    pub fn new(indices: Arc<[u32]>) -> Self {
+        Self {
+            identity: IndexSnapshotIdentity {
+                fingerprint: index_snapshot_fingerprint(&indices),
+            },
+            indices,
+        }
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> IndexSnapshotIdentity {
+        self.identity
+    }
+
+    #[must_use]
+    pub fn indices(&self) -> &Arc<[u32]> {
+        &self.indices
+    }
+}
+
+impl std::ops::Deref for IndexSnapshot {
+    type Target = [u32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.indices
+    }
+}
+
+impl AsRef<[u32]> for IndexSnapshot {
+    fn as_ref(&self) -> &[u32] {
+        &self.indices
+    }
+}
+
+impl From<Arc<[u32]>> for IndexSnapshot {
+    fn from(indices: Arc<[u32]>) -> Self {
+        Self::new(indices)
+    }
+}
+
+impl From<Vec<u32>> for IndexSnapshot {
+    fn from(indices: Vec<u32>) -> Self {
+        Self::new(indices.into())
+    }
+}
+
+impl<const N: usize> From<[u32; N]> for IndexSnapshot {
+    fn from(indices: [u32; N]) -> Self {
+        Self::new(Arc::from(indices))
+    }
+}
+
+fn index_snapshot_fingerprint(indices: &[u32]) -> u128 {
+    // FNV-1a 128. Including the logical element count separates different slices whose byte
+    // encodings might otherwise share a prefix. A 128-bit content identity makes collision risk
+    // negligible while keeping cache lookup O(1); the immutable bytes remain owned by the draw.
+    const FNV_OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const FNV_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let mut fingerprint = FNV_OFFSET;
+    for byte in u64::try_from(indices.len())
+        .unwrap_or(u64::MAX)
+        .to_le_bytes()
+        .into_iter()
+        .chain(indices.iter().flat_map(|index| index.to_le_bytes()))
+    {
+        fingerprint ^= u128::from(byte);
+        fingerprint = fingerprint.wrapping_mul(FNV_PRIME);
+    }
+    fingerprint
+}
+
 /// One cached shader evaluation together with packet-time copies of transient read-only globals.
 ///
 /// Resource discovery is shared across draws through `evaluation`. Only the guest bytes which can
@@ -228,7 +319,7 @@ pub struct IndexedDraw {
     /// The presenter can lag command decoding during shader compilation, so retaining only the
     /// guest address would allow Unity to recycle and overwrite the indices before Metal reads
     /// them.
-    pub index_snapshot: Option<Arc<[u32]>>,
+    pub index_snapshot: Option<IndexSnapshot>,
     pub draw_flags: u32,
     pub primitive_type: u32,
     pub export_shader_address: u64,

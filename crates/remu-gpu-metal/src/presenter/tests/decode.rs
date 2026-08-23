@@ -166,8 +166,17 @@ fn accepts_fragmentless_depth_only_pipeline() {
     });
     draw.export_shader_evaluation = Some(empty_shader_evaluation().into());
     append_depth_target_registers(&mut draw, 0x0080_10b5_0000, 256, 256, 0xa000_0003, 0x66);
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: u32::MAX,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_by_key(|register| register.offset);
 
-    let key = graphics_pipeline_key(&draw).expect("depth-only draw has a Metal pipeline");
+    let key = graphics_pipeline_key(&draw)
+        .expect("fragmentless depth-only draw ignores stale raw color-mask bits");
     assert!(key.targets.is_empty());
     assert!(key.depth.is_some());
     assert_eq!(key.pixel_shader_address, 0);
@@ -247,6 +256,14 @@ fn recognizes_noop_placeholder_cover_without_attachments() {
         metadata: None,
     });
     draw.export_shader_evaluation = Some(empty_shader_evaluation().into());
+    push_gpu_register(
+        &mut draw.context_registers,
+        GpuRegister {
+            offset: CB_TARGET_MASK,
+            value: u32::MAX,
+        },
+    );
+    Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
     assert!(noop_placeholder_cover_draw(&draw));
     assert!(
         graphics_pipeline_key(&draw)
@@ -318,7 +335,7 @@ fn storage_only_image_store_draw_gets_a_dummy_color_target() {
     draw.export_shader_evaluation = None;
     draw.pixel_shader_address = 0x8051_4c00_00;
     draw.pixel_shader = Some(snapshot);
-    draw.pixel_shader_evaluation = Some(Arc::new(pixel_evaluation));
+    draw.pixel_shader_evaluation = Some(Arc::new(pixel_evaluation).into());
     // Superliminal programs CB_TARGET_MASK=0 and leaves STENCIL_ENABLE latched
     // (DB_DEPTH_CONTROL=0x771) without a depth surface.
     push_gpu_register(
@@ -344,7 +361,7 @@ fn storage_only_image_store_draw_gets_a_dummy_color_target() {
 }
 
 #[test]
-fn rejects_fragmentless_pipeline_with_color_writes() {
+fn fragmentless_pipeline_does_not_treat_raw_color_mask_as_an_attachment() {
     let mut draw = indexed_draw(0, 0, 3);
     draw.export_shader_address = 0x0080_07a8_0000;
     draw.export_shader = Some(ShaderSnapshot {
@@ -363,8 +380,11 @@ fn rejects_fragmentless_pipeline_with_color_writes() {
     );
     Arc::make_mut(&mut draw.context_registers).sort_unstable_by_key(|register| register.offset);
 
-    let error = graphics_pipeline_key(&draw).expect_err("color writes require a pixel shader");
-    assert!(error.contains("requests color output"), "{error}");
+    let error = graphics_pipeline_key(&draw).expect_err("attachment-free work remains a no-op");
+    assert!(
+        error.contains("neither an enabled color target nor an active depth target"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -1392,7 +1412,7 @@ fn recovers_32_bit_index_buffers_mislabeled_as_16_bit() {
 fn prefers_immutable_index_snapshot_over_recycled_guest_memory() {
     let mut transient_indices = [0_u16, 1, 2, 0, 2, 3];
     let mut draw = indexed_draw(transient_indices.as_ptr().addr() as u64, 0, 6);
-    draw.index_snapshot = Some(std::sync::Arc::from([0_u32, 1, 2, 0, 2, 3]));
+    draw.index_snapshot = Some(remu_gpu::IndexSnapshot::from([0_u32, 1, 2, 0, 2, 3]));
     transient_indices.fill(0xffff);
 
     assert_eq!(
@@ -1450,6 +1470,18 @@ fn zero_color_target_mask_is_a_valid_depth_only_attachment_set() {
 
     let targets = decode_render_targets_from_registers(&registers, 0xf)
         .expect("depth-only draws have no color attachments");
+    assert!(targets.is_empty());
+}
+
+#[test]
+fn nonzero_raw_color_mask_with_zero_pixel_exports_has_no_color_attachments() {
+    let registers = [GpuRegister {
+        offset: CB_TARGET_MASK,
+        value: u32::MAX,
+    }];
+
+    let targets = decode_render_targets_from_registers(&registers, 0)
+        .expect("zero pixel exports make the effective color-write mask empty");
     assert!(targets.is_empty());
 }
 

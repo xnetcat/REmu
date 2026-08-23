@@ -134,7 +134,7 @@ impl MetalPresenter {
         for candidate in candidates {
             match candidate {
                 PipelineCompileCandidate::Graphics { draw, key: Ok(key) } => {
-                    self.compile_draw_shaders(&draw, key);
+                    self.compile_draw_shaders(draw, key);
                 }
                 PipelineCompileCandidate::Compute {
                     dispatch,
@@ -150,7 +150,7 @@ impl MetalPresenter {
 
     pub(super) fn compile_draw_shaders(
         &mut self,
-        draw: &IndexedDraw,
+        draw: Arc<IndexedDraw>,
         key: Arc<GraphicsPipelineKey>,
     ) {
         if self.compiled_shader_pairs.contains_key(&key)
@@ -161,7 +161,7 @@ impl MetalPresenter {
         }
         let request = ShaderCompileRequest::Graphics {
             key: Arc::clone(&key),
-            draw: draw.clone(),
+            draw,
         };
         match self.shader_compile_sender.try_send(request) {
             Ok(()) => {

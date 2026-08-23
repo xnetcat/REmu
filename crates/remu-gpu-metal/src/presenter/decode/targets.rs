@@ -491,17 +491,10 @@ fn decode_render_targets_untimed(
         if draw.scanout_target.is_some() {
             return Err("scanout draw has no decoded pixel shader".to_owned());
         }
-        // An absent mask leaves programmed color targets discoverable to the command processor,
-        // but a missing pixel stage still has no color exports. Treat the mask as zero only for
-        // this fragmentless path; an explicit nonzero mask remains an invalid color-write request.
-        let target_mask =
-            register_value(&draw.context_registers, CB_TARGET_MASK).unwrap_or_default();
-        if target_mask == 0 {
-            return Ok(Vec::new());
-        }
-        return Err(format!(
-            "draw has no decoded pixel shader but CB_TARGET_MASK={target_mask:#010x} requests color output"
-        ));
+        // CB_TARGET_MASK is persistent command-processor state, independent of whether a pixel
+        // stage is active. A fragmentless draw has no color exports, so its effective color-write
+        // mask is empty even when stale/raw target nibbles remain programmed.
+        return Ok(Vec::new());
     };
     let export_masks = pixel.program.pixel_color_export_masks();
     if let Some(target) = draw.scanout_target {
@@ -598,11 +591,6 @@ pub(crate) fn decode_render_targets_from_registers(
             guest_slot,
             write_mask,
         )?);
-    }
-    if targets.is_empty() && target_mask != 0 {
-        return Err(format!(
-            "draw has no color target enabled by both CB_TARGET_MASK={target_mask:#010x} and pixel exports={export_masks:#010x}"
-        ));
     }
     Ok(targets)
 }

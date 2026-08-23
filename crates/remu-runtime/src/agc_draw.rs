@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use remu_shader::GuestMemoryReader;
 
@@ -892,7 +892,7 @@ pub(crate) fn agc_emit_draw_with_indirect_arguments(
         }
     }
     agc_trace_draw_summary(&draw);
-    emit_agc_gpu_event(remu_gpu::GpuEvent::IndexedDraw(Box::new(draw)));
+    emit_agc_gpu_event(remu_gpu::GpuEvent::IndexedDraw(Arc::new(draw)));
 }
 
 pub(crate) fn agc_emit_indexed_draw(

@@ -83,6 +83,25 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
 }
 
 #[test]
+fn graphics_compile_request_retains_the_event_draw_arc() {
+    let (_gpu_sender, gpu_receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(gpu_receiver).expect("Metal presenter initializes");
+    let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
+    presenter.shader_compile_sender = request_sender;
+    let draw = Arc::new(super::indexed_draw(0, 0, 3));
+    let key = Arc::new(super::cold_graphics_pipeline_key());
+
+    presenter.compile_draw_shaders(Arc::clone(&draw), Arc::clone(&key));
+
+    match request_receiver.recv().expect("graphics compile request") {
+        ShaderCompileRequest::Graphics {
+            draw: requested, ..
+        } => assert!(Arc::ptr_eq(&requested, &draw)),
+        ShaderCompileRequest::Compute { .. } => panic!("expected graphics compile request"),
+    }
+}
+
+#[test]
 fn graphics_pipeline_key_interner_deduplicates_content_and_separates_mutations() {
     let mut interner = PipelineKeyInterner::default();
     let key = super::cold_graphics_pipeline_key();
@@ -133,7 +152,7 @@ fn repeated_pipeline_prefetch_uses_ingress_snapshots_without_rebuilding_keys() {
         .send(GpuEvent::QueueSubmission {
             queue_id: 0,
             events: vec![
-                GpuEvent::IndexedDraw(Box::new(draw)),
+                GpuEvent::IndexedDraw(Arc::new(draw)),
                 GpuEvent::ComputeDispatch(Box::new(dispatch)),
             ],
         })

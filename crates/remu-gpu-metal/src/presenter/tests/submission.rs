@@ -2576,9 +2576,12 @@ fn pending_terminal_wait_settle_continues_the_same_drain_tick() {
         .as_ref()
         .expect("Metal queue")
         .clone();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     presenter.open_guest_batch = Some(GuestCommandBatch {
         queue_id: None,
-        command_buffer: queue.new_command_buffer().to_owned(),
+        command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -2653,9 +2656,12 @@ fn pending_terminal_wait_settle_flushes_open_producer_when_committed_queue_is_em
         .as_ref()
         .expect("Metal queue")
         .clone();
+    let command_buffer = queue.new_command_buffer().to_owned();
+    let completion = CommandBufferCompletion::attach(&command_buffer);
     presenter.open_guest_batch = Some(GuestCommandBatch {
         queue_id: None,
-        command_buffer: queue.new_command_buffer().to_owned(),
+        command_buffer,
+        completion,
         work: Vec::new(),
         committed_at: None,
         global_upload_chunks: Vec::new(),
@@ -3750,7 +3756,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
         .send(GpuEvent::QueueSubmission {
             queue_id: 0,
             events: vec![
-                GpuEvent::IndexedDraw(Box::new(draw)),
+                GpuEvent::IndexedDraw(Arc::new(draw)),
                 GpuEvent::PipelineBarrier(remu_gpu::GpuPipelineBarrier {
                     wait_for: remu_gpu::GpuPipelineStage::PixelShader,
                 }),
@@ -3762,7 +3768,7 @@ fn queue_local_compile_gate_runs_compute_without_overtaking_graphics_or_flip() {
                     poll_interval: 0,
                     gcr_control: 0,
                 }),
-                GpuEvent::IndexedDraw(Box::new(later_draw)),
+                GpuEvent::IndexedDraw(Arc::new(later_draw)),
                 GpuEvent::SubmissionBoundary(1),
             ],
         })
@@ -4024,6 +4030,7 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
     first.sequence = 1;
     let mut second = first.clone();
     second.sequence = 2;
+    let second = Arc::new(second);
     let mut third = first.clone();
     third.sequence = 3;
     let dispatch = ComputeDispatch {
@@ -4049,9 +4056,9 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
         .send(GpuEvent::QueueSubmission {
             queue_id: 0,
             events: vec![
-                GpuEvent::IndexedDraw(Box::new(first)),
-                GpuEvent::IndexedDraw(Box::new(second)),
-                GpuEvent::IndexedDraw(Box::new(third)),
+                GpuEvent::IndexedDraw(Arc::new(first)),
+                GpuEvent::IndexedDraw(Arc::clone(&second)),
+                GpuEvent::IndexedDraw(Arc::new(third)),
             ],
         })
         .expect("queue graphics lookahead");
@@ -4074,6 +4081,14 @@ fn pipeline_prefetch_filters_before_clone_and_shares_lookahead_across_queues() {
         &prefetched[0],
         PipelineCompileCandidate::Graphics { draw, .. } if draw.sequence == 2
     ));
+    let PipelineCompileCandidate::Graphics {
+        draw: prefetched_draw,
+        ..
+    } = &prefetched[0]
+    else {
+        unreachable!("first accepted candidate is graphics")
+    };
+    assert!(Arc::ptr_eq(prefetched_draw, &second));
     assert!(matches!(
         &prefetched[1],
         PipelineCompileCandidate::Compute { dispatch, .. } if dispatch.sequence == 9
@@ -5929,7 +5944,7 @@ fn disjoint_direct_draw_admission_is_default_disabled() {
         queue_id: 0,
         events: vec![
             GpuEvent::MemoryWait(wait),
-            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth))),
+            GpuEvent::IndexedDraw(Arc::new(shared_event_depth_draw(depth))),
         ],
     }));
 
@@ -5998,7 +6013,7 @@ fn opt_in_disjoint_draw_keeps_the_exact_gpu_wait_without_early_ack_or_completion
         queue_id: 0,
         events: vec![
             GpuEvent::MemoryWait(wait),
-            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(depth))),
+            GpuEvent::IndexedDraw(Arc::new(shared_event_depth_draw(depth))),
         ],
     }));
 
@@ -6103,7 +6118,7 @@ fn opt_in_direct_draw_keeps_physical_overlap_behind_the_host_gate() {
         queue_id: 0,
         events: vec![
             GpuEvent::MemoryWait(wait),
-            GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(shared_address))),
+            GpuEvent::IndexedDraw(Arc::new(shared_event_depth_draw(shared_address))),
         ],
     }));
 
@@ -6234,7 +6249,7 @@ fn opt_in_direct_draw_keeps_an_incomplete_producer_behind_the_host_gate() {
 
     assert!(remu_gpu::emit_event(GpuEvent::QueueSubmission {
         queue_id: 0,
-        events: vec![GpuEvent::IndexedDraw(Box::new(shared_event_depth_draw(
+        events: vec![GpuEvent::IndexedDraw(Arc::new(shared_event_depth_draw(
             depth
         )))],
     }));
