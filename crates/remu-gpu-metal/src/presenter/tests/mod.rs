@@ -225,6 +225,7 @@ fn cold_graphics_pipeline_key() -> GraphicsPipelineKey {
         ngg_subgroup_limits: None,
         ngg_registers: None,
         wave_state: GraphicsWaveState::default(),
+        shader_optimization: remu_shader_metal::ShaderOptimizationOptions::LEGACY,
         diagnostics: GraphicsDiagnosticPipelineState::default(),
         targets: Vec::new(),
         depth: None,

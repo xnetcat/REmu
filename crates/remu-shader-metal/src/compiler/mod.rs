@@ -18,7 +18,7 @@ use crate::compiler::control_flow::ControlFlowLowering;
 use crate::compiler::image::ImageKind;
 use crate::compiler::interface::PixelInterpolation;
 use crate::compiler::memory::is_lds_memory_instruction;
-use crate::{MetalCompileOptions, MetalShaderStage};
+use crate::{MetalCompileOptions, MetalOptimizationReport, MetalShaderStage};
 
 pub(crate) mod control_flow;
 pub(crate) mod driver;
@@ -58,6 +58,7 @@ pub(crate) struct Compiler<'a> {
     /// into `evaluation.image_bindings`; `Compiler::new` converts and refuses anything else.
     pub(crate) heap_tables: std::collections::BTreeMap<usize, HeapTextureRoute>,
     control_flow: ControlFlowLowering,
+    optimization_report: MetalOptimizationReport,
     /// VGPR holding the NGG compacted output vertex id that gates EXP (the `vM` in
     /// `V_CMPX_* sN, vM` immediately before `EXP POS`). When the mesh ABI has an explicit
     /// capacity, each export publishes directly to that Metal vertex slot so PRIM indices and

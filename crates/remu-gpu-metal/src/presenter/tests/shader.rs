@@ -78,6 +78,7 @@ fn pending_compute_pipeline() -> (ComputeDispatch, ComputePipelineKey) {
         initial_scalar_count: 0,
         global_bindings: Vec::new(),
         image_bindings: Vec::new(),
+        shader_optimization: remu_shader_metal::ShaderOptimizationOptions::LEGACY,
     };
     (dispatch, key)
 }
@@ -237,6 +238,7 @@ fn speculative_compile_limit_keeps_required_queue_front_capacity_available() {
                 initial_scalar_count: 0,
                 global_bindings: Vec::new(),
                 image_bindings: Vec::new(),
+                shader_optimization: remu_shader_metal::ShaderOptimizationOptions::LEGACY,
             }));
     }
     let (dispatch, key) = pending_compute_pipeline();

@@ -738,6 +738,7 @@ struct GraphicsPipelineKey {
     /// `SPI_TMPRING_SIZE` scratch allocation and `CxVgtShaderStagesEn` export wave width. Both
     /// change the generated Metal function, so they belong in the pipeline cache key.
     wave_state: GraphicsWaveState,
+    shader_optimization: remu_shader_metal::ShaderOptimizationOptions,
     /// `DB_SHADER_CONTROL.Z_EXPORT_ENABLE`, gated by an active depth attachment.
     pixel_depth_export: bool,
     /// Diagnostic lowerings alter the generated Metal function body and interface. Keep the
@@ -1046,6 +1047,7 @@ struct ComputePipelineKey {
     /// type, canonical texture slot, canonical sampler slot, the evaluator's runtime-index flag,
     /// and whether this stage effectively fetches through a heap table.
     image_bindings: Vec<(u32, bool, bool, u32, u32, u32, Option<u32>, bool, bool)>,
+    shader_optimization: remu_shader_metal::ShaderOptimizationOptions,
 }
 
 /// Content-addressed owner for immutable pipeline keys.

@@ -3954,6 +3954,7 @@ fn queue_local_compute_pipeline_gate_preserves_and_prefetches_dispatch() {
         initial_scalar_count: 0,
         global_bindings: Vec::new(),
         image_bindings: Vec::new(),
+        shader_optimization: remu_shader_metal::ShaderOptimizationOptions::LEGACY,
     };
     sender
         .send(GpuEvent::QueueSubmission {

@@ -47,6 +47,56 @@ pub enum MetalShaderStage {
 
 pub const PIXEL_INPUT_CONTROL_COUNT: usize = 32;
 
+/// Rollout mode for the GCN-to-MSL optimizer. Environment policy is resolved by the host; the
+/// compiler consumes only this typed, cache-keyable value.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ShaderOptimizationMode {
+    #[default]
+    Legacy,
+    Analyze,
+    On,
+    Force,
+}
+
+/// Independently reversible shader optimization policy.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ShaderOptimizationOptions {
+    pub mode: ShaderOptimizationMode,
+    pub uniformity: bool,
+    pub licm: bool,
+    pub descriptor_cache: bool,
+    pub constant_bindings: bool,
+}
+
+impl Default for ShaderOptimizationOptions {
+    fn default() -> Self {
+        Self::LEGACY
+    }
+}
+
+impl ShaderOptimizationOptions {
+    pub const LEGACY: Self = Self {
+        mode: ShaderOptimizationMode::Legacy,
+        uniformity: false,
+        licm: false,
+        descriptor_cache: false,
+        constant_bindings: false,
+    };
+
+    #[must_use]
+    pub const fn analyzes(self) -> bool {
+        !matches!(self.mode, ShaderOptimizationMode::Legacy)
+    }
+
+    #[must_use]
+    pub const fn lowers(self) -> bool {
+        matches!(
+            self.mode,
+            ShaderOptimizationMode::On | ShaderOptimizationMode::Force
+        )
+    }
+}
+
 /// Decoded `SPI_PS_INPUT_CNTL_n` state for one logical pixel-shader input.
 ///
 /// Pixel shaders name logical attributes through `V_INTERP`, while this register selects the
@@ -306,6 +356,8 @@ pub struct MetalCompileOptions {
     /// instead of the evaluation snapshot (docs/design/2026-08-13-runtime-image-descriptor-
     /// fetch.md). Off by default until the encoder stage binds the tables.
     pub runtime_heap_tables: bool,
+    /// Typed optimizer policy resolved once by the presenter and included in pipeline keys.
+    pub optimization: ShaderOptimizationOptions,
 }
 
 impl MetalCompileOptions {
@@ -343,6 +395,7 @@ impl MetalCompileOptions {
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         }
     }
 
@@ -383,6 +436,7 @@ impl MetalCompileOptions {
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         }
     }
 
@@ -419,6 +473,7 @@ impl MetalCompileOptions {
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         }
     }
 
@@ -455,6 +510,7 @@ impl MetalCompileOptions {
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         }
     }
 
@@ -505,6 +561,7 @@ impl MetalCompileOptions {
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
             runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         }
     }
 
@@ -643,6 +700,26 @@ pub struct MetalShader {
     /// values independent lets Metal's SSA and liveness passes allocate only the values which are
     /// actually referenced by the translated program.
     pub register_footprint: MetalRegisterFootprint,
+    pub optimization_report: MetalOptimizationReport,
+}
+
+/// Per-shader evidence for analysis, optimized emission, and conservative fallback.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct MetalOptimizationReport {
+    pub mode: ShaderOptimizationMode,
+    pub analyzed_instructions: u64,
+    pub uniform_values: u64,
+    pub scalarized_salu: u64,
+    pub scalarized_smem: u64,
+    pub hoisted_operations: u64,
+    pub decoded_descriptors: u64,
+    pub reused_descriptors: u64,
+    pub optimized_loops: u64,
+    pub fallback_loops: u64,
+    pub fallback_reasons: Vec<String>,
+    pub analysis_nanos: u64,
+    pub legacy_msl_bytes: u64,
+    pub emitted_msl_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -737,6 +814,7 @@ pub fn compile_procedural_rectangle_vertex(
         let _ = writeln!(source, "    remu_out.param{location} = {value};");
     }
     source.push_str("    return remu_out;\n}\n");
+    let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
     MetalShader {
         source,
         entry_point: "remu_main".to_owned(),
@@ -757,6 +835,11 @@ pub fn compile_procedural_rectangle_vertex(
             scalar_values: 0,
             vector_values: 0,
             direct_control_flow: true,
+        },
+        optimization_report: MetalOptimizationReport {
+            legacy_msl_bytes: source_bytes,
+            emitted_msl_bytes: source_bytes,
+            ..MetalOptimizationReport::default()
         },
     }
 }

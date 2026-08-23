@@ -321,7 +321,8 @@ fn lowers_wave64_readfirstlane_across_both_simd32_halves() {
             ngg_registers_proven: false,
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
-        runtime_heap_tables: false,
+            runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         },
     )
     .expect("wave64 readfirstlane should lower with threadgroup exchange");
@@ -551,7 +552,8 @@ fn pixel_writelane_wave_constant_table_refuses_without_proven_lane_occupancy() {
             ngg_registers_proven: false,
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
-        runtime_heap_tables: false,
+            runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         },
     )
     .expect_err("pixel writelane table must refuse");

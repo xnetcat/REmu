@@ -209,7 +209,8 @@ fn compile_vector_instruction(instruction: Instruction, stage: MetalShaderStage)
             ngg_registers_proven: false,
             ngg_fixed_allocation_fallback: false,
             wave64_lane_doubled: false,
-        runtime_heap_tables: false,
+            runtime_heap_tables: false,
+            optimization: ShaderOptimizationOptions::LEGACY,
         },
     )
     .expect("vector instruction should lower")
