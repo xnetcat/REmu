@@ -10,7 +10,7 @@ use super::{
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
-    guest_texture_byte_count, mode5_mip_chain_layout, mode27_mip_chain_layout,
+    guest_texture_byte_count, mode27_mip_chain_layout,
     record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
     retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
     trace_resident_texture_demotion, trace_resident_texture_removal,
@@ -796,6 +796,15 @@ pub(crate) fn resident_texture_raw_byte_count(
             return guest_texture_byte_count(descriptor)
                 .ok_or_else(|| "resident texture byte count overflows".to_owned());
         }
+        if !matches!(descriptor.tile_mode, 9 | 27)
+            || super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+                != Some(descriptor.bytes_per_pixel)
+        {
+            return Err(format!(
+                "mipmapped resident byte count requires uncompressed tile 9/27, got tile={} format={:?} bpe={}",
+                descriptor.tile_mode, descriptor.pixel_format, descriptor.bytes_per_pixel
+            ));
+        }
         let layout = mode27_mip_chain_layout(descriptor, mip_level_count)?;
         return u64::try_from(layout.byte_count)
             .map_err(|_| "mip chain byte count does not fit u64".to_owned());
@@ -812,6 +821,7 @@ pub(crate) fn resident_texture_raw_byte_count(
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type,
+        base_array_slice: 0,
         layer_count,
     };
     let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
@@ -830,13 +840,21 @@ pub(crate) fn refresh_sampled_texture_write_watch(
             let was_dirty = cached.write_watch.is_dirty();
             let mut renewed = watch_sampled_texture(DecodedImageDescriptor {
                 guest: key.descriptor,
-                span: ResourceSpan::for_texture(key.descriptor),
+                span: ResourceSpan::for_image_view(
+                    key.descriptor,
+                    key.base_mip_level,
+                    key.mip_level_count,
+                    key.texture_type,
+                    key.base_array_slice,
+                    key.layer_count,
+                )?,
                 // Component selection is lowered into each shader and does not change the host
                 // texture allocation or the guest bytes covered by its write watch.
                 destination_select: 0,
                 base_mip_level: key.base_mip_level,
                 mip_level_count: key.mip_level_count,
                 texture_type: key.texture_type,
+                base_array_slice: key.base_array_slice,
                 layer_count: key.layer_count,
             })?;
             renewed.inherit_content_state_from(&cached.write_watch)?;
@@ -933,61 +951,25 @@ pub(crate) fn watch_guest_texture(
 pub(crate) fn sampled_texture_raw_range(
     descriptor: DecodedImageDescriptor,
 ) -> Result<(usize, usize), String> {
-    let exact_mode5_mip_chain = sampled_texture_uses_exact_mode5_mips(descriptor);
-    let exact_mode27_mip_chain = sampled_texture_uses_exact_mode27_mips(descriptor);
-    let byte_count = if exact_mode5_mip_chain || exact_mode27_mip_chain {
-        if exact_mode27_mip_chain && (descriptor.texture_type != 9 || descriptor.layer_count != 1) {
-            return Err(format!(
-                "exact mode-27 sampled mip-chain upload requires a 2D single-layer resource, got type={} layers={} tile={} base={} count={}",
-                descriptor.texture_type,
-                descriptor.layer_count,
-                descriptor.guest.tile_mode,
-                descriptor.base_mip_level,
-                descriptor.mip_level_count
-            ));
-        }
-        if exact_mode5_mip_chain && !matches!(descriptor.texture_type, 9 | 11 | 13) {
-            return Err(format!(
-                "exact mode-5 sampled mip-chain upload requires a 2D or array resource, got type={} layers={} tile={} base={} count={}",
-                descriptor.texture_type,
-                descriptor.layer_count,
-                descriptor.guest.tile_mode,
-                descriptor.base_mip_level,
-                descriptor.mip_level_count
-            ));
-        }
-        let underlying_mip_count = descriptor
-            .base_mip_level
-            .checked_add(descriptor.mip_level_count)
-            .ok_or("sampled mip range overflows")?;
-        let byte_count = if exact_mode5_mip_chain {
-            mode5_mip_chain_layout(descriptor.guest, underlying_mip_count)?
-                .byte_count
-                .checked_mul(
-                    usize::try_from(descriptor.layer_count)
-                        .map_err(|_| "sampled layer count does not fit usize")?,
-                )
-                .ok_or("mode-5 sampled mip-chain byte count overflows")?
-        } else {
-            mode27_mip_chain_layout(descriptor.guest, underlying_mip_count)?.byte_count
-        };
-        u64::try_from(byte_count).map_err(|_| "sampled mip-chain byte count does not fit u64")?
-    } else {
-        guest_texture_byte_count(descriptor.guest)
-            .ok_or("sampled texture face byte count overflows")?
-            .checked_mul(u64::from(descriptor.layer_count))
-            .ok_or("sampled texture byte count overflows")?
-    };
-    if descriptor.guest.address < 0x10_000 || byte_count > 512 * 1024 * 1024 {
+    let span = ResourceSpan::for_image_view(
+        descriptor.guest,
+        descriptor.base_mip_level,
+        descriptor.mip_level_count,
+        descriptor.texture_type,
+        descriptor.base_array_slice,
+        descriptor.layer_count,
+    )?
+    .ok_or("sampled texture selected span overflows")?;
+    if span.address() < 0x10_000 || span.len() > 512 * 1024 * 1024 {
         return Err(format!(
-            "invalid sampled texture range address={:#x} bytes={byte_count}",
-            descriptor.guest.address
+            "invalid sampled texture range address={:#x} bytes={}",
+            span.address(),
+            span.len()
         ));
     }
     Ok((
-        usize::try_from(descriptor.guest.address)
-            .map_err(|_| "sampled texture address does not fit usize")?,
-        usize::try_from(byte_count).map_err(|_| "sampled texture byte count does not fit usize")?,
+        usize::try_from(span.address()).map_err(|_| "sampled texture address does not fit usize")?,
+        usize::try_from(span.len()).map_err(|_| "sampled texture byte count does not fit usize")?,
     ))
 }
 
@@ -997,16 +979,22 @@ pub(crate) fn sampled_texture_uses_exact_mode5_mips(descriptor: DecodedImageDesc
 }
 
 pub(crate) fn sampled_texture_uses_exact_mode27_mips(descriptor: DecodedImageDescriptor) -> bool {
-    descriptor.guest.tile_mode == 27
+    sampled_texture_uses_exact_mode64k_2d_mips(descriptor) && descriptor.guest.tile_mode == 27
+}
+
+pub(crate) fn sampled_texture_uses_exact_mode64k_2d_mips(
+    descriptor: DecodedImageDescriptor,
+) -> bool {
+    matches!(descriptor.guest.tile_mode, 9 | 27)
         && (descriptor.base_mip_level != 0 || descriptor.mip_level_count != 1)
 }
 
 pub(crate) fn watch_sampled_texture(
     descriptor: DecodedImageDescriptor,
 ) -> Result<GuestTextureWriteWatch, String> {
-    let (_, byte_count) = sampled_texture_raw_range(descriptor)?;
+    let (address, byte_count) = sampled_texture_raw_range(descriptor)?;
     GuestTextureWriteWatch::new(
-        descriptor.guest.address,
+        u64::try_from(address).map_err(|_| "sampled address does not fit u64")?,
         u64::try_from(byte_count).map_err(|_| "sampled byte count does not fit u64")?,
     )
 }
@@ -1016,8 +1004,12 @@ pub(crate) fn snapshot_watched_sampled_texture_raw(
     descriptor: DecodedImageDescriptor,
     write_watch: &GuestTextureWriteWatch,
 ) -> Result<Vec<u8>, String> {
-    let (_, source_length) = sampled_texture_raw_range(descriptor)?;
-    snapshot_watched_guest_range(descriptor.guest.address, source_length, write_watch)
+    let (source_address, source_length) = sampled_texture_raw_range(descriptor)?;
+    snapshot_watched_guest_range(
+        u64::try_from(source_address).map_err(|_| "sampled address does not fit u64")?,
+        source_length,
+        write_watch,
+    )
 }
 
 #[track_caller]

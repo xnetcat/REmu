@@ -60,10 +60,9 @@ pub(crate) fn depth_array_face_descriptor(
     }
     let pixel_format = depth_render_format_for_sample(sampled.guest.pixel_format)?;
     let face_bytes = guest_texture_byte_count(sampled.guest)?;
-    let address = sampled
-        .guest
-        .address
-        .checked_add(face_bytes.checked_mul(u64::from(layer))?)?;
+    let address = sampled.guest.address.checked_add(
+        face_bytes.checked_mul(u64::from(sampled.base_array_slice.checked_add(layer)?))?,
+    )?;
     Some(GuestTextureDescriptor {
         address,
         pixel_format,
@@ -84,10 +83,16 @@ pub(crate) fn resident_is_depth_array_face(
     let Some(face_bytes) = guest_texture_byte_count(sampled.guest) else {
         return false;
     };
-    if face_bytes == 0 || resident.descriptor.address < sampled.guest.address {
+    let Some(selected_offset) = face_bytes.checked_mul(u64::from(sampled.base_array_slice)) else {
+        return false;
+    };
+    let Some(selected_address) = sampled.guest.address.checked_add(selected_offset) else {
+        return false;
+    };
+    if face_bytes == 0 || resident.descriptor.address < selected_address {
         return false;
     }
-    let offset = resident.descriptor.address - sampled.guest.address;
+    let offset = resident.descriptor.address - selected_address;
     if !offset.is_multiple_of(face_bytes) {
         return false;
     }
@@ -154,6 +159,7 @@ impl MetalPresenter {
                 }
                 let key = DepthArrayKey {
                     descriptor: descriptor.guest,
+                    base_array_slice: descriptor.base_array_slice,
                     layer_count: descriptor.layer_count,
                 };
                 let faces: Option<Vec<(metal::Texture, u64)>> = (0..descriptor.layer_count)

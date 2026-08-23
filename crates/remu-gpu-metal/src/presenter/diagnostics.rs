@@ -2109,6 +2109,7 @@ mod tests {
             base_mip_level: 0,
             mip_level_count: 1,
             texture_type: 9,
+            base_array_slice: 0,
             layer_count: 1,
         }
     }

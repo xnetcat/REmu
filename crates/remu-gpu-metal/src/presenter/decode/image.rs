@@ -91,13 +91,14 @@ fn decode_image_descriptor_impl(
             "Metal image upload does not yet implement texture type {texture_type}"
         ));
     }
+    let mut base_array_slice = 0;
     let layer_count = if texture_type == 10 {
         (words.get(4).copied().unwrap_or_default() & 0x1fff)
             .checked_add(1)
             .ok_or("3D image depth overflows")?
     } else if texture_type == 11 {
         let last_array_slice = words.get(4).copied().unwrap_or_default() & 0x1fff;
-        let base_array_slice = (words.get(4).copied().unwrap_or_default() >> 16) & 0x1fff;
+        base_array_slice = (words.get(4).copied().unwrap_or_default() >> 16) & 0x1fff;
         if base_array_slice > last_array_slice {
             return Err(format!(
                 "invalid cube array slice range {base_array_slice}..={last_array_slice}"
@@ -113,7 +114,7 @@ fn decode_image_descriptor_impl(
     } else if texture_type == 13 {
         let slices = words.get(4).copied().unwrap_or_default();
         let last_array_slice = slices & 0x1fff;
-        let base_array_slice = (slices >> 16) & 0x1fff;
+        base_array_slice = (slices >> 16) & 0x1fff;
         if base_array_slice > last_array_slice {
             return Err(format!(
                 "invalid array slice range {base_array_slice}..={last_array_slice}"
@@ -143,21 +144,25 @@ fn decode_image_descriptor_impl(
         pixel_format,
         bytes_per_pixel: bytes_per_element,
     };
+    let mip_level_count = last_level - base_level + 1;
     Ok(DecodedImageDescriptor {
         guest,
         // The one place a bound image's physical span is resolved. Every later overlap query
         // against this binding reuses it instead of re-entering the shared-mapping registry.
-        // TYPE-10 volumes name depth in word 4; a 2D face span would leave slices 1..N
-        // unwatched and let later samples re-upload unpublished guest RAM.
-        span: if texture_type == 10 && layer_count > 1 {
-            ResourceSpan::for_texture_layers(guest, layer_count)
-        } else {
-            ResourceSpan::for_texture(guest)
-        },
+        // Array/cube views start at the selected base slice; TYPE-10 volumes still cover depth.
+        span: ResourceSpan::for_image_view(
+            guest,
+            base_level,
+            mip_level_count,
+            texture_type,
+            base_array_slice,
+            layer_count,
+        )?,
         destination_select,
         base_mip_level: base_level,
-        mip_level_count: last_level - base_level + 1,
+        mip_level_count,
         texture_type,
+        base_array_slice,
         layer_count,
     })
 }
@@ -203,6 +208,7 @@ pub(crate) fn fallback_image_descriptor(
         match binding.control.dimension {
             2 => 10,
             3 => 11,
+            5 => 13,
             _ => 9,
         }
     };
@@ -223,6 +229,7 @@ pub(crate) fn fallback_image_descriptor(
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type,
+        base_array_slice: 0,
         layer_count,
     })
 }

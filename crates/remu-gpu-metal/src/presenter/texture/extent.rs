@@ -228,7 +228,7 @@ fn level_extents(
         }]);
     }
     let layout = match descriptor.tile_mode {
-        27 => mode27_mip_chain_layout(descriptor, mip_level_count).ok()?,
+        9 | 27 => mode27_mip_chain_layout(descriptor, mip_level_count).ok()?,
         5 => mode5_mip_chain_layout(descriptor, mip_level_count).ok()?,
         _ => return None,
     };

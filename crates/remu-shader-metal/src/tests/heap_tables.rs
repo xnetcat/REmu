@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::compiler::image::{ImageKind, heap_texture_table_type, metal_texture_declaration};
+use remu_shader::ImageViewReinterpretation;
 
 /// The SGPR holding the flagged binding's T#.
 const HEAP_BASE: u32 = 12;
@@ -345,6 +346,7 @@ fn heap_table_msl_type_is_derived_from_the_canonical_image_kind() {
         comparison: false,
         dimension: 2,
         texture_type: 10,
+        view_reinterpretation: ImageViewReinterpretation::Direct,
     };
     assert_eq!(
         metal_texture_declaration(uint_3d_read),
@@ -367,6 +369,7 @@ fn heap_table_msl_type_is_derived_from_the_canonical_image_kind() {
         comparison: false,
         dimension: 3,
         texture_type: 11,
+        view_reinterpretation: ImageViewReinterpretation::Direct,
     };
     assert_eq!(
         metal_texture_declaration(sint_array_write),
@@ -380,6 +383,7 @@ fn heap_table_msl_type_is_derived_from_the_canonical_image_kind() {
         comparison: true,
         dimension: 3,
         texture_type: 11,
+        view_reinterpretation: ImageViewReinterpretation::Direct,
     };
     assert_eq!(
         metal_texture_declaration(comparison_array),

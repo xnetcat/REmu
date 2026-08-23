@@ -240,7 +240,11 @@ fn append_image_range(
     descriptor: super::super::DecodedImageDescriptor,
     byte_count: u64,
 ) -> Result<(), SharedEventDrawReject> {
-    let mut range = DrawFootprintRange::new(kind, descriptor.guest.address, byte_count)?;
+    let span = descriptor.span.ok_or(SharedEventDrawReject::Unresolved)?;
+    if span.len() != byte_count {
+        return Err(SharedEventDrawReject::Unresolved);
+    }
+    let mut range = DrawFootprintRange::new(kind, span.address(), byte_count)?;
     range.image = Some(descriptor);
     ranges.push(range);
     Ok(())
@@ -1682,6 +1686,47 @@ mod tests {
             Err(SharedEventDrawReject::OverlapCopiedGlobal),
             "a writable consumer needs a new ordered copy and cannot alias the retained version"
         );
+    }
+
+    #[test]
+    fn image_footprint_starts_at_the_selected_array_slice() {
+        let mut space = GuestAddressSpace::new(64 * GUEST_PAGE_SIZE).expect("guest address space");
+        let backing = GuestPhysicalBacking::new(20 * GUEST_PAGE_SIZE).expect("array backing");
+        let address = space
+            .map_shared(
+                GuestMapPlacement::Anywhere,
+                20 * GUEST_PAGE_SIZE,
+                GUEST_PAGE_SIZE,
+                GuestProtection::READ_WRITE,
+                &backing,
+                0,
+            )
+            .expect("array mapping")
+            .get();
+        let width = 64_u32;
+        let height = 64_u32;
+        let encoded_width = width - 1;
+        let mut words = [0_u32; 8];
+        words[0] = u32::try_from(address >> 8).expect("low address fits");
+        words[1] = u32::try_from(address >> 40).expect("high address fits")
+            | (130 << 20)
+            | ((encoded_width & 0x3) << 30);
+        words[2] = (encoded_width >> 2) | ((height - 1) << 14);
+        words[3] = 0xfac | (27 << 20) | (13 << 28);
+        words[4] = (3 << 16) | 4;
+        let sampled = decode_image_descriptor_without_diagnostics(&words)
+            .expect("nonzero-base array descriptor");
+        let (_, byte_count) = sampled_texture_raw_range(sampled).expect("selected range");
+        let mut ranges = Vec::new();
+        append_image_range(
+            &mut ranges,
+            DrawFootprintKind::ImageRead,
+            sampled,
+            u64::try_from(byte_count).expect("byte count fits"),
+        )
+        .expect("image footprint");
+        assert_eq!(ranges[0].guest_address, address + 3 * 65_536);
+        assert_eq!(ranges[0].byte_count, 2 * 65_536);
     }
 
     #[test]

@@ -252,7 +252,8 @@ use self::texture::{
     prepare_sampled_texture_upload, rematerialisation_blit_source_origin_y,
     resident_texture_eviction_plan, sampled_texture_cache_accepts,
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
-    sampled_texture_key, snapshot_guest_texture_linear, snapshot_watched_guest_texture_raw,
+    sampled_texture_key, sampled_texture_view_for_binding, snapshot_guest_texture_linear,
+    snapshot_watched_guest_texture_raw,
     watch_guest_texture, write_guest_texture_linear,
 };
 use self::tiling::{
@@ -275,6 +276,8 @@ use self::tiling::{
     mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
     mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
+    copy_linear_to_mode64k_2d_mip_level, copy_mode64k_2d_mip_level_to_linear,
+    mode64k_2d_mip_chain_layout,
 };
 
 #[cfg(test)]
@@ -1811,6 +1814,7 @@ struct SampledTextureKey {
     base_mip_level: u32,
     mip_level_count: u32,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
     comparison: bool,
 }
@@ -1819,6 +1823,7 @@ struct SampledTextureKey {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct DepthArrayKey {
     descriptor: GuestTextureDescriptor,
+    base_array_slice: u32,
     layer_count: u32,
 }
 
@@ -2186,6 +2191,7 @@ impl SharedEventDrawTextureOverride {
             && self.sampled.base_mip_level == sampled.base_mip_level
             && self.sampled.mip_level_count == sampled.mip_level_count
             && self.sampled.texture_type == sampled.texture_type
+            && self.sampled.base_array_slice == sampled.base_array_slice
             && self.sampled.layer_count == sampled.layer_count
     }
 }
@@ -2631,6 +2637,7 @@ struct DecodedImageDescriptor {
     base_mip_level: u32,
     mip_level_count: u32,
     texture_type: u32,
+    base_array_slice: u32,
     layer_count: u32,
 }
 

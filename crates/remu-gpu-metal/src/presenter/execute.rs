@@ -15,7 +15,7 @@ use super::{
     GuestBatchFlushReason, GuestBatchWork, GuestRenderPassKey, GuestScissor,
     GuestTextureDescriptor, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX,
     OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidencyState, ResidentTextureActivityStamp, SharedEventDrawTextureOverride,
+    ResidencyState, ResidentTextureActivityStamp, ResourceSpan, SharedEventDrawTextureOverride,
     SharedEventWriteKind, SpanQueryOrder, StaleSource, append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
@@ -1132,13 +1132,11 @@ impl MetalPresenter {
                 target_resident_descriptors.push(None);
                 texture
             } else {
-                let has_resident_storage = self.resident_guest_textures.values().any(|resident| {
-                    resident.serves_reads()
-                        && guest_texture_descriptors_share_storage(
-                            resident.descriptor,
-                            target.texture,
-                        )
-                });
+                // Decide the attachment load policy only after residency has observed mapping
+                // replacement and restored any B15-demoted GPU authority. The ensure below is too
+                // late: this boolean decides whether DCC bytes are loaded or discarded.
+                let has_resident_storage = self
+                    .render_target_has_live_resident_storage(target.texture, target.span)?;
                 let metadata_clear_pending = consume_color_metadata_clear(
                     &mut self.color_metadata_clears,
                     render_target_cmask_address(target, &draw.context_registers)?,
@@ -1222,12 +1220,17 @@ impl MetalPresenter {
             initial_target_clear_colors.push(Some(MTLClearColor::new(0.0, 0.0, 0.0, 0.0)));
             target_resident_descriptors.push(None);
         }
-        let depth_had_resident_storage = depth.is_some_and(|depth| {
-            self.resident_guest_textures.values().any(|resident| {
-                resident.serves_reads()
-                    && guest_texture_descriptors_share_storage(resident.descriptor, depth.texture)
-            })
-        });
+        let depth_had_resident_storage = if let Some(depth) = depth {
+            self.render_target_has_live_resident_storage(
+                depth.texture,
+                depth
+                    .span
+                    .or_else(|| ResourceSpan::for_texture_layers(depth.texture, depth.layer_count))
+                    .or_else(|| ResourceSpan::for_texture(depth.texture)),
+            )?
+        } else {
+            false
+        };
         let resolved_depth = depth
             .map(|depth| {
                 self.ensure_depth_render_target_texture(&device, depth, render_width, render_height)

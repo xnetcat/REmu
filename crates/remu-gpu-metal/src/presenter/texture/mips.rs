@@ -152,6 +152,7 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         &texture,
         crate::presenter::tiler::GpuTilerView {
             texture_type: 9,
+            base_array_slice: 0,
             layer_count: 1,
             mip_level_count: underlying_mip_count,
         },

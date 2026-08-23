@@ -19,7 +19,7 @@ use super::{
     image_resource_descriptor_is_null, is_storage_image_opcode,
     refresh_resident_texture_write_watch, render_resolve_candidate_matches,
     resident_is_depth_array_face, sampled_alias_descriptor, sampled_texture_raw_range,
-    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
+    sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode64k_2d_mips,
     texture_element_layout, trace_image_descriptors, trace_resident_texture_removal,
     trace_target_sampling, trace_video_target_consumers,
 };
@@ -30,7 +30,7 @@ use metal::{
 };
 use objc::runtime::Object;
 use objc::{msg_send, sel, sel_impl};
-use remu_shader::{ShaderEvaluation, image_is_comparison};
+use remu_shader::{ImageBinding, ImageViewReinterpretation, ShaderEvaluation, image_is_comparison};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -292,6 +292,7 @@ pub(crate) fn sampled_texture_key(
         base_mip_level: descriptor.base_mip_level,
         mip_level_count: descriptor.mip_level_count,
         texture_type: descriptor.texture_type,
+        base_array_slice: descriptor.base_array_slice,
         layer_count: descriptor.layer_count,
         comparison,
     }
@@ -318,6 +319,47 @@ pub(crate) fn sampled_texture_supports_access(texture: &Texture, writable: bool)
         MTLTextureUsage::ShaderRead
     };
     texture.usage().contains(required)
+}
+
+pub(crate) fn sampled_texture_view_for_binding(
+    texture: &Texture,
+    binding: &ImageBinding,
+) -> Result<Texture, String> {
+    if binding.control.dimension != 5 {
+        return Ok(texture.clone());
+    }
+    match binding.view_reinterpretation() {
+        ImageViewReinterpretation::Direct | ImageViewReinterpretation::CubeFacesAsArray => {
+            if texture.texture_type() != MTLTextureType::D2Array {
+                return Err(format!(
+                    "DIM=2D_ARRAY {:?} binding produced non-array Metal texture {:?}",
+                    binding.view_reinterpretation(),
+                    texture.texture_type()
+                ));
+            }
+            Ok(texture.clone())
+        }
+        ImageViewReinterpretation::SingleLayerAsArray => {
+            if texture.texture_type() == MTLTextureType::D2Array {
+                return Ok(texture.clone());
+            }
+            if texture.texture_type() != MTLTextureType::D2 {
+                return Err(format!(
+                    "DIM=2D_ARRAY single-layer view requires a 2D Metal texture, got {:?}",
+                    texture.texture_type()
+                ));
+            }
+            Ok(texture.new_texture_view_from_slice(
+                texture.pixel_format(),
+                MTLTextureType::D2Array,
+                NSRange::new(0, texture.mipmap_level_count()),
+                NSRange::new(0, 1),
+            ))
+        }
+        reinterpretation => Err(format!(
+            "DIM=2D_ARRAY cannot use descriptor view {reinterpretation:?}"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -701,7 +743,11 @@ pub(crate) fn decode_sampled_texture_linear_from_raw(
         ));
     }
     let mut linear = Vec::new();
-    for (surface_z, face) in raw.chunks_exact(face_bytes).enumerate() {
+    for (local_surface_z, face) in raw.chunks_exact(face_bytes).enumerate() {
+        let surface_z = usize::try_from(descriptor.base_array_slice)
+            .map_err(|_| "sampled base array slice does not fit usize")?
+            .checked_add(local_surface_z)
+            .ok_or("sampled surface index overflows")?;
         linear.extend(decode_guest_texture_linear_from_raw_at_z(
             descriptor.guest,
             face,
@@ -749,7 +795,7 @@ pub(crate) fn create_sampled_guest_texture_from_guest_gpu(
         .checked_add(descriptor.mip_level_count.max(1))
         .ok_or("sampled Metal mip range overflows")?;
     let exact_guest_mips = sampled_texture_uses_exact_mode5_mips(descriptor)
-        || sampled_texture_uses_exact_mode27_mips(descriptor);
+        || sampled_texture_uses_exact_mode64k_2d_mips(descriptor);
     let mip_level_count = if exact_guest_mips {
         underlying_mip_level_count
     } else if compressed_texture_block_extent(guest.pixel_format).is_some() {
@@ -793,6 +839,7 @@ pub(crate) fn create_sampled_guest_texture_from_guest_gpu(
     let texture = device.new_texture(&metal_descriptor);
     let view = GpuTilerView {
         texture_type: descriptor.texture_type,
+        base_array_slice: descriptor.base_array_slice,
         layer_count: descriptor.layer_count,
         mip_level_count: if exact_guest_mips { mip_level_count } else { 1 },
     };

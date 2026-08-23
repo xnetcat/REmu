@@ -32,13 +32,15 @@ pub(crate) use self::descriptors::{
 pub(crate) use self::mode5::encode_mode5_mip_chain_into_raw;
 pub(crate) use self::mode5::{decode_mode5_mip_chain_from_raw, mode5_mip_chain_layout};
 pub(crate) use self::mode27::{
-    copy_mode27_mip_level_to_linear, decode_mode27_mip_chain_from_raw,
-    encode_mode27_mip_chain_into_raw, mode27_block_byte_offsets, mode27_mip_chain_layout,
-    mode27_surface_z_xor, mode27_within_block_byte_offset_for_format,
+    copy_mode27_mip_level_to_linear, copy_mode64k_2d_mip_level_to_linear,
+    decode_mode27_mip_chain_from_raw, encode_mode27_mip_chain_into_raw, mode27_block_byte_offsets,
+    mode27_mip_chain_layout, mode27_surface_z_xor, mode27_within_block_byte_offset_for_format,
+    mode64k_2d_mip_chain_layout,
 };
 #[cfg(test)]
 pub(crate) use self::mode27::{
-    mode27_block_dimensions, mode27_source_byte_offset, mode27_within_block_byte_offset,
+    copy_linear_to_mode64k_2d_mip_level, mode27_block_dimensions, mode27_source_byte_offset,
+    mode27_within_block_byte_offset,
 };
 
 pub(super) fn copy_tiled_to_linear_at_z(

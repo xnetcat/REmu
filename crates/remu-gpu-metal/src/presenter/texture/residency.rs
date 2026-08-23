@@ -789,6 +789,58 @@ impl MetalPresenter {
 }
 
 impl MetalPresenter {
+    /// Prepares color-target residency before its DCC/CMASK load policy is selected.
+    ///
+    /// A decoded target can still have an admission-time resident whose guest mapping has since
+    /// been replaced. Its descriptor may be identical to the newly decoded descriptor, so a
+    /// descriptor-only storage check would call it resident even though the Metal allocation
+    /// belongs to the retired backing. Conversely, a B15-demoted target can have current pixels
+    /// recoverable from another allocation and must be rematerialised before first-use DCC logic
+    /// decides to discard them.
+    ///
+    /// Rematerialisation stays in the open Metal batch and transfers `owned`, publication debt,
+    /// and `content_version`; it neither publishes to guest RAM nor advances guest completion.
+    /// `Replaced` remains destructive because the old watch can prove nothing about the new
+    /// mapping. Candidates come from the admission-time complete-span index, with the linear
+    /// fallback retained only for descriptors whose span could not be resolved.
+    pub(crate) fn render_target_has_live_resident_storage(
+        &mut self,
+        descriptor: GuestTextureDescriptor,
+        span: Option<ResourceSpan>,
+    ) -> Result<bool, String> {
+        self.rematerialise_stale_resident_for_read(descriptor)?;
+
+        let candidates = if let Some(span) = span {
+            self.resident_guest_textures
+                .overlapping(&span, SpanQueryOrder::ResidentFirst)
+        } else {
+            self.resident_guest_textures.keys().copied().collect()
+        };
+        let mut has_live_storage = false;
+        for candidate in candidates {
+            let refresh = refresh_resident_texture_write_watch(
+                self.resident_guest_textures
+                    .get_mut(&candidate)
+                    .expect("indexed render-target resident exists"),
+            )?;
+            if refresh == WriteWatchRefresh::Replaced {
+                if let Some(resident) = self.resident_guest_textures.remove(&candidate) {
+                    trace_resident_texture_removal(
+                        "render-target-policy-mapping-replaced",
+                        &resident,
+                    );
+                }
+                continue;
+            }
+            has_live_storage |= guest_texture_descriptors_share_storage(candidate, descriptor)
+                && self
+                    .resident_guest_textures
+                    .get(&candidate)
+                    .is_some_and(ResidentGuestTexture::serves_reads);
+        }
+        Ok(has_live_storage)
+    }
+
     /// Restores a demoted read target from the allocation that currently owns its bytes.
     ///
     /// View reuse is immediate. A copy is appended to the existing guest command buffer after
@@ -1829,6 +1881,7 @@ impl MetalPresenter {
                 base_mip_level: 0,
                 mip_level_count: target.mip_level_count,
                 texture_type: target.texture_type,
+                base_array_slice: 0,
                 layer_count: target.layer_count,
             };
             let promoted = promote_resident_mip_hierarchy(
@@ -2004,6 +2057,7 @@ impl MetalPresenter {
             base_mip_level: 0,
             mip_level_count: 1,
             texture_type: target.texture_type,
+            base_array_slice: 0,
             layer_count: target.layer_count,
         };
         let write_watch = watch_sampled_texture(descriptor)?;
@@ -2269,6 +2323,7 @@ impl MetalPresenter {
             base_mip_level: 0,
             mip_level_count: 1,
             texture_type: DEPTH_ARRAY_TEXTURE_TYPE,
+            base_array_slice: 0,
             layer_count: depth.layer_count,
         };
         let write_watch = watch_sampled_texture(descriptor)?;

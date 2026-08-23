@@ -36,11 +36,12 @@ use super::{
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
     resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
     sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
-    sampled_texture_cache_requires_eviction, snapshot_guest_texture_raw,
-    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
-    upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
+    sampled_texture_cache_requires_eviction, sampled_texture_view_for_binding,
+    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
+    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
+    write_watched_guest_texture_linear,
 };
-use metal::foreign_types::ForeignType;
+use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
     CompileOptions, Device, MTLClearColor, MTLCommandBufferStatus, MTLLoadAction, MTLPixelFormat,
     MTLRegion, MTLResourceOptions, MTLSize, MTLStorageMode, MTLStoreAction, MTLTextureType,
@@ -672,6 +673,7 @@ fn layered_depth_sample_faces_resolve_to_per_face_depth_targets() {
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type: 11,
+        base_array_slice: 0,
         layer_count: 6,
     };
     let face_bytes = guest_texture_byte_count(sampled.guest).expect("face bytes");
@@ -728,6 +730,7 @@ fn layered_depth_sample_requires_every_face_before_skipping_alias_writeback() {
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type: 11,
+        base_array_slice: 0,
         layer_count: 6,
     };
     let faces = (0..sampled.layer_count)
@@ -1959,6 +1962,14 @@ fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
     assert_eq!(fallback.texture_type, 9);
     assert_eq!(fallback.layer_count, 1);
 
+    let mut array_binding = binding.clone();
+    array_binding.control.dimension = 5;
+    array_binding.control.is_array = true;
+    array_binding.control.address_registers = vec![0, 1, 2];
+    let fallback = fallback_image_descriptor(&array_binding).expect("2D-array fallback descriptor");
+    assert_eq!(fallback.texture_type, 13);
+    assert_eq!(fallback.layer_count, 1);
+
     let mut buffer_descriptor = binding.clone();
     buffer_descriptor.pc = 0xc4;
     buffer_descriptor.resource_descriptor =
@@ -1983,6 +1994,67 @@ fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
     buffer_descriptor.resource_descriptor =
         vec![0x804b_9100, 0xc240_0000, 0x021b_c3bf, 0x91b0_03ac].into();
     assert!(sampled_alias_descriptor(&buffer_descriptor).is_some());
+}
+
+#[test]
+fn dim2d_array_over_a_single_layer_descriptor_binds_a_real_array_view() {
+    let device = Device::system_default().expect("Metal device");
+    let descriptor = TextureDescriptor::new();
+    descriptor.set_texture_type(MTLTextureType::D2);
+    descriptor.set_pixel_format(MTLPixelFormat::RGBA8Unorm);
+    descriptor.set_width(4);
+    descriptor.set_height(4);
+    descriptor.set_mipmap_level_count(2);
+    descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let texture = device.new_texture(&descriptor);
+    let binding = ImageBinding {
+        descriptor_index_is_runtime: false,
+        pc: 0x58,
+        opcode: Opcode::Known("ImageSampleD"),
+        control: ImageControl {
+            dmask: 1,
+            vector_address: 0,
+            address_registers: (0..7).collect(),
+            vector_data: 8,
+            scalar_resource: 12,
+            scalar_sampler: 20,
+            dimension: 5,
+            is_array: true,
+            glc: false,
+            slc: false,
+            a16: false,
+            d16: false,
+            unorm: false,
+        },
+        resource_descriptor: vec![1, 0, 0, 9 << 28, 0, 0, 0, 0].into(),
+        sampler_descriptor: vec![0; 4].into(),
+        mip_level: None,
+    };
+
+    let view = sampled_texture_view_for_binding(&texture, &binding)
+        .expect("single-layer 2D descriptor should expose an array view");
+    assert_eq!(view.texture_type(), MTLTextureType::D2Array);
+    assert_eq!(view.array_length(), 1);
+    assert_eq!(view.mipmap_level_count(), 2);
+    assert_eq!(
+        view.parent_texture().expect("array view parent").as_ptr(),
+        texture.as_ptr()
+    );
+
+    let depth_descriptor = TextureDescriptor::new();
+    depth_descriptor.set_texture_type(MTLTextureType::D2);
+    depth_descriptor.set_pixel_format(MTLPixelFormat::Depth32Float);
+    depth_descriptor.set_width(4);
+    depth_descriptor.set_height(4);
+    depth_descriptor.set_usage(MTLTextureUsage::ShaderRead);
+    let depth = device.new_texture(&depth_descriptor);
+    let mut comparison_binding = binding;
+    comparison_binding.opcode = Opcode::Known("ImageSampleCLz");
+    let depth_view = sampled_texture_view_for_binding(&depth, &comparison_binding)
+        .expect("single-layer depth descriptor should expose an array view");
+    assert_eq!(depth_view.texture_type(), MTLTextureType::D2Array);
+    assert_eq!(depth_view.pixel_format(), MTLPixelFormat::Depth32Float);
+    assert_eq!(depth_view.array_length(), 1);
 }
 
 #[test]
@@ -2146,6 +2218,7 @@ fn mode5_sampled_mip_range_covers_the_packed_prefix_and_deferred_base_image() {
         base_mip_level: 0,
         mip_level_count: 10,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
     assert_eq!(
@@ -2185,6 +2258,7 @@ fn mode5_cube_mip_range_uses_one_complete_chain_per_face() {
         base_mip_level: 0,
         mip_level_count: 9,
         texture_type: 11,
+        base_array_slice: 0,
         layer_count: 6,
     };
     let face_bytes = mode5_mip_chain_layout(descriptor.guest, 9)
@@ -3044,6 +3118,7 @@ fn clean_mip_promotion_is_encoded_in_order_and_remains_cpu_owned() {
         base_mip_level: 2,
         mip_level_count: 1,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
 
@@ -4225,6 +4300,7 @@ fn mode27_gpu_detile_reconstructs_nontail_and_mip_tail_levels() {
         base_mip_level: 0,
         mip_level_count: 6,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
     let mip_layout = mode27_mip_chain_layout(mipped, 6).expect("target mip layout");
@@ -4492,6 +4568,7 @@ fn same_address_color_view_survives_partial_owned_supersession() {
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
 
@@ -4540,6 +4617,7 @@ fn same_address_color_view_survives_partial_owned_supersession() {
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
     assert!(
@@ -4586,6 +4664,7 @@ fn same_address_same_format_sample_survives_partial_owned_supersession() {
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
 
@@ -4626,6 +4705,7 @@ fn same_address_same_format_sample_survives_partial_owned_supersession() {
         base_mip_level: 0,
         mip_level_count: 1,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
     assert!(
@@ -5014,6 +5094,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
         base_mip_level: 0,
         mip_level_count: 6,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
     // Residency comes from the hierarchy the guest declares. A single-level descriptor is
@@ -5056,6 +5137,7 @@ fn reuses_a_larger_resident_mip_hierarchy_for_a_smaller_view() {
         base_mip_level: 2,
         mip_level_count: 2,
         texture_type: 9,
+        base_array_slice: 0,
         layer_count: 1,
     };
     let view = super::ensure_mipmapped_resident_texture_in_map(
@@ -5101,6 +5183,7 @@ fn creates_exact_initial_mode27_base_three_and_seven_views() {
             base_mip_level,
             mip_level_count: 1,
             texture_type: 9,
+            base_array_slice: 0,
             layer_count: 1,
         };
         let underlying_mip_count = base_mip_level + 1;
@@ -5796,6 +5879,160 @@ fn cached_overlap_identity_survives_original_virtual_address_rebinding() {
     assert!(
         written_alias.overlaps(&cached),
         "the admission-time identity continues to name the cached physical storage",
+    );
+}
+
+#[test]
+fn render_target_policy_rejects_residency_from_a_replaced_mapping() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let original_backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("original backing");
+    let replacement_backing =
+        GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("replacement backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &original_backing,
+            0,
+        )
+        .expect("original target mapping");
+    let descriptor = GuestTextureDescriptor {
+        address: address.get(),
+        width: 64,
+        height: 64,
+        pitch: 64,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::RGBA8Unorm,
+        bytes_per_pixel: 4,
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, descriptor)
+        .expect("original target resident");
+    assert!(
+        presenter
+            .render_target_has_live_resident_storage(
+                descriptor,
+                ResourceSpan::for_texture(descriptor),
+            )
+            .expect("original policy query")
+    );
+
+    memory
+        .unmap(address, GUEST_PAGE_SIZE)
+        .expect("retire original mapping");
+    memory
+        .map_shared(
+            GuestMapPlacement::Fixed(address),
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &replacement_backing,
+            0,
+        )
+        .expect("replacement target mapping");
+
+    assert!(
+        !presenter
+            .render_target_has_live_resident_storage(
+                descriptor,
+                ResourceSpan::for_texture(descriptor),
+            )
+            .expect("replacement policy query"),
+        "the retired backing must not suppress compressed-target first-use discard",
+    );
+    assert!(
+        !presenter.resident_guest_textures.contains_key(&descriptor),
+        "mapping replacement destroys the old allocation instead of demoting it",
+    );
+}
+
+#[test]
+fn render_target_policy_rematerialises_b15_stale_gpu_authority_before_discard() {
+    use remu_memory::{
+        GUEST_PAGE_SIZE, GuestAddressSpace, GuestMapPlacement, GuestPhysicalBacking,
+        GuestProtection,
+    };
+
+    let mut memory = GuestAddressSpace::new(2 * GUEST_PAGE_SIZE).expect("guest address space");
+    let backing = GuestPhysicalBacking::new(GUEST_PAGE_SIZE).expect("guest backing");
+    let address = memory
+        .map_shared(
+            GuestMapPlacement::Anywhere,
+            GUEST_PAGE_SIZE,
+            GUEST_PAGE_SIZE,
+            GuestProtection::READ_WRITE,
+            &backing,
+            0,
+        )
+        .expect("alias mapping")
+        .get();
+    let source = GuestTextureDescriptor {
+        address,
+        width: 16,
+        height: 16,
+        pitch: 16,
+        tile_mode: 0,
+        pixel_format: MTLPixelFormat::R32Float,
+        bytes_per_pixel: 4,
+    };
+    let target = GuestTextureDescriptor {
+        pixel_format: MTLPixelFormat::R32Uint,
+        ..source
+    };
+
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    // Kill-switch (A1) legacy shared-queue path; delete this pin with that path.
+    presenter.per_queue_guest_batches = false;
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    presenter
+        .ensure_resident_texture(&device, source)
+        .expect("source resident");
+    presenter
+        .ensure_resident_texture(&device, target)
+        .expect("target resident");
+    presenter.mark_resident_texture_written(source);
+    let source_version = presenter.resident_guest_textures[&source].content_version;
+    assert!(matches!(
+        presenter.resident_guest_textures[&target].state,
+        ResidencyState::Stale(StaleSource::Allocation { descriptor, .. }) if descriptor == source
+    ));
+
+    let snapshots_before = TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed);
+    let views_before = OWNED_REMATERIALISE_VIEW.load(AtomicOrdering::Relaxed);
+    assert!(
+        presenter
+            .render_target_has_live_resident_storage(target, ResourceSpan::for_texture(target))
+            .expect("prepare stale target for load policy"),
+        "recoverable GPU authority is resident before DCC policy is selected",
+    );
+    assert_eq!(
+        TEXTURE_SNAPSHOT_COUNT.load(AtomicOrdering::Relaxed),
+        snapshots_before,
+        "pre-policy rematerialisation must not round-trip through guest RAM",
+    );
+    assert_eq!(
+        OWNED_REMATERIALISE_VIEW.load(AtomicOrdering::Relaxed),
+        views_before + 1,
+    );
+    let resident = &presenter.resident_guest_textures[&target];
+    assert!(resident.serves_reads());
+    assert!(resident.gpu_written());
+    assert_eq!(resident.content_version, source_version);
+    assert!(
+        presenter.open_guest_batch.is_none(),
+        "a zero-copy rematerialisation cannot publish guest completion",
     );
 }
 

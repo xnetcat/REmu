@@ -1,6 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+use super::mode27::mode64k_2d_mip_chain_layout;
+use super::mode5::mode5_mip_chain_layout;
 use super::{GuestTextureDescriptor, guest_texture_byte_count};
 use metal::MTLPixelFormat;
 use remu_memory::{GuestSharedMappingIdentity, guest_shared_mapping_identity};
@@ -41,6 +43,89 @@ impl ResourceSpan {
             descriptor.address,
             face.checked_mul(u64::from(layer_count.max(1)))?,
         ))
+    }
+
+    /// Resolves the complete allocation named by a 2D 64K mip hierarchy.
+    pub(crate) fn for_mode64k_2d_mip_chain(
+        descriptor: GuestTextureDescriptor,
+        mip_level_count: u32,
+    ) -> Result<Self, String> {
+        let layout = mode64k_2d_mip_chain_layout(descriptor, mip_level_count)?;
+        let byte_count = u64::try_from(layout.byte_count)
+            .map_err(|_| "64 KiB mip-chain span does not fit u64")?;
+        Ok(Self::new(descriptor.address, byte_count))
+    }
+
+    /// Resolves exactly the guest bytes selected by an image view.
+    ///
+    /// `descriptor.address` remains the allocation base from the SRD. Array/cube views select an
+    /// absolute slice range through `base_array_slice`; their returned span starts at the first
+    /// selected face rather than silently naming the allocation prefix.
+    pub(crate) fn for_image_view(
+        descriptor: GuestTextureDescriptor,
+        base_mip_level: u32,
+        mip_level_count: u32,
+        texture_type: u32,
+        base_array_slice: u32,
+        layer_count: u32,
+    ) -> Result<Option<Self>, String> {
+        let underlying_mip_count = base_mip_level
+            .checked_add(mip_level_count)
+            .ok_or("image underlying mip count overflows")?;
+        let face_byte_count = if underlying_mip_count > 1 && descriptor.tile_mode == 5 {
+            if !matches!(texture_type, 9 | 11 | 13) {
+                return Err(format!(
+                    "exact mode-5 image view requires type 9, 11, or 13, got {texture_type}"
+                ));
+            }
+            u64::try_from(mode5_mip_chain_layout(descriptor, underlying_mip_count)?.byte_count)
+                .map_err(|_| "mode-5 image face byte count does not fit u64")?
+        } else if underlying_mip_count > 1 && matches!(descriptor.tile_mode, 9 | 27) {
+            if texture_type != 9 || layer_count != 1 {
+                return Err(format!(
+                    "mode-{} exact mip layout does not support layered or 3D mip views (type={texture_type} layers={layer_count})",
+                    descriptor.tile_mode,
+                ));
+            }
+            if super::super::metal_uncompressed_bytes_per_pixel(descriptor.pixel_format)
+                != Some(descriptor.bytes_per_pixel)
+            {
+                return Err(format!(
+                    "mode-{} exact mip layout requires an uncompressed Metal format",
+                    descriptor.tile_mode,
+                ));
+            }
+            u64::try_from(mode64k_2d_mip_chain_layout(descriptor, underlying_mip_count)?.byte_count)
+                .map_err(|_| "64 KiB image face byte count does not fit u64")?
+        } else {
+            guest_texture_byte_count(descriptor).ok_or("image face byte count overflows")?
+        };
+        let selected_base = if matches!(texture_type, 11 | 13) {
+            descriptor
+                .address
+                .checked_add(
+                    face_byte_count
+                        .checked_mul(u64::from(base_array_slice))
+                        .ok_or("image base-array byte offset overflows")?,
+                )
+                .ok_or("image selected address overflows")?
+        } else {
+            if base_array_slice != 0 {
+                return Err(format!(
+                    "texture type {texture_type} cannot select base array slice {base_array_slice}"
+                ));
+            }
+            descriptor.address
+        };
+        let selected_faces = if matches!(texture_type, 10 | 11 | 13) {
+            layer_count
+        } else {
+            1
+        };
+        let selected_byte_count = face_byte_count
+            .checked_mul(u64::from(selected_faces))
+            .ok_or("image selected byte count overflows")?;
+        Ok(Some(Self::new(selected_base, selected_byte_count)))
     }
 
     pub(crate) fn new(address: u64, len: u64) -> Self {

@@ -28,6 +28,7 @@ use super::{
     resident_sample_authority_ok, resident_volume_sample_is_eligible,
     resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
     sampled_texture_key, sampled_texture_raw_range, sampled_texture_supports_access,
+    sampled_texture_view_for_binding,
     sampler_uses_normalized_coordinates,
     storage_image_requires_mip_hierarchy, texture_element_layout,
     trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
@@ -645,8 +646,9 @@ pub(crate) fn upload_image_textures(
                 .iter()
                 .find(|retained| retained.matches(descriptor))
             {
+                let texture = sampled_texture_view_for_binding(&retained.texture, binding)?;
                 return Ok(UploadedImageTexture {
-                    texture: retained.texture.clone(),
+                    texture,
                     descriptor,
                     writable: false,
                     selected_resident: None,
@@ -1213,6 +1215,7 @@ pub(crate) fn upload_image_textures(
                     depth_array_textures
                         .get(&DepthArrayKey {
                             descriptor: descriptor.guest,
+                            base_array_slice: descriptor.base_array_slice,
                             layer_count: descriptor.layer_count,
                         })
                         .map(|entry| entry.texture.clone())
@@ -1528,6 +1531,7 @@ pub(crate) fn upload_image_textures(
                     texture
                 }
             };
+            let texture = sampled_texture_view_for_binding(&texture, binding)?;
             Ok(UploadedImageTexture {
                 texture,
                 descriptor,
