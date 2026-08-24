@@ -893,6 +893,7 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
     let _event_guard = GPU_EVENT_SINK_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
     let address = 0x0070_1234_5600_u64;
     let mut state = ProbeDispatchState {
         video_out: targetless_scanout_test_video(address),
@@ -951,6 +952,66 @@ fn direct_video_out_submit_flip_reaches_the_presenter() {
     });
     assert_eq!(delivered, vec![(6, 0xfeed), (1, 0xbeef)]);
     assert!(receiver.try_recv().is_err());
+    remu_gpu::clear_thread_local_event_sink();
+}
+
+#[test]
+fn two_completed_flips_stay_distinct_equeue_events() {
+    let _event_guard = GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
+    let first = 0x0070_1234_5600_u64;
+    let second = 0x0070_1234_6600_u64;
+    let mut video = targetless_scanout_test_video(first);
+    video.display_buffers.push(second);
+    video
+        .display_buffer_attributes
+        .push(video.display_buffer_attributes[0]);
+    let mut state = ProbeDispatchState {
+        video_out: video,
+        ..ProbeDispatchState::default()
+    };
+    state.video_out.flip_events.insert(0x44, 0xfeed);
+    let (sender, receiver) = remu_gpu::gpu_event_channel();
+    remu_gpu::install_thread_local_event_sink(sender);
+
+    assert_eq!(
+        video_out_submit_flip([1, 0, 0, 0x1001, 0, 0], &mut state),
+        0
+    );
+    assert_eq!(
+        video_out_submit_flip([1, 1, 0, 0x1002, 0, 0], &mut state),
+        0
+    );
+    crate::QUEUED_FLIPS.with(|queued| queued.set(0));
+    let _ = receiver.recv().expect("first flip");
+    let _ = receiver.recv().expect("second flip");
+    remu_gpu::record_gpu_flip_completed(remu_gpu::GpuFlipCompletion {
+        address: first,
+        buffer_index: 0,
+        flip_argument: 0x1001,
+    });
+    remu_gpu::record_gpu_flip_completed(remu_gpu::GpuFlipCompletion {
+        address: second,
+        buffer_index: 1,
+        flip_argument: 0x1002,
+    });
+    crate::refresh_completed_video_out_flips(&mut state);
+
+    let delivered = crate::event_state::with_event_state_mut(|events| {
+        events
+            .pending_events
+            .drain(..)
+            .filter(|event| event.equeue == 0x44 && event.ident == 6)
+            .map(|event| event.data)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        delivered,
+        vec![6 | (0x1001_u64 << 16), 6 | (0x1002_u64 << 16),],
+        "two flips must not coalesce into one WaitEqueue return"
+    );
     remu_gpu::clear_thread_local_event_sink();
 }
 

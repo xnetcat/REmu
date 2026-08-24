@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use crate::{
-    ProbeDispatchState, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
-    VIDEO_OUT_ERROR_INVALID_INDEX, VIDEO_OUT_ERROR_INVALID_VALUE, VideoOutBufferAttributes,
-    guest_memset, kernel_process_time, low_i32, low_u32, process_guest_range_is_readable,
-    publish_gpu_event, read_guest_u32, read_guest_u64, sce_kernel_error, signed_i32_return,
-    write_guest_u32, write_guest_u64,
+    KERNEL_EVENT_FILTER_VIDEO_OUT, KernelQueuedEvent, ProbeDispatchState,
+    VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE, VIDEO_OUT_ERROR_INVALID_INDEX,
+    VIDEO_OUT_ERROR_INVALID_VALUE, VideoOutBufferAttributes, guest_memset, kernel_process_time,
+    low_i32, low_u32, process_guest_range_is_readable, publish_gpu_event, read_guest_u32,
+    read_guest_u64, sce_kernel_error, signed_i32_return, write_guest_u32, write_guest_u64,
 };
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -92,7 +92,7 @@ pub(super) const VIDEO_OUT_FALSE: u64 = 0;
 ///
 /// The presenter runs at one fixed mode, so this rate is a property of the emulated display
 /// rather than of the flip cadence a title selects.
-pub(super) const VIDEO_OUT_VBLANK_INTERVAL_MICROSECONDS: u64 = 1_000_000 / 60;
+pub(crate) const VIDEO_OUT_VBLANK_INTERVAL_MICROSECONDS: u64 = 1_000_000 / 60;
 
 /// Nanoseconds in one microsecond, the scale between the two process-time clocks.
 pub(super) const NANOSECONDS_PER_MICROSECOND: u64 = 1_000;
@@ -135,6 +135,75 @@ pub(super) fn video_out_vblank_position() -> (u64, u64) {
     )
 }
 
+/// Reports whether `equeue` is registered for a VideoOut flip or vblank.
+pub(crate) fn equeue_is_display_paced(equeue: u64, state: &ProbeDispatchState) -> bool {
+    state.video_out.vblank_events.contains_key(&equeue)
+        || state.video_out.flip_events.contains_key(&equeue)
+}
+
+/// Consumes the current display-clock tick so a flip-tied vblank is not followed by a second ident=1.
+pub(crate) fn note_flip_coincident_vblank(state: &mut ProbeDispatchState) {
+    let (count, _) = video_out_vblank_position();
+    if count > state.video_out.last_delivered_vblank {
+        state.video_out.last_delivered_vblank = count;
+    }
+}
+
+/// Queues one vblank kernel event per listener when the display clock has advanced.
+///
+/// The console delivers `sceVideoOutAddVblankEvent` at the refresh rate even when no flip
+/// completed. After a hitch the FlipThread is otherwise parked on a vblank that never arrives.
+pub(crate) fn deliver_display_clock_vblanks(
+    state: &mut ProbeDispatchState,
+    events: &mut crate::event_state::EventState,
+) -> bool {
+    if !state.video_out.is_open || state.video_out.vblank_events.is_empty() {
+        return false;
+    }
+    let (count, _) = video_out_vblank_position();
+    if count <= state.video_out.last_delivered_vblank {
+        return false;
+    }
+    let registrations = state
+        .video_out
+        .vblank_events
+        .iter()
+        .map(|(&equeue, &user_data)| (equeue, user_data))
+        .collect::<Vec<_>>();
+    for (equeue, user_data) in registrations {
+        crate::event_state::queue_kernel_event_distinct(
+            events,
+            KernelQueuedEvent {
+                equeue,
+                ident: 1,
+                filter: KERNEL_EVENT_FILTER_VIDEO_OUT,
+                flags: 0,
+                fflags: 0,
+                data: count,
+                user_data,
+                agc_graphics_completions: 0,
+                agc_user_interrupts: 0,
+            },
+        );
+    }
+    state.video_out.last_delivered_vblank = count;
+    true
+}
+
+/// Moves the display clock `elapsed` into the past so tests can observe a vblank without sleeping.
+#[cfg(test)]
+pub(crate) fn video_out_set_display_clock_age(elapsed: Duration) {
+    let clock = VIDEO_OUT_DISPLAY_CLOCK.get_or_init(|| Mutex::new(None));
+    let mut clock = clock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *clock = Some(
+        Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now),
+    );
+}
+
 /// Releases the display port and everything registered against it.
 pub(super) fn video_out_close(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
     if !video_out_port_is_open(arguments[0], state) {
@@ -143,6 +212,7 @@ pub(super) fn video_out_close(arguments: [u64; 6], state: &mut ProbeDispatchStat
     state.video_out.is_open = false;
     state.video_out.flip_events.clear();
     state.video_out.vblank_events.clear();
+    state.video_out.last_delivered_vblank = 0;
     state.video_out.display_buffers.clear();
     state.video_out.display_buffer_attributes.clear();
     video_out_reset_display_clock();

@@ -35,16 +35,16 @@ pub(crate) use self::compile::{
 mod program;
 pub(crate) use self::program::{
     compute_pipeline_key, compute_program_can_split_wave64, effective_global_memory_binding,
-    effective_global_memory_binding_indices,
-    fragmentless_pixel_evaluation, fragmentless_pixel_program,
-    graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, log_wave64_hazard_census,
-    ngg_export_uses_general_lds, ngg_export_uses_wave64_exec, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_interpolation_attribute_mask,
-    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    program_uses_lds, reconcile_pixel_input_controls_with_export_producers,
-    rectangle_coordinate_parameter_mask, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, vertex_parameter_export_mask, wave64_split_blockers,
+    effective_global_memory_binding_indices, fragmentless_pixel_evaluation,
+    fragmentless_pixel_program, graphics_allocated_vector_register_count,
+    image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
+    log_wave64_hazard_census, ngg_export_uses_general_lds, ngg_export_uses_wave64_exec,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    pixel_interpolation_attribute_mask, pixel_scalars, procedural_rectangle_stage_for_draw,
+    program_embeds_global_base, program_uses_lds,
+    reconcile_pixel_input_controls_with_export_producers, rectangle_coordinate_parameter_mask,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal,
+    vertex_parameter_export_mask, wave64_split_blockers,
 };
 
 pub(crate) fn shader_optimization_options() -> remu_shader_metal::ShaderOptimizationOptions {
@@ -133,13 +133,8 @@ mod optimization_policy_tests {
 
     #[test]
     fn feature_rollbacks_are_independent() {
-        let options = shader_optimization_options_from_values(
-            Some("on"),
-            Some("0"),
-            None,
-            Some("0"),
-            None,
-        );
+        let options =
+            shader_optimization_options_from_values(Some("on"), Some("0"), None, Some("0"), None);
         assert!(!options.uniformity);
         assert!(options.licm);
         assert!(!options.descriptor_cache);

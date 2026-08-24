@@ -782,3 +782,123 @@ fn gen5_direct_memory_v2_and_checked_release_preserve_their_distinct_abi() {
         0
     );
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn allocate_main_direct_memory_keeps_eight_gib_after_a_48kib_boot_allocation() {
+    let mut state = ProbeDispatchState::default();
+    let mut first = u64::MAX;
+    assert_eq!(
+        crate::allocate_main_direct_memory(
+            [0xc000, 0x4000, 12, (&raw mut first).addr() as u64, 0, 0],
+            &mut state
+        ),
+        0
+    );
+    assert_eq!(first, 0);
+
+    let mut sixteen_gib = u64::MAX;
+    assert_eq!(
+        crate::allocate_main_direct_memory(
+            [
+                16 * 1024 * 1024 * 1024,
+                0x1_0000,
+                12,
+                (&raw mut sixteen_gib).addr() as u64,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(sixteen_gib, 0x1_0000);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn allocate_main_direct_memory_keeps_sixteen_gib_after_silent_hill_boot_probes() {
+    let mut state = ProbeDispatchState::default();
+    let mut boot = u64::MAX;
+    assert_eq!(
+        crate::allocate_main_direct_memory(
+            [0xc000, 0x4000, 12, (&raw mut boot).addr() as u64, 0, 0],
+            &mut state
+        ),
+        0
+    );
+    assert_eq!(boot, 0);
+
+    let mut probe = u64::MAX;
+    assert_eq!(
+        crate::allocate_main_direct_memory(
+            [
+                0x12c0_0000,
+                0x1_0000,
+                12,
+                (&raw mut probe).addr() as u64,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(probe, 0x1_0000);
+
+    let mut sixteen_gib = u64::MAX;
+    assert_eq!(
+        crate::allocate_main_direct_memory(
+            [
+                16 * 1024 * 1024 * 1024,
+                0x1_0000,
+                12,
+                (&raw mut sixteen_gib).addr() as u64,
+                0,
+                0,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    assert_eq!(sixteen_gib, 0x12c1_0000);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn map_direct_memory_refuses_to_overwrite_the_process_image() {
+    let mut state = ProbeDispatchState::default();
+    state.process_mapping_start = 0x8000_0000;
+    state.process_mapping_end = 0x8010_0000;
+    let mut direct = u64::MAX;
+    assert_eq!(
+        allocate_direct_memory(
+            [
+                0,
+                0x4000,
+                0x4000,
+                0x4000,
+                12,
+                (&raw mut direct).addr() as u64,
+            ],
+            &mut state,
+        ),
+        0
+    );
+    let mut requested = 0x8000_4000_u64;
+    assert_eq!(
+        crate::map_direct_memory(
+            [
+                (&raw mut requested).addr() as u64,
+                0x4000,
+                0x33,
+                0x10,
+                direct,
+                0x4000,
+            ],
+            &mut state,
+        ),
+        sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND)
+    );
+    assert_eq!(requested, 0x8000_4000);
+}

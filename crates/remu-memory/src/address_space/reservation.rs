@@ -10,7 +10,9 @@ use super::shared::{begin_shared_mapping_mutation, unregister_shared_mapping_ran
 use super::{
     AddressSpaceError, GUEST_PAGE_SIZE, RequestedAddress, align_up, host_pointer, host_size,
 };
-use crate::write_watch::{CpuWriteWatch, forget_guest_reservation, publish_guest_reservation};
+use crate::write_watch::{
+    CpuWriteWatch, forget_guest_committed_range, forget_guest_reservation, publish_guest_reservation,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum ReservationKind {
@@ -178,6 +180,7 @@ impl HostReservation {
 impl Drop for HostReservation {
     fn drop(&mut self) {
         forget_guest_reservation(self.address(), self.size as u64);
+        forget_guest_committed_range(self.address(), self.size as u64);
         let _mapping_mutation = begin_shared_mapping_mutation();
         CpuWriteWatch::retire_overlapping(self.address(), self.size as u64);
         unregister_shared_mapping_range(self.address(), self.size as u64);

@@ -627,6 +627,40 @@ impl Program {
         self.linked_transfer_targets.get(&pc).copied()
     }
 
+    /// Dword stride of one ES vertex in the ESGS ring, from the ES half's LDS stores.
+    ///
+    /// GFX10 hardware scales packed GS vertex offsets by `VGT_ESGS_RING_ITEMSIZE`. The ES
+    /// stage still writes one vertex record at `base + immediate`, so the span of those
+    /// immediates is the architectural record size when the context register is missing
+    /// from a draw snapshot. A constant four is not substituted here.
+    #[must_use]
+    pub fn linked_esgs_ring_itemsize_dwords(&self) -> Option<u32> {
+        let mut saw_linked_transfer = false;
+        let mut end_bytes = 0_u32;
+        let mut wrote = false;
+        for instruction in &self.instructions {
+            if self.linked_transfer_target(instruction.pc).is_some() {
+                saw_linked_transfer = true;
+                break;
+            }
+            let Some(InstructionControl::DataShare(share)) = instruction.control.as_ref() else {
+                continue;
+            };
+            if share.gds {
+                continue;
+            }
+            let Some(span) = data_share_write_end_bytes(instruction.opcode, share) else {
+                continue;
+            };
+            wrote = true;
+            end_bytes = end_bytes.max(span);
+        }
+        if !saw_linked_transfer || !wrote {
+            return None;
+        }
+        Some(end_bytes.div_ceil(4).max(1))
+    }
+
     /// Returns the original guest address of an instruction.
     ///
     /// Linked programs use a compact, ascending PC namespace for control-flow analysis. This
@@ -856,6 +890,32 @@ pub fn link_program_continuation(
         &linked.linked_transfer_targets,
     );
     Ok(linked)
+}
+
+fn data_share_write_end_bytes(opcode: Opcode, share: &DataShareControl) -> Option<u32> {
+    match opcode.known_name()? {
+        "DsWriteB8" => Some(share.offset0.saturating_add(1)),
+        "DsWriteB16" => Some(share.offset0.saturating_add(2)),
+        "DsWriteB32" => Some(share.offset0.saturating_add(4)),
+        "DsWriteB64" => Some(share.offset0.saturating_add(8)),
+        "DsWriteB96" => Some(share.offset0.saturating_add(12)),
+        "DsWriteB128" => Some(share.offset0.saturating_add(16)),
+        "DsWrite2B32" => Some(
+            share
+                .offset0
+                .saturating_mul(4)
+                .saturating_add(4)
+                .max(share.offset1.saturating_mul(4).saturating_add(4)),
+        ),
+        "DsWrite2B64" => Some(
+            share
+                .offset0
+                .saturating_mul(8)
+                .saturating_add(8)
+                .max(share.offset1.saturating_mul(8).saturating_add(8)),
+        ),
+        _ => None,
+    }
 }
 
 fn decoded_program_end_address(program: &Program) -> Result<u64, ProgramLinkError> {

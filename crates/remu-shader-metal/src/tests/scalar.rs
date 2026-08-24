@@ -300,7 +300,9 @@ fn lowers_observed_bit_reverse_and_wave32_saveexec_operations() {
         MetalShaderStage::Pixel,
     );
     assert!(
-        saveexec.source.contains("exec ? 0xfffffffffffffffful : 0ul"),
+        saveexec
+            .source
+            .contains("exec ? 0xfffffffffffffffful : 0ul"),
         "fragment saveexec cannot use simd_ballot; a zero ballot restores EXEC empty and discards the quad"
     );
     assert!(!saveexec.source.contains("simd_ballot(exec)"));
@@ -455,11 +457,7 @@ fn fixed_ngg_compatibility_preserves_legacy_shifted_scalar_add_dataflow() {
     let shader = compile_msl(&program, &empty_evaluation(), &options)
         .expect("fixed-NGG shifted scalar add should lower");
 
-    assert!(
-        shader
-            .source
-            .contains("((remu_s_10 << 4) + remu_s_12)")
-    );
+    assert!(shader.source.contains("((remu_s_10 << 4) + remu_s_12)"));
     assert!(!shader.source.contains("((ulong)remu_s_10 << 4)"));
     assert!(!shader.source.contains(">> 32) != 0ul"));
 }

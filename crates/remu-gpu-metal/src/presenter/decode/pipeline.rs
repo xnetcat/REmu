@@ -7,8 +7,8 @@ use super::{
     DEFAULT_CB_BLEND_CONTROL, DEFAULT_PA_SU_SC_MODE_CNTL, DecodedDepthBias, DecodedRasterState,
     DecodedRenderTarget, DepthTargetPipelineState, GE_MAX_OUTPUT_PER_SUBGROUP, GE_NGG_SUBGRP_CNTL,
     GraphicsDiagnosticPipelineState, GraphicsPipelineKey, GraphicsShaderResourceKey,
-    GraphicsWaveState, MetalBlendAttachmentState, NggOutputPrimitiveType, NggSubgroupLimits,
-    PA_CL_VS_OUT_CNTL, PA_CL_VTE_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
+    GraphicsWaveState, GuestTextureDescriptor, MetalBlendAttachmentState, NggOutputPrimitiveType,
+    NggSubgroupLimits, PA_CL_VS_OUT_CNTL, PA_CL_VTE_CNTL, PA_SU_SC_MODE_CNTL, ProgramIdentity,
     RenderTargetPipelineState, SPI_SHADER_COL_FORMAT, UC_GE_CNTL, VGT_ESGS_RING_ITEMSIZE,
     VGT_GS_INSTANCE_CNT, VGT_GS_MAX_VERT_OUT, VGT_GS_ONCHIP_CNTL, VGT_GS_OUT_PRIM_TYPE,
     common_render_target_array_length, decode_depth_target, decode_render_targets,
@@ -24,11 +24,10 @@ use super::{
     diagnostic_video_chain_selected_draw, evaluation_samples_glyph_atlas,
     evaluation_samples_large_linear_video, evaluation_samples_layered_comparison,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
-    graphics_allocated_vector_register_count, image_component_class,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_input_controls,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base, register_value,
-    video_target_binding_summary, GuestTextureDescriptor,
+    graphics_allocated_vector_register_count, image_component_class, is_storage_image_opcode,
+    is_writable_image_opcode, ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
+    ngg_mesh_stage_for_draw, pixel_input_controls, procedural_rectangle_stage_for_draw,
+    program_embeds_global_base, register_value, video_target_binding_summary,
 };
 use metal::{
     MTLBlendFactor, MTLBlendOperation, MTLColorWriteMask, MTLCullMode, MTLPixelFormat,
@@ -268,21 +267,21 @@ pub(crate) const fn ngg_mesh_base_vertex(draw: &IndexedDraw) -> i32 {
     if draw.indexed { draw.base_vertex } else { 0 }
 }
 
-/// Keep the pre-subgroup-allocation fixed wave64 ABI unless the register-sized path is explicitly
-/// requested for development. The fixed ABI is the last verified path for both ordinary primitive
-/// shaders and linked API geometry shaders; selecting the newer path from program linkage left the
-/// two classes with incompatible mesh publication semantics in real titles.
+/// The legacy fixed allocation is selected from the actual fused-program shape. Context GS
+/// registers persist across draws and therefore cannot prove that an ordinary no-GS primitive
+/// shader has a linked API geometry stage. Linked ES/GS must use the register-sized ABI
+/// (GS_ALLOC_REQ, scaled ESGS offsets, compacted PARAM export). Force the old ABI for every
+/// program with `REMU_NGG_LEGACY_FIXED=1`.
 pub(crate) fn ngg_fixed_allocation_fallback_for_program(program: &remu_shader::Program) -> bool {
-    static ENABLE_SUBGROUP_ALLOCATION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLE_SUBGROUP_ALLOCATION.get_or_init(|| {
-        let enabled = std::env::var_os("REMU_NGG_SUBGROUP_ALLOCATION")
-            .is_some_and(|value| value == "1");
-        if !enabled {
+    static FORCE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *FORCE_LEGACY.get_or_init(|| {
+        let forced = std::env::var_os("REMU_NGG_LEGACY_FIXED").is_some_and(|value| value == "1");
+        if forced {
             eprintln!(
-                "[REMu][METAL] using the verified fixed wave64 NGG ABI; set REMU_NGG_SUBGROUP_ALLOCATION=1 to test register-sized allocation"
+                "[REMu][METAL] forcing the pre-subgroup-allocation fixed NGG ABI (REMU_NGG_LEGACY_FIXED=1)"
             );
         }
-        enabled
+        forced
     }) {
         return true;
     }
@@ -1373,7 +1372,7 @@ pub(crate) fn graphics_pipeline_key_from_targets(
                     export_program,
                 ))
             });
-    let ngg_registers = ngg_subgroup_limits
+    let mut ngg_registers = ngg_subgroup_limits
         .map(|_| {
             decode_ngg_registers_from_state(
                 &draw.shader_registers,
@@ -1382,6 +1381,23 @@ pub(crate) fn graphics_pipeline_key_from_targets(
             )
         })
         .transpose()?;
+    if let Some(registers) = ngg_registers.as_mut() {
+        // `PRIMGEN_PASSTHROUGH` lives in the same sticky context state as the GS limits.
+        // A linked ES/GS binary is never the no-GS passthrough ABI; a leftover bit would
+        // refuse lowering after we select the register-sized path from program shape.
+        if export_program.instructions.iter().any(|instruction| {
+            export_program
+                .linked_transfer_target(instruction.pc)
+                .is_some()
+        }) {
+            registers.primgen_passthrough = false;
+        }
+        if registers.esgs_ring_itemsize == 0
+            && let Some(inferred) = export_program.linked_esgs_ring_itemsize_dwords()
+        {
+            registers.esgs_ring_itemsize = inferred;
+        }
+    }
     Ok(GraphicsPipelineKey {
         export_shader_address: draw.export_shader_address,
         pixel_shader_address: draw.pixel_shader_address,

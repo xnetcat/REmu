@@ -30,6 +30,7 @@ pub use compute::{
     ComputeDispatchSource, ComputeGrid, ComputeIndirectDimensions, ComputeIndirectPacket,
     ComputeLaunch, compute_program_address, decode_compute_dispatch_direct,
     decode_compute_dispatch_indirect, decode_compute_launch, decode_compute_system_registers,
+    threadgroups_are_plausible_indirect_snapshot,
 };
 
 mod event;
@@ -81,8 +82,7 @@ mod resource;
 pub use resource::{
     GpuAdapter, GpuColorTarget, GpuHostImage, GpuProbe, GpuProbeError, GpuRegister,
     GpuScanoutTarget, GraphicsApi, IndexSnapshot, IndexSnapshotIdentity, IndexedDraw,
-    ShaderEvaluationSnapshot, ShaderSnapshot,
-    agc_color_attrib2_extent,
+    ShaderEvaluationSnapshot, ShaderSnapshot, agc_color_attrib2_extent,
 };
 
 mod dialog;

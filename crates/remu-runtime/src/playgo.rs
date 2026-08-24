@@ -79,6 +79,17 @@ fn package_chunk_ids(state: &ProbeDispatchState) -> &[u16] {
     }
 }
 
+fn play_go_chunk_is_installed(state: &ProbeDispatchState, chunk_id: u16) -> bool {
+    if state.services.play_go_chunk_ids.is_empty() {
+        // Extracted dumps often lose `playgo-chunkdefs.xml`. The files are still on disk, so every
+        // identifier the title asks about is already present. A parsed manifest keeps the tighter
+        // allow-list so a real unknown chunk still fails.
+        true
+    } else {
+        state.services.play_go_chunk_ids.contains(&chunk_id)
+    }
+}
+
 /// Reports whether PlayGo is initialized, rejecting the double-initialize the ABI forbids.
 pub(crate) fn play_go_initialize(state: &mut ProbeDispatchState) -> u64 {
     if state.services.play_go_initialized {
@@ -162,7 +173,7 @@ fn play_go_entry_query(
     }
     for entry in 0..u64::from(entries) {
         let chunk_id = read_guest_u16(chunk_ids + entry * 2);
-        if !package_chunk_ids(state).contains(&chunk_id) {
+        if !play_go_chunk_is_installed(state, chunk_id) {
             return Err(sce_kernel_error(PLAYGO_ERROR_BAD_CHUNK_ID));
         }
     }

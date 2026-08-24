@@ -62,9 +62,8 @@ use self::decode::{
     metal_nonindexed_vertex_count, metal_primitive_type, ngg_mesh_base_vertex,
     noop_placeholder_cover_draw, prepare_indexed_ngg_indices, prepare_indexed_primitive,
     prepare_ngg_meshlets, prepare_nonindexed_ngg_indices, primitive_restart_index,
-    raw_video_out_texture_descriptor,
-    read_draw_indices, register_value, render_target_cmask_address, render_target_fast_clear_color,
-    sampled_alias_descriptor,
+    raw_video_out_texture_descriptor, read_draw_indices, register_value,
+    render_target_cmask_address, render_target_fast_clear_color, sampled_alias_descriptor,
 };
 #[cfg(test)]
 use self::decode::{
@@ -75,26 +74,24 @@ use self::decode::{
     SPI_PS_INPUT_CNTL_0, VIDEO_OUT_DISPLAY_TILE_MODE, VIDEO_OUT_TILING_MODE_LINEAR,
     VIDEO_OUT_TILING_MODE_TILE, apply_transparent_premultiplied_fill_clear,
     common_render_target_array_length, decode_fast_clear_color, decode_graphics_wave_state,
-    ngg_fixed_allocation_fallback_for_program,
     decode_ngg_registers_from_state, decode_ngg_subgroup_limits,
     decode_ngg_subgroup_limits_with_uc, decode_render_targets_from_registers,
     decode_scanout_target, disabled_metal_blend_attachment, graphics_shader_resource_key,
     initial_depth_clear_value, is_transparent_premultiplied_fill_blend,
-    metal_primitive_topology_class, ngg_fullscreen_cover_draw, pixel_input_controls,
-    raw_video_out_layout_is_linear,
+    metal_primitive_topology_class, ngg_fixed_allocation_fallback_for_program,
+    ngg_fullscreen_cover_draw, pixel_input_controls, raw_video_out_layout_is_linear,
 };
 #[cfg(test)]
 use self::diagnostics::parse_diagnostic_hex_address;
 use self::diagnostics::{
     DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX,
     DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT, DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,
-    DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL,
-    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY,
-    DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX, capture_target_sample_textures,
-    diagnostic_capture_pixel_output, diagnostic_capture_vertex_position,
-    diagnostic_compute_texture_dispatch_is_eligible, diagnostic_context_register_snapshot,
-    diagnostic_disable_blending, diagnostic_disable_culling, diagnostic_disable_depth,
-    diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
+    DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL, DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
+    DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
+    capture_target_sample_textures, diagnostic_capture_pixel_output,
+    diagnostic_capture_vertex_position, diagnostic_compute_texture_dispatch_is_eligible,
+    diagnostic_context_register_snapshot, diagnostic_disable_blending, diagnostic_disable_culling,
+    diagnostic_disable_depth, diagnostic_disable_depth_and_culling, diagnostic_dump_complex_msaa,
     diagnostic_dump_compute_texture_minimum_dispatch, diagnostic_dump_depth_export_shader,
     diagnostic_dump_gbuffer, diagnostic_dump_glyph_draw, diagnostic_dump_shadow_consumer,
     diagnostic_dump_target_address, diagnostic_dump_target_address_range,
@@ -165,11 +162,10 @@ use self::shader::{
     effective_global_memory_binding, effective_global_memory_binding_indices,
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, image_resource_descriptor_is_null,
-    is_storage_image_opcode, is_writable_image_opcode, ngg_memoryless_cover_export_stage,
-    ngg_mesh_export_stage, ngg_mesh_stage_for_draw, pixel_scalars,
-    procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    log_wave64_hazard_census, shader_scalar_metadata_for_registers,
-    validate_compute_launch_for_metal, wave64_split_blockers,
+    is_storage_image_opcode, is_writable_image_opcode, log_wave64_hazard_census,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    pixel_scalars, procedural_rectangle_stage_for_draw, program_embeds_global_base,
+    shader_scalar_metadata_for_registers, validate_compute_launch_for_metal, wave64_split_blockers,
 };
 #[cfg(test)]
 use self::shader::{
@@ -189,15 +185,15 @@ use self::stats::{
     MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT, MIP_UPLOAD_NANOSECONDS, MODE27_DECODE_BYTES,
     MODE27_DECODE_COUNT, MODE27_DECODE_NANOSECONDS, OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE,
     OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD, OWNED_RECLAIM_EXECUTED,
-    OWNED_REMATERIALISE_BLIT,
-    OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED,
-    OWNED_REMATERIALISE_FAILED_CPU_GPU, OWNED_REMATERIALISE_FAILED_LAYOUT,
-    OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
-    OWNED_SUBTRACT_TENANTS_SURVIVED, OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED,
-    PIPELINE_COMPILE_ENQUEUED, PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL,
-    PIPELINE_COMPUTE_GATES, PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS,
-    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, RESIDENT_WRITE_ATTRIBUTION_MISSES,
-    RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
+    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
+    OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
+    OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
+    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
+    OWNED_UNRESOLVED_SPAN, PIPELINE_COMPILE_COMPLETED, PIPELINE_COMPILE_ENQUEUED,
+    PIPELINE_COMPILE_FAILED, PIPELINE_COMPILE_QUEUE_FULL, PIPELINE_COMPUTE_GATES,
+    PIPELINE_DRAW_GATES, RESIDENT_DEPTH_SAMPLE_HITS, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS,
+    RESIDENT_WRITE_ATTRIBUTION_MISSES, RESIDENT_WRITEBACK_DISCARDED,
+    RESIDENT_WRITEBACK_DISCARDED_BYTES, RESIDENT_WRITEBACK_PUBLISHED,
     RESIDENT_WRITEBACK_PUBLISHED_BYTES, SAMPLED_ALIAS_WRITEBACK_BYTES,
     SAMPLED_ALIAS_WRITEBACK_COUNT, SAMPLED_ALIAS_WRITEBACK_NANOSECONDS,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY_EVICTIONS,
@@ -231,10 +227,9 @@ use self::texture::{
     refresh_resident_texture_write_watch, resident_color_view_sample_is_eligible,
     resident_declared_span, resident_depth_sample_is_eligible,
     resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
-    resident_volume_sample_is_eligible,
-    resident_texture_activity_stats,
-    resident_texture_backing_overlap_stats, resident_texture_ownership_stats,
-    resident_texture_raw_byte_count, retire_multisample_textures_overlapping_writeback,
+    resident_texture_activity_stats, resident_texture_backing_overlap_stats,
+    resident_texture_ownership_stats, resident_texture_raw_byte_count,
+    resident_volume_sample_is_eligible, retire_multisample_textures_overlapping_writeback,
     retire_sampled_textures_matching, retire_sampled_textures_overlapping_writeback,
     sampled_texture_raw_range, snapshot_guest_texture_raw, snapshot_watched_guest_range,
     storage_image_requires_mip_hierarchy, trace_resident_texture_removal, upload_image_textures,
@@ -253,8 +248,7 @@ use self::texture::{
     resident_texture_eviction_plan, sampled_texture_cache_accepts,
     sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
     sampled_texture_key, sampled_texture_view_for_binding, snapshot_guest_texture_linear,
-    snapshot_watched_guest_texture_raw,
-    watch_guest_texture, write_guest_texture_linear,
+    snapshot_watched_guest_texture_raw, watch_guest_texture, write_guest_texture_linear,
 };
 use self::tiling::{
     ResourceSpan, copy_linear_to_tiled_at_z, copy_mode27_mip_level_to_linear,
@@ -272,11 +266,11 @@ use self::tiling::{
 };
 #[cfg(test)]
 use self::tiling::{
+    copy_linear_to_mode64k_2d_mip_level, copy_mode64k_2d_mip_level_to_linear,
     encode_mode5_mip_chain_into_raw, guest_texture_descriptors_share_component_reordered_storage,
     mode5_within_block_byte_offset, mode9_within_block_byte_offset,
     mode24_within_block_byte_offset_for_format, mode27_block_dimensions, mode27_source_byte_offset,
     mode27_within_block_byte_offset, mode27_within_block_byte_offset_for_format,
-    copy_linear_to_mode64k_2d_mip_level, copy_mode64k_2d_mip_level_to_linear,
     mode64k_2d_mip_chain_layout,
 };
 
@@ -348,7 +342,7 @@ const DEFAULT_SAMPLED_TEXTURE_CACHE_MIB: u64 = 1_536;
 /// Unlike the sampled-image cache, pressure eviction of a GPU-owned resident first downloads and
 /// retiles its exact contents into guest memory. This is a cache budget, not a correctness cap.
 const MAX_RESIDENT_TEXTURE_EVICTIONS_PER_FLIP: usize = 32;
-const DEFAULT_SHADER_COMPILER_WORKER_COUNT: usize = 4;
+const DEFAULT_SHADER_COMPILER_WORKER_COUNT: usize = 8;
 const METAL_TEXTURE_BUFFER_ROW_ALIGNMENT: u64 = 256;
 const NGG_MESHLET_BUFFER_INDEX: u64 = 29;
 const NGG_MESH_DRAW_BUFFER_INDEX: u64 = 30;

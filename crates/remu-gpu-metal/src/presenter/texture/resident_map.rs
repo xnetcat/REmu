@@ -262,10 +262,7 @@ impl ResidentTextureMap {
         }
     }
 
-    fn remove(
-        &mut self,
-        descriptor: &GuestTextureDescriptor,
-    ) -> Option<ResidentGuestTexture> {
+    fn remove(&mut self, descriptor: &GuestTextureDescriptor) -> Option<ResidentGuestTexture> {
         self.index.remove(descriptor);
         self.textures.remove(descriptor)
     }

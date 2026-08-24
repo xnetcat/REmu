@@ -18,6 +18,10 @@ use super::page::{align_down, host_page_size_infallible, initialize_host_page_si
 use super::snapshot::{ACTIVE_HANDLERS, WATCH_SNAPSHOT};
 
 static RECOVERED_DISARMED_FAULTS: AtomicU64 = AtomicU64::new(0);
+static FAULT_TRACE_COUNT: AtomicU64 = AtomicU64::new(0);
+static HANDLED_STORM_PC: AtomicU64 = AtomicU64::new(0);
+static HANDLED_STORM_STREAK: AtomicU64 = AtomicU64::new(0);
+const HANDLED_STORM_DEMOTE_AFTER: u64 = 16;
 
 /// Fills a guest page with a producer's (GPU) bytes so a faulting guest read observes them.
 ///
@@ -315,6 +319,7 @@ extern "C" fn write_fault_signal_handler(
     }
     // SAFETY: SA_SIGINFO supplies a live ucontext_t (or null) for the duration of this callback.
     let access = unsafe { fault_access(context) };
+    trace_fault(b"enter", fault_address, context);
     let handled = try_handle_write_fault(fault_address, access, || {
         // SAFETY: SA_SIGINFO supplies a live ucontext_t for the duration of this callback.
         let (program_counter, registers) = unsafe { fault_machine_state(context) };
@@ -335,8 +340,10 @@ extern "C" fn write_fault_signal_handler(
     });
     ACTIVE_HANDLERS.fetch_sub(1, Ordering::SeqCst);
     if handled {
+        trace_fault(b"handled", fault_address, context);
         return;
     }
+    trace_fault(b"declined", fault_address, context);
     // Phase 1F: wire unrecovered faults to installed guest exception handlers (Unity / Orbis
     // InstallExceptionHandler) with Darwin→Orbis ucontext translation, before the host crash path.
     if let Some(delivery) = guest_fault_delivery_handler() {
@@ -377,6 +384,21 @@ fn try_handle_write_fault(
         write_fault_diagnostic(state(), FaultReason::Unwatched);
         return false;
     }
+    // The 8 TiB guest pin is one PROT_NONE VM object. `mprotect` of a never-`MAP_FIXED`
+    // hole — even when `mincore` reports it resident — stalls the faulting thread
+    // (run `20260823T124624Z`, ~183s of presents then 0 FPS). Only `MAP_FIXED` 0x7X /
+    // 8 TiB-class islands are safe. Ordinary 0x80 GPU watches and host test mappings stay
+    // on the make-writable path. PROT_NONE read-watch test pages are not in the guest
+    // reservation, so they still materialize.
+    let has_read_watch_owner = has_page
+        && snapshot.owners(page_address).any(|owner| {
+            // SAFETY: the snapshot pins the range allocation referenced by its owner.
+            unsafe { (*owner.range).read_watch }
+        });
+    if should_skip_reservation_watch_mprotect(page_address, has_read_watch_owner) {
+        write_fault_diagnostic(state(), FaultReason::NotResident);
+        return false;
+    }
     let has_armed_owner = has_page
         && snapshot.owners(page_address).any(|owner| {
             // SAFETY: the snapshot pins all range allocations referenced by its owners.
@@ -412,6 +434,18 @@ fn try_handle_write_fault(
         return materialize_read_watch_page(snapshot, page_address, address, length, &state);
     }
 
+    // Name 0x7X / PoolInfo `mprotect`s before they can stall. The last hang had no TRACE
+    // because the count was already past the rate limit (`20260823T124624Z`).
+    if is_unreal_heap_bank(page_address) || is_eight_tib_class_address(page_address) {
+        let (report, _) = state();
+        let mut buffer = DiagnosticBuffer::new();
+        buffer.push_bytes(b"[REMu][WATCH] pin-mprotect addr=");
+        buffer.push_hexadecimal(fault_address);
+        buffer.push_bytes(b" pc=");
+        buffer.push_hexadecimal(report.program_counter);
+        buffer.push_bytes(b"\n");
+        write_signal_diagnostic_bytes(buffer.as_slice());
+    }
     // SAFETY: all page owners registered this live mapping. This is the exact protected host page.
     if unsafe {
         libc::mprotect(
@@ -476,6 +510,7 @@ fn try_handle_write_fault(
             );
         }
     }
+    demote_repeated_watch_fault(snapshot, page_address, &state);
     true
 }
 
@@ -944,14 +979,149 @@ impl MachineContext {
 
 fn write_signal_diagnostic_bytes(message: &[u8]) {
     // SAFETY: `write` is async-signal-safe, and the static byte slice remains live throughout the
-    // call. Ignore short writes because this is a last-chance crash diagnostic.
+    // call. Ignore short writes because this is a last-chance crash diagnostic. The preserved
+    // real stderr is required: fd 2 is a 64 KiB async pipe, and a blocking write from this
+    // handler wedges the guest thread that took the fault (RenderThread) with no WATCH line.
     unsafe {
         libc::write(
-            libc::STDERR_FILENO,
+            crate::crash_output_fd(),
             message.as_ptr().cast::<c_void>(),
             message.len(),
         );
     }
+}
+
+fn is_unreal_heap_bank(address: u64) -> bool {
+    (0x70..=0x7f).contains(&(address >> 32))
+}
+
+/// The Silent Hill 8 TiB pin (`0x7000000000` + 8 TiB). Not every published guest
+/// reservation: test address spaces also call `publish_guest_reservation`, and those
+/// PROT_NONE read-watch pages must still take the make-writable path.
+const EIGHT_TIB_PIN_START: u64 = 0x0000_0070_0000_0000;
+const EIGHT_TIB_PIN_END: u64 = 0x0000_0870_0000_0000;
+
+fn is_eight_tib_pin_address(address: u64) -> bool {
+    (EIGHT_TIB_PIN_START..EIGHT_TIB_PIN_END).contains(&address)
+}
+
+/// True when `mprotect` of this snapshot hit would lock the 8 TiB guest pin.
+///
+/// `0x71` leftover PoolInfo is never a live island. Other 0x7X / 8 TiB-class pages
+/// are skipped unless `MapDirectMemory` published a `MAP_FIXED` island — `mincore`
+/// can report a pin hole as resident. Uncommitted 0x80 pin holes still use `mincore`
+/// so GPU watches keep the make-writable path.
+fn should_skip_reservation_watch_mprotect(page_address: u64, has_read_watch_owner: bool) -> bool {
+    if (page_address >> 32) == 0x71 {
+        return true;
+    }
+    if has_read_watch_owner {
+        return false;
+    }
+    if is_unreal_heap_bank(page_address) || is_eight_tib_class_address(page_address) {
+        return !super::guest_space::guest_page_is_committed(page_address);
+    }
+    if page_is_resident(page_address) {
+        return false;
+    }
+    is_eight_tib_pin_address(page_address)
+}
+
+fn is_eight_tib_class_address(address: u64) -> bool {
+    address != 0 && (address >> 40) == 0x8
+}
+
+fn page_is_resident(page_address: u64) -> bool {
+    let page_size = host_page_size_infallible();
+    let Ok(length) = usize::try_from(page_size) else {
+        return false;
+    };
+    if length == 0 {
+        return false;
+    }
+    let mut status = 0_i8;
+    // SAFETY: `mincore` only reports residency; a never-committed reservation page or a hole
+    // returns false / ENOMEM instead of inventing a mapping.
+    unsafe {
+        libc::mincore(
+            page_address as usize as *mut c_void,
+            length,
+            &raw mut status,
+        ) == 0
+            && status & 1 != 0
+    }
+}
+
+fn trace_fault(stage: &[u8], fault_address: u64, context: *mut c_void) {
+    let count = FAULT_TRACE_COUNT.fetch_add(1, Ordering::Relaxed);
+    // SAFETY: SA_SIGINFO supplies a live ucontext, or null; `fault_machine_state` tolerates null.
+    let (program_counter, registers) = unsafe { fault_machine_state(context) };
+    // RenderThread dies on `mov rdi,[r12+8]` at this PC with no rate-limited breadcrumb.
+    const RENDER_THREAD_THIS_LOAD: u64 = 0x0000_0008_025E_D3E2;
+    if count >= 32 && count & 255 != 0 && program_counter != RENDER_THREAD_THIS_LOAD {
+        return;
+    }
+    let mut buffer = DiagnosticBuffer::new();
+    buffer.push_bytes(b"[REMu][WATCH][TRACE] ");
+    buffer.push_bytes(stage);
+    buffer.push_bytes(b" n=");
+    buffer.push_signed(count.try_into().unwrap_or(i64::MAX));
+    buffer.push_bytes(b" addr=");
+    buffer.push_hexadecimal(fault_address);
+    buffer.push_bytes(b" pc=");
+    buffer.push_hexadecimal(program_counter);
+    if let Some(registers) = registers.as_ref() {
+        for name in [b"r12" as &[u8], b"rax", b"rdi", b"rsi"] {
+            if let Some(register) = registers.iter().find(|register| register.name == name) {
+                buffer.push_bytes(b" ");
+                buffer.push_bytes(register.name);
+                buffer.push_bytes(b"=");
+                buffer.push_hexadecimal(register.value);
+            }
+        }
+    }
+    buffer.push_bytes(b"\n");
+    write_signal_diagnostic_bytes(buffer.as_slice());
+}
+
+fn demote_repeated_watch_fault(
+    snapshot: &super::snapshot::WatchSnapshot,
+    page_address: u64,
+    state: &impl Fn() -> FaultState,
+) {
+    let (report, _) = state();
+    // A SIMD memcpy through a write-watched command buffer faults once per page at the same
+    // store PC. Keying the streak on the page as well never reached the demote threshold.
+    let same_pc = HANDLED_STORM_PC.load(Ordering::Relaxed) == report.program_counter
+        && report.program_counter != 0;
+    let streak = if same_pc {
+        HANDLED_STORM_STREAK.fetch_add(1, Ordering::Relaxed) + 1
+    } else {
+        HANDLED_STORM_PC.store(report.program_counter, Ordering::Relaxed);
+        HANDLED_STORM_STREAK.store(1, Ordering::Relaxed);
+        1
+    };
+    if streak < HANDLED_STORM_DEMOTE_AFTER || (streak > HANDLED_STORM_DEMOTE_AFTER && streak & 255 != 0)
+    {
+        return;
+    }
+    for owner in snapshot.owners(page_address) {
+        // SAFETY: the snapshot pins the range for the duration of this handler.
+        let range = unsafe { &*owner.range };
+        range.demoted.store(true, Ordering::Release);
+        range.pages[owner.page_index]
+            .armed
+            .store(false, Ordering::Release);
+    }
+    let mut buffer = DiagnosticBuffer::new();
+    buffer.push_bytes(b"[REMu][WATCH] demoted repeated watch fault streak=");
+    buffer.push_signed(streak.try_into().unwrap_or(i64::MAX));
+    buffer.push_bytes(b" addr=");
+    buffer.push_hexadecimal(report.address);
+    buffer.push_bytes(b" pc=");
+    buffer.push_hexadecimal(report.program_counter);
+    buffer.push_bytes(b"\n");
+    write_signal_diagnostic_bytes(buffer.as_slice());
 }
 
 /// # Safety
@@ -998,8 +1168,9 @@ unsafe fn chain_previous_action(
 mod stack_diagnostic_tests {
     use super::{
         StackDiagnosticWindow, copy_process_bytes, initialize_diagnostic_copy_pipe,
-        stack_diagnostic_window,
+        page_is_resident, stack_diagnostic_window,
     };
+    use super::super::page::initialize_host_page_size;
 
     #[test]
     fn centers_the_demons_souls_stack_window_without_crossing_its_page() {
@@ -1039,5 +1210,76 @@ mod stack_diagnostic_tests {
         let mut refused = [0_u8; 8];
         assert!(!copy_process_bytes(1, &mut refused));
         assert_eq!(refused, [0; 8]);
+    }
+
+    #[test]
+    fn mincore_reports_a_live_page_and_rejects_an_unmapped_hole() {
+        initialize_host_page_size().expect("host page geometry");
+        let length = 16 * 1024;
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mapping, libc::MAP_FAILED);
+        unsafe { mapping.cast::<u8>().write_volatile(1) };
+        assert!(page_is_resident(mapping.addr() as u64));
+        unsafe { libc::munmap(mapping, length) };
+        assert!(!page_is_resident(0x0076_a0f4_c000));
+        assert!(super::is_unreal_heap_bank(0x0076_a0f4_c000));
+        assert!(super::is_unreal_heap_bank(0x0075_a0fa_c000));
+        assert!(!super::is_unreal_heap_bank(0x0000_0080_0593_0000));
+        assert!(!super::is_unreal_heap_bank(0x0000_0efc_1000_0000));
+        assert!(!super::is_unreal_heap_bank(mapping.addr() as u64));
+        assert!(super::should_skip_reservation_watch_mprotect(
+            0x0076_a0f4_c000,
+            false
+        ));
+        assert!(!super::should_skip_reservation_watch_mprotect(
+            0x0076_a0f4_c000,
+            true
+        ));
+        assert!(super::is_eight_tib_pin_address(0x0000_0807_6ee0_4800));
+        assert!(super::is_eight_tib_class_address(0x0000_0807_6ee0_4800));
+        assert!(super::should_skip_reservation_watch_mprotect(
+            0x0000_0807_6ee0_4800,
+            false
+        ));
+        assert!(super::should_skip_reservation_watch_mprotect(
+            0x7100_0000_99,
+            false
+        ));
+        crate::publish_guest_committed_range(0x0075_00e0_0000, 0x1_0000);
+        assert!(!super::should_skip_reservation_watch_mprotect(
+            0x0075_00e0_0000,
+            false
+        ));
+        crate::write_watch::forget_guest_committed_range(0x0075_00e0_0000, 0x1_0000);
+        assert!(super::should_skip_reservation_watch_mprotect(
+            0x0075_00e0_0000,
+            false
+        ));
+        assert!(!super::is_eight_tib_pin_address(0x0000_0008_0444_5000));
+        assert!(!super::should_skip_reservation_watch_mprotect(
+            0x0000_0008_0444_5000,
+            false
+        ));
+        // Uncommitted 0x80 pin holes skip; MapDirectMemory islands stay on mprotect.
+        assert!(!super::is_unreal_heap_bank(0x0000_0080_0593_0000));
+        assert!(!super::is_eight_tib_class_address(0x0000_0080_0593_0000));
+        assert!(super::is_eight_tib_pin_address(0x0000_0080_0593_0000));
+        assert!(super::should_skip_reservation_watch_mprotect(
+            0x0000_0080_0593_0000,
+            false
+        ));
+        assert!(!super::should_skip_reservation_watch_mprotect(
+            mapping.addr() as u64,
+            false
+        ));
     }
 }

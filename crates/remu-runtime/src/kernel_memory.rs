@@ -13,6 +13,15 @@ use remu_memory::{
 use thiserror::Error;
 
 pub(super) const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
+/// Extra physical pages past the advertised 16 GiB.
+///
+/// `sceKernelGetDirectMemorySize` still reports [`DIRECT_MEMORY_SIZE`]. Titles take that figure
+/// as their first `sceKernelAllocateMainDirectMemory` request. Silent Hill's CRT and Unreal boot
+/// probes already occupy ~300 MiB before that call, so a pool that is exactly 16 GiB can never
+/// satisfy a 16 GiB request. The slack is only visible to the allocator's search window; it is
+/// not added to the size the guest reads.
+pub(super) const DIRECT_MEMORY_SLACK: u64 = 1024 * 1024 * 1024;
+pub(super) const DIRECT_MEMORY_CAPACITY: u64 = DIRECT_MEMORY_SIZE + DIRECT_MEMORY_SLACK;
 /// Size of the flexible-memory pool the guest may map without owning direct memory.
 ///
 /// Flexible memory is a separate, much smaller budget than direct memory: the kernel commits it
@@ -21,14 +30,25 @@ pub(super) const DIRECT_MEMORY_SIZE: u64 = 16 * 1024 * 1024 * 1024;
 /// pair. A title may override its own budget through `mem_param->flexible_memory_size` in its
 /// process parameters; that override is not read yet, and no title exercised here sets it.
 pub(super) const FLEXIBLE_MEMORY_SIZE: u64 = 448 * 1024 * 1024;
-/// Size of the managed guest virtual address space.
+/// One tebibyte of address space. Used when the preferred 8 TiB pin cannot be placed.
+const VIRTUAL_MEMORY_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
+/// Preferred size of the managed guest virtual address space.
 ///
 /// This is address space, not memory: the host reservation is one `PROT_NONE` mapping and pages
-/// are committed only when the guest maps them. Console user address space spans roughly a
-/// terabyte, and engines reserve very large sparse ranges up front — Unreal reserves hundreds of
-/// gigabytes for its virtual-memory allocator before committing any of it — so a space sized for
-/// expected residency instead of the architectural range fails those reservations.
-const VIRTUAL_MEMORY_SIZE: u64 = 1024 * 1024 * 1024 * 1024;
+/// are committed only when the guest maps them. Unreal reserves hundreds of gigabytes at
+/// `0x7000000000` and then also forms PoolInfo page pointers in the 8 TiB class
+/// (`0x08 << 40 | offset`, e.g. `0x8076ee04800`). A 1 TiB pin that ends at `0x17000000000`
+/// leaves those pointers in host space, so `mov edx, [r12+rbx*4]` dies as `space=host`. Eight
+/// tebibytes from the same base covers that window; the 1 TiB size remains the fallback.
+const VIRTUAL_MEMORY_PREFERRED_SIZE: u64 = 8 * VIRTUAL_MEMORY_SIZE;
+/// Preferred base of the managed guest virtual address space.
+///
+/// Unreal (and other Gen5 engines) print and then hard-code a VA window beginning at
+/// `0x7000000000`. A host-selected `mmap` can land the reservation anywhere; a title that then
+/// `MAP_FIXED`s or mprotects the printed window faults in host memory. Pinning puts that window
+/// inside the managed space. The process image lives at [`remu_memory::PS5_MAIN_IMAGE_BASE`]
+/// (32 GiB) and does not overlap this range.
+pub(super) const PS5_LARGE_VA_BASE: u64 = 0x0000_0070_0000_0000;
 
 #[derive(Debug, Error)]
 pub(super) enum KernelMemoryError {
@@ -97,7 +117,7 @@ struct DirectMemory {
 impl DirectMemory {
     fn new() -> Result<Self, AddressSpaceError> {
         Ok(Self {
-            backing: GuestPhysicalBacking::new(DIRECT_MEMORY_SIZE)?,
+            backing: GuestPhysicalBacking::new(DIRECT_MEMORY_CAPACITY)?,
             allocations: BTreeMap::new(),
         })
     }
@@ -198,7 +218,7 @@ impl DirectMemory {
         let end = start
             .checked_add(size)
             .ok_or(KernelMemoryError::DirectMemoryOverflow { start, size })?;
-        if end > DIRECT_MEMORY_SIZE {
+        if end > DIRECT_MEMORY_CAPACITY {
             return Err(KernelMemoryError::DirectMemoryNotAllocated { start, end });
         }
         let mut cursor = start;
@@ -293,6 +313,21 @@ fn larger_aligned_span(
     }
 }
 
+fn allocate_virtual_memory() -> Result<GuestAddressSpace, KernelMemoryError> {
+    for size in [VIRTUAL_MEMORY_PREFERRED_SIZE, VIRTUAL_MEMORY_SIZE] {
+        match GuestAddressSpace::new_at(GuestAddress::new(PS5_LARGE_VA_BASE), size) {
+            Ok(space) => return Ok(space),
+            Err(error) => {
+                eprintln!(
+                    "[REMu][VM] pinned kernel space size={size:#x} at {PS5_LARGE_VA_BASE:#x} failed ({error})"
+                );
+            }
+        }
+    }
+    eprintln!("[REMu][VM] falling back to a 1 TiB kernel space anywhere");
+    Ok(GuestAddressSpace::new(VIRTUAL_MEMORY_SIZE)?)
+}
+
 #[derive(Debug)]
 pub(super) struct KernelMemory {
     virtual_memory: GuestAddressSpace,
@@ -302,9 +337,13 @@ pub(super) struct KernelMemory {
 impl KernelMemory {
     pub fn new() -> Result<Self, KernelMemoryError> {
         Ok(Self {
-            virtual_memory: GuestAddressSpace::new(VIRTUAL_MEMORY_SIZE)?,
+            virtual_memory: allocate_virtual_memory()?,
             direct_memory: DirectMemory::new()?,
         })
+    }
+
+    pub fn virtual_bounds(&self) -> (GuestAddress, GuestAddress) {
+        (self.virtual_memory.base(), self.virtual_memory.end())
     }
 
     #[cfg(test)]
@@ -430,6 +469,16 @@ impl KernelMemory {
     ) -> Option<(u64, u64)> {
         self.direct_memory
             .available(search_start, search_end, alignment)
+    }
+
+    /// Occupied direct-memory spans as `start:end` pairs, for allocate-failure diagnostics.
+    pub fn direct_allocation_spans(&self) -> String {
+        self.direct_memory
+            .allocations
+            .values()
+            .map(|allocation| format!("{:#x}..{:#x}", allocation.start, allocation.end))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     pub fn query_direct(&self, offset: u64, find_next: bool) -> Option<KernelDirectAllocation> {
@@ -710,6 +759,18 @@ mod tests {
     }
 
     #[test]
+    fn kernel_space_is_page_aligned_and_covers_the_unreal_window_when_pinned() {
+        let memory = KernelMemory::new().unwrap();
+        let (base, end) = memory.virtual_bounds();
+        let size = end.get() - base.get();
+        assert!(size >= VIRTUAL_MEMORY_SIZE);
+        assert_eq!(size % GUEST_PAGE_SIZE, 0);
+        if base.get() == PS5_LARGE_VA_BASE && size >= VIRTUAL_MEMORY_PREFERRED_SIZE {
+            assert!(memory.contains_virtual_address(GuestAddress::new(0x0000_0807_6ee0_4800)));
+        }
+    }
+
+    #[test]
     fn physical_allocator_is_deterministic_and_release_splits_ranges() {
         let mut memory = KernelMemory::new().unwrap();
         let first = memory
@@ -806,6 +867,61 @@ mod tests {
                 .allocate_direct(start, start + size, size, ALIGNMENT, 12)
                 .unwrap(),
             start
+        );
+    }
+
+    #[test]
+    fn a_small_low_allocation_does_not_exhaust_an_eight_gib_request() {
+        let mut memory = KernelMemory::new().unwrap();
+        // Silent Hill's boot sequence: 48 KiB at the base, then a binary search that starts at
+        // the full 16 GiB pool and halves. The 16 GiB request cannot fit beside the 48 KiB
+        // block; every smaller power of two must.
+        let tracking = memory
+            .allocate_direct(0, DIRECT_MEMORY_SIZE, 0xc000, 0x4000, 12)
+            .unwrap();
+        assert_eq!(tracking, 0);
+        assert!(
+            memory
+                .allocate_direct(0, DIRECT_MEMORY_SIZE, DIRECT_MEMORY_SIZE, 0x1_0000, 12)
+                .is_err()
+        );
+        let eight_gib = 8 * 1024 * 1024 * 1024;
+        assert_eq!(
+            memory
+                .allocate_direct(0, DIRECT_MEMORY_SIZE, eight_gib, 0x1_0000, 12)
+                .unwrap(),
+            0x1_0000
+        );
+    }
+
+    #[test]
+    fn advertised_sixteen_gib_fits_after_silent_hill_boot_probes() {
+        let mut memory = KernelMemory::new().unwrap();
+        // Live Silent Hill boot: 48 KiB, then a 300 MiB probe, then a request for the
+        // advertised 16 GiB. That request has to search the slack-extended capacity;
+        // the 16 GiB advertised window alone cannot hold it.
+        assert_eq!(
+            memory
+                .allocate_direct(0, DIRECT_MEMORY_CAPACITY, 0xc000, 0x4000, 12)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            memory
+                .allocate_direct(0, DIRECT_MEMORY_CAPACITY, 0x12c0_0000, 0x1_0000, 12)
+                .unwrap(),
+            0x1_0000
+        );
+        assert!(
+            memory
+                .allocate_direct(0, DIRECT_MEMORY_SIZE, DIRECT_MEMORY_SIZE, 0x1_0000, 12)
+                .is_err()
+        );
+        assert_eq!(
+            memory
+                .allocate_direct(0, DIRECT_MEMORY_CAPACITY, DIRECT_MEMORY_SIZE, 0x1_0000, 12)
+                .unwrap(),
+            0x12c1_0000
         );
     }
 

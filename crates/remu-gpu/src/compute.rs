@@ -55,6 +55,32 @@ pub enum ComputeGrid {
     Threads([u64; 3]),
 }
 
+/// Largest per-axis workgroup count treated as a CPU-fetched `DISPATCH_INDIRECT` snapshot.
+///
+/// Packet-time reads that still hold recycled heap bytes or color-target pixels decode as
+/// ~2^31-class counts. Baking those into Metal parks the command buffer and starves later
+/// `RELEASE_MEM` labels (Silent Hill PPSA10112 seq 9178/9179). A live GPU producer is still
+/// forwarded; this bound only decides whether the packet-time dwords themselves are safe.
+pub const MAX_PLAUSIBLE_INDIRECT_SNAPSHOT_GROUPS_PER_AXIS: u32 = 1 << 24;
+
+/// Largest workgroup product treated as a CPU-fetched `DISPATCH_INDIRECT` snapshot.
+pub const MAX_PLAUSIBLE_INDIRECT_SNAPSHOT_GROUP_PRODUCT: u64 = 1 << 24;
+
+/// Reports whether packet-time threadgroup counts look like a real command-processor fetch.
+#[must_use]
+pub const fn threadgroups_are_plausible_indirect_snapshot(groups: [u32; 3]) -> bool {
+    if groups[0] > MAX_PLAUSIBLE_INDIRECT_SNAPSHOT_GROUPS_PER_AXIS
+        || groups[1] > MAX_PLAUSIBLE_INDIRECT_SNAPSHOT_GROUPS_PER_AXIS
+        || groups[2] > MAX_PLAUSIBLE_INDIRECT_SNAPSHOT_GROUPS_PER_AXIS
+    {
+        return false;
+    }
+    let product = (groups[0] as u64)
+        .saturating_mul(groups[1] as u64)
+        .saturating_mul(groups[2] as u64);
+    product <= MAX_PLAUSIBLE_INDIRECT_SNAPSHOT_GROUP_PRODUCT
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct ComputeLaunch {
     pub grid: ComputeGrid,

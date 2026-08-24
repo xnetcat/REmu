@@ -38,17 +38,13 @@ impl MetalPresenter {
     }
 
     fn scanout_snapshot_address(&self) -> Option<u64> {
-        // An accepted flip names the buffer to present. A recorded write only selects the snapshot
-        // when no flip is waiting for one, so a write to the other registered buffer cannot divert
-        // the pending flip's own snapshot to the frame the guest has not flipped yet.
-        if let Some(flip) = self
-            .pending_flip
-            .filter(|flip| flip.sequence != self.uploaded_flip_sequence)
-        {
+        // An accepted flip names the buffer to present. After that snapshot exists, a write to the
+        // other registered buffer is the next frame and must not replace the image already queued
+        // for display — that is the one-frame rewind Silent Hill shows between correct presents.
+        if let Some(flip) = self.pending_flip {
             return Some(flip.address);
         }
         self.pending_scanout_write_address
-            .or_else(|| self.pending_flip.map(|flip| flip.address))
     }
 
     fn pipeline_blocked_scanout_address(&self) -> Option<u64> {
@@ -78,6 +74,13 @@ impl MetalPresenter {
                     }
                     if let Some(flip) = flip {
                         self.uploaded_flip_sequence = flip.sequence;
+                        // Windowed present of a clear/raw dummy flip never records a snapshot.
+                        // Leaving the buffer unsafe parks later WAIT_FLIP_DONE on this allocation
+                        // for the rest of the run (Silent Hill's first VideoOut flip).
+                        self.release_flip_buffer_without_snapshot(
+                            flip.sequence,
+                            "raw-pending-no-snapshot",
+                        );
                     }
                     "raw-pending"
                 }
@@ -144,7 +147,7 @@ impl MetalPresenter {
             }
         }
         self.pending_scanout_write_address = None;
-        self.compositor_post_stack_active = false;
+        self.clear_compositor_flip_selection();
         self.redraw_pending = true;
         if trace_scanout_writes() {
             eprintln!(
@@ -544,11 +547,26 @@ impl MetalPresenter {
         writes
             .iter()
             .filter(|(address, (written, _))| {
-                !unsampled_only
-                    || samples.get(*address).copied().unwrap_or(0) < *written
+                !unsampled_only || samples.get(*address).copied().unwrap_or(0) < *written
             })
             .max_by_key(|(_, (written, _))| *written)
             .map(|(_, (_, descriptor))| *descriptor)
+    }
+
+    /// Drops per-flip compositor source selection after the scanout snapshot is taken.
+    ///
+    /// The freeze and the last scene-write map otherwise survive into the next flip. Present then
+    /// samples last frame's warehouse-lit copy (or an in-progress write to the other buffer) and
+    /// the window rewinds one frame before the next real flip catches up.
+    fn clear_compositor_flip_selection(&mut self) {
+        self.compositor_post_stack_active = false;
+        self.compositor_scene_frozen = None;
+        self.pending_compositor_scanout = None;
+        self.compositor_scene_writes.clear();
+        self.compositor_scanout_writes.clear();
+        self.compositor_grade_writes.clear();
+        self.compositor_lut_writes.clear();
+        self.compositor_scanout_samples.clear();
     }
 
     fn refresh_pending_compositor_scanout(&mut self) {
@@ -586,15 +604,17 @@ impl MetalPresenter {
         let Some(scene) = self.pending_compositor_scanout else {
             return;
         };
-        if !targets.into_iter().any(|target| target.address == scene.address) {
+        if !targets
+            .into_iter()
+            .any(|target| target.address == scene.address)
+        {
             return;
         }
-        let Some(source) = self.resident_guest_textures.get(&scene).map(|resident| {
-            (
-                resident.descriptor,
-                resident.texture.clone(),
-            )
-        }) else {
+        let Some(source) = self
+            .resident_guest_textures
+            .get(&scene)
+            .map(|resident| (resident.descriptor, resident.texture.clone()))
+        else {
             return;
         };
         let Some(device) = self.device.clone() else {
@@ -659,10 +679,8 @@ impl MetalPresenter {
         let fullscreen_post = self.compositor_pass_is_fullscreen_post();
         // Geometry / lighting: high vertex count, or a non-post presentable write before
         // bloom/uber. Fullscreen HDR/ACES and UI-on-grade stay out of scene scanout.
-        let scene_write = presentable
-            && !likely_clear
-            && !fullscreen_post
-            && !self.compositor_post_stack_active;
+        let scene_write =
+            presentable && !likely_clear && !fullscreen_post && !self.compositor_post_stack_active;
         if fullscreen_post {
             self.compositor_post_stack_active = true;
         }
@@ -1235,9 +1253,7 @@ impl MetalPresenter {
             return;
         };
         let flip = self.pending_flip;
-        if flip.is_some_and(|flip| flip.sequence == self.uploaded_flip_sequence)
-            && self.pending_scanout_write_address.is_none()
-        {
+        if flip.is_some_and(|flip| flip.sequence == self.uploaded_flip_sequence) {
             return;
         }
         match self.activate_translated_scanout(address, display.width, display.height) {

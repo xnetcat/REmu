@@ -428,36 +428,15 @@ pub(crate) fn install_guest_signal_delivery() {}
 /// true when the guest handler ran (fault consumed).
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 pub(crate) unsafe extern "C" fn try_deliver_guest_fault(
-    signal: i32,
+    _signal: i32,
     _fault_address: u64,
-    context: *mut c_void,
+    _context: *mut c_void,
 ) -> bool {
-    let handler = installed_guest_handler(signal);
-    if handler == 0 || guest_signal_is_blocked(signal) {
-        return false;
-    }
-    let thread = current_guest_thread_handle();
-    if thread == 0 {
-        return false;
-    }
-    let mut guest_context = GuestExceptionContext([0; ORBIS_UCONTEXT_BYTES]);
-    // SAFETY: live Darwin fault ucontext from SA_SIGINFO.
-    if !unsafe {
-        darwin_x86::fill_orbis_from_darwin(
-            &mut guest_context,
-            context,
-            current_guest_thread_pointer(),
-        )
-    } {
-        return false;
-    }
-    eprintln!(
-        "[REMu][KERNEL] delivering fault exception type={signal} handler={handler:#x} to guest"
-    );
-    invoke_guest_exception_handler(signal, handler, &mut guest_context);
-    // SAFETY: write guest-updated registers back for resume.
-    unsafe { darwin_x86::apply_orbis_to_darwin(&guest_context, context) };
-    true
+    // Invoking the guest handler — or taking the delivery/sync mutexes to queue one —
+    // from SIGSEGV/SIGBUS deadlocks when that handler waits on an HLE import or a guest
+    // lock the interrupted thread still owns. Cooperative delivery stays on the import
+    // boundary (`deliver_pending_guest_exception_at_import`).
+    false
 }
 
 /// Queues a guest exception and nudges the target host thread when possible.

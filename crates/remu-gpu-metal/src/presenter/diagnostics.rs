@@ -1907,7 +1907,8 @@ mod tests {
 
     #[test]
     fn glyph_draw_match_accepts_sampled_thin_1d_red_atlas_with_alpha_destination() {
-        let binding = ImageBinding { descriptor_index_is_runtime: false,
+        let binding = ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0,
             opcode: remu_shader::Opcode::Known("ImageSample"),
             control: remu_shader::ImageControl {

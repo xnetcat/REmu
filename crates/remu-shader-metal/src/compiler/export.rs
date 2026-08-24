@@ -409,7 +409,14 @@ impl Compiler<'_> {
                 (PixelOutputKind::Float, false, _) => {
                     format!("as_type<float>(v[{register}])")
                 }
-                (PixelOutputKind::Float, true, PixelExportFormat::AbgrFp16) => {
+                (
+                    PixelOutputKind::Float,
+                    true,
+                    PixelExportFormat::AbgrFp16 | PixelExportFormat::Zero,
+                ) => {
+                    // AGC seeds SPI_SHADER_COL_FORMAT to Zero. Cover/warmup draws still emit a
+                    // compressed float EXP; AbgrFp16 matches that payload. Write-masking stays
+                    // with the CB (Zero keeps mask 0) so this does not invent a color write.
                     format!("(float)as_type<half2>(v[{register}])[{}]", component & 1)
                 }
                 (PixelOutputKind::Float, true, PixelExportFormat::AbgrUnorm16) => format!(

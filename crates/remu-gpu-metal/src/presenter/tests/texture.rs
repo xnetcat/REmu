@@ -32,14 +32,13 @@ use super::{
     new_color_alias_texture_view, new_red_blue_swizzled_texture_view, read_texture_linear,
     rematerialisation_blit_source_origin_y, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_same_image_sample_is_eligible,
-    resident_volume_sample_is_eligible,
     resident_texture_activity_stats, resident_texture_backing_overlap_stats,
-    resident_texture_eviction_plan, resident_texture_ownership_stats, sampled_alias_descriptor,
-    sampled_texture_cache_accepts, sampled_texture_cache_needs_reload,
-    sampled_texture_cache_requires_eviction, sampled_texture_view_for_binding,
-    snapshot_guest_texture_raw, snapshot_watched_guest_texture_raw,
-    storage_image_requires_mip_hierarchy, upload_image_textures, watch_guest_texture,
-    write_watched_guest_texture_linear,
+    resident_texture_eviction_plan, resident_texture_ownership_stats,
+    resident_volume_sample_is_eligible, sampled_alias_descriptor, sampled_texture_cache_accepts,
+    sampled_texture_cache_needs_reload, sampled_texture_cache_requires_eviction,
+    sampled_texture_view_for_binding, snapshot_guest_texture_raw,
+    snapshot_watched_guest_texture_raw, storage_image_requires_mip_hierarchy,
+    upload_image_textures, watch_guest_texture, write_watched_guest_texture_linear,
 };
 use metal::foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -160,7 +159,8 @@ fn shared_event_texture_override_bypasses_replaced_guest_mapping_at_bind() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0x40,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -325,7 +325,8 @@ fn storage_image_color_view_reuses_gpu_current_resident_instead_of_guest_memory(
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0x60,
             opcode: Opcode::Known("ImageLoad"),
             control: ImageControl {
@@ -471,7 +472,8 @@ fn r32_depth_sample_prefers_gpu_written_depth32_over_exact_clean_shadow() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0x80,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -601,7 +603,8 @@ fn r32_depth_sample_keeps_depth32_after_later_empty_r32_mark_written() {
         initial_scalar_registers: Vec::new().into(),
         scalar_registers: Vec::new().into(),
         scalar_memory_reads: Vec::new(),
-        image_bindings: vec![ImageBinding { descriptor_index_is_runtime: false,
+        image_bindings: vec![ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 0x80,
             opcode: Opcode::Known("ImageSample"),
             control: ImageControl {
@@ -1871,7 +1874,8 @@ fn load_before_store_binds_one_read_write_array_texture() {
         d16: false,
         unorm: false,
     };
-    let mut store = ImageBinding { descriptor_index_is_runtime: false,
+    let mut store = ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0x38,
         opcode: Opcode::Known("ImageStore"),
         control: control.clone(),
@@ -1879,7 +1883,8 @@ fn load_before_store_binds_one_read_write_array_texture() {
         sampler_descriptor: Vec::new().into(),
         mip_level: None,
     };
-    let load = ImageBinding { descriptor_index_is_runtime: false,
+    let load = ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0x30,
         opcode: Opcode::Known("ImageLoad"),
         control,
@@ -1972,7 +1977,8 @@ fn ordinary_storage_load_does_not_promote_a_full_mip_view() {
     assert_eq!(descriptor.guest.tile_mode, 9);
     assert_eq!(descriptor.base_mip_level, 0);
     assert_eq!(descriptor.mip_level_count, 9);
-    let mut binding = ImageBinding { descriptor_index_is_runtime: false,
+    let mut binding = ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0x190,
         opcode: Opcode::Known("ImageLoad"),
         control: ImageControl {
@@ -2001,7 +2007,8 @@ fn ordinary_storage_load_does_not_promote_a_full_mip_view() {
 
 #[test]
 fn invalid_sampled_images_receive_a_dimension_compatible_fallback() {
-    let binding = ImageBinding { descriptor_index_is_runtime: false,
+    let binding = ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0x50,
         opcode: Opcode::Known("ImageSample"),
         control: ImageControl {
@@ -4888,9 +4895,7 @@ fn volume_sample_reuses_gpu_authored_resident_across_tile_modes() {
 
     let resident = &presenter.resident_guest_textures[&stored.guest];
     assert!(resident.gpu_written());
-    assert!(resident_volume_sample_is_eligible(
-        resident, sampled, false
-    ));
+    assert!(resident_volume_sample_is_eligible(resident, sampled, false));
     assert!(!guest_texture_descriptors_share_storage(
         stored.guest,
         sampled.guest
@@ -5010,10 +5015,7 @@ fn offset_alias_sample_binds_gpu_authored_resident() {
     assert_eq!(sampled.texture_type, 9);
     assert_eq!(stored.guest.width, width);
     assert_eq!(sampled.guest.width, width);
-    assert_eq!(
-        sampled.guest.address,
-        stored.guest.address + 0x20_0000
-    );
+    assert_eq!(sampled.guest.address, stored.guest.address + 0x20_0000);
     assert!(guest_texture_descriptors_share_offset_alias_storage(
         stored.guest,
         sampled.guest

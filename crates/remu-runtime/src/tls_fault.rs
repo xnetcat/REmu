@@ -294,7 +294,7 @@ fn write_fs_fault_diagnostic(message: &[u8]) {
 /// Darwin `__darwin_ucontext` truncated after the machine-context pointer.
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[repr(C)]
-struct UserContext {
+pub(crate) struct UserContext {
     _on_stack: libc::c_int,
     _signal_mask: u32,
     _stack: libc::stack_t,
@@ -306,32 +306,34 @@ struct UserContext {
 /// Darwin `_STRUCT_MCONTEXT64` integer state used by the FS emulator.
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
 #[repr(C)]
-struct MachineContext {
+pub(crate) struct MachineContext {
     _trap_number: u16,
     _cpu: u16,
     _error: u32,
     _fault_address: u64,
-    rax: u64,
-    rbx: u64,
-    rcx: u64,
-    rdx: u64,
-    rdi: u64,
-    rsi: u64,
-    rbp: u64,
-    rsp: u64,
-    r8: u64,
-    r9: u64,
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
-    instruction_pointer: u64,
+    pub(crate) rax: u64,
+    pub(crate) rbx: u64,
+    pub(crate) rcx: u64,
+    pub(crate) rdx: u64,
+    pub(crate) rdi: u64,
+    pub(crate) rsi: u64,
+    pub(crate) rbp: u64,
+    pub(crate) rsp: u64,
+    pub(crate) r8: u64,
+    pub(crate) r9: u64,
+    pub(crate) r10: u64,
+    pub(crate) r11: u64,
+    pub(crate) r12: u64,
+    pub(crate) r13: u64,
+    pub(crate) r14: u64,
+    pub(crate) r15: u64,
+    pub(crate) instruction_pointer: u64,
 }
 
 #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-unsafe fn machine_context_mut(context: *mut c_void) -> Option<&'static mut MachineContext> {
+pub(crate) unsafe fn machine_context_mut(
+    context: *mut c_void,
+) -> Option<&'static mut MachineContext> {
     // SAFETY: caller guarantees a live ucontext from SA_SIGINFO.
     let user = unsafe { &mut *context.cast::<UserContext>() };
     if user.machine_context.is_null() {

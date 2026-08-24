@@ -1,8 +1,8 @@
 // Copyright (C) 2026 REmu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-use super::mode27::mode64k_2d_mip_chain_layout;
 use super::mode5::mode5_mip_chain_layout;
+use super::mode27::mode64k_2d_mip_chain_layout;
 use super::{GuestTextureDescriptor, guest_texture_byte_count};
 use metal::MTLPixelFormat;
 use remu_memory::{GuestSharedMappingIdentity, guest_shared_mapping_identity};

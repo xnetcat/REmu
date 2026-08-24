@@ -38,7 +38,8 @@ fn playgo_locus_rejects_more_than_the_sdk_max_without_writing() {
 
 #[test]
 fn playgo_locus_rejects_an_unknown_chunk_without_writing() {
-    let state = open_playgo_state();
+    let mut state = open_playgo_state();
+    state.services.play_go_chunk_ids = vec![0];
     let chunk_id = 1_000_u16;
     let mut locus = [0xcc_u8; 3];
 
@@ -57,6 +58,29 @@ fn playgo_locus_rejects_an_unknown_chunk_without_writing() {
         sce_kernel_error(0x80b2_000c)
     );
     assert_eq!(locus, [0xcc; 3]);
+}
+
+#[test]
+fn playgo_locus_treats_any_chunk_as_installed_when_the_package_table_is_missing() {
+    let state = open_playgo_state();
+    let chunk_id = 1_000_u16;
+    let mut locus = [0xcc_u8; 3];
+
+    assert_eq!(
+        play_go_get_locus(
+            [
+                1,
+                (&raw const chunk_id).addr() as u64,
+                1,
+                locus[1..].as_mut_ptr().addr() as u64,
+                0,
+                0,
+            ],
+            &state,
+        ),
+        0
+    );
+    assert_eq!(locus, [0xcc, 3, 0xcc]);
 }
 
 #[test]

@@ -4,14 +4,14 @@
 use super::{
     CachedGlobalBuffer, CachedIndexBuffer, CachedNggMeshlets, CachedSamplerArguments,
     DecodedDepthTarget, GlobalBufferCacheKey, GlobalBufferOriginalVersion, GuestCommandBatch,
-    IndexBufferCacheKey, MetalPresenter, NggMeshletCacheKey, NggMeshletSourceKey, NggSubgroupLimits,
-    PendingGlobalWriteback, PhysicalFootprintRange,
+    IndexBufferCacheKey, MetalPresenter, NggMeshletCacheKey, NggMeshletSourceKey,
+    NggSubgroupLimits, PendingGlobalWriteback, PhysicalFootprintRange,
     SAMPLER_ARGUMENT_CACHE_CAPACITY, SamplerArgumentCacheKey, SharedEventComputeGlobalBindingPlan,
     SharedEventDirectComputePlan, SharedEventGlobalBufferVersion, SharedEventSignalCheckpoint,
     UploadedGlobalBuffer, canonical_sampler_bindings, create_sampler_argument_buffer,
-    describe_guest_batch, effective_global_memory_binding, guest_batch_writes_overlap,
-    guest_physical_ranges_overlap, guest_ranges_overlap, metal_buffer_with_bytes,
-    prepare_ngg_meshlets, primitive_restart_index, effective_global_memory_binding_indices,
+    describe_guest_batch, effective_global_memory_binding, effective_global_memory_binding_indices,
+    guest_batch_writes_overlap, guest_physical_ranges_overlap, guest_ranges_overlap,
+    metal_buffer_with_bytes, prepare_ngg_meshlets, primitive_restart_index,
 };
 use block::ConcreteBlock;
 use metal::foreign_types::ForeignType;
@@ -19,11 +19,11 @@ use metal::{
     Buffer, DepthStencilDescriptor, DepthStencilState, Device, Function, MTLCompareFunction,
     MTLResourceOptions, SamplerState, StencilDescriptor,
 };
+use remu_gpu::{ShaderEvaluationSnapshot, threadgroups_are_plausible_indirect_snapshot};
 use remu_memory::{
     GuestSharedBackingRange, GuestSharedMappingIdentity, guest_shared_backing_any_range_overlaps,
     guest_shared_backing_identity, guest_shared_backing_range, read_guest_shared_backing,
 };
-use remu_gpu::ShaderEvaluationSnapshot;
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -126,6 +126,26 @@ fn indirect_packet_snapshot<'a>(
     matches!(source, QueuedGlobalReadSource::None)
         .then_some(packet_snapshot)
         .flatten()
+}
+
+fn log_implausible_indirect_threadgroups(address: u64, groups: [u32; 3], phase: &str) {
+    static OCCURRENCES: AtomicUsize = AtomicUsize::new(0);
+    let sequence = OCCURRENCES.fetch_add(1, Ordering::Relaxed) + 1;
+    if sequence <= 16 || sequence.is_power_of_two() {
+        eprintln!(
+            "[REMu][METAL] discarding implausible DISPATCH_INDIRECT {phase} threadgroups address={address:#x} groups={groups:?}"
+        );
+    }
+}
+
+fn empty_indirect_dispatch_arguments(device: &Device) -> Result<UploadedGlobalBuffer, String> {
+    Ok(UploadedGlobalBuffer {
+        buffer: metal_buffer_with_bytes(device, &[0_u8; 3 * std::mem::size_of::<u32>()])?,
+        offset: 0,
+        guest_memory: false,
+        physical_identity: None,
+        original_version: None,
+    })
 }
 
 fn indirect_producer_overlap_summary(
@@ -289,12 +309,50 @@ impl MetalPresenter {
             snapshot[start..start + std::mem::size_of::<u32>()]
                 .copy_from_slice(&value.to_le_bytes());
         }
-        self.upload_ordered_indirect_arguments_with_snapshot(
-            device,
-            address,
-            snapshot.len(),
-            Some(&snapshot),
-        )
+        // A queued GPU producer still wins. Its writeback may hold unread bytes at encode
+        // time; Metal consumes the live values after that producer. Recycled heap or
+        // color-target pixels must not be baked into a huge dispatch that never completes.
+        if self.queued_indirect_has_copied_gpu_producer(address, snapshot.len())? {
+            return self.upload_ordered_indirect_arguments_with_snapshot(
+                device,
+                address,
+                snapshot.len(),
+                None,
+            );
+        }
+        if threadgroups_are_plausible_indirect_snapshot(dimensions) {
+            return self.upload_ordered_indirect_arguments_with_snapshot(
+                device,
+                address,
+                snapshot.len(),
+                Some(&snapshot),
+            );
+        }
+        log_implausible_indirect_threadgroups(address, dimensions, "packet");
+        empty_indirect_dispatch_arguments(device)
+    }
+
+    fn queued_indirect_has_copied_gpu_producer(
+        &self,
+        address: u64,
+        byte_count: usize,
+    ) -> Result<bool, String> {
+        let binding = GlobalMemoryBinding {
+            scalar_address: 0,
+            base_address: address,
+            instruction_pcs: Default::default(),
+            byte_count,
+            data: Vec::new(),
+            writable: false,
+            write_back_to_guest: false,
+        };
+        Ok(matches!(
+            self.queued_global_read_source(&binding)?,
+            QueuedGlobalReadSource::Buffer {
+                guest_memory: false,
+                ..
+            }
+        ))
     }
 
     /// Identifies the queued producer selected for a native indirect argument read.
@@ -1475,10 +1533,8 @@ impl MetalPresenter {
         indices: &std::sync::Arc<[u32]>,
         limits: NggSubgroupLimits,
     ) -> Result<Option<CachedNggMeshlets>, String> {
-        let cache_key = NggMeshletSourceKey::for_draw(draw).map(|source| NggMeshletCacheKey {
-            source,
-            limits,
-        });
+        let cache_key =
+            NggMeshletSourceKey::for_draw(draw).map(|source| NggMeshletCacheKey { source, limits });
         if let Some(cache_key) = cache_key
             && let Some(cached) = self.ngg_meshlet_cache.get(&cache_key)
             && (std::sync::Arc::ptr_eq(&cached.source_indices, indices)

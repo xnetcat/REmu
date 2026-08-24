@@ -408,7 +408,10 @@ mod tests {
         let new_span = RangeSet::from_run(0, u64::try_from(run_count + 128).unwrap() * 4);
 
         assert!(debt.rebase_whole_span(&old_span, new_span).is_err());
-        assert_eq!(debt, before, "a refused promotion leaves exact debt unchanged");
+        assert_eq!(
+            debt, before,
+            "a refused promotion leaves exact debt unchanged"
+        );
         assert!(!debt.as_ranges().contains_run(2, 4));
     }
 }

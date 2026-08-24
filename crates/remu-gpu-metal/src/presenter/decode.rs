@@ -22,9 +22,9 @@ use super::{
     fragmentless_pixel_evaluation, fragmentless_pixel_program,
     graphics_allocated_vector_register_count, guest_texture_byte_count, half_float_to_f32,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage,
-    ngg_mesh_stage_for_draw, procedural_rectangle_stage_for_draw, program_embeds_global_base,
-    tiled_block_dimensions, trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
+    ngg_memoryless_cover_export_stage, ngg_mesh_export_stage, ngg_mesh_stage_for_draw,
+    procedural_rectangle_stage_for_draw, program_embeds_global_base, tiled_block_dimensions,
+    trace_image_descriptors, trace_target_sampling, unsigned_float_to_f32,
     video_target_binding_summary,
 };
 use metal::{MTLScissorRect, MTLViewport};
@@ -42,12 +42,10 @@ pub(crate) use self::pipeline::{
     ColorOperationMode, NGG_MESHLET_WORDS_PER_GROUP, STORAGE_ONLY_RASTER_EXTENT,
     color_operation_is_raster_noop, decode_color_operation_mode, decode_metal_blend_attachment,
     decode_raster_state, draw_writes_storage_image, evaluation_writes_storage_image,
-    graphics_pipeline_key,
-    metal_color_write_mask, metal_nonindexed_vertex_count, metal_primitive_type,
-    ngg_mesh_base_vertex, noop_placeholder_cover_draw, prepare_indexed_ngg_indices,
-    prepare_indexed_primitive, prepare_ngg_meshlets, prepare_nonindexed_ngg_indices,
-    primitive_restart_index,
-    storage_only_dummy_render_target,
+    graphics_pipeline_key, metal_color_write_mask, metal_nonindexed_vertex_count,
+    metal_primitive_type, ngg_mesh_base_vertex, noop_placeholder_cover_draw,
+    prepare_indexed_ngg_indices, prepare_indexed_primitive, prepare_ngg_meshlets,
+    prepare_nonindexed_ngg_indices, primitive_restart_index, storage_only_dummy_render_target,
 };
 #[cfg(test)]
 pub(crate) use self::pipeline::{
@@ -65,12 +63,11 @@ pub(crate) use self::scanout::{
 };
 pub(crate) use self::scanout::{decode_scanout_target, raw_video_out_texture_descriptor};
 pub(crate) use self::targets::{
-    common_render_target_array_length, decode_color_eliminate_fast_clear_target,
-    decode_color_resolve_targets, decode_depth_target, decode_depth_target_without_diagnostics,
-    DECODE_TARGETS_CALLS, DECODE_TARGETS_NANOS, decode_render_target_format,
-    decode_render_target_state, decode_render_targets,
-    initial_depth_clear_for_target, initial_render_target_clear_color, render_target_cmask_address,
-    render_target_fast_clear_color,
+    DECODE_TARGETS_CALLS, DECODE_TARGETS_NANOS, common_render_target_array_length,
+    decode_color_eliminate_fast_clear_target, decode_color_resolve_targets, decode_depth_target,
+    decode_depth_target_without_diagnostics, decode_render_target_format,
+    decode_render_target_state, decode_render_targets, initial_depth_clear_for_target,
+    initial_render_target_clear_color, render_target_cmask_address, render_target_fast_clear_color,
 };
 #[cfg(test)]
 pub(crate) use self::targets::{

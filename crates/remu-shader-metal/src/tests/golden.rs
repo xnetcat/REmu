@@ -316,8 +316,8 @@ fn analyze_mode_reports_uniformity_without_changing_msl() {
         descriptor_cache: true,
         constant_bindings: true,
     };
-    let analyzed = compile_msl(&program, &empty_evaluation(), &options)
-        .expect("analyze-only program lowers");
+    let analyzed =
+        compile_msl(&program, &empty_evaluation(), &options).expect("analyze-only program lowers");
 
     assert_eq!(analyzed.source, legacy.source);
     assert_eq!(

@@ -570,12 +570,20 @@ impl Compiler<'_> {
                         "linked ES/GS cannot use the no-GS NGG passthrough input ABI".into(),
                     ));
                 }
-                if has_linked_geometry_stage && self.options.ngg_esgs_ring_itemsize == 0 {
-                    return Err(MetalCompileError::InvalidInterface(
-                        "linked ES/GS is missing VGT_ESGS_RING_ITEMSIZE; refusing an invented vertex stride"
-                            .into(),
-                    ));
-                }
+                let linked_esgs_itemsize = if has_linked_geometry_stage {
+                    if self.options.ngg_esgs_ring_itemsize != 0 {
+                        self.options.ngg_esgs_ring_itemsize
+                    } else if let Some(inferred) = self.program.linked_esgs_ring_itemsize_dwords() {
+                        inferred
+                    } else {
+                        return Err(MetalCompileError::InvalidInterface(
+                            "linked ES/GS is missing VGT_ESGS_RING_ITEMSIZE; refusing an invented vertex stride"
+                                .into(),
+                        ));
+                    }
+                } else {
+                    1
+                };
                 if self.options.ngg_fixed_allocation_fallback {
                     source.push_str(
                             "    RemuVsOut remu_out = {};\n\
@@ -640,24 +648,22 @@ impl Compiler<'_> {
                         );
                     }
                 }
-                if !self.options.ngg_fixed_allocation_fallback
-                    && !self.options.ngg_primgen_passthrough
+                if has_linked_geometry_stage
+                    || (!self.options.ngg_fixed_allocation_fallback
+                        && !self.options.ngg_primgen_passthrough)
                 {
                     // Default GFX10 NGG input ABI. Unlike passthrough mode, SPI supplies six
                     // packed 16-bit ES vertex offsets in v0/v1/v4, the primitive ID in v2 and
                     // the GS invocation ID in v3. No-GS NGG lowering consumes the offsets as
                     // local vertex indices; an actual linked GS consumes dword ESGS offsets.
                     // Hardware scales every packed local index by VGT_ESGS_RING_ITEMSIZE.
-                    let itemsize = if has_linked_geometry_stage {
-                        self.options.ngg_esgs_ring_itemsize
-                    } else {
-                        1
-                    };
+                    // The live default ABI is the fixed wave64 fallback; linked GS continuations
+                    // still re-seed v0/v1 from these scaled offsets, so they must exist there too.
                     let _ = writeln!(
                         source,
-                        "    uint remu_mesh_gs_vtx_offset_0 = ((((remu_mesh_primitive >> 0u) & 0x1ffu) * {itemsize}u) & 0xffffu)\n\
-                         \x20       | (((((remu_mesh_primitive >> 10u) & 0x1ffu) * {itemsize}u) & 0xffffu) << 16u);\n\
-                         \x20   uint remu_mesh_gs_vtx_offset_1 = (((remu_mesh_primitive >> 20u) & 0x1ffu) * {itemsize}u) & 0xffffu;",
+                        "    uint remu_mesh_gs_vtx_offset_0 = ((((remu_mesh_primitive >> 0u) & 0x1ffu) * {linked_esgs_itemsize}u) & 0xffffu)\n\
+                         \x20       | (((((remu_mesh_primitive >> 10u) & 0x1ffu) * {linked_esgs_itemsize}u) & 0xffffu) << 16u);\n\
+                         \x20   uint remu_mesh_gs_vtx_offset_1 = (((remu_mesh_primitive >> 20u) & 0x1ffu) * {linked_esgs_itemsize}u) & 0xffffu;",
                     );
                 }
                 if self.options.render_target_array_length > 1 {

@@ -5,6 +5,8 @@
 
 use remu_core::GuestAddress;
 
+use crate::write_watch::{forget_guest_committed_range, publish_guest_committed_range};
+
 use super::shared::{
     begin_shared_mapping_mutation, existing_shared_backing_alias_segments,
     register_shared_mapping_range, unregister_shared_mapping_range,
@@ -250,6 +252,11 @@ impl GuestAddressSpace {
         // single byte store; record it so a zero-poisoned crash can name it.
         crate::record_guest_write(crate::GuestWriteSite::MapZero, start, size, &[0], 0);
         unregister_shared_mapping_range(start, size);
+        if protection == GuestProtection::NONE {
+            forget_guest_committed_range(start, size);
+        } else {
+            publish_guest_committed_range(start, size);
+        }
         Ok(())
     }
 
@@ -297,6 +304,7 @@ impl GuestAddressSpace {
         }
         debug_assert_eq!(result, pointer);
         register_shared_mapping_range(start, size, backing, backing_offset);
+        publish_guest_committed_range(start, size);
         self.arm_diagnostic_cpu_write_watch(start, size, protection);
         Ok(())
     }

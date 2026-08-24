@@ -3,9 +3,8 @@
 
 use super::super::GuestMipChainLayout;
 use super::{
-    DecodedImageDescriptor, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
-    GpuDebtSet, MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState,
-    ResidentGuestTexture,
+    DecodedImageDescriptor, GpuDebtSet, GuestTextureDescriptor, MIP_UPLOAD_BYTES, MIP_UPLOAD_COUNT,
+    MIP_UPLOAD_NANOSECONDS, Mode27WorkOrigin, RangeSet, ResidencyState, ResidentGuestTexture,
     ResidentTextureMap, WriteWatchRefresh, comparison_depth32_upload,
     compressed_texture_block_extent, copy_mode27_mip_level_to_linear,
     decode_mode5_mip_chain_from_raw, decode_mode27_mip_chain_from_raw, mode27_mip_chain_layout,
@@ -93,9 +92,11 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
                 descriptor.guest.address
             )
         })?;
-        assert!(resident_guest_textures.try_replace(&descriptor.guest, |resident| {
-            promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)
-        })?);
+        assert!(
+            resident_guest_textures.try_replace(&descriptor.guest, |resident| {
+                promote_resident_mip_hierarchy(device, command_buffer, descriptor, resident, origin)
+            })?
+        );
         return resident_texture_for_sample(
             resident_guest_textures
                 .get_mut(&descriptor.guest)
@@ -104,8 +105,8 @@ pub(crate) fn ensure_mipmapped_resident_texture_in_map(
         )
         .ok_or_else(|| "promoted clean mip hierarchy cannot represent storage view".to_owned());
     }
-    if let Some(resident) = resident_guest_textures
-        .retire_clean(&descriptor.guest, "mip-hierarchy-replacement")?
+    if let Some(resident) =
+        resident_guest_textures.retire_clean(&descriptor.guest, "mip-hierarchy-replacement")?
     {
         trace_resident_texture_removal("mip-hierarchy-replacement", &resident);
     }

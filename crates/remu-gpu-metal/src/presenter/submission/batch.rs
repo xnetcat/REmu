@@ -1128,8 +1128,7 @@ impl MetalPresenter {
     }
 
     fn drain_settle_deadline() -> Instant {
-        Instant::now()
-            + Duration::from_millis(super::super::GUEST_BATCH_DRAIN_SETTLE_MILLISECONDS)
+        Instant::now() + Duration::from_millis(super::super::GUEST_BATCH_DRAIN_SETTLE_MILLISECONDS)
     }
 
     fn settle_oldest_in_flight_guest_batch(&mut self, deadline: Instant) -> FrontBatchSettlement {
@@ -2242,9 +2241,7 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
                                 .map(|&count| u64::from(count))
                                 .product(),
                         ),
-                    remu_gpu::ComputeGrid::Threads(threads) => {
-                        threads.iter().copied().product()
-                    }
+                    remu_gpu::ComputeGrid::Threads(threads) => threads.iter().copied().product(),
                 };
                 let entry = compute_shaders.entry(*shader).or_insert((0, 0));
                 entry.0 += 1;
@@ -2283,7 +2280,11 @@ fn report_slow_guest_command_buffer(batch: &GuestCommandBatch, gpu_execution: Du
     // The GPU duration covers every encoder in the command buffer, not only the summarized
     // draws/dispatches; upload, writeback, and guest-write volumes are printed so a buffer whose
     // time is spent in blit work is not blamed on its one small draw.
-    let upload_bytes: usize = batch.global_upload_chunks.iter().map(|chunk| chunk.used).sum();
+    let upload_bytes: usize = batch
+        .global_upload_chunks
+        .iter()
+        .map(|chunk| chunk.used)
+        .sum();
     let writeback_bytes: u64 = batch
         .guest_write_ranges
         .iter()

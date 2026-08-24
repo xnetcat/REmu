@@ -4,9 +4,8 @@
 use super::super::completion::{command_buffer_native_state_summary, trace_metal_command_stalls};
 use super::super::{
     OWNED_DEMOTIONS, OWNED_FALLBACK_FULL_RANGE, OWNED_RANGE_SET_COARSENED, OWNED_RECLAIM_DISCARD,
-    OWNED_RECLAIM_EXECUTED,
-    OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE,
-    OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
+    OWNED_RECLAIM_EXECUTED, OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU,
+    OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
     OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
     OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
     OWNED_UNRESOLVED_SPAN, RESIDENT_WRITEBACK_DISCARDED, RESIDENT_WRITEBACK_DISCARDED_BYTES,
@@ -1677,10 +1676,7 @@ impl MetalPresenter {
         ) {
             return Ok(());
         }
-        self.flush_guest_command_batch(
-            FlushPolicy::Opportunistic,
-            GuestBatchFlushReason::EventLoop,
-        )
+        self.flush_guest_command_batch(FlushPolicy::Opportunistic, GuestBatchFlushReason::EventLoop)
     }
 
     pub(crate) fn service_interactive_presenter_before_wait(&mut self) -> PresenterFlow {

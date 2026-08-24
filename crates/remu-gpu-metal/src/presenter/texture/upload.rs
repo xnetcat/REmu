@@ -25,14 +25,12 @@ use super::{
     refresh_sampled_texture_write_watch, render_resolve_candidate_matches,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
-    resident_sample_authority_ok, resident_volume_sample_is_eligible,
-    resident_texture_for_sample, retire_sampled_texture, sampled_texture_cache_needs_reload,
-    sampled_texture_key, sampled_texture_raw_range, sampled_texture_supports_access,
-    sampled_texture_view_for_binding,
-    sampler_uses_normalized_coordinates,
-    storage_image_requires_mip_hierarchy, texture_element_layout,
-    trace_alias_correlated_image_bindings, trace_glyph_atlas, trace_resident_texture_removal,
-    trace_target_sampling,
+    resident_sample_authority_ok, resident_texture_for_sample, resident_volume_sample_is_eligible,
+    retire_sampled_texture, sampled_texture_cache_needs_reload, sampled_texture_key,
+    sampled_texture_raw_range, sampled_texture_supports_access, sampled_texture_view_for_binding,
+    sampler_uses_normalized_coordinates, storage_image_requires_mip_hierarchy,
+    texture_element_layout, trace_alias_correlated_image_bindings, trace_glyph_atlas,
+    trace_resident_texture_removal, trace_target_sampling,
 };
 use metal::{Device, MTLPixelFormat, Texture};
 use remu_memory::guest_shared_mapping_identity;

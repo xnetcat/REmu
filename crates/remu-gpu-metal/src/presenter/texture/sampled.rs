@@ -504,10 +504,7 @@ pub(crate) fn resident_texture_for_sample(
     }
     if guest_texture_descriptors_share_storage(resident.descriptor, sampled.guest)
         || guest_texture_descriptors_share_gpu_sample_storage(resident.descriptor, sampled.guest)
-        || guest_texture_descriptors_share_offset_alias_storage(
-            resident.descriptor,
-            sampled.guest,
-        )
+        || guest_texture_descriptors_share_offset_alias_storage(resident.descriptor, sampled.guest)
     {
         if sampled.base_mip_level == 0 && sampled.mip_level_count.max(1) == resident.mip_level_count
         {

@@ -26,12 +26,44 @@ fn kernel_memory_mut(
     state: &mut ProbeDispatchState,
 ) -> Result<&mut kernel_memory::KernelMemory, kernel_memory::KernelMemoryError> {
     if state.kernel_memory.is_none() {
-        state.kernel_memory = Some(kernel_memory::KernelMemory::new()?);
+        let memory = kernel_memory::KernelMemory::new()?;
+        let (base, end) = memory.virtual_bounds();
+        eprintln!(
+            "[REMu][VM] kernel space base={:#x} end={:#x} pinned={}",
+            base.get(),
+            end.get(),
+            base.get() == kernel_memory::PS5_LARGE_VA_BASE
+        );
+        state.kernel_memory = Some(memory);
     }
     Ok(state
         .kernel_memory
         .as_mut()
         .expect("kernel memory was initialized immediately above"))
+}
+
+#[cfg(target_os = "macos")]
+fn process_image_range(state: &ProbeDispatchState) -> (u64, u64) {
+    (state.process_mapping_start, state.process_mapping_end)
+}
+
+#[cfg(target_os = "macos")]
+fn process_image_overlap_error(
+    image_start: u64,
+    image_end: u64,
+    address: u64,
+    length: u64,
+) -> Option<u64> {
+    let Some(end) = address.checked_add(length) else {
+        return Some(sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT));
+    };
+    if !process_mapping_contains(image_start, image_end, address, end) {
+        return None;
+    }
+    eprintln!(
+        "[REMu][VM] refused mapping over process image address={address:#x} length={length:#x} image={image_start:#x}..{image_end:#x}"
+    );
+    Some(sce_kernel_error(SCE_KERNEL_ERROR_NOT_FOUND))
 }
 
 #[cfg(target_os = "macos")]
@@ -69,8 +101,8 @@ fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
         KernelMemoryError::AddressSpace(AddressSpaceError::PermissionDenied { .. }) => {
             SCE_KERNEL_ERROR_PERMISSION_DENIED
         }
-        KernelMemoryError::DirectMemoryExhausted { .. }
-        | KernelMemoryError::AddressSpace(
+        KernelMemoryError::DirectMemoryExhausted { .. } => SCE_KERNEL_ERROR_OUT_OF_MEMORY,
+        KernelMemoryError::AddressSpace(
             AddressSpaceError::InvalidHostPageSize
             | AddressSpaceError::IncompatibleHostPageSize { .. }
             | AddressSpaceError::AddressSpaceExhausted { .. }
@@ -85,7 +117,7 @@ fn kernel_memory_error(error: &kernel_memory::KernelMemoryError) -> u64 {
 
 #[cfg(target_os = "macos")]
 pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispatchState) -> u64 {
-    const DIRECT_MEMORY_SIZE: u64 = kernel_memory::DIRECT_MEMORY_SIZE;
+    const DIRECT_MEMORY_CAPACITY: u64 = kernel_memory::DIRECT_MEMORY_CAPACITY;
     let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
         .max(0)
         .cast_unsigned();
@@ -107,9 +139,9 @@ pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispa
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let search_end = if raw_search_end <= 0 {
-        DIRECT_MEMORY_SIZE
+        DIRECT_MEMORY_CAPACITY
     } else {
-        raw_search_end.cast_unsigned().min(DIRECT_MEMORY_SIZE)
+        raw_search_end.cast_unsigned().min(DIRECT_MEMORY_CAPACITY)
     };
     let search_start = if search_start >= search_end {
         0
@@ -120,13 +152,24 @@ pub(crate) fn allocate_direct_memory(arguments: [u64; 6], state: &mut ProbeDispa
         Ok(memory) => memory,
         Err(error) => return kernel_memory_error(&error),
     };
-    let offset =
-        match memory.allocate_direct(search_start, search_end, length, alignment, memory_type) {
-            Ok(offset) => offset,
-            Err(error) => return kernel_memory_error(&error),
-        };
+    let offset = match memory.allocate_direct(
+        search_start,
+        search_end,
+        length,
+        alignment,
+        memory_type,
+    ) {
+        Ok(offset) => offset,
+        Err(error) => {
+            eprintln!(
+                "[REMu][VM] allocate direct failed search={search_start:#x}..{search_end:#x} length={length:#x} alignment={alignment:#x} occupied={occupied} error={error}",
+                occupied = memory.direct_allocation_spans(),
+            );
+            return kernel_memory_error(&error);
+        }
+    };
     write_guest_u64(output, offset);
-    if trace_guest_vm() {
+    if length >= 0x10_0000 || trace_guest_vm() {
         eprintln!(
             "[REMu][VM] allocated direct start={offset:#x} length={length:#x} alignment={alignment:#x} type={memory_type:#x}"
         );
@@ -150,7 +193,7 @@ pub(crate) fn available_direct_memory_size(
     arguments: [u64; 6],
     state: &mut ProbeDispatchState,
 ) -> u64 {
-    const DIRECT_MEMORY_SIZE: u64 = kernel_memory::DIRECT_MEMORY_SIZE;
+    const DIRECT_MEMORY_CAPACITY: u64 = kernel_memory::DIRECT_MEMORY_CAPACITY;
     let search_start = i64::from_ne_bytes(arguments[0].to_ne_bytes())
         .max(0)
         .cast_unsigned();
@@ -172,9 +215,9 @@ pub(crate) fn available_direct_memory_size(
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let search_end = if raw_search_end <= 0 {
-        DIRECT_MEMORY_SIZE
+        DIRECT_MEMORY_CAPACITY
     } else {
-        raw_search_end.cast_unsigned().min(DIRECT_MEMORY_SIZE)
+        raw_search_end.cast_unsigned().min(DIRECT_MEMORY_CAPACITY)
     };
     let search_start = if search_start >= search_end {
         0
@@ -248,7 +291,7 @@ pub(crate) fn allocate_main_direct_memory(
     allocate_direct_memory(
         [
             0,
-            kernel_memory::DIRECT_MEMORY_SIZE,
+            kernel_memory::DIRECT_MEMORY_CAPACITY,
             arguments[0],
             arguments[1],
             arguments[2],
@@ -272,7 +315,7 @@ pub(crate) fn direct_memory_query(arguments: [u64; 6], state: &mut ProbeDispatch
     let find_next = arguments[1] & 1 != 0;
     let output = arguments[2];
     let output_size = arguments[3];
-    if output == 0 || output_size < 0x18 || offset >= kernel_memory::DIRECT_MEMORY_SIZE {
+    if output == 0 || output_size < 0x18 || offset >= kernel_memory::DIRECT_MEMORY_CAPACITY {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
     let memory = match kernel_memory_mut(state) {
@@ -347,6 +390,12 @@ fn map_direct_memory_core(
     }
     let requested = read_guest_u64(output);
     let fixed = flags & 0x10 != 0 && requested != 0;
+    let (image_start, image_end) = process_image_range(state);
+    if fixed
+        && let Some(error) = process_image_overlap_error(image_start, image_end, requested, length)
+    {
+        return error;
+    }
     let memory = match kernel_memory_mut(state) {
         Ok(memory) => memory,
         Err(error) => return kernel_memory_error(&error),
@@ -377,19 +426,22 @@ fn map_direct_memory_core(
     let mapped = match result {
         Ok(mapped) => mapped,
         Err(error) => {
-            if trace_guest_vm() {
-                eprintln!(
-                    "[REMu][VM] map direct failed direct={direct_start:#x} requested={requested:#x} length={length:#x} protection={protection:#x} flags={flags:#x} error={error}"
-                );
-            }
+            eprintln!(
+                "[REMu][VM] map direct failed direct={direct_start:#x} requested={requested:#x} length={length:#x} protection={protection:#x} flags={flags:#x} error={error}"
+            );
             return kernel_memory_error(&error);
         }
     };
+    if let Some(error) = process_image_overlap_error(image_start, image_end, mapped.get(), length) {
+        let _ = memory.unmap(mapped, length);
+        refresh_kernel_memory_readable_ranges(memory);
+        return error;
+    }
     refresh_kernel_memory_readable_ranges(memory);
     write_guest_u64(output, mapped.get());
-    if trace_guest_vm() {
+    if length >= 0x1_0000 || requested != mapped.get() || trace_guest_vm() {
         eprintln!(
-            "[REMu][VM] mapped direct={direct_start:#x} address={:#x} length={length:#x} protection={protection:#x}",
+            "[REMu][VM] mapped direct={direct_start:#x} address={:#x} requested={requested:#x} length={length:#x} protection={protection:#x} flags={flags:#x}",
             mapped.get()
         );
     }
@@ -454,6 +506,12 @@ pub(crate) fn map_flexible_memory_core(
     if fixed && requested == 0 {
         return sce_kernel_error(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
     }
+    let (image_start, image_end) = process_image_range(state);
+    if fixed
+        && let Some(error) = process_image_overlap_error(image_start, image_end, requested, length)
+    {
+        return error;
+    }
     let memory = match kernel_memory_mut(state) {
         Ok(memory) => memory,
         Err(error) => return kernel_memory_error(&error),
@@ -470,9 +528,14 @@ pub(crate) fn map_flexible_memory_core(
             Ok(mapped) => mapped,
             Err(error) => return kernel_memory_error(&error),
         };
+    if let Some(error) = process_image_overlap_error(image_start, image_end, mapped.get(), length) {
+        let _ = memory.unmap(mapped, length);
+        refresh_kernel_memory_readable_ranges(memory);
+        return error;
+    }
     refresh_kernel_memory_readable_ranges(memory);
     write_guest_u64(output, mapped.get());
-    if trace_guest_vm() {
+    if length >= 0x1_0000 || trace_guest_vm() {
         eprintln!(
             "[REMu][VM] mapped flexible address={:#x} length={length:#x} protection={protection:#x} flags={flags:#x} name={name:?}",
             mapped.get()
@@ -668,6 +731,13 @@ pub(crate) fn kernel_reserve_virtual_range(
     }
 
     let requested = read_guest_u64(output);
+    let (image_start, image_end) = process_image_range(state);
+    if flags & 0x10 != 0
+        && requested != 0
+        && let Some(error) = process_image_overlap_error(image_start, image_end, requested, length)
+    {
+        return error;
+    }
     let memory = match kernel_memory_mut(state) {
         Ok(memory) => memory,
         Err(error) => return kernel_memory_error(&error),
@@ -683,13 +753,16 @@ pub(crate) fn kernel_reserve_virtual_range(
         Ok(address) => address,
         Err(error) => return kernel_memory_error(&error),
     };
-    write_guest_u64(output, reserved.get());
-    if trace_guest_vm() {
-        eprintln!(
-            "[REMu][VM] reserved address={:#x} length={length:#x} alignment={alignment:#x} flags={flags:#x}",
-            reserved.get()
-        );
+    if let Some(error) = process_image_overlap_error(image_start, image_end, reserved.get(), length)
+    {
+        let _ = memory.unmap(reserved, length);
+        return error;
     }
+    write_guest_u64(output, reserved.get());
+    eprintln!(
+        "[REMu][VM] reserved address={:#x} length={length:#x} alignment={alignment:#x} flags={flags:#x}",
+        reserved.get()
+    );
     0
 }
 
@@ -778,7 +851,7 @@ pub(crate) fn kernel_mprotect(arguments: [u64; 6], state: &mut ProbeDispatchStat
         Err(error) => return kernel_memory_error(&error),
     };
     refresh_kernel_memory_readable_ranges(memory);
-    if trace_guest_vm() {
+    if committed > 0 || trace_guest_vm() {
         eprintln!(
             "[REMu][VM] protected address={aligned_address:#x} length={aligned_length:#x} protection={protection:#x} committed={committed:#x}"
         );

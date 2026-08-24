@@ -1,12 +1,12 @@
 use crate::{
-    AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE, AGC_IT_INDEX_TYPE,
-    AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_R_DRAW_INDEX_AUTO, AGC_R_FLIP, CompletedVideoOutFlip,
-    KERNEL_EVENT_FILTER_GRAPHICS, KernelQueuedEvent, PendingVideoOutFlip, ProbeDispatchState,
-    QUEUED_FLIPS, VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE,
-    VIDEO_OUT_ERROR_INVALID_INDEX, VideoOutBufferAttributes, VideoOutState,
     agc_allocate_command_dwords, agc_pm4, emit_agc_gpu_event, kernel_process_time, low_i32,
-    low_u32, notify_kernel_equeue_waiters, publish_gpu_event, read_guest_u32,
-    read_guest_u64, sce_kernel_error, trace_logarithmic_sequence, write_guest_u32,
+    low_u32, notify_kernel_equeue_waiters, publish_gpu_event, read_guest_u32, read_guest_u64,
+    sce_kernel_error, trace_logarithmic_sequence, write_guest_u32, CompletedVideoOutFlip,
+    KernelQueuedEvent, PendingVideoOutFlip, ProbeDispatchState, VideoOutBufferAttributes,
+    VideoOutState, AGC_IT_DRAW_INDEX_OFFSET, AGC_IT_INDEX_BASE, AGC_IT_INDEX_BUFFER_SIZE,
+    AGC_IT_INDEX_TYPE, AGC_IT_NOP, AGC_IT_NUM_INSTANCES, AGC_R_DRAW_INDEX_AUTO, AGC_R_FLIP,
+    KERNEL_EVENT_FILTER_GRAPHICS, KERNEL_EVENT_FILTER_VIDEO_OUT, QUEUED_FLIPS,
+    VIDEO_OUT_ERROR_INVALID_ADDRESS, VIDEO_OUT_ERROR_INVALID_HANDLE, VIDEO_OUT_ERROR_INVALID_INDEX,
 };
 
 pub(crate) fn video_out_register_buffers2(
@@ -86,6 +86,10 @@ pub(crate) fn video_out_add_flip_event(arguments: [u64; 6], state: &mut ProbeDis
         return sce_kernel_error(VIDEO_OUT_ERROR_INVALID_ADDRESS);
     }
     state.video_out.flip_events.insert(equeue, arguments[2]);
+    eprintln!(
+        "[REMu][VIDEO] add flip event equeue={equeue:#x} user_data={:#x}",
+        arguments[2]
+    );
     0
 }
 
@@ -104,6 +108,11 @@ pub(crate) fn video_out_add_vblank_event(
     // OrbisVideoOutInternalEventId::Vblank == 1. Flip uses ident 6; keep them distinct so
     // sceVideoOutGetEventId can classify the queue entry.
     state.video_out.vblank_events.insert(equeue, arguments[2]);
+    eprintln!(
+        "[REMu][VIDEO] add vblank event equeue={equeue:#x} user_data={:#x}",
+        arguments[2]
+    );
+    crate::start_display_clock_pump();
     0
 }
 
@@ -225,10 +234,11 @@ pub(crate) fn queue_video_out_flip_for_video_out(
 
 pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) {
     let completed = remu_gpu::take_gpu_completed_flips();
-    if completed.is_empty() {
+    if completed.is_empty() && state.video_out.vblank_events.is_empty() {
         return;
     }
     let mut queued = false;
+    let mut queued_flip_vblank = false;
     let (_h, mut events) = crate::event_state::lock_event_state_for_write();
     for completion in completed {
         let Some(index) = events
@@ -263,12 +273,12 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in registrations {
-            crate::event_state::queue_kernel_event_into(
+            crate::event_state::queue_kernel_event_distinct(
                 &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 6,
-                    filter: -13,
+                    filter: KERNEL_EVENT_FILTER_VIDEO_OUT,
                     flags: 0,
                     fflags: 0,
                     data: event_data,
@@ -294,12 +304,12 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
             .map(|(&equeue, &user_data)| (equeue, user_data))
             .collect::<Vec<_>>();
         for (equeue, user_data) in vblank_registrations {
-            crate::event_state::queue_kernel_event_into(
+            crate::event_state::queue_kernel_event_distinct(
                 &mut events,
                 KernelQueuedEvent {
                     equeue,
                     ident: 1,
-                    filter: -13,
+                    filter: KERNEL_EVENT_FILTER_VIDEO_OUT,
                     flags: 0,
                     fflags: 0,
                     data: state.video_out.completed_flip_count,
@@ -309,8 +319,13 @@ pub(crate) fn refresh_completed_video_out_flips(state: &mut ProbeDispatchState) 
                 },
             );
             queued = true;
+            queued_flip_vblank = true;
         }
     }
+    if queued_flip_vblank {
+        crate::av::note_flip_coincident_vblank(state);
+    }
+    queued |= crate::av::deliver_display_clock_vblanks(state, &mut events);
     drop(events);
     if queued {
         notify_kernel_equeue_waiters();

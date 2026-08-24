@@ -15,15 +15,14 @@ use super::{
     diagnostic_target_after_mrt_ready, diagnostic_texture_numeric_range, diagnostic_texture_writer,
     diagnostic_texture_writer_enabled, dump_msl_compute_filter_matches,
     image_resource_descriptor_is_null, is_storage_image_opcode, is_writable_image_opcode,
-    metal_uncompressed_bytes_per_pixel, read_texture_linear,
-    rearm_color_metadata_clear,
-    rearm_depth_metadata_clear, record_diagnostic_global_writers, record_diagnostic_texture_writer,
-    resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
-    resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
-    resident_volume_sample_is_eligible,
-    shader_scalar_metadata_for_registers,
-    storage_image_requires_mip_hierarchy, trace_target_sampling, upload_image_textures,
-    log_wave64_hazard_census, validate_compute_launch_for_metal, wave64_split_blockers,
+    log_wave64_hazard_census, metal_uncompressed_bytes_per_pixel, read_texture_linear,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
+    record_diagnostic_texture_writer, resident_color_view_sample_is_eligible,
+    resident_depth_sample_is_eligible, resident_offset_alias_sample_is_eligible,
+    resident_same_image_sample_is_eligible, resident_volume_sample_is_eligible,
+    shader_scalar_metadata_for_registers, storage_image_requires_mip_hierarchy,
+    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
+    wave64_split_blockers,
 };
 use metal::{MTLPixelFormat, MTLResourceOptions, MTLResourceUsage, MTLSize};
 use remu_gpu::{ComputeDispatch, ComputeGrid};
@@ -187,15 +186,11 @@ impl MetalPresenter {
                                 .data
                                 .chunks_exact(4)
                                 .take(8)
-                                .map(|chunk| {
-                                    u32::from_le_bytes(chunk.try_into().expect("dword"))
-                                })
+                                .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("dword")))
                                 .collect::<Vec<_>>();
                             format!(
                                 "b{index} {:#x}/{}B wr={} data={words:08x?}",
-                                binding.base_address,
-                                binding.byte_count,
-                                binding.writable,
+                                binding.base_address, binding.byte_count, binding.writable,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -234,9 +229,8 @@ impl MetalPresenter {
                     || binding.opcode.starts_with("ImageAtomic")
                 {
                     use std::fmt::Write as _;
-                    let address = u64::from(binding.resource_descriptor.first().copied().
-                        unwrap_or(0))
-                        << 8;
+                    let address =
+                        u64::from(binding.resource_descriptor.first().copied().unwrap_or(0)) << 8;
                     let _ = write!(writes, " iw={address:#x}");
                 }
             }

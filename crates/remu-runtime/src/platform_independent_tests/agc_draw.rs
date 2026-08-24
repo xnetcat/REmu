@@ -144,15 +144,18 @@ fn explicit_zero_target_mask_does_not_enable_targetless_scanout_fallback() {
     assert!(!color_target_absent);
 
     let mut draw = targetless_scanout_test_draw();
-    draw.pixel_shader_evaluation = Some(Arc::new(remu_shader::ShaderEvaluation {
-        initial_scalar_registers: Vec::new().into(),
-        scalar_registers: Vec::new().into(),
-        scalar_memory_reads: Vec::new(),
-        image_bindings: Vec::new(),
-        global_memory_bindings: Vec::new(),
-        compute_system_registers: None,
-        vertex_inputs: Vec::new(),
-    }).into());
+    draw.pixel_shader_evaluation = Some(
+        Arc::new(remu_shader::ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        })
+        .into(),
+    );
     crate::agc_resolve_targetless_scanout(
         &mut graphics,
         &mut draw,
@@ -486,51 +489,58 @@ fn targetless_scanout_resolution_requires_complete_unambiguous_draw_state() {
         "failed resource evaluation is not guessed"
     );
 
-    draw.pixel_shader_evaluation = Some(Arc::new(remu_shader::ShaderEvaluation {
-        initial_scalar_registers: Vec::new().into(),
-        scalar_registers: Vec::new().into(),
-        scalar_memory_reads: Vec::new(),
-        image_bindings: Vec::new(),
-        global_memory_bindings: Vec::new(),
-        compute_system_registers: None,
-        vertex_inputs: Vec::new(),
-    }).into());
+    draw.pixel_shader_evaluation = Some(
+        Arc::new(remu_shader::ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        })
+        .into(),
+    );
     crate::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
     assert_eq!(
         draw.scanout_target, None,
         "a constant export with no sampled source is not a display composite"
     );
 
-    draw.pixel_shader_evaluation = Some(Arc::new(remu_shader::ShaderEvaluation {
-        initial_scalar_registers: Vec::new().into(),
-        scalar_registers: Vec::new().into(),
-        scalar_memory_reads: Vec::new(),
-        image_bindings: vec![remu_shader::ImageBinding { descriptor_index_is_runtime: false,
-            pc: 0,
-            opcode: remu_shader::Opcode::Known("ImageSample"),
-            control: remu_shader::ImageControl {
-                dmask: 0xf,
-                vector_address: 0,
-                address_registers: Vec::new(),
-                vector_data: 0,
-                scalar_resource: 0,
-                scalar_sampler: 0,
-                dimension: 2,
-                is_array: false,
-                glc: false,
-                slc: false,
-                a16: false,
-                d16: false,
-                unorm: false,
-            },
-            resource_descriptor: vec![1, 0, 0, 0].into(),
-            sampler_descriptor: vec![0; 4].into(),
-            mip_level: None,
-        }],
-        global_memory_bindings: Vec::new(),
-        compute_system_registers: None,
-        vertex_inputs: Vec::new(),
-    }).into());
+    draw.pixel_shader_evaluation = Some(
+        Arc::new(remu_shader::ShaderEvaluation {
+            initial_scalar_registers: Vec::new().into(),
+            scalar_registers: Vec::new().into(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: vec![remu_shader::ImageBinding {
+                descriptor_index_is_runtime: false,
+                pc: 0,
+                opcode: remu_shader::Opcode::Known("ImageSample"),
+                control: remu_shader::ImageControl {
+                    dmask: 0xf,
+                    vector_address: 0,
+                    address_registers: Vec::new(),
+                    vector_data: 0,
+                    scalar_resource: 0,
+                    scalar_sampler: 0,
+                    dimension: 2,
+                    is_array: false,
+                    glc: false,
+                    slc: false,
+                    a16: false,
+                    d16: false,
+                    unorm: false,
+                },
+                resource_descriptor: vec![1, 0, 0, 0].into(),
+                sampler_descriptor: vec![0; 4].into(),
+                mip_level: None,
+            }],
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        })
+        .into(),
+    );
     crate::agc_resolve_targetless_scanout(&mut graphics, &mut draw, true, Some(target));
     assert_eq!(
         draw.scanout_target.map(|scanout| scanout.address),

@@ -9,8 +9,8 @@ use metal::{
 use remu_gpu::{
     ComputeDispatch, ComputeDispatchSource, ComputeGrid, ComputeLaunch, GpuEvent, GpuFlipWait,
     GpuMemoryAcquire, GpuMemoryCopy, GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait,
-    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw,
-    ShaderEvaluationSnapshot, ShaderSnapshot, gpu_event_channel,
+    GpuMemoryWrite, GpuPipelineBarrier, GpuPipelineStage, IndexedDraw, ShaderEvaluationSnapshot,
+    ShaderSnapshot, gpu_event_channel,
 };
 
 use remu_memory::{
@@ -34,10 +34,9 @@ use super::super::submission::{
 };
 use super::super::{
     CachedGlobalBuffer, FlipTerminalSource, GUEST_BATCH_COMPLETION_CAPACITY, GlobalBufferCacheKey,
-    GlobalUploadChunk, PendingGuestWriteRange,
-    PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT,
-    SameQueueDmaFillReject, SharedEventDrawReject, SharedEventFence,
-    SharedEventGlobalBufferVersion, SharedEventHostEffectLatencyPhase,
+    GlobalUploadChunk, PendingGuestWriteRange, PhysicalFootprintRange, SHARED_HOST_KIND_ACQUIRE,
+    SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_WAIT, SameQueueDmaFillReject, SharedEventDrawReject,
+    SharedEventFence, SharedEventGlobalBufferVersion, SharedEventHostEffectLatencyPhase,
     SharedEventHostEffectLatencyState, SharedEventHostEffectLatencyStatistics,
     SharedEventProducerId, SharedEventSignalCheckpoint, SharedEventWriteKind, UploadedGlobalBuffer,
 };
@@ -226,15 +225,18 @@ pub(super) fn shared_event_depth_draw(address: u64) -> IndexedDraw {
         supplemental_programs: Arc::from([]),
         metadata: None,
     });
-    draw.export_shader_evaluation = Some(Arc::new(ShaderEvaluation {
-        initial_scalar_registers: Default::default(),
-        scalar_registers: Default::default(),
-        scalar_memory_reads: Vec::new(),
-        image_bindings: Vec::new(),
-        global_memory_bindings: Vec::new(),
-        compute_system_registers: None,
-        vertex_inputs: Vec::new(),
-    }).into());
+    draw.export_shader_evaluation = Some(
+        Arc::new(ShaderEvaluation {
+            initial_scalar_registers: Default::default(),
+            scalar_registers: Default::default(),
+            scalar_memory_reads: Vec::new(),
+            image_bindings: Vec::new(),
+            global_memory_bindings: Vec::new(),
+            compute_system_registers: None,
+            vertex_inputs: Vec::new(),
+        })
+        .into(),
+    );
     super::append_depth_target_registers(&mut draw, address, 64, 64, 0xa000_0003, 0x66);
     draw
 }
@@ -434,7 +436,11 @@ fn global_upload_uses_readonly_sidecar_without_cloning_shader_evaluation() {
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
-    let queue = presenter.command_queue.as_ref().expect("Metal queue").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
     presenter.ensure_open_guest_batch(&queue);
 
     let evaluation = Arc::new(evaluation_with_global(GlobalMemoryBinding {
@@ -477,7 +483,11 @@ fn null_global_alias_uses_the_live_bindings_sidecar() {
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
     presenter.per_queue_guest_batches = false;
     let device = presenter.device.as_ref().expect("Metal device").clone();
-    let queue = presenter.command_queue.as_ref().expect("Metal queue").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
     presenter.ensure_open_guest_batch(&queue);
 
     let mut evaluation = evaluation_with_global(GlobalMemoryBinding {
@@ -1068,6 +1078,16 @@ fn queued_global_writer_buffer_is_forwarded_to_later_snapshot() {
     assert_eq!(indirect.offset, 48);
     assert!(!indirect.guest_memory);
 
+    let stale_packet = presenter
+        .upload_indirect_dispatch_arguments(
+            &device,
+            0x12_0010,
+            [1_971_877_254, 1_972_139_403, 1_972_008_331],
+        )
+        .expect("a queued GPU producer wins over an implausible packet snapshot");
+    assert!(std::ptr::eq(stale_packet.buffer.as_ref(), producer.as_ref()));
+    assert_eq!(stale_packet.offset, 48);
+
     let indexed_draw = presenter
         .upload_ordered_indirect_arguments(&device, 0x12_0010, 5 * std::mem::size_of::<u32>())
         .expect("indexed draw arguments forward the queued GPU producer");
@@ -1116,6 +1136,38 @@ fn cpu_indirect_dispatch_uses_the_packet_snapshot_after_guest_reuse() {
 
     assert_eq!(observed, expected);
     assert_ne!(guest_arguments, packet_snapshot);
+    assert!(!uploaded.guest_memory);
+}
+
+#[test]
+fn implausible_indirect_packet_snapshot_does_not_bake_a_huge_grid() {
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let queue = presenter
+        .command_queue
+        .as_ref()
+        .expect("Metal queue")
+        .clone();
+    presenter.ensure_open_guest_batch(&queue);
+
+    let mut guest_arguments = [1_971_877_254_u32, 1_972_139_403, 1_972_008_331];
+    let address = guest_arguments.as_mut_ptr().addr() as u64;
+    let uploaded = presenter
+        .upload_indirect_dispatch_arguments(&device, address, guest_arguments)
+        .expect("implausible snapshot is replaced with an empty launch");
+    let observed = unsafe {
+        std::slice::from_raw_parts(
+            uploaded
+                .buffer
+                .contents()
+                .cast::<u8>()
+                .add(usize::try_from(uploaded.offset).expect("test offset fits usize")),
+            3 * std::mem::size_of::<u32>(),
+        )
+    };
+
+    assert_eq!(observed, [0_u8; 12]);
     assert!(!uploaded.guest_memory);
 }
 
@@ -2677,7 +2729,10 @@ fn pending_terminal_wait_settle_continues_the_same_drain_tick() {
             GpuMemoryRelease::label(address, GpuMemoryReleaseValue::Immediate32(2)),
         )
         .expect("producer label stays deferred in the open batch");
-    assert_eq!(presenter.pending_guest_memory_value(address, false), Some(2));
+    assert_eq!(
+        presenter.pending_guest_memory_value(address, false),
+        Some(2)
+    );
     assert!(presenter.committed_guest_batches.is_empty());
 
     let wait = GpuMemoryWait::memory(address, 2, u64::from(u32::MAX), 3, false);
@@ -2712,6 +2767,28 @@ fn pending_terminal_wait_settle_continues_the_same_drain_tick() {
         read_test_label(address),
         9,
         "the packet after WAIT_REG_MEM must run in the same drain, not the next AppKit tick"
+    );
+    remu_gpu::clear_event_sink();
+}
+
+#[test]
+fn an_unarmed_generation_wait_does_not_park_a_pointer_payload() {
+    remu_gpu::clear_event_sink();
+    let (_sender, receiver) = gpu_event_channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter initializes");
+    let (_label_space, address) = mapped_test_label();
+    let pointer_payload = u32::try_from((address.wrapping_add(0x20)) & 0xffff_ffff)
+        .expect("low 32 bits of the next-pointer");
+    // SAFETY: `address` is the mapped test label retained by `_label_space`.
+    unsafe {
+        std::ptr::write_volatile(address as *mut u32, pointer_payload);
+    }
+    let wait = GpuMemoryWait::memory(address, 1, u64::from(u32::MAX), 3, false);
+    assert_eq!(
+        presenter
+            .execute_guest_memory_wait(OrderedEventSource::GuestQueue(33), None, wait)
+            .expect("unarmed pointer payload must not deadlock the compute queue"),
+        GuestMemoryWaitStatus::Satisfied
     );
     remu_gpu::clear_event_sink();
 }
@@ -3221,10 +3298,12 @@ fn render_scalar_uploads_are_nonempty_aligned_and_do_not_alias() {
         signal_checkpoints: Vec::new(),
         completion_sequences: Vec::new(),
     };
-    assert!(batch
-        .upload_render_scalar_words(&device, &[])
-        .expect("empty scalar metadata")
-        .is_none());
+    assert!(
+        batch
+            .upload_render_scalar_words(&device, &[])
+            .expect("empty scalar metadata")
+            .is_none()
+    );
     assert!(
         batch.global_upload_chunks.is_empty(),
         "empty scalar metadata must not manufacture a Metal resource"
@@ -5392,10 +5471,8 @@ fn completion_capacity_commits_only_the_source_queue_batch() {
     open_per_queue_batch(&mut presenter, 0);
     for index in 0..GUEST_BATCH_COMPLETION_CAPACITY {
         assert_eq!(
-            presenter.record_guest_submission_boundary(
-                OrderedEventSource::GuestQueue(0),
-                index as u64,
-            ),
+            presenter
+                .record_guest_submission_boundary(OrderedEventSource::GuestQueue(0), index as u64,),
             index + 1 == GUEST_BATCH_COMPLETION_CAPACITY,
             "only the exact completion bound requests a flush"
         );

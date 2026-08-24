@@ -32,7 +32,8 @@ fn sdk_tile9_2d_mips_share_64k_placement_with_tile27() {
     };
 
     let mode9_layout = mode64k_2d_mip_chain_layout(mode9, 10).expect("SDK SW_64KB_S mip layout");
-    let mode27_layout = mode64k_2d_mip_chain_layout(mode27, 10).expect("SDK SW_64KB_R_X mip layout");
+    let mode27_layout =
+        mode64k_2d_mip_chain_layout(mode27, 10).expect("SDK SW_64KB_R_X mip layout");
 
     assert_eq!(mode9_layout, mode27_layout);
     assert_eq!(mode9_layout.block_width, 128);

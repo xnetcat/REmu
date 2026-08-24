@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::WrittenRegion;
+use super::decode::{STORAGE_ONLY_RASTER_EXTENT, storage_only_dummy_render_target};
 use super::{
     CB_BLEND_ALPHA, CB_BLEND_BLUE, CB_BLEND_GREEN, CB_BLEND_RED, CB_COLOR_CONTROL,
     CB_COLOR_REGISTER_STRIDE, CB_COLOR0_FMASK, CB_COLOR0_FMASK_BASE_EXT, ColorOperationMode,
@@ -9,19 +10,19 @@ use super::{
     DEFAULT_PA_SU_SC_MODE_CNTL, DIAGNOSTIC_MESH_POSITION_BUFFER_INDEX,
     DIAGNOSTIC_PIXEL_OUTPUT_BUFFER_INDEX, DIAGNOSTIC_PIXEL_OUTPUT_HEIGHT,
     DIAGNOSTIC_PIXEL_OUTPUT_WIDTH, DIAGNOSTIC_PIXEL_OUTPUT_WORDS_PER_PIXEL,
-    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX,
-    DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY, DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX,
-    DiagnosticScanoutWriter, FlushPolicy, GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey,
-    GuestBatchFlushReason, GuestBatchWork, GuestRenderPassKey, GuestScissor,
-    GuestTextureDescriptor, MetalPresenter, NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX,
-    OpenGuestRenderPass, PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL,
-    ResidencyState, ResidentTextureActivityStamp, ResourceSpan, SharedEventDrawTextureOverride,
+    DIAGNOSTIC_VERTEX_POSITION_BUFFER_INDEX, DIAGNOSTIC_VERTEX_POSITION_VERTEX_CAPACITY,
+    DIAGNOSTIC_VERTEX_STATE_WORDS_PER_VERTEX, DiagnosticScanoutWriter, FlushPolicy,
+    GUEST_BATCH_WORK_CAPACITY, GraphicsPipelineKey, GuestBatchFlushReason, GuestBatchWork,
+    GuestRenderPassKey, GuestScissor, GuestTextureDescriptor, MetalPresenter,
+    NGG_MESH_DRAW_BUFFER_INDEX, NGG_MESHLET_BUFFER_INDEX, OpenGuestRenderPass,
+    PA_SC_AA_MASK_X0Y0_X1Y0, PA_SC_AA_MASK_X0Y1_X1Y1, PA_SU_SC_MODE_CNTL, ResidencyState,
+    ResidentTextureActivityStamp, ResourceSpan, SharedEventDrawTextureOverride,
     SharedEventWriteKind, SpanQueryOrder, StaleSource, append_unique_global_writebacks,
     append_unique_guest_write_ranges, canonical_texture_bindings, capture_guest_frame,
     capture_target_sample_textures, collect_pending_global_writebacks,
     collect_pending_guest_write_ranges, collect_shared_event_global_versions,
-    color_operation_is_raster_noop, compute_program_can_split_wave64,
-    consume_color_metadata_clear, consume_depth_metadata_clear, create_global_argument_buffer,
+    color_operation_is_raster_noop, compute_program_can_split_wave64, consume_color_metadata_clear,
+    consume_depth_metadata_clear, create_global_argument_buffer,
     decode_color_eliminate_fast_clear_target, decode_color_operation_mode,
     decode_color_resolve_targets, decode_depth_target, decode_image_descriptor,
     decode_raster_state, decode_render_targets, decode_scissor, decode_viewport,
@@ -54,26 +55,22 @@ use super::{
     guest_texture_descriptors_overlap, guest_texture_descriptors_share_storage, half_float_to_f32,
     image_resource_descriptor_is_null, initial_depth_clear_for_target,
     initial_render_target_clear_color, is_storage_image_opcode, is_writable_image_opcode,
-    metal_nonindexed_vertex_count, metal_primitive_type, metal_uncompressed_bytes_per_pixel,
-    native_texture_capture_to_bgra, ngg_memoryless_cover_export_stage, ngg_mesh_base_vertex,
-    prepare_indexed_ngg_indices, procedural_rectangle_stage_for_draw,
-    prepare_indexed_primitive, prepare_nonindexed_ngg_indices, read_draw_indices,
-    read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
+    log_wave64_hazard_census, metal_nonindexed_vertex_count, metal_primitive_type,
+    metal_uncompressed_bytes_per_pixel, native_texture_capture_to_bgra,
+    ngg_memoryless_cover_export_stage, ngg_mesh_base_vertex, prepare_indexed_ngg_indices,
+    prepare_indexed_primitive, prepare_nonindexed_ngg_indices, procedural_rectangle_stage_for_draw,
+    read_draw_indices, read_texture_array_linear, read_texture_linear, read_texture_volume_linear,
     rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_global_writers,
     record_diagnostic_scanout_writer, record_diagnostic_texture_writer, register_value,
     render_target_cmask_address, render_target_fast_clear_color,
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
-    resident_volume_sample_is_eligible,
-    sampled_image_bindings,
+    resident_volume_sample_is_eligible, sampled_image_bindings,
     shader_scalar_metadata_for_registers, should_record_diagnostic_target_writer,
     snapshot_guest_texture_raw, spans_overlap, storage_image_requires_mip_hierarchy,
     trace_glyph_atlas, trace_image_descriptors, trace_msaa_writes, trace_scanout_writes,
-    log_wave64_hazard_census, trace_target_sampling, upload_image_textures,
-    validate_compute_launch_for_metal, video_target_binding_summary, wave64_split_blockers,
-};
-use super::decode::{
-    storage_only_dummy_render_target, STORAGE_ONLY_RASTER_EXTENT,
+    trace_target_sampling, upload_image_textures, validate_compute_launch_for_metal,
+    video_target_binding_summary, wave64_split_blockers,
 };
 use metal::{
     MTLClearColor, MTLCullMode, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat,
@@ -226,14 +223,8 @@ fn storage_only_raster_extent(draw: &IndexedDraw) -> (u32, u32) {
     // A 64x64 dummy clips that cover to a few percent of the LUT. Size the dummy to the
     // guest viewport so every fragment that ImageStore needs actually runs.
     let viewport = decode_viewport(draw, 1, 1, GuestScissor::Full);
-    let width = viewport
-        .width
-        .round()
-        .clamp(1.0, 4_096.0) as u32;
-    let height = viewport
-        .height
-        .round()
-        .clamp(1.0, 4_096.0) as u32;
+    let width = viewport.width.round().clamp(1.0, 4_096.0) as u32;
+    let height = viewport.height.round().clamp(1.0, 4_096.0) as u32;
     (
         width.max(STORAGE_ONLY_RASTER_EXTENT),
         height.max(STORAGE_ONLY_RASTER_EXTENT),
@@ -679,9 +670,10 @@ impl MetalPresenter {
             return Ok(());
         }
         if trace_target_sampling()
-            && targets.iter().any(|target| {
-            target.texture.width == 1_920 && target.texture.height == 1_080
-        }) {
+            && targets
+                .iter()
+                .any(|target| target.texture.width == 1_920 && target.texture.height == 1_080)
+        {
             static LOGGED_SCENE_HDR: AtomicUsize = AtomicUsize::new(0);
             let sequence = LOGGED_SCENE_HDR.fetch_add(1, Ordering::Relaxed) + 1;
             if sequence <= 32 || sequence.is_power_of_two() {
@@ -689,13 +681,7 @@ impl MetalPresenter {
                 let pipeline_masks = key
                     .targets
                     .iter()
-                    .map(|target| {
-                        (
-                            target.guest_slot,
-                            target.write_mask,
-                            target.export_format,
-                        )
-                    })
+                    .map(|target| (target.guest_slot, target.write_mask, target.export_format))
                     .collect::<Vec<_>>();
                 let color_targets = targets
                     .iter()
@@ -992,12 +978,10 @@ impl MetalPresenter {
             .ok_or("Metal device is unavailable")?
             .clone();
         let queue = self.active_guest_command_queue()?;
-        let storage_only_draw = targets.is_empty()
-            && depth.is_none()
-            && draw.pixel_shader.is_some();
+        let storage_only_draw =
+            targets.is_empty() && depth.is_none() && draw.pixel_shader.is_some();
         if storage_only_draw {
-            static LOGGED: std::sync::atomic::AtomicUsize =
-                std::sync::atomic::AtomicUsize::new(0);
+            static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
             if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
                 let bindings = pixel_evaluation
                     .image_bindings
@@ -1135,8 +1119,8 @@ impl MetalPresenter {
                 // Decide the attachment load policy only after residency has observed mapping
                 // replacement and restored any B15-demoted GPU authority. The ensure below is too
                 // late: this boolean decides whether DCC bytes are loaded or discarded.
-                let has_resident_storage = self
-                    .render_target_has_live_resident_storage(target.texture, target.span)?;
+                let has_resident_storage =
+                    self.render_target_has_live_resident_storage(target.texture, target.span)?;
                 let metadata_clear_pending = consume_color_metadata_clear(
                     &mut self.color_metadata_clears,
                     render_target_cmask_address(target, &draw.context_registers)?,
@@ -1399,14 +1383,14 @@ impl MetalPresenter {
         for evaluation in [export_evaluation, pixel_evaluation] {
             for binding in &evaluation.image_bindings {
                 if binding.resource_descriptor.iter().all(|word| *word == 0)
-                    || super::decode::decode_image_descriptor(&binding.resource_descriptor)
-                        .is_ok()
+                    || super::decode::decode_image_descriptor(&binding.resource_descriptor).is_ok()
                 {
                     continue;
                 }
-                let Some(source) =
-                    super::texture::descriptor_source_address(evaluation, &binding.resource_descriptor)
-                else {
+                let Some(source) = super::texture::descriptor_source_address(
+                    evaluation,
+                    &binding.resource_descriptor,
+                ) else {
                     continue;
                 };
                 if self.any_guest_batch(|batch| {
@@ -1582,8 +1566,9 @@ impl MetalPresenter {
         }
         if trace_target_sampling()
             && pixel_textures.iter().any(|texture| {
-            texture.descriptor.texture_type == 10 && texture.descriptor.layer_count >= 32
-        }) {
+                texture.descriptor.texture_type == 10 && texture.descriptor.layer_count >= 32
+            })
+        {
             static LOGGED_GRADE: AtomicUsize = AtomicUsize::new(0);
             if LOGGED_GRADE.fetch_add(1, Ordering::Relaxed) < 8 {
                 let bindings = pixel_textures
@@ -1659,15 +1644,11 @@ impl MetalPresenter {
                             .data
                             .chunks_exact(4)
                             .take(64)
-                            .map(|chunk| {
-                                u32::from_le_bytes(chunk.try_into().expect("dword"))
-                            })
+                            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("dword")))
                             .collect::<Vec<_>>();
                         format!(
                             "b{index} {:#x}/{}B wr={} data={words:08x?}",
-                            binding.base_address,
-                            binding.byte_count,
-                            binding.writable,
+                            binding.base_address, binding.byte_count, binding.writable,
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1676,12 +1657,7 @@ impl MetalPresenter {
                     texture.get_bytes(
                         raw.as_mut_ptr().cast(),
                         u64::from(width) * 8,
-                        metal::MTLRegion::new_2d(
-                            u64::from(width / 2),
-                            u64::from(height / 2),
-                            1,
-                            1,
-                        ),
+                        metal::MTLRegion::new_2d(u64::from(width / 2), u64::from(height / 2), 1, 1),
                         0,
                     );
                     [
@@ -1707,11 +1683,7 @@ impl MetalPresenter {
                         );
                         format!(
                             "{:#x} center=[{:.4},{:.4},{:.4},{:.4}]",
-                            texture.descriptor.guest.address,
-                            rgba[0],
-                            rgba[1],
-                            rgba[2],
-                            rgba[3],
+                            texture.descriptor.guest.address, rgba[0], rgba[1], rgba[2], rgba[3],
                         )
                     })
                     .collect::<Vec<_>>();
@@ -1855,11 +1827,7 @@ impl MetalPresenter {
                 draw.sequence, draw.export_shader_address, draw.pixel_shader_address,
             );
             for (stage, evaluation, textures) in [
-                (
-                    "vertex",
-                    export_evaluation,
-                    export_textures.as_slice(),
-                ),
+                ("vertex", export_evaluation, export_textures.as_slice()),
                 ("pixel", pixel_evaluation, pixel_textures.as_slice()),
             ] {
                 for (binding_index, (binding, uploaded)) in canonical_texture_bindings(evaluation)
@@ -2934,11 +2902,7 @@ impl MetalPresenter {
                 encoder.set_fragment_texture(*index, Some(&texture.texture));
             }
             for (buffer_slot, argument_buffer, textures) in &pixel_heap_tables {
-                encoder.set_fragment_buffer(
-                    u64::from(*buffer_slot),
-                    Some(argument_buffer),
-                    0,
-                );
+                encoder.set_fragment_buffer(u64::from(*buffer_slot), Some(argument_buffer), 0);
                 for texture in textures {
                     let usage = if texture.usage().contains(MTLTextureUsage::ShaderWrite) {
                         MTLResourceUsage::Read | MTLResourceUsage::Write
@@ -4573,8 +4537,7 @@ impl MetalPresenter {
                                 let uv = uv_raw.map(f32::from_bits);
                                 let raw = [words[3], words[4], words[5], words[6]];
                                 let value = raw.map(f32::from_bits);
-                                let texture_sample_raw =
-                                    [words[7], words[8], words[9], words[10]];
+                                let texture_sample_raw = [words[7], words[8], words[9], words[10]];
                                 let texture_sample = texture_sample_raw.map(f32::from_bits);
                                 (
                                     pixel % DIAGNOSTIC_PIXEL_OUTPUT_WIDTH,

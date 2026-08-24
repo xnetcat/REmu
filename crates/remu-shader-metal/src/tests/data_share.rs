@@ -847,30 +847,15 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
     };
     let front = Program::new(
         0x1000,
-        vec![
-            Instruction {
-                pc: 0,
-                encoding: ShaderEncoding::Ds,
-                opcode: Opcode::Known("DsWriteB32"),
-                words: vec![0, 0],
-                sources: vec![Operand::vector(0), Operand::vector(1)],
-                destinations: Vec::new(),
-                control: Some(InstructionControl::DataShare(DataShareControl {
-                    offset0: 0,
-                    offset1: 0,
-                    gds: false,
-                })),
-            },
-            Instruction {
-                pc: 8,
-                encoding: ShaderEncoding::Sop1,
-                opcode: Opcode::Known("SSetpcB64"),
-                words: vec![0xbe80_2006],
-                sources: vec![Operand::scalar(6)],
-                destinations: Vec::new(),
-                control: None,
-            },
-        ],
+        vec![Instruction {
+            pc: 0,
+            encoding: ShaderEncoding::Sop1,
+            opcode: Opcode::Known("SSetpcB64"),
+            words: vec![0xbe80_2006],
+            sources: vec![Operand::scalar(6)],
+            destinations: Vec::new(),
+            control: None,
+        }],
     );
     let continuation = Program::new(
         0x4000,
@@ -952,11 +937,11 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
             },
         ],
     );
-    let linked = remu_shader::link_program_continuation(&front, &continuation)
+    let linked_without_es_lds = remu_shader::link_program_continuation(&front, &continuation)
         .expect("exact fused front/back pair");
 
     let missing_stride = compile_msl(
-        &linked,
+        &linked_without_es_lds,
         &empty_evaluation(),
         &MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96),
     )
@@ -965,6 +950,69 @@ fn lowers_linked_ngg_front_and_export_continuation_with_silent_hill_lds_allocati
         missing_stride
             .to_string()
             .contains("missing VGT_ESGS_RING_ITEMSIZE")
+    );
+
+    let es_lds_write = |pc, offset0| Instruction {
+        pc,
+        encoding: ShaderEncoding::Ds,
+        opcode: Opcode::Known("DsWriteB32"),
+        words: vec![0, 0],
+        sources: vec![Operand::vector(0), Operand::vector(1)],
+        destinations: Vec::new(),
+        control: Some(InstructionControl::DataShare(DataShareControl {
+            offset0,
+            offset1: 0,
+            gds: false,
+        })),
+    };
+    let front_with_es_lds = Program::new(
+        0x1000,
+        vec![
+            es_lds_write(0, 0),
+            es_lds_write(8, 4),
+            es_lds_write(16, 8),
+            es_lds_write(24, 12),
+            Instruction {
+                pc: 32,
+                encoding: ShaderEncoding::Sop1,
+                opcode: Opcode::Known("SSetpcB64"),
+                words: vec![0xbe80_2006],
+                sources: vec![Operand::scalar(6)],
+                destinations: Vec::new(),
+                control: None,
+            },
+        ],
+    );
+    let linked = remu_shader::link_program_continuation(&front_with_es_lds, &continuation)
+        .expect("exact fused front/back pair");
+    assert_eq!(linked.linked_esgs_ring_itemsize_dwords(), Some(4));
+
+    let inferred = compile_msl(
+        &linked,
+        &empty_evaluation(),
+        &MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96),
+    )
+    .expect("ES LDS write span must supply the missing ring itemsize");
+    assert!(
+        inferred.source.contains(
+            "uint remu_mesh_gs_vtx_offset_0 = ((((remu_mesh_primitive >> 0u) & 0x1ffu) * 4u)"
+        ),
+        "inferred ESGS stride must match the ES vertex record span"
+    );
+
+    let mut fallback_options = MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96);
+    fallback_options.enable_fixed_ngg_allocation_fallback();
+    let fallback = compile_msl(&linked, &empty_evaluation(), &fallback_options)
+        .expect("linked GS must declare scaled offsets on the default fixed wave64 ABI");
+    assert!(
+        fallback.source.contains("uint remu_mesh_gs_vtx_offset_0 ="),
+        "fixed-allocation fallback still feeds the linked GS continuation ABI"
+    );
+    assert!(
+        fallback
+            .source
+            .contains("remu_v_0 = remu_mesh_gs_vtx_offset_0;"),
+        "linked GS continuation must re-seed v0 from the declared scaled offsets"
     );
 
     let mut options = MetalCompileOptions::mesh(1, 16 * 1024, 96, 96, 96);

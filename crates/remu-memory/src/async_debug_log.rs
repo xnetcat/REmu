@@ -16,7 +16,7 @@
 
 use std::io::Write as _;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
 use std::time::{Duration, Instant};
 

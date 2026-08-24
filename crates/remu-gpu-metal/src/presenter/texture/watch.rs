@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    CachedSampledTexture, DecodedImageDescriptor, GuestTextureContentState, GuestTextureDescriptor,
-    GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
-    GpuDebtSet, RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
+    CachedSampledTexture, DecodedImageDescriptor, GpuDebtSet, GuestTextureContentState,
+    GuestTextureDescriptor, GuestTextureWatchRange, GuestTextureWriteWatch, MetalPresenter,
+    RESIDENT_TEXTURE_ACQUIRE_INVALIDATIONS, ResidentGuestTexture, ResourceSpan,
     SAMPLED_TEXTURE_CACHE_ACQUIRE_INVALIDATIONS, SAMPLED_TEXTURE_CACHE_CAPACITY, SampledTextureKey,
     StaleSource, TEXTURE_DIRTY_VALIDATION_BYTES, TEXTURE_DIRTY_VALIDATION_COUNT,
     TEXTURE_DIRTY_VALIDATION_NANOSECONDS, TEXTURE_DIRTY_VALIDATION_UNCHANGED,
     TEXTURE_SNAPSHOT_BYTES, TEXTURE_SNAPSHOT_COUNT, TEXTURE_SNAPSHOT_NANOSECONDS,
     TEXTURE_SNAPSHOT_UNSTABLE_COUNT, WriteWatchRefresh, gpu_written_resident_serving_sampled_key,
-    guest_texture_byte_count, mode27_mip_chain_layout,
-    record_texture_dirty_work_detail, record_texture_snapshot_work_detail, record_texture_work,
-    retire_sampled_texture, texture_alias_trace_match, trace_alias_correlated_acquire,
-    trace_resident_texture_demotion, trace_resident_texture_removal,
+    guest_texture_byte_count, mode27_mip_chain_layout, record_texture_dirty_work_detail,
+    record_texture_snapshot_work_detail, record_texture_work, retire_sampled_texture,
+    texture_alias_trace_match, trace_alias_correlated_acquire, trace_resident_texture_demotion,
+    trace_resident_texture_removal,
 };
 use remu_gpu::GpuMemoryAcquire;
 use remu_memory::{
@@ -971,7 +971,8 @@ pub(crate) fn sampled_texture_raw_range(
         ));
     }
     Ok((
-        usize::try_from(span.address()).map_err(|_| "sampled texture address does not fit usize")?,
+        usize::try_from(span.address())
+            .map_err(|_| "sampled texture address does not fit usize")?,
         usize::try_from(span.len()).map_err(|_| "sampled texture byte count does not fit usize")?,
     ))
 }

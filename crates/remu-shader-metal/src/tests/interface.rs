@@ -90,6 +90,20 @@ fn compressed_normalized_exports_decode_fixed_point_instead_of_fp16() {
 }
 
 #[test]
+fn compressed_float_export_accepts_zero_col_format_as_fp16() {
+    let shader = compile_pixel_export_mask_and_format(
+        PixelOutputKind::Float,
+        true,
+        0x05,
+        PixelExportFormat::Zero,
+    );
+    assert!(
+        shader.source.contains("as_type<half2>(remu_v_0)"),
+        "Zero COL_FORMAT still has to unpack the compressed float EXP payload"
+    );
+}
+
+#[test]
 fn compressed_pixel_export_preserves_guest_alpha() {
     // Alpha is architectural shader output, including zero for additive and premultiplied-alpha
     // pixels. The translator must not infer coverage from unrelated RGB channels.

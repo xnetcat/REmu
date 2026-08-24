@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::{
-    ProbeDispatchState, compare_i32, dispatch_guest_numeric_parser, guest_free,
-    guest_global_locale, guest_qsort, guest_tolower_table, guest_toupper_table, guest_wmemchr,
-    guest_wmemcmp, guest_wmemcpy, guest_wmemmove, low_f32, read_guest_u16, read_guest_u64,
-    sce_kernel_error,
+    ProbeDispatchState, compare_i32, dispatch_guest_numeric_parser, dispatch_probe_import,
+    guest_free, guest_global_locale, guest_qsort, guest_tolower_table, guest_toupper_table,
+    guest_wmemchr, guest_wmemcmp, guest_wmemcpy, guest_wmemmove, low_f32, read_guest_u16,
+    read_guest_u64, sce_kernel_error, write_guest_u64,
 };
 
 #[test]
@@ -128,4 +128,63 @@ fn sorts_guest_elements_with_the_guest_comparator() {
         0,
     ]);
     assert_eq!(values, [-2, 0, 4, 7, 11]);
+}
+
+#[repr(C)]
+struct ApplicationHeapApi {
+    malloc: u64,
+    free: u64,
+    calloc: u64,
+    realloc: u64,
+    memalign: u64,
+    posix_memalign: u64,
+    unused: [u64; 4],
+}
+
+extern "C" fn heap_api_malloc(size: u64) -> u64 {
+    0x1111_0000 + size
+}
+
+extern "C" fn heap_api_free(_address: u64) {}
+
+extern "C" fn heap_api_reentrant_malloc(size: u64) -> u64 {
+    crate::libc_malloc(size)
+}
+
+#[test]
+fn routes_libc_malloc_through_the_registered_application_heap_api() {
+    let mut api = ApplicationHeapApi {
+        malloc: heap_api_malloc as *const () as usize as u64,
+        free: heap_api_free as *const () as usize as u64,
+        calloc: 0,
+        realloc: 0,
+        memalign: 0,
+        posix_memalign: 0,
+        unused: [0; 4],
+    };
+    let api_address = u64::try_from(std::ptr::from_mut(&mut api).addr()).unwrap();
+    let mut state = ProbeDispatchState::default();
+
+    assert_eq!(
+        dispatch_probe_import(
+            "p5EcQeEeJAE",
+            [api_address, 0, 0, 0, 0, 0],
+            [0; 6],
+            &mut state
+        ),
+        0
+    );
+    assert_eq!(crate::libc_malloc(0x20), 0x1111_0020);
+    crate::libc_free(0x1111_0020);
+
+    write_guest_u64(
+        api_address,
+        heap_api_reentrant_malloc as *const () as usize as u64,
+    );
+    let host = crate::libc_malloc(32);
+    assert_ne!(host, 0);
+    assert_ne!(host, 0x1111_0020);
+    guest_free(host);
+
+    dispatch_probe_import("p5EcQeEeJAE", [0; 6], [0; 6], &mut state);
 }

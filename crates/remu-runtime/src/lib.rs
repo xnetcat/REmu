@@ -63,6 +63,7 @@ mod shader_cache;
 mod shader_eval;
 mod tls;
 mod tls_fault;
+mod truncated_va_fault;
 mod unwind;
 mod vfs;
 mod video_out;
@@ -987,8 +988,9 @@ struct RuntimeServiceState {
     play_go_open: bool,
     /// Declared package chunk identifiers discovered from the unpacked title metadata.
     ///
-    /// Empty means the metadata was unavailable; PlayGo then exposes the mandatory launch chunk
-    /// (zero) instead of claiming that every possible 16-bit identifier belongs to the package.
+    /// Empty means the metadata was unavailable. `scePlayGoGetChunkId` still reports the mandatory
+    /// launch chunk (zero). Locus/progress queries accept any identifier the title asks about,
+    /// because a fully extracted local image already has those files on disk.
     play_go_chunk_ids: Vec<u16>,
     save_data_dialog_status: i32,
     save_data_dialog_sequence: u64,
@@ -1096,6 +1098,13 @@ struct VideoOutState {
     flip_events: BTreeMap<u64, u64>,
     /// Equeues registered with `sceVideoOutAddVblankEvent`, keyed by queue handle.
     vblank_events: BTreeMap<u64, u64>,
+    /// Display-clock vblank count last turned into a kernel event.
+    ///
+    /// Flip completion used to be the only vblank producer. After a hitch with no further
+    /// flips, FlipThread's `sceVideoOutAddVblankEvent` wait never woke and the title sat at
+    /// 0 FPS. The display clock now fills in the missed ticks; this field keeps delivery
+    /// level-triggered so a 2s compile hitch does not enqueue 120 events.
+    last_delivered_vblank: u64,
     completed_flip_count: u64,
     /// Most recently completed flip, which `sceVideoOutGetFlipStatus` reports until the next one.
     last_completed_flip: Option<CompletedVideoOutFlip>,
@@ -1602,7 +1611,7 @@ impl Drop for EqueueWaitRegistration {
 }
 
 /// Prints the state of every completion-delivery leg, plus any waiter blocked past the threshold.
-fn report_equeue_delivery(stale_after_nanos: u64) {
+fn report_equeue_delivery(stale_after_nanos: u64, force_summary: bool) {
     let (inserted, coalesced) = event_state::equeue_insertion_counts();
     let drained = AGC_DRAINED_BACKEND_IDS.load(Ordering::Relaxed);
     let claimed = AGC_CLAIMED_BACKEND_IDS.load(Ordering::Relaxed);
@@ -1622,15 +1631,20 @@ fn report_equeue_delivery(stale_after_nanos: u64) {
                 .collect::<Vec<_>>()
         },
     );
-    eprintln!(
-        "[REMu][EQUEUE] backend_newest={} drained={drained} claimed={claimed} inserted={inserted} coalesced={coalesced} waits={}/{} wakes={} blocked={}",
-        remu_gpu::gpu_completed_submission_sequence(),
-        EQUEUE_WAITS_ENTERED.load(Ordering::Relaxed),
-        EQUEUE_WAITS_RETURNED.load(Ordering::Relaxed),
-        EQUEUE_WAKEUPS_SIGNALLED.load(Ordering::Relaxed),
-        blocked.len(),
-    );
     let now = guest_import_trace_nanos();
+    let stale_blocked = blocked
+        .iter()
+        .any(|(_, _, since, _)| now.saturating_sub(*since) >= stale_after_nanos);
+    if force_summary || stale_blocked || trace_guest_threads() {
+        eprintln!(
+            "[REMu][EQUEUE] backend_newest={} drained={drained} claimed={claimed} inserted={inserted} coalesced={coalesced} waits={}/{} wakes={} blocked={}",
+            remu_gpu::gpu_completed_submission_sequence(),
+            EQUEUE_WAITS_ENTERED.load(Ordering::Relaxed),
+            EQUEUE_WAITS_RETURNED.load(Ordering::Relaxed),
+            EQUEUE_WAKEUPS_SIGNALLED.load(Ordering::Relaxed),
+            blocked.len(),
+        );
+    }
     for (thread, equeue, since, thread_name) in blocked {
         let blocked_nanos = now.saturating_sub(since);
         if blocked_nanos < stale_after_nanos {
@@ -1653,10 +1667,9 @@ fn report_equeue_delivery(stale_after_nanos: u64) {
             snapshot
                 .as_ref()
                 .map_or_else(unknown, |snapshot| snapshot.arms.to_string()),
-            snapshot.as_ref().map_or_else(unknown, |snapshot| format!(
-                "{:?}",
-                snapshot.filters
-            )),
+            snapshot
+                .as_ref()
+                .map_or_else(unknown, |snapshot| format!("{:?}", snapshot.filters)),
         );
     }
 }
@@ -1958,6 +1971,18 @@ static GUEST_THREAD_UNIQUE_ID_KEY_INIT: Once = Once::new();
 
 static PTHREAD_KEY_GENERATIONS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256];
 static NEXT_PTHREAD_KEY_GENERATION: AtomicU64 = AtomicU64::new(1);
+/// Guest `HeapAPI` registered by `_sceKernelRtldSetApplicationHeapAPI`.
+///
+/// Stored in an atomic so the pre-lock libc malloc family can read it without taking
+/// `PROBE_DISPATCH`. The table itself lives in guest memory and is re-read per call.
+static APPLICATION_HEAP_API: AtomicU64 = AtomicU64::new(0);
+static APPLICATION_HEAP_API_LOGGED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Prevents libc malloc from re-entering the same guest heap callback if that callback
+    /// itself calls back into the HLE malloc NIDs (libc registering its own malloc).
+    static APPLICATION_HEAP_REENTRANT: Cell<bool> = const { Cell::new(false) };
+}
 
 #[cfg(target_os = "macos")]
 fn cached_kernel_memory_readable_range_end(address: u64) -> Option<u64> {
@@ -2556,6 +2581,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     state.thread_dtors_callback = 0;
     state.module_tls_destructor_refs.clear();
     state.application_heap_api_address = 0;
+    APPLICATION_HEAP_API.store(0, Ordering::Release);
+    APPLICATION_HEAP_API_LOGGED.store(false, Ordering::Release);
     state.bundled_modules.clone_from(&image.bundled_modules);
     module_lifecycle::reset_guest_module_registry(image.bundled_modules.iter().map(|module| {
         module_lifecycle::GuestModule {
@@ -2675,6 +2702,8 @@ fn configure_probe_dispatch(image: &LinkedImage, game_root: &Path, maximum_hits:
     path_roots::republish_from_dispatch(&state);
     drop(state);
     publish_system_splash(system_splash);
+    start_guest_import_trace_reporter();
+    start_display_clock_pump();
 }
 
 /// Dumps selected linked guest ranges before any module initializer or process entry can mutate
@@ -3058,7 +3087,10 @@ fn report_longest_blocked_guest_threads(
         .iter()
         .filter(|(_, _, _, _, _, thread)| !previously_blocked.contains(thread))
         .map(|(age, name, phase, import, argument0, _)| {
-            format!("{name}:{}ms:{phase}:{import}:{argument0:#x}", age / 1_000_000)
+            format!(
+                "{name}:{}ms:{phase}:{import}:{argument0:#x}",
+                age / 1_000_000
+            )
         })
         .collect::<Vec<_>>();
     let left = previously_blocked.difference(&current).count();
@@ -3071,7 +3103,10 @@ fn report_longest_blocked_guest_threads(
         .iter()
         .take(4)
         .map(|(age, name, phase, import, argument0, _)| {
-            format!("{name}:{}ms:{phase}:{import}:{argument0:#x}", age / 1_000_000)
+            format!(
+                "{name}:{}ms:{phase}:{import}:{argument0:#x}",
+                age / 1_000_000
+            )
         })
         .collect::<Vec<_>>()
         .join(" ");
@@ -3100,19 +3135,76 @@ fn guest_import_trace_nanos() -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+pub(crate) fn start_display_clock_pump() {
+    static PUMP: OnceLock<()> = OnceLock::new();
+    PUMP.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("REMu display clock".to_owned())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_micros(
+                        crate::av::VIDEO_OUT_VBLANK_INTERVAL_MICROSECONDS,
+                    ));
+                    let Some(dispatch) = PROBE_DISPATCH.get() else {
+                        continue;
+                    };
+                    let has_listeners = dispatch.try_read().ok().is_some_and(|state| {
+                        state.video_out.is_open && !state.video_out.vblank_events.is_empty()
+                    });
+                    if !has_listeners {
+                        continue;
+                    }
+                    let mut state = lock_probe_dispatch_for_write(dispatch);
+                    let (_event_hierarchy, mut events) = event_state::lock_event_state_for_write();
+                    let queued =
+                        crate::av::deliver_display_clock_vblanks(&mut state, &mut events);
+                    drop(events);
+                    drop(state);
+                    if queued {
+                        notify_kernel_equeue_waiters();
+                    }
+                }
+            })
+            .expect("display clock pump must start");
+    });
+}
+
 fn start_guest_import_trace_reporter() {
     GUEST_IMPORT_TRACE_REPORTER.get_or_init(|| {
         std::thread::Builder::new()
             .name("REMu guest import trace".to_owned())
             .spawn(|| {
                 const STALE_AFTER: Duration = Duration::from_secs(2);
+                const GPU_IDLE_AFTER: Duration = Duration::from_secs(5);
+                const GPU_IDLE_DUMP_INTERVAL: Duration = Duration::from_secs(10);
                 let stale_after_nanos =
                     u64::try_from(STALE_AFTER.as_nanos()).unwrap_or(u64::MAX);
+                let idle_after_millis =
+                    u64::try_from(GPU_IDLE_AFTER.as_millis()).unwrap_or(u64::MAX);
                 let mut reported_agc_counters = (u64::MAX, u64::MAX, u64::MAX);
                 let mut previously_blocked_threads = BTreeSet::new();
+                let mut last_gpu_idle_dump = Instant::now()
+                    .checked_sub(GPU_IDLE_DUMP_INTERVAL)
+                    .unwrap_or_else(Instant::now);
                 loop {
                     std::thread::sleep(STALE_AFTER);
                     report_dispatch_write_holder(stale_after_nanos);
+                    let gpu_drained = remu_gpu::gpu_completed_submission_sequence() >= 64
+                        && remu_gpu::gpu_work_items_pending() == 0
+                        && remu_gpu::gpu_events_in_flight() == 0
+                        && remu_gpu::gpu_flips_pending() == 0
+                        && remu_gpu::gpu_progress_age_millis()
+                            .is_some_and(|age| age >= idle_after_millis);
+                    if gpu_drained && last_gpu_idle_dump.elapsed() >= GPU_IDLE_DUMP_INTERVAL {
+                        last_gpu_idle_dump = Instant::now();
+                        eprintln!(
+                            "[REMu][STALL] gpu drained after progress completed_submission={} progress_age_ms={:?}",
+                            remu_gpu::gpu_completed_submission_sequence(),
+                            remu_gpu::gpu_progress_age_millis(),
+                        );
+                        report_diagnostic_stall_attribution();
+                        report_equeue_delivery(stale_after_nanos, true);
+                    }
                     // Printed on change, or whenever completions are being carried, so a healthy
                     // run stays quiet while a wedge reports every tick.
                     let agc_counters = (
@@ -3120,7 +3212,7 @@ fn start_guest_import_trace_reporter() {
                         AGC_RECLAIMED_BACKEND_IDS.load(Ordering::Relaxed),
                         AGC_EVICTED_BACKEND_IDS.load(Ordering::Relaxed),
                     );
-                    report_equeue_delivery(stale_after_nanos);
+                    report_equeue_delivery(stale_after_nanos, false);
                     let carried = event_state::try_carried_agc_completion_depth();
                     if agc_counters != reported_agc_counters || carried.is_some_and(|d| d > 0) {
                         reported_agc_counters = agc_counters;
@@ -4635,9 +4727,7 @@ fn dispatch_kernel_path_import(nid: &str, arguments: [u64; 6]) -> Option<u64> {
         "6c3rCVE-fTU" | "wuCroIGjt2g" => {
             guest_posix_file_result(guest_files::guest_kernel_open_prelock(arguments))
         }
-        "E6ao34wPw+U" => {
-            guest_posix_file_result(guest_files::guest_kernel_stat_prelock(arguments))
-        }
+        "E6ao34wPw+U" => guest_posix_file_result(guest_files::guest_kernel_stat_prelock(arguments)),
         _ => return None,
     })
 }
@@ -5445,6 +5535,20 @@ fn dispatch_probe_import(
         "959qrazPIrg" => state.process_param_address,
         "p5EcQeEeJAE" => {
             state.application_heap_api_address = arguments[0];
+            APPLICATION_HEAP_API.store(arguments[0], Ordering::Release);
+            APPLICATION_HEAP_API_LOGGED.store(false, Ordering::Release);
+            if arguments[0] != 0 {
+                eprintln!(
+                    "[REMu][HEAP] application heap API registered at {:#x} malloc={:#x} free={:#x} calloc={:#x} realloc={:#x} memalign={:#x} posix_memalign={:#x}",
+                    arguments[0],
+                    read_guest_u64(arguments[0]),
+                    read_guest_u64(arguments[0] + 8),
+                    read_guest_u64(arguments[0] + 16),
+                    read_guest_u64(arguments[0] + 24),
+                    read_guest_u64(arguments[0] + 32),
+                    read_guest_u64(arguments[0] + 40),
+                );
+            }
             0
         }
         // Bundled PRXs are mapped, relocated, and initialized before the main executable. Runtime
@@ -5650,7 +5754,9 @@ fn dispatch_probe_import(
         // The guest ABI returns the previous four-byte value; the third argument is memory order.
         "2HnmKiLmV6s" => guest_atomic_fetch_4(arguments[0], arguments[1], true),
         "iPBqs+YUUFw" => guest_atomic_fetch_4(arguments[0], arguments[1], false),
-        // The native x86-64 process and guest share the libc allocation ABI.
+        // The native x86-64 process and guest share the libc allocation ABI. The application
+        // heap API is recorded for diagnostics; CRT registers it before GMalloc exists, so the
+        // live NIDs stay on the host allocator.
         "gQX+4GDQjpM" => guest_malloc(arguments[0]),
         "tIhsqj0qsFE" => guest_free(arguments[0]),
         "2X5agFjKxMc" => guest_calloc(arguments[0], arguments[1]),
@@ -6306,7 +6412,9 @@ fn refresh_completed_agc_submissions(state: &mut ProbeDispatchState) {
         return;
     }
     let (_event_hierarchy, mut events) = event_state::lock_event_state_for_write();
-    events.unclaimed_agc_completions.extend(drained.iter().copied());
+    events
+        .unclaimed_agc_completions
+        .extend(drained.iter().copied());
     if events.unclaimed_agc_completions.is_empty() {
         AGC_UNCLAIMED_COMPLETIONS_CARRIED.store(false, Ordering::Release);
         return;
@@ -6659,10 +6767,12 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = {
+        let (result, display_paced) = {
             let state = PROBE_DISPATCH.get_or_init(|| RwLock::new(ProbeDispatchState::default()));
             let mut state = lock_probe_dispatch_for_write(state);
-            kernel_poll_equeue(arguments, &mut state)
+            let result = kernel_poll_equeue(arguments, &mut state);
+            let display_paced = crate::av::equeue_is_display_paced(arguments[0], &state);
+            (result, display_paced)
         };
         match result {
             Err(error) => return error,
@@ -6691,14 +6801,19 @@ fn kernel_wait_equeue_blocking(arguments: [u64; 6]) -> u64 {
         if guest_exception_is_pending(guest_thread) {
             return sce_kernel_error(SCE_KERNEL_ERROR_INTERRUPTED);
         }
+        let display_slice = display_paced
+            .then(|| Duration::from_micros(crate::av::VIDEO_OUT_VBLANK_INTERVAL_MICROSECONDS));
         let wait_for = if let Some(deadline) = deadline {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 write_guest_u32(timeout_pointer, 0);
                 return sce_kernel_error(SCE_KERNEL_ERROR_TIMED_OUT);
             };
-            Some(remaining)
+            Some(match display_slice {
+                Some(slice) => remaining.min(slice),
+                None => remaining,
+            })
         } else {
-            None
+            display_slice
         };
         let wake = kernel_equeue_wake();
         let wake_state = wake
@@ -8751,6 +8866,124 @@ fn json_initializer_terminate(arguments: [u64; 6], state: &mut ProbeDispatchStat
     }
 }
 
+/// Offsets into the PS4/PS5 `HeapAPI` table `_sceKernelRtldSetApplicationHeapAPI` receives.
+const HEAP_API_MALLOC: u64 = 0;
+const HEAP_API_FREE: u64 = 8;
+#[allow(dead_code)]
+const HEAP_API_CALLOC: u64 = 16;
+#[allow(dead_code)]
+const HEAP_API_REALLOC: u64 = 24;
+#[allow(dead_code)]
+const HEAP_API_MEMALIGN: u64 = 32;
+#[allow(dead_code)]
+const HEAP_API_POSIX_MEMALIGN: u64 = 40;
+
+fn application_heap_function(offset: u64) -> Option<u64> {
+    let api = APPLICATION_HEAP_API.load(Ordering::Acquire);
+    if api == 0 {
+        return None;
+    }
+    let function = read_guest_u64(api.saturating_add(offset));
+    (function != 0).then_some(function)
+}
+
+fn with_application_heap<T>(fallback: impl FnOnce() -> T, call: impl FnOnce() -> T) -> T {
+    APPLICATION_HEAP_REENTRANT.with(|flag| {
+        if flag.get() {
+            return fallback();
+        }
+        flag.set(true);
+        struct Reset<'a>(&'a Cell<bool>);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.set(false);
+            }
+        }
+        let _reset = Reset(flag);
+        if !APPLICATION_HEAP_API_LOGGED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "[REMu][HEAP] libc allocation routed through application heap API at {:#x}",
+                APPLICATION_HEAP_API.load(Ordering::Acquire)
+            );
+        }
+        call()
+    })
+}
+
+fn call_application_heap(function: u64, argument0: u64, argument1: u64, argument2: u64) -> u64 {
+    type HeapFn = unsafe extern "C" fn(u64, u64, u64) -> u64;
+    // SAFETY: HeapAPI callbacks are SysV guest functions. Narrower callees ignore unused
+    // argument registers; a void free still returns through this path and the result is dropped.
+    unsafe { std::mem::transmute::<u64, HeapFn>(function)(argument0, argument1, argument2) }
+}
+
+pub(crate) fn libc_malloc(size: u64) -> u64 {
+    if let Some(function) = application_heap_function(HEAP_API_MALLOC) {
+        return with_application_heap(
+            || guest_malloc(size),
+            || call_application_heap(function, size, 0, 0),
+        );
+    }
+    guest_malloc(size)
+}
+
+pub(crate) fn libc_free(address: u64) -> u64 {
+    if let Some(function) = application_heap_function(HEAP_API_FREE) {
+        return with_application_heap(
+            || guest_free(address),
+            || {
+                call_application_heap(function, address, 0, 0);
+                0
+            },
+        );
+    }
+    guest_free(address)
+}
+
+#[allow(dead_code)]
+fn libc_calloc(count: u64, size: u64) -> u64 {
+    if let Some(function) = application_heap_function(HEAP_API_CALLOC) {
+        return with_application_heap(
+            || guest_calloc(count, size),
+            || call_application_heap(function, count, size, 0),
+        );
+    }
+    guest_calloc(count, size)
+}
+
+#[allow(dead_code)]
+fn libc_realloc(address: u64, size: u64) -> u64 {
+    if let Some(function) = application_heap_function(HEAP_API_REALLOC) {
+        return with_application_heap(
+            || guest_realloc(address, size),
+            || call_application_heap(function, address, size, 0),
+        );
+    }
+    guest_realloc(address, size)
+}
+
+#[allow(dead_code)]
+fn libc_aligned_alloc(alignment: u64, size: u64) -> u64 {
+    if let Some(function) = application_heap_function(HEAP_API_MEMALIGN) {
+        return with_application_heap(
+            || guest_aligned_alloc(alignment, size),
+            || call_application_heap(function, alignment, size, 0),
+        );
+    }
+    guest_aligned_alloc(alignment, size)
+}
+
+#[allow(dead_code)]
+fn libc_posix_memalign(output: u64, alignment: u64, size: u64) -> u64 {
+    if let Some(function) = application_heap_function(HEAP_API_POSIX_MEMALIGN) {
+        return with_application_heap(
+            || guest_posix_memalign(output, alignment, size),
+            || call_application_heap(function, output, alignment, size),
+        );
+    }
+    guest_posix_memalign(output, alignment, size)
+}
+
 fn guest_malloc(size: u64) -> u64 {
     let Ok(size) = usize::try_from(size) else {
         return 0;
@@ -9721,7 +9954,9 @@ fn probe_entry(
         install_guest_signal_delivery();
         #[cfg(target_arch = "x86_64")]
         {
-            remu_memory::set_guest_fault_delivery_handler(guest_signal::try_deliver_guest_fault);
+            remu_memory::set_guest_fault_delivery_handler(
+                truncated_va_fault::deliver_or_recover_truncated_heap_pointer,
+            );
         }
     }
     // Main thread identity for interruptive RaiseException and host QoS.
@@ -9743,6 +9978,8 @@ fn probe_entry(
     }
     trace_linked_guest_code(image);
     trace_linked_guest_references(image);
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    truncated_va_fault::patch_silent_hill_binned3_tls_pop();
     start_abi_gap_reporter();
     set_current_guest_thread_pointer(image.tls.thread_pointer.get());
     resolve_pending_ifunc_relocations(image);

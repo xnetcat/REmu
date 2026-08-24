@@ -21,7 +21,12 @@ pub(crate) fn guest_cpu_write_trace_range() -> Option<(u64, u64)> {
 }
 
 mod guest_space;
-pub(crate) use guest_space::{forget_guest_reservation, publish_guest_reservation};
+pub use guest_space::{
+    guest_page_is_committed, guest_reservation_contains, publish_guest_committed_range,
+};
+pub(crate) use guest_space::{
+    forget_guest_committed_range, forget_guest_reservation, publish_guest_reservation,
+};
 
 mod page;
 #[cfg(test)]

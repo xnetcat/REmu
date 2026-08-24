@@ -1636,6 +1636,56 @@ fn applies_direct_uconfig_vgt_index_type_to_graphics_index_size() {
 }
 
 #[test]
+fn applies_direct_context_reg_with_selector_high_bits() {
+    // UE SET_CONTEXT_REG uses the same 0x2000_/0xA000_ selector tags as SH/UC. The
+    // Cx dword index is the low 16 bits; leaving the tag in the map key hid
+    // VGT_ESGS_RING_ITEMSIZE (0x2ab) and SPI_SHADER_COL_FORMAT (0x1c5).
+    let mut graphics = AgcGraphicsState::default();
+    for (tagged_offset, value) in [(0x2000_02ab, 4_u32), (0xa000_01c5, 0x0000_0004)] {
+        let packet = [
+            agc_pm4(3, crate::AGC_IT_SET_CONTEXT_REG, 0),
+            tagged_offset,
+            value,
+        ];
+        agc_apply_submission_registers(
+            packet.as_ptr().addr() as u64,
+            3,
+            crate::AGC_IT_SET_CONTEXT_REG,
+            0,
+            &mut graphics,
+        )
+        .expect("direct context packet with selector tags");
+    }
+    assert_eq!(graphics.context_registers.get(&0x2ab), Some(&4));
+    assert_eq!(graphics.context_registers.get(&0x1c5), Some(&0x0000_0004));
+    assert!(!graphics.context_registers.contains_key(&0x2000_02ab));
+}
+
+#[test]
+fn applies_indirect_context_reg_with_selector_high_bits() {
+    let context_registers = [0x2000_02abu32, 5, 0xa000_01c5, 0x0000_0004];
+    let address = context_registers.as_ptr().addr() as u64;
+    let packet = [
+        agc_pm4(5, AGC_IT_SET_CONTEXT_REG_INDIRECT, 0),
+        low_u32(address),
+        (address >> 32) as u32,
+        0x8000_0000,
+        2,
+    ];
+    let mut graphics = AgcGraphicsState::default();
+    agc_apply_submission_registers(
+        packet.as_ptr().addr() as u64,
+        5,
+        AGC_IT_SET_CONTEXT_REG_INDIRECT,
+        0,
+        &mut graphics,
+    )
+    .expect("indirect context table with selector tags");
+    assert_eq!(graphics.context_registers.get(&0x2ab), Some(&5));
+    assert_eq!(graphics.context_registers.get(&0x1c5), Some(&4));
+}
+
+#[test]
 fn applies_direct_sh_reg_with_selector_high_bits() {
     // UE SET_SH_REG for compute threadgroup size uses the same 0x2000_ selector high bits as
     // SET_SH_REG_INDIRECT tables. Without masking, COMPUTE_NUM_THREAD_* never match decode.

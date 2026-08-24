@@ -39,7 +39,8 @@ fn sampled_images_apply_dynamic_descriptor_component_selection_in_the_shader() {
     // R32F sampled as R,R,R,R, the live Superliminal descriptor that previously failed
     // because the host tried to materialize the swizzle by changing the texture format.
     resource_descriptor[3] = 0x924;
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageSample"),
         control,
@@ -89,7 +90,8 @@ fn pixel_output_diagnostic_samples_the_bound_texture_before_reporting_guest_expo
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 9 << 28;
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageSample"),
         control,
@@ -109,8 +111,12 @@ fn pixel_output_diagnostic_samples_the_bound_texture_before_reporting_guest_expo
     );
     options.diagnostic_capture_pixel_output = true;
 
-    let shader = compile_msl(&Program::new(0x1000, vec![instruction]), &evaluation, &options)
-        .expect("diagnostic sampled pixel shader should lower");
+    let shader = compile_msl(
+        &Program::new(0x1000, vec![instruction]),
+        &evaluation,
+        &options,
+    )
+    .expect("diagnostic sampled pixel shader should lower");
     assert!(
         shader.source.contains(
             "float4 remu_debug_texture = tex0.sample(remu_samplers.s0, float2(remu_in.attr1[0], remu_in.attr1[1]))"
@@ -172,7 +178,8 @@ fn a8_font_atlas_select_reads_word_three_of_its_own_descriptor_window() {
     ];
     evaluation.initial_scalar_registers[15] = resource_descriptor[3];
     evaluation.scalar_registers[15] = resource_descriptor[3];
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageSample"),
         control,
@@ -242,7 +249,8 @@ fn zero_lod_gather_returns_four_neighbor_values_from_the_selected_component() {
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 0xfac | (9 << 28);
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageGather4Lz"),
         control,
@@ -328,7 +336,8 @@ fn try_compile_sample(
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 0x204 | (texture_type << 28);
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known(name),
         control,
@@ -703,7 +712,8 @@ fn canonicalizes_silent_hill_scale_image_uses_below_the_direct_texture_limit() {
             destinations: (4..8).map(Operand::vector).collect(),
             control: Some(InstructionControl::Image(control.clone())),
         });
-        evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+        evaluation.image_bindings.push(ImageBinding {
+            descriptor_index_is_runtime: false,
             pc,
             opcode: Opcode::Known("ImageSampleLz"),
             control: control.clone(),
@@ -792,7 +802,8 @@ fn comparison_gather_uses_distinct_depth_resources_and_gather_compare_codegen() 
         (&ordinary, ordinary_control),
         (&comparison, comparison_control),
     ] {
-        evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+        evaluation.image_bindings.push(ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: instruction.pc,
             opcode: instruction.opcode,
             control,
@@ -933,7 +944,8 @@ fn comparison_samples_use_depth_texture_typing_and_the_z_reference_operand() {
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 0x204 | (9 << 28);
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageSampleCLz"),
         control,
@@ -981,7 +993,8 @@ fn cube_evaluation(opcode: Opcode, control: &ImageControl) -> ShaderEvaluation {
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 0x204 | (11 << 28);
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode,
         control: control.clone(),
@@ -1127,7 +1140,8 @@ fn image_get_resinfo_queries_mip_relative_dimensions() {
         control: Some(InstructionControl::Image(control.clone())),
     };
     let mut evaluation = empty_evaluation();
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageGetResinfo"),
         control: control.clone(),
@@ -1178,7 +1192,8 @@ fn image_get_resinfo_unorm_writes_float_bitcasts() {
         control: Some(InstructionControl::Image(control.clone())),
     };
     let mut evaluation = empty_evaluation();
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageGetResinfo"),
         control,
@@ -1229,7 +1244,8 @@ fn rematerializes_dim3_sample_against_type2d_srd_like_ue_slate() {
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 0xfac | (9 << 28);
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageSample"),
         control,
@@ -1296,7 +1312,8 @@ fn compile_array_srd_sample(texture_type: u32, dimension: u32) -> String {
     let mut evaluation = empty_evaluation();
     let mut resource_descriptor = vec![0; 8];
     resource_descriptor[3] = 0x204 | (texture_type << 28);
-    evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+    evaluation.image_bindings.push(ImageBinding {
+        descriptor_index_is_runtime: false,
         pc: 0,
         opcode: Opcode::Known("ImageSample"),
         control,

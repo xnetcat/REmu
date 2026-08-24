@@ -171,6 +171,15 @@ pub(crate) fn queue_kernel_event_into(events: &mut EventState, mut event: Kernel
     }
 }
 
+/// Queues a kernel event as its own entry, even if equeue/ident/filter already match a pending one.
+///
+/// VideoOut flip and vblank events stay distinct: a guest that counts `WaitEqueue` returns
+/// otherwise under-counts when two display ticks land before it polls.
+pub(crate) fn queue_kernel_event_distinct(events: &mut EventState, event: KernelQueuedEvent) {
+    EQUEUE_EVENTS_INSERTED.fetch_add(1, Ordering::Relaxed);
+    events.pending_events.push_back(event);
+}
+
 pub(crate) fn with_event_state_mut<R>(f: impl FnOnce(&mut EventState) -> R) -> R {
     let (_h, mut events) = lock_event_state_for_write();
     f(&mut events)

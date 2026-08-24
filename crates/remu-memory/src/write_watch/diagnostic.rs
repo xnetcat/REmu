@@ -68,6 +68,7 @@ pub(super) enum FaultReason {
     LengthConversion,
     ProtectFailed,
     MaterializeFailed,
+    NotResident,
     #[allow(dead_code)] // Reserved for SIGILL/write-watch overlap reports; label already wired.
     IllegalInstruction,
 }
@@ -83,6 +84,7 @@ impl FaultReason {
             Self::LengthConversion => b"length-conversion-failed",
             Self::ProtectFailed => b"mprotect-failed",
             Self::MaterializeFailed => b"read-watch-materialize-failed",
+            Self::NotResident => b"watch-page-not-resident",
         }
     }
 }

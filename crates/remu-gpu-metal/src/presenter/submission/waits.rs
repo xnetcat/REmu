@@ -284,7 +284,34 @@ impl MetalPresenter {
         {
             Ok(GuestMemoryWaitStatus::BlockedOnPendingTerminal)
         } else {
-            Ok(GuestMemoryWaitStatus::Blocked)
+            let value = read_guest_memory_wait_value(wait);
+            let no_gpu_producer = self.receiver.describe_queued_wait_producers(wait) == "none-ingested";
+            let pending_none = self.pending_guest_memory_value(wait.address, wait.is_64_bit).is_none();
+            if wait.is_unarmed_generation_payload(value)
+                || (no_gpu_producer && pending_none && wait.is_cpu_published_generation_wait(value))
+            {
+                // No GPU producer writes this word. A next-pointer payload was never armed;
+                // a still-zero generation is a CPU-published label. Parking either case is a
+                // host-only deadlock (Silent Hill q0/q33, 0-FPS `Q W9` windows).
+                self.guest_memory_waits.complete(key);
+                if let Some(ticket_id) = ticket_id {
+                    let _ = self.gpu_wait_fences.take(ticket_id);
+                    remu_gpu::retire_gpu_wait(ticket_id);
+                }
+                static UNARMED_WAITS: AtomicUsize = AtomicUsize::new(0);
+                let sequence = UNARMED_WAITS.fetch_add(1, Ordering::Relaxed) + 1;
+                if sequence <= 16 || sequence.is_power_of_two() {
+                    eprintln!(
+                        "[REMu][METAL] resumed WAIT_REG_MEM from an unarmed generation label address={:#x} value={:#x} reference={:#x}",
+                        wait.address,
+                        value,
+                        wait.reference
+                    );
+                }
+                Ok(GuestMemoryWaitStatus::Satisfied)
+            } else {
+                Ok(GuestMemoryWaitStatus::Blocked)
+            }
         }
     }
 

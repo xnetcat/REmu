@@ -247,7 +247,9 @@ fn split_wave64_materializes_one_ballot_for_both_mask_words() {
         exec.source,
     );
     assert_eq!(
-        exec.source.matches("uint remu_initial_exec_ballot =").count(),
+        exec.source
+            .matches("uint remu_initial_exec_ballot =")
+            .count(),
         1,
     );
 }

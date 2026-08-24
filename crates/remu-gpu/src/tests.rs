@@ -9,10 +9,10 @@ use super::{
     GpuEndOfPipeCbDbAction, GpuEvent, GpuFlipCompletion, GpuHostImage, GpuMemoryAcquire,
     GpuMemoryRelease, GpuMemoryReleaseValue, GpuMemoryWait, GpuRegister, GpuRenderBackendFlush,
     GpuWaitOperation, HostPadState, IndexSnapshot, ShaderEvaluationSnapshot, audio_output_frames,
-    audio_progress_age_millis,
-    audio_underrun_frames, clear_event_sink, compute_program_address,
+    audio_progress_age_millis, audio_underrun_frames, clear_event_sink, compute_program_address,
     decode_compute_dispatch_direct, decode_compute_dispatch_indirect, decode_compute_launch,
     decode_compute_system_registers, emit_event, emit_event_with_admission,
+    threadgroups_are_plausible_indirect_snapshot,
     gpu_completed_submission_ids_snapshot, gpu_completed_submission_sequence, gpu_event_channel,
     gpu_events_in_flight, gpu_progress_age_millis, gpu_work_items_pending, host_pad_state,
     install_event_sink, install_gpu_completion_notifier, progress_telemetry_enabled,
@@ -22,8 +22,8 @@ use super::{
     take_gpu_completed_submission_ids, take_gpu_wait_latch,
 };
 use remu_shader::{GlobalMemoryBinding, ShaderEvaluation};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 static EVENT_SINK_TEST: Mutex<()> = Mutex::new(());
@@ -68,14 +68,8 @@ fn shader_evaluation_snapshot_shares_discovery_and_overrides_only_guest_bytes() 
     .expect("valid read-only sidecar");
 
     assert!(Arc::ptr_eq(snapshot.evaluation(), &evaluation));
-    assert_eq!(
-        snapshot.global_binding_data(0),
-        Some(&[1, 2, 3, 4][..])
-    );
-    assert_eq!(
-        snapshot.global_binding_data(1),
-        Some(&[8, 9][..])
-    );
+    assert_eq!(snapshot.global_binding_data(0), Some(&[1, 2, 3, 4][..]));
+    assert_eq!(snapshot.global_binding_data(1), Some(&[8, 9][..]));
     assert!(evaluation.global_memory_bindings[0].data.is_empty());
 }
 
@@ -83,11 +77,8 @@ fn shader_evaluation_snapshot_shares_discovery_and_overrides_only_guest_bytes() 
 fn shader_evaluation_snapshot_rejects_inconsistent_sidecars() {
     let evaluation = shader_evaluation_with_globals(vec![readonly_global(4, Vec::new())]);
     assert!(
-        ShaderEvaluationSnapshot::with_readonly_global_data(
-            Arc::clone(&evaluation),
-            Vec::new(),
-        )
-        .is_err()
+        ShaderEvaluationSnapshot::with_readonly_global_data(Arc::clone(&evaluation), Vec::new(),)
+            .is_err()
     );
     assert!(
         ShaderEvaluationSnapshot::with_readonly_global_data(
@@ -761,6 +752,35 @@ fn memory_wait_comparisons_apply_the_packet_mask() {
             ..wait
         }
         .is_satisfied_by(0xabcd_1235)
+    );
+}
+
+#[test]
+fn recycled_indirect_threadgroup_dwords_are_not_a_plausible_snapshot() {
+    assert!(threadgroups_are_plausible_indirect_snapshot([0, 8, 1]));
+    assert!(threadgroups_are_plausible_indirect_snapshot([65_535, 4, 1]));
+    assert!(threadgroups_are_plausible_indirect_snapshot([256, 256, 256]));
+    assert!(!threadgroups_are_plausible_indirect_snapshot([
+        1_971_877_254,
+        1_972_139_403,
+        1_972_008_331
+    ]));
+    assert!(!threadgroups_are_plausible_indirect_snapshot([1 << 24, 2, 1]));
+}
+
+#[test]
+fn equal_generation_waits_treat_pointer_payloads_as_unarmed() {
+    let wait = GpuMemoryWait::memory(0x7020_f6e4_e0, 1, u64::from(u32::MAX), 3, false);
+    assert!(wait.is_unarmed_generation_payload(0x20f6_e500));
+    assert!(!wait.is_unarmed_generation_payload(0));
+    assert!(wait.is_cpu_published_generation_wait(0));
+    assert!(!wait.is_cpu_published_generation_wait(1));
+    assert!(!wait.is_unarmed_generation_payload(1));
+    assert!(!wait.is_unarmed_generation_payload(8));
+    assert!(
+        !GpuMemoryWait::memory(0x1000, 0x1234, u64::from(u32::MAX), 3, false)
+            .is_unarmed_generation_payload(0x20f6_e500),
+        "a wait for a large reference is not a generation handshake"
     );
 }
 

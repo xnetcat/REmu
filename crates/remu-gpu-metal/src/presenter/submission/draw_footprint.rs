@@ -1164,7 +1164,8 @@ mod tests {
             offset_bytes: 0,
             data: vec![0; 48],
         });
-        export_evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+        export_evaluation.image_bindings.push(ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 16,
             opcode: Opcode::Known("ImageSample"),
             control: image_control(),
@@ -1187,7 +1188,8 @@ mod tests {
                 writable: true,
                 write_back_to_guest: true,
             });
-        pixel_evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+        pixel_evaluation.image_bindings.push(ImageBinding {
+            descriptor_index_is_runtime: false,
             pc: 20,
             opcode: Opcode::Known("ImageStore"),
             control: image_control(),
@@ -1373,7 +1375,8 @@ mod tests {
                     writable: false,
                     write_back_to_guest: false,
                 });
-                evaluation.image_bindings.push(ImageBinding { descriptor_index_is_runtime: false,
+                evaluation.image_bindings.push(ImageBinding {
+                    descriptor_index_is_runtime: false,
                     pc: 999,
                     opcode: Opcode::Known("ImageSample"),
                     control: image_control(),
@@ -1444,9 +1447,12 @@ mod tests {
                         .as_mut()
                         .expect("export evaluation"),
                     |evaluation| {
-                        evaluation.global_memory_bindings.iter_mut().for_each(|binding| {
-                            binding.instruction_pcs.retain(|covered| *covered != pc);
-                        });
+                        evaluation
+                            .global_memory_bindings
+                            .iter_mut()
+                            .for_each(|binding| {
+                                binding.instruction_pcs.retain(|covered| *covered != pc);
+                            });
                         evaluation.vertex_inputs.retain(|binding| binding.pc != pc);
                         evaluation.image_bindings.retain(|binding| binding.pc != pc);
                     },
@@ -1457,9 +1463,12 @@ mod tests {
                         .as_mut()
                         .expect("pixel evaluation"),
                     |evaluation| {
-                        evaluation.global_memory_bindings.iter_mut().for_each(|binding| {
-                            binding.instruction_pcs.retain(|covered| *covered != pc);
-                        });
+                        evaluation
+                            .global_memory_bindings
+                            .iter_mut()
+                            .for_each(|binding| {
+                                binding.instruction_pcs.retain(|covered| *covered != pc);
+                            });
                         evaluation.image_bindings.retain(|binding| binding.pc != pc);
                     },
                 );

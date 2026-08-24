@@ -330,13 +330,13 @@ pub(crate) fn effective_global_memory_binding<'a>(
 ///
 /// Null stubs can alias a later live binding on the same scalar slot. Returning indices lets
 /// packet sidecars follow that alias without a pointer scan for each upload.
-pub(crate) fn effective_global_memory_binding_indices(
-    evaluation: &ShaderEvaluation,
-) -> Vec<usize> {
+pub(crate) fn effective_global_memory_binding_indices(evaluation: &ShaderEvaluation) -> Vec<usize> {
     let mut live_by_scalar = HashMap::new();
     for (index, binding) in evaluation.global_memory_bindings.iter().enumerate() {
         if binding.base_address != 0 {
-            live_by_scalar.entry(binding.scalar_address).or_insert(index);
+            live_by_scalar
+                .entry(binding.scalar_address)
+                .or_insert(index);
         }
     }
     evaluation

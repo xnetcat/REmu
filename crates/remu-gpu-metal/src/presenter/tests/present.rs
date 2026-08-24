@@ -435,6 +435,74 @@ fn a_write_to_the_other_registered_buffer_waits_for_its_own_flip() {
 }
 
 #[test]
+fn an_already_uploaded_flip_does_not_present_the_next_buffer_or_a_stale_scene() {
+    let (_sender, receiver) = std::sync::mpsc::channel();
+    let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
+    presenter.set_active_guest_queue(Some(7));
+    let device = presenter.device.as_ref().expect("Metal device").clone();
+    let front = GuestTextureDescriptor {
+        address: 0xefc0_0000_00,
+        width: 640,
+        height: 360,
+        pitch: 640,
+        tile_mode: 27,
+        pixel_format: MTLPixelFormat::BGRA8Unorm,
+        bytes_per_pixel: 4,
+    };
+    let back = GuestTextureDescriptor {
+        address: 0xefc2_0000_00,
+        ..front
+    };
+    presenter.registered_video_out_buffers = vec![front.address, back.address];
+    presenter.display = Some(DisplayConfiguration {
+        width: front.width,
+        height: front.height,
+        pitch: front.pitch,
+        pixel_format: 0x8000_0000_0000_0000,
+        tiling_mode: 27,
+    });
+    presenter.ensure_direct_scanout_texture(&device, front);
+    presenter.mark_direct_scanout_initialized(front.address);
+    presenter.pending_flip = Some(PendingFlip {
+        address: front.address,
+        buffer_index: 0,
+        flip_argument: 0,
+        submission_sequence: None,
+        sequence: 1,
+    });
+    presenter.next_flip_sequence = 1;
+    presenter.finalize_pending_flip();
+    let first_texture = presenter
+        .frame_texture
+        .clone()
+        .expect("flip 1 has a snapshot");
+    assert_eq!(presenter.uploaded_flip_sequence, 1);
+    assert!(presenter.compositor_scene_frozen.is_none());
+    assert!(presenter.pending_compositor_scanout.is_none());
+
+    presenter.ensure_direct_scanout_texture(&device, back);
+    presenter.mark_direct_scanout_initialized(back.address);
+    presenter.note_pending_flip_target_write(back);
+    assert_eq!(presenter.pending_scanout_write_address, Some(back.address));
+
+    presenter.upload_pending_frame();
+    let still_first = presenter
+        .frame_texture
+        .as_ref()
+        .expect("flip 1 snapshot remains");
+    assert!(
+        std::ptr::eq(still_first.as_ref(), first_texture.as_ref()),
+        "compositing the next VideoOut buffer must not replace the snapshot already queued"
+    );
+    assert_eq!(
+        presenter
+            .active_translated_scanout
+            .map(|scanout| scanout.address),
+        Some(front.address)
+    );
+}
+
+#[test]
 fn a_flip_without_a_presentable_surface_still_completes() {
     let (_sender, receiver) = std::sync::mpsc::channel();
     let mut presenter = MetalPresenter::new(receiver).expect("Metal presenter state");
@@ -463,6 +531,15 @@ fn a_flip_without_a_presentable_surface_still_completes() {
 
     presenter.finalize_pending_flip();
     assert_eq!(presenter.submitted_flip_sequence, 1);
+    let (_, safe_before_tail) = presenter.bind_flip_safety_wait(GpuFlipWait {
+        address: flip.address,
+        buffer_index: flip.buffer_index,
+        required_flip_sequence: None,
+    });
+    assert!(
+        safe_before_tail,
+        "a raw-pending flip with no snapshot must release its buffer at finalize"
+    );
     assert!(
         remu_gpu::take_gpu_completed_flips().is_empty(),
         "surface-less finalization must wait for its asynchronous tail command buffer"
@@ -1292,8 +1369,9 @@ fn translated_scanout_prefers_later_compositor_over_untonemapped_video_out() {
         bytes_per_pixel: 8,
     };
     let compositor = GuestTextureDescriptor {
-        address: base.get() + u64::try_from(texture_bytes.next_multiple_of(GUEST_PAGE_SIZE))
-            .expect("compositor offset fits"),
+        address: base.get()
+            + u64::try_from(texture_bytes.next_multiple_of(GUEST_PAGE_SIZE))
+                .expect("compositor offset fits"),
         ..video_out
     };
     let other_flip = GuestTextureDescriptor {
@@ -1505,10 +1583,7 @@ fn translated_scanout_prefers_later_compositor_over_untonemapped_video_out() {
         selected.address, compositor.address,
         "the next frame's lighting write is the warehouse-lit backbuffer"
     );
-    assert!(std::ptr::eq(
-        texture.as_ref(),
-        compositor_texture.as_ref()
-    ));
+    assert!(std::ptr::eq(texture.as_ref(), compositor_texture.as_ref()));
 }
 
 #[test]

@@ -724,8 +724,8 @@ impl EventLoopTimeStatistics {
     pub(super) fn record(&mut self, class: usize, elapsed: Duration) {
         let class = class.min(EVENT_LOOP_CLASS_COUNT - 1);
         self.counts[class] = self.counts[class].saturating_add(1);
-        self.nanos[class] = self.nanos[class]
-            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.nanos[class] =
+            self.nanos[class].saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
     }
 
     /// Formats the window's non-empty classes ordered by spent time and resets the counters.

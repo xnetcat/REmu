@@ -205,6 +205,24 @@ pub(crate) fn analyze_control_flow(
     // conversion. The forward PC form preserves the guest's wave-wide branch sequencing;
     // backward graphics control flow keeps the honest dispatcher seam. Compute and ordinary
     // vertex stages retain structured loops and therefore the no-step-cap progress guarantee.
+    //
+    // Mesh is the exception when the program contains S_BARRIER: the step-capped Dispatcher
+    // cannot emit a defined Metal threadgroup barrier. A reducible structured tree is the
+    // only safe lowering; irreducible mesh barriers still refuse in driver.rs.
+    let has_workgroup_barrier = program
+        .instructions
+        .iter()
+        .any(|instruction| instruction.opcode.is("SBarrier"));
+    if matches!(stage, MetalShaderStage::Mesh) && has_workgroup_barrier {
+        let cfg = build_control_flow_graph(program);
+        let structured = cfg.structure();
+        if structured_cfg_is_fully_reducible(&structured) {
+            return Ok(ControlFlowLowering::Structured {
+                tree: structured,
+                blocks: cfg.blocks().to_vec(),
+            });
+        }
+    }
     if !matches!(stage, MetalShaderStage::Pixel | MetalShaderStage::Mesh) {
         let cfg = build_control_flow_graph(program);
         let structured = cfg.structure();

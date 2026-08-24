@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 use super::*;
+use std::time::Duration;
 
 #[test]
 fn closing_the_display_port_releases_its_buffers_and_refuses_a_second_close() {
@@ -213,6 +214,10 @@ fn the_vblank_status_reports_a_free_running_counter_in_its_documented_layout() {
 
 #[test]
 fn the_flip_status_reports_pending_depth_and_the_last_completed_flip() {
+    let _event_guard = crate::GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
     let mut state = open_display();
     let mut status = [0xff_u8; 0x80];
     let status_address = address_mut(&mut status);
@@ -397,6 +402,48 @@ fn colour_adjustment_requires_the_declared_size_and_a_usable_gamma() {
     assert_eq!(
         dispatch("pv9CI5VC+R0", args(&[VIDEO_OUT_HANDLE, 0, 16]), &mut state),
         Some(error(VIDEO_OUT_ERROR_INVALID_ADDRESS))
+    );
+}
+
+#[test]
+fn a_display_clock_vblank_reaches_waiters_without_a_flip() {
+    let _event_guard = crate::GPU_EVENT_SINK_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::event_state::reset_event_state_for_tests();
+    let mut state = open_display();
+    state.video_out.vblank_events.insert(0x44, 0xbeef);
+    video_out_set_display_clock_age(Duration::from_micros(
+        VIDEO_OUT_VBLANK_INTERVAL_MICROSECONDS.saturating_mul(2),
+    ));
+
+    crate::refresh_completed_video_out_flips(&mut state);
+
+    let delivered = crate::event_state::with_event_state_mut(|events| {
+        events
+            .pending_events
+            .drain(..)
+            .filter(|event| event.equeue == 0x44)
+            .map(|event| (event.ident, event.user_data, event.data))
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        delivered.len(),
+        1,
+        "one level-triggered vblank, not one per missed tick"
+    );
+    assert_eq!(delivered[0].0, 1);
+    assert_eq!(delivered[0].1, 0xbeef);
+    assert!(
+        delivered[0].2 >= 2,
+        "vblank data must be the display-clock count, got {}",
+        delivered[0].2
+    );
+
+    crate::refresh_completed_video_out_flips(&mut state);
+    assert!(
+        crate::event_state::with_event_state(|events| events.pending_events.is_empty()),
+        "the same display tick must not enqueue a second vblank"
     );
 }
 

@@ -12,17 +12,18 @@ use super::super::{
 };
 use super::{
     DecodedDepthTarget, DecodedImageDescriptor, DecodedRenderTarget, DirectScanoutTexture,
-    GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin, MultisampleResidentTexture,
-    MultisampleTextureKey, OWNED_REMATERIALISE_BLIT, OWNED_REMATERIALISE_CPU,
-    OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED, OWNED_REMATERIALISE_FAILED_CPU_GPU,
-    OWNED_REMATERIALISE_FAILED_LAYOUT, OWNED_REMATERIALISE_FAILED_MAPPING,
-    OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW, OWNED_SUBTRACT_TENANTS_SURVIVED,
-    GpuDebtSet, RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState, ResidentGuestTexture,
-    ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan, ScanoutSnapshotTexture,
-    SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion, create_mipmapped_guest_texture,
-    decode_guest_texture_linear_from_raw, decode_mode27_mip_chain_from_raw,
-    decode_sampled_texture_linear_from_raw, depth_sample_view_must_not_steal_depth_authority,
-    guest_ranges_overlap, guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
+    GpuDebtSet, GuestTextureDescriptor, MetalPresenter, Mode27WorkOrigin,
+    MultisampleResidentTexture, MultisampleTextureKey, OWNED_REMATERIALISE_BLIT,
+    OWNED_REMATERIALISE_CPU, OWNED_REMATERIALISE_DETILE, OWNED_REMATERIALISE_FAILED,
+    OWNED_REMATERIALISE_FAILED_CPU_GPU, OWNED_REMATERIALISE_FAILED_LAYOUT,
+    OWNED_REMATERIALISE_FAILED_MAPPING, OWNED_REMATERIALISE_FAILED_METAL, OWNED_REMATERIALISE_VIEW,
+    OWNED_SUBTRACT_TENANTS_SURVIVED, RESIDENT_WRITE_ATTRIBUTION_MISSES, RangeSet, ResidencyState,
+    ResidentGuestTexture, ResidentTextureActivityStamp, ResidentTextureMap, ResourceSpan,
+    ScanoutSnapshotTexture, SpanQueryOrder, StaleSource, WriteWatchRefresh, WrittenRegion,
+    create_mipmapped_guest_texture, decode_guest_texture_linear_from_raw,
+    decode_mode27_mip_chain_from_raw, decode_sampled_texture_linear_from_raw,
+    depth_sample_view_must_not_steal_depth_authority, guest_ranges_overlap,
+    guest_texture_byte_count, guest_texture_descriptors_share_byte_storage,
     guest_texture_descriptors_share_color_view_storage,
     guest_texture_descriptors_share_gpu_sample_storage, guest_texture_descriptors_share_storage,
     initial_depth_clear_for_target, mode27_mip_chain_layout, new_color_alias_texture_view,
@@ -824,10 +825,10 @@ impl MetalPresenter {
                     .expect("indexed render-target resident exists"),
             )?;
             if refresh == WriteWatchRefresh::Replaced {
-                if let Some(resident) = self.resident_guest_textures.retire_clean(
-                    &candidate,
-                    "render-target-policy-mapping-replaced",
-                )? {
+                if let Some(resident) = self
+                    .resident_guest_textures
+                    .retire_clean(&candidate, "render-target-policy-mapping-replaced")?
+                {
                     trace_resident_texture_removal(
                         "render-target-policy-mapping-replaced",
                         &resident,
@@ -1606,10 +1607,10 @@ impl MetalPresenter {
                     });
                 }
                 WriteWatchRefresh::Replaced => {
-                    if let Some(resident) = self.resident_guest_textures.retire_clean(
-                        &shared_resident,
-                        "ensure-shared-resident-mapping-replaced",
-                    )? {
+                    if let Some(resident) = self
+                        .resident_guest_textures
+                        .retire_clean(&shared_resident, "ensure-shared-resident-mapping-replaced")?
+                    {
                         trace_resident_texture_removal(
                             "ensure-shared-resident-mapping-replaced",
                             &resident,
@@ -1916,15 +1917,18 @@ impl MetalPresenter {
                 base_array_slice: 0,
                 layer_count: target.layer_count,
             };
-            assert!(self.resident_guest_textures.try_replace(&target.texture, |resident| {
-                promote_resident_mip_hierarchy(
-                    device,
-                    &command_buffer,
-                    descriptor,
-                    resident,
-                    Mode27WorkOrigin::RenderTargetCreate,
-                )
-            })?);
+            assert!(
+                self.resident_guest_textures
+                    .try_replace(&target.texture, |resident| {
+                        promote_resident_mip_hierarchy(
+                            device,
+                            &command_buffer,
+                            descriptor,
+                            resident,
+                            Mode27WorkOrigin::RenderTargetCreate,
+                        )
+                    })?
+            );
             let texture = self
                 .resident_guest_textures
                 .get(&target.texture)
@@ -2908,10 +2912,9 @@ pub(crate) fn ensure_resident_texture_in_map(
             WriteWatchRefresh::Replaced => {}
         }
     }
-    if let Some(resident) = resident_guest_textures.retire_clean(
-        &descriptor,
-        "ensure-map-resident-replacement",
-    )? {
+    if let Some(resident) =
+        resident_guest_textures.retire_clean(&descriptor, "ensure-map-resident-replacement")?
+    {
         let reason = if resident.write_watch.retirement() == Some(CpuWriteWatchRetirement::Replaced)
         {
             "ensure-map-mapping-replaced"

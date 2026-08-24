@@ -171,6 +171,11 @@ pub(crate) fn agc_apply_submission_registers(
         let raw_first_register = read_guest_u32(packet_address + 4);
         let first_register = if matches!(opcode, AGC_IT_SET_UCONFIG_REG | AGC_IT_SET_SH_REG) {
             raw_first_register & !0x7000_0000
+        } else if opcode == AGC_IT_SET_CONTEXT_REG {
+            // UE/AGC context packets use the same selector high bits as SH/UC
+            // (0x2000_/0xA000_). Cx offsets fit in 16 bits; leaving the tag in the
+            // key made VGT_ESGS_RING_ITEMSIZE and SPI_SHADER_COL_FORMAT miss.
+            raw_first_register & 0xffff
         } else {
             raw_first_register
         };
@@ -393,10 +398,10 @@ fn agc_apply_indirect_register_table(
         if raw_offset == u32::MAX {
             continue;
         }
-        let offset = if destination.normalize_selector() {
-            raw_offset & !0x7000_0000
-        } else {
-            raw_offset
+        let offset = match destination {
+            AgcRegisterFile::Context => raw_offset & 0xffff,
+            _ if destination.normalize_selector() => raw_offset & !0x7000_0000,
+            _ => raw_offset,
         };
         let value = u32::from_le_bytes(pair[4..].try_into().expect("register value dword"));
         if trace_agc_registers() && offset == AGC_VGT_PRIMITIVE_TYPE {

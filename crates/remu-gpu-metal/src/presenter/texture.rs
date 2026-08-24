@@ -100,8 +100,8 @@ pub(crate) use self::sampled::{
     resident_color_view_sample_is_eligible, resident_depth_sample_is_eligible,
     resident_offset_alias_sample_is_eligible, resident_same_image_sample_is_eligible,
     resident_sample_authority_ok, resident_texture_for_sample, resident_volume_sample_is_eligible,
-    sampled_texture_cache_needs_reload, sampled_texture_key,
-    sampled_texture_supports_access, sampled_texture_usage, sampled_texture_view_for_binding,
+    sampled_texture_cache_needs_reload, sampled_texture_key, sampled_texture_supports_access,
+    sampled_texture_usage, sampled_texture_view_for_binding,
 };
 pub(crate) use self::upload::{
     comparison_depth32_upload, descriptor_source_address, upload_image_textures,
@@ -117,8 +117,8 @@ pub(crate) use self::watch::{
     refresh_resident_texture_write_watch, refresh_sampled_texture_write_watch,
     resident_texture_raw_byte_count, sampled_texture_raw_range,
     sampled_texture_uses_exact_mode5_mips, sampled_texture_uses_exact_mode27_mips,
-    sampled_texture_uses_exact_mode64k_2d_mips,
-    snapshot_guest_texture_raw, snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
+    sampled_texture_uses_exact_mode64k_2d_mips, snapshot_guest_texture_raw,
+    snapshot_watched_guest_range, snapshot_watched_guest_texture_raw,
     snapshot_watched_sampled_texture_raw, watch_guest_texture, watch_resident_texture,
     watch_sampled_texture, write_watched_guest_range,
 };

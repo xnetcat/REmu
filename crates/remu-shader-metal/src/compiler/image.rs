@@ -953,9 +953,7 @@ impl Compiler<'_> {
         } else {
             self.temp(
                 &vector_kind,
-                &format!(
-                    "{tex}.sample({sampler}, {coordinate_arguments}{extra}{sample_offset})"
-                ),
+                &format!("{tex}.sample({sampler}, {coordinate_arguments}{extra}{sample_offset})"),
             )
         };
         if is_gather {

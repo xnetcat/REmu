@@ -12,15 +12,13 @@ use super::{
     PhysicalFootprintRange, PipelineCompileCandidate, PresenterFlow, QueueBlockReason, RangeSet,
     ResourceSpan, SHARED_HOST_KIND_ACQUIRE, SHARED_HOST_KIND_COMPUTE, SHARED_HOST_KIND_DMA,
     SHARED_HOST_KIND_DRAW, SHARED_HOST_KIND_FLIP, SHARED_HOST_KIND_OTHER, SHARED_HOST_KIND_UI,
-    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent,
-    ScheduledPipelineKey,
+    SHARED_HOST_KIND_WAIT, ScheduledGpuSubmission, ScheduledHostEvent, ScheduledPipelineKey,
     SharedEventDirectComputePlan, SharedEventHostEffectLatencyPhase,
     SharedEventHostEffectLatencyState, SharedEventHostEffectPendingStatistics,
-    SharedEventWriteKind, UploadedGlobalBuffer, WriteWatchRefresh,
-    diagnostic_skip_export_shader, diagnostic_skip_pixel_shader,
-    guest_physical_ranges_overlap, guest_ranges_overlap, guest_texture_byte_count,
-    noop_placeholder_cover_draw, pixel_scalars, rearm_color_metadata_clear,
-    rearm_depth_metadata_clear, record_diagnostic_memory_copy,
+    SharedEventWriteKind, UploadedGlobalBuffer, WriteWatchRefresh, diagnostic_skip_export_shader,
+    diagnostic_skip_pixel_shader, guest_physical_ranges_overlap, guest_ranges_overlap,
+    guest_texture_byte_count, noop_placeholder_cover_draw, pixel_scalars,
+    rearm_color_metadata_clear, rearm_depth_metadata_clear, record_diagnostic_memory_copy,
     refresh_resident_texture_write_watch, register_value, retire_sampled_textures_matching,
     trace_resident_texture_removal, trace_video_target_compute_consumer,
     trace_video_target_draw_consumer,
@@ -29,8 +27,8 @@ use metal::{MTLRenderStages, NSUInteger};
 use objc::{msg_send, sel, sel_impl};
 use remu_gpu::{GpuEvent, GpuMemoryAcquire};
 use remu_memory::guest_shared_backing_identity;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 mod batch;
 mod draw_footprint;
@@ -732,6 +730,10 @@ impl MetalPresenter {
                     if noop_placeholder_cover_draw(&draw) {
                         super::stats::NOOP_DRAWS_COVER_PLACEHOLDER.fetch_add(1, Ordering::Relaxed);
                         super::stats::note_noop_draw("gpu:noop-cover-placeholder");
+                        self.receiver.finish_event(source);
+                        self.statistics
+                            .event_loop_time
+                            .record(event_class, event_processing_started.elapsed());
                         continue;
                     }
                     let key = match scheduled_pipeline_key.as_ref() {
@@ -781,6 +783,10 @@ impl MetalPresenter {
                                 draw.pixel_shader_address,
                             );
                         }
+                        self.receiver.finish_event(source);
+                        self.statistics
+                            .event_loop_time
+                            .record(event_class, event_processing_started.elapsed());
                         continue;
                     }
                     let cpu_synchronization_epoch = self.guest_batch_cpu_synchronization_epoch;
@@ -860,9 +866,7 @@ impl MetalPresenter {
                             GuestBatchFlushReason::WorkCapacity,
                         )
                     {
-                        eprintln!(
-                            "[REMu][METAL] completion-capacity submission failed: {error}"
-                        );
+                        eprintln!("[REMu][METAL] completion-capacity submission failed: {error}");
                     }
                 }
                 GpuEvent::Shutdown => {

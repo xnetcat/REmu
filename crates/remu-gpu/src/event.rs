@@ -558,6 +558,29 @@ impl GpuMemoryWait {
             _ => true,
         }
     }
+
+    /// Reports whether `value` is leftover list/object state rather than a generation counter.
+    ///
+    /// Silent Hill's first async-compute ACB waits for generation `== 1` at a label whose first
+    /// dword still holds a next-pointer (`address + 0x20`). No ingested GPU producer writes that
+    /// word, so the wait parked q33 forever at 0 FPS. A generation wait's live payload is 0 or a
+    /// small counter; a pointer-sized value means the fence was never armed.
+    #[must_use]
+    pub const fn is_unarmed_generation_payload(self, value: u64) -> bool {
+        let value = value & self.mask;
+        self.compare_function == 3 && self.reference > 0 && self.reference <= 16 && value > 0xffff
+    }
+
+    /// A generation wait still sitting at 0 with no ingested GPU producer.
+    ///
+    /// Silent Hill parks q0 on `== 1` at a label the CPU will publish. With
+    /// `producers=[none-ingested]` that park is a host deadlock (RenderThread waits for GPU,
+    /// GPU waits for the CPU store) and shows up as a 0-FPS window with `Q W9`.
+    #[must_use]
+    pub const fn is_cpu_published_generation_wait(self, value: u64) -> bool {
+        let value = value & self.mask;
+        self.compare_function == 3 && self.reference > 0 && self.reference <= 16 && value == 0
+    }
 }
 
 impl GpuMemoryAcquire {

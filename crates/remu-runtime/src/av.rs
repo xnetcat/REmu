@@ -88,7 +88,13 @@ use self::video_out::{
     video_out_unregister_buffers, video_out_vrr_unpeg_from_fixed_rate,
 };
 // Dispatched before the process-wide dispatch lock (plan C5).
+#[cfg(test)]
+pub(crate) use self::video_out::video_out_set_display_clock_age;
 pub(crate) use self::video_out::video_out_wait_vblank;
+pub(crate) use self::video_out::{
+    VIDEO_OUT_VBLANK_INTERVAL_MICROSECONDS, deliver_display_clock_vblanks, equeue_is_display_paced,
+    note_flip_coincident_vblank,
+};
 
 /// Handles a NID belonging to this module, or returns `None` if it owns no such NID.
 pub(crate) fn dispatch(

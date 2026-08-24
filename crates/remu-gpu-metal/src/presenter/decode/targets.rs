@@ -493,9 +493,7 @@ pub(crate) fn decode_render_targets(
     targets
 }
 
-fn decode_render_targets_untimed(
-    draw: &IndexedDraw,
-) -> Result<Vec<DecodedRenderTarget>, String> {
+fn decode_render_targets_untimed(draw: &IndexedDraw) -> Result<Vec<DecodedRenderTarget>, String> {
     let Some(pixel) = draw.pixel_shader.as_ref() else {
         if draw.scanout_target.is_some() {
             return Err("scanout draw has no decoded pixel shader".to_owned());

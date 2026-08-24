@@ -273,7 +273,10 @@ fn spawn_timed_guest_memory_dump() {
         .spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(seconds));
             if let Err(error) = std::fs::create_dir_all(&directory) {
-                eprintln!("[REMu][MEMDUMP] cannot create {}: {error}", directory.display());
+                eprintln!(
+                    "[REMu][MEMDUMP] cannot create {}: {error}",
+                    directory.display()
+                );
                 return;
             }
             let table = remu_memory::guest_shared_mapping_table();
@@ -295,10 +298,8 @@ fn spawn_timed_guest_memory_dump() {
                 let mut cursor = 0_u64;
                 while cursor < *length {
                     let step = chunk.len().min((*length - cursor) as usize);
-                    if !remu_memory::read_guest_shared_backing(
-                        address + cursor,
-                        &mut chunk[..step],
-                    ) {
+                    if !remu_memory::read_guest_shared_backing(address + cursor, &mut chunk[..step])
+                    {
                         break;
                     }
                     if file.write_all(&chunk[..step]).is_err() {
